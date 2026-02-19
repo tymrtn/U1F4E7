@@ -1,0 +1,50 @@
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;
+    &lt;title&gt;Envelope Email Dashboard&lt;/title&gt;
+    &lt;link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2/dist/tailwind.min.css" rel="stylesheet"&gt;
+&lt;/head&gt;
+&lt;body class="bg-gray-100 p-8"&gt;
+    &lt;div class="max-w-md mx-auto bg-white rounded-lg shadow-md p-6"&gt;
+        &lt;h1 class="text-2xl font-bold mb-6 text-center"&gt;Envelope Email&lt;/h1&gt;
+        &lt;form id="emailForm" class="space-y-4"&gt;
+            &lt;input type="email" id="from" placeholder="From: your@domain.com" class="w-full p-2 border rounded" required&gt;
+            &lt;input type="email" id="to" placeholder="To: recipient@example.com" class="w-full p-2 border rounded" required&gt;
+            &lt;input type="text" id="subject" placeholder="Subject" class="w-full p-2 border rounded" required&gt;
+            &lt;textarea id="html" placeholder="HTML Body (optional)" rows="5" class="w-full p-2 border rounded"&gt;&lt;/textarea&gt;
+            &lt;textarea id="text" placeholder="Text Body (optional)" rows="3" class="w-full p-2 border rounded"&gt;&lt;/textarea&gt;
+            &lt;button type="submit" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600"&gt;Send Test Email&lt;/button&gt;
+        &lt;/form&gt;
+        &lt;div id="result" class="mt-4 p-4 bg-green-100 hidden rounded"&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;script&gt;
+        document.getElementById('emailForm').addEventListener('submit', async (e) =&gt; {
+            e.preventDefault();
+            const formData = {
+                from_email: document.getElementById('from').value,
+                to: document.getElementById('to').value,
+                subject: document.getElementById('subject').value,
+                html: document.getElementById('html').value,
+                text: document.getElementById('text').value
+            };
+            const result = document.getElementById('result');
+            result.className = 'mt-4 p-4 bg-blue-100 rounded';
+            result.innerHTML = 'Sending...';
+            result.classList.remove('hidden');
+            try {
+                const res = await fetch('/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(formData)
+                });
+                const data = await res.json();
+                result.className = data.status === 'success' ? 'mt-4 p-4 bg-green-100 rounded' : 'mt-4 p-4 bg-red-100 rounded';
+                result.innerHTML = data.status === 'success' ? `Success! ID: ${data.id}` : `Error: ${data.message}`;
+            } catch (err) {
+                result.className = 'mt-4 p-4 bg-red-100 rounded';
+                result.innerHTML = `Error: ${err.message}`;
+            }
+        });
+    &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
