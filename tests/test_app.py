@@ -79,3 +79,27 @@ async def test_account_crud(client):
     # Verify deleted
     resp = await client.get(f"/accounts/{account_id}")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_messages_list_empty(client):
+    resp = await client.get("/messages")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_message_not_found(client):
+    resp = await client.get("/messages/nonexistent")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_stats_empty(client):
+    resp = await client.get("/stats")
+    assert resp.status_code == 200
+    stats = resp.json()
+    assert stats["total"] == 0
+    assert stats["sent"] == 0
+    assert stats["failed"] == 0
+    assert stats["success_rate"] == 0

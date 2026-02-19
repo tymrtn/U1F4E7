@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from app.db import init_db
 from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
+from app import messages
 
 load_dotenv()
 
@@ -90,6 +91,14 @@ async def send_email(data: SendEmail):
 
     from_addr = data.from_email or account["username"]
 
+    # Create tracking record
+    record = await messages.create_message(
+        account_id=data.account_id,
+        from_addr=from_addr,
+        to_addr=data.to,
+        subject=data.subject,
+    )
+
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=data.to,
@@ -100,22 +109,46 @@ async def send_email(data: SendEmail):
     )
 
     try:
-        message_id = await send_message(account, msg)
+        smtp_message_id = await send_message(account, msg)
     except SmtpSendError as e:
+        await messages.mark_failed(record["id"], e.message)
         return JSONResponse(
             status_code=502,
             content={"error": e.message, "error_type": e.error_type},
         )
 
+    await messages.mark_sent(record["id"], smtp_message_id)
+
     return {
         "status": "sent",
-        "message_id": message_id,
+        "id": record["id"],
+        "message_id": smtp_message_id,
         "envelope": {
             "from": from_addr,
             "to": data.to,
             "subject": data.subject,
         },
     }
+
+
+# --- Messages ---
+
+@app.get("/messages")
+async def list_messages(limit: int = 50, offset: int = 0):
+    return await messages.list_messages(limit=limit, offset=offset)
+
+
+@app.get("/messages/{message_id}")
+async def get_message(message_id: str):
+    msg = await messages.get_message(message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return msg
+
+
+@app.get("/stats")
+async def get_stats():
+    return await messages.get_stats()
 
 
 # --- Accounts ---

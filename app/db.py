@@ -22,6 +22,21 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TEXT NOT NULL,
     verified_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    message_id TEXT,
+    direction TEXT NOT NULL DEFAULT 'outbound',
+    from_addr TEXT NOT NULL,
+    to_addr TEXT NOT NULL,
+    subject TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    error TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
 """
 
 
