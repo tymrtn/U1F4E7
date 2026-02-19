@@ -124,12 +124,19 @@
                 <div id="add-account-form" class="hidden mb-6 border border-rule bg-white p-4 space-y-3">
                     <p class="text-xs font-medium text-ink mb-3">New Account</p>
                     <input type="text" id="acc-name" placeholder="Account name" class="input-field">
-                    <input type="text" id="acc-host" placeholder="SMTP/IMAP host" class="input-field">
+                    <div class="flex gap-2">
+                        <input type="text" id="acc-username" placeholder="Username / email" class="input-field flex-1">
+                        <button id="btn-discover" class="btn-ghost text-xs whitespace-nowrap">Discover</button>
+                    </div>
+                    <div id="discover-status" class="hidden text-xs font-mono mt-1"></div>
                     <div class="grid grid-cols-2 gap-3">
+                        <input type="text" id="acc-smtp-host" placeholder="SMTP host" class="input-field">
                         <input type="number" id="acc-smtp-port" placeholder="SMTP port" value="587" class="input-field">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <input type="text" id="acc-imap-host" placeholder="IMAP host" class="input-field">
                         <input type="number" id="acc-imap-port" placeholder="IMAP port" value="993" class="input-field">
                     </div>
-                    <input type="text" id="acc-username" placeholder="Username / email" class="input-field">
                     <input type="password" id="acc-password" placeholder="Password" class="input-field">
                     <input type="text" id="acc-display-name" placeholder="Display name (optional)" class="input-field">
                     <div class="flex gap-2 pt-1">

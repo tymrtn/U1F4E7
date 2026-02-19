@@ -18,6 +18,7 @@ from app.db import init_db
 from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app import messages
+from app.discovery import discover
 
 load_dotenv()
 
@@ -149,6 +150,13 @@ async def get_message(message_id: str):
 @app.get("/stats")
 async def get_stats():
     return await messages.get_stats()
+
+
+# --- Discovery ---
+
+@app.get("/accounts/discover")
+async def discover_settings(email: str):
+    return await discover(email)
 
 
 # --- Accounts ---

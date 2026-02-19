@@ -146,6 +146,7 @@
     var toggleBtn = document.getElementById('toggle-add-account');
     var saveBtn = document.getElementById('btn-save-account');
     var cancelBtn = document.getElementById('btn-cancel-account');
+    var discoverBtn = document.getElementById('btn-discover');
     var errorEl = document.getElementById('add-account-error');
 
     toggleBtn.addEventListener('click', function () {
@@ -159,11 +160,16 @@
       clearAddForm();
     });
 
+    discoverBtn.addEventListener('click', runDiscover);
+
     saveBtn.addEventListener('click', async function () {
       errorEl.classList.add('hidden');
+      var smtpHost = document.getElementById('acc-smtp-host').value.trim();
+      var imapHost = document.getElementById('acc-imap-host').value.trim();
       var payload = {
         name: document.getElementById('acc-name').value.trim(),
-        host: document.getElementById('acc-host').value.trim(),
+        smtp_host: smtpHost,
+        imap_host: imapHost,
         smtp_port: parseInt(document.getElementById('acc-smtp-port').value) || 587,
         imap_port: parseInt(document.getElementById('acc-imap-port').value) || 993,
         username: document.getElementById('acc-username').value.trim(),
@@ -171,8 +177,8 @@
         display_name: document.getElementById('acc-display-name').value.trim() || undefined,
       };
 
-      if (!payload.name || !payload.host || !payload.username || !payload.password) {
-        errorEl.textContent = 'Name, host, username, and password are required.';
+      if (!payload.name || !smtpHost || !imapHost || !payload.username || !payload.password) {
+        errorEl.textContent = 'Name, hosts, username, and password are required.';
         errorEl.classList.remove('hidden');
         return;
       }
@@ -204,13 +210,63 @@
     });
   }
 
+  async function runDiscover() {
+    var email = document.getElementById('acc-username').value.trim();
+    var statusEl = document.getElementById('discover-status');
+    var discoverBtn = document.getElementById('btn-discover');
+
+    if (!email || !email.includes('@')) {
+      statusEl.textContent = 'Enter an email address first.';
+      statusEl.className = 'text-xs font-mono mt-1 text-warn';
+      statusEl.classList.remove('hidden');
+      return;
+    }
+
+    discoverBtn.textContent = 'Discovering...';
+    discoverBtn.disabled = true;
+    statusEl.textContent = 'Probing DNS records and mail servers...';
+    statusEl.className = 'text-xs font-mono mt-1 text-mid';
+    statusEl.classList.remove('hidden');
+
+    try {
+      var data = await api('/accounts/discover?email=' + encodeURIComponent(email));
+
+      var found = [];
+      if (data.smtp_host) {
+        document.getElementById('acc-smtp-host').value = data.smtp_host;
+        document.getElementById('acc-smtp-port').value = data.smtp_port;
+        found.push('SMTP: ' + data.smtp_host + ':' + data.smtp_port + ' (' + data.smtp_source + ')');
+      }
+      if (data.imap_host) {
+        document.getElementById('acc-imap-host').value = data.imap_host;
+        document.getElementById('acc-imap-port').value = data.imap_port;
+        found.push('IMAP: ' + data.imap_host + ':' + data.imap_port + ' (' + data.imap_source + ')');
+      }
+
+      if (found.length > 0) {
+        statusEl.innerHTML = found.join('<br>');
+        statusEl.className = 'text-xs font-mono mt-1 text-accent';
+      } else {
+        statusEl.textContent = 'No servers found. Enter settings manually.';
+        statusEl.className = 'text-xs font-mono mt-1 text-warn';
+      }
+    } catch (e) {
+      statusEl.textContent = 'Discovery failed: ' + e.message;
+      statusEl.className = 'text-xs font-mono mt-1 text-warn';
+    } finally {
+      discoverBtn.textContent = 'Discover';
+      discoverBtn.disabled = false;
+    }
+  }
+
   function clearAddForm() {
-    ['acc-name', 'acc-host', 'acc-username', 'acc-password', 'acc-display-name'].forEach(function (id) {
+    ['acc-name', 'acc-smtp-host', 'acc-imap-host', 'acc-username', 'acc-password', 'acc-display-name'].forEach(function (id) {
       document.getElementById(id).value = '';
     });
     document.getElementById('acc-smtp-port').value = '587';
     document.getElementById('acc-imap-port').value = '993';
     document.getElementById('add-account-error').classList.add('hidden');
+    document.getElementById('discover-status').classList.add('hidden');
   }
 
   // ── Messages ──
