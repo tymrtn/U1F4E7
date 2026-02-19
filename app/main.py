@@ -1,7 +1,5 @@
-# Envelope Email - BYO Mailbox API
-# Aposema Licensed Code
-# Copyright (c) 2026 Tyler Martin (aposema.com)
-# Licensed under Aposema Protocol: infer|public
+# Copyright (c) 2026 Tyler Martin
+# Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 from fastapi import FastAPI, Request, Form, Depends
 from fastapi.responses import HTMLResponse

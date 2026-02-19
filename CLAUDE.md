@@ -4,6 +4,14 @@
 
 BYO mailbox API with agent-native primitives. Turn any IMAP/SMTP account into a programmable email API.
 
+## License
+
+FSL-1.1-ALv2. All source files must include:
+```
+# Copyright (c) 2026 Tyler Martin
+# Licensed under FSL-1.1-ALv2 (see LICENSE)
+```
+
 Stack: Python, FastAPI, aiosmtplib, aioimaplib, SQLite.
 
 ## Multi-Agent Coordination

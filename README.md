@@ -54,3 +54,14 @@ U1F4E7/
   VISION.md              # Product vision
   ARCHITECTURE.md        # System architecture
 ```
+
+## License
+
+Envelope Email is licensed under the Functional Source License, Version 1.1,
+Apache License v2.0 Future License (FSL-1.1-ALv2).
+
+You can use, modify, and self-host Envelope freely. You cannot offer it as a
+competing commercial service. Each version converts to Apache 2.0 two years
+after release.
+
+For commercial platform integration, contact ty@tmrtn.com.
