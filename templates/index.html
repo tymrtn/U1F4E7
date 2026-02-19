@@ -1,50 +1,210 @@
-&lt;!DOCTYPE html&gt;
-&lt;html&gt;
-&lt;head&gt;
-    &lt;title&gt;Envelope Email Dashboard&lt;/title&gt;
-    &lt;link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2/dist/tailwind.min.css" rel="stylesheet"&gt;
-&lt;/head&gt;
-&lt;body class="bg-gray-100 p-8"&gt;
-    &lt;div class="max-w-md mx-auto bg-white rounded-lg shadow-md p-6"&gt;
-        &lt;h1 class="text-2xl font-bold mb-6 text-center"&gt;Envelope Email&lt;/h1&gt;
-        &lt;form id="emailForm" class="space-y-4"&gt;
-            &lt;input type="email" id="from" placeholder="From: your@domain.com" class="w-full p-2 border rounded" required&gt;
-            &lt;input type="email" id="to" placeholder="To: recipient@example.com" class="w-full p-2 border rounded" required&gt;
-            &lt;input type="text" id="subject" placeholder="Subject" class="w-full p-2 border rounded" required&gt;
-            &lt;textarea id="html" placeholder="HTML Body (optional)" rows="5" class="w-full p-2 border rounded"&gt;&lt;/textarea&gt;
-            &lt;textarea id="text" placeholder="Text Body (optional)" rows="3" class="w-full p-2 border rounded"&gt;&lt;/textarea&gt;
-            &lt;button type="submit" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600"&gt;Send Test Email&lt;/button&gt;
-        &lt;/form&gt;
-        &lt;div id="result" class="mt-4 p-4 bg-green-100 hidden rounded"&gt;&lt;/div&gt;
-    &lt;/div&gt;
-    &lt;script&gt;
-        document.getElementById('emailForm').addEventListener('submit', async (e) =&gt; {
-            e.preventDefault();
-            const formData = {
-                from_email: document.getElementById('from').value,
-                to: document.getElementById('to').value,
-                subject: document.getElementById('subject').value,
-                html: document.getElementById('html').value,
-                text: document.getElementById('text').value
-            };
-            const result = document.getElementById('result');
-            result.className = 'mt-4 p-4 bg-blue-100 rounded';
-            result.innerHTML = 'Sending...';
-            result.classList.remove('hidden');
-            try {
-                const res = await fetch('/send', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(formData)
-                });
-                const data = await res.json();
-                result.className = data.status === 'success' ? 'mt-4 p-4 bg-green-100 rounded' : 'mt-4 p-4 bg-red-100 rounded';
-                result.innerHTML = data.status === 'success' ? `Success! ID: ${data.id}` : `Error: ${data.message}`;
-            } catch (err) {
-                result.className = 'mt-4 p-4 bg-red-100 rounded';
-                result.innerHTML = `Error: ${err.message}`;
-            }
-        });
-    &lt;/script&gt;
-&lt;/body&gt;
-&lt;/html&gt;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Envelope</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Instrument Sans', 'system-ui', 'sans-serif'],
+                        mono: ['DM Mono', 'monospace'],
+                    },
+                    colors: {
+                        ink: '#0a0a0a',
+                        paper: '#f7f6f3',
+                        mid: '#8a8780',
+                        rule: '#d9d7d1',
+                        accent: '#1a6b4a',
+                        'accent-light': '#e8f5ee',
+                        warn: '#c4421a',
+                        'warn-light': '#fdf0ec',
+                        pending: '#9a7b1a',
+                        'pending-light': '#fdf8e8',
+                    },
+                },
+            },
+        }
+    </script>
+    <style>
+        body { -webkit-font-smoothing: antialiased; }
+        [data-cloak] { display: none !important; }
+        .fade-in { animation: fadeIn 0.3s ease-out forwards; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 1; }
+        }
+        .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+        .input-field {
+            @apply w-full px-3 py-2 bg-white border border-rule text-sm font-mono
+                   text-ink placeholder-mid focus:outline-none focus:border-ink
+                   transition-colors;
+        }
+        .btn-primary {
+            @apply px-4 py-2 bg-ink text-paper text-sm font-medium tracking-wide
+                   hover:bg-neutral-800 active:bg-neutral-700 transition-colors;
+        }
+        .btn-ghost {
+            @apply px-3 py-1.5 text-sm text-mid border border-rule
+                   hover:border-ink hover:text-ink transition-colors;
+        }
+        .section-label {
+            @apply text-[10px] font-mono font-medium tracking-[0.15em] uppercase text-mid;
+        }
+    </style>
+</head>
+<body class="bg-paper text-ink min-h-screen">
+
+    <!-- Header -->
+    <header id="header" class="border-b border-rule">
+        <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 border-2 border-ink flex items-center justify-center">
+                    <svg width="14" height="10" viewBox="0 0 14 10" fill="none">
+                        <path d="M1 1L7 5.5L13 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <rect x="0.5" y="0.5" width="13" height="9" rx="0.5" stroke="currentColor" stroke-width="1"/>
+                    </svg>
+                </div>
+                <h1 class="text-lg font-semibold tracking-tight">Envelope</h1>
+            </div>
+            <div class="flex items-center gap-3">
+                <div id="refresh-indicator" class="flex items-center gap-1.5 text-xs text-mid font-mono">
+                    <span class="w-1.5 h-1.5 rounded-full bg-accent pulse-dot"></span>
+                    <span id="last-refresh">--</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-6 py-8 space-y-10">
+
+        <!-- Stats Bar -->
+        <section id="stats-section" class="fade-in">
+            <div class="grid grid-cols-4 gap-px bg-rule border border-rule">
+                <div class="bg-paper px-5 py-4">
+                    <p class="section-label mb-1">Total Sent</p>
+                    <p id="stat-total" class="text-2xl font-semibold tabular-nums font-mono">--</p>
+                </div>
+                <div class="bg-paper px-5 py-4">
+                    <p class="section-label mb-1">Delivered</p>
+                    <p id="stat-sent" class="text-2xl font-semibold tabular-nums font-mono text-accent">--</p>
+                </div>
+                <div class="bg-paper px-5 py-4">
+                    <p class="section-label mb-1">Failed</p>
+                    <p id="stat-failed" class="text-2xl font-semibold tabular-nums font-mono text-warn">--</p>
+                </div>
+                <div class="bg-paper px-5 py-4">
+                    <p class="section-label mb-1">Success Rate</p>
+                    <p id="stat-rate" class="text-2xl font-semibold tabular-nums font-mono">--</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Two-column layout: Accounts + Send -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-10">
+
+            <!-- Accounts -->
+            <section id="accounts-section">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="section-label">Accounts</h2>
+                    <button id="toggle-add-account" class="btn-ghost text-xs">+ Add</button>
+                </div>
+
+                <!-- Add Account Form (hidden by default) -->
+                <div id="add-account-form" class="hidden mb-6 border border-rule bg-white p-4 space-y-3">
+                    <p class="text-xs font-medium text-ink mb-3">New Account</p>
+                    <input type="text" id="acc-name" placeholder="Account name" class="input-field">
+                    <input type="text" id="acc-host" placeholder="SMTP/IMAP host" class="input-field">
+                    <div class="grid grid-cols-2 gap-3">
+                        <input type="number" id="acc-smtp-port" placeholder="SMTP port" value="587" class="input-field">
+                        <input type="number" id="acc-imap-port" placeholder="IMAP port" value="993" class="input-field">
+                    </div>
+                    <input type="text" id="acc-username" placeholder="Username / email" class="input-field">
+                    <input type="password" id="acc-password" placeholder="Password" class="input-field">
+                    <input type="text" id="acc-display-name" placeholder="Display name (optional)" class="input-field">
+                    <div class="flex gap-2 pt-1">
+                        <button id="btn-save-account" class="btn-primary text-xs">Save Account</button>
+                        <button id="btn-cancel-account" class="btn-ghost text-xs">Cancel</button>
+                    </div>
+                    <div id="add-account-error" class="hidden text-xs text-warn mt-2 font-mono"></div>
+                </div>
+
+                <!-- Account List -->
+                <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule">
+                    <div class="px-4 py-8 text-center text-sm text-mid">Loading accounts...</div>
+                </div>
+            </section>
+
+            <!-- Send Form -->
+            <section id="send-section">
+                <h2 class="section-label mb-4">Compose</h2>
+                <div class="border border-rule bg-white">
+                    <div class="p-4 space-y-3">
+                        <select id="send-account" class="input-field">
+                            <option value="">Select account...</option>
+                        </select>
+                        <input type="email" id="send-to" placeholder="To" class="input-field">
+                        <input type="text" id="send-subject" placeholder="Subject" class="input-field">
+
+                        <!-- Format Toggle -->
+                        <div class="flex items-center gap-2 pt-1">
+                            <span class="text-xs text-mid font-mono">Format:</span>
+                            <button id="toggle-text" class="px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper transition-colors">Text</button>
+                            <button id="toggle-html" class="px-2 py-0.5 text-xs font-mono border border-rule text-mid hover:border-ink hover:text-ink transition-colors">HTML</button>
+                        </div>
+
+                        <textarea id="send-body" placeholder="Message body" rows="6" class="input-field font-mono text-xs leading-relaxed resize-y"></textarea>
+                    </div>
+                    <div class="border-t border-rule px-4 py-3 flex items-center justify-between bg-neutral-50/50">
+                        <div id="send-status" class="text-xs font-mono text-mid"></div>
+                        <button id="btn-send" class="btn-primary text-xs">Send</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Messages Log -->
+        <section id="messages-section">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="section-label">Message Log</h2>
+                <span id="msg-count" class="text-xs text-mid font-mono"></span>
+            </div>
+            <div class="border border-rule">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-rule bg-neutral-50/50">
+                            <th class="text-left px-4 py-2.5 section-label font-medium">Status</th>
+                            <th class="text-left px-4 py-2.5 section-label font-medium">To</th>
+                            <th class="text-left px-4 py-2.5 section-label font-medium">Subject</th>
+                            <th class="text-left px-4 py-2.5 section-label font-medium hidden md:table-cell">From</th>
+                            <th class="text-right px-4 py-2.5 section-label font-medium">Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="messages-body" class="divide-y divide-rule">
+                        <tr><td colspan="5" class="px-4 py-8 text-center text-mid">Loading messages...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer class="border-t border-rule mt-16">
+        <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between text-xs text-mid font-mono">
+            <span>Envelope v0.2.0</span>
+            <a href="/docs" class="hover:text-ink transition-colors">API Docs</a>
+        </div>
+    </footer>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>
