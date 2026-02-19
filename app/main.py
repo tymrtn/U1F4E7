@@ -12,9 +12,11 @@ import os
 from typing import Optional
 
 import aiosmtplib
+from fastapi.responses import JSONResponse
 
 from app.db import init_db
 from app.credentials import store as credential_store
+from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 
 load_dotenv()
 
@@ -43,9 +45,10 @@ templates = Jinja2Templates(directory="templates")
 # --- Models ---
 
 class SendEmail(BaseModel):
-    from_email: str
+    account_id: str
     to: str
     subject: str
+    from_email: Optional[str] = None
     html: Optional[str] = None
     text: Optional[str] = None
 
@@ -77,18 +80,41 @@ async def dashboard(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-# --- Send (stub until story-001) ---
+# --- Send ---
 
 @app.post("/send")
 async def send_email(data: SendEmail):
+    account = await credential_store.get_account_with_credentials(data.account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    from_addr = data.from_email or account["username"]
+
+    msg = build_mime_message(
+        from_addr=from_addr,
+        to_addr=data.to,
+        subject=data.subject,
+        text=data.text,
+        html=data.html,
+        display_name=account.get("display_name"),
+    )
+
+    try:
+        message_id = await send_message(account, msg)
+    except SmtpSendError as e:
+        return JSONResponse(
+            status_code=502,
+            content={"error": e.message, "error_type": e.error_type},
+        )
+
     return {
-        "status": "pending",
-        "message": "SMTP transport not yet configured",
+        "status": "sent",
+        "message_id": message_id,
         "envelope": {
-            "from": data.from_email,
+            "from": from_addr,
             "to": data.to,
             "subject": data.subject,
-        }
+        },
     }
 
 

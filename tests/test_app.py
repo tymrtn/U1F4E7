@@ -17,24 +17,65 @@ async def test_openapi_schema_accessible(client):
 
 
 @pytest.mark.asyncio
-async def test_send_stub_returns_pending(client):
+async def test_send_requires_account_id(client):
     resp = await client.post("/send", json={
-        "from_email": "agent@example.com",
         "to": "human@example.com",
         "subject": "Test",
         "text": "Hello",
     })
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "pending"
-    assert body["envelope"]["from"] == "agent@example.com"
-    assert body["envelope"]["to"] == "human@example.com"
-    assert body["envelope"]["subject"] == "Test"
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_send_unknown_account_returns_404(client):
+    resp = await client.post("/send", json={
+        "account_id": "nonexistent",
+        "to": "human@example.com",
+        "subject": "Test",
+        "text": "Hello",
+    })
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_send_missing_required_fields(client):
     resp = await client.post("/send", json={
-        "from_email": "a@b.com",
+        "account_id": "some-id",
     })
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_account_crud(client):
+    # Create
+    resp = await client.post("/accounts", json={
+        "name": "Test Account",
+        "host": "mail.example.com",
+        "username": "test@example.com",
+        "password": "secret",
+    })
+    assert resp.status_code == 200
+    account = resp.json()
+    assert account["name"] == "Test Account"
+    account_id = account["id"]
+
+    # List
+    resp = await client.get("/accounts")
+    assert resp.status_code == 200
+    accounts = resp.json()
+    assert len(accounts) >= 1
+    assert any(a["id"] == account_id for a in accounts)
+
+    # Get
+    resp = await client.get(f"/accounts/{account_id}")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == account_id
+
+    # Delete
+    resp = await client.delete(f"/accounts/{account_id}")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+
+    # Verify deleted
+    resp = await client.get(f"/accounts/{account_id}")
+    assert resp.status_code == 404
