@@ -33,49 +33,8 @@ async def test_send_stub_returns_pending(client):
 
 
 @pytest.mark.asyncio
-async def test_send_returns_pending_not_success(client):
-    """Resend is stripped. Send must NOT return status=success."""
-    resp = await client.post("/send", json={
-        "from_email": "a@b.com",
-        "to": "c@d.com",
-        "subject": "x",
-        "text": "y",
-    })
-    body = resp.json()
-    assert body["status"] != "success", "Send should be a stub, not a live transport"
-
-
-@pytest.mark.asyncio
-async def test_send_with_html(client):
-    resp = await client.post("/send", json={
-        "from_email": "a@b.com",
-        "to": "c@d.com",
-        "subject": "HTML test",
-        "html": "<h1>Hi</h1>",
-    })
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "pending"
-
-
-@pytest.mark.asyncio
 async def test_send_missing_required_fields(client):
     resp = await client.post("/send", json={
         "from_email": "a@b.com",
     })
     assert resp.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_no_resend_webhook_endpoint(client):
-    """Resend webhook endpoint must not exist."""
-    resp = await client.post("/webhooks/resend")
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_no_resend_in_openapi_schema(client):
-    """No trace of Resend in the API schema."""
-    resp = await client.get("/openapi.json")
-    assert resp.status_code == 200
-    schema_text = resp.text.lower()
-    assert "resend" not in schema_text

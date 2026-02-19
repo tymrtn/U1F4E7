@@ -1,4 +1,4 @@
-# Envelope Email (U1F4E7)
+# Envelope Email
 
 Turn any IMAP/SMTP email account into a programmable API. Built for agents.
 
@@ -12,15 +12,21 @@ See [VISION.md](VISION.md) for product direction and [ARCHITECTURE.md](ARCHITECT
 
 ## Current State
 
-FastAPI skeleton with a `/send` stub endpoint, dashboard, and test suite. Transport layer (SMTP/IMAP) is next.
+Early prototype. FastAPI skeleton with a `/send` endpoint and basic dashboard.
+
+What's next:
+- IMAP/SMTP transport (send and read via BYO mailbox credentials)
+- Credential management (encrypted at rest)
+- Inbox read and reply threading
+- Agent primitives (drafts, approvals, audit trails)
 
 ## Local Dev
 
 ```bash
-cd U1F4E7
-source ../venv/bin/activate
+cd ~/Dropbox/Code/envelope-email
+source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env  # Configure your credentials
 uvicorn app.main:app --reload
 ```
 
@@ -28,40 +34,15 @@ App: http://localhost:8000
 
 API docs: http://localhost:8000/docs
 
-## Tests
-
-```bash
-cd U1F4E7
-python -m pytest tests/ -v
-```
-
 ## Project Structure
 
 ```
-U1F4E7/
+envelope-email/
   app/
-    main.py              # FastAPI application
-  static/                # CSS/JS assets
-  templates/             # Jinja2 HTML templates
-  tests/                 # Test suite (pytest + httpx)
-  agents/                # Agentic team coordination
-    backlog/             # Story queue
-    active/              # In-flight work
-    handoffs/            # Cross-agent communication
-    standups/            # Daily standups
-    PROTOCOL.md          # Team protocol
-  CLAUDE.md              # Agent instructions
-  VISION.md              # Product vision
-  ARCHITECTURE.md        # System architecture
+    main.py          # FastAPI application
+  static/            # CSS/JS assets
+  templates/         # Jinja2 HTML templates
+  VISION.md          # Product vision
+  ARCHITECTURE.md    # System architecture
+  plan.md            # Development plan
 ```
-
-## License
-
-Envelope Email is licensed under the Functional Source License, Version 1.1,
-Apache License v2.0 Future License (FSL-1.1-ALv2).
-
-You can use, modify, and self-host Envelope freely. You cannot offer it as a
-competing commercial service. Each version converts to Apache 2.0 two years
-after release.
-
-For commercial platform integration, contact ty@tmrtn.com.

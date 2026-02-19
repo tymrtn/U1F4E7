@@ -1,3 +1,4 @@
+aiosqlite==0.21.0
 aiosmtplib==5.1.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -5,6 +6,7 @@ anyio==4.12.1
 certifi==2026.1.4
 charset-normalizer==3.4.4
 click==8.3.1
+cryptography==44.0.3
 fastapi==0.129.0
 h11==0.16.0
 httpcore==1.0.9

@@ -10,13 +10,13 @@ Plug in your existing mailbox credentials (Gmail, Outlook, Migadu, Fastmail, any
 
 Agentic engineering teams building AI systems that need to send and receive email.
 
-These teams know that paid sending services are commodity SMTP wrappers charging per-message fees for infrastructure that costs nearly nothing to operate. They don't need another sending service. They need their existing mailbox exposed as an API their agents can use.
+These teams know that Mailgun, SendGrid, and Resend are commodity SMTP wrappers charging per-message fees for infrastructure that costs nearly nothing to operate. They don't need another sending service. They need their existing mailbox exposed as an API their agents can use.
 
 ## The Problem
 
 Email is the last integration agents can't own. Every other channel (Slack, Discord, SMS) has clean programmatic access. Email still requires either:
 
-1. A paid sending service that forces a new domain, DNS records, and per-message billing for what amounts to an SMTP relay
+1. A paid sending service (Mailgun, Resend) that forces a new domain, DNS records, and per-message billing for what amounts to an SMTP relay
 2. Raw IMAP/SMTP library code that every team rewrites from scratch, with no standard patterns for threading, drafts, or audit trails
 
 Neither path gives agents what they actually need: draft previews before sending, reply-to threading that preserves conversation context, approval gates for human oversight, signature handling, and accountability logs.
@@ -34,9 +34,9 @@ Envelope sits between your existing mailbox and your agents. Two layers:
 - **Signature management**: Per-account, per-context signature handling
 - **Audit trails**: Full provenance log of every action taken on every message
 
-## Why Not Just Use a Sending Service?
+## Why Not Just Use Resend/Mailgun?
 
-Paid sending services solve a different problem: bulk transactional email from a dedicated sending domain. They're the right tool for SaaS notification pipelines.
+Resend and Mailgun solve a different problem: bulk transactional email from a dedicated sending domain. They're the right tool for SaaS notification pipelines.
 
 Envelope solves the agent problem: programmatic access to real mailboxes that already exist, with primitives designed for autonomous workflows. Your agent sends email *as you*, from *your* account, with *your* approval.
 
