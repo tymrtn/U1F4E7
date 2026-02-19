@@ -1,32 +1,56 @@
-# Envelope Email MVP
+# Envelope Email (U1F4E7)
 
-Transactional Email API like Mailgun.
+Turn any IMAP/SMTP email account into a programmable API. Built for agents.
+
+## What This Is
+
+Envelope gives your AI agents a REST API to send, read, and manage email from your existing mailbox. No new domain, no DNS config, no sending service fees. Plug in your Gmail, Outlook, Migadu, or Fastmail credentials and go.
+
+On top of the mailbox API, Envelope adds agent-native primitives: draft previews, approval gates, reply threading, signature management, and full audit trails.
+
+See [VISION.md](VISION.md) for product direction and [ARCHITECTURE.md](ARCHITECTURE.md) for system design.
+
+## Current State
+
+FastAPI skeleton with a `/send` stub endpoint, dashboard, and test suite. Transport layer (SMTP/IMAP) is next.
 
 ## Local Dev
 
 ```bash
-cd ~/Dropbox/Code/envelope-email
-source venv/bin/activate
+cd U1F4E7
+source ../venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # Add your RESEND_API_KEY
+cp .env.example .env
 uvicorn app.main:app --reload
 ```
 
-Visit http://localhost:8000
+App: http://localhost:8000
 
-API Docs: http://localhost:8000/docs
+API docs: http://localhost:8000/docs
 
-## Deploy Railway
+## Tests
 
-1. `git add . && git commit -m "MVP" && git push`
-2. Connect repo to Railway.app new project.
-3. Add RESEND_API_KEY env var.
+```bash
+cd U1F4E7
+python -m pytest tests/ -v
+```
 
-## Features
+## Project Structure
 
-- POST /send: Send email via Resend
-- GET /: Dashboard
-- POST /webhooks/resend: Events (todo: log)
-- SMTP/IMAP backend planned (aiosmtplib)
-
-Aposema licensed.
+```
+U1F4E7/
+  app/
+    main.py              # FastAPI application
+  static/                # CSS/JS assets
+  templates/             # Jinja2 HTML templates
+  tests/                 # Test suite (pytest + httpx)
+  agents/                # Agentic team coordination
+    backlog/             # Story queue
+    active/              # In-flight work
+    handoffs/            # Cross-agent communication
+    standups/            # Daily standups
+    PROTOCOL.md          # Team protocol
+  CLAUDE.md              # Agent instructions
+  VISION.md              # Product vision
+  ARCHITECTURE.md        # System architecture
+```
