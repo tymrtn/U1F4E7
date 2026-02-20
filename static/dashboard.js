@@ -210,7 +210,7 @@
     });
   }
 
-  async function runDiscover() {
+  function runDiscover() {
     var email = document.getElementById('acc-username').value.trim();
     var statusEl = document.getElementById('discover-status');
     var discoverBtn = document.getElementById('btn-discover');
@@ -224,39 +224,66 @@
 
     discoverBtn.textContent = 'Discovering...';
     discoverBtn.disabled = true;
-    statusEl.textContent = 'Probing DNS records and mail servers...';
+    statusEl.textContent = 'Starting discovery...';
     statusEl.className = 'text-xs font-mono mt-1 text-mid';
     statusEl.classList.remove('hidden');
 
-    try {
-      var data = await api('/accounts/discover?email=' + encodeURIComponent(email));
+    var source = new EventSource('/accounts/discover/stream?email=' + encodeURIComponent(email));
 
-      var found = [];
-      if (data.smtp_host) {
-        document.getElementById('acc-smtp-host').value = data.smtp_host;
-        document.getElementById('acc-smtp-port').value = data.smtp_port;
-        found.push('SMTP: ' + data.smtp_host + ':' + data.smtp_port + ' (' + data.smtp_source + ')');
-      }
-      if (data.imap_host) {
-        document.getElementById('acc-imap-host').value = data.imap_host;
-        document.getElementById('acc-imap-port').value = data.imap_port;
-        found.push('IMAP: ' + data.imap_host + ':' + data.imap_port + ' (' + data.imap_source + ')');
-      }
+    source.addEventListener('phase', function (e) {
+      try {
+        var d = JSON.parse(e.data);
+        statusEl.textContent = d.message || ('Phase: ' + d.name);
+        statusEl.className = 'text-xs font-mono mt-1 text-mid';
+      } catch (err) { /* ignore parse errors */ }
+    });
 
-      if (found.length > 0) {
-        statusEl.innerHTML = found.join('<br>');
-        statusEl.className = 'text-xs font-mono mt-1 text-accent';
-      } else {
-        statusEl.textContent = 'No servers found. Enter settings manually.';
-        statusEl.className = 'text-xs font-mono mt-1 text-warn';
-      }
-    } catch (e) {
-      statusEl.textContent = 'Discovery failed: ' + e.message;
-      statusEl.className = 'text-xs font-mono mt-1 text-warn';
-    } finally {
+    source.addEventListener('complete', function (e) {
+      source.close();
       discoverBtn.textContent = 'Discover';
       discoverBtn.disabled = false;
-    }
+
+      try {
+        var data = JSON.parse(e.data);
+
+        if (data.error) {
+          statusEl.textContent = data.error;
+          statusEl.className = 'text-xs font-mono mt-1 text-warn';
+          return;
+        }
+
+        var found = [];
+        if (data.smtp_host) {
+          document.getElementById('acc-smtp-host').value = data.smtp_host;
+          document.getElementById('acc-smtp-port').value = data.smtp_port;
+          found.push('SMTP: ' + data.smtp_host + ':' + data.smtp_port + ' (' + data.smtp_source + ')');
+        }
+        if (data.imap_host) {
+          document.getElementById('acc-imap-host').value = data.imap_host;
+          document.getElementById('acc-imap-port').value = data.imap_port;
+          found.push('IMAP: ' + data.imap_host + ':' + data.imap_port + ' (' + data.imap_source + ')');
+        }
+
+        if (found.length > 0) {
+          statusEl.innerHTML = found.join('<br>');
+          statusEl.className = 'text-xs font-mono mt-1 text-accent';
+        } else {
+          statusEl.textContent = 'No servers found. Enter settings manually.';
+          statusEl.className = 'text-xs font-mono mt-1 text-warn';
+        }
+      } catch (err) {
+        statusEl.textContent = 'Discovery failed: ' + err.message;
+        statusEl.className = 'text-xs font-mono mt-1 text-warn';
+      }
+    });
+
+    source.addEventListener('error', function () {
+      source.close();
+      discoverBtn.textContent = 'Discover';
+      discoverBtn.disabled = false;
+      statusEl.textContent = 'Discovery connection lost.';
+      statusEl.className = 'text-xs font-mono mt-1 text-warn';
+    });
   }
 
   function clearAddForm() {

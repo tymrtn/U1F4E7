@@ -11,14 +11,16 @@ from dotenv import load_dotenv
 import os
 from typing import Optional
 
-import aiosmtplib
 from fastapi.responses import JSONResponse
+from starlette.responses import StreamingResponse
 
-from app.db import init_db
+from app.db import init_db, close_db
 from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
+from app.transport.pool import SmtpConnectionPool
+from app.transport.worker import SendWorker
 from app import messages
-from app.discovery import discover
+from app.discovery import discover, discover_stream
 
 load_dotenv()
 
@@ -26,7 +28,14 @@ load_dotenv()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    app.state.smtp_pool = SmtpConnectionPool()
+    app.state.smtp_pool.start_cleanup_task()
+    app.state.send_worker = SendWorker(app.state.smtp_pool)
+    await app.state.send_worker.start()
     yield
+    await app.state.send_worker.stop()
+    await app.state.smtp_pool.close_all()
+    await close_db()
 
 app = FastAPI(title="Envelope Email API", version="0.2.0", lifespan=lifespan)
 
@@ -53,6 +62,7 @@ class SendEmail(BaseModel):
     from_email: Optional[str] = None
     html: Optional[str] = None
     text: Optional[str] = None
+    wait: bool = True
 
 
 class CreateAccount(BaseModel):
@@ -85,21 +95,38 @@ async def dashboard(request: Request):
 # --- Send ---
 
 @app.post("/send")
-async def send_email(data: SendEmail):
+async def send_email(request: Request, data: SendEmail):
     account = await credential_store.get_account_with_credentials(data.account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
     from_addr = data.from_email or account["username"]
+    pool = request.app.state.smtp_pool
 
-    # Create tracking record
+    # Create tracking record (store body for async sends)
     record = await messages.create_message(
         account_id=data.account_id,
         from_addr=from_addr,
         to_addr=data.to,
         subject=data.subject,
+        text_content=data.text,
+        html_content=data.html,
     )
 
+    # Async mode: queue and return immediately
+    if not data.wait:
+        request.app.state.send_worker.notify()
+        return {
+            "status": "queued",
+            "id": record["id"],
+            "envelope": {
+                "from": from_addr,
+                "to": data.to,
+                "subject": data.subject,
+            },
+        }
+
+    # Sync mode (default): send now and wait for result
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=data.to,
@@ -110,7 +137,7 @@ async def send_email(data: SendEmail):
     )
 
     try:
-        smtp_message_id = await send_message(account, msg)
+        smtp_message_id = await send_message(account, msg, pool=pool)
     except SmtpSendError as e:
         await messages.mark_failed(record["id"], e.message)
         return JSONResponse(
@@ -157,6 +184,15 @@ async def get_stats():
 @app.get("/accounts/discover")
 async def discover_settings(email: str):
     return await discover(email)
+
+
+@app.get("/accounts/discover/stream")
+async def discover_settings_stream(email: str):
+    return StreamingResponse(
+        discover_stream(email),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # --- Accounts ---
@@ -220,35 +256,27 @@ async def get_account(account_id: str):
 
 
 @app.delete("/accounts/{account_id}")
-async def delete_account(account_id: str):
+async def delete_account(request: Request, account_id: str):
     deleted = await credential_store.delete_account(account_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Account not found")
+    request.app.state.smtp_pool.invalidate_account(account_id)
     return {"status": "deleted", "id": account_id}
 
 
 @app.post("/accounts/{account_id}/verify")
-async def verify_account(account_id: str):
+async def verify_account(request: Request, account_id: str):
     account = await credential_store.get_account_with_credentials(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
     results = {"smtp": None, "imap": None}
+    pool = request.app.state.smtp_pool
 
-    # Verify SMTP
+    # Verify SMTP via pool (acquire validates auth)
     try:
-        smtp = aiosmtplib.SMTP(
-            hostname=account["smtp_host"],
-            port=account["smtp_port"],
-            use_tls=account["smtp_port"] == 465,
-            start_tls=account["smtp_port"] != 465,
-        )
-        await smtp.connect()
-        await smtp.login(
-            account["effective_smtp_username"],
-            account["effective_smtp_password"],
-        )
-        await smtp.quit()
+        async with pool.acquire(account) as client:
+            await client.noop()
         results["smtp"] = {"status": "ok"}
     except Exception as e:
         results["smtp"] = {"status": "error", "message": str(e)}

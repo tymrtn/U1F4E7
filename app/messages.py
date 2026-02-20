@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Tyler Martin
+# Licensed under FSL-1.1-ALv2 (see LICENSE)
+
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,21 +14,22 @@ async def create_message(
     to_addr: str,
     subject: Optional[str] = None,
     direction: str = "outbound",
+    text_content: Optional[str] = None,
+    html_content: Optional[str] = None,
 ) -> dict:
     msg_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
     db = await get_db()
-    try:
-        await db.execute(
-            """INSERT INTO messages
-            (id, account_id, direction, from_addr, to_addr, subject, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)""",
-            (msg_id, account_id, direction, from_addr, to_addr, subject, now),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await db.execute(
+        """INSERT INTO messages
+        (id, account_id, direction, from_addr, to_addr, subject, status, created_at,
+         text_content, html_content)
+        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+        (msg_id, account_id, direction, from_addr, to_addr, subject, now,
+         text_content, html_content),
+    )
+    await db.commit()
 
     return {
         "id": msg_id,
@@ -42,83 +46,118 @@ async def create_message(
 async def mark_sent(msg_id: str, message_id: str):
     now = datetime.now(timezone.utc).isoformat()
     db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE messages SET status = 'sent', message_id = ?, sent_at = ? WHERE id = ?",
-            (message_id, now, msg_id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await db.execute(
+        "UPDATE messages SET status = 'sent', message_id = ?, sent_at = ? WHERE id = ?",
+        (message_id, now, msg_id),
+    )
+    await db.commit()
 
 
 async def mark_failed(msg_id: str, error: str):
     db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE messages SET status = 'failed', error = ? WHERE id = ?",
-            (error, msg_id),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await db.execute(
+        "UPDATE messages SET status = 'failed', error = ? WHERE id = ?",
+        (error, msg_id),
+    )
+    await db.commit()
+
+
+async def mark_retry(msg_id: str, error: str, next_retry_at: str):
+    db = await get_db()
+    await db.execute(
+        """UPDATE messages
+           SET status = 'retry', error = ?, retry_count = retry_count + 1,
+               next_retry_at = ?
+           WHERE id = ?""",
+        (error, next_retry_at, msg_id),
+    )
+    await db.commit()
+
+
+async def get_queued_messages(limit: int = 10) -> list[dict]:
+    db = await get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = await db.execute(
+        """SELECT id, account_id, from_addr, to_addr, subject,
+                  text_content, html_content, retry_count
+           FROM messages
+           WHERE status = 'queued'
+              OR (status = 'retry' AND next_retry_at <= ?)
+           ORDER BY created_at ASC
+           LIMIT ?""",
+        (now, limit),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def claim_message(msg_id: str) -> bool:
+    db = await get_db()
+    cursor = await db.execute(
+        """UPDATE messages SET status = 'sending'
+           WHERE id = ? AND status IN ('queued', 'retry')""",
+        (msg_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def recover_orphans():
+    db = await get_db()
+    await db.execute(
+        "UPDATE messages SET status = 'queued' WHERE status = 'sending'"
+    )
+    await db.commit()
 
 
 async def list_messages(limit: int = 50, offset: int = 0) -> list[dict]:
     db = await get_db()
-    try:
-        cursor = await db.execute(
-            """SELECT id, account_id, message_id, direction, from_addr, to_addr,
-                      subject, status, error, created_at, sent_at
-               FROM messages ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-            (limit, offset),
-        )
-        rows = await cursor.fetchall()
-        return [_row_to_dict(row) for row in rows]
-    finally:
-        await db.close()
+    cursor = await db.execute(
+        """SELECT id, account_id, message_id, direction, from_addr, to_addr,
+                  subject, status, error, created_at, sent_at, retry_count,
+                  next_retry_at
+           FROM messages ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (limit, offset),
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_dict(row) for row in rows]
 
 
 async def get_message(msg_id: str) -> Optional[dict]:
     db = await get_db()
-    try:
-        cursor = await db.execute(
-            """SELECT id, account_id, message_id, direction, from_addr, to_addr,
-                      subject, status, error, created_at, sent_at
-               FROM messages WHERE id = ?""",
-            (msg_id,),
-        )
-        row = await cursor.fetchone()
-        return _row_to_dict(row) if row else None
-    finally:
-        await db.close()
+    cursor = await db.execute(
+        """SELECT id, account_id, message_id, direction, from_addr, to_addr,
+                  subject, status, error, created_at, sent_at, retry_count,
+                  next_retry_at
+           FROM messages WHERE id = ?""",
+        (msg_id,),
+    )
+    row = await cursor.fetchone()
+    return _row_to_dict(row) if row else None
 
 
 async def get_stats() -> dict:
     db = await get_db()
-    try:
-        cursor = await db.execute(
-            """SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued
-               FROM messages WHERE direction = 'outbound'"""
-        )
-        row = await cursor.fetchone()
-        total = row["total"] or 0
-        sent = row["sent"] or 0
-        failed = row["failed"] or 0
-        queued = row["queued"] or 0
-        return {
-            "total": total,
-            "sent": sent,
-            "failed": failed,
-            "queued": queued,
-            "success_rate": round(sent / total * 100, 1) if total > 0 else 0,
-        }
-    finally:
-        await db.close()
+    cursor = await db.execute(
+        """SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN status IN ('queued', 'retry', 'sending') THEN 1 ELSE 0 END) as queued
+           FROM messages WHERE direction = 'outbound'"""
+    )
+    row = await cursor.fetchone()
+    total = row["total"] or 0
+    sent = row["sent"] or 0
+    failed = row["failed"] or 0
+    queued = row["queued"] or 0
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "queued": queued,
+        "success_rate": round(sent / total * 100, 1) if total > 0 else 0,
+    }
 
 
 def _row_to_dict(row) -> dict:
@@ -134,4 +173,6 @@ def _row_to_dict(row) -> dict:
         "error": row["error"],
         "created_at": row["created_at"],
         "sent_at": row["sent_at"],
+        "retry_count": row["retry_count"],
+        "next_retry_at": row["next_retry_at"],
     }

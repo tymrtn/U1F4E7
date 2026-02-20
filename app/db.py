@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Tyler Martin
+# Licensed under FSL-1.1-ALv2 (see LICENSE)
+
 import os
 import aiosqlite
 
@@ -35,22 +38,49 @@ CREATE TABLE IF NOT EXISTS messages (
     error TEXT,
     created_at TEXT NOT NULL,
     sent_at TEXT,
+    text_content TEXT,
+    html_content TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
     FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
 """
 
+MIGRATIONS = [
+    "ALTER TABLE messages ADD COLUMN text_content TEXT",
+    "ALTER TABLE messages ADD COLUMN html_content TEXT",
+    "ALTER TABLE messages ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN next_retry_at TEXT",
+]
+
+_connection: aiosqlite.Connection | None = None
+
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    return db
+    global _connection
+    if _connection is None:
+        _connection = await aiosqlite.connect(DB_PATH)
+        _connection.row_factory = aiosqlite.Row
+        await _connection.execute("PRAGMA journal_mode=WAL")
+        await _connection.execute("PRAGMA busy_timeout=5000")
+        await _connection.execute("PRAGMA foreign_keys=ON")
+    return _connection
+
+
+async def close_db():
+    global _connection
+    if _connection is not None:
+        await _connection.close()
+        _connection = None
 
 
 async def init_db():
     db = await get_db()
-    try:
-        await db.executescript(SCHEMA)
-        await db.commit()
-    finally:
-        await db.close()
+    await db.executescript(SCHEMA)
+    # Run migrations for existing databases (ALTER TABLE is idempotent-safe)
+    for migration in MIGRATIONS:
+        try:
+            await db.execute(migration)
+        except Exception:
+            pass  # Column already exists
+    await db.commit()

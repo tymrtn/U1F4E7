@@ -1,5 +1,6 @@
 import asyncio
-from typing import Optional
+import json
+from typing import AsyncGenerator, Optional
 from xml.etree import ElementTree
 
 import dns.resolver
@@ -254,3 +255,89 @@ async def _probe_best(
     successes.sort(key=lambda x: x[2])
     best = successes[0]
     return (best[0], best[1], best[3])
+
+
+# ── SSE streaming discovery ──
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def discover_stream(email: str) -> AsyncGenerator[str, None]:
+    if "@" not in email:
+        yield _sse_event("complete", {"error": "Invalid email address"})
+        return
+
+    domain = email.split("@", 1)[1].lower()
+
+    smtp_candidates = []
+    imap_candidates = []
+    mx_bases = set()
+
+    # Phase: DNS (SRV + MX)
+    yield _sse_event("phase", {"name": "dns", "message": "Querying DNS records..."})
+    dns_results = await asyncio.gather(
+        _discover_srv(domain),
+        _discover_mx(domain),
+        return_exceptions=True,
+    )
+    for r in dns_results:
+        if isinstance(r, Exception):
+            continue
+        smtp_candidates.extend(r.get("smtp", []))
+        imap_candidates.extend(r.get("imap", []))
+        mx_bases.update(r.get("mx_bases", []))
+
+    # Phase: Autoconfig
+    yield _sse_event("phase", {"name": "autoconfig", "message": "Checking autoconfig..."})
+    autoconfig_result = await _discover_autoconfig(domain)
+    smtp_candidates.extend(autoconfig_result.get("smtp", []))
+    imap_candidates.extend(autoconfig_result.get("imap", []))
+
+    # Phase: MX alias expansion
+    alias_domains = set()
+    for mx_base in mx_bases:
+        alias_domains.add(mx_base)
+        for alias in MX_ALIASES.get(mx_base, []):
+            alias_domains.add(alias)
+    alias_domains.discard(domain)
+
+    if alias_domains:
+        yield _sse_event("phase", {"name": "aliases", "message": f"Trying provider aliases: {', '.join(alias_domains)}"})
+        alias_results = await asyncio.gather(
+            *[_discover_autoconfig(d) for d in alias_domains],
+            return_exceptions=True,
+        )
+        for r in alias_results:
+            if isinstance(r, Exception):
+                continue
+            smtp_candidates.extend(r.get("smtp", []))
+            imap_candidates.extend(r.get("imap", []))
+
+    for alias in alias_domains:
+        for port in [465, 587]:
+            smtp_candidates.append((f"smtp.{alias}", port, 2, "mx"))
+        imap_candidates.append((f"imap.{alias}", 993, 2, "mx"))
+
+    common = _common_candidates(domain)
+    smtp_candidates.extend(common["smtp"])
+    imap_candidates.extend(common["imap"])
+
+    # Phase: Probing
+    yield _sse_event("phase", {"name": "probing", "message": "Probing mail servers..."})
+    smtp_result, imap_result = await asyncio.gather(
+        _probe_best(smtp_candidates),
+        _probe_best(imap_candidates),
+    )
+
+    response = {"domain": domain}
+    if smtp_result:
+        response["smtp_host"] = smtp_result[0]
+        response["smtp_port"] = smtp_result[1]
+        response["smtp_source"] = smtp_result[2]
+    if imap_result:
+        response["imap_host"] = imap_result[0]
+        response["imap_port"] = imap_result[1]
+        response["imap_source"] = imap_result[2]
+
+    yield _sse_event("complete", response)

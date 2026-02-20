@@ -47,26 +47,30 @@ def build_mime_message(
     return msg
 
 
-async def send_message(account: dict, msg: EmailMessage) -> str:
-    """Send an EmailMessage via SMTP. Returns the SMTP message-id on success."""
-    port = account["smtp_port"]
-
+async def send_message(account: dict, msg: EmailMessage, pool=None) -> str:
+    """Send an EmailMessage via SMTP. Uses pool if provided, otherwise direct."""
     try:
-        smtp = aiosmtplib.SMTP(
-            hostname=account["smtp_host"],
-            port=port,
-            use_tls=(port == 465),
-            start_tls=(port != 465),
-            timeout=30,
-        )
-        await smtp.connect()
-        await smtp.login(
-            account["effective_smtp_username"],
-            account["effective_smtp_password"],
-        )
-        response = await smtp.send_message(msg)
-        await smtp.quit()
-        return msg["Message-ID"] or response[1]
+        if pool is not None:
+            async with pool.acquire(account) as client:
+                response = await client.send_message(msg)
+                return msg["Message-ID"] or response[1]
+        else:
+            port = account["smtp_port"]
+            smtp = aiosmtplib.SMTP(
+                hostname=account["smtp_host"],
+                port=port,
+                use_tls=(port == 465),
+                start_tls=(port != 465),
+                timeout=30,
+            )
+            await smtp.connect()
+            await smtp.login(
+                account["effective_smtp_username"],
+                account["effective_smtp_password"],
+            )
+            response = await smtp.send_message(msg)
+            await smtp.quit()
+            return msg["Message-ID"] or response[1]
 
     except SMTPAuthenticationError as e:
         raise SmtpSendError("auth_error", str(e))
