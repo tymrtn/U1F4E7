@@ -10,24 +10,42 @@ REST API (FastAPI)
     |
     +---> Credential Store (encrypted, SQLite)
     |
-    +---> IMAP/SMTP Transport
+    +---> SMTP Transport
     |         |
-    |         +---> Send (SMTP via aiosmtplib)
-    |         +---> Read (IMAP via aioimaplib)
-    |         +---> Track (IMAP folder polling)
+    |         +---> Connection Pool (per-account, semaphore-limited)
+    |         +---> Send Worker (background queue, exponential backoff retry)
+    |         +---> Direct Send (synchronous, wait=true)
     |
-    +---> Agent Primitives
+    +---> Mail Server Discovery
     |         |
-    |         +---> Draft Preview (compose + hold)
-    |         +---> Approval Gate (human review before send)
-    |         +---> Reply Threading (In-Reply-To / References)
-    |         +---> Signature Manager (per-account templates)
-    |         +---> Audit Log (every action, every message)
+    |         +---> DNS (SRV + MX records)
+    |         +---> Autoconfig XML (Mozilla Thunderbird DB)
+    |         +---> Provider alias expansion (Gmail, Outlook)
+    |         +---> Port probing (465/587/993)
+    |         +---> SSE streaming endpoint for real-time UI
     |
-    +---> Webhook Emulation
-              |
-              +---> Delivery status via IMAP polling
-              +---> Inbound message notifications
+    +---> Message Tracking (SQLite)
+    |         |
+    |         +---> Status: queued → sending → sent/failed/retry
+    |         +---> Stats dashboard (total, sent, failed, success rate)
+    |
+    +---> IMAP Read Transport
+    |         |
+    |         +---> Search (IMAP SEARCH, paginated)
+    |         +---> Fetch (full RFC822 parse, attachments)
+    |         +---> Folders (LIST command)
+    |         +---> [Future] Track (IMAP folder polling)
+    |
+    +---> Drafts Primitive
+    |         |
+    |         +---> CRUD (SQLite-backed, status: draft → sent | discarded)
+    |         +---> Send (draft → SMTP pipeline → message tracking)
+    |         +---> Metadata (JSON field for agent context)
+    |
+    +---> [Future] Agent Primitives
+              +---> Approval Gate (human review before send)
+              +---> Reply Threading (In-Reply-To / References)
+              +---> Audit Log (every action, every message)
 ```
 
 ## Components
@@ -36,14 +54,25 @@ REST API (FastAPI)
 
 The public interface. REST endpoints for all operations.
 
-- `POST /send` - Send email (or create draft for approval)
-- `GET /inbox` - Read messages from connected account
-- `GET /message/{id}` - Get specific message with full thread
-- `POST /draft` - Create draft for review
-- `POST /approve/{id}` - Approve a held draft for sending
-- `GET /track/{id}` - Delivery and read status
+- `POST /send` - Send email (sync with `wait: true`, async with `wait: false`)
+- `GET /messages` - List sent messages with status
+- `GET /messages/{id}` - Get message details
+- `GET /stats` - Send stats (total, sent, failed, success rate)
 - `POST /accounts` - Register IMAP/SMTP credentials
-- `GET /audit` - Query the audit log
+- `GET /accounts` - List accounts
+- `DELETE /accounts/{id}` - Remove account (invalidates connection pool)
+- `POST /accounts/{id}/verify` - Test SMTP connection via pool
+- `GET /accounts/discover?email=` - Auto-discover mail server settings
+- `GET /accounts/discover/stream?email=` - SSE progressive discovery
+- `POST /accounts/{id}/drafts` - Create draft
+- `GET /accounts/{id}/drafts` - List drafts (limit/offset)
+- `GET /accounts/{id}/drafts/{draft_id}` - Get draft
+- `PUT /accounts/{id}/drafts/{draft_id}` - Update draft (409 if not draft status)
+- `POST /accounts/{id}/drafts/{draft_id}/send` - Send draft via SMTP pipeline
+- `DELETE /accounts/{id}/drafts/{draft_id}` - Discard draft
+- `GET /accounts/{id}/inbox` - Paginated inbox (folder, limit, offset, q params)
+- `GET /accounts/{id}/inbox/{uid}` - Full message with attachments
+- `GET /accounts/{id}/folders` - List IMAP folders
 
 ### 2. Credential Store
 
@@ -56,43 +85,65 @@ Encrypted storage for IMAP/SMTP credentials. Each account entry holds:
 
 MVP: SQLite with encrypted credential fields. Fernet symmetric encryption, key from environment variable.
 
-### 3. IMAP/SMTP Transport
+### 3. SMTP Transport
 
-The core. Direct connections to the user's mail server.
+**Connection Pool** (`transport/pool.py`): Per-account connection pooling with configurable limits. Features:
+- Semaphore-limited concurrency (default 2 per account)
+- NOOP validation before reuse
+- Credential versioning — pool auto-invalidates when account credentials change
+- Idle timeout and max lifetime eviction
+- Background cleanup task
 
-**Send (SMTP)**: `aiosmtplib` for async SMTP. Handles STARTTLS, authentication, MIME construction, attachments.
+**Send Worker** (`transport/worker.py`): Background queue processor for async sends (`wait: false`). Features:
+- Claims messages atomically (prevents double-send)
+- Exponential backoff retry: 30s → 60s → 120s, capped at 600s
+- Max 3 retries for connection errors
+- Auth errors fail permanently (no retry)
+- Orphan recovery on startup (resets `sending` → `queued`)
+- In-flight tracking prevents duplicate processing
 
-**Read (IMAP)**: `aioimaplib` for async IMAP. Folder listing, message fetch, search, flag management.
+**Direct Send** (`transport/smtp.py`): Synchronous SMTP via `aiosmtplib`. Handles STARTTLS (587) and implicit TLS (465), MIME construction with text/HTML multipart.
 
-**Track**: IMAP-based delivery tracking. Check Sent folder for message status. Poll for bounces and replies.
+### 4. Mail Server Discovery
 
-### 4. Agent Primitives
+Auto-discovers SMTP/IMAP settings from an email address. Three data sources queried concurrently:
 
-The differentiator. Features that make email safe and useful for autonomous agents.
+1. **DNS SRV records** — `_submissions._tcp`, `_imaps._tcp`
+2. **Autoconfig XML** — Mozilla Thunderbird database + domain-specific autoconfig
+3. **MX records** — Extracts provider domain, expands aliases (e.g., google.com → gmail.com)
 
-**Draft Preview**: Agent composes a message that enters a held state. Human can review, edit, approve, or reject via API or webhook callback. Nothing sends without explicit approval (when gates are enabled).
+All candidates are port-probed in parallel. Best result by priority (SRV > autoconfig > MX > common patterns).
 
-**Approval Gate**: Configurable per-account or per-request. When enabled, `POST /send` creates a draft instead of sending. The draft must be explicitly approved via `POST /approve/{id}`.
+SSE streaming endpoint (`/accounts/discover/stream`) pushes phase updates to the dashboard in real time: dns → autoconfig → aliases → probing → complete.
 
-**Reply Threading**: Automatic `In-Reply-To` and `References` header management. When replying to a message, Envelope maintains the thread so replies appear correctly in the recipient's client.
+### 5. Persistence
 
-**Signature Manager**: Per-account signature templates. Agents don't need to know or manage signature blocks -- Envelope appends the correct signature based on the sending account.
+SQLite with WAL mode for concurrent reads. Tables:
+- `accounts` — Credentials encrypted with Fernet (key from `ENVELOPE_SECRET_KEY`)
+- `messages` — Status tracking with retry metadata (retry_count, next_retry_at)
+- `drafts` — Agent compose primitive (status: draft → sent | discarded, JSON metadata)
 
-**Audit Log**: Append-only log of every API action. Who requested what, when, what happened. Queryable via `GET /audit`.
+### 6. IMAP Read Transport
 
-### 5. Webhook Emulation
+Sync `imaplib` via `asyncio.to_thread()` for non-blocking IMAP access. Features:
+- **Search**: IMAP SEARCH with pagination (reverse-sorted UIDs, sliced)
+- **Fetch**: Full RFC822 parse with text/HTML body and attachment metadata
+- **Folders**: LIST command for available mailboxes
 
-Since IMAP/SMTP has no native push mechanism (outside of IMAP IDLE), Envelope emulates webhooks:
+Endpoints scoped to `/accounts/{id}/inbox` and `/accounts/{id}/folders`. IMAP auth/connection errors return 502.
 
-- Periodic IMAP polling for new messages and status changes
-- HTTP callback to registered webhook URLs when events occur
-- Event types: `message.received`, `message.sent`, `message.bounced`, `message.replied`
+### 7. Drafts Primitive
 
-### 6. Persistence
+SQLite-backed compose primitive for agent workflows. Status machine: `draft` → `sent` | `discarded`.
+- **Create/Update**: Compose with to, subject, text/html, in_reply_to, JSON metadata
+- **Send**: Builds MIME, creates message tracking record, sends via SMTP pool
+- **Discard**: Soft delete (status = discarded)
 
-**MVP**: SQLite for everything -- accounts, drafts, audit log, message cache.
+### 8. Future Components
 
-**Later**: Postgres when concurrent access or query complexity demands it. The schema stays the same; only the driver changes.
+- **IMAP IDLE Polling**: Real-time inbox monitoring via IDLE command
+- **Approval Gates**: Human review before send
+- **Webhook Emulation**: IMAP IDLE → HTTP callbacks for inbound events
 
 ## Design Principles
 

@@ -44,6 +44,39 @@ CREATE TABLE IF NOT EXISTS messages (
     next_retry_at TEXT,
     FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+    id TEXT PRIMARY KEY,
+    inbound_message_id TEXT NOT NULL UNIQUE,
+    from_addr TEXT,
+    subject TEXT,
+    classification TEXT,
+    confidence REAL,
+    action TEXT,
+    reasoning TEXT,
+    draft_reply TEXT,
+    escalation_note TEXT,
+    outbound_message_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS drafts (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    to_addr TEXT NOT NULL,
+    subject TEXT,
+    text_content TEXT,
+    html_content TEXT,
+    in_reply_to TEXT,
+    metadata TEXT,
+    message_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sent_at TEXT,
+    created_by TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
 """
 
 MIGRATIONS = [

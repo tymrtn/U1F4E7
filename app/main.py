@@ -19,8 +19,11 @@ from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app.transport.pool import SmtpConnectionPool
 from app.transport.worker import SendWorker
+from app.transport.imap import search_messages, fetch_message, list_folders, ImapError
 from app import messages
+from app import drafts
 from app.discovery import discover, discover_stream
+from app.agent.inbox_agent import InboxAgent
 
 load_dotenv()
 
@@ -32,7 +35,16 @@ async def lifespan(app: FastAPI):
     app.state.smtp_pool.start_cleanup_task()
     app.state.send_worker = SendWorker(app.state.smtp_pool)
     await app.state.send_worker.start()
+
+    app.state.inbox_agent = None
+    if os.getenv("AGENT_ENABLED", "false").lower() == "true":
+        app.state.inbox_agent = InboxAgent(app.state.smtp_pool)
+        await app.state.inbox_agent.start()
+
     yield
+
+    if app.state.inbox_agent:
+        await app.state.inbox_agent.stop()
     await app.state.send_worker.stop()
     await app.state.smtp_pool.close_all()
     await close_db()
@@ -65,6 +77,25 @@ class SendEmail(BaseModel):
     wait: bool = True
 
 
+class CreateDraft(BaseModel):
+    to: str
+    subject: Optional[str] = None
+    text: Optional[str] = None
+    html: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_by: Optional[str] = None
+
+
+class UpdateDraft(BaseModel):
+    to: Optional[str] = None
+    subject: Optional[str] = None
+    text: Optional[str] = None
+    html: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
 class CreateAccount(BaseModel):
     name: str
     # Shared credentials (common case)
@@ -89,7 +120,7 @@ class CreateAccount(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 # --- Send ---
@@ -286,6 +317,214 @@ async def verify_account(request: Request, account_id: str):
         await credential_store.update_verified(account_id)
 
     return {"id": account_id, "verification": results}
+
+
+# --- Drafts ---
+
+@app.post("/accounts/{account_id}/drafts", status_code=201)
+async def create_draft(account_id: str, data: CreateDraft):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    draft = await drafts.create_draft(
+        account_id=account_id,
+        to_addr=data.to,
+        subject=data.subject,
+        text_content=data.text,
+        html_content=data.html,
+        in_reply_to=data.in_reply_to,
+        metadata=data.metadata,
+        created_by=data.created_by,
+    )
+    return draft
+
+
+@app.get("/accounts/{account_id}/drafts")
+async def list_drafts(account_id: str, limit: int = 50, offset: int = 0):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return await drafts.list_drafts(account_id, limit=limit, offset=offset)
+
+
+@app.get("/accounts/{account_id}/drafts/{draft_id}")
+async def get_draft(account_id: str, draft_id: str):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return draft
+
+
+@app.put("/accounts/{account_id}/drafts/{draft_id}")
+async def update_draft(account_id: str, draft_id: str, data: UpdateDraft):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft["status"] != "draft":
+        raise HTTPException(status_code=409, detail=f"Cannot update draft with status '{draft['status']}'")
+    fields = {}
+    if data.to is not None:
+        fields["to_addr"] = data.to
+    if data.subject is not None:
+        fields["subject"] = data.subject
+    if data.text is not None:
+        fields["text_content"] = data.text
+    if data.html is not None:
+        fields["html_content"] = data.html
+    if data.in_reply_to is not None:
+        fields["in_reply_to"] = data.in_reply_to
+    if data.metadata is not None:
+        fields["metadata"] = data.metadata
+    updated = await drafts.update_draft(draft_id, **fields)
+    return updated
+
+
+@app.post("/accounts/{account_id}/drafts/{draft_id}/send")
+async def send_draft(request: Request, account_id: str, draft_id: str):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft["status"] != "draft":
+        raise HTTPException(status_code=409, detail=f"Cannot send draft with status '{draft['status']}'")
+
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    from_addr = account["username"]
+    pool = request.app.state.smtp_pool
+
+    # Build MIME message
+    msg = build_mime_message(
+        from_addr=from_addr,
+        to_addr=draft["to_addr"],
+        subject=draft["subject"] or "",
+        text=draft["text_content"],
+        html=draft["html_content"],
+        display_name=account.get("display_name"),
+    )
+    if draft["in_reply_to"]:
+        msg["In-Reply-To"] = draft["in_reply_to"]
+
+    # Create message tracking record
+    record = await messages.create_message(
+        account_id=account_id,
+        from_addr=from_addr,
+        to_addr=draft["to_addr"],
+        subject=draft["subject"],
+        text_content=draft["text_content"],
+        html_content=draft["html_content"],
+    )
+
+    # Send via SMTP
+    try:
+        smtp_message_id = await send_message(account, msg, pool=pool)
+    except SmtpSendError as e:
+        await messages.mark_failed(record["id"], e.message)
+        return JSONResponse(
+            status_code=502,
+            content={"error": e.message, "error_type": e.error_type},
+        )
+
+    await messages.mark_sent(record["id"], smtp_message_id)
+    await drafts.mark_draft_sent(draft_id, record["id"])
+
+    return {
+        "status": "sent",
+        "draft_id": draft_id,
+        "message_id": record["id"],
+    }
+
+
+@app.delete("/accounts/{account_id}/drafts/{draft_id}")
+async def discard_draft(account_id: str, draft_id: str):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    discarded = await drafts.discard_draft(draft_id)
+    if not discarded:
+        raise HTTPException(status_code=409, detail=f"Cannot discard draft with status '{draft['status']}'")
+    return {"status": "discarded", "id": draft_id}
+
+
+# --- Inbox ---
+
+@app.get("/accounts/{account_id}/inbox")
+async def list_inbox(
+    account_id: str,
+    folder: str = "INBOX",
+    limit: int = 50,
+    offset: int = 0,
+    q: Optional[str] = None,
+):
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    query = q if q else "ALL"
+    try:
+        return await search_messages(account, folder=folder, query=query, limit=limit, offset=offset)
+    except ImapError as e:
+        return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
+
+
+@app.get("/accounts/{account_id}/inbox/{uid}")
+async def get_inbox_message(account_id: str, uid: str, folder: str = "INBOX"):
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        msg = await fetch_message(account, folder=folder, uid=uid)
+    except ImapError as e:
+        return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return msg
+
+
+@app.get("/accounts/{account_id}/folders")
+async def list_account_folders(account_id: str):
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        folders = await list_folders(account)
+    except ImapError as e:
+        return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
+    return {"folders": folders}
+
+
+# --- Agent ---
+
+@app.get("/agent/status")
+async def agent_status(request: Request):
+    agent = request.app.state.inbox_agent
+    if not agent:
+        return {"enabled": False}
+    return {"enabled": True, **agent.status()}
+
+
+@app.get("/agent/actions")
+async def agent_actions(limit: int = 50, offset: int = 0):
+    from app.db import get_db
+    db = await get_db()
+    cursor = await db.execute(
+        """SELECT id, inbound_message_id, from_addr, subject,
+                  classification, confidence, action, reasoning,
+                  draft_reply, escalation_note, outbound_message_id, created_at
+           FROM agent_actions ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (limit, offset),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/agent/poll")
+async def agent_poll(request: Request):
+    agent = request.app.state.inbox_agent
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not enabled")
+    results = await agent.poll_once()
+    return {"polled": True, "actions": results}
 
 
 if __name__ == "__main__":
