@@ -19,7 +19,7 @@ from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app.transport.pool import SmtpConnectionPool
 from app.transport.worker import SendWorker
-from app.transport.imap import search_messages, fetch_message, list_folders, ImapError
+from app.transport.imap import search_messages, fetch_message, list_folders, get_thread, ImapError
 from app import messages
 from app import drafts
 from app.discovery import discover, discover_stream
@@ -96,6 +96,15 @@ class UpdateDraft(BaseModel):
     metadata: Optional[dict] = None
 
 
+class ScheduleDraft(BaseModel):
+    send_after: Optional[str] = None
+    snoozed_until: Optional[str] = None
+
+
+class RejectDraft(BaseModel):
+    feedback: Optional[str] = None
+
+
 class CreateAccount(BaseModel):
     name: str
     # Shared credentials (common case)
@@ -114,6 +123,15 @@ class CreateAccount(BaseModel):
     # Optional metadata
     display_name: Optional[str] = None
     approval_required: bool = True
+    # Agent thresholds
+    auto_send_threshold: float = 0.85
+    review_threshold: float = 0.50
+
+
+class UpdateAccount(BaseModel):
+    display_name: Optional[str] = None
+    auto_send_threshold: Optional[float] = None
+    review_threshold: Optional[float] = None
 
 
 # --- Dashboard ---
@@ -269,6 +287,8 @@ async def create_account(data: CreateAccount):
         imap_password=data.imap_password,
         display_name=data.display_name,
         approval_required=data.approval_required,
+        auto_send_threshold=data.auto_send_threshold,
+        review_threshold=data.review_threshold,
     )
     return account
 
@@ -284,6 +304,24 @@ async def get_account(account_id: str):
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     return account
+
+
+@app.patch("/accounts/{account_id}")
+async def update_account(account_id: str, data: UpdateAccount):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    updates = {}
+    if data.display_name is not None:
+        updates["display_name"] = data.display_name
+    if data.auto_send_threshold is not None:
+        updates["auto_send_threshold"] = data.auto_send_threshold
+    if data.review_threshold is not None:
+        updates["review_threshold"] = data.review_threshold
+    if not updates:
+        return account
+    updated = await credential_store.update_account(account_id, **updates)
+    return updated
 
 
 @app.delete("/accounts/{account_id}")
@@ -340,11 +378,21 @@ async def create_draft(account_id: str, data: CreateDraft):
 
 
 @app.get("/accounts/{account_id}/drafts")
-async def list_drafts(account_id: str, limit: int = 50, offset: int = 0):
+async def list_drafts(
+    account_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    hide_snoozed: bool = False,
+):
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    return await drafts.list_drafts(account_id, limit=limit, offset=offset)
+    return await drafts.list_drafts(
+        account_id, limit=limit, offset=offset, status=status,
+        created_by=created_by, hide_snoozed=hide_snoozed,
+    )
 
 
 @app.get("/accounts/{account_id}/drafts/{draft_id}")
@@ -379,8 +427,37 @@ async def update_draft(account_id: str, draft_id: str, data: UpdateDraft):
     return updated
 
 
-@app.post("/accounts/{account_id}/drafts/{draft_id}/send")
-async def send_draft(request: Request, account_id: str, draft_id: str):
+@app.patch("/accounts/{account_id}/drafts/{draft_id}")
+async def patch_draft(account_id: str, draft_id: str, data: ScheduleDraft):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft["status"] != "draft":
+        raise HTTPException(status_code=409, detail=f"Cannot update draft with status '{draft['status']}'")
+    fields = {}
+    for field in data.__fields_set__:
+        if field == "send_after":
+            fields["send_after"] = data.send_after
+        elif field == "snoozed_until":
+            fields["snoozed_until"] = data.snoozed_until
+    if not fields:
+        return draft
+    updated = await drafts.update_draft(draft_id, **fields)
+    return updated
+
+
+@app.post("/accounts/{account_id}/drafts/{draft_id}/approve")
+async def approve_draft(request: Request, account_id: str, draft_id: str):
+    """Send a draft immediately. Records approved_by='review-queue' in metadata."""
+    return await _send_draft(request, account_id, draft_id, approved_by="review-queue")
+
+
+async def _send_draft(
+    request: Request,
+    account_id: str,
+    draft_id: str,
+    approved_by: Optional[str] = None,
+):
     draft = await drafts.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         raise HTTPException(status_code=404, detail="Draft not found")
@@ -390,6 +467,14 @@ async def send_draft(request: Request, account_id: str, draft_id: str):
     account = await credential_store.get_account_with_credentials(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+
+    # Record approval metadata before sending
+    if approved_by:
+        from datetime import datetime, timezone
+        existing_meta = draft.get("metadata") or {}
+        existing_meta["approved_at"] = datetime.now(timezone.utc).isoformat()
+        existing_meta["approved_by"] = approved_by
+        await drafts.update_draft(draft_id, metadata=existing_meta)
 
     from_addr = account["username"]
     pool = request.app.state.smtp_pool
@@ -436,6 +521,16 @@ async def send_draft(request: Request, account_id: str, draft_id: str):
     }
 
 
+@app.post("/accounts/{account_id}/drafts/{draft_id}/send")
+async def send_draft(
+    request: Request,
+    account_id: str,
+    draft_id: str,
+    approved_by: Optional[str] = None,
+):
+    return await _send_draft(request, account_id, draft_id, approved_by=approved_by)
+
+
 @app.delete("/accounts/{account_id}/drafts/{draft_id}")
 async def discard_draft(account_id: str, draft_id: str):
     draft = await drafts.get_draft(draft_id)
@@ -445,6 +540,33 @@ async def discard_draft(account_id: str, draft_id: str):
     if not discarded:
         raise HTTPException(status_code=409, detail=f"Cannot discard draft with status '{draft['status']}'")
     return {"status": "discarded", "id": draft_id}
+
+
+@app.post("/accounts/{account_id}/drafts/{draft_id}/reject")
+async def reject_draft(account_id: str, draft_id: str, data: RejectDraft):
+    draft = await drafts.get_draft(draft_id)
+    if not draft or draft["account_id"] != account_id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft["status"] != "draft":
+        raise HTTPException(status_code=409, detail=f"Cannot reject draft with status '{draft['status']}'")
+
+    # Record feedback in metadata before discarding
+    from datetime import datetime, timezone
+    existing_meta = draft.get("metadata") or {}
+    existing_meta["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    if data.feedback:
+        existing_meta["rejection_feedback"] = data.feedback
+    await drafts.update_draft(draft_id, metadata=existing_meta)
+
+    await drafts.discard_draft(draft_id)
+    return {"status": "rejected", "id": draft_id}
+
+
+# --- Review Queue ---
+
+@app.get("/review", response_class=HTMLResponse)
+async def review_queue(request: Request):
+    return templates.TemplateResponse(request, "review.html")
 
 
 # --- Inbox ---
@@ -481,6 +603,22 @@ async def get_inbox_message(account_id: str, uid: str, folder: str = "INBOX"):
     return msg
 
 
+@app.get("/accounts/{account_id}/threads/{message_id}")
+async def get_thread_messages(
+    account_id: str,
+    message_id: str,
+    folder: str = "INBOX",
+):
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        thread = await get_thread(account, message_id=message_id, folder=folder)
+    except ImapError as e:
+        return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
+    return {"message_id": message_id, "thread": thread, "count": len(thread)}
+
+
 @app.get("/accounts/{account_id}/folders")
 async def list_account_folders(account_id: str):
     account = await credential_store.get_account_with_credentials(account_id)
@@ -491,6 +629,55 @@ async def list_account_folders(account_id: str):
     except ImapError as e:
         return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
     return {"folders": folders}
+
+
+# --- Context (Semantic Search) ---
+
+@app.get("/accounts/{account_id}/context")
+async def search_context(
+    account_id: str,
+    q: str,
+    limit: int = 5,
+):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    from app.agent.embeddings import find_similar
+    results = await find_similar(account_id, q, limit=limit)
+    return {"query": q, "results": results, "count": len(results)}
+
+
+@app.post("/accounts/{account_id}/embed")
+async def bulk_embed(
+    account_id: str,
+    folder: str = "INBOX",
+    limit: int = 500,
+):
+    account = await credential_store.get_account_with_credentials(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # Fetch recent messages from IMAP
+    try:
+        msgs = await search_messages(account, folder=folder, limit=limit)
+    except ImapError as e:
+        return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
+
+    # Fetch full bodies for messages that have message_ids
+    from app.agent.embeddings import backfill_embeddings
+    full_messages = []
+    for summary in msgs:
+        if not summary.get("message_id"):
+            continue
+        try:
+            full = await fetch_message(account, folder=folder, uid=summary["uid"])
+            if full:
+                full_messages.append(full)
+        except ImapError:
+            continue
+
+    result = await backfill_embeddings(account_id, full_messages)
+    return {"status": "complete", **result}
 
 
 # --- Agent ---

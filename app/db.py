@@ -77,6 +77,23 @@ CREATE TABLE IF NOT EXISTS drafts (
     created_by TEXT,
     FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS thread_links (
+    message_id TEXT NOT NULL,
+    references_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, references_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    model TEXT NOT NULL,
+    embedded_at TEXT NOT NULL
+);
 """
 
 MIGRATIONS = [
@@ -84,6 +101,10 @@ MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN html_content TEXT",
     "ALTER TABLE messages ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN next_retry_at TEXT",
+    "ALTER TABLE accounts ADD COLUMN auto_send_threshold REAL NOT NULL DEFAULT 0.85",
+    "ALTER TABLE accounts ADD COLUMN review_threshold REAL NOT NULL DEFAULT 0.50",
+    "ALTER TABLE drafts ADD COLUMN send_after TEXT",
+    "ALTER TABLE drafts ADD COLUMN snoozed_until TEXT",
 ]
 
 _connection: aiosqlite.Connection | None = None

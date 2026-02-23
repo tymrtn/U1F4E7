@@ -18,6 +18,8 @@ async def create_draft(
     in_reply_to: Optional[str] = None,
     metadata: Optional[dict] = None,
     created_by: Optional[str] = None,
+    send_after: Optional[str] = None,
+    snoozed_until: Optional[str] = None,
 ) -> dict:
     draft_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -27,10 +29,11 @@ async def create_draft(
     await db.execute(
         """INSERT INTO drafts
         (id, account_id, status, to_addr, subject, text_content, html_content,
-         in_reply_to, metadata, created_at, updated_at, created_by)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         in_reply_to, metadata, created_at, updated_at, created_by,
+         send_after, snoozed_until)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (draft_id, account_id, to_addr, subject, text_content, html_content,
-         in_reply_to, meta_json, now, now, created_by),
+         in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until),
     )
     await db.commit()
 
@@ -49,23 +52,38 @@ async def create_draft(
         "updated_at": now,
         "sent_at": None,
         "created_by": created_by,
+        "send_after": send_after,
+        "snoozed_until": snoozed_until,
     }
 
 
 async def list_drafts(
-    account_id: str, limit: int = 50, offset: int = 0
+    account_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    hide_snoozed: bool = False,
 ) -> list[dict]:
     db = await get_db()
-    cursor = await db.execute(
-        """SELECT id, account_id, status, to_addr, subject, text_content,
+    query = """SELECT id, account_id, status, to_addr, subject, text_content,
                   html_content, in_reply_to, metadata, message_id,
-                  created_at, updated_at, sent_at, created_by
+                  created_at, updated_at, sent_at, created_by,
+                  send_after, snoozed_until
            FROM drafts
-           WHERE account_id = ?
-           ORDER BY updated_at DESC
-           LIMIT ? OFFSET ?""",
-        (account_id, limit, offset),
-    )
+           WHERE account_id = ?"""
+    params: list = [account_id]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if created_by:
+        query += " AND created_by = ?"
+        params.append(created_by)
+    if hide_snoozed:
+        query += " AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))"
+    query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    cursor = await db.execute(query, params)
     rows = await cursor.fetchall()
     return [_row_to_dict(row) for row in rows]
 
@@ -75,7 +93,8 @@ async def get_draft(draft_id: str) -> Optional[dict]:
     cursor = await db.execute(
         """SELECT id, account_id, status, to_addr, subject, text_content,
                   html_content, in_reply_to, metadata, message_id,
-                  created_at, updated_at, sent_at, created_by
+                  created_at, updated_at, sent_at, created_by,
+                  send_after, snoozed_until
            FROM drafts WHERE id = ?""",
         (draft_id,),
     )
@@ -90,9 +109,18 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     if draft["status"] != "draft":
         return None
 
+    # Fields that can be explicitly set to NULL (clearing them)
+    clearable_fields = {"send_after", "snoozed_until"}
     allowed = {"to_addr", "subject", "text_content", "html_content",
-               "in_reply_to", "metadata"}
-    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+               "in_reply_to", "metadata", "send_after", "snoozed_until"}
+
+    updates = {}
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k in clearable_fields or v is not None:
+            updates[k] = v
+
     if not updates:
         return draft
 
@@ -133,6 +161,24 @@ async def mark_draft_sent(draft_id: str, message_id: str) -> None:
     await db.commit()
 
 
+async def get_scheduled_drafts() -> list[dict]:
+    """Return drafts that are approved (send_after set) and past their send time."""
+    db = await get_db()
+    cursor = await db.execute(
+        """SELECT id, account_id, status, to_addr, subject, text_content,
+                  html_content, in_reply_to, metadata, message_id,
+                  created_at, updated_at, sent_at, created_by,
+                  send_after, snoozed_until
+           FROM drafts
+           WHERE status = 'draft'
+             AND send_after IS NOT NULL
+             AND datetime(send_after) <= datetime('now')
+           ORDER BY send_after ASC"""
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 def _row_to_dict(row) -> dict:
     meta_raw = row["metadata"]
     metadata = json.loads(meta_raw) if meta_raw else None
@@ -151,4 +197,6 @@ def _row_to_dict(row) -> dict:
         "updated_at": row["updated_at"],
         "sent_at": row["sent_at"],
         "created_by": row["created_by"],
+        "send_after": row["send_after"],
+        "snoozed_until": row["snoozed_until"],
     }
