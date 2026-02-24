@@ -5,4 +5,17 @@ __pycache__/
 *.log
 .DS_Store
 *.db
+*.db-shm
+*.db-wal
 .pytest_cache/
+
+# Internal / agentic team files — not for public repo
+CLAUDE.md
+ARCHITECTURE.md
+VISION.md
+agents/
+.claude/
+demo_agent.py
+plan.md
+LAUNCH_READINESS.md
+U1F4E7/
