@@ -1,7 +1,8 @@
 # Envelope Email - Transactional Email API
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -23,9 +24,30 @@ from app.transport.imap import search_messages, fetch_message, list_folders, get
 from app import messages
 from app import drafts
 from app.discovery import discover, discover_stream
-from app.agent.inbox_agent import InboxAgent
 
 load_dotenv()
+
+# --- API Key Auth ---
+
+_bearer = HTTPBearer(auto_error=False)
+_api_key = os.getenv("ENVELOPE_API_KEY")
+
+_PUBLIC_PATHS = {"/health", "/", "/review", "/openapi.json", "/docs", "/redoc"}
+
+
+async def require_api_key(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+):
+    """Reject requests without a valid Bearer token.
+    Disabled when ENVELOPE_API_KEY is not set (local dev).
+    Public paths and /static are always exempt."""
+    if not _api_key:
+        return
+    if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/static"):
+        return
+    if not creds or creds.credentials != _api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @asynccontextmanager
@@ -38,6 +60,7 @@ async def lifespan(app: FastAPI):
 
     app.state.inbox_agent = None
     if os.getenv("AGENT_ENABLED", "false").lower() == "true":
+        from app.agent.inbox_agent import InboxAgent
         app.state.inbox_agent = InboxAgent(app.state.smtp_pool)
         await app.state.inbox_agent.start()
 
@@ -49,7 +72,12 @@ async def lifespan(app: FastAPI):
     await app.state.smtp_pool.close_all()
     await close_db()
 
-app = FastAPI(title="Envelope Email API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(
+    title="Envelope Email API",
+    version="0.3.0",
+    lifespan=lifespan,
+    dependencies=[Depends(require_api_key)],
+)
 
 # CORS for webhooks/dashboard
 app.add_middleware(
@@ -132,6 +160,17 @@ class UpdateAccount(BaseModel):
     display_name: Optional[str] = None
     auto_send_threshold: Optional[float] = None
     review_threshold: Optional[float] = None
+
+
+# --- Health ---
+
+@app.get("/health")
+async def health():
+    from app.db import get_db
+    db = await get_db()
+    cursor = await db.execute("SELECT COUNT(*) FROM accounts")
+    row = await cursor.fetchone()
+    return {"status": "ok", "version": app.version, "accounts": row[0]}
 
 
 # --- Dashboard ---
