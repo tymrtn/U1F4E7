@@ -58,16 +58,8 @@ async def lifespan(app: FastAPI):
     app.state.send_worker = SendWorker(app.state.smtp_pool)
     await app.state.send_worker.start()
 
-    app.state.inbox_agent = None
-    if os.getenv("AGENT_ENABLED", "false").lower() == "true":
-        from app.agent.inbox_agent import InboxAgent
-        app.state.inbox_agent = InboxAgent(app.state.smtp_pool)
-        await app.state.inbox_agent.start()
-
     yield
 
-    if app.state.inbox_agent:
-        await app.state.inbox_agent.stop()
     await app.state.send_worker.stop()
     await app.state.smtp_pool.close_all()
     await close_db()
@@ -681,7 +673,7 @@ async def search_context(
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    from app.agent.embeddings import find_similar
+    from app.embeddings import find_similar
     results = await find_similar(account_id, q, limit=limit)
     return {"query": q, "results": results, "count": len(results)}
 
@@ -703,7 +695,7 @@ async def bulk_embed(
         return JSONResponse(status_code=502, content={"error": e.message, "error_type": e.error_type})
 
     # Fetch full bodies for messages that have message_ids
-    from app.agent.embeddings import backfill_embeddings
+    from app.embeddings import backfill_embeddings
     full_messages = []
     for summary in msgs:
         if not summary.get("message_id"):
@@ -718,39 +710,6 @@ async def bulk_embed(
     result = await backfill_embeddings(account_id, full_messages)
     return {"status": "complete", **result}
 
-
-# --- Agent ---
-
-@app.get("/agent/status")
-async def agent_status(request: Request):
-    agent = request.app.state.inbox_agent
-    if not agent:
-        return {"enabled": False}
-    return {"enabled": True, **agent.status()}
-
-
-@app.get("/agent/actions")
-async def agent_actions(limit: int = 50, offset: int = 0):
-    from app.db import get_db
-    db = await get_db()
-    cursor = await db.execute(
-        """SELECT id, inbound_message_id, from_addr, subject,
-                  classification, confidence, action, reasoning,
-                  draft_reply, escalation_note, outbound_message_id, created_at
-           FROM agent_actions ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        (limit, offset),
-    )
-    rows = await cursor.fetchall()
-    return [dict(row) for row in rows]
-
-
-@app.post("/agent/poll")
-async def agent_poll(request: Request):
-    agent = request.app.state.inbox_agent
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not enabled")
-    results = await agent.poll_once()
-    return {"polled": True, "actions": results}
 
 
 if __name__ == "__main__":

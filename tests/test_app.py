@@ -222,7 +222,7 @@ async def test_context_endpoint_returns_structure(client):
     from unittest.mock import patch, AsyncMock
     account = await _create_test_account(client)
     with patch(
-        "app.agent.embeddings.find_similar",
+        "app.embeddings.find_similar",
         new_callable=AsyncMock,
         return_value=[{"message_id": "<a@test.com>", "score": 0.95, "subject": "", "from_addr": "", "date": "", "preview": ""}],
     ):
