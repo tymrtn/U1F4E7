@@ -162,6 +162,126 @@ async def mark_seen(account: dict, uid: str, folder: str = "INBOX") -> None:
     )
 
 
+# --- Thread search ---
+
+
+def _search_thread_sync(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    message_id: str,
+    folder: str = "INBOX",
+) -> list[dict]:
+    """Search for all messages in a thread by following References/In-Reply-To headers."""
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        conn.select(folder, readonly=True)
+
+        seen_uids = set()
+        to_search = [message_id]
+        thread_messages = []
+
+        while to_search:
+            target_id = to_search.pop(0)
+            # Search for messages referencing this ID
+            for header in ("References", "In-Reply-To"):
+                try:
+                    _, data = conn.uid(
+                        "SEARCH", None,
+                        f'HEADER "{header}" "{target_id}"',
+                    )
+                    uids = data[0].split() if data[0] else []
+                    for uid_bytes in uids:
+                        uid = uid_bytes.decode()
+                        if uid not in seen_uids:
+                            seen_uids.add(uid)
+                except imaplib.IMAP4.error:
+                    continue
+
+            # Also search for the message itself by Message-ID
+            try:
+                _, data = conn.uid(
+                    "SEARCH", None,
+                    f'HEADER "Message-ID" "{target_id}"',
+                )
+                uids = data[0].split() if data[0] else []
+                for uid_bytes in uids:
+                    uid = uid_bytes.decode()
+                    if uid not in seen_uids:
+                        seen_uids.add(uid)
+            except imaplib.IMAP4.error:
+                pass
+
+        # Fetch full messages for all found UIDs
+        for uid in sorted(seen_uids):
+            try:
+                _, msg_data = conn.uid("FETCH", uid, "(RFC822)")
+                if not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                text_body, html_body = _extract_body(msg)
+
+                # Queue referenced messages for search
+                refs = msg.get("References", "")
+                in_reply = msg.get("In-Reply-To", "")
+                for ref_id in _parse_message_ids(refs) + _parse_message_ids(in_reply):
+                    if ref_id not in [m.get("message_id") for m in thread_messages]:
+                        # Don't re-search IDs we've already found
+                        pass
+
+                thread_messages.append({
+                    "uid": uid,
+                    "message_id": msg.get("Message-ID"),
+                    "from_addr": _decode_header_value(msg.get("From", "")),
+                    "to_addr": _decode_header_value(msg.get("To", "")),
+                    "subject": _decode_header_value(msg.get("Subject", "")),
+                    "date": msg.get("Date"),
+                    "in_reply_to": msg.get("In-Reply-To"),
+                    "references": msg.get("References"),
+                    "text_body": text_body,
+                    "html_body": html_body,
+                })
+            except imaplib.IMAP4.error:
+                continue
+
+        # Sort by date (oldest first)
+        thread_messages.sort(key=lambda m: m.get("date") or "")
+        return thread_messages
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+def _parse_message_ids(header_value: str) -> list[str]:
+    """Extract message IDs from References or In-Reply-To headers."""
+    if not header_value:
+        return []
+    import re
+    return re.findall(r"<[^>]+>", header_value)
+
+
+async def get_thread(
+    account: dict,
+    message_id: str,
+    folder: str = "INBOX",
+) -> list[dict]:
+    args = _imap_account_args(account)
+    try:
+        return await asyncio.to_thread(
+            _search_thread_sync, **args, message_id=message_id, folder=folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
 # --- Inbox API extensions ---
 
 

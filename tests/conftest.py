@@ -25,6 +25,7 @@ async def setup_db(tmp_path):
     app.state.smtp_pool = SmtpConnectionPool()
     app.state.send_worker = MagicMock()
     app.state.send_worker.notify = MagicMock()
+    app.state.inbox_agent = None
     yield
     await app.state.smtp_pool.close_all()
     await close_db()

@@ -37,6 +37,8 @@
       sent: 'bg-accent-light text-accent',
       failed: 'bg-warn-light text-warn',
       queued: 'bg-pending-light text-pending',
+      retry: 'bg-amber-50 text-amber-700',
+      sending: 'bg-blue-50 text-blue-700',
     };
     const cls = map[status] || 'bg-neutral-100 text-mid';
     return '<span class="inline-block px-2 py-0.5 text-[11px] font-mono font-medium rounded-sm ' + cls + '">' + esc(status) + '</span>';

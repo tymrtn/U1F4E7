@@ -239,3 +239,148 @@ async def test_draft_for_nonexistent_account(client):
         "to": "a@b.com", "subject": "Hi", "text": "body",
     })
     assert resp.status_code == 404
+
+
+# --- Filters (Phase 1: Approval Gate) ---
+
+
+@pytest.mark.asyncio
+async def test_filter_drafts_by_status(client):
+    account = await _create_account(client)
+    aid = account["id"]
+
+    d1 = (await _create_draft(client, aid, subject="Draft A")).json()
+    d2 = (await _create_draft(client, aid, subject="Draft B")).json()
+
+    # Discard one
+    await client.delete(f"/accounts/{aid}/drafts/{d1['id']}")
+
+    # Filter for active drafts
+    resp = await client.get(f"/accounts/{aid}/drafts?status=draft")
+    assert resp.status_code == 200
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["id"] == d2["id"]
+
+    # Filter for discarded
+    resp = await client.get(f"/accounts/{aid}/drafts?status=discarded")
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["id"] == d1["id"]
+
+
+@pytest.mark.asyncio
+async def test_filter_drafts_by_created_by(client):
+    account = await _create_account(client)
+    aid = account["id"]
+
+    (await _create_draft(client, aid, subject="Human draft")).json()
+    (await _create_draft(client, aid, subject="Agent draft", created_by="inbox-agent")).json()
+
+    resp = await client.get(f"/accounts/{aid}/drafts?created_by=inbox-agent")
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["subject"] == "Agent draft"
+    assert items[0]["created_by"] == "inbox-agent"
+
+
+@pytest.mark.asyncio
+async def test_filter_drafts_combined(client):
+    account = await _create_account(client)
+    aid = account["id"]
+
+    d1 = (await _create_draft(client, aid, subject="Agent 1", created_by="inbox-agent")).json()
+    (await _create_draft(client, aid, subject="Agent 2", created_by="inbox-agent")).json()
+    (await _create_draft(client, aid, subject="Human 1")).json()
+
+    await client.delete(f"/accounts/{aid}/drafts/{d1['id']}")
+
+    resp = await client.get(f"/accounts/{aid}/drafts?status=draft&created_by=inbox-agent")
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["subject"] == "Agent 2"
+
+
+# --- Approval metadata (Phase 1) ---
+
+
+@pytest.mark.asyncio
+async def test_send_with_approved_by_records_metadata(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid, metadata={"agent": "inbox-agent"})).json()
+
+    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "<sent@example.com>"
+        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send?approved_by=tyler")
+        assert resp.status_code == 200
+
+    from app.drafts import get_draft
+    updated = await get_draft(draft["id"])
+    assert updated["metadata"]["approved_by"] == "tyler"
+    assert "approved_at" in updated["metadata"]
+    assert updated["metadata"]["agent"] == "inbox-agent"
+
+
+# --- Reject with feedback (Phase 1) ---
+
+
+@pytest.mark.asyncio
+async def test_reject_with_feedback(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid, metadata={"agent": "inbox-agent"})).json()
+
+    resp = await client.post(
+        f"/accounts/{aid}/drafts/{draft['id']}/reject",
+        json={"feedback": "Too formal, soften the tone"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+
+    from app.drafts import get_draft
+    updated = await get_draft(draft["id"])
+    assert updated["status"] == "discarded"
+    assert updated["metadata"]["rejection_feedback"] == "Too formal, soften the tone"
+    assert "rejected_at" in updated["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_reject_without_feedback(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    resp = await client.post(
+        f"/accounts/{aid}/drafts/{draft['id']}/reject",
+        json={},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_reject_already_sent_fails(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "<sent@example.com>"
+        await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send")
+
+    resp = await client.post(
+        f"/accounts/{aid}/drafts/{draft['id']}/reject",
+        json={"feedback": "Too late"},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reject_nonexistent_draft(client):
+    account = await _create_account(client)
+    resp = await client.post(
+        f"/accounts/{account['id']}/drafts/nonexistent/reject",
+        json={},
+    )
+    assert resp.status_code == 404
