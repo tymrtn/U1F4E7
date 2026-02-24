@@ -105,6 +105,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN review_threshold REAL NOT NULL DEFAULT 0.50",
     "ALTER TABLE drafts ADD COLUMN send_after TEXT",
     "ALTER TABLE drafts ADD COLUMN snoozed_until TEXT",
+    "ALTER TABLE accounts ADD COLUMN rate_limit_per_hour INTEGER",
 ]
 
 _connection: aiosqlite.Connection | None = None

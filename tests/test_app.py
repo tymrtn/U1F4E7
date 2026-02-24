@@ -232,3 +232,128 @@ async def test_context_endpoint_returns_structure(client):
         assert data["query"] == "villa pricing"
         assert data["count"] == 1
         assert len(data["results"]) == 1
+
+
+# --- Pre-marketing improvements ---
+
+
+@pytest.mark.asyncio
+async def test_send_display_name_override(client):
+    """display_name on SendEmail body overrides the account-level display name."""
+    from unittest.mock import patch, AsyncMock
+    account = await _create_test_account(client)
+
+    captured = {}
+
+    async def fake_send(account, msg, pool=None):
+        captured["from"] = msg.get("From")
+        return "<fake-id@test>"
+
+    with patch("app.main.send_message", new_callable=AsyncMock, side_effect=fake_send):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Override test",
+            "text": "hi",
+            "display_name": "Alerts Bot",
+        })
+    assert resp.status_code == 200
+    assert "Alerts Bot" in captured["from"]
+
+
+@pytest.mark.asyncio
+async def test_send_display_name_falls_back_to_account(client):
+    """When no display_name in body, account default is used."""
+    from unittest.mock import patch, AsyncMock
+    resp = await client.post("/accounts", json={
+        "name": "Named Account",
+        "host": "mail.example.com",
+        "username": "test@example.com",
+        "password": "secret",
+        "display_name": "Default Name",
+    })
+    account = resp.json()
+
+    captured = {}
+
+    async def fake_send(account, msg, pool=None):
+        captured["from"] = msg.get("From")
+        return "<fake-id@test>"
+
+    with patch("app.main.send_message", new_callable=AsyncMock, side_effect=fake_send):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Fallback test",
+            "text": "hi",
+        })
+    assert resp.status_code == 200
+    assert "Default Name" in captured["from"]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_blocks_after_cap(client):
+    """3rd send within the hour returns 429 when rate_limit_per_hour=2."""
+    resp = await client.post("/accounts", json={
+        "name": "Limited Account",
+        "host": "mail.example.com",
+        "username": "test@example.com",
+        "password": "secret",
+        "rate_limit_per_hour": 2,
+    })
+    account = resp.json()
+    assert account.get("rate_limit_per_hour") == 2
+
+    payload = {
+        "account_id": account["id"],
+        "to": "to@example.com",
+        "subject": "Rate test",
+        "text": "hi",
+        "wait": False,
+    }
+    resp1 = await client.post("/send", json=payload)
+    assert resp1.status_code == 200
+    resp2 = await client.post("/send", json=payload)
+    assert resp2.status_code == 200
+    resp3 = await client.post("/send", json=payload)
+    assert resp3.status_code == 429
+    body = resp3.json()
+    assert body["error"] == "rate_limit_exceeded"
+    assert body["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_not_applied_when_unset(client):
+    """Accounts without a rate limit can send freely."""
+    account = await _create_test_account(client)
+    payload = {
+        "account_id": account["id"],
+        "to": "to@example.com",
+        "subject": "No limit test",
+        "text": "hi",
+        "wait": False,
+    }
+    for _ in range(5):
+        resp = await client.post("/send", json=payload)
+        assert resp.status_code == 200
+
+
+def test_parse_message_id_strips_whitespace():
+    """_parse_message_id trims leading/trailing whitespace from the header value."""
+    import email as email_module
+    from app.transport.imap import _parse_message_id
+
+    raw = email_module.message_from_string(
+        "Message-ID:  <test@host.com>  \r\nFrom: a@b.com\r\n\r\n"
+    )
+    result = _parse_message_id(raw)
+    assert result == "<test@host.com>"
+
+
+def test_parse_message_id_returns_none_when_absent():
+    """_parse_message_id returns None when the header is missing."""
+    import email as email_module
+    from app.transport.imap import _parse_message_id
+
+    raw = email_module.message_from_string("From: a@b.com\r\n\r\n")
+    assert _parse_message_id(raw) is None

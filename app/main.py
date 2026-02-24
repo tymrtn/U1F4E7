@@ -15,7 +15,9 @@ from typing import Optional
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
-from app.db import init_db, close_db
+from datetime import datetime, timezone, timedelta
+
+from app.db import init_db, close_db, get_db
 from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app.transport.pool import SmtpConnectionPool
@@ -94,6 +96,7 @@ class SendEmail(BaseModel):
     from_email: Optional[str] = None
     html: Optional[str] = None
     text: Optional[str] = None
+    display_name: Optional[str] = None
     wait: bool = True
 
 
@@ -146,12 +149,29 @@ class CreateAccount(BaseModel):
     # Agent thresholds
     auto_send_threshold: float = 0.85
     review_threshold: float = 0.50
+    rate_limit_per_hour: Optional[int] = None
 
 
 class UpdateAccount(BaseModel):
     display_name: Optional[str] = None
     auto_send_threshold: Optional[float] = None
     review_threshold: Optional[float] = None
+    rate_limit_per_hour: Optional[int] = None
+
+
+# --- Rate limit helper ---
+
+async def _check_rate_limit(account_id: str, limit: Optional[int]) -> bool:
+    if not limit:
+        return True
+    db = await get_db()
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM messages WHERE account_id = ? AND created_at > ? AND status != 'failed'",
+        (account_id, window_start),
+    )
+    row = await cursor.fetchone()
+    return row[0] < limit
 
 
 # --- Health ---
@@ -179,6 +199,13 @@ async def send_email(request: Request, data: SendEmail):
     account = await credential_store.get_account_with_credentials(data.account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+
+    if not await _check_rate_limit(data.account_id, account.get("rate_limit_per_hour")):
+        limit = account.get("rate_limit_per_hour")
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limit_exceeded", "limit": limit},
+        )
 
     from_addr = data.from_email or account["username"]
     pool = request.app.state.smtp_pool
@@ -213,7 +240,7 @@ async def send_email(request: Request, data: SendEmail):
         subject=data.subject,
         text=data.text,
         html=data.html,
-        display_name=account.get("display_name"),
+        display_name=data.display_name or account.get("display_name"),
     )
 
     try:
@@ -320,6 +347,7 @@ async def create_account(data: CreateAccount):
         approval_required=data.approval_required,
         auto_send_threshold=data.auto_send_threshold,
         review_threshold=data.review_threshold,
+        rate_limit_per_hour=data.rate_limit_per_hour,
     )
     return account
 
@@ -349,6 +377,8 @@ async def update_account(account_id: str, data: UpdateAccount):
         updates["auto_send_threshold"] = data.auto_send_threshold
     if data.review_threshold is not None:
         updates["review_threshold"] = data.review_threshold
+    if data.rate_limit_per_hour is not None:
+        updates["rate_limit_per_hour"] = data.rate_limit_per_hour
     if not updates:
         return account
     updated = await credential_store.update_account(account_id, **updates)
@@ -501,7 +531,6 @@ async def _send_draft(
 
     # Record approval metadata before sending
     if approved_by:
-        from datetime import datetime, timezone
         existing_meta = draft.get("metadata") or {}
         existing_meta["approved_at"] = datetime.now(timezone.utc).isoformat()
         existing_meta["approved_by"] = approved_by
@@ -582,7 +611,6 @@ async def reject_draft(account_id: str, draft_id: str, data: RejectDraft):
         raise HTTPException(status_code=409, detail=f"Cannot reject draft with status '{draft['status']}'")
 
     # Record feedback in metadata before discarding
-    from datetime import datetime, timezone
     existing_meta = draft.get("metadata") or {}
     existing_meta["rejected_at"] = datetime.now(timezone.utc).isoformat()
     if data.feedback:

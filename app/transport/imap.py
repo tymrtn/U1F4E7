@@ -26,6 +26,13 @@ class InboundMessage:
     date: Optional[str]
 
 
+def _parse_message_id(msg) -> Optional[str]:
+    raw = msg.get("Message-ID") or msg.get("Message-Id")
+    if not raw:
+        return None
+    return raw.strip()
+
+
 def _decode_header_value(value: str) -> str:
     if not value:
         return ""
@@ -98,7 +105,7 @@ def _fetch_unread_sync(
 
             messages.append(InboundMessage(
                 uid=uid,
-                message_id=msg.get("Message-ID"),
+                message_id=_parse_message_id(msg),
                 from_addr=_decode_header_value(msg.get("From", "")),
                 to_addr=_decode_header_value(msg.get("To", "")),
                 subject=_decode_header_value(msg.get("Subject", "")),
@@ -234,7 +241,7 @@ def _search_thread_sync(
 
                 thread_messages.append({
                     "uid": uid,
-                    "message_id": msg.get("Message-ID"),
+                    "message_id": _parse_message_id(msg),
                     "from_addr": _decode_header_value(msg.get("From", "")),
                     "to_addr": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
@@ -401,7 +408,7 @@ def _fetch_summaries_sync(
                 msg = email.message_from_bytes(header_bytes)
                 results.append({
                     "uid": uid,
-                    "message_id": msg.get("Message-ID"),
+                    "message_id": _parse_message_id(msg),
                     "from_addr": _decode_header_value(msg.get("From", "")),
                     "to_addr": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
@@ -441,7 +448,7 @@ def _fetch_message_sync(
 
         return {
             "uid": uid,
-            "message_id": msg.get("Message-ID"),
+            "message_id": _parse_message_id(msg),
             "from_addr": _decode_header_value(msg.get("From", "")),
             "to_addr": _decode_header_value(msg.get("To", "")),
             "subject": _decode_header_value(msg.get("Subject", "")),
