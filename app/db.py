@@ -106,6 +106,15 @@ MIGRATIONS = [
     "ALTER TABLE drafts ADD COLUMN send_after TEXT",
     "ALTER TABLE drafts ADD COLUMN snoozed_until TEXT",
     "ALTER TABLE accounts ADD COLUMN rate_limit_per_hour INTEGER",
+    # Story 011 — Policy tables
+    'CREATE TABLE IF NOT EXISTS domain_policies (account_id TEXT PRIMARY KEY, name TEXT, description TEXT, "values" TEXT, tone TEXT, style TEXT, kb_text TEXT, updated_at TEXT)',
+    "CREATE TABLE IF NOT EXISTS address_policies (account_id TEXT NOT NULL, pattern TEXT NOT NULL, purpose TEXT, reply_instructions TEXT, escalation_rules TEXT, routing_rules TEXT, trash_criteria TEXT, help_resources TEXT, sensitive_topics TEXT, confidence_threshold REAL DEFAULT 0.7, webhook_url TEXT, updated_at TEXT, PRIMARY KEY (account_id, pattern))",
+    # Story 013 — Action log
+    "CREATE TABLE IF NOT EXISTS action_log (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, action_type TEXT NOT NULL, confidence REAL NOT NULL, justification TEXT NOT NULL, action_taken TEXT NOT NULL, message_id TEXT, draft_id TEXT, created_at TEXT NOT NULL)",
+    # Story 015 — Webhook fields
+    "ALTER TABLE accounts ADD COLUMN webhook_url TEXT",
+    "ALTER TABLE accounts ADD COLUMN webhook_secret TEXT",
+    "CREATE TABLE IF NOT EXISTS webhook_state (account_id TEXT PRIMARY KEY, last_uid TEXT, updated_at TEXT)",
 ]
 
 _connection: aiosqlite.Connection | None = None

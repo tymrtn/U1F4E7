@@ -1,7 +1,7 @@
 # Envelope Email - Transactional Email API
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-from typing import Optional
+from typing import Optional, Literal
+from urllib.parse import unquote
 
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
@@ -23,9 +24,13 @@ from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app.transport.pool import SmtpConnectionPool
 from app.transport.worker import SendWorker
 from app.transport.imap import search_messages, fetch_message, list_folders, get_thread, ImapError
+from app.transport.webhook import WebhookPoller
 from app import messages
 from app import drafts
 from app.discovery import discover, discover_stream
+from app.services import policy as policy_svc
+from app.services import actions as actions_svc
+from app.services.start_here import build_start_here_response
 
 load_dotenv()
 
@@ -48,6 +53,8 @@ async def require_api_key(
         return
     if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/static"):
         return
+    if request.url.path.endswith("/start-here"):
+        return
     if not creds or creds.credentials != _api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
@@ -59,10 +66,13 @@ async def lifespan(app: FastAPI):
     app.state.smtp_pool.start_cleanup_task()
     app.state.send_worker = SendWorker(app.state.smtp_pool)
     await app.state.send_worker.start()
+    app.state.webhook_poller = WebhookPoller()
+    await app.state.webhook_poller.start()
 
     yield
 
     await app.state.send_worker.stop()
+    await app.state.webhook_poller.stop()
     await app.state.smtp_pool.close_all()
     await close_db()
 
@@ -157,6 +167,40 @@ class UpdateAccount(BaseModel):
     auto_send_threshold: Optional[float] = None
     review_threshold: Optional[float] = None
     rate_limit_per_hour: Optional[int] = None
+    webhook_url: Optional[str] = None
+    webhook_secret: Optional[str] = None
+
+
+class DomainPolicyIn(BaseModel):
+    name: str
+    description: Optional[str] = None
+    values: Optional[list[str]] = None
+    tone: Optional[str] = None
+    style: Optional[str] = None
+    kb_text: Optional[str] = None
+
+
+class AddressPolicyIn(BaseModel):
+    pattern: str
+    purpose: Optional[str] = None
+    reply_instructions: Optional[str] = None
+    escalation_rules: Optional[str] = None
+    routing_rules: Optional[str] = None
+    trash_criteria: Optional[str] = None
+    help_resources: Optional[str] = None
+    sensitive_topics: Optional[list[str]] = None
+    confidence_threshold: float = 0.7
+    webhook_url: Optional[str] = None
+
+
+class LogActionIn(BaseModel):
+    account_id: str
+    action_type: Literal["inbound_route", "draft_approve", "draft_reject", "send_decision", "escalate", "trash"]
+    confidence: float
+    justification: str
+    action_taken: str
+    message_id: Optional[str] = None
+    draft_id: Optional[str] = None
 
 
 # --- Rate limit helper ---
@@ -379,6 +423,10 @@ async def update_account(account_id: str, data: UpdateAccount):
         updates["review_threshold"] = data.review_threshold
     if data.rate_limit_per_hour is not None:
         updates["rate_limit_per_hour"] = data.rate_limit_per_hour
+    if data.webhook_url is not None:
+        updates["webhook_url"] = data.webhook_url
+    if data.webhook_secret is not None:
+        updates["webhook_secret"] = data.webhook_secret
     if not updates:
         return account
     updated = await credential_store.update_account(account_id, **updates)
@@ -738,6 +786,174 @@ async def bulk_embed(
     result = await backfill_embeddings(account_id, full_messages)
     return {"status": "complete", **result}
 
+
+
+# --- Domain Policy (Story 011) ---
+
+@app.post("/accounts/{account_id}/domain-policy")
+async def upsert_domain_policy(account_id: str, data: DomainPolicyIn):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    policy = await policy_svc.upsert_domain_policy(
+        account_id,
+        name=data.name,
+        description=data.description,
+        values=data.values,
+        tone=data.tone,
+        style=data.style,
+        kb_text=data.kb_text,
+    )
+    return policy
+
+
+@app.get("/accounts/{account_id}/domain-policy")
+async def get_domain_policy(account_id: str):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    policy = await policy_svc.get_domain_policy(account_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Domain policy not found")
+    kb_text = policy.get("kb_text") or ""
+    if len(kb_text) > 2000:
+        policy = dict(policy)
+        policy["kb_text"] = None
+        policy["kb_text_truncated"] = True
+        policy["kb_text_url"] = f"/accounts/{account_id}/domain-policy"
+    return policy
+
+
+@app.post("/accounts/{account_id}/address-policies", status_code=201)
+async def create_address_policy(account_id: str, data: AddressPolicyIn):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    policy = await policy_svc.upsert_address_policy(
+        account_id,
+        data.pattern,
+        purpose=data.purpose,
+        reply_instructions=data.reply_instructions,
+        escalation_rules=data.escalation_rules,
+        routing_rules=data.routing_rules,
+        trash_criteria=data.trash_criteria,
+        help_resources=data.help_resources,
+        sensitive_topics=data.sensitive_topics,
+        confidence_threshold=data.confidence_threshold,
+        webhook_url=data.webhook_url,
+    )
+    return policy
+
+
+@app.get("/accounts/{account_id}/address-policies")
+async def list_address_policies(account_id: str):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return await policy_svc.list_address_policies(account_id)
+
+
+@app.get("/accounts/{account_id}/address-policies/{pattern}")
+async def get_address_policy(account_id: str, pattern: str = Path(...)):
+    pattern = unquote(pattern)
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    policy = await policy_svc.get_address_policy(account_id, pattern)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Address policy not found")
+    return policy
+
+
+@app.put("/accounts/{account_id}/address-policies/{pattern}")
+async def update_address_policy(account_id: str, pattern: str, data: AddressPolicyIn):
+    pattern = unquote(pattern)
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    policy = await policy_svc.upsert_address_policy(
+        account_id,
+        pattern,
+        purpose=data.purpose,
+        reply_instructions=data.reply_instructions,
+        escalation_rules=data.escalation_rules,
+        routing_rules=data.routing_rules,
+        trash_criteria=data.trash_criteria,
+        help_resources=data.help_resources,
+        sensitive_topics=data.sensitive_topics,
+        confidence_threshold=data.confidence_threshold,
+        webhook_url=data.webhook_url,
+    )
+    return policy
+
+
+@app.delete("/accounts/{account_id}/address-policies/{pattern}")
+async def delete_address_policy(account_id: str, pattern: str = Path(...)):
+    pattern = unquote(pattern)
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    deleted = await policy_svc.delete_address_policy(account_id, pattern)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Address policy not found")
+    return {"status": "deleted", "pattern": pattern}
+
+
+# --- Start Here (Story 012) ---
+
+@app.get("/accounts/{account_id}/start-here")
+async def start_here(account_id: str):
+    return await build_start_here_response(account_id)
+
+
+# --- Action Log (Story 013) ---
+
+@app.post("/actions/log", status_code=201)
+async def log_action(data: LogActionIn):
+    entry = await actions_svc.log_action(
+        account_id=data.account_id,
+        action_type=data.action_type,
+        confidence=data.confidence,
+        justification=data.justification,
+        action_taken=data.action_taken,
+        message_id=data.message_id,
+        draft_id=data.draft_id,
+    )
+    return entry
+
+
+@app.get("/accounts/{account_id}/actions")
+async def list_actions(
+    account_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    draft_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return await actions_svc.list_actions(
+        account_id, limit=limit, offset=offset,
+        draft_id=draft_id, message_id=message_id,
+    )
+
+
+@app.get("/actions/log/{log_id}")
+async def get_action(log_id: str):
+    entry = await actions_svc.get_action(log_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Action log entry not found")
+    return entry
+
+
+# --- MCP Server (Story 014) ---
+
+try:
+    from app.mcp import mcp
+    app.mount("/mcp", mcp.sse_app())
+except ImportError:
+    pass
 
 
 if __name__ == "__main__":

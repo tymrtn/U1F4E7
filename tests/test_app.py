@@ -357,3 +357,205 @@ def test_parse_message_id_returns_none_when_absent():
 
     raw = email_module.message_from_string("From: a@b.com\r\n\r\n")
     assert _parse_message_id(raw) is None
+
+
+# --- Story 011: Domain Policy CRUD ---
+
+
+@pytest.mark.asyncio
+async def test_domain_policy_upsert_and_get(client):
+    account = await _create_test_account(client)
+    aid = account["id"]
+
+    # Upsert
+    resp = await client.post(f"/accounts/{aid}/domain-policy", json={
+        "name": "Support Policy",
+        "description": "Handle support emails",
+        "values": ["empathy", "speed"],
+        "tone": "friendly",
+        "style": "brief",
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "Support Policy"
+    assert data["values"] == ["empathy", "speed"]
+
+    # Get
+    resp = await client.get(f"/accounts/{aid}/domain-policy")
+    assert resp.status_code == 200
+    assert resp.json()["tone"] == "friendly"
+
+
+@pytest.mark.asyncio
+async def test_domain_policy_404_if_missing(client):
+    account = await _create_test_account(client)
+    resp = await client.get(f"/accounts/{account['id']}/domain-policy")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_domain_policy_upsert_unknown_account(client):
+    resp = await client.post("/accounts/nonexistent/domain-policy", json={"name": "X"})
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_address_policy_crud(client):
+    account = await _create_test_account(client)
+    aid = account["id"]
+
+    # Create
+    resp = await client.post(f"/accounts/{aid}/address-policies", json={
+        "pattern": "*@vip.com",
+        "purpose": "VIP customers",
+        "confidence_threshold": 0.9,
+    })
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["pattern"] == "*@vip.com"
+    assert data["confidence_threshold"] == 0.9
+
+    # List
+    resp = await client.get(f"/accounts/{aid}/address-policies")
+    assert resp.status_code == 200
+    policies = resp.json()
+    assert len(policies) == 1
+    assert policies[0]["pattern"] == "*@vip.com"
+
+    # Get
+    resp = await client.get(f"/accounts/{aid}/address-policies/*@vip.com")
+    assert resp.status_code == 200
+    assert resp.json()["purpose"] == "VIP customers"
+
+    # Update (PUT)
+    resp = await client.put(f"/accounts/{aid}/address-policies/*@vip.com", json={
+        "pattern": "*@vip.com",
+        "purpose": "Updated purpose",
+        "confidence_threshold": 0.8,
+    })
+    assert resp.status_code == 200
+    assert resp.json()["purpose"] == "Updated purpose"
+
+    # Delete
+    resp = await client.delete(f"/accounts/{aid}/address-policies/*@vip.com")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+
+    # Verify gone
+    resp = await client.get(f"/accounts/{aid}/address-policies/*@vip.com")
+    assert resp.status_code == 404
+
+
+# --- Story 012: Start Here ---
+
+
+@pytest.mark.asyncio
+async def test_start_here_onboarding_mode(client):
+    account = await _create_test_account(client)
+    resp = await client.get(f"/accounts/{account['id']}/start-here")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "onboarding"
+    assert "instructions" in data
+    assert "POST" in data["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_start_here_operational_mode(client):
+    account = await _create_test_account(client)
+    aid = account["id"]
+
+    await client.post(f"/accounts/{aid}/domain-policy", json={
+        "name": "My Policy",
+        "tone": "neutral",
+    })
+
+    resp = await client.get(f"/accounts/{aid}/start-here")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "operational"
+    assert "domain_policy" in data
+    assert data["domain_policy"]["tone"] == "neutral"
+
+
+@pytest.mark.asyncio
+async def test_start_here_no_auth_required(client):
+    """start-here must be accessible without API key (when key is set)."""
+    import os
+    from app.main import app as the_app
+    account = await _create_test_account(client)
+    # Temporarily set API key enforcement
+    import app.main as main_module
+    original = main_module._api_key
+    main_module._api_key = "test-secret-key"
+    try:
+        resp = await client.get(f"/accounts/{account['id']}/start-here")
+        assert resp.status_code == 200
+    finally:
+        main_module._api_key = original
+
+
+# --- Story 013: Action Log ---
+
+
+@pytest.mark.asyncio
+async def test_log_action_and_retrieve(client):
+    account = await _create_test_account(client)
+    aid = account["id"]
+
+    resp = await client.post("/actions/log", json={
+        "account_id": aid,
+        "action_type": "inbound_route",
+        "confidence": 0.85,
+        "justification": "Matched VIP pattern",
+        "action_taken": "Created draft reply",
+    })
+    assert resp.status_code == 201
+    entry = resp.json()
+    assert entry["action_type"] == "inbound_route"
+    assert entry["confidence"] == 0.85
+    log_id = entry["id"]
+
+    # Get by ID
+    resp = await client.get(f"/actions/log/{log_id}")
+    assert resp.status_code == 200
+    assert resp.json()["justification"] == "Matched VIP pattern"
+
+
+@pytest.mark.asyncio
+async def test_list_actions_for_account(client):
+    account = await _create_test_account(client)
+    aid = account["id"]
+
+    for i in range(3):
+        await client.post("/actions/log", json={
+            "account_id": aid,
+            "action_type": "trash",
+            "confidence": 0.95,
+            "justification": f"Spam #{i}",
+            "action_taken": "Discarded",
+        })
+
+    resp = await client.get(f"/accounts/{aid}/actions")
+    assert resp.status_code == 200
+    entries = resp.json()
+    assert len(entries) == 3
+
+
+@pytest.mark.asyncio
+async def test_action_log_invalid_type(client):
+    account = await _create_test_account(client)
+    resp = await client.post("/actions/log", json={
+        "account_id": account["id"],
+        "action_type": "invalid_type",
+        "confidence": 0.5,
+        "justification": "test",
+        "action_taken": "test",
+    })
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_action_log_not_found(client):
+    resp = await client.get("/actions/log/nonexistent-id")
+    assert resp.status_code == 404
