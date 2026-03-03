@@ -23,6 +23,7 @@ from app.credentials import store as credential_store
 from app.transport.smtp import build_mime_message, send_message, SmtpSendError
 from app.transport.pool import SmtpConnectionPool
 from app.transport.worker import SendWorker
+from app.workers.draft_scheduler import DraftScheduler
 from app.transport.imap import search_messages, fetch_message, list_folders, get_thread, ImapError
 from app.transport.webhook import WebhookPoller
 from app import messages
@@ -66,12 +67,15 @@ async def lifespan(app: FastAPI):
     app.state.smtp_pool.start_cleanup_task()
     app.state.send_worker = SendWorker(app.state.smtp_pool)
     await app.state.send_worker.start()
+    app.state.draft_scheduler = DraftScheduler(app.state.smtp_pool)
+    await app.state.draft_scheduler.start()
     app.state.webhook_poller = WebhookPoller()
     await app.state.webhook_poller.start()
 
     yield
 
     await app.state.send_worker.stop()
+    await app.state.draft_scheduler.stop()
     await app.state.webhook_poller.stop()
     await app.state.smtp_pool.close_all()
     await close_db()
@@ -118,6 +122,7 @@ class CreateDraft(BaseModel):
     in_reply_to: Optional[str] = None
     metadata: Optional[dict] = None
     created_by: Optional[str] = None
+    send_after: Optional[str] = None
 
 
 class UpdateDraft(BaseModel):
@@ -254,18 +259,18 @@ async def send_email(request: Request, data: SendEmail):
     from_addr = data.from_email or account["username"]
     pool = request.app.state.smtp_pool
 
-    # Create tracking record (store body for async sends)
-    record = await messages.create_message(
-        account_id=data.account_id,
-        from_addr=from_addr,
-        to_addr=data.to,
-        subject=data.subject,
-        text_content=data.text,
-        html_content=data.html,
-    )
-
     # Async mode: queue and return immediately
     if not data.wait:
+        # Create as 'queued' so the background worker picks it up
+        record = await messages.create_message(
+            account_id=data.account_id,
+            from_addr=from_addr,
+            to_addr=data.to,
+            subject=data.subject,
+            text_content=data.text,
+            html_content=data.html,
+            initial_status="queued",
+        )
         request.app.state.send_worker.notify()
         return {
             "status": "queued",
@@ -278,6 +283,17 @@ async def send_email(request: Request, data: SendEmail):
         }
 
     # Sync mode (default): send now and wait for result
+    # Create as 'sending' so the background worker never picks it up (prevents duplicate sends)
+    record = await messages.create_message(
+        account_id=data.account_id,
+        from_addr=from_addr,
+        to_addr=data.to,
+        subject=data.subject,
+        text_content=data.text,
+        html_content=data.html,
+        initial_status="sending",
+    )
+
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=data.to,
@@ -482,6 +498,7 @@ async def create_draft(account_id: str, data: CreateDraft):
         in_reply_to=data.in_reply_to,
         metadata=data.metadata,
         created_by=data.created_by,
+        send_after=data.send_after,
     )
     return draft
 

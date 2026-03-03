@@ -8,7 +8,7 @@ from typing import Optional
 from app.db import get_db
 
 
-async def create_message(
+async def create_message(  # noqa: PLR0913
     account_id: str,
     from_addr: str,
     to_addr: str,
@@ -16,16 +16,17 @@ async def create_message(
     direction: str = "outbound",
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
+    initial_status: str = "queued",
 ) -> dict:
     msg_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
     db = await get_db()
     await db.execute(
-        """INSERT INTO messages
+        f"""INSERT INTO messages
         (id, account_id, direction, from_addr, to_addr, subject, status, created_at,
          text_content, html_content)
-        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?)""",
         (msg_id, account_id, direction, from_addr, to_addr, subject, now,
          text_content, html_content),
     )
@@ -38,7 +39,7 @@ async def create_message(
         "from_addr": from_addr,
         "to_addr": to_addr,
         "subject": subject,
-        "status": "queued",
+        "status": initial_status,
         "created_at": now,
     }
 
