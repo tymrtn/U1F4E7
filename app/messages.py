@@ -105,8 +105,10 @@ async def claim_message(msg_id: str) -> bool:
 
 async def recover_orphans():
     db = await get_db()
+    # Only reset messages that were claimed but never actually submitted to SMTP.
+    # If message_id is already set, Migadu accepted it. Re-queuing would cause a duplicate send.
     await db.execute(
-        "UPDATE messages SET status = 'queued' WHERE status = 'sending'"
+        "UPDATE messages SET status = 'queued' WHERE status = 'sending' AND (message_id IS NULL OR message_id = '')"
     )
     await db.commit()
 
