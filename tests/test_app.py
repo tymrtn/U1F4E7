@@ -559,3 +559,287 @@ async def test_action_log_invalid_type(client):
 async def test_action_log_not_found(client):
     resp = await client.get("/actions/log/nonexistent-id")
     assert resp.status_code == 404
+
+
+# --- Story 017: Cc, Bcc, Reply-To ---
+
+
+@pytest.mark.asyncio
+async def test_send_with_cc_sets_header(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        msg = real_build(*args, **kwargs)
+        captured["msg"] = msg
+        return msg
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "cc": "cc@example.com",
+            "subject": "CC Test",
+            "text": "Hello",
+        })
+    assert resp.status_code == 200
+    assert captured["msg"]["Cc"] == "cc@example.com"
+
+
+@pytest.mark.asyncio
+async def test_send_with_reply_to(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        msg = real_build(*args, **kwargs)
+        captured["msg"] = msg
+        return msg
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "reply_to": "noreply@example.com",
+            "subject": "Reply-To Test",
+            "text": "Hello",
+        })
+    assert resp.status_code == 200
+    assert captured["msg"]["Reply-To"] == "noreply@example.com"
+
+
+@pytest.mark.asyncio
+async def test_draft_cc_bcc_persisted(client):
+    account = await _create_test_account(client)
+    resp = await client.post(f"/accounts/{account['id']}/drafts", json={
+        "to": "to@example.com",
+        "subject": "CC Draft",
+        "text": "Body",
+        "cc": "cc@example.com",
+        "bcc": "bcc@example.com",
+        "reply_to": "reply@example.com",
+    })
+    assert resp.status_code == 201
+    draft = resp.json()
+    assert draft["cc_addr"] == "cc@example.com"
+    assert draft["bcc_addr"] == "bcc@example.com"
+    assert draft["reply_to"] == "reply@example.com"
+
+    # Verify persisted via GET
+    resp2 = await client.get(f"/accounts/{account['id']}/drafts/{draft['id']}")
+    assert resp2.status_code == 200
+    fetched = resp2.json()
+    assert fetched["cc_addr"] == "cc@example.com"
+    assert fetched["bcc_addr"] == "bcc@example.com"
+    assert fetched["reply_to"] == "reply@example.com"
+
+
+# --- Story 018: Account Signatures ---
+
+
+@pytest.mark.asyncio
+async def test_signature_appended_to_text(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+
+    # Set signature
+    resp = await client.patch(f"/accounts/{account['id']}", json={
+        "signature_text": "Best,\nAlice",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["signature_text"] == "Best,\nAlice"
+
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_build(*args, **kwargs)
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Sig Test",
+            "text": "Hello there",
+        })
+    assert resp.status_code == 200
+    text_sent = captured["kwargs"]["text"]
+    assert "Best,\nAlice" in text_sent
+    assert text_sent.startswith("Hello there")
+
+
+@pytest.mark.asyncio
+async def test_signature_injected_into_html(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+
+    await client.patch(f"/accounts/{account['id']}", json={
+        "signature_html": "<p>Best, Alice</p>",
+    })
+
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_build(*args, **kwargs)
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "HTML Sig Test",
+            "html": "<html><body><p>Hello</p></body></html>",
+        })
+    assert resp.status_code == 200
+    html_sent = captured["kwargs"]["html"]
+    assert '<div class="env-signature"><p>Best, Alice</p></div>' in html_sent
+    assert html_sent.index('<div class="env-signature">') < html_sent.index("</body>")
+
+
+@pytest.mark.asyncio
+async def test_use_signature_false_skips_injection(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+
+    await client.patch(f"/accounts/{account['id']}", json={
+        "signature_text": "Best,\nAlice",
+    })
+
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_build(*args, **kwargs)
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "No Sig",
+            "text": "Hello there",
+            "use_signature": False,
+        })
+    assert resp.status_code == 200
+    text_sent = captured["kwargs"]["text"]
+    assert "Best,\nAlice" not in text_sent
+
+
+# --- Story 019: Open Tracking ---
+
+
+@pytest.mark.asyncio
+async def test_tracking_pixel_injected_into_html(client):
+    from unittest.mock import patch, AsyncMock
+    from app.transport.smtp import build_mime_message as real_build
+    account = await _create_test_account(client)
+
+    captured = {}
+
+    def capturing_build(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_build(*args, **kwargs)
+
+    with patch("app.main.build_mime_message", side_effect=capturing_build), \
+         patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Track Test",
+            "html": "<html><body><p>Hello</p></body></html>",
+            "track_opens": True,
+        })
+    assert resp.status_code == 200
+    html_sent = captured["kwargs"]["html"]
+    assert '<img src=' in html_sent
+    assert '/track/' in html_sent
+    assert 'width="1"' in html_sent
+
+
+@pytest.mark.asyncio
+async def test_track_endpoint_returns_gif(client):
+    resp = await client.get("/track/unknown-token-xyz")
+    assert resp.status_code == 200
+    assert "image/gif" in resp.headers["content-type"]
+
+
+@pytest.mark.asyncio
+async def test_track_endpoint_records_open(client):
+    from unittest.mock import patch, AsyncMock
+    account = await _create_test_account(client)
+
+    msg_id_ref = {}
+
+    with patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Track Open",
+            "html": "<p>Hello</p>",
+            "track_opens": True,
+        })
+    assert resp.status_code == 200
+    msg_id_ref["id"] = resp.json()["id"]
+
+    # Grab the tracking token from messages table
+    from app.db import get_db
+    db = await get_db()
+    cursor = await db.execute("SELECT tracking_token FROM messages WHERE id = ?", (msg_id_ref["id"],))
+    row = await cursor.fetchone()
+    assert row is not None
+    token = row["tracking_token"]
+    assert token is not None
+
+    # Simulate open
+    resp2 = await client.get(f"/track/{token}")
+    assert resp2.status_code == 200
+    assert "image/gif" in resp2.headers["content-type"]
+
+    # Verify open recorded
+    resp3 = await client.get(f"/messages/{msg_id_ref['id']}/opens")
+    assert resp3.status_code == 200
+    opens = resp3.json()
+    assert len(opens) == 1
+    assert opens[0]["token"] == token
+
+
+@pytest.mark.asyncio
+async def test_message_opens_list(client):
+    from unittest.mock import patch, AsyncMock
+    account = await _create_test_account(client)
+
+    with patch("app.main.send_message", new_callable=AsyncMock, return_value="<mid@example.com>"):
+        resp = await client.post("/send", json={
+            "account_id": account["id"],
+            "to": "to@example.com",
+            "subject": "Open List Test",
+            "html": "<p>Hello</p>",
+            "track_opens": True,
+        })
+    msg_id = resp.json()["id"]
+
+    from app.db import get_db
+    db = await get_db()
+    cursor = await db.execute("SELECT tracking_token FROM messages WHERE id = ?", (msg_id,))
+    row = await cursor.fetchone()
+    token = row["tracking_token"]
+
+    # Two opens
+    await client.get(f"/track/{token}")
+    await client.get(f"/track/{token}")
+
+    resp = await client.get(f"/messages/{msg_id}/opens")
+    assert resp.status_code == 200
+    opens = resp.json()
+    assert len(opens) == 2

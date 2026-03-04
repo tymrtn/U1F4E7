@@ -17,6 +17,8 @@ async def create_message(  # noqa: PLR0913
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
     initial_status: str = "queued",
+    track_opens: bool = False,
+    tracking_token: Optional[str] = None,
 ) -> dict:
     msg_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -25,10 +27,10 @@ async def create_message(  # noqa: PLR0913
     await db.execute(
         f"""INSERT INTO messages
         (id, account_id, direction, from_addr, to_addr, subject, status, created_at,
-         text_content, html_content)
-        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?)""",
+         text_content, html_content, track_opens, tracking_token)
+        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?, ?, ?)""",
         (msg_id, account_id, direction, from_addr, to_addr, subject, now,
-         text_content, html_content),
+         text_content, html_content, 1 if track_opens else 0, tracking_token),
     )
     await db.commit()
 
@@ -41,6 +43,8 @@ async def create_message(  # noqa: PLR0913
         "subject": subject,
         "status": initial_status,
         "created_at": now,
+        "track_opens": track_opens,
+        "tracking_token": tracking_token,
     }
 
 
@@ -161,6 +165,36 @@ async def get_stats() -> dict:
         "queued": queued,
         "success_rate": round(sent / total * 100, 1) if total > 0 else 0,
     }
+
+
+async def record_open(token: str, user_agent: Optional[str] = None, ip_addr: Optional[str] = None) -> Optional[str]:
+    """Record an open event for a message by its tracking token. Returns message_id or None."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM messages WHERE tracking_token = ?", (token,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    message_id = row["id"]
+    open_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO message_opens (id, message_id, token, opened_at, user_agent, ip_addr) VALUES (?, ?, ?, ?, ?, ?)",
+        (open_id, message_id, token, now, user_agent, ip_addr),
+    )
+    await db.commit()
+    return message_id
+
+
+async def list_opens(message_id: str) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, message_id, token, opened_at, user_agent, ip_addr FROM message_opens WHERE message_id = ? ORDER BY opened_at DESC",
+        (message_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
 def _row_to_dict(row) -> dict:

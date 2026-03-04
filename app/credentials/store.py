@@ -28,6 +28,8 @@ async def create_account(
     rate_limit_per_hour: Optional[int] = None,
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
+    signature_text: Optional[str] = None,
+    signature_html: Optional[str] = None,
 ) -> dict:
     account_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -44,14 +46,14 @@ async def create_account(
          username, encrypted_password, smtp_username, encrypted_smtp_password,
          imap_username, encrypted_imap_password, display_name,
          approval_required, auto_send_threshold, review_threshold, rate_limit_per_hour,
-         webhook_url, webhook_secret, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         webhook_url, webhook_secret, signature_text, signature_html, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             account_id, name, smtp_host, smtp_port, imap_host, imap_port,
             username, encrypted_password, smtp_username, encrypted_smtp_pw,
             imap_username, encrypted_imap_pw, display_name,
             1 if approval_required else 0, auto_send_threshold, review_threshold, rate_limit_per_hour,
-            webhook_url, encrypted_webhook_secret, now,
+            webhook_url, encrypted_webhook_secret, signature_text, signature_html, now,
         ),
     )
     await db.commit()
@@ -80,7 +82,8 @@ async def list_accounts() -> list[dict]:
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
                   username, smtp_username, imap_username, display_name,
                   approval_required, auto_send_threshold, review_threshold,
-                  rate_limit_per_hour, webhook_url, created_at, verified_at
+                  rate_limit_per_hour, webhook_url, signature_text, signature_html,
+                  created_at, verified_at
            FROM accounts ORDER BY created_at DESC"""
     )
     rows = await cursor.fetchall()
@@ -93,7 +96,8 @@ async def get_account(account_id: str) -> Optional[dict]:
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
                   username, smtp_username, imap_username, display_name,
                   approval_required, auto_send_threshold, review_threshold,
-                  rate_limit_per_hour, webhook_url, created_at, verified_at
+                  rate_limit_per_hour, webhook_url, signature_text, signature_html,
+                  created_at, verified_at
            FROM accounts WHERE id = ?""",
         (account_id,),
     )
@@ -138,7 +142,8 @@ async def get_account_by_name(name: str) -> Optional[dict]:
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
                   username, smtp_username, imap_username, display_name,
                   approval_required, auto_send_threshold, review_threshold,
-                  rate_limit_per_hour, webhook_url, created_at, verified_at
+                  rate_limit_per_hour, webhook_url, signature_text, signature_html,
+                  created_at, verified_at
            FROM accounts WHERE name = ?""",
         (name,),
     )
@@ -153,7 +158,7 @@ async def update_account(account_id: str, **fields) -> Optional[dict]:
 
     allowed = {
         "display_name", "auto_send_threshold", "review_threshold",
-        "rate_limit_per_hour", "webhook_url",
+        "rate_limit_per_hour", "webhook_url", "signature_text", "signature_html",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
 
@@ -194,6 +199,7 @@ async def update_verified(account_id: str):
 
 
 def _row_to_dict(row) -> dict:
+    keys = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
         "name": row["name"],
@@ -209,7 +215,9 @@ def _row_to_dict(row) -> dict:
         "auto_send_threshold": row["auto_send_threshold"] if row["auto_send_threshold"] is not None else 0.85,
         "review_threshold": row["review_threshold"] if row["review_threshold"] is not None else 0.50,
         "rate_limit_per_hour": row["rate_limit_per_hour"],
-        "webhook_url": row["webhook_url"] if "webhook_url" in row.keys() else None,
+        "webhook_url": row["webhook_url"] if "webhook_url" in keys else None,
+        "signature_text": row["signature_text"] if "signature_text" in keys else None,
+        "signature_html": row["signature_html"] if "signature_html" in keys else None,
         "created_at": row["created_at"],
         "verified_at": row["verified_at"],
     }

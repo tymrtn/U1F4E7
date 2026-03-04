@@ -24,6 +24,10 @@ def build_mime_message(
     text: Optional[str] = None,
     html: Optional[str] = None,
     display_name: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    custom_headers: Optional[dict] = None,
 ) -> EmailMessage:
     msg = EmailMessage()
 
@@ -33,6 +37,15 @@ def build_mime_message(
         msg["From"] = from_addr
     msg["To"] = to_addr
     msg["Subject"] = subject
+
+    if cc:
+        msg["Cc"] = cc
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if bcc:
+        msg["Bcc"] = bcc  # aiosmtplib strips Bcc from wire, uses it for RCPT TO
+    for k, v in (custom_headers or {}).items():
+        msg[k] = v
 
     if text and html:
         msg.set_content(text)

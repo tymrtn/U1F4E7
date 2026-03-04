@@ -20,6 +20,9 @@ async def create_draft(
     created_by: Optional[str] = None,
     send_after: Optional[str] = None,
     snoozed_until: Optional[str] = None,
+    cc_addr: Optional[str] = None,
+    bcc_addr: Optional[str] = None,
+    reply_to: Optional[str] = None,
 ) -> dict:
     draft_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -30,10 +33,11 @@ async def create_draft(
         """INSERT INTO drafts
         (id, account_id, status, to_addr, subject, text_content, html_content,
          in_reply_to, metadata, created_at, updated_at, created_by,
-         send_after, snoozed_until)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         send_after, snoozed_until, cc_addr, bcc_addr, reply_to)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (draft_id, account_id, to_addr, subject, text_content, html_content,
-         in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until),
+         in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until,
+         cc_addr, bcc_addr, reply_to),
     )
     await db.commit()
 
@@ -42,6 +46,9 @@ async def create_draft(
         "account_id": account_id,
         "status": "draft",
         "to_addr": to_addr,
+        "cc_addr": cc_addr,
+        "bcc_addr": bcc_addr,
+        "reply_to": reply_to,
         "subject": subject,
         "text_content": text_content,
         "html_content": html_content,
@@ -66,8 +73,8 @@ async def list_drafts(
     hide_snoozed: bool = False,
 ) -> list[dict]:
     db = await get_db()
-    query = """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+    query = """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
                   send_after, snoozed_until
            FROM drafts
@@ -91,8 +98,8 @@ async def list_drafts(
 async def get_draft(draft_id: str) -> Optional[dict]:
     db = await get_db()
     cursor = await db.execute(
-        """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+        """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
                   send_after, snoozed_until
            FROM drafts WHERE id = ?""",
@@ -112,7 +119,8 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     # Fields that can be explicitly set to NULL (clearing them)
     clearable_fields = {"send_after", "snoozed_until"}
     allowed = {"to_addr", "subject", "text_content", "html_content",
-               "in_reply_to", "metadata", "send_after", "snoozed_until"}
+               "in_reply_to", "metadata", "send_after", "snoozed_until",
+               "cc_addr", "bcc_addr", "reply_to"}
 
     updates = {}
     for k, v in fields.items():
@@ -165,8 +173,8 @@ async def get_scheduled_drafts() -> list[dict]:
     """Return drafts that are approved (send_after set) and past their send time."""
     db = await get_db()
     cursor = await db.execute(
-        """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+        """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
                   send_after, snoozed_until
            FROM drafts
@@ -182,11 +190,15 @@ async def get_scheduled_drafts() -> list[dict]:
 def _row_to_dict(row) -> dict:
     meta_raw = row["metadata"]
     metadata = json.loads(meta_raw) if meta_raw else None
+    keys = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
         "account_id": row["account_id"],
         "status": row["status"],
         "to_addr": row["to_addr"],
+        "cc_addr": row["cc_addr"] if "cc_addr" in keys else None,
+        "bcc_addr": row["bcc_addr"] if "bcc_addr" in keys else None,
+        "reply_to": row["reply_to"] if "reply_to" in keys else None,
         "subject": row["subject"],
         "text_content": row["text_content"],
         "html_content": row["html_content"],

@@ -13,7 +13,8 @@ import os
 from typing import Optional, Literal
 from urllib.parse import unquote
 
-from fastapi.responses import JSONResponse
+import uuid
+from fastapi.responses import JSONResponse, Response
 from starlette.responses import StreamingResponse
 
 from datetime import datetime, timezone, timedelta
@@ -55,6 +56,8 @@ async def require_api_key(
     if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/static"):
         return
     if request.url.path.endswith("/start-here"):
+        return
+    if request.url.path.startswith("/track/"):
         return
     if not creds or creds.credentials != _api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
@@ -111,6 +114,12 @@ class SendEmail(BaseModel):
     html: Optional[str] = None
     text: Optional[str] = None
     display_name: Optional[str] = None
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    reply_to: Optional[str] = None
+    headers: Optional[dict] = None
+    use_signature: bool = True
+    track_opens: bool = False
     wait: bool = True
 
 
@@ -123,6 +132,9 @@ class CreateDraft(BaseModel):
     metadata: Optional[dict] = None
     created_by: Optional[str] = None
     send_after: Optional[str] = None
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    reply_to: Optional[str] = None
 
 
 class UpdateDraft(BaseModel):
@@ -132,6 +144,9 @@ class UpdateDraft(BaseModel):
     html: Optional[str] = None
     in_reply_to: Optional[str] = None
     metadata: Optional[dict] = None
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    reply_to: Optional[str] = None
 
 
 class ScheduleDraft(BaseModel):
@@ -174,6 +189,8 @@ class UpdateAccount(BaseModel):
     rate_limit_per_hour: Optional[int] = None
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None
+    signature_text: Optional[str] = None
+    signature_html: Optional[str] = None
 
 
 class DomainPolicyIn(BaseModel):
@@ -259,6 +276,31 @@ async def send_email(request: Request, data: SendEmail):
     from_addr = data.from_email or account["username"]
     pool = request.app.state.smtp_pool
 
+    # Inject account signature
+    text_body = data.text
+    html_body = data.html
+    if data.use_signature:
+        sig_text = account.get("signature_text")
+        sig_html = account.get("signature_html")
+        if sig_text and text_body:
+            text_body = text_body + "\n\n-- \n" + sig_text
+        if sig_html and html_body:
+            if "</body>" in html_body:
+                html_body = html_body.replace("</body>", f'<div class="env-signature">{sig_html}</div></body>', 1)
+            else:
+                html_body = html_body + f'<div class="env-signature">{sig_html}</div>'
+
+    # Prepare open tracking token
+    tracking_token = None
+    if data.track_opens and html_body:
+        tracking_token = str(uuid.uuid4())
+        base_url = os.getenv("ENVELOPE_BASE_URL", "")
+        pixel = f'<img src="{base_url}/track/{tracking_token}" width="1" height="1" style="display:none;" />'
+        if "</body>" in html_body:
+            html_body = html_body.replace("</body>", pixel + "</body>", 1)
+        else:
+            html_body = html_body + pixel
+
     # Async mode: queue and return immediately
     if not data.wait:
         # Create as 'queued' so the background worker picks it up
@@ -267,9 +309,11 @@ async def send_email(request: Request, data: SendEmail):
             from_addr=from_addr,
             to_addr=data.to,
             subject=data.subject,
-            text_content=data.text,
-            html_content=data.html,
+            text_content=text_body,
+            html_content=html_body,
             initial_status="queued",
+            track_opens=data.track_opens,
+            tracking_token=tracking_token,
         )
         request.app.state.send_worker.notify()
         return {
@@ -289,18 +333,24 @@ async def send_email(request: Request, data: SendEmail):
         from_addr=from_addr,
         to_addr=data.to,
         subject=data.subject,
-        text_content=data.text,
-        html_content=data.html,
+        text_content=text_body,
+        html_content=html_body,
         initial_status="sending",
+        track_opens=data.track_opens,
+        tracking_token=tracking_token,
     )
 
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=data.to,
         subject=data.subject,
-        text=data.text,
-        html=data.html,
+        text=text_body,
+        html=html_body,
         display_name=data.display_name or account.get("display_name"),
+        cc=data.cc,
+        bcc=data.bcc,
+        reply_to=data.reply_to,
+        custom_headers=data.headers,
     )
 
     try:
@@ -344,6 +394,32 @@ async def get_message(message_id: str):
 @app.get("/stats")
 async def get_stats():
     return await messages.get_stats()
+
+
+# 1x1 transparent GIF bytes
+_TRANSPARENT_GIF = (
+    b"\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00"
+    b"\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x00\x00\x00\x00"
+    b"\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02"
+    b"\x44\x01\x00\x3b"
+)
+
+
+@app.get("/track/{token}")
+async def track_open(request: Request, token: str):
+    """Open tracking pixel. Always returns a 1x1 GIF, never 404."""
+    user_agent = request.headers.get("user-agent")
+    ip_addr = request.client.host if request.client else None
+    await messages.record_open(token, user_agent=user_agent, ip_addr=ip_addr)
+    return Response(content=_TRANSPARENT_GIF, media_type="image/gif")
+
+
+@app.get("/messages/{message_id}/opens")
+async def list_message_opens(message_id: str):
+    msg = await messages.get_message(message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return await messages.list_opens(message_id)
 
 
 # --- Discovery ---
@@ -443,6 +519,10 @@ async def update_account(account_id: str, data: UpdateAccount):
         updates["webhook_url"] = data.webhook_url
     if data.webhook_secret is not None:
         updates["webhook_secret"] = data.webhook_secret
+    if data.signature_text is not None:
+        updates["signature_text"] = data.signature_text
+    if data.signature_html is not None:
+        updates["signature_html"] = data.signature_html
     if not updates:
         return account
     updated = await credential_store.update_account(account_id, **updates)
@@ -499,6 +579,9 @@ async def create_draft(account_id: str, data: CreateDraft):
         metadata=data.metadata,
         created_by=data.created_by,
         send_after=data.send_after,
+        cc_addr=data.cc,
+        bcc_addr=data.bcc,
+        reply_to=data.reply_to,
     )
     return draft
 
@@ -549,6 +632,12 @@ async def update_draft(account_id: str, draft_id: str, data: UpdateDraft):
         fields["in_reply_to"] = data.in_reply_to
     if data.metadata is not None:
         fields["metadata"] = data.metadata
+    if data.cc is not None:
+        fields["cc_addr"] = data.cc
+    if data.bcc is not None:
+        fields["bcc_addr"] = data.bcc
+    if data.reply_to is not None:
+        fields["reply_to"] = data.reply_to
     updated = await drafts.update_draft(draft_id, **fields)
     return updated
 
@@ -604,14 +693,30 @@ async def _send_draft(
     from_addr = account["username"]
     pool = request.app.state.smtp_pool
 
+    # Inject account signature
+    text_body = draft["text_content"]
+    html_body = draft["html_content"]
+    sig_text = account.get("signature_text")
+    sig_html = account.get("signature_html")
+    if sig_text and text_body:
+        text_body = text_body + "\n\n-- \n" + sig_text
+    if sig_html and html_body:
+        if "</body>" in html_body:
+            html_body = html_body.replace("</body>", f'<div class="env-signature">{sig_html}</div></body>', 1)
+        else:
+            html_body = html_body + f'<div class="env-signature">{sig_html}</div>'
+
     # Build MIME message
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=draft["to_addr"],
         subject=draft["subject"] or "",
-        text=draft["text_content"],
-        html=draft["html_content"],
+        text=text_body,
+        html=html_body,
         display_name=account.get("display_name"),
+        cc=draft.get("cc_addr"),
+        bcc=draft.get("bcc_addr"),
+        reply_to=draft.get("reply_to"),
     )
     if draft["in_reply_to"]:
         msg["In-Reply-To"] = draft["in_reply_to"]
@@ -622,8 +727,8 @@ async def _send_draft(
         from_addr=from_addr,
         to_addr=draft["to_addr"],
         subject=draft["subject"],
-        text_content=draft["text_content"],
-        html_content=draft["html_content"],
+        text_content=text_body,
+        html_content=html_body,
     )
 
     # Send via SMTP

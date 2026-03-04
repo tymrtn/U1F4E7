@@ -115,6 +115,17 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN webhook_url TEXT",
     "ALTER TABLE accounts ADD COLUMN webhook_secret TEXT",
     "CREATE TABLE IF NOT EXISTS webhook_state (account_id TEXT PRIMARY KEY, last_uid TEXT, updated_at TEXT)",
+    # Story 017 — Cc, Bcc, Reply-To
+    "ALTER TABLE drafts ADD COLUMN cc_addr TEXT",
+    "ALTER TABLE drafts ADD COLUMN bcc_addr TEXT",
+    "ALTER TABLE drafts ADD COLUMN reply_to TEXT",
+    # Story 018 — Account signatures
+    "ALTER TABLE accounts ADD COLUMN signature_text TEXT",
+    "ALTER TABLE accounts ADD COLUMN signature_html TEXT",
+    # Story 019 — Open tracking
+    "ALTER TABLE messages ADD COLUMN track_opens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN tracking_token TEXT",
+    "CREATE TABLE IF NOT EXISTS message_opens (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, token TEXT NOT NULL, opened_at TEXT NOT NULL, user_agent TEXT, ip_addr TEXT)",
 ]
 
 _connection: aiosqlite.Connection | None = None

@@ -106,6 +106,9 @@ async def create_draft_tool(
     html: str = None,
     in_reply_to: str = None,
     created_by: str = "agent",
+    cc: str = None,
+    bcc: str = None,
+    reply_to: str = None,
 ) -> str:
     """Create a draft email for human review.
 
@@ -114,6 +117,7 @@ async def create_draft_tool(
 
     Set in_reply_to to the Message-ID of the email being replied to.
     created_by should be 'agent' for agent-created drafts.
+    cc/bcc: comma-separated addresses. reply_to: single address.
     """
     draft = await drafts_module.create_draft(
         account_id=account_id,
@@ -123,6 +127,9 @@ async def create_draft_tool(
         html_content=html,
         in_reply_to=in_reply_to,
         created_by=created_by,
+        cc_addr=cc,
+        bcc_addr=bcc,
+        reply_to=reply_to,
     )
     return json.dumps(draft, indent=2)
 
@@ -146,6 +153,9 @@ async def send_email_tool(
     subject: str,
     text: str = None,
     html: str = None,
+    cc: str = None,
+    bcc: str = None,
+    reply_to: str = None,
 ) -> str:
     """Send an email immediately without creating a draft.
 
@@ -153,6 +163,7 @@ async def send_email_tool(
     For low-confidence actions, use create_draft_tool instead.
 
     Requires the account to have valid SMTP credentials configured.
+    cc/bcc: comma-separated addresses. reply_to: single address.
     """
     from app.credentials.store import get_account_with_credentials
     from app.transport.smtp import build_mime_message, send_message, SmtpSendError
@@ -170,6 +181,9 @@ async def send_email_tool(
         text=text,
         html=html,
         display_name=account.get("display_name"),
+        cc=cc,
+        bcc=bcc,
+        reply_to=reply_to,
     )
 
     record = await messages.create_message(
@@ -229,6 +243,9 @@ async def approve_draft_tool(account_id: str, draft_id: str) -> str:
         text=draft["text_content"],
         html=draft["html_content"],
         display_name=account.get("display_name"),
+        cc=draft.get("cc_addr"),
+        bcc=draft.get("bcc_addr"),
+        reply_to=draft.get("reply_to"),
     )
     if draft["in_reply_to"]:
         msg["In-Reply-To"] = draft["in_reply_to"]
