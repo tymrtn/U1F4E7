@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Envelope — Review Queue</title>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Instrument Sans', 'system-ui', 'sans-serif'],
+                        mono: ['DM Mono', 'monospace'],
+                    },
+                    colors: {
+                        ink: '#0a0a0a',
+                        paper: '#f7f6f3',
+                        mid: '#8a8780',
+                        rule: '#d9d7d1',
+                        accent: '#1a6b4a',
+                        'accent-light': '#e8f5ee',
+                        warn: '#c4421a',
+                        'warn-light': '#fdf0ec',
+                        pending: '#9a7b1a',
+                        'pending-light': '#fdf8e8',
+                    },
+                },
+            },
+        }
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style type="text/css">
+        body { -webkit-font-smoothing: antialiased; }
+        .btn-primary { @apply bg-accent text-white text-sm font-medium px-4 py-2 rounded hover:opacity-90 transition-opacity; }
+        .btn-ghost   { @apply text-mid text-sm font-medium px-3 py-2 rounded hover:text-ink hover:bg-rule/40 transition-colors border border-rule; }
+        .btn-warn    { @apply text-warn text-sm font-medium px-3 py-2 rounded hover:bg-warn-light transition-colors; }
+        .input-field { @apply border border-rule bg-white text-ink text-sm rounded px-3 py-2 font-mono w-full focus:outline-none focus:border-accent; }
+        .section-label { @apply text-xs font-mono font-medium tracking-widest uppercase text-mid; }
+    </style>
+</head>
+<body class="bg-paper text-ink min-h-screen font-sans">
+
+    <!-- Header -->
+    <header id="header" class="border-b border-rule">
+        <div class="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-4">
+                <a href="/" class="flex items-center gap-3">
+                    <div class="w-8 h-8 border-2 border-ink flex items-center justify-center">
+                        <svg width="14" height="10" viewBox="0 0 14 10" fill="none">
+                            <path d="M1 1L7 5.5L13 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            <rect x="0.5" y="0.5" width="13" height="9" rx="0.5" stroke="currentColor" stroke-width="1"/>
+                        </svg>
+                    </div>
+                    <span class="text-lg font-semibold tracking-tight">Envelope</span>
+                </a>
+                <span class="text-mid text-sm font-mono">/</span>
+                <span class="text-sm font-medium">Review Queue</span>
+            </div>
+            <a href="/" class="text-xs text-mid font-mono hover:text-ink transition-colors">Dashboard →</a>
+        </div>
+    </header>
+
+    <!-- React mount point -->
+    <div id="review-root" class="max-w-4xl mx-auto px-6 py-8"></div>
+
+    <script type="text/babel" src="/static/review.js"></script>
+</body>
+</html>
