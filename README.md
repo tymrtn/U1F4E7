@@ -1,8 +1,11 @@
 <p align="center">
   <h1 align="center">📧 Envelope</h1>
+  <p align="center"><code>U+1F4E7</code> — if you know, you know.</p>
   <p align="center"><strong>The open-source email API for AI agents.</strong></p>
   <p align="center">BYO mailbox. MCP-native. Zero sending fees.</p>
 </p>
+
+> **Why U1F4E7?** It's the Unicode codepoint for 📧. Humans see a repo name. Agents see an envelope. The ones who get it are the ones this is built for.
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> •
