@@ -1,20 +1,67 @@
-# Envelope Email
+<p align="center">
+  <h1 align="center">📧 Envelope</h1>
+  <p align="center"><strong>The open-source email API for AI agents.</strong></p>
+  <p align="center">BYO mailbox. MCP-native. Zero sending fees.</p>
+</p>
 
-Turn any IMAP/SMTP email account into a programmable API. Agent-native primitives: drafts, approval gates, threading, audit logs.
+<p align="center">
+  <a href="#quickstart">Quickstart</a> •
+  <a href="#why-envelope">Why Envelope</a> •
+  <a href="#features">Features</a> •
+  <a href="#mcp-integration">MCP Integration</a> •
+  <a href="#api-reference">API</a> •
+  <a href="#comparison">Comparison</a> •
+  <a href="LICENSE">License</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
+  <img src="https://img.shields.io/badge/MCP-native-purple.svg" alt="MCP Native">
+</p>
+
+---
+
+Turn any IMAP/SMTP mailbox into a programmable email API. Connect Gmail, Outlook, Fastmail, Migadu — anything with IMAP/SMTP — and get a REST API + MCP server that AI agents can use natively.
+
+No new domain. No DNS records. No per-message fees. Your agent sends email **as you**, from **your** mailbox, with **your** approval.
+
+```bash
+# Your agent can now send email
+curl -X POST http://localhost:8000/send \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"account_id": "...", "to": "hello@example.com", "subject": "Hello", "text": "Sent by my agent"}'
+```
+
+## Why Envelope
+
+Email is the last integration AI agents can't own. Every other channel — Slack, Discord, SMS — has clean programmatic access. Email still requires either:
+
+1. **A paid sending service** (Resend, Mailgun, SendGrid) that forces a new domain, DNS configuration, and per-message billing for what amounts to an SMTP relay
+2. **Raw IMAP/SMTP library code** that every team rewrites from scratch, with no standard patterns for threading, drafts, or audit trails
+
+Neither path gives agents what they actually need: **draft previews before sending, approval gates for human oversight, threading that preserves conversation context, and accountability logs for every action taken.**
+
+Envelope solves this. Two layers:
+
+- **Layer 1 — BYO Mailbox API:** Connect any IMAP/SMTP account. Send, read, search, and track email through a REST API. Zero infrastructure cost — you already own the mailbox.
+- **Layer 2 — Agent Primitives:** Draft previews, approval gates, reply threading, signature management, domain policies, action audit logs, and an MCP server for native AI integration.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/tymrtn/U1F4E7.git && cd U1F4E7
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set `ENVELOPE_SECRET_KEY` to any passphrase (used to encrypt stored credentials):
+Set `ENVELOPE_SECRET_KEY` in `.env` (any passphrase — used to encrypt stored credentials):
 
-```
-ENVELOPE_SECRET_KEY=pick-any-passphrase-here
+```bash
+# Generate a key
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 Start the server:
@@ -23,206 +70,181 @@ Start the server:
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000 (dashboard) or http://localhost:8000/review (agent review queue).
+Open **http://localhost:8000** → add your first mailbox → start sending.
 
-## Adding an Email Account
+## Features
 
-1. Click **+ Add** in the Accounts section
-2. Enter your email address in the Username field
-3. Click **Discover** — probes DNS (SRV, autoconfig, MX) to find your provider's SMTP/IMAP servers automatically
-4. Enter your password (app password if using Gmail/Outlook with 2FA)
-5. Click **Save Account**, then **Verify** to test the SMTP connection
+### Core API
+- **Send email** with CC, BCC, Reply-To, attachments
+- **Read inbox** via IMAP — list, search, fetch messages
+- **Thread reconstruction** — follow conversation chains
+- **Folder management** — list and navigate mailbox folders
+- **Auto-discovery** — paste an email address, Envelope finds the IMAP/SMTP settings
 
-Works with Gmail, Outlook, Fastmail, Migadu, and most providers. If discovery fails, enter SMTP/IMAP host and port manually.
+### Agent Primitives
+- **Draft previews** — agent composes, human reviews before send
+- **Approval gates** — human-in-the-loop checkpoint before any outbound message
+- **Domain policies** — per-domain rules that govern agent behavior
+- **Action audit log** — full provenance trail of every agent action
+- **Signature management** — per-account, per-context signatures
+- **Open tracking** — pixel-based read receipts
+- **Scheduled sends** — `send_after` for time-delayed delivery
+- **Rate limiting** — per-account send throttling
 
-## Sending Email
+### MCP Integration
+- **Native MCP server** — AI agents connect via Model Context Protocol
+- **Policy-aware** — agents call `start_here()` to learn account rules before acting
+- **Action logging** — every MCP tool call is logged for audit
 
-Use the Compose form in the dashboard, or hit the API directly:
+### Dashboard
+- **Web UI** at `/` — manage accounts, view messages, monitor status
+- **Review queue** at `/review` — approve or reject agent-drafted emails
+- **Agent status** at `/agent/status` — monitor agent activity
 
-```bash
-# Synchronous (waits for SMTP delivery)
-curl -X POST http://localhost:8000/send \
-  -H "Content-Type: application/json" \
-  -d '{
-    "account_id": "<account-id>",
-    "to": "recipient@example.com",
-    "subject": "Hello",
-    "text": "Sent via Envelope"
-  }'
+## MCP Integration
 
-# Async (queues for background delivery with retry)
-curl -X POST http://localhost:8000/send \
-  -H "Content-Type: application/json" \
-  -d '{
-    "account_id": "<account-id>",
-    "to": "recipient@example.com",
-    "subject": "Hello",
-    "text": "Sent via Envelope",
-    "wait": false
-  }'
+Envelope ships with a built-in [MCP](https://modelcontextprotocol.io/) server. Add it to your Claude Code, Cursor, or any MCP-compatible client:
+
+```json
+{
+  "mcpServers": {
+    "envelope": {
+      "command": "python",
+      "args": ["-m", "app.mcp"],
+      "cwd": "/path/to/U1F4E7",
+      "env": {
+        "ENVELOPE_SECRET_KEY": "your-key",
+        "ENVELOPE_API_URL": "http://localhost:8000"
+      }
+    }
+  }
+}
 ```
 
-## Drafts & Approval
+Your agent can then:
 
-Drafts are the core primitive for human-in-the-loop and agent workflows.
-
-```bash
-# Create a draft
-curl -X POST http://localhost:8000/accounts/{id}/drafts \
-  -H "Content-Type: application/json" \
-  -d '{"to": "recipient@example.com", "subject": "Hello", "text": "Draft body"}'
-
-# Approve and send immediately
-curl -X POST http://localhost:8000/accounts/{id}/drafts/{draft_id}/approve
-
-# Schedule for later
-curl -X PATCH http://localhost:8000/accounts/{id}/drafts/{draft_id} \
-  -H "Content-Type: application/json" \
-  -d '{"send_after": "2026-03-01T09:00:00Z"}'
-
-# Snooze (hide from queue until a future time)
-curl -X PATCH http://localhost:8000/accounts/{id}/drafts/{draft_id} \
-  -H "Content-Type: application/json" \
-  -d '{"snoozed_until": "2026-02-25T08:00:00Z"}'
-
-# Reject with feedback (agent regenerates on next poll)
-curl -X POST http://localhost:8000/accounts/{id}/drafts/{draft_id}/reject \
-  -H "Content-Type: application/json" \
-  -d '{"feedback": "Too formal, use a warmer tone"}'
 ```
-
-## Review Queue
-
-Open http://localhost:8000/review to review agent-created drafts without re-reading every email.
-
-The queue is decision-first: each card leads with the agent's reasoning, not the draft text. Layout adapts based on where confidence falls relative to your account thresholds:
-
-- **Above auto-send threshold** — collapsed, batch-selectable, Send is the primary action
-- **Between thresholds** — expanded with variable highlights, full four-intent CTA row: Send / Send later / Snooze / Feedback
-- **Escalations** — no approve button; escalation note leads; View Thread fetches the original message inline
-
-Thresholds are visible and adjustable inline — changes PATCH the account immediately.
-
-## Inbox Agent
-
-Enable to classify incoming mail and create drafts for review automatically:
-
-```env
-AGENT_ENABLED=true
-AGENT_ACCOUNT_ID=<account-id>
-AGENT_POLL_INTERVAL=120
-```
-
-The agent outputs structured signals alongside each draft (`kb_match`, `sensitive_categories`, `thread_context`) so the review queue can show scannable evidence rather than a score tier.
-
-Trigger a manual poll:
-
-```bash
-curl -X POST http://localhost:8000/agent/poll
+→ start_here(account_id="...")     # Learn account policies
+→ create_draft(to="...", ...)      # Compose a draft
+→ list_drafts(account_id="...")    # Review pending drafts  
+→ log_action(action="reviewed_inbox", ...)  # Audit trail
 ```
 
 ## API Reference
 
 ### Accounts
-
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/accounts` | List all accounts |
-| POST | `/accounts` | Add an account |
-| GET | `/accounts/{id}` | Get account details (includes thresholds) |
-| PATCH | `/accounts/{id}` | Update display_name, auto_send_threshold, review_threshold |
-| DELETE | `/accounts/{id}` | Remove an account |
-| POST | `/accounts/{id}/verify` | Test SMTP connection |
-| GET | `/accounts/discover?email=` | Auto-discover mail server settings |
-| GET | `/accounts/discover/stream?email=` | SSE progressive discovery stream |
+| `POST` | `/accounts` | Add a mailbox (IMAP/SMTP credentials) |
+| `GET` | `/accounts` | List all accounts |
+| `GET` | `/accounts/{id}` | Get account details |
+| `PATCH` | `/accounts/{id}` | Update account settings |
+| `DELETE` | `/accounts/{id}` | Remove account |
+| `POST` | `/accounts/{id}/verify` | Test IMAP/SMTP connection |
+| `GET` | `/accounts/discover?email=...` | Auto-discover mail settings |
 
-### Drafts
-
+### Send & Read
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/accounts/{id}/drafts` | Create draft |
-| GET | `/accounts/{id}/drafts` | List drafts (filter by status, created_by, hide_snoozed) |
-| GET | `/accounts/{id}/drafts/{draft_id}` | Get draft |
-| PUT | `/accounts/{id}/drafts/{draft_id}` | Update draft content |
-| PATCH | `/accounts/{id}/drafts/{draft_id}` | Set send_after or snoozed_until |
-| POST | `/accounts/{id}/drafts/{draft_id}/approve` | Send now (records approved_by=review-queue) |
-| POST | `/accounts/{id}/drafts/{draft_id}/send` | Send now (generic, accepts approved_by param) |
-| POST | `/accounts/{id}/drafts/{draft_id}/reject` | Reject with optional feedback |
-| DELETE | `/accounts/{id}/drafts/{draft_id}` | Discard draft |
+| `POST` | `/send` | Send an email |
+| `GET` | `/accounts/{id}/inbox` | List inbox messages |
+| `GET` | `/accounts/{id}/inbox/{uid}` | Get full message |
+| `GET` | `/accounts/{id}/threads/{msg_id}` | Get conversation thread |
+| `GET` | `/accounts/{id}/folders` | List IMAP folders |
 
-### Inbox & Threads
-
+### Drafts & Approval
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/accounts/{id}/inbox` | List inbox messages |
-| GET | `/accounts/{id}/inbox/{uid}` | Fetch full message |
-| GET | `/accounts/{id}/threads/{message_id}` | Get thread by message-id |
-| GET | `/accounts/{id}/folders` | List IMAP folders |
-| GET | `/accounts/{id}/context?q=` | Semantic search over indexed mail |
-
-### Messages & Stats
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/send` | Send email (wait: false for async) |
-| GET | `/messages` | List sent messages |
-| GET | `/messages/{id}` | Get message details |
-| GET | `/stats` | Send stats |
+| `POST` | `/accounts/{id}/drafts` | Create a draft |
+| `GET` | `/accounts/{id}/drafts` | List pending drafts |
+| `POST` | `/accounts/{id}/drafts/{id}/approve` | Approve and send |
+| `POST` | `/accounts/{id}/drafts/{id}/reject` | Reject with reason |
+| `DELETE` | `/accounts/{id}/drafts/{id}` | Discard draft |
 
 ### Agent
-
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/agent/status` | Agent status and poll counts |
-| GET | `/agent/actions` | Agent action log |
-| POST | `/agent/poll` | Trigger manual poll |
+| `GET` | `/agent/status` | Agent activity status |
+| `GET` | `/agent/actions` | Audit log of all actions |
+| `POST` | `/agent/poll` | Poll for new messages |
 
-## Project Structure
+### Monitoring
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/stats` | Send/receive statistics |
+| `GET` | `/messages` | Global message log |
+
+## Comparison
+
+| Feature | Envelope | Resend | Mailgun | SendGrid |
+|---------|----------|--------|---------|----------|
+| BYO mailbox (IMAP/SMTP) | ✅ | ❌ | ❌ | ❌ |
+| MCP server for AI agents | ✅ | ❌ | ❌ | ❌ |
+| Draft preview + approval gates | ✅ | ❌ | ❌ | ❌ |
+| Agent action audit log | ✅ | ❌ | ❌ | ❌ |
+| Domain policy engine | ✅ | ❌ | ❌ | ❌ |
+| Read inbox (IMAP) | ✅ | ❌ | ✅ | ✅ |
+| Open tracking | ✅ | ✅ | ✅ | ✅ |
+| Per-message pricing | **$0** | $0.001+ | $0.001+ | $0.001+ |
+| New domain required | **No** | Yes | Yes | Yes |
+| DNS configuration | **No** | Yes | Yes | Yes |
+| Self-hosted | ✅ | ❌ | ❌ | ❌ |
+| Open source | ✅ | ❌ | ❌ | ❌ |
+| React Email templates | ❌ | ✅ | ❌ | ✅ |
+| Webhooks | ✅ | ✅ | ✅ | ✅ |
+
+## Stack
+
+- **Python 3.11+** / **FastAPI**
+- **aiosmtplib** + **aioimaplib** for async mail transport
+- **SQLite** for persistence (swap to Postgres for production)
+- **MCP SDK** for AI agent integration
+- **Fernet** for credential encryption at rest
+
+## Architecture
 
 ```
-app/
-  main.py              # FastAPI routes
-  db.py                # SQLite setup (WAL mode, migrations)
-  messages.py          # Message tracking
-  drafts.py            # Draft CRUD with approval workflow
-  discovery.py         # Mail server auto-discovery
-  credentials/
-    store.py           # Account CRUD with encrypted passwords
-    crypto.py          # Fernet encryption
-  transport/
-    smtp.py            # SMTP send + MIME construction
-    pool.py            # Connection pool (per-account semaphore, NOOP validation)
-    worker.py          # Background send worker (exponential backoff retry)
-    imap.py            # IMAP read, search, thread reconstruction
-  agent/
-    inbox_agent.py     # Email triage agent (poll, classify, draft, escalate)
-    prompts.py         # LLM system prompts and response schema
-    llm.py             # OpenRouter API client
-    knowledge.py       # Domain knowledge base
-    embeddings.py      # Semantic search over indexed mail
-templates/
-  index.html           # Dashboard (Jinja2)
-  review.html          # Review queue shell
-static/
-  dashboard.js         # Dashboard client logic
-  review.js            # Review queue React app
-tests/
-  test_app.py          # API endpoint tests
-  test_drafts.py       # Draft workflow tests
-  test_pool.py         # Connection pool tests
-  test_worker.py       # Background worker tests
-  test_discovery.py    # Auto-discovery tests
-  test_agent.py        # Agent classification tests
+┌──────────────┐     ┌──────────────────────┐     ┌──────────────┐
+│  AI Agent    │────▶│   Envelope API       │────▶│  Your SMTP   │
+│  (MCP/REST)  │     │  (FastAPI + SQLite)  │     │  (Gmail,     │
+│              │◀────│                      │◀────│   Migadu,    │
+│              │     │  Drafts → Approval   │     │   Fastmail)  │
+│              │     │  Policies → Audit    │     │              │
+└──────────────┘     └──────────────────────┘     └──────────────┘
 ```
 
-## Running Tests
+## Roadmap
+
+- [ ] Python SDK (`pip install envelope-email`)
+- [ ] Node.js SDK
+- [ ] Webhook delivery events
+- [ ] Multi-tenant mode
+- [ ] Postgres adapter
+- [ ] React Email template support
+- [ ] OAuth2 for Gmail/Outlook (no app passwords)
+- [ ] CLI tool (`envelope send ...`)
+- [ ] Docker compose one-liner
+
+## Contributing
+
+Envelope uses an agentic engineering protocol. See `agents/PROTOCOL.md` for contribution workflow.
 
 ```bash
-ENVELOPE_SECRET_KEY=test pytest tests/ -x -q
+# Run tests
+pytest tests/
+
+# Run with debug logging
+uvicorn app.main:app --reload --log-level debug
 ```
 
 ## License
 
-FSL-1.1-ALv2. See [LICENSE](LICENSE).
+[FSL-1.1-ALv2](LICENSE) — Functional Source License. Free to use, modify, and self-host. Converts to Apache 2.0 after 2 years. Cannot be used to build a competing hosted email API service.
 
-See [VISION.md](VISION.md) for product direction and [ARCHITECTURE.md](ARCHITECTURE.md) for system design.
+---
+
+<p align="center">
+  <strong>Built by <a href="https://github.com/tymrtn">Tyler Martin</a></strong><br>
+  <em>Because your agent shouldn't need a $50/month Resend plan to send an email.</em>
+</p>
