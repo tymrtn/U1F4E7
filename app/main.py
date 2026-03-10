@@ -33,6 +33,7 @@ from app import drafts
 from app.discovery import discover, discover_stream
 from app.services import policy as policy_svc
 from app.services import actions as actions_svc
+from app.services import compose as compose_svc
 from app.services.start_here import build_start_here_response
 
 load_dotenv()
@@ -148,6 +149,8 @@ class CreateDraft(BaseModel):
     bcc: Optional[str] = None
     reply_to: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
+    confidence: Optional[float] = None
+    justification: Optional[str] = None
 
 
 class UpdateDraft(BaseModel):
@@ -637,11 +640,30 @@ async def verify_account(request: Request, account_id: str):
 # --- Drafts ---
 
 @app.post("/accounts/{account_id}/drafts", status_code=201)
-async def create_draft(account_id: str, data: CreateDraft):
+async def create_draft(request: Request, account_id: str, data: CreateDraft):
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     att_dicts = _validate_attachments(data.attachments) if data.attachments else None
+    if data.confidence is not None:
+        return await compose_svc.route_composed_email(
+            account_id=account_id,
+            to_addr=data.to,
+            confidence=data.confidence,
+            justification=data.justification or "Draft created via REST compose routing",
+            subject=data.subject,
+            text_content=data.text,
+            html_content=data.html,
+            in_reply_to=data.in_reply_to,
+            metadata=data.metadata,
+            created_by=data.created_by or "agent",
+            send_after=data.send_after,
+            cc_addr=data.cc,
+            bcc_addr=data.bcc,
+            reply_to=data.reply_to,
+            attachments=att_dicts,
+            smtp_pool=request.app.state.smtp_pool,
+        )
     draft = await drafts.create_draft(
         account_id=account_id,
         to_addr=data.to,
@@ -691,7 +713,7 @@ async def update_draft(account_id: str, draft_id: str, data: UpdateDraft):
     draft = await drafts.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         raise HTTPException(status_code=404, detail="Draft not found")
-    if draft["status"] != "draft":
+    if draft["status"] not in compose_svc.EDITABLE_DRAFT_STATUSES:
         raise HTTPException(status_code=409, detail=f"Cannot update draft with status '{draft['status']}'")
     fields = {}
     if data.to is not None:
@@ -723,7 +745,7 @@ async def patch_draft(account_id: str, draft_id: str, data: ScheduleDraft):
     draft = await drafts.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         raise HTTPException(status_code=404, detail="Draft not found")
-    if draft["status"] != "draft":
+    if draft["status"] not in compose_svc.EDITABLE_DRAFT_STATUSES:
         raise HTTPException(status_code=409, detail=f"Cannot update draft with status '{draft['status']}'")
     fields = {}
     for field in data.__fields_set__:
@@ -749,86 +771,20 @@ async def _send_draft(
     draft_id: str,
     approved_by: Optional[str] = None,
 ):
-    draft = await drafts.get_draft(draft_id)
-    if not draft or draft["account_id"] != account_id:
-        raise HTTPException(status_code=404, detail="Draft not found")
-    if draft["status"] != "draft":
-        raise HTTPException(status_code=409, detail=f"Cannot send draft with status '{draft['status']}'")
-
-    account = await credential_store.get_account_with_credentials(account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    # Record approval metadata before sending
-    if approved_by:
-        existing_meta = draft.get("metadata") or {}
-        existing_meta["approved_at"] = datetime.now(timezone.utc).isoformat()
-        existing_meta["approved_by"] = approved_by
-        await drafts.update_draft(draft_id, metadata=existing_meta)
-
-    from_addr = account["username"]
-    pool = request.app.state.smtp_pool
-    draft_attachments = draft.get("attachments") or []
-
-    # Inject account signature
-    text_body = draft["text_content"]
-    html_body = draft["html_content"]
-    sig_text = account.get("signature_text")
-    sig_html = account.get("signature_html")
-    if sig_text and text_body:
-        text_body = text_body + "\n\n-- \n" + sig_text
-    if sig_html and html_body:
-        if "</body>" in html_body:
-            html_body = html_body.replace("</body>", f'<div class="env-signature">{sig_html}</div></body>', 1)
-        else:
-            html_body = html_body + f'<div class="env-signature">{sig_html}</div>'
-
-    # Build MIME message
-    msg = build_mime_message(
-        from_addr=from_addr,
-        to_addr=draft["to_addr"],
-        subject=draft["subject"] or "",
-        text=text_body,
-        html=html_body,
-        display_name=account.get("display_name"),
-        cc=draft.get("cc_addr"),
-        bcc=draft.get("bcc_addr"),
-        reply_to=draft.get("reply_to"),
-        attachments=draft_attachments or None,
-    )
-    if draft["in_reply_to"]:
-        msg["In-Reply-To"] = draft["in_reply_to"]
-
-    # Create message tracking record
-    att_meta = _attachments_meta(draft_attachments) if draft_attachments else None
-    record = await messages.create_message(
-        account_id=account_id,
-        from_addr=from_addr,
-        to_addr=draft["to_addr"],
-        subject=draft["subject"],
-        text_content=text_body,
-        html_content=html_body,
-        attachments_meta=att_meta,
-    )
-
-    # Send via SMTP
     try:
-        smtp_message_id = await send_message(account, msg, pool=pool)
-    except SmtpSendError as e:
-        await messages.mark_failed(record["id"], e.message)
-        return JSONResponse(
-            status_code=502,
-            content={"error": e.message, "error_type": e.error_type},
+        return await compose_svc.send_draft(
+            account_id=account_id,
+            draft_id=draft_id,
+            smtp_pool=request.app.state.smtp_pool,
+            approved_by=approved_by,
         )
-
-    await messages.mark_sent(record["id"], smtp_message_id)
-    await drafts.mark_draft_sent(draft_id, record["id"])
-
-    return {
-        "status": "sent",
-        "draft_id": draft_id,
-        "message_id": record["id"],
-    }
+    except compose_svc.DraftRoutingError as exc:
+        if exc.status_code == 502:
+            return JSONResponse(
+                status_code=502,
+                content={"error": exc.detail, "error_type": exc.error_type},
+            )
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 @app.post("/accounts/{account_id}/drafts/{draft_id}/send")
@@ -857,7 +813,7 @@ async def reject_draft(account_id: str, draft_id: str, data: RejectDraft):
     draft = await drafts.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         raise HTTPException(status_code=404, detail="Draft not found")
-    if draft["status"] != "draft":
+    if draft["status"] not in compose_svc.EDITABLE_DRAFT_STATUSES:
         raise HTTPException(status_code=409, detail=f"Cannot reject draft with status '{draft['status']}'")
 
     # Record feedback in metadata before discarding

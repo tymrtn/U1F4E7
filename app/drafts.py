@@ -12,6 +12,7 @@ from app.db import get_db
 async def create_draft(
     account_id: str,
     to_addr: str,
+    status: str = "draft",
     subject: Optional[str] = None,
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
@@ -36,8 +37,8 @@ async def create_draft(
         (id, account_id, status, to_addr, subject, text_content, html_content,
          in_reply_to, metadata, created_at, updated_at, created_by,
          send_after, snoozed_until, cc_addr, bcc_addr, reply_to, attachments)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (draft_id, account_id, to_addr, subject, text_content, html_content,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (draft_id, account_id, status, to_addr, subject, text_content, html_content,
          in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until,
          cc_addr, bcc_addr, reply_to, att_json),
     )
@@ -46,7 +47,7 @@ async def create_draft(
     return {
         "id": draft_id,
         "account_id": account_id,
-        "status": "draft",
+        "status": status,
         "to_addr": to_addr,
         "cc_addr": cc_addr,
         "bcc_addr": bcc_addr,
@@ -116,7 +117,7 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     draft = await get_draft(draft_id)
     if not draft:
         return None
-    if draft["status"] != "draft":
+    if draft["status"] not in {"draft", "pending_review", "blocked"}:
         return None
 
     # Fields that can be explicitly set to NULL (clearing them)
@@ -157,7 +158,9 @@ async def discard_draft(draft_id: str) -> bool:
     db = await get_db()
     now = datetime.now(timezone.utc).isoformat()
     cursor = await db.execute(
-        "UPDATE drafts SET status = 'discarded', updated_at = ? WHERE id = ? AND status = 'draft'",
+        """UPDATE drafts
+           SET status = 'discarded', updated_at = ?
+           WHERE id = ? AND status IN ('draft', 'pending_review', 'blocked')""",
         (now, draft_id),
     )
     await db.commit()

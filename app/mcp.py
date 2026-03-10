@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from app.services.policy import get_domain_policy, list_address_policies
 from app.services.actions import log_action
+from app.services import compose as compose_svc
 from app.services import start_here as start_here_svc
 from app import drafts as drafts_module
 
@@ -98,9 +99,11 @@ async def log_action_tool(
 
 
 @mcp.tool()
-async def create_draft_tool(
+async def compose_email(
     account_id: str,
     to: str,
+    confidence: float,
+    justification: str,
     subject: str = None,
     text: str = None,
     html: str = None,
@@ -111,30 +114,41 @@ async def create_draft_tool(
     reply_to: str = None,
     attachments: list[dict] = None,
 ) -> str:
-    """Create a draft email for human review.
+    """Compose an email and let the server route it by confidence.
 
-    Use this when confidence is below the account's confidence_threshold,
-    or when the policy requires human approval before sending.
+    The server decides whether to auto-send, queue for review, or block:
+    confidence >= auto_send_threshold -> sent
+    review_threshold <= confidence < auto_send_threshold -> pending_review
+    confidence < review_threshold -> blocked
 
     Set in_reply_to to the Message-ID of the email being replied to.
     created_by should be 'agent' for agent-created drafts.
+    justification must explain why the email is safe to send or review.
     cc/bcc: comma-separated addresses. reply_to: single address.
     attachments: list of {filename, content (base64), content_type?, content_id?}
     """
-    draft = await drafts_module.create_draft(
-        account_id=account_id,
-        to_addr=to,
-        subject=subject,
-        text_content=text,
-        html_content=html,
-        in_reply_to=in_reply_to,
-        created_by=created_by,
-        cc_addr=cc,
-        bcc_addr=bcc,
-        reply_to=reply_to,
-        attachments=attachments,
-    )
-    return json.dumps(draft, indent=2)
+    try:
+        outcome = await compose_svc.route_composed_email(
+            account_id=account_id,
+            to_addr=to,
+            confidence=confidence,
+            justification=justification,
+            subject=subject,
+            text_content=text,
+            html_content=html,
+            in_reply_to=in_reply_to,
+            created_by=created_by,
+            cc_addr=cc,
+            bcc_addr=bcc,
+            reply_to=reply_to,
+            attachments=attachments,
+        )
+    except compose_svc.DraftRoutingError as exc:
+        error = {"error": exc.detail}
+        if exc.error_type:
+            error["error_type"] = exc.error_type
+        return json.dumps(error)
+    return json.dumps(outcome, indent=2)
 
 
 @mcp.tool()
@@ -150,144 +164,27 @@ async def get_draft_tool(account_id: str, draft_id: str) -> str:
 
 
 @mcp.tool()
-async def send_email_tool(
-    account_id: str,
-    to: str,
-    subject: str,
-    text: str = None,
-    html: str = None,
-    cc: str = None,
-    bcc: str = None,
-    reply_to: str = None,
-    attachments: list[dict] = None,
-) -> str:
-    """Send an email immediately without creating a draft.
-
-    Use this ONLY when confidence is high and policy permits direct send.
-    For low-confidence actions, use create_draft_tool instead.
-
-    Requires the account to have valid SMTP credentials configured.
-    cc/bcc: comma-separated addresses. reply_to: single address.
-    attachments: list of {filename, content (base64), content_type?, content_id?}
-    """
-    from app.credentials.store import get_account_with_credentials
-    from app.transport.smtp import build_mime_message, send_message, SmtpSendError
-    from app import messages
-
-    account = await get_account_with_credentials(account_id)
-    if not account:
-        return json.dumps({"error": "Account not found"})
-
-    from_addr = account["username"]
-    msg = build_mime_message(
-        from_addr=from_addr,
-        to_addr=to,
-        subject=subject,
-        text=text,
-        html=html,
-        display_name=account.get("display_name"),
-        cc=cc,
-        bcc=bcc,
-        reply_to=reply_to,
-        attachments=attachments,
-    )
-
-    import base64 as b64
-    att_meta = None
-    if attachments:
-        att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(b64.b64decode(a["content"]))} for a in attachments]
-
-    record = await messages.create_message(
-        account_id=account_id,
-        from_addr=from_addr,
-        to_addr=to,
-        subject=subject,
-        text_content=text,
-        html_content=html,
-        attachments_meta=att_meta,
-    )
-
-    try:
-        smtp_message_id = await send_message(account, msg, pool=None)
-    except SmtpSendError as e:
-        await messages.mark_failed(record["id"], e.message)
-        return json.dumps({"error": e.message, "error_type": e.error_type})
-
-    await messages.mark_sent(record["id"], smtp_message_id)
-    return json.dumps({"status": "sent", "id": record["id"], "message_id": smtp_message_id})
-
-
-@mcp.tool()
 async def approve_draft_tool(account_id: str, draft_id: str) -> str:
     """Approve and send a draft immediately.
 
     Use this when a draft has been reviewed and is ready to send.
-    Only works on drafts with status='draft'. Records approval metadata.
+    Works on unsent drafts that are pending review or blocked. Records approval metadata.
 
     Do NOT use this for drafts awaiting human review in the review queue —
     those are for humans to approve via the /review interface.
     """
-    from app.credentials.store import get_account_with_credentials
-    from app.transport.smtp import build_mime_message, send_message, SmtpSendError
-    from app import messages
-
-    draft = await drafts_module.get_draft(draft_id)
-    if not draft or draft["account_id"] != account_id:
-        return json.dumps({"error": "Draft not found"})
-    if draft["status"] != "draft":
-        return json.dumps({"error": f"Cannot send draft with status '{draft['status']}'"})
-
-    account = await get_account_with_credentials(account_id)
-    if not account:
-        return json.dumps({"error": "Account not found"})
-
-    # Record approval metadata
-    existing_meta = draft.get("metadata") or {}
-    existing_meta["approved_at"] = datetime.now(timezone.utc).isoformat()
-    existing_meta["approved_by"] = "agent"
-    await drafts_module.update_draft(draft_id, metadata=existing_meta)
-
-    from_addr = account["username"]
-    draft_attachments = draft.get("attachments") or []
-    msg = build_mime_message(
-        from_addr=from_addr,
-        to_addr=draft["to_addr"],
-        subject=draft["subject"] or "",
-        text=draft["text_content"],
-        html=draft["html_content"],
-        display_name=account.get("display_name"),
-        cc=draft.get("cc_addr"),
-        bcc=draft.get("bcc_addr"),
-        reply_to=draft.get("reply_to"),
-        attachments=draft_attachments or None,
-    )
-    if draft["in_reply_to"]:
-        msg["In-Reply-To"] = draft["in_reply_to"]
-
-    import base64 as b64
-    att_meta = None
-    if draft_attachments:
-        att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(b64.b64decode(a["content"]))} for a in draft_attachments]
-
-    record = await messages.create_message(
-        account_id=account_id,
-        from_addr=from_addr,
-        to_addr=draft["to_addr"],
-        subject=draft["subject"],
-        text_content=draft["text_content"],
-        html_content=draft["html_content"],
-        attachments_meta=att_meta,
-    )
-
     try:
-        smtp_message_id = await send_message(account, msg, pool=None)
-    except SmtpSendError as e:
-        await messages.mark_failed(record["id"], e.message)
-        return json.dumps({"error": e.message, "error_type": e.error_type})
-
-    await messages.mark_sent(record["id"], smtp_message_id)
-    await drafts_module.mark_draft_sent(draft_id, record["id"])
-    return json.dumps({"status": "sent", "draft_id": draft_id, "message_id": record["id"]})
+        result = await compose_svc.send_draft(
+            account_id=account_id,
+            draft_id=draft_id,
+            approved_by="agent",
+        )
+    except compose_svc.DraftRoutingError as exc:
+        error = {"error": exc.detail}
+        if exc.error_type:
+            error["error_type"] = exc.error_type
+        return json.dumps(error)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -307,7 +204,7 @@ async def reject_draft_tool(
     draft = await drafts_module.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         return json.dumps({"error": "Draft not found"})
-    if draft["status"] != "draft":
+    if draft["status"] not in compose_svc.EDITABLE_DRAFT_STATUSES:
         return json.dumps({"error": f"Cannot reject draft with status '{draft['status']}'"})
 
     existing_meta = draft.get("metadata") or {}
