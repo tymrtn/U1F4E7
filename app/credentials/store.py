@@ -159,6 +159,7 @@ async def update_account(account_id: str, **fields) -> Optional[dict]:
     allowed = {
         "display_name", "auto_send_threshold", "review_threshold",
         "rate_limit_per_hour", "webhook_url", "signature_text", "signature_html",
+        "smtp_host", "smtp_port", "imap_host", "imap_port",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
 
