@@ -91,11 +91,34 @@ You can also configure **domain policies** — rules like "always require approv
 
 ## OpenClaw Integration
 
-Envelope was built to work with [OpenClaw](https://openclaw.ai) and any agent framework that speaks MCP.
+Envelope ships with a `SKILL.md` in the repo root. OpenClaw agents that clone or install Envelope get the full API reference, confidence scoring guidelines, and blind routing protocol automatically.
 
-### As an OpenClaw skill
+### As an OpenClaw Skill
 
-Add Envelope as an MCP server in your OpenClaw config:
+Your agent uses the REST API directly — no MCP required:
+
+```
+→ POST /accounts/{id}/drafts          # Compose email (blind routed by confidence)
+→ GET /accounts/{id}/inbox            # Read inbox
+→ GET /accounts/{id}/drafts           # Review pending drafts
+→ POST /accounts/{id}/drafts/{id}/approve  # Approve and send
+→ POST /accounts/{id}/drafts/{id}/reject   # Reject with feedback
+→ GET /accounts/{id}/search?q=...     # Search messages
+```
+
+Blind routing means your agent always composes — never sends directly. The system evaluates confidence against hidden thresholds and routes automatically:
+
+```
+confidence ≥ 0.85  →  auto-sent
+0.50 – 0.84        →  pending_review (human approves)
+< 0.50             →  blocked
+```
+
+See [`SKILL.md`](SKILL.md) for the full API reference and confidence scoring guidelines.
+
+### With Claude Desktop, Cursor, Windsurf
+
+Add Envelope as an MCP server in your client config:
 
 ```json
 {
@@ -113,24 +136,11 @@ Add Envelope as an MCP server in your OpenClaw config:
 }
 ```
 
-Your agent can then:
-
-```
-→ start_here(account_id="...")        # Learn account policies and rules
-→ create_draft(to="...", ...)         # Compose a draft (does NOT send)
-→ list_drafts(account_id="...")       # Review pending drafts
-→ approve_draft(draft_id="...")       # Approve and send (or reject with reason)
-→ read_inbox(account_id="...")        # Check for replies
-→ log_action(action="...", ...)       # Audit trail
-```
-
-### With Claude Code, Cursor, Windsurf
-
-Same MCP config. Envelope works with any MCP-compatible client — it's not locked to OpenClaw.
+Envelope works with any MCP-compatible client — it's not locked to any framework.
 
 ### With raw REST
 
-No MCP? No problem. Every feature is available via the REST API. Use it from Python, Node, curl, or any HTTP client.
+No MCP? No skill? Every feature is available via the REST API. Use it from Python, Node, curl, or any HTTP client.
 
 ## Why Not Himalaya / Resend / Mailgun?
 
