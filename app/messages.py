@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Tyler Martin
 # Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,18 +20,21 @@ async def create_message(  # noqa: PLR0913
     initial_status: str = "queued",
     track_opens: bool = False,
     tracking_token: Optional[str] = None,
+    attachments_meta: Optional[list[dict]] = None,
 ) -> dict:
     msg_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    att_meta_json = json.dumps(attachments_meta) if attachments_meta else "[]"
 
     db = await get_db()
     await db.execute(
         f"""INSERT INTO messages
         (id, account_id, direction, from_addr, to_addr, subject, status, created_at,
-         text_content, html_content, track_opens, tracking_token)
-        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?, ?, ?)""",
+         text_content, html_content, track_opens, tracking_token, attachments_meta)
+        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?, ?, ?, ?)""",
         (msg_id, account_id, direction, from_addr, to_addr, subject, now,
-         text_content, html_content, 1 if track_opens else 0, tracking_token),
+         text_content, html_content, 1 if track_opens else 0, tracking_token,
+         att_meta_json),
     )
     await db.commit()
 
@@ -45,6 +49,7 @@ async def create_message(  # noqa: PLR0913
         "created_at": now,
         "track_opens": track_opens,
         "tracking_token": tracking_token,
+        "attachments_meta": attachments_meta or [],
     }
 
 

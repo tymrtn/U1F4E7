@@ -126,6 +126,9 @@ MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN track_opens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN tracking_token TEXT",
     "CREATE TABLE IF NOT EXISTS message_opens (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, token TEXT NOT NULL, opened_at TEXT NOT NULL, user_agent TEXT, ip_addr TEXT)",
+    # Story 020 — Attachments
+    "ALTER TABLE drafts ADD COLUMN attachments TEXT DEFAULT '[]'",
+    "ALTER TABLE messages ADD COLUMN attachments_meta TEXT DEFAULT '[]'",
 ]
 
 _connection: aiosqlite.Connection | None = None

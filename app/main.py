@@ -1,5 +1,6 @@
 # Envelope Email - Transactional Email API
 
+import base64
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends, Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -106,6 +107,16 @@ templates = Jinja2Templates(directory="templates")
 
 # --- Models ---
 
+MAX_ATTACHMENTS_BYTES = 40 * 1024 * 1024  # 40 MB
+
+
+class Attachment(BaseModel):
+    filename: str
+    content: str  # base64-encoded
+    content_type: Optional[str] = None
+    content_id: Optional[str] = None
+
+
 class SendEmail(BaseModel):
     account_id: str
     to: str
@@ -121,6 +132,7 @@ class SendEmail(BaseModel):
     use_signature: bool = True
     track_opens: bool = False
     wait: bool = True
+    attachments: Optional[list[Attachment]] = None
 
 
 class CreateDraft(BaseModel):
@@ -135,6 +147,7 @@ class CreateDraft(BaseModel):
     cc: Optional[str] = None
     bcc: Optional[str] = None
     reply_to: Optional[str] = None
+    attachments: Optional[list[Attachment]] = None
 
 
 class UpdateDraft(BaseModel):
@@ -147,6 +160,7 @@ class UpdateDraft(BaseModel):
     cc: Optional[str] = None
     bcc: Optional[str] = None
     reply_to: Optional[str] = None
+    attachments: Optional[list[Attachment]] = None
 
 
 class ScheduleDraft(BaseModel):
@@ -191,6 +205,10 @@ class UpdateAccount(BaseModel):
     webhook_secret: Optional[str] = None
     signature_text: Optional[str] = None
     signature_html: Optional[str] = None
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = None
 
 
 class DomainPolicyIn(BaseModel):
@@ -223,6 +241,46 @@ class LogActionIn(BaseModel):
     action_taken: str
     message_id: Optional[str] = None
     draft_id: Optional[str] = None
+
+
+# --- Attachment helpers ---
+
+def _validate_attachments(attachments: Optional[list[Attachment]]) -> Optional[list[dict]]:
+    """Validate size and return serializable dicts. Returns None if no attachments."""
+    if not attachments:
+        return None
+    total_bytes = 0
+    result = []
+    for att in attachments:
+        decoded = base64.b64decode(att.content)
+        total_bytes += len(decoded)
+        result.append({
+            "filename": att.filename,
+            "content": att.content,
+            "content_type": att.content_type,
+            "content_id": att.content_id,
+        })
+    if total_bytes > MAX_ATTACHMENTS_BYTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Total attachment size ({total_bytes} bytes) exceeds 40 MB limit",
+        )
+    return result
+
+
+def _attachments_meta(attachments: Optional[list[dict]]) -> Optional[list[dict]]:
+    """Build metadata-only list (no binary content) for audit trail."""
+    if not attachments:
+        return None
+    meta = []
+    for att in attachments:
+        decoded = base64.b64decode(att["content"])
+        meta.append({
+            "filename": att["filename"],
+            "content_type": att.get("content_type"),
+            "size_bytes": len(decoded),
+        })
+    return meta
 
 
 # --- Rate limit helper ---
@@ -273,6 +331,9 @@ async def send_email(request: Request, data: SendEmail):
             content={"error": "rate_limit_exceeded", "limit": limit},
         )
 
+    att_dicts = _validate_attachments(data.attachments)
+    att_meta = _attachments_meta(att_dicts)
+
     from_addr = data.from_email or account["username"]
     pool = request.app.state.smtp_pool
 
@@ -314,6 +375,7 @@ async def send_email(request: Request, data: SendEmail):
             initial_status="queued",
             track_opens=data.track_opens,
             tracking_token=tracking_token,
+            attachments_meta=att_meta,
         )
         request.app.state.send_worker.notify()
         return {
@@ -338,6 +400,7 @@ async def send_email(request: Request, data: SendEmail):
         initial_status="sending",
         track_opens=data.track_opens,
         tracking_token=tracking_token,
+        attachments_meta=att_meta,
     )
 
     msg = build_mime_message(
@@ -351,6 +414,7 @@ async def send_email(request: Request, data: SendEmail):
         bcc=data.bcc,
         reply_to=data.reply_to,
         custom_headers=data.headers,
+        attachments=att_dicts,
     )
 
     try:
@@ -523,6 +587,14 @@ async def update_account(account_id: str, data: UpdateAccount):
         updates["signature_text"] = data.signature_text
     if data.signature_html is not None:
         updates["signature_html"] = data.signature_html
+    if data.smtp_host is not None:
+        updates["smtp_host"] = data.smtp_host
+    if data.smtp_port is not None:
+        updates["smtp_port"] = data.smtp_port
+    if data.imap_host is not None:
+        updates["imap_host"] = data.imap_host
+    if data.imap_port is not None:
+        updates["imap_port"] = data.imap_port
     if not updates:
         return account
     updated = await credential_store.update_account(account_id, **updates)
@@ -569,6 +641,7 @@ async def create_draft(account_id: str, data: CreateDraft):
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+    att_dicts = _validate_attachments(data.attachments) if data.attachments else None
     draft = await drafts.create_draft(
         account_id=account_id,
         to_addr=data.to,
@@ -582,6 +655,7 @@ async def create_draft(account_id: str, data: CreateDraft):
         cc_addr=data.cc,
         bcc_addr=data.bcc,
         reply_to=data.reply_to,
+        attachments=att_dicts,
     )
     return draft
 
@@ -638,6 +712,8 @@ async def update_draft(account_id: str, draft_id: str, data: UpdateDraft):
         fields["bcc_addr"] = data.bcc
     if data.reply_to is not None:
         fields["reply_to"] = data.reply_to
+    if data.attachments is not None:
+        fields["attachments"] = _validate_attachments(data.attachments)
     updated = await drafts.update_draft(draft_id, **fields)
     return updated
 
@@ -692,6 +768,7 @@ async def _send_draft(
 
     from_addr = account["username"]
     pool = request.app.state.smtp_pool
+    draft_attachments = draft.get("attachments") or []
 
     # Inject account signature
     text_body = draft["text_content"]
@@ -717,11 +794,13 @@ async def _send_draft(
         cc=draft.get("cc_addr"),
         bcc=draft.get("bcc_addr"),
         reply_to=draft.get("reply_to"),
+        attachments=draft_attachments or None,
     )
     if draft["in_reply_to"]:
         msg["In-Reply-To"] = draft["in_reply_to"]
 
     # Create message tracking record
+    att_meta = _attachments_meta(draft_attachments) if draft_attachments else None
     record = await messages.create_message(
         account_id=account_id,
         from_addr=from_addr,
@@ -729,6 +808,7 @@ async def _send_draft(
         subject=draft["subject"],
         text_content=text_body,
         html_content=html_body,
+        attachments_meta=att_meta,
     )
 
     # Send via SMTP

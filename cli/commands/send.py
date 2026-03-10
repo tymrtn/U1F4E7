@@ -2,7 +2,10 @@
 # Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 import asyncio
+import base64
 import json
+import mimetypes
+import os
 import typer
 from typing import Optional
 
@@ -15,6 +18,7 @@ def send(
     subject: str = typer.Option(..., "--subject", help="Email subject"),
     body: str = typer.Option(..., "--body", help="Plain text body"),
     account: Optional[str] = typer.Option(None, "--account", "-a"),
+    attach: Optional[list[str]] = typer.Option(None, "--attach", "-f", help="File path to attach (repeatable)"),
     output_json: bool = typer.Option(False, "--json"),
 ):
     """Send an email immediately."""
@@ -24,6 +28,24 @@ def send(
     if not aid:
         typer.echo("No account specified. Use --account or set ENVELOPE_ACCOUNT_ID.", err=True)
         raise typer.Exit(1)
+
+    # Build attachments from file paths
+    attachments = None
+    if attach:
+        attachments = []
+        for path in attach:
+            if not os.path.isfile(path):
+                typer.echo(f"File not found: {path}", err=True)
+                raise typer.Exit(1)
+            with open(path, "rb") as f:
+                data = f.read()
+            filename = os.path.basename(path)
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            attachments.append({
+                "filename": filename,
+                "content": base64.b64encode(data).decode(),
+                "content_type": content_type,
+            })
 
     async def _run():
         from app.db import init_db
@@ -44,13 +66,20 @@ def send(
             subject=subject,
             text=body,
             display_name=acct.get("display_name"),
+            attachments=attachments,
         )
+
+        att_meta = None
+        if attachments:
+            att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(base64.b64decode(a["content"]))} for a in attachments]
+
         record = await messages.create_message(
             account_id=aid,
             from_addr=from_addr,
             to_addr=to,
             subject=subject,
             text_content=body,
+            attachments_meta=att_meta,
         )
         try:
             smtp_id = await send_message(acct, msg, pool=None)

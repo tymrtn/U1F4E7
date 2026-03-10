@@ -23,21 +23,23 @@ async def create_draft(
     cc_addr: Optional[str] = None,
     bcc_addr: Optional[str] = None,
     reply_to: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
 ) -> dict:
     draft_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata) if metadata else None
+    att_json = json.dumps(attachments) if attachments else "[]"
 
     db = await get_db()
     await db.execute(
         """INSERT INTO drafts
         (id, account_id, status, to_addr, subject, text_content, html_content,
          in_reply_to, metadata, created_at, updated_at, created_by,
-         send_after, snoozed_until, cc_addr, bcc_addr, reply_to)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         send_after, snoozed_until, cc_addr, bcc_addr, reply_to, attachments)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (draft_id, account_id, to_addr, subject, text_content, html_content,
          in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until,
-         cc_addr, bcc_addr, reply_to),
+         cc_addr, bcc_addr, reply_to, att_json),
     )
     await db.commit()
 
@@ -54,6 +56,7 @@ async def create_draft(
         "html_content": html_content,
         "in_reply_to": in_reply_to,
         "metadata": metadata,
+        "attachments": attachments or [],
         "message_id": None,
         "created_at": now,
         "updated_at": now,
@@ -76,7 +79,7 @@ async def list_drafts(
     query = """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
                   subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts
            WHERE account_id = ?"""
     params: list = [account_id]
@@ -101,7 +104,7 @@ async def get_draft(draft_id: str) -> Optional[dict]:
         """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
                   subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts WHERE id = ?""",
         (draft_id,),
     )
@@ -120,7 +123,7 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     clearable_fields = {"send_after", "snoozed_until"}
     allowed = {"to_addr", "subject", "text_content", "html_content",
                "in_reply_to", "metadata", "send_after", "snoozed_until",
-               "cc_addr", "bcc_addr", "reply_to"}
+               "cc_addr", "bcc_addr", "reply_to", "attachments"}
 
     updates = {}
     for k, v in fields.items():
@@ -135,6 +138,8 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     now = datetime.now(timezone.utc).isoformat()
     if "metadata" in updates:
         updates["metadata"] = json.dumps(updates["metadata"])
+    if "attachments" in updates:
+        updates["attachments"] = json.dumps(updates["attachments"])
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [now, draft_id]
@@ -176,7 +181,7 @@ async def get_scheduled_drafts() -> list[dict]:
         """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
                   subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts
            WHERE status = 'draft'
              AND send_after IS NOT NULL
@@ -191,6 +196,8 @@ def _row_to_dict(row) -> dict:
     meta_raw = row["metadata"]
     metadata = json.loads(meta_raw) if meta_raw else None
     keys = row.keys() if hasattr(row, "keys") else []
+    att_raw = row["attachments"] if "attachments" in keys else "[]"
+    attachments = json.loads(att_raw) if att_raw else []
     return {
         "id": row["id"],
         "account_id": row["account_id"],
@@ -204,6 +211,7 @@ def _row_to_dict(row) -> dict:
         "html_content": row["html_content"],
         "in_reply_to": row["in_reply_to"],
         "metadata": metadata,
+        "attachments": attachments,
         "message_id": row["message_id"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

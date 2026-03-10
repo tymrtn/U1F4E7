@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: envelope-email
+Version: 0.4.0
+Summary: BYO mailbox API with agent-native primitives
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: aiosqlite>=0.21.0
+Requires-Dist: aiosmtplib>=5.1.0
+Requires-Dist: aioimaplib>=2.0.1
+Requires-Dist: cryptography>=44.0.3
+Requires-Dist: fastapi>=0.129.0
+Requires-Dist: httpx>=0.28.1
+Requires-Dist: Jinja2>=3.1.6
+Requires-Dist: mcp>=1.0.0
+Requires-Dist: pydantic>=2.12.5
+Requires-Dist: python-dotenv>=1.2.1
+Requires-Dist: starlette>=0.52.1
+Requires-Dist: uvicorn>=0.41.0
+Provides-Extra: cli
+Requires-Dist: typer>=0.12; extra == "cli"
+Requires-Dist: rich>=13; extra == "cli"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.5; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.25.3; extra == "dev"
+Requires-Dist: httpx>=0.28.1; extra == "dev"
+Dynamic: license-file

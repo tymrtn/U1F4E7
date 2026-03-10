@@ -109,6 +109,7 @@ async def create_draft_tool(
     cc: str = None,
     bcc: str = None,
     reply_to: str = None,
+    attachments: list[dict] = None,
 ) -> str:
     """Create a draft email for human review.
 
@@ -118,6 +119,7 @@ async def create_draft_tool(
     Set in_reply_to to the Message-ID of the email being replied to.
     created_by should be 'agent' for agent-created drafts.
     cc/bcc: comma-separated addresses. reply_to: single address.
+    attachments: list of {filename, content (base64), content_type?, content_id?}
     """
     draft = await drafts_module.create_draft(
         account_id=account_id,
@@ -130,6 +132,7 @@ async def create_draft_tool(
         cc_addr=cc,
         bcc_addr=bcc,
         reply_to=reply_to,
+        attachments=attachments,
     )
     return json.dumps(draft, indent=2)
 
@@ -156,6 +159,7 @@ async def send_email_tool(
     cc: str = None,
     bcc: str = None,
     reply_to: str = None,
+    attachments: list[dict] = None,
 ) -> str:
     """Send an email immediately without creating a draft.
 
@@ -164,6 +168,7 @@ async def send_email_tool(
 
     Requires the account to have valid SMTP credentials configured.
     cc/bcc: comma-separated addresses. reply_to: single address.
+    attachments: list of {filename, content (base64), content_type?, content_id?}
     """
     from app.credentials.store import get_account_with_credentials
     from app.transport.smtp import build_mime_message, send_message, SmtpSendError
@@ -184,7 +189,13 @@ async def send_email_tool(
         cc=cc,
         bcc=bcc,
         reply_to=reply_to,
+        attachments=attachments,
     )
+
+    import base64 as b64
+    att_meta = None
+    if attachments:
+        att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(b64.b64decode(a["content"]))} for a in attachments]
 
     record = await messages.create_message(
         account_id=account_id,
@@ -193,6 +204,7 @@ async def send_email_tool(
         subject=subject,
         text_content=text,
         html_content=html,
+        attachments_meta=att_meta,
     )
 
     try:
@@ -236,6 +248,7 @@ async def approve_draft_tool(account_id: str, draft_id: str) -> str:
     await drafts_module.update_draft(draft_id, metadata=existing_meta)
 
     from_addr = account["username"]
+    draft_attachments = draft.get("attachments") or []
     msg = build_mime_message(
         from_addr=from_addr,
         to_addr=draft["to_addr"],
@@ -246,9 +259,15 @@ async def approve_draft_tool(account_id: str, draft_id: str) -> str:
         cc=draft.get("cc_addr"),
         bcc=draft.get("bcc_addr"),
         reply_to=draft.get("reply_to"),
+        attachments=draft_attachments or None,
     )
     if draft["in_reply_to"]:
         msg["In-Reply-To"] = draft["in_reply_to"]
+
+    import base64 as b64
+    att_meta = None
+    if draft_attachments:
+        att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(b64.b64decode(a["content"]))} for a in draft_attachments]
 
     record = await messages.create_message(
         account_id=account_id,
@@ -257,6 +276,7 @@ async def approve_draft_tool(account_id: str, draft_id: str) -> str:
         subject=draft["subject"],
         text_content=draft["text_content"],
         html_content=draft["html_content"],
+        attachments_meta=att_meta,
     )
 
     try:
