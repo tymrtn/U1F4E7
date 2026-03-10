@@ -38,17 +38,26 @@ POST /accounts/{account_id}/drafts
 → {"id": "...", "status": "sent"|"pending_review"|"blocked", ...}
 ```
 
-### Read Inbox
+### List Inbox
 ```
 GET /accounts/{account_id}/inbox?limit=10
-→ [{"message_id": "...", "from": "...", "subject": "...", "snippet": "...", ...}]
+→ [{"uid": "22", "message_id": "...", "from_addr": "Name <email>", "subject": "...", "date": "...", "flags": [], "size": 12133}]
 ```
+Note: listing returns metadata only, no body. Use the UID to fetch full message.
 
-### Read Message
+### Read Message (by UID)
 ```
-GET /accounts/{account_id}/messages/{message_id}
-→ {"from": "...", "subject": "...", "text_content": "...", "html_content": "...", ...}
+GET /accounts/{account_id}/inbox/{uid}
+→ {"uid": "22", "from_addr": "...", "to_addr": "...", "subject": "...", "text_body": "...", "html_body": "...", "attachments": [...]}
 ```
+⚠️ Field names: inbox uses `text_body`/`html_body`. Sent messages DB (`/messages/{id}`) uses `text_content`/`html_content`.
+
+### Read Sent Message (from DB)
+```
+GET /messages/{message_id}
+→ {"from_addr": "...", "to_addr": "...", "text_content": "...", "html_content": "...", ...}
+```
+This is for messages Envelope sent, stored in the local DB. Not for reading inbox.
 
 ### List Drafts
 ```
