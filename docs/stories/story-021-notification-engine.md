@@ -210,6 +210,206 @@ When a draft transitions to `pending_review` or `blocked`:
 
 ---
 
+## Amendment: Contextual Attribution Scoring (Blind Rubric)
+
+**Added:** 2026-03-11  
+**Status:** Approved  
+**Replaces:** LLM-assigned confidence score
+
+### The Problem with LLM Confidence
+
+The current blind routing asks the LLM to assign a confidence score (0.0–1.0) and a justification. This is backwards. The LLM is estimating *how much the human will approve* — which means it's modeling the routing system, not describing the email. Any sufficiently capable model will learn to game a scalar confidence score.
+
+### The Fix: Pure Attribution
+
+The LLM does **not** score confidence. It does **not** see modifiers, weights, or thresholds. It has no concept of "routing" or "approval likelihood."
+
+Instead, the LLM provides **structured attribution tags** — factual descriptions of what the email is:
+
+```json
+{
+  "attribution": {
+    "relationship": "first_contact",
+    "intent": "pitch",
+    "stakes": "high",
+    "ask": true,
+    "domain": "press",
+    "recipient_context": "senior_executive",
+    "emotional_tone": "formal",
+    "contains_claims": true,
+    "references_prior_thread": false
+  }
+}
+```
+
+The LLM is filling out a form. "Is this cold outreach? Yes. Am I making an ask? Yes. Is this press-related? Yes." Pure description. No judgment about what happens next.
+
+### Server-Side Scoring
+
+The **server** holds a modifier rubric that the LLM never sees:
+
+```
+Base score: 0.80
+
+Relationship modifiers:
+  first_contact:        -0.20
+  known_contact:        +0.00
+  established_ally:     +0.15
+
+Intent modifiers:
+  reply:                +0.10
+  follow_up:            +0.05
+  pitch:                -0.10
+  proposal:             -0.10
+
+Stakes modifiers:
+  low:                  +0.05
+  medium:               +0.00
+  high:                 -0.15
+  mission_critical:     -0.30
+
+Ask modifier:
+  true:                 -0.20
+  false:                +0.00
+
+Domain modifiers:
+  internal:             +0.10
+  research:             +0.00
+  press:                -0.20
+  investment:           -0.10
+  legal:                -0.25
+
+Recipient context modifiers:
+  peer:                 +0.00
+  senior_executive:     -0.05
+  public_figure:        -0.15
+  high_net_worth:       -0.05
+  high_net_worth_10m:   -0.20
+```
+
+The server sums the modifiers, clamps to [0.0, 1.0], and routes:
+- `≥ auto_send_threshold` → sent
+- `≥ review_threshold` → pending_review
+- `< review_threshold` → blocked
+
+### Why This Is Better
+
+1. **Ungameable.** The LLM can't optimize for auto-send because it doesn't know what the weights are or even that weights exist. It's describing, not scoring.
+2. **Auditable.** Every tag is a verifiable fact about the email. "Is this cold outreach?" has a ground-truth answer. "Is my confidence 0.72?" does not.
+3. **Tunable.** The human owner adjusts weights without touching the LLM prompt. Want to be more cautious about press emails? Change `-0.20` to `-0.40`. The LLM's behavior doesn't change.
+4. **Composable.** Multiple modifiers stack naturally. A cold-outreach pitch to a high-net-worth press contact about an investment opportunity stacks to a very low score — without anyone teaching the LLM that combination is dangerous.
+
+### Attribution Schema
+
+Required tags (LLM must provide all):
+
+| Tag | Type | Values |
+|-----|------|--------|
+| `relationship` | enum | `first_contact`, `known_contact`, `established_ally`, `internal` |
+| `intent` | enum | `reply`, `follow_up`, `introduction`, `pitch`, `proposal`, `informational`, `request` |
+| `stakes` | enum | `low`, `medium`, `high`, `mission_critical` |
+| `ask` | bool | Is the email making a request of the recipient? |
+| `domain` | enum | `internal`, `research`, `business`, `press`, `investment`, `legal`, `personal` |
+| `recipient_context` | enum | `peer`, `senior_executive`, `public_figure`, `academic`, `unknown` |
+| `emotional_tone` | enum | `casual`, `professional`, `formal`, `urgent` |
+| `contains_claims` | bool | Does the email assert facts that could be wrong? |
+| `references_prior_thread` | bool | Is this part of an existing conversation? |
+
+Optional tags (LLM can add for context):
+
+| Tag | Type | Description |
+|-----|------|-------------|
+| `topic_tags` | string[] | Free-form topic labels |
+| `sensitivity_notes` | string | Why this email might be sensitive |
+
+### Compose API Change
+
+Current:
+```json
+POST /accounts/{id}/compose
+{
+  "to": "mnot@mnot.net",
+  "subject": "...",
+  "body": "...",
+  "confidence": 0.72,
+  "justification": "Cold outreach to IETF leader..."
+}
+```
+
+New:
+```json
+POST /accounts/{id}/compose
+{
+  "to": "mnot@mnot.net",
+  "subject": "...",
+  "body": "...",
+  "attribution": {
+    "relationship": "first_contact",
+    "intent": "pitch",
+    "stakes": "high",
+    "ask": false,
+    "domain": "research",
+    "recipient_context": "public_figure",
+    "emotional_tone": "formal",
+    "contains_claims": true,
+    "references_prior_thread": false
+  },
+  "justification": "Sharing CSLE paper with IETF HTTP WG former chair..."
+}
+```
+
+The `confidence` field is **removed from the compose request**. The server calculates it from attribution + modifiers. The `justification` field stays — it's useful for human review even though it doesn't affect routing.
+
+### Response includes computed score
+
+```json
+{
+  "draft_id": "...",
+  "routing_status": "pending_review",
+  "computed_score": 0.35,
+  "attribution_applied": {
+    "first_contact": -0.20,
+    "pitch": -0.10,
+    "high_stakes": -0.15,
+    "public_figure": -0.15
+  }
+}
+```
+
+The response DOES show the computed score and which modifiers fired — but only AFTER routing. This is post-hoc transparency, not pre-hoc gaming. The agent sees what happened but can't use it to change what it submitted.
+
+### Migration Path
+
+1. **Phase 1 (backward compatible):** Accept both `confidence` (legacy) and `attribution` (new). If `attribution` is present, use it. If only `confidence`, use the old routing.
+2. **Phase 2:** Deprecate `confidence` field. Warn in response.
+3. **Phase 3:** Remove `confidence` from compose. Attribution-only.
+
+### Modifier Rubric Storage
+
+Modifiers are stored per-account alongside domain policy:
+
+```
+POST /accounts/{id}/scoring-rubric
+{
+  "base_score": 0.80,
+  "modifiers": {
+    "relationship": {
+      "first_contact": -0.20,
+      "known_contact": 0.00,
+      "established_ally": 0.15,
+      "internal": 0.10
+    },
+    "intent": { ... },
+    "stakes": { ... },
+    ...
+  }
+}
+```
+
+Default rubric ships with sensible values. Human owner tunes as needed.
+
+---
+
 ## API Changes
 
 ### New Endpoints
