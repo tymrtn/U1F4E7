@@ -1,16 +1,19 @@
 # Copyright (c) 2026 Tyler Martin
 # Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+from app.services import scoring as scoring_svc
 from app.services.policy import get_domain_policy, list_address_policies
 
 
 async def build_start_here_response(account_id: str) -> dict:
     domain_policy = await get_domain_policy(account_id)
+    attribution_schema = scoring_svc.get_attribution_schema()
 
     if not domain_policy:
         return {
             "mode": "onboarding",
             "account_id": account_id,
+            "attribution_schema": attribution_schema,
             "instructions": _onboarding_instructions(account_id),
         }
 
@@ -28,8 +31,22 @@ async def build_start_here_response(account_id: str) -> dict:
         "mode": "operational",
         "account_id": account_id,
         "domain_policy": policy_copy,
-        "address_policies": address_policies,
+        "address_policies": [_sanitize_address_policy(policy) for policy in address_policies],
+        "attribution_schema": attribution_schema,
         "instructions": _operational_instructions(account_id),
+    }
+
+
+def _sanitize_address_policy(policy: dict) -> dict:
+    return {
+        "pattern": policy.get("pattern"),
+        "purpose": policy.get("purpose"),
+        "reply_instructions": policy.get("reply_instructions"),
+        "escalation_rules": policy.get("escalation_rules"),
+        "routing_rules": policy.get("routing_rules"),
+        "trash_criteria": policy.get("trash_criteria"),
+        "help_resources": policy.get("help_resources"),
+        "sensitive_topics": policy.get("sensitive_topics"),
     }
 
 
@@ -65,9 +82,17 @@ POST /accounts/{account_id}/address-policies
   "pattern": "*@example.com",
   "purpose": "Why these emails matter",
   "reply_instructions": "How to respond",
-  "confidence_threshold": 0.7,
   "trash_criteria": "What to discard without action"
 }}
+
+## Step 4: Compose with attribution tags
+
+When you compose outbound email, fill every required field in the attribution_schema
+returned by this endpoint and send it to:
+
+POST /accounts/{account_id}/compose
+
+Do not estimate confidence or approval likelihood.
 
 ## After setup
 
@@ -88,9 +113,30 @@ def _operational_instructions(account_id: str) -> str:
 
 1. Read the message content and sender
 2. Find the matching policy (see above)
-3. Determine confidence (0.0-1.0) in your proposed action
-4. If confidence >= policy.confidence_threshold: act directly
-5. If confidence < policy.confidence_threshold: create a draft for human review
+3. Decide whether to reply, draft, escalate, or ignore
+4. If you compose outbound email, fill every required field in attribution_schema
+5. Do not estimate confidence, routing thresholds, or approval likelihood
+
+## Routing a composed email
+
+POST /accounts/{account_id}/compose
+{{
+  "to": "recipient@example.com",
+  "subject": "Re: Original Subject",
+  "body": "Draft reply text...",
+  "attribution": {{
+    "relationship": "known_contact",
+    "intent": "reply",
+    "stakes": "medium",
+    "ask": false,
+    "domain": "business",
+    "recipient_context": "peer",
+    "emotional_tone": "professional",
+    "contains_claims": false,
+    "references_prior_thread": true
+  }},
+  "justification": "Replying to an existing thread and following the account policy."
+}}
 
 ## Logging every action (required)
 
@@ -107,7 +153,7 @@ POST /actions/log
 
 action_type must be one of: inbound_route, draft_approve, draft_reject, send_decision, escalate, trash
 
-## Creating a draft for review
+## Creating an unrouted draft
 
 POST /accounts/{account_id}/drafts
 {{
@@ -117,7 +163,7 @@ POST /accounts/{account_id}/drafts
   "created_by": "agent"
 }}
 
-## Sending directly (when confidence is high)
+## Sending directly outside routing
 
 POST /send
 {{

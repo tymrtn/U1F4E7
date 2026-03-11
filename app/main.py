@@ -34,6 +34,7 @@ from app.discovery import discover, discover_stream
 from app.services import policy as policy_svc
 from app.services import actions as actions_svc
 from app.services import compose as compose_svc
+from app.services import scoring as scoring_svc
 from app.services.start_here import build_start_here_response
 
 load_dotenv()
@@ -136,6 +137,20 @@ class SendEmail(BaseModel):
     attachments: Optional[list[Attachment]] = None
 
 
+class AttributionIn(BaseModel):
+    relationship: Literal["first_contact", "known_contact", "established_ally", "internal"]
+    intent: Literal["reply", "follow_up", "introduction", "pitch", "proposal", "informational", "request"]
+    stakes: Literal["low", "medium", "high", "mission_critical"]
+    ask: bool
+    domain: Literal["internal", "research", "business", "press", "investment", "legal", "personal"]
+    recipient_context: Literal["peer", "senior_executive", "public_figure", "academic", "unknown"]
+    emotional_tone: Literal["casual", "professional", "formal", "urgent"]
+    contains_claims: bool
+    references_prior_thread: bool
+    topic_tags: Optional[list[str]] = None
+    sensitivity_notes: Optional[str] = None
+
+
 class CreateDraft(BaseModel):
     to: str
     subject: Optional[str] = None
@@ -150,6 +165,7 @@ class CreateDraft(BaseModel):
     reply_to: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
     confidence: Optional[float] = None
+    attribution: Optional[AttributionIn] = None
     justification: Optional[str] = None
 
 
@@ -173,6 +189,25 @@ class ScheduleDraft(BaseModel):
 
 class RejectDraft(BaseModel):
     feedback: Optional[str] = None
+
+
+class ComposeEmailIn(BaseModel):
+    to: str
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    text: Optional[str] = None
+    html: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_by: Optional[str] = None
+    send_after: Optional[str] = None
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    reply_to: Optional[str] = None
+    attachments: Optional[list[Attachment]] = None
+    confidence: Optional[float] = None
+    attribution: Optional[AttributionIn] = None
+    justification: Optional[str] = None
 
 
 class CreateAccount(BaseModel):
@@ -238,6 +273,11 @@ class AddressPolicyIn(BaseModel):
     webhook_url: Optional[str] = None
 
 
+class ScoringRubricIn(BaseModel):
+    base_score: float
+    modifiers: dict[str, dict[str, float]]
+
+
 class LogActionIn(BaseModel):
     account_id: str
     action_type: Literal["inbound_route", "draft_approve", "draft_reject", "send_decision", "escalate", "trash"]
@@ -286,6 +326,45 @@ def _attachments_meta(attachments: Optional[list[dict]]) -> Optional[list[dict]]
             "size_bytes": len(decoded),
         })
     return meta
+
+
+def _normalize_compose_text(data: CreateDraft | ComposeEmailIn) -> Optional[str]:
+    if getattr(data, "text", None) is not None:
+        return data.text
+    return getattr(data, "body", None)
+
+
+def _serialize_attribution(data: CreateDraft | ComposeEmailIn) -> Optional[dict]:
+    if data.attribution is None:
+        return None
+    return data.attribution.model_dump(exclude_none=True)
+
+
+async def _route_compose_request(
+    request: Request,
+    account_id: str,
+    data: CreateDraft | ComposeEmailIn,
+):
+    att_dicts = _validate_attachments(data.attachments) if data.attachments else None
+    return await compose_svc.route_composed_email(
+        account_id=account_id,
+        to_addr=data.to,
+        confidence=data.confidence,
+        attribution=_serialize_attribution(data),
+        justification=data.justification or "Draft created via REST compose routing",
+        subject=data.subject,
+        text_content=_normalize_compose_text(data),
+        html_content=data.html,
+        in_reply_to=data.in_reply_to,
+        metadata=data.metadata,
+        created_by=data.created_by or "agent",
+        send_after=data.send_after,
+        cc_addr=data.cc,
+        bcc_addr=data.bcc,
+        reply_to=data.reply_to,
+        attachments=att_dicts,
+        smtp_pool=request.app.state.smtp_pool,
+    )
 
 
 # --- Rate limit helper ---
@@ -626,31 +705,27 @@ async def verify_account(request: Request, account_id: str):
 
 # --- Drafts ---
 
+@app.post("/accounts/{account_id}/compose", status_code=201)
+async def compose_email(request: Request, account_id: str, data: ComposeEmailIn):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if data.confidence is None and data.attribution is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Either confidence or attribution is required",
+        )
+    return await _route_compose_request(request, account_id, data)
+
+
 @app.post("/accounts/{account_id}/drafts", status_code=201)
 async def create_draft(request: Request, account_id: str, data: CreateDraft):
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+    if data.confidence is not None or data.attribution is not None:
+        return await _route_compose_request(request, account_id, data)
     att_dicts = _validate_attachments(data.attachments) if data.attachments else None
-    if data.confidence is not None:
-        return await compose_svc.route_composed_email(
-            account_id=account_id,
-            to_addr=data.to,
-            confidence=data.confidence,
-            justification=data.justification or "Draft created via REST compose routing",
-            subject=data.subject,
-            text_content=data.text,
-            html_content=data.html,
-            in_reply_to=data.in_reply_to,
-            metadata=data.metadata,
-            created_by=data.created_by or "agent",
-            send_after=data.send_after,
-            cc_addr=data.cc,
-            bcc_addr=data.bcc,
-            reply_to=data.reply_to,
-            attachments=att_dicts,
-            smtp_pool=request.app.state.smtp_pool,
-        )
     draft = await drafts.create_draft(
         account_id=account_id,
         to_addr=data.to,
@@ -1042,6 +1117,31 @@ async def delete_address_policy(account_id: str, pattern: str = Path(...)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Address policy not found")
     return {"status": "deleted", "pattern": pattern}
+
+
+# --- Scoring Rubric ---
+
+@app.post("/accounts/{account_id}/scoring-rubric")
+async def upsert_scoring_rubric(account_id: str, data: ScoringRubricIn):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        return await scoring_svc.upsert_scoring_rubric(
+            account_id,
+            base_score=data.base_score,
+            modifiers=data.modifiers,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/accounts/{account_id}/scoring-rubric")
+async def get_scoring_rubric(account_id: str):
+    account = await credential_store.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return await scoring_svc.get_scoring_rubric(account_id)
 
 
 # --- Start Here (Story 012) ---

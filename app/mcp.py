@@ -3,6 +3,7 @@
 
 import json
 from datetime import datetime, timezone
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -18,6 +19,8 @@ mcp = FastMCP(
         "Envelope is a programmable email API. "
         "Call start_here first with the account_id to get the domain policy and "
         "address policies that govern how this account should behave. "
+        "Use the attribution schema returned by start_here when composing email. "
+        "Do not infer or guess routing thresholds or modifier weights. "
         "Always log every action you take using log_action."
     ),
 )
@@ -102,9 +105,11 @@ async def log_action_tool(
 async def compose_email(
     account_id: str,
     to: str,
-    confidence: float,
     justification: str,
+    confidence: Optional[float] = None,
+    attribution: dict | None = None,
     subject: str = None,
+    body: str = None,
     text: str = None,
     html: str = None,
     in_reply_to: str = None,
@@ -114,12 +119,13 @@ async def compose_email(
     reply_to: str = None,
     attachments: list[dict] = None,
 ) -> str:
-    """Compose an email and let the server route it by confidence.
+    """Compose an email and let the server route it.
 
-    The server decides whether to auto-send, queue for review, or block:
-    confidence >= auto_send_threshold -> sent
-    review_threshold <= confidence < auto_send_threshold -> pending_review
-    confidence < review_threshold -> blocked
+    Preferred mode: provide attribution, not confidence. The server scores the
+    attribution tags privately and decides whether to auto-send, queue for review,
+    or block. Legacy confidence is still accepted for backward compatibility.
+
+    If attribution is present, confidence is ignored.
 
     Set in_reply_to to the Message-ID of the email being replied to.
     created_by should be 'agent' for agent-created drafts.
@@ -132,9 +138,10 @@ async def compose_email(
             account_id=account_id,
             to_addr=to,
             confidence=confidence,
+            attribution=attribution,
             justification=justification,
             subject=subject,
-            text_content=text,
+            text_content=text or body,
             html_content=html,
             in_reply_to=in_reply_to,
             created_by=created_by,

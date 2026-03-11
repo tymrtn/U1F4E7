@@ -8,6 +8,7 @@ from typing import Optional
 from app import drafts, messages
 from app.credentials import store as credential_store
 from app.services.actions import log_action
+from app.services import scoring as scoring_svc
 from app.transport.smtp import SmtpSendError, build_mime_message, send_message
 
 EDITABLE_DRAFT_STATUSES = {"draft", "pending_review", "blocked"}
@@ -150,8 +151,9 @@ async def send_draft(  # noqa: PLR0913
 async def route_composed_email(  # noqa: PLR0913
     account_id: str,
     to_addr: str,
-    confidence: float,
     justification: str,
+    confidence: Optional[float] = None,
+    attribution: Optional[dict] = None,
     subject: Optional[str] = None,
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
@@ -170,18 +172,36 @@ async def route_composed_email(  # noqa: PLR0913
     if not account:
         raise DraftRoutingError(status_code=404, detail="Account not found")
 
-    routing_status = resolve_routing_status(confidence, account)
+    score = confidence
+    attribution_applied: dict[str, float] = {}
+    if attribution is not None:
+        rubric = await scoring_svc.get_scoring_rubric(account_id)
+        score, attribution_applied = scoring_svc.compute_attribution_score(
+            attribution,
+            rubric,
+        )
+    if score is None:
+        raise DraftRoutingError(
+            status_code=422,
+            detail="Either confidence or attribution is required",
+        )
+
+    routing_status = resolve_routing_status(score, account)
     auto_send_threshold = account.get("auto_send_threshold", 0.85)
     review_threshold = account.get("review_threshold", 0.50)
     routing_metadata = dict(metadata or {})
     routing_metadata.update({
-        "confidence": confidence,
+        "confidence": score,
+        "computed_score": score,
         "justification": justification,
         "routing_status": routing_status,
         "routed_at": datetime.now(timezone.utc).isoformat(),
         "auto_send_threshold": auto_send_threshold,
         "review_threshold": review_threshold,
     })
+    if attribution is not None:
+        routing_metadata["attribution"] = attribution
+        routing_metadata["attribution_applied"] = attribution_applied
 
     draft_status = "draft" if routing_status == "sent" else routing_status
     draft = await drafts.create_draft(
@@ -205,7 +225,7 @@ async def route_composed_email(  # noqa: PLR0913
     await log_action(
         account_id=account_id,
         action_type="send_decision",
-        confidence=confidence,
+        confidence=score,
         justification=justification,
         action_taken=(
             f"Routed compose_email to {routing_status} "
@@ -226,6 +246,9 @@ async def route_composed_email(  # noqa: PLR0913
     return {
         "draft_id": draft["id"],
         "status": routing_status,
+        "routing_status": routing_status,
         "to": to_addr,
         "subject": subject,
+        "computed_score": score,
+        "attribution_applied": attribution_applied,
     }

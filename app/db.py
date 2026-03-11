@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     model TEXT NOT NULL,
     embedded_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scoring_rubrics (
+    account_id TEXT PRIMARY KEY,
+    base_score REAL NOT NULL,
+    modifiers TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 MIGRATIONS = [
@@ -133,6 +140,8 @@ MIGRATIONS = [
     # Story 020 — Attachments
     "ALTER TABLE drafts ADD COLUMN attachments TEXT DEFAULT '[]'",
     "ALTER TABLE messages ADD COLUMN attachments_meta TEXT DEFAULT '[]'",
+    # Story 021 — Contextual attribution scoring
+    "CREATE TABLE IF NOT EXISTS scoring_rubrics (account_id TEXT PRIMARY KEY, base_score REAL NOT NULL, modifiers TEXT NOT NULL, updated_at TEXT NOT NULL)",
 ]
 
 _connection: aiosqlite.Connection | None = None
