@@ -26,6 +26,7 @@ async def create_account(
     auto_send_threshold: float = 0.85,
     review_threshold: float = 0.50,
     rate_limit_per_hour: Optional[int] = None,
+    notification_email: Optional[str] = None,
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
     signature_text: Optional[str] = None,
@@ -38,20 +39,21 @@ async def create_account(
     encrypted_smtp_pw = encrypt(smtp_password) if smtp_password else None
     encrypted_imap_pw = encrypt(imap_password) if imap_password else None
     encrypted_webhook_secret = encrypt(webhook_secret) if webhook_secret else None
+    effective_notification_email = notification_email or username
 
     db = await get_db()
     await db.execute(
         """INSERT INTO accounts
         (id, name, smtp_host, smtp_port, imap_host, imap_port,
          username, encrypted_password, smtp_username, encrypted_smtp_password,
-         imap_username, encrypted_imap_password, display_name,
+         imap_username, encrypted_imap_password, display_name, notification_email,
          approval_required, auto_send_threshold, review_threshold, rate_limit_per_hour,
          webhook_url, webhook_secret, signature_text, signature_html, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             account_id, name, smtp_host, smtp_port, imap_host, imap_port,
             username, encrypted_password, smtp_username, encrypted_smtp_pw,
-            imap_username, encrypted_imap_pw, display_name,
+            imap_username, encrypted_imap_pw, display_name, effective_notification_email,
             1 if approval_required else 0, auto_send_threshold, review_threshold, rate_limit_per_hour,
             webhook_url, encrypted_webhook_secret, signature_text, signature_html, now,
         ),
@@ -67,6 +69,7 @@ async def create_account(
         "imap_port": imap_port,
         "username": username,
         "display_name": display_name,
+        "notification_email": effective_notification_email,
         "approval_required": approval_required,
         "auto_send_threshold": auto_send_threshold,
         "review_threshold": review_threshold,
@@ -80,7 +83,7 @@ async def list_accounts() -> list[dict]:
     db = await get_db()
     cursor = await db.execute(
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
-                  username, smtp_username, imap_username, display_name,
+                  username, smtp_username, imap_username, display_name, notification_email,
                   approval_required, auto_send_threshold, review_threshold,
                   rate_limit_per_hour, webhook_url, signature_text, signature_html,
                   created_at, verified_at
@@ -94,7 +97,7 @@ async def get_account(account_id: str) -> Optional[dict]:
     db = await get_db()
     cursor = await db.execute(
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
-                  username, smtp_username, imap_username, display_name,
+                  username, smtp_username, imap_username, display_name, notification_email,
                   approval_required, auto_send_threshold, review_threshold,
                   rate_limit_per_hour, webhook_url, signature_text, signature_html,
                   created_at, verified_at
@@ -140,7 +143,7 @@ async def get_account_by_name(name: str) -> Optional[dict]:
     db = await get_db()
     cursor = await db.execute(
         """SELECT id, name, smtp_host, smtp_port, imap_host, imap_port,
-                  username, smtp_username, imap_username, display_name,
+                  username, smtp_username, imap_username, display_name, notification_email,
                   approval_required, auto_send_threshold, review_threshold,
                   rate_limit_per_hour, webhook_url, signature_text, signature_html,
                   created_at, verified_at
@@ -157,15 +160,25 @@ async def update_account(account_id: str, **fields) -> Optional[dict]:
         return None
 
     allowed = {
-        "display_name", "auto_send_threshold", "review_threshold",
+        "display_name", "notification_email", "auto_send_threshold", "review_threshold",
         "rate_limit_per_hour", "webhook_url", "signature_text", "signature_html",
         "smtp_host", "smtp_port", "imap_host", "imap_port",
     }
-    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    clearable_fields = {"notification_email", "webhook_url", "signature_text", "signature_html"}
+    updates = {}
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        if key in clearable_fields or value is not None:
+            updates[key] = value
 
     # Handle webhook_secret separately (needs encryption)
-    if "webhook_secret" in fields and fields["webhook_secret"] is not None:
-        updates["webhook_secret"] = encrypt(fields["webhook_secret"])
+    if "webhook_secret" in fields:
+        updates["webhook_secret"] = (
+            encrypt(fields["webhook_secret"])
+            if fields["webhook_secret"] is not None
+            else None
+        )
 
     if not updates:
         return account
@@ -212,6 +225,11 @@ def _row_to_dict(row) -> dict:
         "smtp_username": row["smtp_username"],
         "imap_username": row["imap_username"],
         "display_name": row["display_name"],
+        "notification_email": (
+            row["notification_email"]
+            if "notification_email" in keys and row["notification_email"]
+            else row["username"]
+        ),
         "approval_required": bool(row["approval_required"]),
         "auto_send_threshold": row["auto_send_threshold"] if row["auto_send_threshold"] is not None else 0.85,
         "review_threshold": row["review_threshold"] if row["review_threshold"] is not None else 0.50,

@@ -192,6 +192,7 @@ class CreateAccount(BaseModel):
     imap_password: Optional[str] = None
     # Optional metadata
     display_name: Optional[str] = None
+    notification_email: Optional[str] = None
     approval_required: bool = True
     # Agent thresholds
     auto_send_threshold: float = 0.85
@@ -201,6 +202,7 @@ class CreateAccount(BaseModel):
 
 class UpdateAccount(BaseModel):
     display_name: Optional[str] = None
+    notification_email: Optional[str] = None
     auto_send_threshold: Optional[float] = None
     review_threshold: Optional[float] = None
     rate_limit_per_hour: Optional[int] = None
@@ -547,6 +549,7 @@ async def create_account(data: CreateAccount):
         imap_username=data.imap_username,
         imap_password=data.imap_password,
         display_name=data.display_name,
+        notification_email=data.notification_email,
         approval_required=data.approval_required,
         auto_send_threshold=data.auto_send_threshold,
         review_threshold=data.review_threshold,
@@ -574,30 +577,14 @@ async def update_account(account_id: str, data: UpdateAccount):
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     updates = {}
-    if data.display_name is not None:
-        updates["display_name"] = data.display_name
-    if data.auto_send_threshold is not None:
-        updates["auto_send_threshold"] = data.auto_send_threshold
-    if data.review_threshold is not None:
-        updates["review_threshold"] = data.review_threshold
-    if data.rate_limit_per_hour is not None:
-        updates["rate_limit_per_hour"] = data.rate_limit_per_hour
-    if data.webhook_url is not None:
-        updates["webhook_url"] = data.webhook_url
-    if data.webhook_secret is not None:
-        updates["webhook_secret"] = data.webhook_secret
-    if data.signature_text is not None:
-        updates["signature_text"] = data.signature_text
-    if data.signature_html is not None:
-        updates["signature_html"] = data.signature_html
-    if data.smtp_host is not None:
-        updates["smtp_host"] = data.smtp_host
-    if data.smtp_port is not None:
-        updates["smtp_port"] = data.smtp_port
-    if data.imap_host is not None:
-        updates["imap_host"] = data.imap_host
-    if data.imap_port is not None:
-        updates["imap_port"] = data.imap_port
+    clearable_fields = {
+        "notification_email", "webhook_url", "webhook_secret",
+        "signature_text", "signature_html",
+    }
+    for field in data.__fields_set__:
+        value = getattr(data, field)
+        if field in clearable_fields or value is not None:
+            updates[field] = value
     if not updates:
         return account
     updated = await credential_store.update_account(account_id, **updates)

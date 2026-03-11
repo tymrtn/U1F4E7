@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     imap_username TEXT,
     encrypted_imap_password TEXT,
     display_name TEXT,
+    notification_email TEXT,
     approval_required INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     verified_at TEXT
@@ -122,6 +123,9 @@ MIGRATIONS = [
     # Story 018 — Account signatures
     "ALTER TABLE accounts ADD COLUMN signature_text TEXT",
     "ALTER TABLE accounts ADD COLUMN signature_html TEXT",
+    # Story 021 — Approval notifications
+    "ALTER TABLE accounts ADD COLUMN notification_email TEXT",
+    "UPDATE accounts SET notification_email = username WHERE notification_email IS NULL",
     # Story 019 — Open tracking
     "ALTER TABLE messages ADD COLUMN track_opens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN tracking_token TEXT",
