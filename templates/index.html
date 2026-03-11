@@ -180,6 +180,222 @@
             </section>
         </div>
 
+        <!-- Policies -->
+        <section id="policies-section" class="fade-in">
+            <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between mb-4">
+                <div class="space-y-2">
+                    <h2 class="section-label">Policies</h2>
+                    <p class="text-sm text-mid max-w-2xl">
+                        Edit domain guidance, address-specific rules, and confidence thresholds for one account.
+                    </p>
+                </div>
+                <div class="w-full lg:w-80">
+                    <label for="policy-account-select" class="section-label block mb-2">Account</label>
+                    <select id="policy-account-select" class="input-field bg-white">
+                        <option value="">Select account...</option>
+                    </select>
+                </div>
+            </div>
+
+            <div id="policies-empty" class="hidden border border-rule bg-white px-4 py-8 text-center text-sm text-mid">
+                Add an account to manage policies.
+            </div>
+
+            <div id="policies-workspace" class="hidden space-y-6">
+                <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)] gap-6">
+                    <section class="border border-rule bg-white">
+                        <div class="border-b border-rule px-4 py-3">
+                            <h3 class="text-sm font-medium">Domain Policy</h3>
+                            <p class="text-xs text-mid font-mono mt-1">Global reply guidance for the selected account.</p>
+                        </div>
+                        <form id="domain-policy-form" class="p-4 space-y-4">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <label class="block">
+                                    <span class="section-label block mb-2">Name</span>
+                                    <input type="text" id="domain-policy-name" class="input-field" placeholder="Primary policy name">
+                                </label>
+                                <label class="block">
+                                    <span class="section-label block mb-2">Tone</span>
+                                    <select id="domain-policy-tone" class="input-field bg-white">
+                                        <option value="formal">formal</option>
+                                        <option value="professional-warm">professional-warm</option>
+                                        <option value="casual">casual</option>
+                                        <option value="neutral">neutral</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <label class="block">
+                                <span class="section-label block mb-2">Description</span>
+                                <input type="text" id="domain-policy-description" class="input-field" placeholder="What this policy should optimize for">
+                            </label>
+                            <label class="block">
+                                <span class="section-label block mb-2">Style</span>
+                                <input type="text" id="domain-policy-style" class="input-field" placeholder="Style notes, phrasing cues, formatting rules">
+                            </label>
+                            <label class="block">
+                                <span class="section-label block mb-2">Values</span>
+                                <input type="text" id="domain-policy-values" class="input-field" placeholder="clear, concise, helpful">
+                            </label>
+                            <label class="block">
+                                <span class="section-label block mb-2">Knowledge Base</span>
+                                <textarea id="domain-policy-kb-text" rows="10" class="input-field font-mono text-xs leading-relaxed resize-y" placeholder="Reference notes, product details, approved positions"></textarea>
+                            </label>
+                            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div class="space-y-1">
+                                    <p id="domain-policy-meta" class="text-xs text-mid font-mono">No policy loaded.</p>
+                                    <div id="domain-policy-feedback" class="hidden text-xs font-mono"></div>
+                                </div>
+                                <button id="save-domain-policy" type="submit" class="btn-primary text-xs whitespace-nowrap">Save Domain Policy</button>
+                            </div>
+                        </form>
+                    </section>
+
+                    <section class="border border-rule bg-white">
+                        <div class="border-b border-rule px-4 py-3">
+                            <h3 class="text-sm font-medium">Account Thresholds</h3>
+                            <p class="text-xs text-mid font-mono mt-1">Define when a draft auto-sends, goes to review, or is blocked.</p>
+                        </div>
+                        <form id="thresholds-form" class="p-4 space-y-5">
+                            <div class="grid grid-cols-1 gap-4">
+                                <label class="block">
+                                    <div class="flex items-center justify-between gap-3 mb-2">
+                                        <span class="section-label">Auto-Send Threshold</span>
+                                        <span id="threshold-auto-display" class="text-xs font-mono text-ink">0.85</span>
+                                    </div>
+                                    <input type="range" id="threshold-auto-range" min="0" max="1" step="0.01" value="0.85" class="w-full accent-ink">
+                                    <div class="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                                        <input type="number" id="threshold-auto-input" min="0" max="1" step="0.01" value="0.85" class="input-field w-full sm:w-24">
+                                        <p class="text-xs text-mid">Confidence at or above this value sends automatically.</p>
+                                    </div>
+                                </label>
+
+                                <label class="block">
+                                    <div class="flex items-center justify-between gap-3 mb-2">
+                                        <span class="section-label">Review Threshold</span>
+                                        <span id="threshold-review-display" class="text-xs font-mono text-ink">0.50</span>
+                                    </div>
+                                    <input type="range" id="threshold-review-range" min="0" max="1" step="0.01" value="0.50" class="w-full accent-ink">
+                                    <div class="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                                        <input type="number" id="threshold-review-input" min="0" max="1" step="0.01" value="0.50" class="input-field w-full sm:w-24">
+                                        <p class="text-xs text-mid">Confidence below this value is blocked for manual handling.</p>
+                                    </div>
+                                </label>
+                            </div>
+
+                            <div class="border border-rule bg-neutral-50/50 p-4 space-y-3">
+                                <div class="flex items-center justify-between text-[11px] font-mono text-mid">
+                                    <span>0.00</span>
+                                    <span>1.00</span>
+                                </div>
+                                <div class="relative h-4 overflow-hidden border border-rule bg-white">
+                                    <div id="threshold-zone-blocked" class="absolute inset-y-0 left-0 bg-warn-light"></div>
+                                    <div id="threshold-zone-review" class="absolute inset-y-0 bg-pending-light"></div>
+                                    <div id="threshold-zone-auto" class="absolute inset-y-0 right-0 bg-accent-light"></div>
+                                    <div id="threshold-marker-review" class="absolute inset-y-0 w-px bg-warn"></div>
+                                    <div id="threshold-marker-auto" class="absolute inset-y-0 w-px bg-accent"></div>
+                                </div>
+                                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px] font-mono text-mid">
+                                    <div>
+                                        <p class="text-warn">Blocked Zone</p>
+                                        <p>Below review threshold</p>
+                                    </div>
+                                    <div>
+                                        <p class="text-pending">Review Zone</p>
+                                        <p>Between review and auto-send</p>
+                                    </div>
+                                    <div>
+                                        <p class="text-accent">Auto-Send Zone</p>
+                                        <p>At or above auto-send threshold</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div id="thresholds-feedback" class="hidden text-xs font-mono"></div>
+                                <button id="save-thresholds" type="submit" class="btn-primary text-xs whitespace-nowrap">Save Thresholds</button>
+                            </div>
+                        </form>
+                    </section>
+                </div>
+
+                <section class="border border-rule bg-white">
+                    <div class="border-b border-rule px-4 py-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div>
+                            <h3 class="text-sm font-medium">Address Policies</h3>
+                            <p class="text-xs text-mid font-mono mt-1">Per-pattern instructions for routing, reply style, and escalation.</p>
+                        </div>
+                        <button id="toggle-add-address-policy" class="btn-ghost text-xs whitespace-nowrap">+ Add Policy</button>
+                    </div>
+
+                    <div id="add-address-policy-panel" class="hidden border-b border-rule bg-neutral-50/50 p-4">
+                        <form id="address-policy-create-form" class="space-y-4">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <label class="block">
+                                    <span class="section-label block mb-2">Pattern</span>
+                                    <input type="text" id="new-address-pattern" class="input-field" placeholder="*@vip.example.com">
+                                </label>
+                                <label class="block">
+                                    <span class="section-label block mb-2">Purpose</span>
+                                    <input type="text" id="new-address-purpose" class="input-field" placeholder="VIP support inbox">
+                                </label>
+                            </div>
+
+                            <label class="block">
+                                <div class="flex items-center justify-between gap-3 mb-2">
+                                    <span class="section-label">Confidence Threshold</span>
+                                    <span id="new-address-confidence-display" class="text-xs font-mono text-ink">0.70</span>
+                                </div>
+                                <input type="range" id="new-address-confidence" min="0" max="1" step="0.01" value="0.70" class="w-full accent-ink">
+                            </label>
+
+                            <label class="block">
+                                <span class="section-label block mb-2">Reply Instructions</span>
+                                <textarea id="new-address-reply-instructions" rows="4" class="input-field font-mono text-xs leading-relaxed resize-y" placeholder="How the assistant should respond for this address pattern"></textarea>
+                            </label>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <label class="block">
+                                    <span class="section-label block mb-2">Escalation Rules</span>
+                                    <textarea id="new-address-escalation-rules" rows="3" class="input-field font-mono text-xs leading-relaxed resize-y" placeholder="When human review is mandatory"></textarea>
+                                </label>
+                                <label class="block">
+                                    <span class="section-label block mb-2">Trash Criteria</span>
+                                    <textarea id="new-address-trash-criteria" rows="3" class="input-field font-mono text-xs leading-relaxed resize-y" placeholder="What to ignore or discard"></textarea>
+                                </label>
+                            </div>
+
+                            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div id="address-policy-create-feedback" class="hidden text-xs font-mono"></div>
+                                <div class="flex gap-2">
+                                    <button id="cancel-add-address-policy" type="button" class="btn-ghost text-xs">Cancel</button>
+                                    <button id="save-new-address-policy" type="submit" class="btn-primary text-xs whitespace-nowrap">Save Policy</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full min-w-[760px] text-sm">
+                            <thead>
+                                <tr class="border-b border-rule bg-neutral-50/50">
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Pattern</th>
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Purpose</th>
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Threshold</th>
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Reply Instructions</th>
+                                    <th class="text-right px-4 py-2.5 section-label font-medium">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="address-policies-body" class="divide-y divide-rule">
+                                <tr>
+                                    <td colspan="5" class="px-4 py-8 text-center text-sm text-mid">Select an account to load address policies.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </section>
+
         <!-- Messages Log -->
         <section id="messages-section">
             <div class="flex items-center justify-between mb-4">

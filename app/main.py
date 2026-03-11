@@ -953,13 +953,15 @@ async def upsert_domain_policy(account_id: str, data: DomainPolicyIn):
 
 
 @app.get("/accounts/{account_id}/domain-policy")
-async def get_domain_policy(account_id: str):
+async def get_domain_policy(account_id: str, full: bool = False):
     account = await credential_store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     policy = await policy_svc.get_domain_policy(account_id)
     if not policy:
         raise HTTPException(status_code=404, detail="Domain policy not found")
+    if full:
+        return policy
     kb_text = policy.get("kb_text") or ""
     if len(kb_text) > 2000:
         policy = dict(policy)
