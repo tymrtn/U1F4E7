@@ -12,6 +12,7 @@ from app.services import scoring as scoring_svc
 from app.transport.smtp import SmtpSendError, build_mime_message, send_message
 
 EDITABLE_DRAFT_STATUSES = {"draft", "pending_review", "blocked"}
+HUMAN_APPROVAL_SOURCES = {"review-queue", "server-routing"}
 
 
 class DraftRoutingError(Exception):
@@ -86,6 +87,14 @@ async def send_draft(  # noqa: PLR0913
             status_code=409,
             detail=f"Cannot send draft with status '{draft['status']}'",
         )
+
+    if draft["status"] in ("blocked", "pending_review"):
+        if approved_by not in HUMAN_APPROVAL_SOURCES:
+            raise DraftRoutingError(
+                status_code=403,
+                detail=f"Draft with status '{draft['status']}' requires human approval.",
+                error_type="agent_approval_denied",
+            )
 
     account = await credential_store.get_account_with_credentials(account_id)
     if not account:

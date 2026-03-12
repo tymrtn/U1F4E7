@@ -162,36 +162,12 @@ async def compose_email(
 async def get_draft_tool(account_id: str, draft_id: str) -> str:
     """Get a draft by ID.
 
-    Use to check the current state of a draft before approving or rejecting it.
+    Use to check the current state of a draft.
     """
     draft = await drafts_module.get_draft(draft_id)
     if not draft or draft["account_id"] != account_id:
         return json.dumps({"error": "Draft not found"})
     return json.dumps(draft, indent=2)
-
-
-@mcp.tool()
-async def approve_draft_tool(account_id: str, draft_id: str) -> str:
-    """Approve and send a draft immediately.
-
-    Use this when a draft has been reviewed and is ready to send.
-    Works on unsent drafts that are pending review or blocked. Records approval metadata.
-
-    Do NOT use this for drafts awaiting human review in the review queue —
-    those are for humans to approve via the /review interface.
-    """
-    try:
-        result = await compose_svc.send_draft(
-            account_id=account_id,
-            draft_id=draft_id,
-            approved_by="agent",
-        )
-    except compose_svc.DraftRoutingError as exc:
-        error = {"error": exc.detail}
-        if exc.error_type:
-            error["error_type"] = exc.error_type
-        return json.dumps(error)
-    return json.dumps(result, indent=2)
 
 
 @mcp.tool()

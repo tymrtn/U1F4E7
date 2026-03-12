@@ -854,9 +854,8 @@ async def send_draft(
     request: Request,
     account_id: str,
     draft_id: str,
-    approved_by: Optional[str] = None,
 ):
-    return await _send_draft(request, account_id, draft_id, approved_by=approved_by)
+    return await _send_draft(request, account_id, draft_id)
 
 
 @app.delete("/accounts/{account_id}/drafts/{draft_id}")
