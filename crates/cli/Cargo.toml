@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 envelope-email-store = { path = "../store" }
 envelope-email-transport = { path = "../email" }
+envelope-email-dashboard = { path = "../dashboard" }
 
 clap.workspace = true
 tokio.workspace = true

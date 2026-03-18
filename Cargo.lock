@@ -640,6 +640,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "envelope-email-dashboard",
  "envelope-email-store",
  "envelope-email-transport",
  "serde",

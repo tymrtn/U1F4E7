@@ -356,54 +356,102 @@ fn main() {
 
     let result = match cli.command {
         Commands::Accounts { subcommand } => commands::accounts::run(subcommand, cli.json),
-        Commands::Inbox { .. } => {
-            eprintln!("Not yet implemented: inbox (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Read { .. } => {
-            eprintln!("Not yet implemented: read (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Search { .. } => {
-            eprintln!("Not yet implemented: search (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Send { .. } => {
-            eprintln!("Not yet implemented: send (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Move { .. } => {
-            eprintln!("Not yet implemented: move (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Copy { .. } => {
-            eprintln!("Not yet implemented: copy (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Delete { .. } => {
-            eprintln!("Not yet implemented: delete (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Flag { .. } => {
-            eprintln!("Not yet implemented: flag (transport layer pending)");
-            std::process::exit(1);
-        }
-        Commands::Folders { .. } => {
-            eprintln!("Not yet implemented: folders (transport layer pending)");
-            std::process::exit(1);
+        Commands::Inbox {
+            folder,
+            limit,
+            account,
+        } => commands::inbox::run(&folder, limit, account.as_deref(), cli.json),
+        Commands::Read {
+            uid,
+            folder,
+            account,
+        } => commands::read::run(uid, &folder, account.as_deref(), cli.json),
+        Commands::Search {
+            query,
+            folder,
+            limit,
+            account,
+        } => commands::search::run(&query, &folder, limit, account.as_deref(), cli.json),
+        Commands::Send {
+            to,
+            subject,
+            body,
+            html,
+            cc,
+            bcc,
+            reply_to,
+            account,
+        } => commands::send::run(
+            &to,
+            &subject,
+            body.as_deref(),
+            html.as_deref(),
+            cc.as_deref(),
+            bcc.as_deref(),
+            reply_to.as_deref(),
+            account.as_deref(),
+            cli.json,
+        ),
+        Commands::Move {
+            uid,
+            to_folder,
+            folder,
+            account,
+        } => commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json),
+        Commands::Copy {
+            uid,
+            to_folder,
+            folder,
+            account,
+        } => commands::messages::run_copy(uid, &folder, &to_folder, account.as_deref(), cli.json),
+        Commands::Delete {
+            uid,
+            folder,
+            account,
+        } => commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json),
+        Commands::Flag { subcommand } => match subcommand {
+            FlagCmd::Add {
+                uid,
+                flag,
+                folder,
+                account,
+            } => commands::flags::run_add(uid, &flag, &folder, account.as_deref(), cli.json),
+            FlagCmd::Remove {
+                uid,
+                flag,
+                folder,
+                account,
+            } => commands::flags::run_remove(uid, &flag, &folder, account.as_deref(), cli.json),
+        },
+        Commands::Folders { account } => {
+            commands::folders::run(account.as_deref(), cli.json)
         }
         Commands::Attachment { .. } => {
             eprintln!("Not yet implemented: attachment (transport layer pending)");
             std::process::exit(1);
         }
-        Commands::Draft { .. } => {
-            eprintln!("Not yet implemented: draft (store integration pending)");
-            std::process::exit(1);
-        }
-        Commands::Serve { port } => {
-            eprintln!("Dashboard not yet implemented (port {port})");
-            std::process::exit(1);
-        }
+        Commands::Draft { subcommand } => match subcommand {
+            DraftCmd::List { account } => {
+                commands::drafts::run_list(account.as_deref(), cli.json)
+            }
+            DraftCmd::Create {
+                to,
+                subject,
+                body,
+                account,
+            } => commands::drafts::run_create(
+                &to,
+                subject.as_deref(),
+                body.as_deref(),
+                account.as_deref(),
+                cli.json,
+            ),
+            DraftCmd::Send { id, account } => {
+                commands::drafts::run_send(&id, account.as_deref(), cli.json)
+            }
+            DraftCmd::Discard { id } => commands::drafts::run_discard(&id, cli.json),
+        },
+        Commands::Serve { port } => commands::serve::run(port),
         Commands::Compose { .. } => {
             eprintln!("License required — visit https://envelope-email.dev");
             std::process::exit(1);
