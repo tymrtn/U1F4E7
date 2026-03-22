@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Tyler Martin
 # Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -8,7 +9,7 @@ from typing import Optional
 from app.db import get_db
 
 
-async def create_message(
+async def create_message(  # noqa: PLR0913
     account_id: str,
     from_addr: str,
     to_addr: str,
@@ -16,18 +17,24 @@ async def create_message(
     direction: str = "outbound",
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
+    initial_status: str = "queued",
+    track_opens: bool = False,
+    tracking_token: Optional[str] = None,
+    attachments_meta: Optional[list[dict]] = None,
 ) -> dict:
     msg_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    att_meta_json = json.dumps(attachments_meta) if attachments_meta else "[]"
 
     db = await get_db()
     await db.execute(
-        """INSERT INTO messages
+        f"""INSERT INTO messages
         (id, account_id, direction, from_addr, to_addr, subject, status, created_at,
-         text_content, html_content)
-        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+         text_content, html_content, track_opens, tracking_token, attachments_meta)
+        VALUES (?, ?, ?, ?, ?, ?, '{initial_status}', ?, ?, ?, ?, ?, ?)""",
         (msg_id, account_id, direction, from_addr, to_addr, subject, now,
-         text_content, html_content),
+         text_content, html_content, 1 if track_opens else 0, tracking_token,
+         att_meta_json),
     )
     await db.commit()
 
@@ -38,8 +45,11 @@ async def create_message(
         "from_addr": from_addr,
         "to_addr": to_addr,
         "subject": subject,
-        "status": "queued",
+        "status": initial_status,
         "created_at": now,
+        "track_opens": track_opens,
+        "tracking_token": tracking_token,
+        "attachments_meta": attachments_meta or [],
     }
 
 
@@ -105,7 +115,7 @@ async def claim_message(msg_id: str) -> bool:
 async def recover_orphans():
     db = await get_db()
     # Only reset messages that were claimed but never actually submitted to SMTP.
-    # If message_id is already set, Migadu accepted it — don't re-queue or we'll duplicate.
+    # If message_id is already set, Migadu accepted it. Re-queuing would cause a duplicate send.
     await db.execute(
         "UPDATE messages SET status = 'queued' WHERE status = 'sending' AND (message_id IS NULL OR message_id = '')"
     )
@@ -160,6 +170,36 @@ async def get_stats() -> dict:
         "queued": queued,
         "success_rate": round(sent / total * 100, 1) if total > 0 else 0,
     }
+
+
+async def record_open(token: str, user_agent: Optional[str] = None, ip_addr: Optional[str] = None) -> Optional[str]:
+    """Record an open event for a message by its tracking token. Returns message_id or None."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM messages WHERE tracking_token = ?", (token,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    message_id = row["id"]
+    open_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO message_opens (id, message_id, token, opened_at, user_agent, ip_addr) VALUES (?, ?, ?, ?, ?, ?)",
+        (open_id, message_id, token, now, user_agent, ip_addr),
+    )
+    await db.commit()
+    return message_id
+
+
+async def list_opens(message_id: str) -> list[dict]:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, message_id, token, opened_at, user_agent, ip_addr FROM message_opens WHERE message_id = ? ORDER BY opened_at DESC",
+        (message_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
 def _row_to_dict(row) -> dict:

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/server-json/draft/server.schema.json",
+  "name": "envelope",
+  "displayName": "Envelope (📧 U1F4E7)",
+  "description": "BYO mailbox email API with MCP server. Connect any IMAP/SMTP account and get agent-native email with draft previews, human-in-the-loop approval gates, domain policies, action audit logs, open tracking, and thread reconstruction.",
+  "repository": {
+    "url": "https://github.com/tymrtn/U1F4E7"
+  },
+  "license": "FSL-1.1-ALv2",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "envelope-email",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import mimetypes
 from email.message import EmailMessage
 from typing import Optional
 
@@ -24,6 +26,11 @@ def build_mime_message(
     text: Optional[str] = None,
     html: Optional[str] = None,
     display_name: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    custom_headers: Optional[dict] = None,
+    attachments: Optional[list[dict]] = None,
 ) -> EmailMessage:
     msg = EmailMessage()
 
@@ -34,6 +41,15 @@ def build_mime_message(
     msg["To"] = to_addr
     msg["Subject"] = subject
 
+    if cc:
+        msg["Cc"] = cc
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if bcc:
+        msg["Bcc"] = bcc  # aiosmtplib strips Bcc from wire, uses it for RCPT TO
+    for k, v in (custom_headers or {}).items():
+        msg[k] = v
+
     if text and html:
         msg.set_content(text)
         msg.add_alternative(html, subtype="html")
@@ -43,6 +59,16 @@ def build_mime_message(
         msg.set_content(text)
     else:
         msg.set_content("")
+
+    for att in (attachments or []):
+        data = base64.b64decode(att["content"])
+        content_type = att.get("content_type") or mimetypes.guess_type(att["filename"])[0] or "application/octet-stream"
+        maintype, subtype = content_type.split("/", 1)
+        kwargs = dict(maintype=maintype, subtype=subtype, filename=att["filename"])
+        if att.get("content_id"):
+            kwargs["cid"] = att["content_id"]
+            kwargs["disposition"] = "inline"
+        msg.add_attachment(data, **kwargs)
 
     return msg
 

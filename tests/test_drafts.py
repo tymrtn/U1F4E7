@@ -146,7 +146,7 @@ async def test_send_after_send_returns_409(client):
     account = await _create_account(client)
     created = (await _create_draft(client, account["id"])).json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "<msg-id@example.com>"
         resp = await client.post(f"/accounts/{account['id']}/drafts/{created['id']}/send")
         assert resp.status_code == 200
@@ -186,7 +186,7 @@ async def test_send_draft_creates_message_record(client):
     account = await _create_account(client)
     created = (await _create_draft(client, account["id"])).json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "<msg-id@example.com>"
         resp = await client.post(f"/accounts/{account['id']}/drafts/{created['id']}/send")
         assert resp.status_code == 200
@@ -210,7 +210,7 @@ async def test_send_draft_with_in_reply_to(client):
     )
     created = resp.json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "<reply-id@example.com>"
         resp = await client.post(f"/accounts/{account['id']}/drafts/{created['id']}/send")
         assert resp.status_code == 200
@@ -227,7 +227,7 @@ async def test_send_draft_smtp_error(client):
     account = await _create_account(client)
     created = (await _create_draft(client, account["id"])).json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.side_effect = SmtpSendError("connection_error", "Connection refused")
         resp = await client.post(f"/accounts/{account['id']}/drafts/{created['id']}/send")
         assert resp.status_code == 502
@@ -305,19 +305,19 @@ async def test_filter_drafts_combined(client):
 
 
 @pytest.mark.asyncio
-async def test_send_with_approved_by_records_metadata(client):
+async def test_approve_records_metadata(client):
     account = await _create_account(client)
     aid = account["id"]
     draft = (await _create_draft(client, aid, metadata={"agent": "inbox-agent"})).json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "<sent@example.com>"
-        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send?approved_by=tyler")
+        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/approve")
         assert resp.status_code == 200
 
     from app.drafts import get_draft
     updated = await get_draft(draft["id"])
-    assert updated["metadata"]["approved_by"] == "tyler"
+    assert updated["metadata"]["approved_by"] == "review-queue"
     assert "approved_at" in updated["metadata"]
     assert updated["metadata"]["agent"] == "inbox-agent"
 
@@ -365,7 +365,7 @@ async def test_reject_already_sent_fails(client):
     aid = account["id"]
     draft = (await _create_draft(client, aid)).json()
 
-    with patch("app.main.send_message", new_callable=AsyncMock) as mock_send:
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "<sent@example.com>"
         await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send")
 
@@ -384,3 +384,86 @@ async def test_reject_nonexistent_draft(client):
         json={},
     )
     assert resp.status_code == 404
+
+
+# --- Enforcement: agent cannot approve blocked/pending drafts ---
+
+
+@pytest.mark.asyncio
+async def test_send_blocked_draft_returns_403(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    from app.db import get_db
+    db = await get_db()
+    await db.execute("UPDATE drafts SET status = 'blocked' WHERE id = ?", (draft["id"],))
+    await db.commit()
+
+    resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_send_pending_review_draft_returns_403(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    from app.db import get_db
+    db = await get_db()
+    await db.execute("UPDATE drafts SET status = 'pending_review' WHERE id = ?", (draft["id"],))
+    await db.commit()
+
+    resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_approve_blocked_draft_succeeds(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    from app.db import get_db
+    db = await get_db()
+    await db.execute("UPDATE drafts SET status = 'blocked' WHERE id = ?", (draft["id"],))
+    await db.commit()
+
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "<sent@example.com>"
+        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/approve")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_approve_pending_review_draft_succeeds(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+
+    from app.db import get_db
+    db = await get_db()
+    await db.execute("UPDATE drafts SET status = 'pending_review' WHERE id = ?", (draft["id"],))
+    await db.commit()
+
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "<sent@example.com>"
+        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/approve")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_send_draft_status_draft_still_works(client):
+    account = await _create_account(client)
+    aid = account["id"]
+    draft = (await _create_draft(client, aid)).json()
+    assert draft["status"] == "draft"
+
+    with patch("app.services.compose.send_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "<sent@example.com>"
+        resp = await client.post(f"/accounts/{aid}/drafts/{draft['id']}/send")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "sent"

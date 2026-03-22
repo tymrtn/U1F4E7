@@ -69,6 +69,7 @@ class DraftScheduler:
             return
 
         from_addr = account["username"]
+        draft_attachments = draft.get("attachments") or []
 
         msg = build_mime_message(
             from_addr=from_addr,
@@ -77,9 +78,15 @@ class DraftScheduler:
             text=draft["text_content"],
             html=draft["html_content"],
             display_name=account.get("display_name"),
+            attachments=draft_attachments or None,
         )
         if draft.get("in_reply_to"):
             msg["In-Reply-To"] = draft["in_reply_to"]
+
+        import base64
+        att_meta = None
+        if draft_attachments:
+            att_meta = [{"filename": a["filename"], "content_type": a.get("content_type"), "size_bytes": len(base64.b64decode(a["content"]))} for a in draft_attachments]
 
         record = await messages.create_message(
             account_id=account_id,
@@ -88,6 +95,7 @@ class DraftScheduler:
             subject=draft["subject"],
             text_content=draft["text_content"],
             html_content=draft["html_content"],
+            attachments_meta=att_meta,
         )
 
         try:

@@ -12,6 +12,7 @@ from app.db import get_db
 async def create_draft(
     account_id: str,
     to_addr: str,
+    status: str = "draft",
     subject: Optional[str] = None,
     text_content: Optional[str] = None,
     html_content: Optional[str] = None,
@@ -20,33 +21,43 @@ async def create_draft(
     created_by: Optional[str] = None,
     send_after: Optional[str] = None,
     snoozed_until: Optional[str] = None,
+    cc_addr: Optional[str] = None,
+    bcc_addr: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
 ) -> dict:
     draft_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata) if metadata else None
+    att_json = json.dumps(attachments) if attachments else "[]"
 
     db = await get_db()
     await db.execute(
         """INSERT INTO drafts
         (id, account_id, status, to_addr, subject, text_content, html_content,
          in_reply_to, metadata, created_at, updated_at, created_by,
-         send_after, snoozed_until)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (draft_id, account_id, to_addr, subject, text_content, html_content,
-         in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until),
+         send_after, snoozed_until, cc_addr, bcc_addr, reply_to, attachments)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (draft_id, account_id, status, to_addr, subject, text_content, html_content,
+         in_reply_to, meta_json, now, now, created_by, send_after, snoozed_until,
+         cc_addr, bcc_addr, reply_to, att_json),
     )
     await db.commit()
 
     return {
         "id": draft_id,
         "account_id": account_id,
-        "status": "draft",
+        "status": status,
         "to_addr": to_addr,
+        "cc_addr": cc_addr,
+        "bcc_addr": bcc_addr,
+        "reply_to": reply_to,
         "subject": subject,
         "text_content": text_content,
         "html_content": html_content,
         "in_reply_to": in_reply_to,
         "metadata": metadata,
+        "attachments": attachments or [],
         "message_id": None,
         "created_at": now,
         "updated_at": now,
@@ -66,10 +77,10 @@ async def list_drafts(
     hide_snoozed: bool = False,
 ) -> list[dict]:
     db = await get_db()
-    query = """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+    query = """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts
            WHERE account_id = ?"""
     params: list = [account_id]
@@ -91,10 +102,10 @@ async def list_drafts(
 async def get_draft(draft_id: str) -> Optional[dict]:
     db = await get_db()
     cursor = await db.execute(
-        """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+        """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts WHERE id = ?""",
         (draft_id,),
     )
@@ -106,13 +117,14 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     draft = await get_draft(draft_id)
     if not draft:
         return None
-    if draft["status"] != "draft":
+    if draft["status"] not in {"draft", "pending_review", "blocked"}:
         return None
 
     # Fields that can be explicitly set to NULL (clearing them)
     clearable_fields = {"send_after", "snoozed_until"}
     allowed = {"to_addr", "subject", "text_content", "html_content",
-               "in_reply_to", "metadata", "send_after", "snoozed_until"}
+               "in_reply_to", "metadata", "send_after", "snoozed_until",
+               "cc_addr", "bcc_addr", "reply_to", "attachments"}
 
     updates = {}
     for k, v in fields.items():
@@ -127,6 +139,8 @@ async def update_draft(draft_id: str, **fields) -> Optional[dict]:
     now = datetime.now(timezone.utc).isoformat()
     if "metadata" in updates:
         updates["metadata"] = json.dumps(updates["metadata"])
+    if "attachments" in updates:
+        updates["attachments"] = json.dumps(updates["attachments"])
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [now, draft_id]
@@ -144,7 +158,9 @@ async def discard_draft(draft_id: str) -> bool:
     db = await get_db()
     now = datetime.now(timezone.utc).isoformat()
     cursor = await db.execute(
-        "UPDATE drafts SET status = 'discarded', updated_at = ? WHERE id = ? AND status = 'draft'",
+        """UPDATE drafts
+           SET status = 'discarded', updated_at = ?
+           WHERE id = ? AND status IN ('draft', 'pending_review', 'blocked')""",
         (now, draft_id),
     )
     await db.commit()
@@ -165,10 +181,10 @@ async def get_scheduled_drafts() -> list[dict]:
     """Return drafts that are approved (send_after set) and past their send time."""
     db = await get_db()
     cursor = await db.execute(
-        """SELECT id, account_id, status, to_addr, subject, text_content,
-                  html_content, in_reply_to, metadata, message_id,
+        """SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to,
+                  subject, text_content, html_content, in_reply_to, metadata, message_id,
                   created_at, updated_at, sent_at, created_by,
-                  send_after, snoozed_until
+                  send_after, snoozed_until, attachments
            FROM drafts
            WHERE status = 'draft'
              AND send_after IS NOT NULL
@@ -182,16 +198,23 @@ async def get_scheduled_drafts() -> list[dict]:
 def _row_to_dict(row) -> dict:
     meta_raw = row["metadata"]
     metadata = json.loads(meta_raw) if meta_raw else None
+    keys = row.keys() if hasattr(row, "keys") else []
+    att_raw = row["attachments"] if "attachments" in keys else "[]"
+    attachments = json.loads(att_raw) if att_raw else []
     return {
         "id": row["id"],
         "account_id": row["account_id"],
         "status": row["status"],
         "to_addr": row["to_addr"],
+        "cc_addr": row["cc_addr"] if "cc_addr" in keys else None,
+        "bcc_addr": row["bcc_addr"] if "bcc_addr" in keys else None,
+        "reply_to": row["reply_to"] if "reply_to" in keys else None,
         "subject": row["subject"],
         "text_content": row["text_content"],
         "html_content": row["html_content"],
         "in_reply_to": row["in_reply_to"],
         "metadata": metadata,
+        "attachments": attachments,
         "message_id": row["message_id"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

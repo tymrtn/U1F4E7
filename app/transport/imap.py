@@ -11,6 +11,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Cache detected drafts folder path per (host, username) to avoid LIST on every save
+_drafts_folder_cache: dict[tuple[str, str], str] = {}
+
 
 @dataclass
 class InboundMessage:
@@ -24,6 +27,13 @@ class InboundMessage:
     in_reply_to: Optional[str]
     references: Optional[str]
     date: Optional[str]
+
+
+def _parse_message_id(msg) -> Optional[str]:
+    raw = msg.get("Message-ID") or msg.get("Message-Id")
+    if not raw:
+        return None
+    return raw.strip()
 
 
 def _decode_header_value(value: str) -> str:
@@ -98,7 +108,7 @@ def _fetch_unread_sync(
 
             messages.append(InboundMessage(
                 uid=uid,
-                message_id=msg.get("Message-ID"),
+                message_id=_parse_message_id(msg),
                 from_addr=_decode_header_value(msg.get("From", "")),
                 to_addr=_decode_header_value(msg.get("To", "")),
                 subject=_decode_header_value(msg.get("Subject", "")),
@@ -234,7 +244,7 @@ def _search_thread_sync(
 
                 thread_messages.append({
                     "uid": uid,
-                    "message_id": msg.get("Message-ID"),
+                    "message_id": _parse_message_id(msg),
                     "from_addr": _decode_header_value(msg.get("From", "")),
                     "to_addr": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
@@ -401,7 +411,7 @@ def _fetch_summaries_sync(
                 msg = email.message_from_bytes(header_bytes)
                 results.append({
                     "uid": uid,
-                    "message_id": msg.get("Message-ID"),
+                    "message_id": _parse_message_id(msg),
                     "from_addr": _decode_header_value(msg.get("From", "")),
                     "to_addr": _decode_header_value(msg.get("To", "")),
                     "subject": _decode_header_value(msg.get("Subject", "")),
@@ -441,7 +451,7 @@ def _fetch_message_sync(
 
         return {
             "uid": uid,
-            "message_id": msg.get("Message-ID"),
+            "message_id": _parse_message_id(msg),
             "from_addr": _decode_header_value(msg.get("From", "")),
             "to_addr": _decode_header_value(msg.get("To", "")),
             "subject": _decode_header_value(msg.get("Subject", "")),
@@ -558,6 +568,321 @@ async def list_folders(account: dict) -> list[str]:
     args = _imap_account_args(account)
     try:
         return await asyncio.to_thread(_list_folders_sync, **args)
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+# --- IMAP message operations ---
+
+
+def _move_message_sync(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    uid: str,
+    folder: str,
+    source_folder: str = "INBOX",
+) -> None:
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        conn.select(source_folder)
+        # COPY then mark deleted in source (standard IMAP move)
+        result, _ = conn.uid("COPY", uid, folder)
+        if result != "OK":
+            raise imaplib.IMAP4.error(f"COPY to {folder} failed")
+        conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+def _copy_message_sync(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    uid: str,
+    folder: str,
+    source_folder: str = "INBOX",
+) -> None:
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        conn.select(source_folder)
+        result, _ = conn.uid("COPY", uid, folder)
+        if result != "OK":
+            raise imaplib.IMAP4.error(f"COPY to {folder} failed")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+def _delete_message_sync(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    uid: str,
+    folder: str = "INBOX",
+    trash_folder: str = "Trash",
+) -> None:
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        conn.select(folder)
+        # Move to Trash (COPY + delete from source)
+        result, _ = conn.uid("COPY", uid, trash_folder)
+        if result != "OK":
+            raise imaplib.IMAP4.error(f"COPY to {trash_folder} failed")
+        conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+def _set_flag_sync(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    uid: str,
+    flag: str,
+    folder: str = "INBOX",
+) -> None:
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        conn.select(folder)
+        conn.uid("STORE", uid, "+FLAGS", f"({flag})")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+async def move_message(
+    account: dict,
+    uid: str,
+    folder: str,
+    source_folder: str = "INBOX",
+) -> None:
+    args = _imap_account_args(account)
+    try:
+        await asyncio.to_thread(
+            _move_message_sync, **args, uid=uid, folder=folder,
+            source_folder=source_folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+async def copy_message(
+    account: dict,
+    uid: str,
+    folder: str,
+    source_folder: str = "INBOX",
+) -> None:
+    args = _imap_account_args(account)
+    try:
+        await asyncio.to_thread(
+            _copy_message_sync, **args, uid=uid, folder=folder,
+            source_folder=source_folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+async def delete_message(
+    account: dict,
+    uid: str,
+    folder: str = "INBOX",
+    trash_folder: str = "Trash",
+) -> None:
+    args = _imap_account_args(account)
+    try:
+        await asyncio.to_thread(
+            _delete_message_sync, **args, uid=uid, folder=folder,
+            trash_folder=trash_folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+async def set_flag(
+    account: dict,
+    uid: str,
+    flag: str,
+    folder: str = "INBOX",
+) -> None:
+    args = _imap_account_args(account)
+    try:
+        await asyncio.to_thread(
+            _set_flag_sync, **args, uid=uid, flag=flag, folder=folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+# --- IMAP Drafts folder management ---
+
+
+def _detect_drafts_folder(conn: imaplib.IMAP4_SSL) -> str:
+    """Detect the actual Drafts folder path via IMAP LIST.
+
+    Gmail uses '[Gmail]/Drafts', other providers use 'Drafts' or 'INBOX.Drafts'.
+    Falls back to 'Drafts' if nothing recognizable is found.
+    """
+    _, data = conn.list()
+    candidates = []
+    for item in data:
+        if not isinstance(item, bytes):
+            continue
+        decoded = item.decode("utf-8", errors="replace")
+        # Extract folder name — format: (\\flags) "delimiter" "name"
+        parts = decoded.rsplit('"', 2)
+        if len(parts) >= 2:
+            folder_name = parts[-2]
+        else:
+            folder_name = decoded.rsplit(" ", 1)[-1]
+        # Match common drafts folder patterns
+        lower = folder_name.lower()
+        if lower == "drafts" or lower.endswith("/drafts") or lower.endswith(".drafts"):
+            candidates.append(folder_name)
+
+    if not candidates:
+        return "Drafts"
+    # Prefer exact "Drafts", then shortest match
+    for c in candidates:
+        if c == "Drafts":
+            return c
+    candidates.sort(key=len)
+    return candidates[0]
+
+
+def _save_to_drafts_sync(
+    host: str, port: int, username: str, password: str,
+    mime_bytes: bytes, folder: str = "Drafts",
+) -> None:
+    import time
+    cache_key = (host, username)
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        # Auto-detect the actual drafts folder if using the default
+        if folder == "Drafts":
+            if cache_key in _drafts_folder_cache:
+                folder = _drafts_folder_cache[cache_key]
+            else:
+                folder = _detect_drafts_folder(conn)
+                _drafts_folder_cache[cache_key] = folder
+                if folder != "Drafts":
+                    logger.info(
+                        "Detected drafts folder '%s' for %s@%s",
+                        folder, username, host,
+                    )
+        conn.append(
+            folder,
+            "(\\Draft)",
+            imaplib.Time2Internaldate(time.time()),
+            mime_bytes,
+        )
+    finally:
+        conn.logout()
+
+
+async def save_to_drafts(
+    account: dict,
+    msg: email.message.Message,
+    folder: str = "Drafts",
+) -> None:
+    """Save a composed MIME message to the account's IMAP Drafts folder."""
+    args = _imap_account_args(account)
+    mime_bytes = msg.as_bytes()
+    try:
+        await asyncio.to_thread(
+            _save_to_drafts_sync, **args,
+            mime_bytes=mime_bytes, folder=folder,
+        )
+    except imaplib.IMAP4.error as e:
+        raise ImapError("imap_error", str(e))
+    except OSError as e:
+        raise ImapError("connection_error", str(e))
+
+
+def _delete_from_drafts_sync(
+    host: str, port: int, username: str, password: str,
+    draft_id: str,
+) -> bool:
+    """Search IMAP Drafts for a message with matching X-Envelope-Draft-Id and delete it."""
+    cache_key = (host, username)
+    conn = imaplib.IMAP4_SSL(host, port)
+    try:
+        conn.login(username, password)
+        # Detect the drafts folder
+        if cache_key in _drafts_folder_cache:
+            folder = _drafts_folder_cache[cache_key]
+        else:
+            folder = _detect_drafts_folder(conn)
+            _drafts_folder_cache[cache_key] = folder
+        conn.select(folder)
+        # Search for the draft by custom header
+        _, data = conn.search(None, f'HEADER X-Envelope-Draft-Id "{draft_id}"')
+        msg_nums = data[0].split()
+        if not msg_nums:
+            logger.info("No IMAP draft found with X-Envelope-Draft-Id=%s", draft_id)
+            return False
+        for num in msg_nums:
+            conn.store(num, "+FLAGS", "(\\Deleted)")
+        conn.expunge()
+        logger.info(
+            "Deleted %d IMAP draft(s) with X-Envelope-Draft-Id=%s",
+            len(msg_nums), draft_id,
+        )
+        return True
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+async def delete_from_drafts(account: dict, draft_id: str) -> bool:
+    """Delete a draft from the IMAP Drafts folder by its X-Envelope-Draft-Id header.
+
+    Returns True if a message was found and deleted, False if not found.
+    Raises ImapError on connection/protocol failures.
+    """
+    args = _imap_account_args(account)
+    try:
+        return await asyncio.to_thread(
+            _delete_from_drafts_sync, **args, draft_id=draft_id,
+        )
     except imaplib.IMAP4.error as e:
         raise ImapError("imap_error", str(e))
     except OSError as e:

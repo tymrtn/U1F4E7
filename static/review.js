@@ -17,8 +17,28 @@ function useInterval(callback, delay) {
   }, [delay]);
 }
 
+function getApiKey() {
+  return localStorage.getItem('envelope_api_key');
+}
+
+function promptForApiKey() {
+  const key = prompt('Enter your Envelope API key:');
+  if (key && key.trim()) {
+    localStorage.setItem('envelope_api_key', key.trim());
+    location.reload();
+  }
+}
+
 async function api(url, opts = {}) {
-  const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const key = getApiKey();
+  if (key) headers['Authorization'] = 'Bearer ' + key;
+  const r = await fetch(url, { ...opts, headers });
+  if (r.status === 401) {
+    localStorage.removeItem('envelope_api_key');
+    promptForApiKey();
+    throw new Error('Unauthorized');
+  }
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }

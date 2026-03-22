@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     imap_username TEXT,
     encrypted_imap_password TEXT,
     display_name TEXT,
+    notification_email TEXT,
     approval_required INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     verified_at TEXT
@@ -94,6 +95,13 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     model TEXT NOT NULL,
     embedded_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scoring_rubrics (
+    account_id TEXT PRIMARY KEY,
+    base_score REAL NOT NULL,
+    modifiers TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 MIGRATIONS = [
@@ -105,6 +113,43 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN review_threshold REAL NOT NULL DEFAULT 0.50",
     "ALTER TABLE drafts ADD COLUMN send_after TEXT",
     "ALTER TABLE drafts ADD COLUMN snoozed_until TEXT",
+    "ALTER TABLE accounts ADD COLUMN rate_limit_per_hour INTEGER",
+    # Story 011 — Policy tables
+    'CREATE TABLE IF NOT EXISTS domain_policies (account_id TEXT PRIMARY KEY, name TEXT, description TEXT, "values" TEXT, tone TEXT, style TEXT, kb_text TEXT, updated_at TEXT)',
+    "CREATE TABLE IF NOT EXISTS address_policies (account_id TEXT NOT NULL, pattern TEXT NOT NULL, purpose TEXT, reply_instructions TEXT, escalation_rules TEXT, routing_rules TEXT, trash_criteria TEXT, help_resources TEXT, sensitive_topics TEXT, confidence_threshold REAL DEFAULT 0.7, webhook_url TEXT, updated_at TEXT, PRIMARY KEY (account_id, pattern))",
+    # Story 013 — Action log
+    "CREATE TABLE IF NOT EXISTS action_log (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, action_type TEXT NOT NULL, confidence REAL NOT NULL, justification TEXT NOT NULL, action_taken TEXT NOT NULL, message_id TEXT, draft_id TEXT, created_at TEXT NOT NULL)",
+    # Story 015 — Webhook fields
+    "ALTER TABLE accounts ADD COLUMN webhook_url TEXT",
+    "ALTER TABLE accounts ADD COLUMN webhook_secret TEXT",
+    "CREATE TABLE IF NOT EXISTS webhook_state (account_id TEXT PRIMARY KEY, last_uid TEXT, updated_at TEXT)",
+    # Story 017 — Cc, Bcc, Reply-To
+    "ALTER TABLE drafts ADD COLUMN cc_addr TEXT",
+    "ALTER TABLE drafts ADD COLUMN bcc_addr TEXT",
+    "ALTER TABLE drafts ADD COLUMN reply_to TEXT",
+    # Story 018 — Account signatures
+    "ALTER TABLE accounts ADD COLUMN signature_text TEXT",
+    "ALTER TABLE accounts ADD COLUMN signature_html TEXT",
+    # Story 021 — Approval notifications
+    "ALTER TABLE accounts ADD COLUMN notification_email TEXT",
+    "UPDATE accounts SET notification_email = username WHERE notification_email IS NULL",
+    # Story 019 — Open tracking
+    "ALTER TABLE messages ADD COLUMN track_opens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN tracking_token TEXT",
+    "CREATE TABLE IF NOT EXISTS message_opens (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, token TEXT NOT NULL, opened_at TEXT NOT NULL, user_agent TEXT, ip_addr TEXT)",
+    # Story 020 — Attachments
+    "ALTER TABLE drafts ADD COLUMN attachments TEXT DEFAULT '[]'",
+    "ALTER TABLE messages ADD COLUMN attachments_meta TEXT DEFAULT '[]'",
+    # Story 021 — Contextual attribution scoring
+    "CREATE TABLE IF NOT EXISTS scoring_rubrics (account_id TEXT PRIMARY KEY, base_score REAL NOT NULL, modifiers TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    # Story 022 — Attribute-oriented scoring
+    "ALTER TABLE accounts ADD COLUMN domain TEXT",
+    "UPDATE accounts SET domain = SUBSTR(username, INSTR(username, '@') + 1) WHERE domain IS NULL",
+    "CREATE TABLE IF NOT EXISTS domain_attribute_catalog (domain TEXT NOT NULL, key TEXT NOT NULL, description TEXT NOT NULL, category TEXT, weight REAL NOT NULL DEFAULT 0.0, is_custom INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (domain, key))",
+    "CREATE TABLE IF NOT EXISTS domain_scoring_config (domain TEXT PRIMARY KEY, base_score REAL NOT NULL DEFAULT 0.80, updated_at TEXT NOT NULL)",
+    # Delayed zone support
+    "ALTER TABLE accounts ADD COLUMN delay_margin REAL NOT NULL DEFAULT 0.10",
+    "ALTER TABLE accounts ADD COLUMN delay_minutes INTEGER NOT NULL DEFAULT 15",
 ]
 
 _connection: aiosqlite.Connection | None = None

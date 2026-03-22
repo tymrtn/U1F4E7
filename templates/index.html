@@ -61,9 +61,18 @@
         .section-label {
             @apply text-[10px] font-mono font-medium tracking-[0.15em] uppercase text-mid;
         }
+        .tab-trigger {
+            @apply px-4 py-3 text-xs font-mono tracking-[0.15em] uppercase text-mid
+                   border-r border-rule bg-paper hover:text-ink transition-colors;
+        }
+        .tab-trigger-active {
+            @apply bg-ink text-paper hover:text-paper;
+        }
     </style>
 </head>
 <body class="bg-paper text-ink min-h-screen">
+
+    <div id="toast-region" class="fixed top-4 right-4 z-50 space-y-2 pointer-events-none"></div>
 
     <!-- Header -->
     <header id="header" class="border-b border-rule">
@@ -86,123 +95,302 @@
         </div>
     </header>
 
-    <main class="max-w-6xl mx-auto px-6 py-8 space-y-10">
+    <main class="max-w-6xl mx-auto px-6 py-8 space-y-8">
 
-        <!-- Stats Bar -->
-        <section id="stats-section" class="fade-in">
-            <div class="grid grid-cols-4 gap-px bg-rule border border-rule">
-                <div class="bg-paper px-5 py-4">
-                    <p class="section-label mb-1">Total Sent</p>
-                    <p id="stat-total" class="text-2xl font-semibold tabular-nums font-mono">--</p>
-                </div>
-                <div class="bg-paper px-5 py-4">
-                    <p class="section-label mb-1">Delivered</p>
-                    <p id="stat-sent" class="text-2xl font-semibold tabular-nums font-mono text-accent">--</p>
-                </div>
-                <div class="bg-paper px-5 py-4">
-                    <p class="section-label mb-1">Failed</p>
-                    <p id="stat-failed" class="text-2xl font-semibold tabular-nums font-mono text-warn">--</p>
-                </div>
-                <div class="bg-paper px-5 py-4">
-                    <p class="section-label mb-1">Success Rate</p>
-                    <p id="stat-rate" class="text-2xl font-semibold tabular-nums font-mono">--</p>
+        <section class="fade-in">
+            <div class="border border-rule bg-white">
+                <div class="flex flex-wrap items-stretch justify-between bg-rule gap-px">
+                    <div class="flex flex-wrap gap-px">
+                        <button type="button" data-tab-trigger="overview" class="tab-trigger tab-trigger-active">Overview</button>
+                        <button type="button" data-tab-trigger="policies" class="tab-trigger">Policies</button>
+                    </div>
+                    <a href="/review" class="px-4 py-3 text-xs font-mono tracking-[0.15em] uppercase text-mid bg-paper hover:text-ink transition-colors">Review Queue</a>
                 </div>
             </div>
         </section>
 
-        <!-- Two-column layout: Accounts + Send -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-10">
-
-            <!-- Accounts -->
-            <section id="accounts-section">
-                <div class="flex items-center justify-between mb-4">
-                    <h2 class="section-label">Accounts</h2>
-                    <button id="toggle-add-account" class="btn-ghost text-xs">+ Add</button>
-                </div>
-
-                <!-- Add Account Form (hidden by default) -->
-                <div id="add-account-form" class="hidden mb-6 border border-rule bg-white p-4 space-y-3">
-                    <p class="text-xs font-medium text-ink mb-3">New Account</p>
-                    <input type="text" id="acc-name" placeholder="Account name" class="input-field">
-                    <div class="flex gap-2">
-                        <input type="text" id="acc-username" placeholder="Username / email" class="input-field flex-1">
-                        <button id="btn-discover" class="btn-ghost text-xs whitespace-nowrap">Discover</button>
+        <div data-tab-panel="overview" class="space-y-10">
+            <!-- Stats Bar -->
+            <section id="stats-section" class="fade-in">
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-px bg-rule border border-rule">
+                    <div class="bg-paper px-5 py-4">
+                        <p class="section-label mb-1">Total Sent</p>
+                        <p id="stat-total" class="text-2xl font-semibold tabular-nums font-mono">--</p>
                     </div>
-                    <div id="discover-status" class="hidden text-xs font-mono mt-1"></div>
-                    <div class="grid grid-cols-2 gap-3">
-                        <input type="text" id="acc-smtp-host" placeholder="SMTP host" class="input-field">
-                        <input type="number" id="acc-smtp-port" placeholder="SMTP port" value="587" class="input-field">
+                    <div class="bg-paper px-5 py-4">
+                        <p class="section-label mb-1">Delivered</p>
+                        <p id="stat-sent" class="text-2xl font-semibold tabular-nums font-mono text-accent">--</p>
                     </div>
-                    <div class="grid grid-cols-2 gap-3">
-                        <input type="text" id="acc-imap-host" placeholder="IMAP host" class="input-field">
-                        <input type="number" id="acc-imap-port" placeholder="IMAP port" value="993" class="input-field">
+                    <div class="bg-paper px-5 py-4">
+                        <p class="section-label mb-1">Failed</p>
+                        <p id="stat-failed" class="text-2xl font-semibold tabular-nums font-mono text-warn">--</p>
                     </div>
-                    <input type="password" id="acc-password" placeholder="Password" class="input-field">
-                    <input type="text" id="acc-display-name" placeholder="Display name (optional)" class="input-field">
-                    <div class="flex gap-2 pt-1">
-                        <button id="btn-save-account" class="btn-primary text-xs">Save Account</button>
-                        <button id="btn-cancel-account" class="btn-ghost text-xs">Cancel</button>
+                    <div class="bg-paper px-5 py-4">
+                        <p class="section-label mb-1">Success Rate</p>
+                        <p id="stat-rate" class="text-2xl font-semibold tabular-nums font-mono">--</p>
                     </div>
-                    <div id="add-account-error" class="hidden text-xs text-warn mt-2 font-mono"></div>
-                </div>
-
-                <!-- Account List -->
-                <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule">
-                    <div class="px-4 py-8 text-center text-sm text-mid">Loading accounts...</div>
                 </div>
             </section>
 
-            <!-- Send Form -->
-            <section id="send-section">
-                <h2 class="section-label mb-4">Compose</h2>
-                <div class="border border-rule bg-white">
-                    <div class="p-4 space-y-3">
-                        <select id="send-account" class="input-field">
-                            <option value="">Select account...</option>
-                        </select>
-                        <input type="email" id="send-to" placeholder="To" class="input-field">
-                        <input type="text" id="send-subject" placeholder="Subject" class="input-field">
+            <!-- Two-column layout: Accounts + Send -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-10">
 
-                        <!-- Format Toggle -->
-                        <div class="flex items-center gap-2 pt-1">
-                            <span class="text-xs text-mid font-mono">Format:</span>
-                            <button id="toggle-text" class="px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper transition-colors">Text</button>
-                            <button id="toggle-html" class="px-2 py-0.5 text-xs font-mono border border-rule text-mid hover:border-ink hover:text-ink transition-colors">HTML</button>
+                <!-- Accounts -->
+                <section id="accounts-section">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="section-label">Accounts</h2>
+                        <button id="toggle-add-account" type="button" class="btn-ghost text-xs">+ Add</button>
+                    </div>
+
+                    <!-- Add Account Form (hidden by default) -->
+                    <div id="add-account-form" class="hidden mb-6 border border-rule bg-white p-4 space-y-3">
+                        <p class="text-xs font-medium text-ink mb-3">New Account</p>
+                        <input type="text" id="acc-name" placeholder="Account name" class="input-field">
+                        <div class="flex gap-2">
+                            <input type="text" id="acc-username" placeholder="Username / email" class="input-field flex-1">
+                            <button id="btn-discover" type="button" class="btn-ghost text-xs whitespace-nowrap">Discover</button>
                         </div>
+                        <div id="discover-status" class="hidden text-xs font-mono mt-1"></div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <input type="text" id="acc-smtp-host" placeholder="SMTP host" class="input-field">
+                            <input type="number" id="acc-smtp-port" placeholder="SMTP port" value="587" class="input-field">
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <input type="text" id="acc-imap-host" placeholder="IMAP host" class="input-field">
+                            <input type="number" id="acc-imap-port" placeholder="IMAP port" value="993" class="input-field">
+                        </div>
+                        <input type="password" id="acc-password" placeholder="Password" class="input-field">
+                        <input type="text" id="acc-display-name" placeholder="Display name (optional)" class="input-field">
+                        <div class="flex gap-2 pt-1">
+                            <button id="btn-save-account" type="button" class="btn-primary text-xs">Save Account</button>
+                            <button id="btn-cancel-account" type="button" class="btn-ghost text-xs">Cancel</button>
+                        </div>
+                        <div id="add-account-error" class="hidden text-xs text-warn mt-2 font-mono"></div>
+                    </div>
 
-                        <textarea id="send-body" placeholder="Message body" rows="6" class="input-field font-mono text-xs leading-relaxed resize-y"></textarea>
+                    <!-- Account List -->
+                    <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule">
+                        <div class="px-4 py-8 text-center text-sm text-mid">Loading accounts...</div>
                     </div>
-                    <div class="border-t border-rule px-4 py-3 flex items-center justify-between bg-neutral-50/50">
-                        <div id="send-status" class="text-xs font-mono text-mid"></div>
-                        <button id="btn-send" class="btn-primary text-xs">Send</button>
+                </section>
+
+                <!-- Send Form -->
+                <section id="send-section">
+                    <h2 class="section-label mb-4">Compose</h2>
+                    <div class="border border-rule bg-white">
+                        <div class="p-4 space-y-3">
+                            <select id="send-account" class="input-field">
+                                <option value="">Select account...</option>
+                            </select>
+                            <input type="email" id="send-to" placeholder="To" class="input-field">
+                            <input type="text" id="send-subject" placeholder="Subject" class="input-field">
+
+                            <!-- Format Toggle -->
+                            <div class="flex items-center gap-2 pt-1">
+                                <span class="text-xs text-mid font-mono">Format:</span>
+                                <button id="toggle-text" type="button" class="px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper transition-colors">Text</button>
+                                <button id="toggle-html" type="button" class="px-2 py-0.5 text-xs font-mono border border-rule text-mid hover:border-ink hover:text-ink transition-colors">HTML</button>
+                            </div>
+
+                            <textarea id="send-body" placeholder="Message body" rows="6" class="input-field font-mono text-xs leading-relaxed resize-y"></textarea>
+                        </div>
+                        <div class="border-t border-rule px-4 py-3 flex items-center justify-between bg-neutral-50/50">
+                            <div id="send-status" class="text-xs font-mono text-mid"></div>
+                            <button id="btn-send" type="button" class="btn-primary text-xs">Send</button>
+                        </div>
                     </div>
+                </section>
+            </div>
+
+            <!-- Messages Log -->
+            <section id="messages-section">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="section-label">Message Log</h2>
+                    <span id="msg-count" class="text-xs text-mid font-mono"></span>
+                </div>
+                <div class="border border-rule overflow-x-auto">
+                    <table class="w-full text-sm min-w-[640px]">
+                        <thead>
+                            <tr class="border-b border-rule bg-neutral-50/50">
+                                <th class="text-left px-4 py-2.5 section-label font-medium">Status</th>
+                                <th class="text-left px-4 py-2.5 section-label font-medium">To</th>
+                                <th class="text-left px-4 py-2.5 section-label font-medium">Subject</th>
+                                <th class="text-left px-4 py-2.5 section-label font-medium hidden md:table-cell">From</th>
+                                <th class="text-right px-4 py-2.5 section-label font-medium">Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="messages-body" class="divide-y divide-rule">
+                            <tr><td colspan="5" class="px-4 py-8 text-center text-mid">Loading messages...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </section>
         </div>
 
-        <!-- Messages Log -->
-        <section id="messages-section">
-            <div class="flex items-center justify-between mb-4">
-                <h2 class="section-label">Message Log</h2>
-                <span id="msg-count" class="text-xs text-mid font-mono"></span>
+        <div data-tab-panel="policies" class="hidden space-y-8">
+            <section class="border border-rule bg-white fade-in">
+                <div class="px-5 py-5 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                    <div class="space-y-2 w-full lg:w-auto">
+                        <p class="section-label">Policy Account</p>
+                        <select id="policy-account" class="input-field lg:min-w-[360px]">
+                            <option value="">Select account...</option>
+                        </select>
+                    </div>
+                    <p id="policy-account-meta" class="text-xs font-mono text-mid max-w-2xl">
+                        Choose an account to edit domain guidance, address routing, scoring modifiers, and send thresholds.
+                    </p>
+                </div>
+            </section>
+
+            <div id="policies-empty" class="hidden border border-rule bg-white px-6 py-12 text-center text-sm text-mid">
+                Add an account first to configure policy rules and thresholds.
             </div>
-            <div class="border border-rule">
-                <table class="w-full text-sm">
-                    <thead>
-                        <tr class="border-b border-rule bg-neutral-50/50">
-                            <th class="text-left px-4 py-2.5 section-label font-medium">Status</th>
-                            <th class="text-left px-4 py-2.5 section-label font-medium">To</th>
-                            <th class="text-left px-4 py-2.5 section-label font-medium">Subject</th>
-                            <th class="text-left px-4 py-2.5 section-label font-medium hidden md:table-cell">From</th>
-                            <th class="text-right px-4 py-2.5 section-label font-medium">Time</th>
-                        </tr>
-                    </thead>
-                    <tbody id="messages-body" class="divide-y divide-rule">
-                        <tr><td colspan="5" class="px-4 py-8 text-center text-mid">Loading messages...</td></tr>
-                    </tbody>
-                </table>
+
+            <div id="policies-content" class="space-y-8">
+                <section class="border border-rule bg-white">
+                    <div class="border-b border-rule px-5 py-4 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                        <div>
+                            <h2 class="section-label">Domain Policy</h2>
+                            <p class="text-sm mt-2 text-mid">Account-wide voice, constraints, and knowledge base for generated replies.</p>
+                        </div>
+                        <div id="domain-policy-meta" class="text-xs font-mono text-mid">Loads when you open the Policies tab.</div>
+                    </div>
+                    <div class="p-5 space-y-5">
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <label class="block space-y-2">
+                                <span class="section-label">Name</span>
+                                <input id="domain-policy-name" type="text" class="input-field" placeholder="Envelope policy">
+                            </label>
+                            <label class="block space-y-2">
+                                <span class="section-label">Tone</span>
+                                <select id="domain-policy-tone" class="input-field">
+                                    <option value="formal">formal</option>
+                                    <option value="professional-warm">professional-warm</option>
+                                    <option value="casual">casual</option>
+                                    <option value="neutral">neutral</option>
+                                </select>
+                            </label>
+                            <label class="block space-y-2 lg:col-span-2">
+                                <span class="section-label">Description</span>
+                                <textarea id="domain-policy-description" rows="3" class="input-field resize-y" placeholder="What this account should optimize for."></textarea>
+                            </label>
+                            <label class="block space-y-2">
+                                <span class="section-label">Style</span>
+                                <input id="domain-policy-style" type="text" class="input-field" placeholder="Short, direct, evidence-backed">
+                            </label>
+                            <label class="block space-y-2">
+                                <span class="section-label">Values</span>
+                                <input id="domain-policy-values" type="text" class="input-field" placeholder="clarity, restraint, responsiveness">
+                            </label>
+                            <label class="block space-y-2 lg:col-span-2">
+                                <span class="section-label">Knowledge Base</span>
+                                <textarea id="domain-policy-kb-text" rows="10" class="input-field resize-y" placeholder="Reference facts, FAQs, positioning, and red lines."></textarea>
+                            </label>
+                        </div>
+                        <p id="domain-policy-note" class="hidden text-xs font-mono text-pending"></p>
+                        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div class="text-xs font-mono text-mid">Changes are saved per account.</div>
+                            <button id="btn-save-domain-policy" type="button" class="btn-primary text-xs self-start">Save Domain Policy</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="border border-rule bg-white">
+                    <div class="border-b border-rule px-5 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                            <h2 class="section-label">Address Policies</h2>
+                            <p class="text-sm mt-2 text-mid">Inline rules for mailbox patterns, escalation, and confidence cutoffs.</p>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span id="address-policy-count" class="text-xs font-mono text-mid"></span>
+                            <button id="btn-add-address-policy" type="button" class="btn-ghost text-xs">+ Add</button>
+                        </div>
+                    </div>
+                    <div id="address-policy-create-wrap" class="hidden border-b border-rule bg-neutral-50/60 px-5 py-5"></div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm min-w-[720px]">
+                            <thead>
+                                <tr class="border-b border-rule bg-neutral-50/50">
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Pattern</th>
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Purpose</th>
+                                    <th class="text-left px-4 py-2.5 section-label font-medium">Threshold</th>
+                                    <th class="text-right px-4 py-2.5 section-label font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="address-policies-body" class="divide-y divide-rule">
+                                <tr><td colspan="4" class="px-4 py-8 text-center text-mid">Loading policies...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="border border-rule bg-white">
+                    <div class="border-b border-rule px-5 py-4 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                        <div>
+                            <h2 class="section-label">Scoring Rubric</h2>
+                            <p class="text-sm mt-2 text-mid">Modifier weights for routing confidence across relationship, intent, stakes, ask, domain, and recipient context.</p>
+                        </div>
+                        <p id="rubric-preview" class="text-xs font-mono text-mid">Example: first_contact + pitch + high stakes + ask = --</p>
+                    </div>
+                    <div id="rubric-editor" class="p-5 space-y-6">
+                        <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,160px)_minmax(0,1fr)] gap-4 items-end">
+                            <label class="block space-y-2">
+                                <span class="section-label">Base Score</span>
+                                <input id="rubric-base-score" type="number" step="0.05" min="0" max="1" class="input-field max-w-[160px]">
+                            </label>
+                            <p class="text-sm text-mid">All modifier inputs accept values from -1.00 to 1.00 in 0.05 steps.</p>
+                        </div>
+                        <div id="rubric-groups" class="space-y-5"></div>
+                        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div id="rubric-meta" class="text-xs font-mono text-mid"></div>
+                            <button id="btn-save-rubric" type="button" class="btn-primary text-xs self-start">Save Rubric</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="border border-rule bg-white">
+                    <div class="border-b border-rule px-5 py-4">
+                        <h2 class="section-label">Account Thresholds</h2>
+                        <p class="text-sm mt-2 text-mid">Tune where replies get blocked, sent to review, or auto-sent.</p>
+                    </div>
+                    <div class="p-5 space-y-6">
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            <label class="block space-y-2">
+                                <span class="flex items-center justify-between">
+                                    <span class="section-label">Review Threshold</span>
+                                    <span id="review-threshold-value" class="text-xs font-mono text-mid">0.50</span>
+                                </span>
+                                <input id="review-threshold" type="range" min="0" max="1" step="0.05" class="w-full">
+                            </label>
+                            <label class="block space-y-2">
+                                <span class="flex items-center justify-between">
+                                    <span class="section-label">Auto-Send Threshold</span>
+                                    <span id="auto-threshold-value" class="text-xs font-mono text-mid">0.85</span>
+                                </span>
+                                <input id="auto-threshold" type="range" min="0" max="1" step="0.05" class="w-full">
+                            </label>
+                        </div>
+                        <div class="space-y-3">
+                            <div class="flex items-center justify-between text-[10px] font-mono tracking-[0.15em] uppercase text-mid">
+                                <span>Blocked</span>
+                                <span>Review</span>
+                                <span>Auto-Send</span>
+                            </div>
+                            <div class="flex h-5 overflow-hidden border border-rule bg-white">
+                                <div id="threshold-zone-blocked" class="min-w-0 flex items-center justify-center bg-warn-light text-[10px] font-mono text-warn"></div>
+                                <div id="threshold-zone-review" class="min-w-0 flex items-center justify-center bg-pending-light text-[10px] font-mono text-pending"></div>
+                                <div id="threshold-zone-auto" class="min-w-0 flex items-center justify-center bg-accent-light text-[10px] font-mono text-accent"></div>
+                            </div>
+                            <div id="threshold-zone-summary" class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-mono text-mid"></div>
+                        </div>
+                        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div id="threshold-meta" class="text-xs font-mono text-mid"></div>
+                            <button id="btn-save-thresholds" type="button" class="btn-primary text-xs self-start">Save Thresholds</button>
+                        </div>
+                    </div>
+                </section>
             </div>
-        </section>
+        </div>
     </main>
 
     <footer class="border-t border-rule mt-16">

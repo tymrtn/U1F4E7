@@ -7,6 +7,20 @@
   let currentFormat = 'text';
   let accounts = [];
 
+  // ── Auth ──
+
+  function getApiKey() {
+    return localStorage.getItem('envelope_api_key');
+  }
+
+  function promptForApiKey() {
+    const key = prompt('Enter your Envelope API key:');
+    if (key && key.trim()) {
+      localStorage.setItem('envelope_api_key', key.trim());
+      location.reload();
+    }
+  }
+
   // ── Helpers ──
 
   function relativeTime(iso) {
@@ -45,7 +59,18 @@
   }
 
   async function api(path, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    const key = getApiKey();
+    if (key) {
+      opts.headers['Authorization'] = 'Bearer ' + key;
+    }
     const res = await fetch(path, opts);
+    if (res.status === 401) {
+      localStorage.removeItem('envelope_api_key');
+      promptForApiKey();
+      throw new Error('Unauthorized');
+    }
     return res.json();
   }
 
@@ -424,6 +449,10 @@
   // ── Init ──
 
   document.addEventListener('DOMContentLoaded', function () {
+    if (!getApiKey()) {
+      promptForApiKey();
+      return;
+    }
     setupAddAccount();
     setupSend();
     refreshAll();

@@ -4,7 +4,7 @@
 import pytest
 from unittest.mock import patch, AsyncMock
 
-from app.agent.embeddings import (
+from app.embeddings import (
     _vector_to_blob,
     _blob_to_vector,
     _cosine_similarity,
@@ -66,7 +66,7 @@ class TestEmbedMessage:
     @pytest.mark.asyncio
     async def test_embed_stores_in_db(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -92,7 +92,7 @@ class TestEmbedMessage:
     @pytest.mark.asyncio
     async def test_embed_skips_duplicate(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ) as mock_embed:
@@ -105,7 +105,7 @@ class TestEmbedMessage:
     @pytest.mark.asyncio
     async def test_embed_updates_on_content_change(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ) as mock_embed:
@@ -120,7 +120,7 @@ class TestFindSimilar:
     async def test_find_returns_scored_results(self):
         # Seed some embeddings
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -129,7 +129,7 @@ class TestFindSimilar:
 
         # Search — mock embed_text to return same vector (will have high similarity)
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -140,7 +140,7 @@ class TestFindSimilar:
     @pytest.mark.asyncio
     async def test_find_empty_account(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -150,7 +150,7 @@ class TestFindSimilar:
     @pytest.mark.asyncio
     async def test_find_respects_limit(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -158,7 +158,7 @@ class TestFindSimilar:
                 await embed_message("acc-3", f"<msg-{i}@test.com>", f"Subject {i}", f"Body {i}")
 
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -168,7 +168,7 @@ class TestFindSimilar:
     @pytest.mark.asyncio
     async def test_find_isolates_accounts(self):
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
@@ -176,7 +176,7 @@ class TestFindSimilar:
             await embed_message("acc-B", "<b@test.com>", "Subject B", "Body B")
 
         with patch(
-            "app.agent.embeddings.embed_text",
+            "app.embeddings.embed_text",
             new_callable=AsyncMock,
             return_value=FAKE_VECTOR,
         ):
