@@ -172,10 +172,16 @@ class CustomAttributeIn(BaseModel):
 
 
 class ReplyIn(BaseModel):
-    body: str
+    text: Optional[str] = None
+    body: Optional[str] = None  # Deprecated: use `text` instead. Kept for backward compatibility.
     cc: Optional[str] = None
     attribution: Optional[AttributionIn] = None
     confidence: Optional[float] = None
+
+    @property
+    def resolved_text(self) -> str:
+        """Return the email body content, preferring `text` over deprecated `body`."""
+        return self.text or self.body or ""
 
 
 class CreateDraft(BaseModel):
@@ -1140,11 +1146,14 @@ async def reply_to_message(
 ):
     if data.confidence is None and data.attribution is None:
         raise HTTPException(status_code=422, detail="Either confidence or attribution is required")
+    if not data.resolved_text:
+        raise HTTPException(status_code=422, detail="Either 'text' or 'body' is required for reply content")
     account, original = await _fetch_original_for_reply(account_id, message_uid, folder)
 
-    # Build quoted body
+    # Build quoted body (resolved_text prefers `text` over deprecated `body`)
+    reply_text = data.resolved_text
     quoted = "\n".join(f"> {line}" for line in (original.get("text_body") or "").splitlines())
-    full_body = f"{data.body}\n\n{quoted}" if quoted else data.body
+    full_body = f"{reply_text}\n\n{quoted}" if quoted else reply_text
 
     # Derive reply headers — strip newlines from subject (long subjects wrap in IMAP)
     raw_subject = (original.get("subject") or "").replace("\r", "").replace("\n", " ").strip()
@@ -1176,11 +1185,14 @@ async def reply_all_to_message(
 ):
     if data.confidence is None and data.attribution is None:
         raise HTTPException(status_code=422, detail="Either confidence or attribution is required")
+    if not data.resolved_text:
+        raise HTTPException(status_code=422, detail="Either 'text' or 'body' is required for reply content")
     account, original = await _fetch_original_for_reply(account_id, message_uid, folder)
 
-    # Build quoted body
+    # Build quoted body (resolved_text prefers `text` over deprecated `body`)
+    reply_text = data.resolved_text
     quoted = "\n".join(f"> {line}" for line in (original.get("text_body") or "").splitlines())
-    full_body = f"{data.body}\n\n{quoted}" if quoted else data.body
+    full_body = f"{reply_text}\n\n{quoted}" if quoted else reply_text
 
     # Derive reply headers — strip newlines from subject
     raw_subject = (original.get("subject") or "").replace("\r", "").replace("\n", " ").strip()

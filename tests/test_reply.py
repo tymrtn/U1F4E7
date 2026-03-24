@@ -266,3 +266,71 @@ class TestReplyAllEndpoint:
             },
         )
         assert resp.status_code == 201
+
+
+class TestReplyTextBodyConsistency:
+    """Tests for text/body field consistency between /send and /reply endpoints.
+
+    The /send endpoint uses `text`, while /reply historically used `body`.
+    Both endpoints now accept both fields, with `text` preferred.
+    """
+
+    def test_reply_with_text_field(self, client, _mock_deps):
+        """Reply endpoint accepts `text` (consistent with /send)."""
+        resp = client.post(
+            "/accounts/acct1/reply/42",
+            json={"text": "Thanks via text!", "confidence": 0.9},
+        )
+        assert resp.status_code == 201
+        compose_data = _mock_deps["route"].call_args[0][2]
+        assert "Thanks via text!" in compose_data.body
+
+    def test_reply_with_body_field_still_works(self, client, _mock_deps):
+        """Reply endpoint still accepts deprecated `body` for backward compat."""
+        resp = client.post(
+            "/accounts/acct1/reply/42",
+            json={"body": "Thanks via body!", "confidence": 0.9},
+        )
+        assert resp.status_code == 201
+        compose_data = _mock_deps["route"].call_args[0][2]
+        assert "Thanks via body!" in compose_data.body
+
+    def test_reply_text_preferred_over_body(self, client, _mock_deps):
+        """When both `text` and `body` are provided, `text` wins."""
+        resp = client.post(
+            "/accounts/acct1/reply/42",
+            json={"text": "text wins", "body": "body loses", "confidence": 0.9},
+        )
+        assert resp.status_code == 201
+        compose_data = _mock_deps["route"].call_args[0][2]
+        assert "text wins" in compose_data.body
+        assert "body loses" not in compose_data.body
+
+    def test_reply_neither_text_nor_body_fails(self, client, _mock_deps):
+        """Reply with no content should fail validation."""
+        resp = client.post(
+            "/accounts/acct1/reply/42",
+            json={"confidence": 0.9},
+        )
+        assert resp.status_code == 422
+
+    def test_reply_all_with_text_field(self, client, _mock_deps):
+        """Reply-all endpoint accepts `text` (consistent with /send)."""
+        resp = client.post(
+            "/accounts/acct1/reply-all/42",
+            json={"text": "Thanks all via text!", "confidence": 0.9},
+        )
+        assert resp.status_code == 201
+        compose_data = _mock_deps["route"].call_args[0][2]
+        assert "Thanks all via text!" in compose_data.body
+
+    def test_reply_all_text_preferred_over_body(self, client, _mock_deps):
+        """Reply-all also prefers `text` over `body`."""
+        resp = client.post(
+            "/accounts/acct1/reply-all/42",
+            json={"text": "text wins", "body": "body loses", "confidence": 0.9},
+        )
+        assert resp.status_code == 201
+        compose_data = _mock_deps["route"].call_args[0][2]
+        assert "text wins" in compose_data.body
+        assert "body loses" not in compose_data.body
