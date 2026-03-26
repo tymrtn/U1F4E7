@@ -2,6 +2,7 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 mod commands;
+mod governor;
 
 use clap::{Parser, Subcommand};
 
@@ -18,6 +19,10 @@ struct Cli {
     /// Credential storage backend: "file" (default) or "keychain"
     #[arg(long, global = true, default_value = "file")]
     credential_store: String,
+
+    /// Bypass governor safety checks (emergency use)
+    #[arg(long, global = true)]
+    no_governor: bool,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +200,12 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ActionsCmd,
     },
+
+    /// Governor safety integration — status and testing
+    Governor {
+        #[command(subcommand)]
+        subcommand: GovernorCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -355,6 +366,27 @@ enum ActionsCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum GovernorCmd {
+    /// Show governor integration status
+    Status,
+    /// Dry-run a send through governor scoring
+    TestSend {
+        /// Recipient address to test
+        #[arg(long)]
+        to: String,
+        /// Subject line to test
+        #[arg(long, default_value = "test message")]
+        subject: String,
+    },
+    /// Dry-run a destructive action through governor scoring
+    TestDelete {
+        /// Description of the action to test
+        #[arg(long, default_value = "delete message UID 1 from INBOX")]
+        action: String,
+    },
+}
+
 fn main() {
     // Install the rustls crypto provider before any TLS connections are made.
     // Without this, rustls panics with "Could not automatically determine
@@ -372,6 +404,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    let no_governor = cli.no_governor;
 
     let result = match cli.command {
         Commands::Accounts { subcommand } => commands::accounts::run(subcommand, cli.json, backend),
@@ -391,6 +425,8 @@ fn main() {
             limit,
             account,
         } => commands::search::run(&query, &folder, limit, account.as_deref(), cli.json, backend),
+
+        // --- GOVERNED: send ---
         Commands::Send {
             to,
             subject,
@@ -400,35 +436,87 @@ fn main() {
             bcc,
             reply_to,
             account,
-        } => commands::send::run(
-            &to,
-            &subject,
-            body.as_deref(),
-            html.as_deref(),
-            cc.as_deref(),
-            bcc.as_deref(),
-            reply_to.as_deref(),
-            account.as_deref(),
-            cli.json,
-            backend,
-        ),
+        } => {
+            if governor::is_enabled(no_governor) {
+                let attrs = governor::GovernorAttrs::email_send(&to, &subject);
+                if let Err(e) = governor::check(&attrs) {
+                    Err(e)
+                } else {
+                    commands::send::run(
+                        &to,
+                        &subject,
+                        body.as_deref(),
+                        html.as_deref(),
+                        cc.as_deref(),
+                        bcc.as_deref(),
+                        reply_to.as_deref(),
+                        account.as_deref(),
+                        cli.json,
+                        backend,
+                    )
+                }
+            } else {
+                commands::send::run(
+                    &to,
+                    &subject,
+                    body.as_deref(),
+                    html.as_deref(),
+                    cc.as_deref(),
+                    bcc.as_deref(),
+                    reply_to.as_deref(),
+                    account.as_deref(),
+                    cli.json,
+                    backend,
+                )
+            }
+        }
+
+        // --- GOVERNED: move (only if destination is destructive) ---
         Commands::Move {
             uid,
             to_folder,
             folder,
             account,
-        } => commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json, backend),
+        } => {
+            if governor::is_enabled(no_governor) && governor::is_destructive_folder(&to_folder) {
+                let desc = format!("move UID {uid} from {folder} to {to_folder}");
+                let attrs = governor::GovernorAttrs::destructive(&desc);
+                if let Err(e) = governor::check(&attrs) {
+                    Err(e)
+                } else {
+                    commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json, backend)
+                }
+            } else {
+                commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json, backend)
+            }
+        }
+
         Commands::Copy {
             uid,
             to_folder,
             folder,
             account,
         } => commands::messages::run_copy(uid, &folder, &to_folder, account.as_deref(), cli.json, backend),
+
+        // --- GOVERNED: delete ---
         Commands::Delete {
             uid,
             folder,
             account,
-        } => commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend),
+        } => {
+            if governor::is_enabled(no_governor) {
+                let desc = format!("delete UID {uid} from {folder}");
+                let attrs = governor::GovernorAttrs::destructive(&desc);
+                if let Err(e) = governor::check(&attrs) {
+                    Err(e)
+                } else {
+                    commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend)
+                }
+            } else {
+                commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend)
+            }
+        }
+
         Commands::Flag { subcommand } => match subcommand {
             FlagCmd::Add {
                 uid,
@@ -468,6 +556,8 @@ fn main() {
                 backend,
             ),
         },
+
+        // --- GOVERNED: draft send (outbound email) ---
         Commands::Draft { subcommand } => match subcommand {
             DraftCmd::List { account } => {
                 commands::drafts::run_list(account.as_deref(), cli.json, backend)
@@ -486,10 +576,24 @@ fn main() {
                 backend,
             ),
             DraftCmd::Send { id, account } => {
-                commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
+                if governor::is_enabled(no_governor) {
+                    // We need draft info for governor attrs — resolve it here
+                    let attrs = governor::GovernorAttrs::email_send(
+                        &format!("draft:{id}"),
+                        "draft send",
+                    );
+                    if let Err(e) = governor::check(&attrs) {
+                        Err(e)
+                    } else {
+                        commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
+                    }
+                } else {
+                    commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
+                }
             }
             DraftCmd::Discard { id } => commands::drafts::run_discard(&id, cli.json),
         },
+
         Commands::Serve { port } => commands::serve::run(port),
         Commands::Compose { .. } => {
             eprintln!("License required — visit https://envelope-email.dev");
@@ -513,6 +617,17 @@ fn main() {
             ActionsCmd::Tail { .. } => {
                 eprintln!("Not yet implemented: actions tail");
                 std::process::exit(1);
+            }
+        },
+
+        // --- Governor subcommand ---
+        Commands::Governor { subcommand } => match subcommand {
+            GovernorCmd::Status => commands::governor::run_status(cli.json),
+            GovernorCmd::TestSend { to, subject } => {
+                commands::governor::run_test_send(&to, &subject, cli.json)
+            }
+            GovernorCmd::TestDelete { action } => {
+                commands::governor::run_test_delete(&action, cli.json)
             }
         },
     };

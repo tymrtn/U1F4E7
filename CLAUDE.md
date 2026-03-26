@@ -4,7 +4,10 @@
 
 Envelope Email is a **clean email client** — BYO-mailbox, IMAP/SMTP, with agent-native primitives (JSON on every command, auto-discovery, scriptable). It gives OpenClaw agents email capabilities.
 
-**Envelope is NOT a governance/scoring product.** The scoring layer, blind attribution, and send-zone routing belong to **Governor** — a separate product that hooks into Envelope externally. Never add governance language, scoring attributes, or `--attr` flags to this codebase. If someone asks for scoring features, the answer is "that's Governor."
+**Envelope has optional Governor integration** for safety. When `ENVELOPE_GOVERNOR=true`,
+destructive/outbound commands are routed through the `governor` CLI's scoring engine before
+execution. Blind attribution and send-zone routing still belong to Governor externally.
+See `crates/cli/src/governor.rs` for the integration layer.
 
 ## Repo & License
 
@@ -97,22 +100,56 @@ cargo clippy
 | `license activate/status` | ⚠️ Partial | Status works; activate is stub |
 | `attributes` | ⚠️ Stub | Not yet implemented |
 | `actions tail` | ⚠️ Stub | Not yet implemented |
+| `governor status` | ✅ Implemented | Show governor integration status |
+| `governor test-send` | ✅ Implemented | Dry-run send through governor scoring |
+| `governor test-delete` | ✅ Implemented | Dry-run delete through governor scoring |
 
-## Governor Integration Points
+## Governor Integration
 
-Governor hooks into Envelope through these existing infrastructure pieces — **without Envelope knowing about governance:**
+Governor integration is built into the CLI as an optional safety layer.
 
-1. **Action Log** (`store/src/action_log.rs`) — Records agent actions with confidence scores and justification. Governor reads this externally.
-2. **License Store** (`store/src/license_store.rs`) — License activation gates compose/attributes/actions commands. Governor manages the license.
-3. **`compose` command** — Currently a license-gated stub. Governor will provide the compose-with-scoring flow.
-4. **`attributes` command** — Stub that will list scoring attributes when Governor is active.
-5. **`actions tail` command** — Stub that will show Governor's decisions.
+### How It Works
 
-The pattern: Envelope stores data and provides stubs. Governor fills them in. Envelope stays clean.
+When `ENVELOPE_GOVERNOR=true` (env var), Envelope shells out to `governor admin score --attr <key> --json`
+before executing governed commands. If Governor returns `"deny"`, Envelope aborts with an error.
+
+### Governed Commands
+
+| Command | Attrs | Condition |
+|---------|-------|-----------|
+| `send` | `outbound`, `email_send` | Always when governor enabled |
+| `delete` | `destructive` | Always when governor enabled |
+| `move` | `destructive` | Only when destination is Trash/Junk/Spam/Deleted |
+| `draft send` | `outbound`, `email_send` | Always when governor enabled |
+
+### Ungoverned Commands (always passthrough)
+
+`inbox`, `read`, `search`, `folders`, `flag`, `accounts list`, `copy`, `draft create`, `draft list`
+
+### Configuration
+
+- `ENVELOPE_GOVERNOR=true` — enable governor checks
+- `GOVERNOR_PATH=/path/to/governor` — custom governor binary path (default: `governor` in PATH)
+- `--no-governor` — CLI flag to bypass all governor checks (emergency use)
+
+### Files
+
+- `crates/cli/src/governor.rs` — Core governor logic (check, is_enabled, is_destructive_folder)
+- `crates/cli/src/commands/governor.rs` — `envelope-email governor` subcommand (status, test-send, test-delete)
+
+### Legacy Integration Points
+
+These existing pieces remain for external Governor integration:
+
+1. **Action Log** (`store/src/action_log.rs`) — Records agent actions with confidence scores.
+2. **License Store** (`store/src/license_store.rs`) — License activation gates compose/attributes/actions.
+3. **`compose` command** — License-gated stub.
+4. **`attributes` command** — Stub for listing scoring attributes.
+5. **`actions tail` command** — Stub for showing decisions.
 
 ## Rules for Contributors
 
-1. **No governance language in Envelope.** No "scoring," "blind attribution," "send zones," "governance," or `--attr` flags in user-facing code or docs. That's Governor.
+1. **Governor integration is opt-in.** The scoring integration in `governor.rs` uses `governor admin score` — it does not implement scoring logic itself. Blind attribution, send zones, and scoring weights belong to the Governor project, not Envelope.
 2. **JSON on every command.** Every command must support `--json` for agent consumption.
 3. **Auto-discovery by default.** Users provide email + password; IMAP/SMTP hosts are discovered via DNS.
 4. **Credentials via pluggable backend.** Passwords encrypted with AES-256-GCM in SQLite. The master passphrase is managed by `--credential-store`:
