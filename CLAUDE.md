@@ -39,8 +39,11 @@ crates/
 ├── email/        # Library — IMAP client, SMTP sender, DNS auto-discovery
 │   └── src/
 │       ├── discovery.rs      # MX/SRV → IMAP/SMTP host resolution
+│       ├── folders.rs        # Folder detection with provider-aware resolution
 │       ├── imap.rs           # IMAP operations (async-imap + rustls)
+│       ├── provider.rs       # Provider detection + canonical folder mapping
 │       ├── smtp.rs           # SMTP send (lettre + rustls)
+│       ├── threading.rs      # Email threading (subject normalization, thread building)
 │       ├── errors.rs
 │       └── lib.rs
 ├── store/        # Library — SQLite persistence, crypto, models
@@ -146,6 +149,50 @@ These existing pieces remain for external Governor integration:
 3. **`compose` command** — License-gated stub.
 4. **`attributes` command** — Stub for listing scoring attributes.
 5. **`actions tail` command** — Stub for showing decisions.
+
+## Provider Detection & Folder Resolution
+
+Different email providers use different IMAP folder naming conventions. The provider
+detection system in `crates/email/src/provider.rs` handles this permanently:
+
+### How It Works
+
+1. **Auto-detection on first connection**: When an account's `provider_type` is NULL, the
+   system lists IMAP folders and detects the provider (Gmail → `[Gmail]/` prefix, Dovecot →
+   `INBOX.` prefix, Exchange → "Deleted Items"/"Junk E-mail", Standard → flat names).
+
+2. **Stored in DB**: The detected `provider_type` is stored in the `accounts` table and
+   reused on subsequent connections (no IMAP round-trip needed).
+
+3. **Canonical folder resolution**: All code uses logical names (`"drafts"`, `"sent"`,
+   `"trash"`, `"spam"`, `"archive"`) and calls `resolve_folder(provider, "drafts")` to get
+   the actual IMAP name (`"[Gmail]/Drafts"` for Gmail, `"Drafts"` for Standard, etc.).
+
+4. **Backward compatibility**: If `provider_type` is NULL, the system falls back to trying
+   all known folder name candidates (the old behavior) and detects the provider for next time.
+
+### Provider Types
+
+| Type | Example Providers | Drafts | Sent | Trash |
+|------|-------------------|--------|------|-------|
+| `gmail` | Gmail | `[Gmail]/Drafts` | `[Gmail]/Sent Mail` | `[Gmail]/Trash` |
+| `standard` | Migadu, Fastmail | `Drafts` | `Sent` | `Trash` |
+| `dovecot` | Self-hosted Dovecot | `INBOX.Drafts` | `INBOX.Sent` | `INBOX.Trash` |
+| `exchange` | Outlook.com | `Drafts` | `Sent Items` | `Deleted Items` |
+| `unknown` | Fallback | Tries all candidates | Tries all candidates | Tries all candidates |
+
+### Key Files
+
+- `crates/email/src/provider.rs` — `ProviderType`, `detect_provider()`, `resolve_folder()`, `classify_folder()`
+- `crates/email/src/folders.rs` — `detect_drafts_folder()`, `detect_sent_folder()`, `detect_folder()`, `classify_folders()`
+- `crates/store/src/db.rs` — `get_provider_type()`, `set_provider_type()`, `detected_folders` table
+
+### Rules for New Folder References
+
+**Never hardcode folder names.** Always use one of:
+- `resolve_folder(provider, "drafts")` — when you know the provider type
+- `detect_drafts_folder(client, db, account_id)` — when you need to detect + cache
+- `detect_folder(client, db, account_id, "trash")` — generic detection for any type
 
 ## Rules for Contributors
 
