@@ -2,7 +2,7 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use envelope_email_store::models::AccountWithCredentials;
-use lettre::message::{header::ContentType, MultiPart, SinglePart};
+use lettre::message::{MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use tracing::info;
@@ -46,11 +46,9 @@ impl SmtpSender {
             .subject(subject);
 
         if let Some(cc_addr) = cc {
-            builder = builder.cc(
-                cc_addr
-                    .parse()
-                    .map_err(|e| SmtpError::Send(format!("invalid cc address: {e}")))?,
-            );
+            builder = builder.cc(cc_addr
+                .parse()
+                .map_err(|e| SmtpError::Send(format!("invalid cc address: {e}")))?);
         }
 
         if let Some(bcc_addr) = bcc {

@@ -12,11 +12,11 @@
 
 use crate::errors::{Result, StoreError};
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng},
 };
 use argon2::Argon2;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -75,11 +75,8 @@ struct CredentialFile {
 }
 
 fn credentials_path() -> PathBuf {
-    let config_dir =
-        dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-    config_dir
-        .join("envelope-email")
-        .join("credentials.json")
+    let config_dir = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
+    config_dir.join("envelope-email").join("credentials.json")
 }
 
 /// Derive the master passphrase for file-based storage.
@@ -116,14 +113,10 @@ fn read_credential_file() -> Result<CredentialFile> {
     if !path.exists() {
         return Ok(CredentialFile::default());
     }
-    let data = std::fs::read_to_string(&path).map_err(|e| {
-        StoreError::Config(format!("cannot read {}: {e}", path.display()))
-    })?;
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| StoreError::Config(format!("cannot read {}: {e}", path.display())))?;
     serde_json::from_str(&data).map_err(|e| {
-        StoreError::Config(format!(
-            "corrupt credentials file {}: {e}",
-            path.display()
-        ))
+        StoreError::Config(format!("corrupt credentials file {}: {e}", path.display()))
     })
 }
 
@@ -137,12 +130,10 @@ fn write_credential_file(cf: &CredentialFile) -> Result<()> {
             ))
         })?;
     }
-    let data = serde_json::to_string_pretty(cf).map_err(|e| {
-        StoreError::Config(format!("serialize credentials: {e}"))
-    })?;
-    std::fs::write(&path, data.as_bytes()).map_err(|e| {
-        StoreError::Config(format!("write {}: {e}", path.display()))
-    })?;
+    let data = serde_json::to_string_pretty(cf)
+        .map_err(|e| StoreError::Config(format!("serialize credentials: {e}")))?;
+    std::fs::write(&path, data.as_bytes())
+        .map_err(|e| StoreError::Config(format!("write {}: {e}", path.display())))?;
 
     // Restrict to owner-only on Unix
     #[cfg(unix)]
@@ -150,10 +141,7 @@ fn write_credential_file(cf: &CredentialFile) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&path, perms).map_err(|e| {
-            StoreError::Config(format!(
-                "set permissions on {}: {e}",
-                path.display()
-            ))
+            StoreError::Config(format!("set permissions on {}: {e}", path.display()))
         })?;
     }
 
@@ -180,8 +168,8 @@ fn encrypt_value(plaintext: &str, passphrase: &str) -> Result<String> {
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| StoreError::Encryption(e.to_string()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| StoreError::Encryption(e.to_string()))?;
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
@@ -210,15 +198,14 @@ fn decrypt_value(encoded: &str, passphrase: &str) -> Result<String> {
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let key = derive_key(passphrase, salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| StoreError::Decryption(e.to_string()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| StoreError::Decryption(e.to_string()))?;
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| StoreError::Decryption(e.to_string()))?;
 
-    String::from_utf8(plaintext)
-        .map_err(|e| StoreError::Decryption(format!("invalid utf8: {e}")))
+    String::from_utf8(plaintext).map_err(|e| StoreError::Decryption(format!("invalid utf8: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +245,7 @@ fn file_get_or_create_passphrase() -> Result<String> {
     let passphrase = B64.encode(bytes);
 
     let encrypted = encrypt_value(&passphrase, &master)?;
-    cf.entries
-        .insert(MASTER_KEY_ENTRY.to_string(), encrypted);
+    cf.entries.insert(MASTER_KEY_ENTRY.to_string(), encrypted);
     write_credential_file(&cf)?;
 
     Ok(passphrase)
@@ -313,8 +299,7 @@ pub fn migrate_keychain_to_file() -> Result<bool> {
                 let master = file_master_key()?;
                 let mut cf = read_credential_file()?;
                 let encrypted = encrypt_value(&keychain_passphrase, &master)?;
-                cf.entries
-                    .insert(MASTER_KEY_ENTRY.to_string(), encrypted);
+                cf.entries.insert(MASTER_KEY_ENTRY.to_string(), encrypted);
                 write_credential_file(&cf)?;
                 Ok(true)
             }

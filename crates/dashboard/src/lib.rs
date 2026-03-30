@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{delete, get};
-use axum::Router;
 use envelope_email_store::Database;
 use tokio::sync::Mutex;
-use axum::http::{HeaderValue, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 

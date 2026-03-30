@@ -102,13 +102,8 @@ mod tests {
     fn expired_license_not_returned() {
         let db = Database::open_memory().unwrap();
 
-        db.store_license(
-            "tok-expired",
-            "Old User",
-            "2020-01-01T00:00:00",
-            &[],
-        )
-        .unwrap();
+        db.store_license("tok-expired", "Old User", "2020-01-01T00:00:00", &[])
+            .unwrap();
 
         let license = db.get_active_license().unwrap();
         assert!(license.is_none());
@@ -118,13 +113,8 @@ mod tests {
     fn delete_license() {
         let db = Database::open_memory().unwrap();
 
-        db.store_license(
-            "tok-delete-me",
-            "Someone",
-            "2099-12-31T23:59:59",
-            &[],
-        )
-        .unwrap();
+        db.store_license("tok-delete-me", "Someone", "2099-12-31T23:59:59", &[])
+            .unwrap();
 
         db.delete_license().unwrap();
         let license = db.get_active_license().unwrap();

@@ -22,18 +22,24 @@ impl Database {
         passphrase: &str,
     ) -> Result<Account> {
         let id = Uuid::new_v4().to_string();
-        let domain = username
-            .split('@')
-            .nth(1)
-            .unwrap_or("unknown")
-            .to_string();
+        let domain = username.split('@').nth(1).unwrap_or("unknown").to_string();
         let encrypted_password = crypto::encrypt(password, passphrase)?;
 
         self.conn().execute(
             "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
              imap_host, imap_port, encrypted_password)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password],
+            params![
+                id,
+                name,
+                username,
+                domain,
+                smtp_host,
+                smtp_port,
+                imap_host,
+                imap_port,
+                encrypted_password
+            ],
         )?;
 
         self.get_account(&id)?
@@ -156,25 +162,21 @@ impl Database {
         )?;
         let password = crypto::decrypt(&encrypted_password, passphrase)?;
 
-        let smtp_password: Option<String> = self
-            .conn()
-            .query_row(
-                "SELECT encrypted_smtp_password FROM accounts WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )?;
+        let smtp_password: Option<String> = self.conn().query_row(
+            "SELECT encrypted_smtp_password FROM accounts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
         let smtp_password = smtp_password
             .as_deref()
             .map(|enc| crypto::decrypt(enc, passphrase))
             .transpose()?;
 
-        let imap_password: Option<String> = self
-            .conn()
-            .query_row(
-                "SELECT encrypted_imap_password FROM accounts WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )?;
+        let imap_password: Option<String> = self.conn().query_row(
+            "SELECT encrypted_imap_password FROM accounts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
         let imap_password = imap_password
             .as_deref()
             .map(|enc| crypto::decrypt(enc, passphrase))
@@ -304,7 +306,9 @@ mod tests {
     fn delete_account() {
         let db = Database::open_memory().unwrap();
         let account = db
-            .create_account("Test", "a@b.com", "pw", "s.b.com", 587, "i.b.com", 993, "pp")
+            .create_account(
+                "Test", "a@b.com", "pw", "s.b.com", 587, "i.b.com", 993, "pp",
+            )
             .unwrap();
 
         assert!(db.delete_account(&account.id).unwrap());

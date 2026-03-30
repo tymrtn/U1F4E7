@@ -16,9 +16,8 @@ impl Database {
     pub fn open_default() -> Result<Self> {
         let path = Self::default_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                StoreError::Config(format!("cannot create config dir: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StoreError::Config(format!("cannot create config dir: {e}")))?;
         }
         let db = Self::open(&path)?;
 
@@ -27,9 +26,8 @@ impl Database {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms).map_err(|e| {
-                StoreError::Config(format!("cannot set database permissions: {e}"))
-            })?;
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| StoreError::Config(format!("cannot set database permissions: {e}")))?;
         }
 
         Ok(db)
@@ -57,8 +55,7 @@ impl Database {
     }
 
     fn default_path() -> PathBuf {
-        let config_dir = dirs_next::config_dir()
-            .unwrap_or_else(|| PathBuf::from(".config"));
+        let config_dir = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
         config_dir.join("envelope-email").join("envelope.db")
     }
 
@@ -140,13 +137,15 @@ impl Database {
         )?;
 
         // Add imap_uid column for IMAP-first drafts (idempotent for existing DBs).
-        let has_imap_uid: bool = self.conn.prepare(
-            "SELECT COUNT(*) FROM pragma_table_info('drafts') WHERE name = 'imap_uid'"
-        )?.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0;
+        let has_imap_uid: bool = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('drafts') WHERE name = 'imap_uid'")?
+            .query_row([], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+            > 0;
         if !has_imap_uid {
-            self.conn.execute_batch(
-                "ALTER TABLE drafts ADD COLUMN imap_uid INTEGER;"
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE drafts ADD COLUMN imap_uid INTEGER;")?;
         }
 
         // Create detected_folders table for caching auto-detected folder names
@@ -162,6 +161,22 @@ impl Database {
             );
             ",
         )?;
+
+        // Add provider_type column to accounts table (idempotent for existing DBs).
+        // Stores the detected email provider type (gmail, standard, dovecot, exchange, unknown).
+        // NULL means not yet detected — triggers auto-detection on first IMAP connection.
+        let has_provider_type: bool = self
+            .conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'provider_type'",
+            )?
+            .query_row([], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+            > 0;
+        if !has_provider_type {
+            self.conn
+                .execute_batch("ALTER TABLE accounts ADD COLUMN provider_type TEXT;")?;
+        }
 
         Ok(())
     }
@@ -204,6 +219,44 @@ impl Database {
                 folder_name = excluded.folder_name,
                 detected_at = excluded.detected_at",
             rusqlite::params![account_id, folder_type, folder_name],
+        )?;
+        Ok(())
+    }
+
+    /// Get all detected folders for an account.
+    pub fn get_detected_folders(&self, account_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT folder_type, folder_name FROM detected_folders WHERE account_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ── Provider type ────────────────────────────────────────────────
+
+    /// Get the stored provider type for an account.
+    /// Returns None if not yet detected (NULL in DB) or if account not found.
+    pub fn get_provider_type(&self, account_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT provider_type FROM accounts WHERE id = ?1",
+                rusqlite::params![account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        // Flatten: None (no row) or Some(None) (NULL column) → None
+        Ok(row.flatten())
+    }
+
+    /// Store the detected provider type for an account.
+    pub fn set_provider_type(&self, account_id: &str, provider_type: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET provider_type = ?2 WHERE id = ?1",
+            rusqlite::params![account_id, provider_type],
         )?;
         Ok(())
     }

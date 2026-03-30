@@ -26,8 +26,18 @@ impl Database {
             "INSERT INTO drafts (id, account_id, to_addr, subject, text_content, html_content,
              in_reply_to, cc_addr, bcc_addr, created_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, account_id, to_addr, subject, text_content, html_content,
-                    in_reply_to, cc_addr, bcc_addr, created_by],
+            params![
+                id,
+                account_id,
+                to_addr,
+                subject,
+                text_content,
+                html_content,
+                in_reply_to,
+                cc_addr,
+                bcc_addr,
+                created_by
+            ],
         )?;
 
         self.get_draft(&id)?
@@ -52,9 +62,7 @@ impl Database {
                 Ok(Draft {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
-                    status: status_str
-                        .parse()
-                        .unwrap_or(DraftStatus::Draft),
+                    status: status_str.parse().unwrap_or(DraftStatus::Draft),
                     to_addr: row.get(3)?,
                     cc_addr: row.get(4)?,
                     bcc_addr: row.get(5)?,
@@ -119,7 +127,9 @@ impl Database {
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
 
         if !current.status.is_editable() {
-            return Err(StoreError::DraftNotEditable(current.status.as_str().to_string()));
+            return Err(StoreError::DraftNotEditable(
+                current.status.as_str().to_string(),
+            ));
         }
 
         self.conn().execute(
@@ -234,8 +244,17 @@ mod tests {
     fn create_and_get_draft() {
         let db = setup();
         let draft = db
-            .create_draft("acc1", "to@test.com", Some("Subject"), Some("Body"),
-                         None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(draft.to_addr, "to@test.com");
@@ -251,7 +270,17 @@ mod tests {
     fn discard_draft() {
         let db = setup();
         let draft = db
-            .create_draft("acc1", "to@test.com", Some("Sub"), None, None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Sub"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         assert!(db.discard_draft(&draft.id).unwrap());
@@ -263,8 +292,17 @@ mod tests {
     fn update_imap_uid() {
         let db = setup();
         let draft = db
-            .create_draft("acc1", "to@test.com", Some("Subject"), Some("Body"),
-                         None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(draft.imap_uid, None);
@@ -278,13 +316,23 @@ mod tests {
     fn mark_message_id() {
         let db = setup();
         let draft = db
-            .create_draft("acc1", "to@test.com", Some("Subject"), None,
-                         None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(draft.message_id, None);
 
-        db.mark_draft_message_id(&draft.id, "<test@example.com>").unwrap();
+        db.mark_draft_message_id(&draft.id, "<test@example.com>")
+            .unwrap();
         let fetched = db.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(fetched.message_id, Some("<test@example.com>".to_string()));
     }
@@ -293,8 +341,17 @@ mod tests {
     fn list_drafts_includes_imap_uid() {
         let db = setup();
         let draft = db
-            .create_draft("acc1", "to@test.com", Some("Subject"), None,
-                         None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         db.update_draft_imap_uid(&draft.id, 99).unwrap();

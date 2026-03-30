@@ -12,70 +12,9 @@ use envelope_email_store::models::AccountWithCredentials;
 use tracing::{debug, info, warn};
 
 use crate::errors::ImapError;
+use crate::folders;
 use crate::imap;
-
-/// Common sent folder names across email providers.
-const SENT_FOLDER_CANDIDATES: &[&str] = &[
-    "Sent",
-    "Sent Mail",
-    "Sent Messages",
-    "Sent Items",
-    "[Gmail]/Sent Mail",
-    "INBOX.Sent",
-    "INBOX.Sent Messages",
-];
-
-/// Common drafts folder names across email providers.
-const DRAFTS_FOLDER_CANDIDATES: &[&str] = &[
-    "Drafts",
-    "[Gmail]/Drafts",
-    "Draft",
-    "INBOX.Drafts",
-    "INBOX/Drafts",
-];
-
-/// Common folder names mapped to their semantic type.
-const FOLDER_TYPE_PATTERNS: &[(&str, &[&str])] = &[
-    ("inbox", &["INBOX"]),
-    (
-        "sent",
-        &[
-            "Sent",
-            "Sent Mail",
-            "Sent Messages",
-            "Sent Items",
-            "[Gmail]/Sent Mail",
-            "INBOX.Sent",
-            "INBOX.Sent Messages",
-        ],
-    ),
-    ("drafts", &["Drafts", "[Gmail]/Drafts", "Draft", "INBOX.Drafts", "INBOX/Drafts"]),
-    (
-        "trash",
-        &[
-            "Trash",
-            "[Gmail]/Trash",
-            "Deleted Messages",
-            "Deleted Items",
-            "INBOX.Trash",
-        ],
-    ),
-    (
-        "junk",
-        &[
-            "Junk",
-            "Spam",
-            "[Gmail]/Spam",
-            "Junk E-mail",
-            "INBOX.Junk",
-            "INBOX.Spam",
-        ],
-    ),
-    (
-        "archive",
-        &["Archive", "All Mail", "[Gmail]/All Mail", "INBOX.Archive"],
-    ),
-];
+use crate::provider;
 
 /// Normalize an email subject for thread grouping.
 ///
@@ -180,138 +119,13 @@ pub fn extract_snippet(text: &str, max_len: usize) -> String {
     }
 }
 
-/// Detect the sent folder for an account by checking IMAP folder list.
-pub async fn detect_sent_folder(
-    client: &mut imap::ImapClient,
-    db: &Database,
-    account_id: &str,
-) -> Result<Option<String>, ImapError> {
-    // Check cached value first
-    if let Ok(Some(cached)) = db.get_sent_folder(account_id) {
-        debug!("using cached sent folder: {cached}");
-        return Ok(Some(cached));
-    }
-
-    // List all folders and match against known patterns
-    let folders = imap::list_folders(client).await?;
-    let folder_set: std::collections::HashSet<&str> = folders.iter().map(|s| s.as_str()).collect();
-
-    for candidate in SENT_FOLDER_CANDIDATES {
-        if folder_set.contains(*candidate) {
-            info!("detected sent folder: {candidate}");
-            if let Err(e) = db.set_detected_folder(account_id, "sent", candidate) {
-                warn!("failed to cache sent folder: {e}");
-            }
-            return Ok(Some(candidate.to_string()));
-        }
-    }
-
-    // Case-insensitive fallback
-    for folder in &folders {
-        let lower = folder.to_lowercase();
-        if lower.contains("sent") && !lower.contains("unsent") {
-            info!("detected sent folder (fuzzy): {folder}");
-            if let Err(e) = db.set_detected_folder(account_id, "sent", folder) {
-                warn!("failed to cache sent folder: {e}");
-            }
-            return Ok(Some(folder.clone()));
-        }
-    }
-
-    warn!("no sent folder detected for account {account_id}");
-    Ok(None)
-}
-
-/// Detect the drafts folder for an account by checking IMAP folder list.
-///
-/// Tries common drafts folder names in priority order, then falls back to
-/// case-insensitive search. Caches the result in the `detected_folders` table.
-pub async fn detect_drafts_folder(
-    client: &mut imap::ImapClient,
-    db: &Database,
-    account_id: &str,
-) -> Result<Option<String>, ImapError> {
-    // Check cached value first
-    if let Ok(Some(cached)) = db.get_drafts_folder(account_id) {
-        debug!("using cached drafts folder: {cached}");
-        return Ok(Some(cached));
-    }
-
-    // List all folders and match against known patterns
-    let folders = imap::list_folders(client).await?;
-    let folder_set: std::collections::HashSet<&str> = folders.iter().map(|s| s.as_str()).collect();
-
-    for candidate in DRAFTS_FOLDER_CANDIDATES {
-        if folder_set.contains(*candidate) {
-            info!("detected drafts folder: {candidate}");
-            if let Err(e) = db.set_detected_folder(account_id, "drafts", candidate) {
-                warn!("failed to cache drafts folder: {e}");
-            }
-            return Ok(Some(candidate.to_string()));
-        }
-    }
-
-    // Case-insensitive fallback
-    for folder in &folders {
-        let lower = folder.to_lowercase();
-        if lower.contains("draft") {
-            info!("detected drafts folder (fuzzy): {folder}");
-            if let Err(e) = db.set_detected_folder(account_id, "drafts", folder) {
-                warn!("failed to cache drafts folder: {e}");
-            }
-            return Ok(Some(folder.clone()));
-        }
-    }
-
-    warn!("no drafts folder detected for account {account_id}");
-    Ok(None)
-}
-
-/// Classify all folders for an account and cache the results.
-pub async fn classify_folders(
-    client: &mut imap::ImapClient,
-    db: &Database,
-    account_id: &str,
-) -> Result<Vec<FolderInfo>, ImapError> {
-    let folders = imap::list_folders(client).await?;
-    let mut results = Vec::new();
-
-    for folder in &folders {
-        let folder_type = classify_folder_type(folder);
-        if let Some(ft) = &folder_type {
-            // Cache known types
-            if let Err(e) = db.set_detected_folder(account_id, ft, folder) {
-                warn!("failed to cache folder type: {e}");
-            }
-        }
-        results.push(FolderInfo {
-            name: folder.clone(),
-            folder_type: folder_type.unwrap_or_else(|| "other".to_string()),
-        });
-    }
-
-    Ok(results)
-}
+// Re-export folder types from the canonical implementations (no more duplication).
+pub use crate::folders::{FolderInfo, classify_folders, detect_drafts_folder, detect_sent_folder};
 
 /// Classify a single folder name into a semantic type.
-fn classify_folder_type(name: &str) -> Option<String> {
-    let lower = name.to_lowercase();
-    for (ftype, patterns) in FOLDER_TYPE_PATTERNS {
-        for pattern in *patterns {
-            if lower == pattern.to_lowercase() {
-                return Some(ftype.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Folder with its detected type.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FolderInfo {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub folder_type: String,
+/// Delegates to the provider-aware classifier in [`crate::provider`].
+pub fn classify_folder_type(name: &str) -> Option<String> {
+    provider::classify_folder(name).map(|s| s.to_string())
 }
 
 /// Build threads for an account by scanning INBOX and Sent folders.
@@ -643,7 +457,10 @@ where
 
     info!(
         "scanned {folder}: {} messages indexed, {} threads created, {} updated, {} unique threads refreshed",
-        result.messages_indexed, result.threads_created, result.threads_updated, dirty_threads.len()
+        result.messages_indexed,
+        result.threads_created,
+        result.threads_updated,
+        dirty_threads.len()
     );
 
     Ok(result)
@@ -822,7 +639,8 @@ mod tests {
         );
         assert_eq!(classify_folder_type("Drafts"), Some("drafts".to_string()));
         assert_eq!(classify_folder_type("Trash"), Some("trash".to_string()));
-        assert_eq!(classify_folder_type("Spam"), Some("junk".to_string()));
+        assert_eq!(classify_folder_type("Spam"), Some("spam".to_string()));
+        assert_eq!(classify_folder_type("Junk"), Some("spam".to_string()));
         assert_eq!(classify_folder_type("My Custom Folder"), None);
     }
 
@@ -932,10 +750,7 @@ mod tests {
     #[test]
     fn test_normalize_subject_mixed_international() {
         // Chain of different language prefixes
-        assert_eq!(
-            normalize_subject("Re: Aw: Sv: Fwd: Hello"),
-            "hello"
-        );
+        assert_eq!(normalize_subject("Re: Aw: Sv: Fwd: Hello"), "hello");
         assert_eq!(
             normalize_subject("Wg: Re: Enc: Meeting notes"),
             "meeting notes"
@@ -954,7 +769,7 @@ mod tests {
     #[test]
     fn test_drafts_folder_candidates_coverage() {
         // All drafts candidates should classify as "drafts" type
-        for candidate in DRAFTS_FOLDER_CANDIDATES {
+        for candidate in provider::all_candidates_for("drafts") {
             assert_eq!(
                 classify_folder_type(candidate),
                 Some("drafts".to_string()),

@@ -436,7 +436,14 @@ fn main() {
             folder,
             limit,
             account,
-        } => commands::search::run(&query, &folder, limit, account.as_deref(), cli.json, backend),
+        } => commands::search::run(
+            &query,
+            &folder,
+            limit,
+            account.as_deref(),
+            cli.json,
+            backend,
+        ),
 
         // --- GOVERNED: send ---
         Commands::Send {
@@ -496,10 +503,24 @@ fn main() {
                 if let Err(e) = governor::check(&attrs) {
                     Err(e)
                 } else {
-                    commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json, backend)
+                    commands::messages::run_move(
+                        uid,
+                        &folder,
+                        &to_folder,
+                        account.as_deref(),
+                        cli.json,
+                        backend,
+                    )
                 }
             } else {
-                commands::messages::run_move(uid, &folder, &to_folder, account.as_deref(), cli.json, backend)
+                commands::messages::run_move(
+                    uid,
+                    &folder,
+                    &to_folder,
+                    account.as_deref(),
+                    cli.json,
+                    backend,
+                )
             }
         }
 
@@ -508,7 +529,14 @@ fn main() {
             to_folder,
             folder,
             account,
-        } => commands::messages::run_copy(uid, &folder, &to_folder, account.as_deref(), cli.json, backend),
+        } => commands::messages::run_copy(
+            uid,
+            &folder,
+            &to_folder,
+            account.as_deref(),
+            cli.json,
+            backend,
+        ),
 
         // --- GOVERNED: delete ---
         Commands::Delete {
@@ -522,7 +550,13 @@ fn main() {
                 if let Err(e) = governor::check(&attrs) {
                     Err(e)
                 } else {
-                    commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend)
+                    commands::messages::run_delete(
+                        uid,
+                        &folder,
+                        account.as_deref(),
+                        cli.json,
+                        backend,
+                    )
                 }
             } else {
                 commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend)
@@ -535,13 +569,22 @@ fn main() {
                 flag,
                 folder,
                 account,
-            } => commands::flags::run_add(uid, &flag, &folder, account.as_deref(), cli.json, backend),
+            } => {
+                commands::flags::run_add(uid, &flag, &folder, account.as_deref(), cli.json, backend)
+            }
             FlagCmd::Remove {
                 uid,
                 flag,
                 folder,
                 account,
-            } => commands::flags::run_remove(uid, &flag, &folder, account.as_deref(), cli.json, backend),
+            } => commands::flags::run_remove(
+                uid,
+                &flag,
+                &folder,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
         },
         Commands::Folders { account } => {
             commands::folders::run(account.as_deref(), cli.json, backend)
@@ -551,7 +594,9 @@ fn main() {
                 uid,
                 folder,
                 account,
-            } => commands::attachments::run_list(uid, &folder, account.as_deref(), cli.json, backend),
+            } => {
+                commands::attachments::run_list(uid, &folder, account.as_deref(), cli.json, backend)
+            }
             AttachmentCmd::Download {
                 uid,
                 filename,
@@ -596,10 +641,8 @@ fn main() {
             DraftCmd::Send { id, account } => {
                 if governor::is_enabled(no_governor) {
                     // We need draft info for governor attrs — resolve it here
-                    let attrs = governor::GovernorAttrs::email_send(
-                        &format!("draft:{id}"),
-                        "draft send",
-                    );
+                    let attrs =
+                        governor::GovernorAttrs::email_send(&format!("draft:{id}"), "draft send");
                     if let Err(e) = governor::check(&attrs) {
                         Err(e)
                     } else {

@@ -9,11 +9,11 @@
 
 use crate::errors::{Result, StoreError};
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng},
 };
 use argon2::Argon2;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use rand::RngCore;
 
 const SALT_LEN: usize = 16;
@@ -39,8 +39,8 @@ pub fn encrypt(plaintext: &str, passphrase: &str) -> Result<String> {
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| StoreError::Encryption(e.to_string()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| StoreError::Encryption(e.to_string()))?;
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
@@ -69,15 +69,14 @@ pub fn decrypt(encoded: &str, passphrase: &str) -> Result<String> {
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let key = derive_key(passphrase, salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| StoreError::Decryption(e.to_string()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| StoreError::Decryption(e.to_string()))?;
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| StoreError::Decryption(e.to_string()))?;
 
-    String::from_utf8(plaintext)
-        .map_err(|e| StoreError::Decryption(format!("invalid utf8: {e}")))
+    String::from_utf8(plaintext).map_err(|e| StoreError::Decryption(format!("invalid utf8: {e}")))
 }
 
 /// Get the encryption passphrase from the OS keychain, or generate and store one.

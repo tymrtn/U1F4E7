@@ -16,7 +16,7 @@
 //!   `governor admin score --attr <key> [--attr <key>...] --json`
 //! Returns JSON with `{ "result": "execute"|"deny", "score": f64, "breakdown": {...} }`
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::process::Command;
 
@@ -91,12 +91,12 @@ pub fn check(attrs: &GovernorAttrs) -> Result<()> {
 
     cmd.arg("--json");
 
-    let output = cmd
-        .output()
-        .with_context(|| format!(
+    let output = cmd.output().with_context(|| {
+        format!(
             "failed to execute governor at '{bin}'. Is it installed and in PATH? \
              Set GOVERNOR_PATH to override."
-        ))?;
+        )
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -142,18 +142,21 @@ pub fn check_verbose(attrs: &GovernorAttrs) -> Result<GovernorScoreResult> {
 
     cmd.arg("--json");
 
-    let output = cmd
-        .output()
-        .with_context(|| format!(
+    let output = cmd.output().with_context(|| {
+        format!(
             "failed to execute governor at '{bin}'. Is it installed and in PATH? \
              Set GOVERNOR_PATH to override."
-        ))?;
+        )
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("governor failed (exit code {}): {stderr}", output.status.code().unwrap_or(-1));
+        bail!(
+            "governor failed (exit code {}): {stderr}",
+            output.status.code().unwrap_or(-1)
+        );
     }
 
     let result: GovernorScoreResult = serde_json::from_str(&stdout)
@@ -167,9 +170,7 @@ pub fn test_connectivity() -> Result<GovernorStatus> {
     let bin = governor_path();
     let enabled = is_enabled(false);
 
-    let version_output = Command::new(&bin)
-        .arg("--version")
-        .output();
+    let version_output = Command::new(&bin).arg("--version").output();
 
     let (reachable, version) = match version_output {
         Ok(o) if o.status.success() => {
@@ -208,7 +209,16 @@ impl GovernorStatus {
 }
 
 /// Check if a move destination is a destructive folder (Trash, Junk, etc.)
+///
+/// Uses the provider-aware folder classifier when possible, with a
+/// fallback to string matching for folders not in the canonical set.
 pub fn is_destructive_folder(folder: &str) -> bool {
+    // Use the canonical classifier first
+    if let Some(canonical_type) = envelope_email_transport::provider::classify_folder(folder) {
+        return matches!(canonical_type, "trash" | "spam");
+    }
+
+    // Fallback: string matching for non-standard folder names
     let lower = folder.to_lowercase();
     lower.contains("trash")
         || lower.contains("junk")

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use envelope_email_store::models::DiscoveryResult;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
@@ -141,7 +141,11 @@ async fn discover_srv(domain: &str) -> Result<Vec<DiscoveryCandidate>, Discovery
     match resolver.srv_lookup(&smtp_srv).await {
         Ok(lookup) => {
             for record in lookup.iter() {
-                let host = record.target().to_string().trim_end_matches('.').to_string();
+                let host = record
+                    .target()
+                    .to_string()
+                    .trim_end_matches('.')
+                    .to_string();
                 candidates.push(DiscoveryCandidate {
                     host,
                     port: record.port(),
@@ -159,7 +163,11 @@ async fn discover_srv(domain: &str) -> Result<Vec<DiscoveryCandidate>, Discovery
     match resolver.srv_lookup(&imap_srv).await {
         Ok(lookup) => {
             for record in lookup.iter() {
-                let host = record.target().to_string().trim_end_matches('.').to_string();
+                let host = record
+                    .target()
+                    .to_string()
+                    .trim_end_matches('.')
+                    .to_string();
                 candidates.push(DiscoveryCandidate {
                     host,
                     port: record.port(),
@@ -199,10 +207,7 @@ async fn discover_mx(domain: &str) -> Result<Vec<DiscoveryCandidate>, DiscoveryE
         debug!("MX {mx_host} → base domain {mx_base}");
 
         // Apply alias mapping
-        let provider = aliases
-            .get(mx_base.as_str())
-            .copied()
-            .unwrap_or(&mx_base);
+        let provider = aliases.get(mx_base.as_str()).copied().unwrap_or(&mx_base);
 
         candidates.push(DiscoveryCandidate {
             host: format!("smtp.{provider}"),

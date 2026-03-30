@@ -25,8 +25,16 @@ impl Database {
             "INSERT INTO action_log (id, account_id, action_type, confidence, justification,
              action_taken, message_id, draft_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, account_id, action_type, confidence, justification,
-                    action_taken, message_id, draft_id],
+            params![
+                id,
+                account_id,
+                action_type,
+                confidence,
+                justification,
+                action_taken,
+                message_id,
+                draft_id
+            ],
         )?;
 
         let mut stmt = self.conn().prepare(

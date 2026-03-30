@@ -5,20 +5,29 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use async_imap::Session;
-use envelope_email_store::models::{AccountWithCredentials, AttachmentMeta, Message, MessageSummary};
+use envelope_email_store::models::{
+    AccountWithCredentials, AttachmentMeta, Message, MessageSummary,
+};
 use futures_util::StreamExt;
 use mail_parser::MimeHeaders;
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, info};
 
 use crate::errors::ImapError;
 
 /// Reject strings containing characters that could be used for IMAP command injection.
 fn validate_imap_input(s: &str) -> Result<(), ImapError> {
-    if s.contains('\r') || s.contains('\n') || s.contains('\0') || s.contains('{') || s.contains('}') {
-        return Err(ImapError::Protocol("invalid characters in input".to_string()));
+    if s.contains('\r')
+        || s.contains('\n')
+        || s.contains('\0')
+        || s.contains('{')
+        || s.contains('}')
+    {
+        return Err(ImapError::Protocol(
+            "invalid characters in input".to_string(),
+        ));
     }
     Ok(())
 }
@@ -116,7 +125,11 @@ pub async fn fetch_inbox(
         return Ok(Vec::new());
     }
 
-    let start = if exists > limit { exists - limit + 1 } else { 1 };
+    let start = if exists > limit {
+        exists - limit + 1
+    } else {
+        1
+    };
     let range = format!("{start}:{exists}");
 
     let messages = client
@@ -131,10 +144,7 @@ pub async fn fetch_inbox(
         match item {
             Ok(fetch) => {
                 let uid = fetch.uid.unwrap_or(0);
-                let flags: Vec<String> = fetch
-                    .flags()
-                    .map(|f| format!("{f:?}"))
-                    .collect();
+                let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
                 let size = fetch.size.unwrap_or(0);
 
                 let (from_addr, to_addr, subject, date, message_id) =
@@ -206,10 +216,7 @@ pub async fn fetch_message(
                 let parsed = mail_parser::MessageParser::default().parse(body);
 
                 if let Some(parsed) = parsed {
-                    let flags: Vec<String> = fetch
-                        .flags()
-                        .map(|f| format!("{f:?}"))
-                        .collect();
+                    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
 
                     let from_addr = mp_first_address(parsed.from());
                     let to_addr = mp_first_address(parsed.to());
@@ -233,10 +240,7 @@ pub async fn fetch_message(
                         .map(|a| {
                             let ct: Option<&mail_parser::ContentType> = a.content_type();
                             AttachmentMeta {
-                                filename: a
-                                    .attachment_name()
-                                    .unwrap_or("unnamed")
-                                    .to_string(),
+                                filename: a.attachment_name().unwrap_or("unnamed").to_string(),
                                 content_type: ct
                                     .map(|ct| {
                                         let subtype = ct.subtype().unwrap_or("octet-stream");
@@ -689,9 +693,7 @@ fn mp_first_address(header: Option<&mail_parser::Address<'_>>) -> String {
 }
 
 /// Format IMAP envelope addresses into a comma-separated string.
-fn imap_envelope_addresses(
-    addrs: &Option<Vec<imap_proto::types::Address<'_>>>,
-) -> String {
+fn imap_envelope_addresses(addrs: &Option<Vec<imap_proto::types::Address<'_>>>) -> String {
     match addrs {
         Some(list) => list
             .iter()

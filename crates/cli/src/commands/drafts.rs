@@ -79,18 +79,23 @@ pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBack
     // Try IMAP first — that's the source of truth
     match imap::connect(&creds).await {
         Ok(mut client) => {
-            let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id).await
+            let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id)
+                .await
                 .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?;
             let drafts_folder = match drafts_folder {
                 Some(f) => f,
                 None => {
-                    warn!("no drafts folder detected for {}, falling back to local", acct.username);
+                    warn!(
+                        "no drafts folder detected for {}, falling back to local",
+                        acct.username
+                    );
                     return run_list_local(&db, &acct.id, json);
                 }
             };
 
             // Fetch all messages from the Drafts folder
-            let summaries = imap::fetch_inbox(&mut client, &drafts_folder, 100).await
+            let summaries = imap::fetch_inbox(&mut client, &drafts_folder, 100)
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to fetch drafts from IMAP: {e}"))?;
 
             if json {
@@ -118,10 +123,7 @@ pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBack
                     return Ok(());
                 }
 
-                println!(
-                    "{:<8}  {:<30}  {:<40}  {}",
-                    "UID", "TO", "SUBJECT", "DATE"
-                );
+                println!("{:<8}  {:<30}  {:<40}  {}", "UID", "TO", "SUBJECT", "DATE");
                 println!("{}", "-".repeat(90));
                 for s in &summaries {
                     let subject_display = if s.subject.len() > 38 {
@@ -200,7 +202,10 @@ fn run_list_local(db: &Database, account_id: &str, json: bool) -> Result<()> {
                 d.id, to_display, subject_display, d.updated_at,
             );
         }
-        println!("\n{} draft(s) (local only — IMAP unavailable)", drafts.len());
+        println!(
+            "\n{} draft(s) (local only — IMAP unavailable)",
+            drafts.len()
+        );
     }
 
     Ok(())
@@ -366,10 +371,7 @@ pub async fn run_create(
         }
         if imap_synced {
             if let Some(uid) = imap_uid {
-                println!(
-                    "  IMAP:    synced to {} (UID {})",
-                    drafts_folder_name, uid
-                );
+                println!("  IMAP:    synced to {} (UID {})", drafts_folder_name, uid);
             } else {
                 println!("  IMAP:    synced to {} (UID pending)", drafts_folder_name);
             }
@@ -438,61 +440,62 @@ pub async fn run_send(
     };
 
     // ── Fetch draft content from IMAP (source of truth) ──
-    let (to_addr, subject, text_body, html_body, cc_addr, bcc_addr, reply_to) = if let Some(uid) =
-        imap_uid
-    {
-        if acct.imap_host.is_empty() {
-            if let Some(ref d) = local_draft {
-                (
-                    d.to_addr.clone(),
-                    d.subject.clone().unwrap_or_default(),
-                    d.text_content.clone(),
-                    d.html_content.clone(),
-                    d.cc_addr.clone(),
-                    d.bcc_addr.clone(),
-                    d.reply_to.clone(),
-                )
+    let (to_addr, subject, text_body, html_body, cc_addr, bcc_addr, reply_to) =
+        if let Some(uid) = imap_uid {
+            if acct.imap_host.is_empty() {
+                if let Some(ref d) = local_draft {
+                    (
+                        d.to_addr.clone(),
+                        d.subject.clone().unwrap_or_default(),
+                        d.text_content.clone(),
+                        d.html_content.clone(),
+                        d.cc_addr.clone(),
+                        d.bcc_addr.clone(),
+                        d.reply_to.clone(),
+                    )
+                } else {
+                    bail!("draft {id} not found locally and account has no IMAP");
+                }
             } else {
-                bail!("draft {id} not found locally and account has no IMAP");
+                let mut client = imap::connect(&creds)
+                    .await
+                    .context("failed to connect to IMAP to fetch draft")?;
+
+                let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
+                    .unwrap_or_else(|| "Drafts".to_string());
+
+                let msg = imap::fetch_message(&mut client, &drafts_folder, uid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to fetch draft UID {uid} from IMAP: {e}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("draft UID {uid} not found in IMAP {drafts_folder}")
+                    })?;
+
+                (
+                    msg.to_addr,
+                    msg.subject,
+                    msg.text_body,
+                    msg.html_body,
+                    msg.cc_addr,
+                    None::<String>,
+                    None::<String>,
+                )
             }
-        } else {
-            let mut client = imap::connect(&creds)
-                .await
-                .context("failed to connect to IMAP to fetch draft")?;
-
-            let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id)
-                .await
-                .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
-                .unwrap_or_else(|| "Drafts".to_string());
-
-            let msg = imap::fetch_message(&mut client, &drafts_folder, uid)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to fetch draft UID {uid} from IMAP: {e}"))?
-                .ok_or_else(|| anyhow::anyhow!("draft UID {uid} not found in IMAP {drafts_folder}"))?;
-
+        } else if let Some(ref d) = local_draft {
             (
-                msg.to_addr,
-                msg.subject,
-                msg.text_body,
-                msg.html_body,
-                msg.cc_addr,
-                None::<String>,
-                None::<String>,
+                d.to_addr.clone(),
+                d.subject.clone().unwrap_or_default(),
+                d.text_content.clone(),
+                d.html_content.clone(),
+                d.cc_addr.clone(),
+                d.bcc_addr.clone(),
+                d.reply_to.clone(),
             )
-        }
-    } else if let Some(ref d) = local_draft {
-        (
-            d.to_addr.clone(),
-            d.subject.clone().unwrap_or_default(),
-            d.text_content.clone(),
-            d.html_content.clone(),
-            d.cc_addr.clone(),
-            d.bcc_addr.clone(),
-            d.reply_to.clone(),
-        )
-    } else {
-        bail!("draft not found: {id}");
-    };
+        } else {
+            bail!("draft not found: {id}");
+        };
 
     // ── Send via SMTP ──
     let message_id = SmtpSender::send(

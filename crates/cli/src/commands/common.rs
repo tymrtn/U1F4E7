@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use envelope_email_store::Database;
 use envelope_email_store::credential_store::{self, CredentialBackend};
 use envelope_email_store::models::{Account, AccountWithCredentials};
-use envelope_email_store::Database;
 
 /// Resolve an account from an optional --account flag.
 /// If provided, looks up by ID or email. Otherwise returns the default account.
@@ -15,11 +15,7 @@ pub fn resolve_account(db: &Database, account_arg: Option<&str>) -> Result<Accou
             let account = db
                 .get_account(id_or_email)
                 .context("database error")?
-                .or_else(|| {
-                    db.find_account_by_email(id_or_email)
-                        .ok()
-                        .flatten()
-                });
+                .or_else(|| db.find_account_by_email(id_or_email).ok().flatten());
             match account {
                 Some(a) => Ok(a),
                 None => bail!("account not found: {id_or_email}"),
@@ -45,8 +41,8 @@ pub fn setup_credentials(
     backend: CredentialBackend,
 ) -> Result<(Database, AccountWithCredentials)> {
     let db = Database::open_default().context("failed to open database")?;
-    let passphrase = credential_store::get_or_create_passphrase(backend)
-        .context("credential store error")?;
+    let passphrase =
+        credential_store::get_or_create_passphrase(backend).context("credential store error")?;
     let acct = resolve_account(&db, account_arg)?;
     let creds = db
         .get_account_with_credentials(&acct.id, &passphrase)

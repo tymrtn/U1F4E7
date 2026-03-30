@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
 
 use super::common::setup_credentials;

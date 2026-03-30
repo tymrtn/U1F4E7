@@ -2,9 +2,9 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use crate::AccountsCmd;
-use anyhow::{bail, Context, Result};
-use envelope_email_store::credential_store::{self, CredentialBackend};
+use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
+use envelope_email_store::credential_store::{self, CredentialBackend};
 use std::io::{self, Write};
 
 pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<()> {
@@ -17,7 +17,9 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             imap_host,
             smtp_port,
             imap_port,
-        } => add(&email, password, name, smtp_host, smtp_port, imap_host, imap_port, json, backend),
+        } => add(
+            &email, password, name, smtp_host, smtp_port, imap_host, imap_port, json, backend,
+        ),
         AccountsCmd::List => list(json),
         AccountsCmd::Remove { id } => remove(&id, json),
     }
@@ -57,13 +59,19 @@ async fn add(
                     let ip = imap_port.unwrap_or(result.imap_port);
                     eprintln!(
                         "Discovered SMTP: {}:{} (via {}), IMAP: {}:{} (via {})",
-                        result.smtp_host, sp, result.smtp_source,
-                        result.imap_host, ip, result.imap_source,
+                        result.smtp_host,
+                        sp,
+                        result.smtp_source,
+                        result.imap_host,
+                        ip,
+                        result.imap_source,
                     );
                     (result.smtp_host, sp, result.imap_host, ip)
                 }
                 Err(e) => {
-                    eprintln!("Auto-discovery failed ({e}), falling back to defaults for {domain}.");
+                    eprintln!(
+                        "Auto-discovery failed ({e}), falling back to defaults for {domain}."
+                    );
                     let sh = format!("smtp.{domain}");
                     let ih = format!("imap.{domain}");
                     let sp = smtp_port.unwrap_or(587);
@@ -114,7 +122,9 @@ fn list(json: bool) -> Result<()> {
     }
 
     if accounts.is_empty() {
-        println!("No accounts configured. Add one with: envelope-email accounts add --email you@example.com");
+        println!(
+            "No accounts configured. Add one with: envelope-email accounts add --email you@example.com"
+        );
         return Ok(());
     }
 
@@ -142,11 +152,7 @@ fn remove(id_or_email: &str, json: bool) -> Result<()> {
     let account = db
         .get_account(id_or_email)
         .context("database error")?
-        .or_else(|| {
-            db.find_account_by_email(id_or_email)
-                .ok()
-                .flatten()
-        });
+        .or_else(|| db.find_account_by_email(id_or_email).ok().flatten());
 
     let account = match account {
         Some(a) => a,

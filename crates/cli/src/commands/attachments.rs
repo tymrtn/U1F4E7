@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
 
 use super::common::setup_credentials;
@@ -77,8 +77,7 @@ pub async fn run_download(
         None => PathBuf::from(&name),
     };
 
-    std::fs::write(&dest, &bytes)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    std::fs::write(&dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
 
     if json {
         let info = serde_json::json!({
