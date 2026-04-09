@@ -1,0 +1,152 @@
+/* Copyright (c) 2026 Tyler Martin */
+/* Licensed under FSL-1.1-ALv2 */
+
+body { -webkit-font-smoothing: antialiased; }
+[data-cloak] { display: none !important; }
+
+.fade-in { animation: fadeIn 0.3s ease-out forwards; }
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+.pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+
+.input-field {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: white;
+  border: 1px solid #d9d7d1;
+  font-size: 0.875rem;
+  font-family: 'DM Mono', monospace;
+  color: #0a0a0a;
+  transition: border-color 0.15s;
+}
+.input-field::placeholder { color: #8a8780; }
+.input-field:focus { outline: none; border-color: #0a0a0a; }
+
+.btn-primary {
+  padding: 0.5rem 1rem;
+  background: #0a0a0a;
+  color: #f7f6f3;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.025em;
+  transition: background 0.15s;
+  border: none;
+  cursor: pointer;
+}
+.btn-primary:hover { background: #262626; }
+.btn-primary:active { background: #404040; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-ghost {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  color: #8a8780;
+  border: 1px solid #d9d7d1;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-ghost:hover { border-color: #0a0a0a; color: #0a0a0a; }
+
+.section-label {
+  font-size: 10px;
+  font-family: 'DM Mono', monospace;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: #8a8780;
+}
+
+/* Folder list items */
+.folder-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  font-family: 'DM Mono', monospace;
+  color: #0a0a0a;
+  border-bottom: 1px solid #d9d7d1;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.folder-item:last-child { border-bottom: none; }
+.folder-item:hover { background: #f7f6f3; }
+.folder-item.active { background: #0a0a0a; color: #f7f6f3; }
+.folder-item .count { font-size: 10px; color: #8a8780; }
+.folder-item.active .count { color: #d9d7d1; }
+.folder-item.has-unseen .count { color: #1a6b4a; font-weight: 500; }
+.folder-item.active.has-unseen .count { color: #e8f5ee; }
+
+/* Message list rows */
+.msg-row {
+  display: grid;
+  grid-template-columns: 200px 1fr 80px;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #d9d7d1;
+  cursor: pointer;
+  transition: background 0.15s;
+  font-size: 0.8125rem;
+}
+.msg-row:last-child { border-bottom: none; }
+.msg-row:hover { background: #f7f6f3; }
+.msg-row.unseen .from,
+.msg-row.unseen .subject { font-weight: 600; color: #0a0a0a; }
+.msg-row .from { color: #0a0a0a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-row .subject { color: #525252; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-row .date { color: #8a8780; font-family: 'DM Mono', monospace; font-size: 0.6875rem; text-align: right; }
+
+/* Account list items in sidebar */
+.account-item {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  font-family: 'DM Mono', monospace;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: default;
+}
+.account-item .email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+.account-item button { font-size: 10px; color: #8a8780; background: none; border: none; cursor: pointer; }
+.account-item button:hover { color: #c4421a; }
+
+/* Reader body */
+#reader-body pre { white-space: pre-wrap; word-break: break-word; font-family: inherit; }
+#reader-body a { color: #1a6b4a; text-decoration: underline; }
+#reader-body img { max-width: 100%; height: auto; }
+
+/* Toast notifications */
+.toast {
+  pointer-events: auto;
+  padding: 0.5rem 0.875rem;
+  font-size: 0.75rem;
+  font-family: 'DM Mono', monospace;
+  border: 1px solid #d9d7d1;
+  background: #f7f6f3;
+  animation: fadeIn 0.2s ease-out forwards;
+}
+.toast.success { border-color: #1a6b4a; background: #e8f5ee; color: #1a6b4a; }
+.toast.error { border-color: #c4421a; background: #fdf0ec; color: #c4421a; }
+
+/* Modal backdrop */
+#add-account-modal, #snooze-modal {
+  display: none;
+}
+#add-account-modal.show, #snooze-modal.show {
+  display: flex;
+}
+
+#reader, #composer {
+  display: none;
+}
+#reader.show, #composer.show {
+  display: flex;
+}

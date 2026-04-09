@@ -1,23 +1,228 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Envelope</title>
-<script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Envelope</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Instrument Sans', 'system-ui', 'sans-serif'],
+            mono: ['DM Mono', 'monospace'],
+          },
+          colors: {
+            ink: '#0a0a0a',
+            paper: '#f7f6f3',
+            mid: '#8a8780',
+            rule: '#d9d7d1',
+            accent: '#1a6b4a',
+            'accent-light': '#e8f5ee',
+            warn: '#c4421a',
+            'warn-light': '#fdf0ec',
+            pending: '#9a7b1a',
+            'pending-light': '#fdf8e8',
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="stylesheet" href="/static/dashboard.css">
 </head>
-<body class="bg-neutral-50 text-neutral-900">
-<div class="max-w-4xl mx-auto p-8">
-  <h1 class="text-2xl font-bold">Envelope v0.3.0</h1>
-  <p class="text-neutral-600">Dashboard scaffold loaded. Full UI coming next.</p>
-  <div id="status" class="mt-4 text-sm text-neutral-500">Loading...</div>
+<body class="bg-paper text-ink min-h-screen font-sans">
+
+<div id="toast-region" class="fixed top-4 right-4 z-50 space-y-2 pointer-events-none"></div>
+
+<!-- Header -->
+<header id="header" class="border-b border-rule bg-paper sticky top-0 z-30">
+  <div class="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 border-2 border-ink flex items-center justify-center">
+        <svg width="14" height="10" viewBox="0 0 14 10" fill="none">
+          <path d="M1 1L7 5.5L13 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="0.5" y="0.5" width="13" height="9" rx="0.5" stroke="currentColor" stroke-width="1"/>
+        </svg>
+      </div>
+      <h1 class="text-lg font-semibold tracking-tight">Envelope</h1>
+      <span class="text-[10px] font-mono text-mid uppercase tracking-[0.15em]">v0.3.0</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <select id="account-switcher" class="input-field !py-1.5 !text-xs w-[240px]">
+        <option value="">Select account...</option>
+      </select>
+      <button id="btn-compose" type="button" class="btn-primary text-xs">Compose</button>
+      <div id="refresh-indicator" class="flex items-center gap-1.5 text-xs text-mid font-mono">
+        <span class="w-1.5 h-1.5 rounded-full bg-accent pulse-dot"></span>
+        <span id="last-refresh">idle</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-[1400px] mx-auto px-6 py-6">
+
+  <!-- Stats strip -->
+  <section id="stats-section" class="mb-6">
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-px bg-rule border border-rule">
+      <div class="bg-paper px-5 py-3">
+        <p class="section-label mb-0.5">Accounts</p>
+        <p id="stat-accounts" class="text-xl font-semibold tabular-nums font-mono">--</p>
+      </div>
+      <div class="bg-paper px-5 py-3">
+        <p class="section-label mb-0.5">Inbox Unread</p>
+        <p id="stat-unread" class="text-xl font-semibold tabular-nums font-mono text-accent">--</p>
+      </div>
+      <div class="bg-paper px-5 py-3">
+        <p class="section-label mb-0.5">Snoozed</p>
+        <p id="stat-snoozed" class="text-xl font-semibold tabular-nums font-mono text-pending">--</p>
+      </div>
+      <div class="bg-paper px-5 py-3">
+        <p class="section-label mb-0.5">Drafts</p>
+        <p id="stat-drafts" class="text-xl font-semibold tabular-nums font-mono">--</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Three column: sidebar + list + reader -->
+  <div class="grid grid-cols-[240px_1fr] gap-6">
+
+    <!-- Sidebar -->
+    <aside class="space-y-4">
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <p class="section-label">Folders</p>
+          <button id="btn-refresh-folders" type="button" class="text-[10px] font-mono text-mid hover:text-ink uppercase tracking-[0.15em]">Refresh</button>
+        </div>
+        <div id="folder-list" class="space-y-0 border border-rule bg-white">
+          <div class="px-3 py-2 text-xs text-mid font-mono">no account selected</div>
+        </div>
+      </div>
+
+      <div>
+        <p class="section-label mb-2">Accounts</p>
+        <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule bg-white"></div>
+        <button id="btn-add-account" type="button" class="btn-ghost text-xs mt-2 w-full">+ Add account</button>
+      </div>
+    </aside>
+
+    <!-- Message list + reader -->
+    <section class="min-w-0">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-3">
+          <h2 id="list-title" class="section-label">Select a folder</h2>
+          <span id="list-count" class="text-xs text-mid font-mono"></span>
+        </div>
+        <div class="flex items-center gap-2">
+          <input type="text" id="search-input" placeholder="IMAP search (e.g. FROM alice)" class="input-field !py-1.5 !text-xs w-[280px]">
+          <button id="btn-search" type="button" class="btn-ghost text-xs">Search</button>
+        </div>
+      </div>
+
+      <div id="message-list" class="border border-rule bg-white overflow-hidden">
+        <div class="px-4 py-12 text-center text-sm text-mid">Pick a folder from the sidebar.</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- Message reader drawer -->
+<aside id="reader" class="fixed inset-y-0 right-0 w-full md:w-[620px] bg-paper border-l border-rule shadow-xl z-40 hidden flex-col">
+  <header class="border-b border-rule px-5 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <button id="btn-reader-close" type="button" class="text-mid hover:text-ink">&times;</button>
+      <p id="reader-subject" class="text-sm font-semibold truncate max-w-[380px]"></p>
+    </div>
+    <div class="flex items-center gap-1 text-xs font-mono">
+      <button id="btn-reader-reply" type="button" class="btn-ghost">Reply</button>
+      <button id="btn-reader-reply-all" type="button" class="btn-ghost">Reply All</button>
+      <button id="btn-reader-snooze" type="button" class="btn-ghost">Snooze</button>
+      <button id="btn-reader-mark-read" type="button" class="btn-ghost">Mark Read</button>
+      <button id="btn-reader-delete" type="button" class="btn-ghost text-warn">Delete</button>
+    </div>
+  </header>
+  <div class="px-5 py-3 border-b border-rule text-xs font-mono text-mid space-y-0.5">
+    <div><span class="text-ink">From:</span> <span id="reader-from"></span></div>
+    <div><span class="text-ink">To:</span> <span id="reader-to"></span></div>
+    <div id="reader-cc-row" class="hidden"><span class="text-ink">Cc:</span> <span id="reader-cc"></span></div>
+    <div><span class="text-ink">Date:</span> <span id="reader-date"></span></div>
+  </div>
+  <div id="reader-body" class="flex-1 overflow-auto px-5 py-4 text-sm leading-relaxed"></div>
+  <div id="reader-attachments" class="border-t border-rule px-5 py-3 hidden"></div>
+</aside>
+
+<!-- Compose / Reply drawer -->
+<aside id="composer" class="fixed inset-y-0 right-0 w-full md:w-[640px] bg-paper border-l border-rule shadow-xl z-50 hidden flex-col">
+  <header class="border-b border-rule px-5 py-3 flex items-center justify-between">
+    <p id="composer-title" class="text-sm font-semibold">New Message</p>
+    <div class="flex items-center gap-1">
+      <button id="btn-composer-send" type="button" class="btn-primary text-xs">Send</button>
+      <button id="btn-composer-close" type="button" class="btn-ghost text-xs">Close</button>
+    </div>
+  </header>
+  <div class="flex-1 overflow-auto p-5 space-y-3">
+    <input type="email" id="composer-to" placeholder="To" class="input-field">
+    <input type="email" id="composer-cc" placeholder="Cc (optional)" class="input-field">
+    <input type="text" id="composer-subject" placeholder="Subject" class="input-field">
+    <div class="flex items-center gap-2">
+      <span class="text-xs text-mid font-mono">Format:</span>
+      <button id="format-text" type="button" class="px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper">Text</button>
+      <button id="format-html" type="button" class="px-2 py-0.5 text-xs font-mono border border-rule text-mid">HTML</button>
+    </div>
+    <textarea id="composer-body" rows="16" placeholder="Message" class="input-field font-mono text-xs leading-relaxed resize-none"></textarea>
+    <div>
+      <label for="composer-attach" class="text-xs font-mono text-mid">Attachments:</label>
+      <input type="file" id="composer-attach" multiple class="block text-xs mt-1">
+      <ul id="attach-list" class="mt-1 text-xs text-mid font-mono space-y-0.5"></ul>
+    </div>
+    <div id="composer-status" class="text-xs font-mono text-mid"></div>
+  </div>
+</aside>
+
+<!-- Add account modal -->
+<div id="add-account-modal" class="fixed inset-0 bg-ink/40 z-50 hidden items-center justify-center">
+  <div class="bg-paper border border-rule w-[420px] p-5 space-y-3">
+    <div class="flex items-center justify-between">
+      <p class="text-sm font-semibold">Add account</p>
+      <button id="btn-add-account-close" type="button" class="text-mid hover:text-ink">&times;</button>
+    </div>
+    <input type="email" id="new-email" placeholder="Email address" class="input-field">
+    <input type="password" id="new-password" placeholder="Password (app password for Gmail/Workmail)" class="input-field">
+    <input type="text" id="new-display" placeholder="Display name (optional)" class="input-field">
+    <div id="discover-status" class="text-xs font-mono text-mid"></div>
+    <div class="flex gap-2 pt-1">
+      <button id="btn-discover" type="button" class="btn-ghost text-xs">Discover servers</button>
+      <button id="btn-create-account" type="button" class="btn-primary text-xs">Add</button>
+    </div>
+    <div id="add-account-error" class="hidden text-xs text-warn font-mono"></div>
+  </div>
 </div>
-<script>
-fetch('/api/stats').then(r => r.json()).then(d => {
-  document.getElementById('status').textContent = `${d.accounts} accounts, ${d.snoozed} snoozed`;
-}).catch(e => {
-  document.getElementById('status').textContent = 'Error: ' + e.message;
-});
-</script>
+
+<!-- Snooze modal -->
+<div id="snooze-modal" class="fixed inset-0 bg-ink/40 z-50 hidden items-center justify-center">
+  <div class="bg-paper border border-rule w-[380px] p-5 space-y-3">
+    <p class="text-sm font-semibold">Snooze message</p>
+    <input type="text" id="snooze-until" placeholder="Return: tomorrow, 2h, 3d, 2026-04-10T09:00" class="input-field">
+    <select id="snooze-reason" class="input-field">
+      <option value="">Reason (optional)</option>
+      <option value="follow-up">follow-up</option>
+      <option value="waiting-reply">waiting-reply</option>
+      <option value="defer">defer</option>
+      <option value="reminder">reminder</option>
+      <option value="review">review</option>
+    </select>
+    <input type="text" id="snooze-note" placeholder="Note (optional)" class="input-field">
+    <div class="flex gap-2 pt-1">
+      <button id="btn-snooze-confirm" type="button" class="btn-primary text-xs">Snooze</button>
+      <button id="btn-snooze-cancel" type="button" class="btn-ghost text-xs">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard.js"></script>
 </body>
 </html>
