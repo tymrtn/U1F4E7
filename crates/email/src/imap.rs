@@ -275,75 +275,66 @@ pub async fn fetch_message(
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?;
 
+    // fetch_message expects exactly one message for the UID — take the first item.
     let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(fetch) => {
-                let body: &[u8] = fetch.body().unwrap_or_default();
-                let parsed = mail_parser::MessageParser::default().parse(body);
+    let Some(item) = stream.next().await else {
+        return Ok(None);
+    };
+    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    let body: &[u8] = fetch.body().unwrap_or_default();
+    let Some(parsed) = mail_parser::MessageParser::default().parse(body) else {
+        return Ok(None);
+    };
 
-                if let Some(parsed) = parsed {
-                    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
+    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
+    let from_addr = mp_first_address(parsed.from());
+    let to_addr = mp_first_address(parsed.to());
+    let cc_addr = {
+        let addr = mp_first_address(parsed.cc());
+        if addr.is_empty() { None } else { Some(addr) }
+    };
 
-                    let from_addr = mp_first_address(parsed.from());
-                    let to_addr = mp_first_address(parsed.to());
-                    let cc_addr = {
-                        let addr = mp_first_address(parsed.cc());
-                        if addr.is_empty() { None } else { Some(addr) }
-                    };
+    let subject = parsed.subject().unwrap_or_default().to_string();
+    let date = parsed.date().map(|d| d.to_rfc3339());
+    let text_body = parsed.body_text(0).map(|t| t.to_string());
+    let html_body = parsed.body_html(0).map(|h| h.to_string());
+    let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
+    let references = parsed.references().as_text().map(|s| s.to_string());
+    let message_id = parsed.message_id().map(|s| s.to_string());
 
-                    let subject = parsed.subject().unwrap_or_default().to_string();
-                    let date = parsed.date().map(|d| d.to_rfc3339());
-
-                    let text_body = parsed.body_text(0).map(|t| t.to_string());
-                    let html_body = parsed.body_html(0).map(|h| h.to_string());
-
-                    let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-                    let references = parsed.references().as_text().map(|s| s.to_string());
-                    let message_id = parsed.message_id().map(|s| s.to_string());
-
-                    let attachments: Vec<AttachmentMeta> = parsed
-                        .attachments()
-                        .map(|a| {
-                            let ct: Option<&mail_parser::ContentType> = a.content_type();
-                            AttachmentMeta {
-                                filename: a.attachment_name().unwrap_or("unnamed").to_string(),
-                                content_type: ct
-                                    .map(|ct| {
-                                        let subtype = ct.subtype().unwrap_or("octet-stream");
-                                        format!("{}/{subtype}", ct.ctype())
-                                    })
-                                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                                size: a.len() as u64,
-                                content_id: a.content_id().map(|s: &str| s.to_string()),
-                            }
-                        })
-                        .collect();
-
-                    return Ok(Some(Message {
-                        uid,
-                        message_id,
-                        from_addr,
-                        to_addr,
-                        cc_addr,
-                        subject,
-                        date,
-                        text_body,
-                        html_body,
-                        in_reply_to,
-                        references,
-                        flags,
-                        attachments,
-                    }));
-                } else {
-                    return Ok(None);
-                }
+    let attachments: Vec<AttachmentMeta> = parsed
+        .attachments()
+        .map(|a| {
+            let ct: Option<&mail_parser::ContentType> = a.content_type();
+            AttachmentMeta {
+                filename: a.attachment_name().unwrap_or("unnamed").to_string(),
+                content_type: ct
+                    .map(|ct| {
+                        let subtype = ct.subtype().unwrap_or("octet-stream");
+                        format!("{}/{subtype}", ct.ctype())
+                    })
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                size: a.len() as u64,
+                content_id: a.content_id().map(|s: &str| s.to_string()),
             }
-            Err(e) => return Err(ImapError::Protocol(format!("UID FETCH parse error: {e}"))),
-        }
-    }
+        })
+        .collect();
 
-    Ok(None)
+    Ok(Some(Message {
+        uid,
+        message_id,
+        from_addr,
+        to_addr,
+        cc_addr,
+        subject,
+        date,
+        text_body,
+        html_body,
+        in_reply_to,
+        references,
+        flags,
+        attachments,
+    }))
 }
 
 /// Append a message to a folder with the given flags.
@@ -749,36 +740,24 @@ pub async fn download_attachment(
         .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?;
 
     let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(fetch) => {
-                let body: &[u8] = fetch.body().unwrap_or_default();
-                let parsed = mail_parser::MessageParser::default().parse(body);
+    let Some(item) = stream.next().await else {
+        return Err(ImapError::NotFound(uid));
+    };
+    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    let body: &[u8] = fetch.body().unwrap_or_default();
+    let parsed = mail_parser::MessageParser::default()
+        .parse(body)
+        .ok_or_else(|| ImapError::Protocol(format!("failed to parse message UID {uid}")))?;
 
-                if let Some(parsed) = parsed {
-                    for attachment in parsed.attachments() {
-                        let att_name = attachment
-                            .attachment_name()
-                            .unwrap_or("unnamed")
-                            .to_string();
-                        if att_name == filename {
-                            return Ok((att_name, attachment.contents().to_vec()));
-                        }
-                    }
-                    return Err(ImapError::Protocol(format!(
-                        "attachment '{filename}' not found in UID {uid}"
-                    )));
-                } else {
-                    return Err(ImapError::Protocol(format!(
-                        "failed to parse message UID {uid}"
-                    )));
-                }
-            }
-            Err(e) => return Err(ImapError::Protocol(format!("UID FETCH parse error: {e}"))),
+    for attachment in parsed.attachments() {
+        let att_name = attachment.attachment_name().unwrap_or("unnamed").to_string();
+        if att_name == filename {
+            return Ok((att_name, attachment.contents().to_vec()));
         }
     }
-
-    Err(ImapError::NotFound(uid))
+    Err(ImapError::Protocol(format!(
+        "attachment '{filename}' not found in UID {uid}"
+    )))
 }
 
 /// Extract first email address from a mail-parser Address.

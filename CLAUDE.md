@@ -1,8 +1,12 @@
 # CLAUDE.md — Envelope Email (Rust)
 
+**Current version: 0.3.0** (see [CHANGELOG.md](CHANGELOG.md))
+
 ## What This Is
 
 Envelope Email is a **clean email client** — BYO-mailbox, IMAP/SMTP, with agent-native primitives (JSON on every command, auto-discovery, scriptable). It gives OpenClaw agents email capabilities.
+
+**The binary is called `envelope`** (the Cargo package is `envelope-email` to preserve the crates.io slot; `[[bin]] name = "envelope"` in `crates/cli/Cargo.toml`). Never use `envelope-email` as a command in documentation — it's `envelope ...`.
 
 ## 🚫 HARD RULE: No Governor / Policy / Scoring Code
 
@@ -31,17 +35,42 @@ governed send/delete/move` introduced coupling and a `--no-governor` bypass flag
 the public repo. Both shipped undetected until the user spotted them. Future agents
 reading old docs/commits must not reintroduce this.
 
+## 🚫 HARD RULE: Every `.rs` file must be declared via `mod`
+
+Every `.rs` file in `crates/*/src/` (except `lib.rs`, `main.rs`, `mod.rs`, `build.rs`,
+`bin/*`, `tests/*`) must be reachable from a crate root via `pub mod` or `mod`. Cargo
+silently ignores orphan files — they compile clean and never run. This has already
+eaten two features.
+
+**Enforcement:** `ci/check-orphans.sh` runs on every CI push. It walks each crate's
+`src/` directory and fails with a non-zero exit if any `.rs` file is not referenced
+in a `mod` declaration. Run it locally before committing:
+
+```bash
+./ci/check-orphans.sh
+```
+
+If you're adding a new file `crates/foo/src/bar.rs`, you MUST add `pub mod bar;`
+(or `mod bar;`) to `crates/foo/src/lib.rs` (or a reachable `mod.rs`) in the same
+commit. See `docs/ORPHANS-AUDIT.md` for the history of what happens when this rule
+gets ignored.
+
 ## Repo & License
 
-- **GitHub:** tymrtn/envelope-email-rs
+- **GitHub:** [tymrtn/envelope-email](https://github.com/tymrtn/envelope-email) (the repo was renamed from `envelope-email-rs` to `envelope-email` before Apr 9 2026; old URL still redirects but use the new one in docs)
 - **License:** FSL-1.1-ALv2 (see LICENSE)
 - **Copyright:** 2026 Tyler Martin
+
+## Release History
+
+- **v0.3.0** (2026-04-09) — Binary renamed `envelope-email` → `envelope`. Full dashboard rewrite (three-pane email client at localhost:3141). Snooze + threading features restored from the 27f3919 silent regression. Reply/reply-all with header threading. SMTP attachments. Orphan detection CI guard. All governor integration removed. See CHANGELOG.md.
+- **v0.2.x** — Initial public Rust CLI. Had governor integration (removed in 0.3.0) and silent orphans (restored in 0.3.0).
 
 ## Workspace Structure (4 crates)
 
 ```
 crates/
-├── cli/          # Binary crate — clap-based CLI (`envelope-email`)
+├── cli/          # Binary crate — clap-based CLI (`envelope` binary, `envelope-email` package)
 │   └── src/
 │       ├── main.rs           # CLI arg parsing + dispatch
 │       └── commands/         # One file per command group
@@ -97,7 +126,7 @@ cargo build --release
 cargo test
 
 # Run the CLI directly
-cargo run -p envelope-email-cli -- inbox --json
+cargo run -p envelope-email --bin envelope -- inbox --json
 
 # Check formatting + lints
 cargo fmt --check

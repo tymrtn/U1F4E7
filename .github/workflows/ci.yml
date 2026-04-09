@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check orphaned modules
+        run: ./ci/check-orphans.sh
+
+      - name: Clippy (errors only)
+        # Warnings are still reported but do not fail the build for v0.3.0.
+        # Tighten to -D warnings in v0.4 after cleanup pass.
+        run: cargo clippy --all-targets
+
+      - name: Build release binary
+        run: cargo build --release --bin envelope
+
+      - name: Test all crates
+        run: cargo test --all
+
+  security-grep:
+    name: Governor re-intro guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep for forbidden identifiers
+        run: |
+          set -e
+          FORBIDDEN='governor::|GovernorAttrs|ENVELOPE_GOVERNOR|--no-governor|GOVERNOR_PATH'
+          if grep -rnE "$FORBIDDEN" crates/ 2>/dev/null; then
+            echo "ERROR: forbidden governor identifiers found above" >&2
+            exit 1
+          fi
+          echo "Clean."
