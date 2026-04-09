@@ -664,6 +664,7 @@ dependencies = [
  "envelope-email-store",
  "envelope-email-transport",
  "mail-builder",
+ "mime_guess",
  "rustls",
  "serde",
  "serde_json",

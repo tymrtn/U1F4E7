@@ -91,6 +91,9 @@ enum Commands {
         /// Reply-To address
         #[arg(long)]
         reply_to: Option<String>,
+        /// File attachment (repeatable — one --attach per file)
+        #[arg(long = "attach")]
+        attach: Vec<String>,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -516,6 +519,7 @@ fn main() {
             cc,
             bcc,
             reply_to,
+            attach,
             account,
         } => commands::send::run(
             &to,
@@ -525,6 +529,7 @@ fn main() {
             cc.as_deref(),
             bcc.as_deref(),
             reply_to.as_deref(),
+            &attach,
             account.as_deref(),
             cli.json,
             backend,

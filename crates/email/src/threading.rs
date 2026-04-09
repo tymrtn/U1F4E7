@@ -47,6 +47,15 @@ const SUBJECT_PREFIXES: &[&str] = &[
 ];
 
 pub fn normalize_subject(subject: &str) -> String {
+    strip_reply_prefixes(subject).to_lowercase()
+}
+
+/// Strip Re:/Fwd:/etc. prefixes from a subject, preserving original case.
+///
+/// Use this for display purposes (e.g., building a reply subject with
+/// `Re: ` prefix). [`normalize_subject`] wraps this and additionally
+/// lowercases the result for thread-grouping equality comparisons.
+pub fn strip_reply_prefixes(subject: &str) -> String {
     let mut s = subject.trim().to_string();
     loop {
         let trimmed = s.trim_start();
@@ -79,7 +88,7 @@ pub fn normalize_subject(subject: &str) -> String {
         }
         s = s.trim_start().to_string();
     }
-    s.trim().to_lowercase()
+    s.trim().to_string()
 }
 
 /// Parse a References header string into individual Message-IDs.

@@ -498,7 +498,7 @@ pub async fn run_send(
         };
 
     // ── Send via SMTP ──
-    let message_id = SmtpSender::send(
+    let message_id = SmtpSender::send_simple(
         &creds,
         &to_addr,
         &subject,
