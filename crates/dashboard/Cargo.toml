@@ -6,10 +6,11 @@ name = "envelope-email-dashboard"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Minimal localhost dashboard for Envelope Email account management"
+description = "Localhost email client dashboard — inbox, read, compose, reply, drafts, snooze, threads"
 
 [dependencies]
 envelope-email-store = { path = "../store" }
+envelope-email-transport = { path = "../email" }
 
 axum.workspace = true
 tokio.workspace = true
@@ -18,3 +19,9 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"

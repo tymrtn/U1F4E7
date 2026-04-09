@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Envelope</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-neutral-50 text-neutral-900">
+<div class="max-w-4xl mx-auto p-8">
+  <h1 class="text-2xl font-bold">Envelope v0.3.0</h1>
+  <p class="text-neutral-600">Dashboard scaffold loaded. Full UI coming next.</p>
+  <div id="status" class="mt-4 text-sm text-neutral-500">Loading...</div>
+</div>
+<script>
+fetch('/api/stats').then(r => r.json()).then(d => {
+  document.getElementById('status').textContent = `${d.accounts} accounts, ${d.snoozed} snoozed`;
+}).catch(e => {
+  document.getElementById('status').textContent = 'Error: ' + e.message;
+});
+</script>
+</body>
+</html>
