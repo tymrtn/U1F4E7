@@ -7,7 +7,6 @@ pub mod common;
 pub mod drafts;
 pub mod flags;
 pub mod folders;
-pub mod governor;
 pub mod inbox;
 pub mod messages;
 pub mod read;

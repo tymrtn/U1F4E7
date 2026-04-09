@@ -4,10 +4,32 @@
 
 Envelope Email is a **clean email client** — BYO-mailbox, IMAP/SMTP, with agent-native primitives (JSON on every command, auto-discovery, scriptable). It gives OpenClaw agents email capabilities.
 
-**Envelope has optional Governor integration** for safety. When `ENVELOPE_GOVERNOR=true`,
-destructive/outbound commands are routed through the `governor` CLI's scoring engine before
-execution. Blind attribution and send-zone routing still belong to Governor externally.
-See `crates/cli/src/governor.rs` for the integration layer.
+## 🚫 HARD RULE: No Governor / Policy / Scoring Code
+
+**Envelope has no governor integration and must never gain one.** This is a public,
+single-purpose email client. Policy, scoring, blind attribution, "safety bypasses,"
+action gating — none of that belongs here.
+
+Specifically forbidden in this repo:
+- Any `mod governor`, `governor.rs`, or `commands/governor.rs` file
+- Any `--no-governor` / `--bypass-*` / `--skip-*` safety bypass flag (self-documenting backdoor)
+- Any `ENVELOPE_GOVERNOR` / `GOVERNOR_PATH` env var reading
+- Any shell-out to a `governor` binary from any command
+- Any dependency on the envelope-governor crate
+- Any README/docs section describing "optional governor integration"
+
+If a caller wants governance, **they wrap Envelope from the outside**:
+
+```
+governor envelope send --to alice@example.com -- --attr user_requested --just "reply"
+```
+
+Envelope's job is email. Policy lives in the caller. Keep this repo clean.
+
+**Why this rule exists:** Commit `9e67d9b feat: optional Governor integration for
+governed send/delete/move` introduced coupling and a `--no-governor` bypass flag into
+the public repo. Both shipped undetected until the user spotted them. Future agents
+reading old docs/commits must not reintroduce this.
 
 ## Repo & License
 
@@ -103,52 +125,17 @@ cargo clippy
 | `license activate/status` | ⚠️ Partial | Status works; activate is stub |
 | `attributes` | ⚠️ Stub | Not yet implemented |
 | `actions tail` | ⚠️ Stub | Not yet implemented |
-| `governor status` | ✅ Implemented | Show governor integration status |
-| `governor test-send` | ✅ Implemented | Dry-run send through governor scoring |
-| `governor test-delete` | ✅ Implemented | Dry-run delete through governor scoring |
 
-## Governor Integration
+## No Governor Integration
 
-Governor integration is built into the CLI as an optional safety layer.
+Envelope does not call, shell out to, or know anything about the Governor. If you
+want governance around destructive/outbound commands, wrap the invocation:
 
-### How It Works
+```
+governor envelope send --to ... -- --attr user_requested --just "reason"
+```
 
-When `ENVELOPE_GOVERNOR=true` (env var), Envelope shells out to `governor admin score --attr <key> --json`
-before executing governed commands. If Governor returns `"deny"`, Envelope aborts with an error.
-
-### Governed Commands
-
-| Command | Attrs | Condition |
-|---------|-------|-----------|
-| `send` | `outbound`, `email_send` | Always when governor enabled |
-| `delete` | `destructive` | Always when governor enabled |
-| `move` | `destructive` | Only when destination is Trash/Junk/Spam/Deleted |
-| `draft send` | `outbound`, `email_send` | Always when governor enabled |
-
-### Ungoverned Commands (always passthrough)
-
-`inbox`, `read`, `search`, `folders`, `flag`, `accounts list`, `copy`, `draft create`, `draft list`
-
-### Configuration
-
-- `ENVELOPE_GOVERNOR=true` — enable governor checks
-- `GOVERNOR_PATH=/path/to/governor` — custom governor binary path (default: `governor` in PATH)
-- `--no-governor` — CLI flag to bypass all governor checks (emergency use)
-
-### Files
-
-- `crates/cli/src/governor.rs` — Core governor logic (check, is_enabled, is_destructive_folder)
-- `crates/cli/src/commands/governor.rs` — `envelope-email governor` subcommand (status, test-send, test-delete)
-
-### Legacy Integration Points
-
-These existing pieces remain for external Governor integration:
-
-1. **Action Log** (`store/src/action_log.rs`) — Records agent actions with confidence scores.
-2. **License Store** (`store/src/license_store.rs`) — License activation gates compose/attributes/actions.
-3. **`compose` command** — License-gated stub.
-4. **`attributes` command** — Stub for listing scoring attributes.
-5. **`actions tail` command** — Stub for showing decisions.
+Envelope's job is email. Policy lives in the caller.
 
 ## Provider Detection & Folder Resolution
 
