@@ -194,6 +194,50 @@ impl Database {
                 synced_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (account_id, folder)
             );
+
+            CREATE TABLE IF NOT EXISTS message_tags (
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                uid INTEGER,
+                folder TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, message_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_tag ON message_tags(tag);
+
+            CREATE TABLE IF NOT EXISTS message_scores (
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                dimension TEXT NOT NULL,
+                value REAL NOT NULL,
+                uid INTEGER,
+                folder TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, message_id, dimension)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scores_dimension
+                ON message_scores(dimension, value);
+
+            CREATE TABLE IF NOT EXISTS rules (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                match_expr TEXT NOT NULL,
+                action TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                stop INTEGER NOT NULL DEFAULT 0,
+                sieve_exportable INTEGER NOT NULL DEFAULT 0,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                last_hit_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(account_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rules_account
+                ON rules(account_id, enabled, priority);
             ",
         )?;
 

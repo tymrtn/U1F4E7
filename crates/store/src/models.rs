@@ -302,3 +302,58 @@ pub struct DiscoveryResult {
     pub imap_port: u16,
     pub imap_source: String,
 }
+
+// ── Message tagging + scoring (v0.4.0) ──────────────────────────────
+
+/// A freeform tag attached to a message, keyed on Message-ID for
+/// stability across folder moves and UIDVALIDITY resets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageTag {
+    pub account_id: String,
+    pub message_id: String,
+    pub tag: String,
+    pub uid: Option<i64>,
+    pub folder: Option<String>,
+    pub created_at: String,
+}
+
+/// A numeric score on a named dimension (e.g., "urgent", "interesting")
+/// attached to a message. Keyed on Message-ID for stability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageScore {
+    pub account_id: String,
+    pub message_id: String,
+    pub dimension: String,
+    pub value: f64,
+    pub uid: Option<i64>,
+    pub folder: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A mail rule: match expression + action, evaluated by the rules engine.
+///
+/// Match expressions and actions are stored as JSON (not a DSL) so the
+/// CLI can construct them from flags (`--match-from`, `--match-tag`,
+/// `--match-score-above`) without a parser. A human-readable DSL may
+/// come in v0.5 as syntactic sugar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    /// JSON-serialized MatchExpr.
+    pub match_expr: String,
+    /// JSON-serialized Action.
+    pub action: String,
+    pub enabled: bool,
+    pub priority: i64,
+    /// If true, stop evaluating further rules after this one fires.
+    pub stop: bool,
+    /// Computed: can this rule be expressed in Sieve?
+    pub sieve_exportable: bool,
+    pub hit_count: i64,
+    pub last_hit_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}

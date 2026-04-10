@@ -10,7 +10,9 @@ pub mod drafts;
 pub mod errors;
 pub mod license_store;
 pub mod models;
+pub mod rule_store;
 pub mod snoozed;
+pub mod tag_store;
 pub mod threads;
 
 pub use credential_store::CredentialBackend;
