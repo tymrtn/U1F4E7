@@ -125,12 +125,13 @@ function renderAccountsList() {
   }
 }
 
-function selectAccount(acct) {
+async function selectAccount(acct) {
   state.currentAccount = acct;
   state.currentFolder = 'INBOX';
   renderAccountSwitcher();
-  loadFolders();
-  loadMessages();
+  // Sequential — folders first (creates the IMAP connection), then messages reuse it.
+  await loadFolders();
+  await loadMessages();
 }
 
 // ── Folders ────────────────────────────────────────────────────────
@@ -196,7 +197,9 @@ function renderFolders(data) {
 // ── Messages list ──────────────────────────────────────────────────
 async function loadMessages() {
   if (!state.currentAccount) return;
-  $('list-title').textContent = state.currentFolder === '__snoozed__' ? '★ Snoozed' : state.currentFolder;
+  const acctLabel = state.currentAccount ? state.currentAccount.username : '';
+  const folderLabel = state.currentFolder === '__snoozed__' ? '★ Snoozed' : state.currentFolder;
+  $('list-title').textContent = acctLabel ? `${folderLabel} — ${acctLabel}` : folderLabel;
   if (state.currentFolder === '__snoozed__') return loadSnoozed();
 
   setRefresh('loading messages…');
