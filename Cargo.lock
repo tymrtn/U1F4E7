@@ -731,6 +731,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-imap",
+ "base64",
  "chrono",
  "envelope-email-store",
  "futures-util",

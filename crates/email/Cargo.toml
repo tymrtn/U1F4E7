@@ -27,6 +27,9 @@ lettre.workspace = true
 mail-parser.workspace = true
 mail-builder.workspace = true
 
+# Header encoding
+base64.workspace = true
+
 # DNS discovery
 hickory-resolver.workspace = true
 

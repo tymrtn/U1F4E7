@@ -206,7 +206,7 @@ pub async fn fetch_inbox(
                         let subj = env
                             .subject
                             .as_ref()
-                            .map(|s| String::from_utf8_lossy(s).to_string())
+                            .map(|s| decode_rfc2047(s))
                             .unwrap_or_default();
                         let dt = env
                             .date
@@ -237,6 +237,121 @@ pub async fn fetch_inbox(
     }
 
     Ok(summaries)
+}
+
+/// Decode RFC 2047 encoded words in IMAP ENVELOPE fields.
+///
+/// IMAP ENVELOPE returns subjects and addresses as raw bytes, which may
+/// contain RFC 2047 encoded words like `=?utf-8?q?Hello_World?=` or
+/// `=?utf-8?b?SGVsbG8=?=`. This function decodes them to plain text.
+///
+/// Handles:
+/// - Q-encoding (quoted-printable variant for headers)
+/// - B-encoding (base64)
+/// - UTF-8 and ASCII charsets (most common in practice)
+/// - Multiple encoded words separated by whitespace
+///
+/// For non-UTF-8 charsets (iso-8859-1, windows-1252, etc.), returns the
+/// raw decoded bytes as lossy UTF-8 — imperfect but better than showing
+/// `=?iso-8859-1?q?...?=` to the user.
+fn decode_rfc2047(raw: &[u8]) -> String {
+    let input = String::from_utf8_lossy(raw);
+
+    // Fast path: no encoded words
+    if !input.contains("=?") {
+        return input.to_string();
+    }
+
+    let mut result = String::new();
+    let mut remaining = input.as_ref();
+
+    while let Some(start) = remaining.find("=?") {
+        // Text before the encoded word
+        result.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+
+        // Find the end of the encoded word: =?charset?encoding?text?=
+        if let Some(end) = remaining[2..].find("?=") {
+            let encoded_word = &remaining[2..end + 2]; // charset?encoding?text
+            remaining = &remaining[end + 4..]; // skip past ?=
+
+            // Strip whitespace between consecutive encoded words (RFC 2047 §6.2)
+            if remaining.starts_with(' ') || remaining.starts_with('\t') {
+                if remaining.trim_start().starts_with("=?") {
+                    remaining = &remaining[remaining.find("=?").unwrap_or(0)..];
+                }
+            }
+
+            // Parse: charset?encoding?text
+            let parts: Vec<&str> = encoded_word.splitn(3, '?').collect();
+            if parts.len() == 3 {
+                let _charset = parts[0]; // TODO: proper charset conversion for non-UTF-8
+                let encoding = parts[1].to_uppercase();
+                let text = parts[2];
+
+                let decoded_bytes = match encoding.as_str() {
+                    "Q" => decode_q_encoding(text),
+                    "B" => {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(text)
+                            .unwrap_or_else(|_| text.as_bytes().to_vec())
+                    }
+                    _ => text.as_bytes().to_vec(),
+                };
+
+                result.push_str(&String::from_utf8_lossy(&decoded_bytes));
+            } else {
+                // Malformed — emit as-is
+                result.push_str("=?");
+                result.push_str(encoded_word);
+                result.push_str("?=");
+            }
+        } else {
+            // No closing ?= — emit remainder as-is
+            result.push_str(remaining);
+            remaining = "";
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Decode Q-encoding (RFC 2047 variant of quoted-printable for headers).
+///
+/// - `_` → space
+/// - `=XX` → byte with hex value XX
+/// - Everything else → literal
+fn decode_q_encoding(input: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'_' => {
+                result.push(b' ');
+                i += 1;
+            }
+            b'=' if i + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(
+                    &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
+                    16,
+                ) {
+                    result.push(byte);
+                    i += 3;
+                } else {
+                    result.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            other => {
+                result.push(other);
+                i += 1;
+            }
+        }
+    }
+    result
 }
 
 /// IMAP fetch descriptor used by `fetch_message`.
@@ -460,7 +575,7 @@ pub async fn search(
                         let subj = env
                             .subject
                             .as_ref()
-                            .map(|s| String::from_utf8_lossy(s).to_string())
+                            .map(|s| decode_rfc2047(s))
                             .unwrap_or_default();
                         let dt = env
                             .date
@@ -842,5 +957,51 @@ mod tests {
         assert_eq!(map_flag_name("seen"), "\\Seen");
         assert_eq!(map_flag_name("SEEN"), "\\Seen");
         assert_eq!(map_flag_name("flagged"), "\\Flagged");
+    }
+
+    #[test]
+    fn test_decode_rfc2047_plain_text() {
+        assert_eq!(decode_rfc2047(b"Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn test_decode_rfc2047_q_encoding_utf8() {
+        let input = b"=?utf-8?q?Ticket_Received_-_Palvelupyynt=C3=B6?=";
+        let result = decode_rfc2047(input);
+        assert_eq!(result, "Ticket Received - Palvelupyynt\u{00f6}");
+    }
+
+    #[test]
+    fn test_decode_rfc2047_b_encoding_utf8() {
+        let input = b"=?utf-8?b?SGVsbG8gV29ybGQ=?=";
+        let result = decode_rfc2047(input);
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn test_decode_rfc2047_mixed_plain_and_encoded() {
+        let input = b"Re: =?utf-8?q?Ihre_Anfrage?= ist eingegangen!";
+        let result = decode_rfc2047(input);
+        assert_eq!(result, "Re: Ihre Anfrage ist eingegangen!");
+    }
+
+    #[test]
+    fn test_decode_rfc2047_multiple_encoded_words() {
+        let input = b"=?utf-8?q?Hello?= =?utf-8?q?_World?=";
+        let result = decode_rfc2047(input);
+        assert!(result.contains("Hello"));
+        assert!(result.contains("World"));
+    }
+
+    #[test]
+    fn test_decode_q_encoding_underscore_to_space() {
+        let decoded = decode_q_encoding("Hello_World");
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn test_decode_q_encoding_hex_escape() {
+        let decoded = decode_q_encoding("caf=C3=A9");
+        assert_eq!(String::from_utf8_lossy(&decoded), "caf\u{00e9}");
     }
 }
