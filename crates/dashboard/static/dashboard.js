@@ -22,6 +22,7 @@ const state = {
   composeParent: null,
   pendingAttachments: [],
   bodyFormat: 'text',
+  showAllAccounts: false,
 };
 
 // ── Fetch helper ───────────────────────────────────────────────────
@@ -109,7 +110,11 @@ function renderAccountSwitcher() {
 function renderAccountsList() {
   const list = $('accounts-list');
   clear(list);
-  for (const acct of state.accounts) {
+  const COLLAPSED_LIMIT = 3;
+  const showAll = state.accounts.length <= COLLAPSED_LIMIT || state.showAllAccounts;
+  const visible = showAll ? state.accounts : state.accounts.slice(0, COLLAPSED_LIMIT);
+
+  for (const acct of visible) {
     const emailSpan = el('span', { class: 'email', text: acct.username, title: acct.username });
     const delBtn = el('button', { text: '×' });
     delBtn.onclick = async () => {
@@ -122,6 +127,24 @@ function renderAccountsList() {
       } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
     };
     list.appendChild(el('div', { class: 'account-item' }, [emailSpan, delBtn]));
+  }
+
+  if (!showAll && state.accounts.length > COLLAPSED_LIMIT) {
+    const more = el('div', {
+      class: 'account-item',
+      text: `+ ${state.accounts.length - COLLAPSED_LIMIT} more`,
+      style: { cursor: 'pointer', color: '#8a8780', justifyContent: 'center' },
+    });
+    more.onclick = () => { state.showAllAccounts = true; renderAccountsList(); };
+    list.appendChild(more);
+  } else if (state.accounts.length > COLLAPSED_LIMIT) {
+    const less = el('div', {
+      class: 'account-item',
+      text: 'show less',
+      style: { cursor: 'pointer', color: '#8a8780', justifyContent: 'center' },
+    });
+    less.onclick = () => { state.showAllAccounts = false; renderAccountsList(); };
+    list.appendChild(less);
   }
 }
 
@@ -145,11 +168,20 @@ async function loadFolders() {
   try {
     const data = await api('GET', `/accounts/${state.currentAccount.id}/folders`);
     state.folders = data.folders || [];
+    if (data.error) {
+      // Partial success — server returned snoozed but IMAP failed
+      toast('Folders: ' + data.error, 'error');
+      setRefresh('partial');
+    } else {
+      setRefresh('ok');
+    }
     renderFolders(data);
-    setRefresh('ok');
   } catch (e) {
     clear(list);
+    const retry = el('button', { class: 'btn-ghost text-xs mt-2', text: 'Retry' });
+    retry.onclick = loadFolders;
     list.appendChild(el('div', { class: 'px-3 py-4 text-xs text-warn font-mono', text: 'Failed to load folders' }));
+    list.appendChild(retry);
     setRefresh('error');
     toast('Folders: ' + e.message, 'error');
   }
