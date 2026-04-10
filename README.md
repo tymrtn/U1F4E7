@@ -17,22 +17,12 @@ Licensed under [FSL-1.1-ALv2](LICENSE).
 ## Install
 
 ```bash
-# Cargo (installs a binary called `envelope`)
-cargo install envelope-email
-
-# Homebrew (macOS/Linux)
-brew install tymrtn/tap/envelope
-
 # From source
 git clone https://github.com/tymrtn/envelope-email
 cd envelope-email
 cargo build --release
-# binary lands at target/release/envelope
+# binary: target/release/envelope
 ```
-
-> **Note on binary name:** the Cargo package is `envelope-email` (for the
-> crates.io slot) but the binary target is `envelope`. After `cargo install`
-> you type `envelope …`, not `envelope-email …`. v0.3.0 renamed the binary.
 
 ## Quick start
 
