@@ -6,7 +6,56 @@ mod commands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "envelope", version, about = "BYO mailbox email client with agent-native primitives")]
+#[command(
+    name = "envelope",
+    version,
+    about = "Email mastery for agents. BYO mailbox — give it an email and password, it does the rest.",
+    after_help = r#"GETTING STARTED
+  Add an account (auto-discovers IMAP/SMTP from the domain):
+    envelope accounts add --email you@gmail.com --password <app-password>
+
+  Browse your inbox:
+    envelope inbox
+    envelope inbox --limit 10 --json
+
+  Read a message (does not mark it as read):
+    envelope read 42
+
+  Send an email with an attachment:
+    envelope send --to someone@example.com --subject "Report" --body "See attached" --attach report.pdf
+
+  Search:
+    envelope search "FROM boss@company.com"
+    envelope search "SUBJECT invoice" --folder Sent
+
+  Snooze a message until Monday:
+    envelope snooze set 42 --until monday --reason follow-up
+
+  Check for due snoozes and return them:
+    envelope unsnooze --once
+
+  Open the local dashboard (inbox, compose, reply, snooze, search):
+    envelope serve
+
+  List folders with unread counts:
+    envelope folders
+
+AGENT USAGE
+  Every command supports --json for machine consumption:
+    envelope inbox --json | jq '.[0].subject'
+    envelope folders --json | jq '.[] | {name: .folder, unseen}'
+    envelope snooze list --json
+
+PROVIDERS
+  Envelope auto-discovers IMAP/SMTP servers via DNS. Tested with:
+    Gmail (app password), Outlook.com, Microsoft Workmail,
+    Migadu, Fastmail, self-hosted Dovecot, generic IMAP.
+
+MORE HELP
+  envelope <command> --help    Show help for a specific command
+  envelope serve               Open the web dashboard at http://localhost:3141
+  https://github.com/tymrtn/envelope-email"#
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
