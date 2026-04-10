@@ -12,7 +12,7 @@ Licensed under [FSL-1.1-ALv2](LICENSE).
 - **Auto-discovery**: SRV → MX → common patterns → TCP probe. Knows Gmail, Outlook/Office 365, Microsoft Workmail, Migadu, Fastmail, self-hosted Dovecot, generic IMAP.
 - **Agent-native**: every command supports `--json`. Pipe to `jq`, feed to an LLM, whatever.
 - **Batteries included**: snooze, threading, reply/reply-all, attachments, drafts, search. Ships with a local dashboard at [http://localhost:3141](http://localhost:3141).
-- **No policy engine**: Envelope does email. If you want governance (scoring, approval queues, action gating), wrap the binary from outside. Envelope itself has no notion of "approved" or "denied."
+- **Single-purpose**: Envelope does email. Nothing else.
 
 ## Install
 
@@ -184,20 +184,6 @@ done
 # Sweep due snoozes (cron-friendly)
 envelope unsnooze --once
 ```
-
-## No governor integration
-
-Envelope does not ship any policy, scoring, approval-queue, or
-action-gating code. It will not grow a `--no-governor` flag. If you
-want governance around destructive or outbound operations, wrap
-Envelope from the outside:
-
-```bash
-governor envelope send --to alice@example.com --subject hi --body "…" \
-    -- --attr user_requested --just "quarterly update"
-```
-
-Policy lives in the caller. Envelope's job is email.
 
 ## Development
 
