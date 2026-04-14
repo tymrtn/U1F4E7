@@ -679,6 +679,12 @@ enum RuleCmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Export rules as a Sieve script (file output)
+    Export {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 fn main() {
@@ -1027,6 +1033,9 @@ fn main() {
             }
             RuleCmd::Delete { name, account } => {
                 commands::rule::run_delete(&name, account.as_deref(), cli.json, backend)
+            }
+            RuleCmd::Export { account } => {
+                commands::rule::run_export(account.as_deref(), cli.json, backend)
             }
         },
 

@@ -8,6 +8,7 @@ pub mod imap;
 pub mod provider;
 pub mod reply;
 pub mod rules;
+pub mod sieve;
 pub mod smtp;
 pub mod threading;
 pub mod unsubscribe;

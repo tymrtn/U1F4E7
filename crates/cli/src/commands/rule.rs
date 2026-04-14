@@ -612,3 +612,43 @@ mod tests {
         assert!(parse_score_filter("bad=xyz").is_err());
     }
 }
+
+/// Export rules as a Sieve script.
+pub fn run_export(
+    account: Option<&str>,
+    json: bool,
+    _backend: CredentialBackend,
+) -> Result<()> {
+    let db = envelope_email_store::Database::open_default()
+        .context("failed to open database")?;
+    let acct = super::common::resolve_account(&db, account)?;
+    let account_email = acct.username;
+
+    let rules = db
+        .list_enabled_rules(&account_email)
+        .context("failed to list rules")?;
+
+    let (script, skipped) = envelope_email_transport::sieve::export_sieve(&rules);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "script": script,
+                "skipped": skipped,
+                "exported_count": rules.len() - skipped.len(),
+            })
+        );
+    } else {
+        if !skipped.is_empty() {
+            eprintln!(
+                "Skipped {} rule(s) (local-only, not Sieve-exportable): {}",
+                skipped.len(),
+                skipped.join(", ")
+            );
+        }
+        print!("{script}");
+    }
+
+    Ok(())
+}
