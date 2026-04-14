@@ -10,6 +10,7 @@ pub mod reply;
 pub mod rules;
 pub mod smtp;
 pub mod threading;
+pub mod unsubscribe;
 
 pub use discovery::{DiscoveryCandidate, discover};
 pub use errors::{DiscoveryError, ImapError, SmtpError};

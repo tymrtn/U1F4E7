@@ -501,6 +501,58 @@ pub async fn find_uid_by_message_id(
     Ok(uid)
 }
 
+/// Fetch List-Unsubscribe and List-Unsubscribe-Post headers for a message.
+///
+/// Returns `(list_unsubscribe, list_unsubscribe_post)` — both are None if
+/// the headers are absent.
+pub async fn fetch_list_unsubscribe_headers(
+    client: &mut ImapClient,
+    folder: &str,
+    uid: u32,
+) -> Result<(Option<String>, Option<String>), ImapError> {
+    validate_imap_input(folder)?;
+
+    client
+        .session
+        .select(folder)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
+
+    let uid_range = format!("{uid}");
+    let messages = client
+        .session
+        .uid_fetch(&uid_range, "BODY.PEEK[HEADER]")
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid} HEADER: {e}")))?;
+
+    let mut stream = messages;
+    let Some(item) = stream.next().await else {
+        return Ok((None, None));
+    };
+    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    let header_bytes = fetch.body().unwrap_or_default();
+
+    let Some(parsed) = mail_parser::MessageParser::default().parse(header_bytes) else {
+        return Ok((None, None));
+    };
+
+    let list_unsub = parsed
+        .header_values("List-Unsubscribe")
+        .find_map(|v| match v {
+            mail_parser::HeaderValue::Text(t) => Some(t.to_string()),
+            _ => None,
+        });
+
+    let list_unsub_post = parsed
+        .header_values("List-Unsubscribe-Post")
+        .find_map(|v| match v {
+            mail_parser::HeaderValue::Text(t) => Some(t.to_string()),
+            _ => None,
+        });
+
+    Ok((list_unsub, list_unsub_post))
+}
+
 /// Map human-readable flag names to IMAP flag format.
 fn map_flag_name(flag: &str) -> String {
     match flag.to_lowercase().as_str() {

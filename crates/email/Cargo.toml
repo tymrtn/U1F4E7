@@ -30,6 +30,9 @@ mail-builder.workspace = true
 # Header encoding
 base64.workspace = true
 
+# HTTP client (List-Unsubscribe)
+reqwest.workspace = true
+
 # DNS discovery
 hickory-resolver.workspace = true
 

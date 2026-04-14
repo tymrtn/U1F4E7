@@ -269,6 +269,33 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ThreadCmd,
     },
+
+    /// Manage message tags and scores
+    Tag {
+        #[command(subcommand)]
+        subcommand: TagCmd,
+    },
+
+    /// Manage mail rules (match + action)
+    Rule {
+        #[command(subcommand)]
+        subcommand: RuleCmd,
+    },
+
+    /// Unsubscribe from a mailing list via List-Unsubscribe header
+    Unsubscribe {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// Actually execute the unsubscribe (default is dry-run)
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -513,6 +540,144 @@ enum ThreadCmd {
         /// Maximum messages to scan
         #[arg(long, default_value = "200")]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagCmd {
+    /// Set tags and/or scores on a message
+    Set {
+        /// Message UID
+        uid: u32,
+        /// Score in key=value format (repeatable, e.g. --score urgent=0.9)
+        #[arg(long)]
+        score: Vec<String>,
+        /// Tag name (repeatable, e.g. --tag newsletter)
+        #[arg(long)]
+        tag: Vec<String>,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show all tags and scores for a message
+    Show {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// List messages matching a tag or minimum score filter
+    List {
+        /// Filter by tag name
+        #[arg(long)]
+        tag: Option<String>,
+        /// Minimum score filter in key=value format (repeatable, e.g. --min-score urgent=0.7)
+        #[arg(long)]
+        min_score: Vec<String>,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCmd {
+    /// Create a new rule
+    #[allow(clippy::struct_field_names)]
+    Create {
+        /// Rule name (unique per account)
+        #[arg(long)]
+        name: String,
+        /// Glob match on sender address (e.g. "*@notifications.github.com")
+        #[arg(long)]
+        match_from: Option<String>,
+        /// Glob match on recipient address
+        #[arg(long)]
+        match_to: Option<String>,
+        /// Glob match on subject
+        #[arg(long)]
+        match_subject: Option<String>,
+        /// Require tag (repeatable)
+        #[arg(long)]
+        match_tag: Vec<String>,
+        /// Score above threshold in key=value format (repeatable, e.g. --match-score-above urgent=0.7)
+        #[arg(long)]
+        match_score_above: Vec<String>,
+        /// Score below threshold in key=value format (repeatable)
+        #[arg(long)]
+        match_score_below: Vec<String>,
+        /// Action: move=Folder, flag=name, unflag=name, delete, unsubscribe, tag=name
+        #[arg(long)]
+        action: String,
+        /// Priority (lower runs first)
+        #[arg(long, default_value = "100")]
+        priority: i64,
+        /// Stop evaluating further rules after this one fires
+        #[arg(long)]
+        stop: bool,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// List all rules
+    List {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Dry-run all rules against a single message
+    Test {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Batch-apply rules to messages in a folder
+    Run {
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Maximum messages to process
+        #[arg(long, default_value = "50")]
+        limit: u32,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Enable a rule by name
+    Enable {
+        /// Rule name
+        name: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Disable a rule by name
+    Disable {
+        /// Rule name
+        name: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Delete a rule by name
+    Delete {
+        /// Rule name
+        name: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
@@ -772,6 +937,112 @@ fn main() {
                 commands::thread::run_build(account.as_deref(), limit, cli.json, backend)
             }
         },
+
+        Commands::Tag { subcommand } => match subcommand {
+            TagCmd::Set {
+                uid,
+                score,
+                tag,
+                folder,
+                account,
+            } => commands::tag::run_set(
+                uid,
+                &folder,
+                &score,
+                &tag,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
+            TagCmd::Show {
+                uid,
+                folder,
+                account,
+            } => commands::tag::run_show(uid, &folder, account.as_deref(), cli.json, backend),
+            TagCmd::List {
+                tag,
+                min_score,
+                account,
+            } => commands::tag::run_list(
+                tag.as_deref(),
+                &min_score,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
+        },
+
+        Commands::Rule { subcommand } => match subcommand {
+            RuleCmd::Create {
+                name,
+                match_from,
+                match_to,
+                match_subject,
+                match_tag,
+                match_score_above,
+                match_score_below,
+                action,
+                priority,
+                stop,
+                account,
+            } => commands::rule::run_create(
+                &name,
+                match_from.as_deref(),
+                match_to.as_deref(),
+                match_subject.as_deref(),
+                &match_tag,
+                &match_score_above,
+                &match_score_below,
+                &action,
+                priority,
+                stop,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
+            RuleCmd::List { account } => {
+                commands::rule::run_list(account.as_deref(), cli.json, backend)
+            }
+            RuleCmd::Test {
+                uid,
+                folder,
+                account,
+            } => commands::rule::run_test(uid, &folder, account.as_deref(), cli.json, backend),
+            RuleCmd::Run {
+                folder,
+                limit,
+                account,
+            } => commands::rule::run_apply(
+                &folder,
+                account.as_deref(),
+                limit,
+                cli.json,
+                backend,
+            ),
+            RuleCmd::Enable { name, account } => {
+                commands::rule::run_enable(&name, account.as_deref(), cli.json, backend)
+            }
+            RuleCmd::Disable { name, account } => {
+                commands::rule::run_disable(&name, account.as_deref(), cli.json, backend)
+            }
+            RuleCmd::Delete { name, account } => {
+                commands::rule::run_delete(&name, account.as_deref(), cli.json, backend)
+            }
+        },
+
+        Commands::Unsubscribe {
+            uid,
+            folder,
+            account,
+            confirm,
+        } => commands::unsubscribe_cmd::run(
+            uid,
+            &folder,
+            account.as_deref(),
+            confirm,
+            cli.json,
+            backend,
+        ),
     };
 
     if let Err(e) = result {
