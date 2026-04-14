@@ -5,6 +5,61 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-14
+
+### Added
+
+- **Rules engine** — agents create mail rules that Envelope enforces
+  deterministically. `envelope rule create --name "..." --match-from "..."
+  --action move=Junk`. Rules evaluate match expressions (FROM/TO/SUBJECT
+  globs, tag checks, score thresholds) against messages and execute actions
+  (move, flag, unflag, snooze, delete, unsubscribe, add tag). All-match
+  default with optional `stop` flag per rule. Batch execution in groups of
+  50 with progress reporting.
+- **Message tagging + scoring** — `envelope tag set <uid> --score urgent=0.9
+  --tag newsletter`. Scores are float dimensions (0.0–1.0), tags are
+  freeform strings. Keyed on Message-ID (stable across folder moves).
+  Rules can match on tags and scores for agent-trained junk filtering.
+- **List-Unsubscribe** — `envelope unsubscribe <uid> --confirm`. Parses
+  RFC 2369 `List-Unsubscribe` and RFC 8058 one-click POST headers.
+  Dry-run by default (shows what it would do), `--confirm` to execute.
+  Never auto-follows GET URLs (tracking risk). Supports HTTPS POST
+  and mailto fallback.
+- **Sieve export** — `envelope rule export`. Generates RFC 5228 Sieve
+  scripts from rules that use pure IMAP-level matches (FROM/TO/SUBJECT).
+  Tag/score-based rules are local-only and skipped with a warning.
+  ManageSieve upload deferred to v0.5.
+- **Background unsnooze ticker** — `envelope serve` now spawns a tokio
+  task that sweeps the snooze queue every 60 seconds and returns due
+  messages to their original folders automatically.
+- **IMAP connection retry** — dashboard folder handler retries with a
+  fresh connection on stale IMAP pooled connections.
+- **Loading indicators** — dashboard shows "Loading folders…" / "Loading
+  messages…" / "Loading message…" while IMAP fetches are in flight.
+- **Account list collapse** — sidebar shows 3 accounts by default with
+  a "+ N more" toggle for large account lists.
+- **Account label in inbox title** — shows "INBOX — tyler@example.com"
+  so you always know which account's inbox you're looking at.
+- **Rich `--help`** — getting-started examples, agent usage patterns,
+  and provider list in the top-level help output.
+
+### Changed
+
+- Workspace version bumped to 0.4.0.
+- `reqwest` added as a dependency (for HTTPS unsubscribe).
+
+### Fixed
+
+- **RFC 2047 subject decoding** — IMAP ENVELOPE subjects now decode
+  `=?utf-8?q?...?=` and `=?utf-8?b?...?=` encoded words instead of
+  showing raw encoded strings. Handles Q-encoding, B-encoding, UTF-8,
+  and multiple consecutive encoded words with whitespace folding.
+- Sequential folder/message loading — folders load before messages
+  (was racing, causing "no account selected" in sidebar).
+- Folder error recovery with retry button on IMAP failures.
+
+[0.4.0]: https://github.com/tymrtn/envelope-email/releases/tag/v0.4.0
+
 ## [0.3.0] — 2026-04-09
 
 ### Added

@@ -12,6 +12,7 @@ Licensed under [FSL-1.1-ALv2](LICENSE).
 - **Auto-discovery**: SRV → MX → common patterns → TCP probe. Knows Gmail, Outlook/Office 365, Microsoft Workmail, Migadu, Fastmail, self-hosted Dovecot, generic IMAP.
 - **Agent-native**: every command supports `--json`. Pipe to `jq`, feed to an LLM, whatever.
 - **Batteries included**: snooze, threading, reply/reply-all, attachments, drafts, search. Ships with a local dashboard at [http://localhost:3141](http://localhost:3141).
+- **Rules engine**: agents score messages, create rules, and Envelope enforces them deterministically. Junk filters your LLM builds, not you.
 - **Email mastery for agents**: one tool, total control over the mailbox.
 
 ## Install
@@ -131,6 +132,41 @@ The dashboard talks to the same IMAP/SMTP code as the CLI.
 | `envelope thread list` | List recent threads |
 | `envelope thread build` | Build / refresh the thread index from IMAP |
 | `envelope serve [--port 3141]` | Start the localhost dashboard |
+| `envelope tag set <uid> --score urgent=0.9 --tag newsletter` | Score and tag a message |
+| `envelope tag show <uid>` | Show tags and scores for a message |
+| `envelope tag list --tag newsletter --min-score urgent=0.7` | Filter messages by tags/scores |
+| `envelope rule create --name "..." --match-from "..." --action move=Junk` | Create a mail rule |
+| `envelope rule list` | List all rules |
+| `envelope rule test <uid>` | Dry-run rules against a message |
+| `envelope rule run` | Batch-apply rules to the inbox |
+| `envelope rule enable/disable/delete <name>` | Rule lifecycle |
+| `envelope rule export` | Export rules as a Sieve script |
+| `envelope unsubscribe <uid> [--confirm]` | Unsubscribe via List-Unsubscribe header (dry-run by default) |
+
+### Rules engine
+
+Agents score messages, create rules, and Envelope enforces them:
+
+```bash
+# 1. Agent scores a message
+envelope tag set 42 --score urgent=0.1 --score interesting=0.2 --tag newsletter
+
+# 2. Agent creates a rule
+envelope rule create \
+  --name "Low-value newsletters" \
+  --match-tag newsletter \
+  --match-score-below interesting=0.3 \
+  --action move=Junk
+
+# 3. Dry-run to verify
+envelope rule test 42 --json
+
+# 4. Apply
+envelope rule run
+
+# 5. Export to Sieve for server-side filtering
+envelope rule export --account tyler@example.com
+```
 
 ### `--until` time format for snooze
 
