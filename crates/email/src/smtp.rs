@@ -44,7 +44,7 @@ impl SmtpSender {
         reply_to: Option<&str>,
     ) -> Result<String, SmtpError> {
         Self::send(
-            account, to, subject, text, html, cc, bcc, reply_to, None, None, &[],
+            account, to, subject, text, html, None, cc, bcc, reply_to, None, None, &[],
         )
         .await
     }
@@ -70,6 +70,7 @@ impl SmtpSender {
         subject: &str,
         text: Option<&str>,
         html: Option<&str>,
+        from_override: Option<&str>,
         cc: Option<&str>,
         bcc: Option<&str>,
         reply_to: Option<&str>,
@@ -77,7 +78,9 @@ impl SmtpSender {
         references: Option<&[String]>,
         attachments: &[Attachment],
     ) -> Result<String, SmtpError> {
-        let from_addr = if let Some(ref display) = account.account.display_name {
+        let from_addr = if let Some(f) = from_override {
+            f.to_string()
+        } else if let Some(ref display) = account.account.display_name {
             format!("{display} <{}>", account.account.username)
         } else {
             account.account.username.clone()

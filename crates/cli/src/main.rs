@@ -131,6 +131,9 @@ enum Commands {
         /// HTML body
         #[arg(long)]
         html: Option<String>,
+        /// Override the From header (sender identity). SMTP auth still uses --account credentials.
+        #[arg(long)]
+        from: Option<String>,
         /// CC addresses (comma-separated)
         #[arg(long)]
         cc: Option<String>,
@@ -410,6 +413,9 @@ enum DraftCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Override the From header (sender identity). SMTP auth still uses --account credentials.
+        #[arg(long)]
+        from: Option<String>,
         /// CC recipient(s)
         #[arg(long)]
         cc: Option<String>,
@@ -736,6 +742,7 @@ fn main() {
             subject,
             body,
             html,
+            from,
             cc,
             bcc,
             reply_to,
@@ -746,6 +753,7 @@ fn main() {
             &subject,
             body.as_deref(),
             html.as_deref(),
+            from.as_deref(),
             cc.as_deref(),
             bcc.as_deref(),
             reply_to.as_deref(),
@@ -849,6 +857,7 @@ fn main() {
                 subject,
                 body,
                 account,
+                from,
                 cc,
                 bcc,
                 in_reply_to,
@@ -859,6 +868,7 @@ fn main() {
                 account.as_deref(),
                 cli.json,
                 backend,
+                from.as_deref(),
                 cc.as_deref(),
                 bcc.as_deref(),
                 in_reply_to.as_deref(),

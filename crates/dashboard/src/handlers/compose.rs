@@ -82,6 +82,7 @@ pub async fn send(
         &req.subject,
         req.text.as_deref(),
         req.html.as_deref(),
+        None, // from_override
         req.cc.as_deref(),
         req.bcc.as_deref(),
         req.reply_to.as_deref(),
@@ -169,9 +170,10 @@ pub async fn reply(
         &headers.subject,
         req.text.as_deref(),
         req.html.as_deref(),
+        None, // from_override
         cc_joined.as_deref(),
-        None,
-        None,
+        None, // bcc
+        None, // reply_to
         headers.in_reply_to.as_deref(),
         Some(&headers.references),
         &attachments,

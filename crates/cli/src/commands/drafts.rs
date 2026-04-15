@@ -221,6 +221,7 @@ pub async fn run_create(
     account: Option<&str>,
     json: bool,
     backend: CredentialBackend,
+    from: Option<&str>,
     cc: Option<&str>,
     bcc: Option<&str>,
     in_reply_to: Option<&str>,
@@ -228,13 +229,15 @@ pub async fn run_create(
     let (db, creds) = setup_credentials(account, backend)?;
 
     // Build RFC822 message for IMAP APPEND
-    let from = if let Some(ref display) = creds.account.display_name {
+    let from_addr = if let Some(f) = from {
+        f.to_string()
+    } else if let Some(ref display) = creds.account.display_name {
         format!("{display} <{}>", creds.account.username)
     } else {
         creds.account.username.clone()
     };
 
-    let (rfc822, message_id) = build_rfc822_draft(&from, to, subject, body, cc, in_reply_to)?;
+    let (rfc822, message_id) = build_rfc822_draft(&from_addr, to, subject, body, cc, in_reply_to)?;
 
     // Check if this is a send-only account (no IMAP)
     let has_imap = !creds.account.imap_host.is_empty();
