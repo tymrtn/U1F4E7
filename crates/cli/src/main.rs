@@ -506,6 +506,12 @@ enum SnoozeCmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Check whether snoozed waiting-reply/follow-up threads received replies
+    CheckReplies {
+        /// Account ID or email (checks all accounts if omitted)
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Unsnooze a single message immediately (by UID in the original folder)
     Cancel {
         /// Message UID (the original UID at time of snoozing)
@@ -929,6 +935,9 @@ fn main() {
             ),
             SnoozeCmd::List { account } => {
                 commands::snooze::run_list(account.as_deref(), cli.json, backend)
+            }
+            SnoozeCmd::CheckReplies { account } => {
+                commands::snooze::run_check_replies(account.as_deref(), cli.json, backend)
             }
             SnoozeCmd::Cancel { uid, account } => {
                 commands::snooze::run_unsnooze(uid, account.as_deref(), cli.json, backend)
