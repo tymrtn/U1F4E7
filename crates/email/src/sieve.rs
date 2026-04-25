@@ -74,7 +74,11 @@ pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
     if !requires.is_empty() {
         let mut reqs: Vec<&&str> = requires.iter().collect();
         reqs.sort();
-        let req_list = reqs.iter().map(|r| format!("\"{}\"", r)).collect::<Vec<_>>().join(", ");
+        let req_list = reqs
+            .iter()
+            .map(|r| format!("\"{}\"", r))
+            .collect::<Vec<_>>()
+            .join(", ");
         script.push_str(&format!("require [{req_list}];\n\n"));
     }
 
@@ -123,15 +127,19 @@ fn expr_to_sieve(expr: &MatchExpr) -> Option<String> {
             }
             Some(format!("anyof ({})", parts.join(", ")))
         }
-        MatchExpr::Not(inner) => {
-            expr_to_sieve(inner).map(|s| format!("not {s}"))
-        }
+        MatchExpr::Not(inner) => expr_to_sieve(inner).map(|s| format!("not {s}")),
         // Tags, scores, and contact tags can't be expressed in Sieve
-        MatchExpr::HasTag(_) | MatchExpr::ScoreAbove { .. } | MatchExpr::ScoreBelow { .. } | MatchExpr::ContactHasTag(_) => None,
+        MatchExpr::HasTag(_)
+        | MatchExpr::ScoreAbove { .. }
+        | MatchExpr::ScoreBelow { .. }
+        | MatchExpr::ContactHasTag(_) => None,
     }
 }
 
-fn action_to_sieve<'a>(action: &Action, requires: &mut std::collections::HashSet<&'a str>) -> Option<String> {
+fn action_to_sieve<'a>(
+    action: &Action,
+    requires: &mut std::collections::HashSet<&'a str>,
+) -> Option<String> {
     match action {
         Action::Move(folder) => {
             requires.insert("fileinto");
@@ -160,9 +168,7 @@ fn action_to_sieve<'a>(action: &Action, requires: &mut std::collections::HashSet
             };
             Some(format!("removeflag \"{sieve_flag}\";"))
         }
-        Action::Delete => {
-            Some("discard;".to_string())
-        }
+        Action::Delete => Some("discard;".to_string()),
         // Snooze, Unsubscribe, AddTag, Webhook are local-only
         Action::Snooze(_) | Action::Unsubscribe | Action::AddTag(_) | Action::Webhook(_) => None,
     }

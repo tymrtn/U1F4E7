@@ -37,10 +37,7 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
 }
 
 /// Start the dashboard server with a specific credential backend.
-pub async fn serve_with_backend(
-    port: u16,
-    backend: CredentialBackend,
-) -> anyhow::Result<()> {
+pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow::Result<()> {
     let db = Database::open_default().map_err(|e| anyhow::anyhow!("{e}"))?;
     let state = AppState::new(db, backend);
 
@@ -60,7 +57,10 @@ pub async fn serve_with_backend(
 
     let api = Router::new()
         // Accounts
-        .route("/accounts", get(handlers::accounts::list).post(handlers::accounts::create))
+        .route(
+            "/accounts",
+            get(handlers::accounts::list).post(handlers::accounts::create),
+        )
         .route("/accounts/{id}", delete(handlers::accounts::delete))
         .route("/accounts/{id}/verify", post(handlers::accounts::verify))
         .route("/accounts/discover", post(handlers::accounts::discover))
@@ -68,10 +68,22 @@ pub async fn serve_with_backend(
         .route("/accounts/{id}/folders", get(handlers::folders::list))
         // Messages
         .route("/accounts/{id}/messages", get(handlers::messages::list))
-        .route("/accounts/{id}/messages/{uid}", get(handlers::messages::read))
-        .route("/accounts/{id}/messages/{uid}/flags", post(handlers::messages::flags))
-        .route("/accounts/{id}/messages/{uid}/move", post(handlers::messages::mv))
-        .route("/accounts/{id}/messages/{uid}", delete(handlers::messages::delete))
+        .route(
+            "/accounts/{id}/messages/{uid}",
+            get(handlers::messages::read),
+        )
+        .route(
+            "/accounts/{id}/messages/{uid}/flags",
+            post(handlers::messages::flags),
+        )
+        .route(
+            "/accounts/{id}/messages/{uid}/move",
+            post(handlers::messages::mv),
+        )
+        .route(
+            "/accounts/{id}/messages/{uid}",
+            delete(handlers::messages::delete),
+        )
         .route("/accounts/{id}/search", get(handlers::messages::search))
         // Attachments
         .route(
@@ -80,7 +92,10 @@ pub async fn serve_with_backend(
         )
         // Compose
         .route("/accounts/{id}/compose", post(handlers::compose::send))
-        .route("/accounts/{id}/compose/reply", post(handlers::compose::reply))
+        .route(
+            "/accounts/{id}/compose/reply",
+            post(handlers::compose::reply),
+        )
         // Drafts
         .route("/accounts/{id}/drafts", get(handlers::drafts::list))
         // Snoozed

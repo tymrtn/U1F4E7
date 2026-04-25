@@ -367,12 +367,7 @@ impl Database {
     }
 
     /// Set the UIDVALIDITY for a folder/account pair.
-    pub fn set_uidvalidity(
-        &self,
-        account_id: &str,
-        folder: &str,
-        uidvalidity: u32,
-    ) -> Result<()> {
+    pub fn set_uidvalidity(&self, account_id: &str, folder: &str, uidvalidity: u32) -> Result<()> {
         // If a sync state row exists, update it; otherwise create one
         let rows = self.conn().execute(
             "UPDATE thread_sync_state SET uidvalidity = ?3 \
@@ -572,7 +567,10 @@ mod tests {
 
         let messages = db.get_thread_messages(&thread.thread_id).unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].from_address.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            messages[0].from_address.as_deref(),
+            Some("alice@example.com")
+        );
         assert!(!messages[0].is_outbound);
         assert_eq!(messages[1].from_address.as_deref(), Some("bob@example.com"));
         assert!(messages[1].is_outbound);
@@ -762,7 +760,8 @@ mod tests {
         );
 
         // Gmail-style drafts folder overwrites the cached value
-        db.set_detected_folder("acct1", "drafts", "[Gmail]/Drafts").unwrap();
+        db.set_detected_folder("acct1", "drafts", "[Gmail]/Drafts")
+            .unwrap();
         assert_eq!(
             db.get_drafts_folder("acct1").unwrap().as_deref(),
             Some("[Gmail]/Drafts")
@@ -770,7 +769,8 @@ mod tests {
 
         // Different accounts have independent caches
         assert!(db.get_drafts_folder("acct2").unwrap().is_none());
-        db.set_detected_folder("acct2", "drafts", "INBOX.Drafts").unwrap();
+        db.set_detected_folder("acct2", "drafts", "INBOX.Drafts")
+            .unwrap();
         assert_eq!(
             db.get_drafts_folder("acct2").unwrap().as_deref(),
             Some("INBOX.Drafts")
@@ -969,17 +969,11 @@ mod tests {
 
         // Store UIDVALIDITY
         db.set_uidvalidity("acct1", "INBOX", 12345).unwrap();
-        assert_eq!(
-            db.get_uidvalidity("acct1", "INBOX").unwrap(),
-            Some(12345)
-        );
+        assert_eq!(db.get_uidvalidity("acct1", "INBOX").unwrap(), Some(12345));
 
         // Update UIDVALIDITY
         db.set_uidvalidity("acct1", "INBOX", 99999).unwrap();
-        assert_eq!(
-            db.get_uidvalidity("acct1", "INBOX").unwrap(),
-            Some(99999)
-        );
+        assert_eq!(db.get_uidvalidity("acct1", "INBOX").unwrap(), Some(99999));
     }
 
     #[test]
@@ -1033,14 +1027,8 @@ mod tests {
         db.set_uidvalidity("acct1", "INBOX", 1000).unwrap();
 
         // Verify initial state
-        assert_eq!(
-            db.get_thread_messages(&thread.thread_id).unwrap().len(),
-            2
-        );
-        assert_eq!(
-            db.get_last_synced_uid("acct1", "INBOX").unwrap(),
-            Some(200)
-        );
+        assert_eq!(db.get_thread_messages(&thread.thread_id).unwrap().len(), 2);
+        assert_eq!(db.get_last_synced_uid("acct1", "INBOX").unwrap(), Some(200));
 
         // Reset folder sync (simulating UIDVALIDITY change)
         let deleted = db.reset_folder_sync("acct1", "INBOX", 2000).unwrap();
@@ -1054,16 +1042,10 @@ mod tests {
         );
 
         // last_uid should be reset to 0
-        assert_eq!(
-            db.get_last_synced_uid("acct1", "INBOX").unwrap(),
-            Some(0)
-        );
+        assert_eq!(db.get_last_synced_uid("acct1", "INBOX").unwrap(), Some(0));
 
         // New UIDVALIDITY should be stored
-        assert_eq!(
-            db.get_uidvalidity("acct1", "INBOX").unwrap(),
-            Some(2000)
-        );
+        assert_eq!(db.get_uidvalidity("acct1", "INBOX").unwrap(), Some(2000));
 
         // Thread with zero messages should have been cleaned up
         assert!(db.get_thread(&thread.thread_id).unwrap().is_none());

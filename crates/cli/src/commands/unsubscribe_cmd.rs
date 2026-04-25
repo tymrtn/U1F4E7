@@ -99,8 +99,9 @@ pub async fn run(
     // For mailto: build an SMTP send closure
     // We capture the credentials to send via SMTP if needed
     let creds_for_smtp = &creds;
-    let smtp_send: Box<dyn Fn(&str) -> std::result::Result<(), envelope_email_transport::SmtpError>>
-         = Box::new(|addr: &str| {
+    let smtp_send: Box<
+        dyn Fn(&str) -> std::result::Result<(), envelope_email_transport::SmtpError>,
+    > = Box::new(|addr: &str| {
         // Use a blocking runtime to call the async SMTP sender
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
@@ -119,8 +120,7 @@ pub async fn run(
         })
     });
 
-    let result =
-        unsubscribe::execute_unsubscribe(&info, confirm, Some(smtp_send.as_ref())).await;
+    let result = unsubscribe::execute_unsubscribe(&info, confirm, Some(smtp_send.as_ref())).await;
 
     if json {
         println!(

@@ -90,10 +90,7 @@ pub async fn run_show(
             let from = msg.from_address.as_deref().unwrap_or("(unknown)");
             let to = msg.to_addresses.as_deref().unwrap_or("(unknown)");
 
-            println!(
-                "{} [{}] {} → {}",
-                direction, date_short, from, to,
-            );
+            println!("{} [{}] {} → {}", direction, date_short, from, to,);
             if let Some(ref snippet) = msg.snippet {
                 // Indent snippet
                 for line in snippet.lines().take(3) {

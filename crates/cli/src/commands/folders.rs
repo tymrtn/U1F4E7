@@ -18,13 +18,10 @@ pub async fn run(account: Option<&str>, json: bool, backend: CredentialBackend) 
         .context("IMAP connection failed")?;
 
     // Use the provider-aware folder classification for rich output
-    let folder_infos = envelope_email_transport::folders::classify_folders(
-        &mut client,
-        &db,
-        &creds.account.id,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("folder classification failed: {e}"))?;
+    let folder_infos =
+        envelope_email_transport::folders::classify_folders(&mut client, &db, &creds.account.id)
+            .await
+            .map_err(|e| anyhow::anyhow!("folder classification failed: {e}"))?;
 
     // Fetch stats for every folder (exists / recent / unseen)
     let stats_vec = envelope_email_transport::imap::list_folder_stats(&mut client)

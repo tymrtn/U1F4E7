@@ -18,11 +18,7 @@ pub async fn list(
     let db = state.db.lock().await;
     match db.list_snoozed(Some(&account_id)) {
         Ok(items) => Json(json!({ "snoozed": items })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
 
@@ -37,10 +33,7 @@ pub async fn unsnooze(
             Ok(Some(s)) => s,
             Ok(None) => return (StatusCode::NOT_FOUND, "snooze record not found").into_response(),
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("db error: {e}"),
-                )
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
                     .into_response();
             }
         }

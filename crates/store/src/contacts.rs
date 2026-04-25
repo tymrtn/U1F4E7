@@ -87,22 +87,27 @@ impl Database {
         };
 
         let mut stmt = self.conn().prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row: &rusqlite::Row| {
-            Ok(Contact {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                email: row.get(2)?,
-                name: row.get(3)?,
-                tags: row.get(4)?,
-                notes: row.get(5)?,
-                message_count: row.get(6)?,
-                first_seen: row.get(7)?,
-                last_seen: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        })?;
-        Ok(rows.filter_map(|r: std::result::Result<Contact, rusqlite::Error>| r.ok()).collect())
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params.iter()),
+            |row: &rusqlite::Row| {
+                Ok(Contact {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    tags: row.get(4)?,
+                    notes: row.get(5)?,
+                    message_count: row.get(6)?,
+                    first_seen: row.get(7)?,
+                    last_seen: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            },
+        )?;
+        Ok(rows
+            .filter_map(|r: std::result::Result<Contact, rusqlite::Error>| r.ok())
+            .collect())
     }
 
     /// Delete a contact by email.
@@ -119,8 +124,7 @@ impl Database {
     pub fn get_contact_tags(&self, account_id: &str, email: &str) -> Result<Vec<String>> {
         match self.get_contact(account_id, email)? {
             Some(contact) => {
-                let tags: Vec<String> =
-                    serde_json::from_str(&contact.tags).unwrap_or_default();
+                let tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
                 Ok(tags)
             }
             None => Ok(vec![]),
@@ -130,8 +134,7 @@ impl Database {
     /// Add a tag to a contact's tag list.
     pub fn add_contact_tag(&self, account_id: &str, email: &str, tag: &str) -> Result<bool> {
         if let Some(contact) = self.get_contact(account_id, email)? {
-            let mut tags: Vec<String> =
-                serde_json::from_str(&contact.tags).unwrap_or_default();
+            let mut tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
             if !tags.contains(&tag.to_string()) {
                 tags.push(tag.to_string());
                 let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
@@ -149,8 +152,7 @@ impl Database {
     /// Remove a tag from a contact's tag list.
     pub fn remove_contact_tag(&self, account_id: &str, email: &str, tag: &str) -> Result<bool> {
         if let Some(contact) = self.get_contact(account_id, email)? {
-            let mut tags: Vec<String> =
-                serde_json::from_str(&contact.tags).unwrap_or_default();
+            let mut tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
             let before = tags.len();
             tags.retain(|t| t != tag);
             if tags.len() < before {
@@ -217,10 +219,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.list_contacts("acc-1", None).unwrap().len(), 2);
-        assert_eq!(
-            db.list_contacts("acc-1", Some("vendor")).unwrap().len(),
-            1
-        );
+        assert_eq!(db.list_contacts("acc-1", Some("vendor")).unwrap().len(), 1);
         assert_eq!(
             db.list_contacts("acc-1", Some("personal")).unwrap().len(),
             1
@@ -248,9 +247,7 @@ mod tests {
     #[test]
     fn get_contact_tags_returns_empty_for_unknown() {
         let db = test_db();
-        let tags = db
-            .get_contact_tags("acc-1", "unknown@example.com")
-            .unwrap();
+        let tags = db.get_contact_tags("acc-1", "unknown@example.com").unwrap();
         assert!(tags.is_empty());
     }
 }

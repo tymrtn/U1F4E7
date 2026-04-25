@@ -2,7 +2,9 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use anyhow::{Result, bail};
-use chrono::{Datelike, DateTime, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc, Weekday,
+};
 
 /// Parse a flexible datetime string into an ISO8601 datetime.
 ///
@@ -18,7 +20,10 @@ pub fn parse_until(input: &str) -> Result<String> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
         let local: Option<DateTime<Local>> = Local.from_local_datetime(&dt).single();
         if let Some(local_dt) = local {
-            return Ok(local_dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string());
+            return Ok(local_dt
+                .with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string());
         }
         return Ok(dt.format("%Y-%m-%dT%H:%M:%S").to_string());
     }
@@ -47,7 +52,10 @@ pub fn parse_until(input: &str) -> Result<String> {
     let to_utc = |naive: NaiveDateTime| -> String {
         let local_dt: Option<DateTime<Local>> = Local.from_local_datetime(&naive).single();
         match local_dt {
-            Some(dt) => dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string(),
+            Some(dt) => dt
+                .with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
             None => naive.format("%Y-%m-%dT%H:%M:%S").to_string(),
         }
     };

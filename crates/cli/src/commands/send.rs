@@ -31,10 +31,14 @@ pub async fn run(
     // ── Scheduled send path ──
     if let Some(at_str) = at {
         if !attach_paths.is_empty() {
-            anyhow::bail!("--attach is not supported with --at (scheduled send does not persist attachments yet)");
+            anyhow::bail!(
+                "--attach is not supported with --at (scheduled send does not persist attachments yet)"
+            );
         }
         if from.is_some() {
-            anyhow::bail!("--from is not supported with --at (scheduled send does not persist sender override yet)");
+            anyhow::bail!(
+                "--from is not supported with --at (scheduled send does not persist sender override yet)"
+            );
         }
         let send_at = parse_until(at_str).context("failed to parse --at value")?;
 
@@ -134,7 +138,12 @@ pub async fn run(
         if !attachments.is_empty() {
             println!("Attachments: {}", attachments.len());
             for a in &attachments {
-                println!("  - {} ({} bytes, {})", a.filename, a.data.len(), a.content_type);
+                println!(
+                    "  - {} ({} bytes, {})",
+                    a.filename,
+                    a.data.len(),
+                    a.content_type
+                );
             }
         }
     }

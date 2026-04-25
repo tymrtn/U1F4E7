@@ -44,7 +44,18 @@ impl SmtpSender {
         reply_to: Option<&str>,
     ) -> Result<String, SmtpError> {
         Self::send(
-            account, to, subject, text, html, None, cc, bcc, reply_to, None, None, &[],
+            account,
+            to,
+            subject,
+            text,
+            html,
+            None,
+            cc,
+            bcc,
+            reply_to,
+            None,
+            None,
+            &[],
         )
         .await
     }
@@ -165,8 +176,8 @@ impl SmtpSender {
                     .content_type
                     .parse::<ContentType>()
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-                let attachment = LettreAttachment::new(att.filename.clone())
-                    .body(att.data.clone(), ct);
+                let attachment =
+                    LettreAttachment::new(att.filename.clone()).body(att.data.clone(), ct);
                 // LettreAttachment::new().body() returns a SinglePart ready to append
                 mixed = mixed.singlepart(attachment);
             }

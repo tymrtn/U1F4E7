@@ -230,9 +230,18 @@ mod tests {
 
     #[test]
     fn glob_star_wildcard() {
-        assert!(glob_match("*@notifications.github.com", "noreply@notifications.github.com"));
-        assert!(glob_match("*@*.github.com", "noreply@notifications.github.com"));
-        assert!(!glob_match("*@github.com", "noreply@notifications.github.com"));
+        assert!(glob_match(
+            "*@notifications.github.com",
+            "noreply@notifications.github.com"
+        ));
+        assert!(glob_match(
+            "*@*.github.com",
+            "noreply@notifications.github.com"
+        ));
+        assert!(!glob_match(
+            "*@github.com",
+            "noreply@notifications.github.com"
+        ));
     }
 
     #[test]
@@ -251,7 +260,10 @@ mod tests {
     #[test]
     fn match_from() {
         let expr = MatchExpr::From("*@notifications.github.com".to_string());
-        assert!(evaluate(&expr, &ctx("noreply@notifications.github.com", "", "")));
+        assert!(evaluate(
+            &expr,
+            &ctx("noreply@notifications.github.com", "", "")
+        ));
         assert!(!evaluate(&expr, &ctx("alice@example.com", "", "")));
     }
 
@@ -265,7 +277,10 @@ mod tests {
     #[test]
     fn match_has_tag() {
         let expr = MatchExpr::HasTag("newsletter".to_string());
-        assert!(evaluate(&expr, &ctx_with_tags("", &["newsletter", "automated"], &[])));
+        assert!(evaluate(
+            &expr,
+            &ctx_with_tags("", &["newsletter", "automated"], &[])
+        ));
         assert!(!evaluate(&expr, &ctx_with_tags("", &["vip"], &[])));
     }
 
@@ -276,7 +291,10 @@ mod tests {
             threshold: 0.7,
         };
         assert!(evaluate(&expr, &ctx_with_tags("", &[], &[("urgent", 0.9)])));
-        assert!(!evaluate(&expr, &ctx_with_tags("", &[], &[("urgent", 0.5)])));
+        assert!(!evaluate(
+            &expr,
+            &ctx_with_tags("", &[], &[("urgent", 0.5)])
+        ));
         assert!(!evaluate(&expr, &ctx_with_tags("", &[], &[]))); // no score = no match
     }
 
@@ -297,7 +315,10 @@ mod tests {
             &expr,
             &ctx_with_tags("", &["newsletter"], &[("interesting", 0.5)])
         ));
-        assert!(!evaluate(&expr, &ctx_with_tags("", &[], &[("interesting", 0.1)])));
+        assert!(!evaluate(
+            &expr,
+            &ctx_with_tags("", &[], &[("interesting", 0.1)])
+        ));
     }
 
     #[test]
@@ -307,7 +328,10 @@ mod tests {
             MatchExpr::HasTag("junk".to_string()),
         ]);
         assert!(evaluate(&expr, &ctx("noreply@spam.com", "", "")));
-        assert!(evaluate(&expr, &ctx_with_tags("alice@example.com", &["junk"], &[])));
+        assert!(evaluate(
+            &expr,
+            &ctx_with_tags("alice@example.com", &["junk"], &[])
+        ));
         assert!(!evaluate(&expr, &ctx("alice@example.com", "", "")));
     }
 

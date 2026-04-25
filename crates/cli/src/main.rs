@@ -270,6 +270,12 @@ enum Commands {
         subcommand: ActionsCmd,
     },
 
+    /// View and acknowledge redacted events
+    Events {
+        #[command(subcommand)]
+        subcommand: EventsCmd,
+    },
+
     /// Snooze a message, list snoozed, or unsnooze
     Snooze {
         #[command(subcommand)]
@@ -541,6 +547,44 @@ enum ActionsCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+    },
+    /// Execute a local audit action for an event
+    Exec {
+        /// Event ID
+        #[arg(long)]
+        event_id: String,
+        /// Actor responsible for the action
+        #[arg(long)]
+        actor: String,
+        #[command(subcommand)]
+        subcommand: ActionsExecCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ActionsExecCmd {
+    /// Record an event as handled locally without mutating the mailbox
+    MarkHandled,
+}
+
+#[derive(Subcommand)]
+enum EventsCmd {
+    /// List recent redacted events
+    List {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// Number of entries
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Mark an event as acknowledged
+    Ack {
+        /// Event ID
+        event_id: String,
+        /// Optional actor label for the CLI caller
+        #[arg(long)]
+        actor: Option<String>,
     },
 }
 
@@ -1053,9 +1097,25 @@ fn main() {
             std::process::exit(1);
         }
         Commands::Actions { subcommand } => match subcommand {
-            ActionsCmd::Tail { .. } => {
-                eprintln!("Not yet implemented: actions tail");
-                std::process::exit(1);
+            ActionsCmd::Tail { limit, account } => {
+                commands::actions::run_tail(limit, account.as_deref(), cli.json, backend)
+            }
+            ActionsCmd::Exec {
+                event_id,
+                actor,
+                subcommand,
+            } => match subcommand {
+                ActionsExecCmd::MarkHandled => {
+                    commands::actions::run_exec_mark_handled(&event_id, &actor, cli.json, backend)
+                }
+            },
+        },
+        Commands::Events { subcommand } => match subcommand {
+            EventsCmd::List { account, limit } => {
+                commands::events::run_list(account.as_deref(), limit, cli.json, backend)
+            }
+            EventsCmd::Ack { event_id, actor } => {
+                commands::events::run_ack(&event_id, actor.as_deref(), cli.json, backend)
             }
         },
 
@@ -1109,10 +1169,9 @@ fn main() {
                 folder,
                 account,
             } => commands::thread::run_show(uid, &folder, account.as_deref(), cli.json, backend),
-            ThreadCmd::List {
-                account,
-                limit,
-            } => commands::thread::run_list(account.as_deref(), limit, cli.json, backend),
+            ThreadCmd::List { account, limit } => {
+                commands::thread::run_list(account.as_deref(), limit, cli.json, backend)
+            }
             ThreadCmd::Build { account, limit } => {
                 commands::thread::run_build(account.as_deref(), limit, cli.json, backend)
             }
@@ -1183,9 +1242,7 @@ fn main() {
                 email,
                 tag,
                 account,
-            } => {
-                commands::contacts::run_untag(&email, &tag, account.as_deref(), cli.json, backend)
-            }
+            } => commands::contacts::run_untag(&email, &tag, account.as_deref(), cli.json, backend),
             ContactsCmd::Import { limit, account } => {
                 commands::contacts::run_import_inbox(limit, account.as_deref(), cli.json, backend)
             }
@@ -1233,13 +1290,7 @@ fn main() {
                 folder,
                 limit,
                 account,
-            } => commands::rule::run_apply(
-                &folder,
-                account.as_deref(),
-                limit,
-                cli.json,
-                backend,
-            ),
+            } => commands::rule::run_apply(&folder, account.as_deref(), limit, cli.json, backend),
             RuleCmd::Enable { name, account } => {
                 commands::rule::run_enable(&name, account.as_deref(), cli.json, backend)
             }

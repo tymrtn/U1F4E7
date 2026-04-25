@@ -28,12 +28,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn remove_tag(
-        &self,
-        account_id: &str,
-        message_id: &str,
-        tag: &str,
-    ) -> Result<bool> {
+    pub fn remove_tag(&self, account_id: &str, message_id: &str, tag: &str) -> Result<bool> {
         let rows = self.conn().execute(
             "DELETE FROM message_tags WHERE account_id = ?1 AND message_id = ?2 AND tag = ?3",
             params![account_id, message_id, tag],
@@ -41,11 +36,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn get_tags(
-        &self,
-        account_id: &str,
-        message_id: &str,
-    ) -> Result<Vec<MessageTag>> {
+    pub fn get_tags(&self, account_id: &str, message_id: &str) -> Result<Vec<MessageTag>> {
         let mut stmt = self.conn().prepare(
             "SELECT account_id, message_id, tag, uid, folder, created_at
              FROM message_tags WHERE account_id = ?1 AND message_id = ?2",
@@ -63,11 +54,7 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn list_messages_with_tag(
-        &self,
-        account_id: &str,
-        tag: &str,
-    ) -> Result<Vec<MessageTag>> {
+    pub fn list_messages_with_tag(&self, account_id: &str, tag: &str) -> Result<Vec<MessageTag>> {
         let mut stmt = self.conn().prepare(
             "SELECT account_id, message_id, tag, uid, folder, created_at
              FROM message_tags WHERE account_id = ?1 AND tag = ?2
@@ -123,11 +110,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn get_scores(
-        &self,
-        account_id: &str,
-        message_id: &str,
-    ) -> Result<Vec<MessageScore>> {
+    pub fn get_scores(&self, account_id: &str, message_id: &str) -> Result<Vec<MessageScore>> {
         let mut stmt = self.conn().prepare(
             "SELECT account_id, message_id, dimension, value, uid, folder, created_at, updated_at
              FROM message_scores WHERE account_id = ?1 AND message_id = ?2",
@@ -182,8 +165,10 @@ mod tests {
     #[test]
     fn tag_roundtrip() {
         let db = Database::open_memory().unwrap();
-        db.add_tag("acct1", "<msg@test>", "newsletter", Some(42), Some("INBOX")).unwrap();
-        db.add_tag("acct1", "<msg@test>", "automated", Some(42), Some("INBOX")).unwrap();
+        db.add_tag("acct1", "<msg@test>", "newsletter", Some(42), Some("INBOX"))
+            .unwrap();
+        db.add_tag("acct1", "<msg@test>", "automated", Some(42), Some("INBOX"))
+            .unwrap();
 
         let tags = db.get_tags("acct1", "<msg@test>").unwrap();
         assert_eq!(tags.len(), 2);
@@ -201,8 +186,24 @@ mod tests {
     #[test]
     fn score_roundtrip() {
         let db = Database::open_memory().unwrap();
-        db.set_score("acct1", "<msg@test>", "urgent", 0.9, Some(42), Some("INBOX")).unwrap();
-        db.set_score("acct1", "<msg@test>", "interesting", 0.3, Some(42), Some("INBOX")).unwrap();
+        db.set_score(
+            "acct1",
+            "<msg@test>",
+            "urgent",
+            0.9,
+            Some(42),
+            Some("INBOX"),
+        )
+        .unwrap();
+        db.set_score(
+            "acct1",
+            "<msg@test>",
+            "interesting",
+            0.3,
+            Some(42),
+            Some("INBOX"),
+        )
+        .unwrap();
 
         let scores = db.get_scores("acct1", "<msg@test>").unwrap();
         assert_eq!(scores.len(), 2);
@@ -211,7 +212,8 @@ mod tests {
         assert!((urgent.value - 0.9).abs() < f64::EPSILON);
 
         // Update score
-        db.set_score("acct1", "<msg@test>", "urgent", 0.5, None, None).unwrap();
+        db.set_score("acct1", "<msg@test>", "urgent", 0.5, None, None)
+            .unwrap();
         let scores = db.get_scores("acct1", "<msg@test>").unwrap();
         let urgent = scores.iter().find(|s| s.dimension == "urgent").unwrap();
         assert!((urgent.value - 0.5).abs() < f64::EPSILON);
@@ -224,19 +226,26 @@ mod tests {
     #[test]
     fn list_by_min_score() {
         let db = Database::open_memory().unwrap();
-        db.set_score("acct1", "<m1@test>", "urgent", 0.9, None, None).unwrap();
-        db.set_score("acct1", "<m2@test>", "urgent", 0.3, None, None).unwrap();
-        db.set_score("acct1", "<m3@test>", "urgent", 0.7, None, None).unwrap();
+        db.set_score("acct1", "<m1@test>", "urgent", 0.9, None, None)
+            .unwrap();
+        db.set_score("acct1", "<m2@test>", "urgent", 0.3, None, None)
+            .unwrap();
+        db.set_score("acct1", "<m3@test>", "urgent", 0.7, None, None)
+            .unwrap();
 
-        let high = db.list_messages_with_min_score("acct1", "urgent", 0.7).unwrap();
+        let high = db
+            .list_messages_with_min_score("acct1", "urgent", 0.7)
+            .unwrap();
         assert_eq!(high.len(), 2); // m1 (0.9) and m3 (0.7)
     }
 
     #[test]
     fn list_by_tag() {
         let db = Database::open_memory().unwrap();
-        db.add_tag("acct1", "<m1@test>", "newsletter", None, None).unwrap();
-        db.add_tag("acct1", "<m2@test>", "newsletter", None, None).unwrap();
+        db.add_tag("acct1", "<m1@test>", "newsletter", None, None)
+            .unwrap();
+        db.add_tag("acct1", "<m2@test>", "newsletter", None, None)
+            .unwrap();
         db.add_tag("acct1", "<m3@test>", "vip", None, None).unwrap();
 
         let newsletters = db.list_messages_with_tag("acct1", "newsletter").unwrap();

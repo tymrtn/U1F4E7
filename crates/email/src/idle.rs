@@ -18,9 +18,7 @@ use crate::imap::ImapSession;
 /// `Session<TlsStream<TcpStream>>`.  Unlike `imap::connect()` this does NOT
 /// wrap the session in `ImapClient`, so the caller can pass ownership to
 /// `session.idle()`.
-pub async fn connect_session(
-    account: &AccountWithCredentials,
-) -> Result<ImapSession, ImapError> {
+pub async fn connect_session(account: &AccountWithCredentials) -> Result<ImapSession, ImapError> {
     let host = &account.account.imap_host;
     let port = account.account.imap_port;
     let username = account.effective_imap_username();

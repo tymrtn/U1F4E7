@@ -49,10 +49,7 @@ pub fn parse_list_unsubscribe(header: &str, post_header: Option<&str>) -> Option
     // Split on commas, extract angle-bracketed URLs
     for part in header.split(',') {
         let trimmed = part.trim();
-        let url = trimmed
-            .trim_start_matches('<')
-            .trim_end_matches('>')
-            .trim();
+        let url = trimmed.trim_start_matches('<').trim_end_matches('>').trim();
         if url.starts_with("https://") || url.starts_with("http://") {
             https_urls.push(url.to_string());
         } else if url.starts_with("mailto:") {

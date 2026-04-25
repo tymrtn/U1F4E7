@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod db;
 pub mod drafts;
 pub mod errors;
+pub mod event_routes;
 pub mod events;
 pub mod license_store;
 pub mod migrations;

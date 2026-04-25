@@ -16,11 +16,7 @@ pub async fn list(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
     match db.list_accounts() {
         Ok(accounts) => Json(json!({ "accounts": accounts })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
 
@@ -41,12 +37,7 @@ pub async fn create(
 ) -> impl IntoResponse {
     // Resolve SMTP/IMAP settings: explicit fields take precedence,
     // otherwise run auto-discovery on the domain.
-    let domain = req
-        .email
-        .split('@')
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let domain = req.email.split('@').nth(1).unwrap_or("").to_string();
 
     let (smtp_host, smtp_port, imap_host, imap_port) =
         if let (Some(sh), Some(sp), Some(ih), Some(ip)) =
@@ -71,18 +62,17 @@ pub async fn create(
             }
         };
 
-    let passphrase = match envelope_email_store::credential_store::get_or_create_passphrase(
-        state.backend,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("credential store error: {e}"),
-            )
-                .into_response();
-        }
-    };
+    let passphrase =
+        match envelope_email_store::credential_store::get_or_create_passphrase(state.backend) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("credential store error: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let _ = domain; // derived from username inside create_account
     let db = state.db.lock().await;
@@ -109,19 +99,12 @@ pub async fn create(
     Json(json!({ "account": account })).into_response()
 }
 
-pub async fn delete(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let db = state.db.lock().await;
     match db.delete_account(&id) {
         Ok(true) => Json(json!({ "deleted": id })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
 
@@ -133,10 +116,7 @@ pub struct VerifyResult {
     pub error: Option<String>,
 }
 
-pub async fn verify(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn verify(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     // Verify IMAP connectivity only (SMTP verify requires sending a
     // test email which is destructive; do that explicitly elsewhere).
     match state.get_or_create_imap(&id).await {

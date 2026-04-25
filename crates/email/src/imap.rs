@@ -112,10 +112,7 @@ pub async fn list_folders(client: &mut ImapClient) -> Result<Vec<String>, ImapEr
 /// unsolicited responses on some servers); it uses the STATUS command which
 /// is read-only and designed for this purpose. Suitable for sidebar rendering
 /// where we want counts without switching the active mailbox.
-pub async fn folder_stats(
-    client: &mut ImapClient,
-    folder: &str,
-) -> Result<FolderStats, ImapError> {
+pub async fn folder_stats(client: &mut ImapClient, folder: &str) -> Result<FolderStats, ImapError> {
     validate_imap_input(folder)?;
 
     let mailbox = client
@@ -135,9 +132,7 @@ pub async fn folder_stats(
 /// Fetch stats for every folder in the account, returning one [`FolderStats`]
 /// per folder (in the same order as `list_folders`). Folders that fail the
 /// STATUS query are skipped with a warning rather than propagating the error.
-pub async fn list_folder_stats(
-    client: &mut ImapClient,
-) -> Result<Vec<FolderStats>, ImapError> {
+pub async fn list_folder_stats(client: &mut ImapClient) -> Result<Vec<FolderStats>, ImapError> {
     let folders = list_folders(client).await?;
     let mut stats = Vec::with_capacity(folders.len());
     for folder in &folders {
@@ -334,10 +329,9 @@ fn decode_q_encoding(input: &str) -> Vec<u8> {
                 i += 1;
             }
             b'=' if i + 2 < bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(
-                    &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                    16,
-                ) {
+                if let Ok(byte) =
+                    u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
+                {
                     result.push(byte);
                     i += 3;
                 } else {
@@ -816,10 +810,7 @@ pub async fn set_flag(
 /// which is logged and converted into success (the caller doesn't care
 /// whether the folder was created just now or previously). Used by
 /// `snooze` to ensure the `Snoozed` folder exists before moving messages.
-pub async fn create_folder(
-    client: &mut ImapClient,
-    folder: &str,
-) -> Result<(), ImapError> {
+pub async fn create_folder(client: &mut ImapClient, folder: &str) -> Result<(), ImapError> {
     validate_imap_input(folder)?;
     match client.session.create(folder).await {
         Ok(()) => {
@@ -844,11 +835,7 @@ pub async fn create_folder(
 /// Since [`fetch_message`] uses `BODY.PEEK[]` to avoid auto-marking messages
 /// as read, callers must invoke this explicitly when the user indicates they
 /// want the message flagged as seen (e.g., dashboard "Mark as read" button).
-pub async fn mark_seen(
-    client: &mut ImapClient,
-    folder: &str,
-    uid: u32,
-) -> Result<(), ImapError> {
+pub async fn mark_seen(client: &mut ImapClient, folder: &str, uid: u32) -> Result<(), ImapError> {
     set_flag(client, folder, uid, "seen").await
 }
 
@@ -917,7 +904,10 @@ pub async fn download_attachment(
         .ok_or_else(|| ImapError::Protocol(format!("failed to parse message UID {uid}")))?;
 
     for attachment in parsed.attachments() {
-        let att_name = attachment.attachment_name().unwrap_or("unnamed").to_string();
+        let att_name = attachment
+            .attachment_name()
+            .unwrap_or("unnamed")
+            .to_string();
         if att_name == filename {
             return Ok((att_name, attachment.contents().to_vec()));
         }
@@ -999,7 +989,8 @@ mod tests {
             "fetch descriptor must contain BODY.PEEK"
         );
         assert!(
-            !FETCH_MESSAGE_DESCRIPTOR.contains("BODY[") || FETCH_MESSAGE_DESCRIPTOR.contains("BODY.PEEK["),
+            !FETCH_MESSAGE_DESCRIPTOR.contains("BODY[")
+                || FETCH_MESSAGE_DESCRIPTOR.contains("BODY.PEEK["),
             "fetch descriptor must not contain BODY[ without .PEEK"
         );
     }

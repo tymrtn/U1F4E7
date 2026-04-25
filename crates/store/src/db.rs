@@ -36,16 +36,14 @@ impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        crate::migrations::run(&mut conn)
-            .map_err(|e| StoreError::Migration(format!("{e}")))?;
+        crate::migrations::run(&mut conn).map_err(|e| StoreError::Migration(format!("{e}")))?;
         Ok(Self { conn })
     }
 
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
-        crate::migrations::run(&mut conn)
-            .map_err(|e| StoreError::Migration(format!("{e}")))?;
+        crate::migrations::run(&mut conn).map_err(|e| StoreError::Migration(format!("{e}")))?;
         Ok(Self { conn })
     }
 
@@ -57,7 +55,6 @@ impl Database {
         let config_dir = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
         config_dir.join("envelope-email").join("envelope.db")
     }
-
 
     // ── Detected folder cache ────────────────────────────────────────
 

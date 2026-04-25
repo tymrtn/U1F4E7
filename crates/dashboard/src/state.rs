@@ -65,11 +65,13 @@ impl AppState {
         pool.remove(account_id);
     }
 
-    async fn resolve_credentials(&self, account_id: &str) -> anyhow::Result<AccountWithCredentials> {
-        let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(
-            self.backend,
-        )
-        .map_err(|e| anyhow::anyhow!("credential store error: {e}"))?;
+    async fn resolve_credentials(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<AccountWithCredentials> {
+        let passphrase =
+            envelope_email_store::credential_store::get_or_create_passphrase(self.backend)
+                .map_err(|e| anyhow::anyhow!("credential store error: {e}"))?;
 
         let db = self.db.lock().await;
         // Try ID, then email lookup

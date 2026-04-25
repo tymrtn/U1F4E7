@@ -130,6 +130,8 @@ pub struct ActionLog {
     pub action_taken: String,
     pub message_id: Option<String>,
     pub draft_id: Option<String>,
+    pub event_id: Option<String>,
+    pub action_status: String,
     pub created_at: String,
 }
 
@@ -372,6 +374,34 @@ pub struct Event {
     pub subject: Option<String>,
     pub snippet: Option<String>,
     pub payload: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub secure_pending: bool,
+    pub acked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRoute {
+    pub id: String,
+    pub account_id: String,
+    pub match_expr: String,
+    pub delivery: String,
+    pub enabled: bool,
+    pub priority: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventDelivery {
+    pub id: String,
+    pub event_id: String,
+    pub route_id: String,
+    pub delivery_id: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub last_attempt_at: Option<String>,
+    pub error_summary: Option<String>,
     pub created_at: String,
 }
 

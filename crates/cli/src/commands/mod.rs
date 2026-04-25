@@ -2,12 +2,14 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 pub mod accounts;
+pub mod actions;
 pub mod attachments;
 pub mod code;
 pub mod common;
 pub mod contacts;
 pub mod datetime;
 pub mod drafts;
+pub mod events;
 pub mod flags;
 pub mod folders;
 pub mod inbox;

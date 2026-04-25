@@ -42,31 +42,38 @@ impl Database {
             ],
         )?;
 
-        self.get_rule(&id)?
-            .ok_or_else(|| crate::errors::StoreError::Config(format!("rule not found after insert: {id}")))
+        self.get_rule(&id)?.ok_or_else(|| {
+            crate::errors::StoreError::Config(format!("rule not found after insert: {id}"))
+        })
     }
 
     pub fn get_rule(&self, id: &str) -> Result<Option<Rule>> {
         use rusqlite::OptionalExtension;
-        let rule = self.conn().query_row(
-            "SELECT id, account_id, name, match_expr, action, enabled, priority,
+        let rule = self
+            .conn()
+            .query_row(
+                "SELECT id, account_id, name, match_expr, action, enabled, priority,
                     stop, sieve_exportable, hit_count, last_hit_at, created_at, updated_at
              FROM rules WHERE id = ?1",
-            params![id],
-            Self::map_rule,
-        ).optional()?;
+                params![id],
+                Self::map_rule,
+            )
+            .optional()?;
         Ok(rule)
     }
 
     pub fn find_rule_by_name(&self, account_id: &str, name: &str) -> Result<Option<Rule>> {
         use rusqlite::OptionalExtension;
-        let rule = self.conn().query_row(
-            "SELECT id, account_id, name, match_expr, action, enabled, priority,
+        let rule = self
+            .conn()
+            .query_row(
+                "SELECT id, account_id, name, match_expr, action, enabled, priority,
                     stop, sieve_exportable, hit_count, last_hit_at, created_at, updated_at
              FROM rules WHERE account_id = ?1 AND name = ?2",
-            params![account_id, name],
-            Self::map_rule,
-        ).optional()?;
+                params![account_id, name],
+                Self::map_rule,
+            )
+            .optional()?;
         Ok(rule)
     }
 
@@ -109,10 +116,9 @@ impl Database {
     }
 
     pub fn delete_rule(&self, id: &str) -> Result<bool> {
-        let rows = self.conn().execute(
-            "DELETE FROM rules WHERE id = ?1",
-            params![id],
-        )?;
+        let rows = self
+            .conn()
+            .execute("DELETE FROM rules WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
@@ -216,7 +222,15 @@ mod tests {
     #[test]
     fn find_by_name() {
         let db = Database::open_memory().unwrap();
-        db.create_rule("acct1", "test-rule", r#"{"from":"*@x"}"#, r#"{"move":"Y"}"#, 100, false).unwrap();
+        db.create_rule(
+            "acct1",
+            "test-rule",
+            r#"{"from":"*@x"}"#,
+            r#"{"move":"Y"}"#,
+            100,
+            false,
+        )
+        .unwrap();
 
         let found = db.find_rule_by_name("acct1", "test-rule").unwrap();
         assert!(found.is_some());

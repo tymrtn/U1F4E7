@@ -32,13 +32,17 @@ fn parse_action(s: &str) -> Result<Action> {
             "snooze" => Ok(Action::Snooze(arg.to_string())),
             "add_tag" | "addtag" | "tag" => Ok(Action::AddTag(arg.to_string())),
             "webhook" => Ok(Action::Webhook(arg.to_string())),
-            _ => bail!("unknown action type '{kind}'. Use: move, flag, unflag, snooze, tag, webhook, delete, unsubscribe"),
+            _ => bail!(
+                "unknown action type '{kind}'. Use: move, flag, unflag, snooze, tag, webhook, delete, unsubscribe"
+            ),
         }
     } else {
         match s.to_lowercase().as_str() {
             "delete" => Ok(Action::Delete),
             "unsubscribe" => Ok(Action::Unsubscribe),
-            _ => bail!("unknown action '{s}'. Use: move=<folder>, flag=<name>, delete, unsubscribe"),
+            _ => {
+                bail!("unknown action '{s}'. Use: move=<folder>, flag=<name>, delete, unsubscribe")
+            }
         }
     }
 }
@@ -144,7 +148,14 @@ pub fn run_create(
     }
 
     let rule = db
-        .create_rule(account_id, name, &match_expr_json, &action_json, priority, stop)
+        .create_rule(
+            account_id,
+            name,
+            &match_expr_json,
+            &action_json,
+            priority,
+            stop,
+        )
         .context("failed to create rule")?;
 
     if json {
@@ -154,7 +165,10 @@ pub fn run_create(
         println!("  ID:       {}", rule.id);
         println!("  Priority: {}", rule.priority);
         println!("  Stop:     {}", rule.stop);
-        println!("  Sieve:    {}", if rule.sieve_exportable { "yes" } else { "no" });
+        println!(
+            "  Sieve:    {}",
+            if rule.sieve_exportable { "yes" } else { "no" }
+        );
         println!("  Match:    {match_expr_json}");
         println!("  Action:   {action_json}");
     }
@@ -163,17 +177,11 @@ pub fn run_create(
 }
 
 /// `envelope rule list` — list all rules for an account.
-pub fn run_list(
-    account: Option<&str>,
-    json: bool,
-    _backend: CredentialBackend,
-) -> Result<()> {
+pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) -> Result<()> {
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
 
-    let rules = db
-        .list_rules(&acct.id)
-        .context("failed to list rules")?;
+    let rules = db.list_rules(&acct.id).context("failed to list rules")?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&rules)?);
@@ -199,7 +207,13 @@ pub fn run_list(
             };
             println!(
                 "{:<8}  {:<3}  {:<5}  {:<4}  {:<6}  {:<30}  {}",
-                r.priority, enabled_mark, stop_mark, r.hit_count, sieve_mark, name_display, r.action,
+                r.priority,
+                enabled_mark,
+                stop_mark,
+                r.hit_count,
+                sieve_mark,
+                name_display,
+                r.action,
             );
         }
         println!("\n{} rule(s)", rules.len());
@@ -275,7 +289,14 @@ pub async fn run_test(
         println!("Testing UID {uid} ({folder})");
         println!("  From:    {}", msg.from_addr);
         println!("  Subject: {}", msg.subject);
-        println!("  Tags:    {}", if ctx.tags.is_empty() { "(none)".to_string() } else { ctx.tags.join(", ") });
+        println!(
+            "  Tags:    {}",
+            if ctx.tags.is_empty() {
+                "(none)".to_string()
+            } else {
+                ctx.tags.join(", ")
+            }
+        );
         println!(
             "  Scores:  {}",
             if ctx.scores.is_empty() {
@@ -335,7 +356,10 @@ pub async fn run_apply(
 
     if enabled_rules.is_empty() {
         if json {
-            println!("{}", serde_json::json!({"processed": 0, "actions": 0, "message": "no enabled rules"}));
+            println!(
+                "{}",
+                serde_json::json!({"processed": 0, "actions": 0, "message": "no enabled rules"})
+            );
         } else {
             println!("No enabled rules — nothing to do");
         }
@@ -377,7 +401,15 @@ pub async fn run_apply(
             };
 
             // Execute the action
-            let action_result = execute_action(&mut client, &action, uid, folder, Some(&rule.name), Some(&ctx)).await;
+            let action_result = execute_action(
+                &mut client,
+                &action,
+                uid,
+                folder,
+                Some(&rule.name),
+                Some(&ctx),
+            )
+            .await;
 
             match &action_result {
                 Ok(desc) => {
@@ -414,10 +446,7 @@ pub async fn run_apply(
 
         // Progress output (non-JSON only, every 50 messages)
         if !json && (i + 1) % 50 == 0 {
-            eprintln!(
-                "processed {}/{total}, {actions_taken} actions taken",
-                i + 1,
-            );
+            eprintln!("processed {}/{total}, {actions_taken} actions taken", i + 1,);
         }
     }
 
@@ -431,9 +460,7 @@ pub async fn run_apply(
             }))?
         );
     } else {
-        println!(
-            "processed {total}/{total}, {actions_taken} action(s) taken"
-        );
+        println!("processed {total}/{total}, {actions_taken} action(s) taken");
     }
 
     Ok(())
@@ -481,7 +508,9 @@ async fn execute_action(
         }
         Action::Snooze(_until) => {
             // Snooze requires full snooze machinery; log as unsupported in batch.
-            Ok(format!("snooze:{_until} (use 'envelope snooze set' instead)"))
+            Ok(format!(
+                "snooze:{_until} (use 'envelope snooze set' instead)"
+            ))
         }
         Action::Unsubscribe => {
             // Unsubscribe requires HTTP/SMTP; log as unsupported in batch.
@@ -535,7 +564,10 @@ pub fn run_enable(
     db.enable_rule(&rule.id).context("failed to enable rule")?;
 
     if json {
-        println!("{}", serde_json::json!({"action": "enable", "name": name, "id": rule.id}));
+        println!(
+            "{}",
+            serde_json::json!({"action": "enable", "name": name, "id": rule.id})
+        );
     } else {
         println!("Enabled rule: {name}");
     }
@@ -562,7 +594,10 @@ pub fn run_disable(
         .context("failed to disable rule")?;
 
     if json {
-        println!("{}", serde_json::json!({"action": "disable", "name": name, "id": rule.id}));
+        println!(
+            "{}",
+            serde_json::json!({"action": "disable", "name": name, "id": rule.id})
+        );
     } else {
         println!("Disabled rule: {name}");
     }
@@ -588,7 +623,10 @@ pub fn run_delete(
     db.delete_rule(&rule.id).context("failed to delete rule")?;
 
     if json {
-        println!("{}", serde_json::json!({"action": "delete", "name": name, "id": rule.id}));
+        println!(
+            "{}",
+            serde_json::json!({"action": "delete", "name": name, "id": rule.id})
+        );
     } else {
         println!("Deleted rule: {name}");
     }
@@ -651,13 +689,8 @@ mod tests {
 }
 
 /// Export rules as a Sieve script.
-pub fn run_export(
-    account: Option<&str>,
-    json: bool,
-    _backend: CredentialBackend,
-) -> Result<()> {
-    let db = envelope_email_store::Database::open_default()
-        .context("failed to open database")?;
+pub fn run_export(account: Option<&str>, json: bool, _backend: CredentialBackend) -> Result<()> {
+    let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
     let account_email = acct.username;
 
