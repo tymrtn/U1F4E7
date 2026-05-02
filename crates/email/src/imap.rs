@@ -32,6 +32,19 @@ fn validate_imap_input(s: &str) -> Result<(), ImapError> {
     Ok(())
 }
 
+/// Format a mailbox name as a quoted IMAP string for commands that async-imap
+/// does not quote internally, such as UID COPY.
+///
+/// async-imap quotes mailbox arguments for SELECT/STATUS, but `uid_copy` places
+/// the target mailbox directly into the command. Passing a bare mailbox with a
+/// space, e.g. WorkMail/Exchange `Junk E-mail`, makes the server parse only the
+/// first atom and fail with "folder not found". Quoting is valid for ordinary
+/// mailbox names too and preserves literal names while escaping quoted-string
+/// metacharacters.
+fn imap_mailbox_arg(mailbox: &str) -> String {
+    format!("\"{}\"", mailbox.replace('\\', r"\\").replace('"', "\\\""))
+}
+
 pub type ImapSession = Session<TlsStream<TcpStream>>;
 
 /// IMAP client wrapping an authenticated async-imap session.
@@ -672,9 +685,11 @@ pub async fn move_message(
 
     let uid_str = uid.to_string();
 
+    let quoted_to = imap_mailbox_arg(to);
+
     client
         .session
-        .uid_copy(&uid_str, to)
+        .uid_copy(&uid_str, &quoted_to)
         .await
         .map_err(|e| ImapError::Protocol(format!("UID COPY {uid} to {to}: {e}")))?;
 
@@ -721,9 +736,12 @@ pub async fn copy_message(
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {from}: {e}")))?;
 
+    let uid_str = uid.to_string();
+    let quoted_to = imap_mailbox_arg(to);
+
     client
         .session
-        .uid_copy(&uid.to_string(), to)
+        .uid_copy(&uid_str, &quoted_to)
         .await
         .map_err(|e| ImapError::Protocol(format!("UID COPY {uid} to {to}: {e}")))?;
 
@@ -968,6 +986,16 @@ fn imap_envelope_addresses(addrs: &Option<Vec<imap_proto::types::Address<'_>>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_imap_mailbox_arg_quotes_workmail_junk_folder() {
+        assert_eq!(imap_mailbox_arg("Junk E-mail"), "\"Junk E-mail\"");
+    }
+
+    #[test]
+    fn test_imap_mailbox_arg_escapes_quoted_string_metacharacters() {
+        assert_eq!(imap_mailbox_arg(r#"Foo\"Bar"#), r#""Foo\\\"Bar""#);
+    }
 
     /// Regression guard: reading a message must NEVER auto-set the \Seen flag.
     ///
