@@ -9,6 +9,7 @@ pub mod event_types;
 pub mod folders;
 pub mod idle;
 pub mod imap;
+pub mod migrate;
 pub mod provider;
 pub mod reply;
 pub mod rules;

@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-dashboard"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -705,6 +705,7 @@ dependencies = [
  "envelope-email-transport",
  "futures-util",
  "mime_guess",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
@@ -715,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -738,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-imap",

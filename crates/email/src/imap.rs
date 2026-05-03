@@ -5,6 +5,7 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use async_imap::Session;
+use chrono::{DateTime, FixedOffset};
 use envelope_email_store::models::{
     AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary,
 };
@@ -46,6 +47,40 @@ fn imap_mailbox_arg(mailbox: &str) -> String {
 }
 
 pub type ImapSession = Session<TlsStream<TcpStream>>;
+
+#[derive(Debug, Clone)]
+pub struct RawMessage {
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub flags: Vec<String>,
+    pub internal_date: Option<DateTime<FixedOffset>>,
+    pub size: u32,
+    pub rfc822: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageHeader {
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SelectedMailbox {
+    pub exists: u32,
+    pub uid_validity: Option<u32>,
+    pub uid_next: Option<u32>,
+}
+
+impl SelectedMailbox {
+    pub fn uidvalidity_key(self) -> u32 {
+        self.uid_validity.unwrap_or(0)
+    }
+
+    pub fn last_uid(self) -> Option<u32> {
+        self.uid_next.and_then(|uid_next| uid_next.checked_sub(1))
+    }
+}
 
 /// IMAP client wrapping an authenticated async-imap session.
 pub struct ImapClient {
@@ -468,15 +503,210 @@ pub async fn append_message(
     flags: &str,
     rfc822: &[u8],
 ) -> Result<(), ImapError> {
+    append_message_with_date(client, folder, flags, None, rfc822).await
+}
+
+/// Append a raw RFC822 message to a folder with flags and optional INTERNALDATE.
+pub async fn append_message_with_date(
+    client: &mut ImapClient,
+    folder: &str,
+    flags: &str,
+    internal_date: Option<DateTime<FixedOffset>>,
+    rfc822: &[u8],
+) -> Result<(), ImapError> {
     validate_imap_input(folder)?;
+    let date = internal_date.map(|d| d.format("%d-%b-%Y %H:%M:%S %z").to_string());
 
     client
         .session
-        .append(folder, Some(flags), None, rfc822)
+        .append(folder, Some(flags), date.as_deref(), rfc822)
         .await
         .map_err(|e| ImapError::Protocol(format!("APPEND to {folder}: {e}")))?;
 
     debug!("appended message to {folder} ({} bytes)", rfc822.len());
+    Ok(())
+}
+
+/// Select a folder and return migration-relevant mailbox metadata.
+pub async fn select_folder_info(
+    client: &mut ImapClient,
+    folder: &str,
+) -> Result<SelectedMailbox, ImapError> {
+    validate_imap_input(folder)?;
+    let mailbox = client
+        .session
+        .select(folder)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
+
+    Ok(SelectedMailbox {
+        exists: mailbox.exists,
+        uid_validity: mailbox.uid_validity,
+        uid_next: mailbox.uid_next,
+    })
+}
+
+/// Create a folder if it does not already exist.
+pub async fn create_folder_if_missing(
+    client: &mut ImapClient,
+    folder: &str,
+) -> Result<(), ImapError> {
+    validate_imap_input(folder)?;
+    let folders = list_folders(client).await?;
+    if folders.iter().any(|f| f == folder) {
+        return Ok(());
+    }
+    client
+        .session
+        .create(folder)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("CREATE {folder}: {e}")))?;
+    Ok(())
+}
+
+/// Return whether a folder currently exists without creating it.
+pub async fn folder_exists(client: &mut ImapClient, folder: &str) -> Result<bool, ImapError> {
+    validate_imap_input(folder)?;
+    let folders = list_folders(client).await?;
+    Ok(folders.iter().any(|f| f == folder))
+}
+
+/// Fetch all raw messages from a folder without marking them seen.
+pub async fn fetch_raw_messages(
+    client: &mut ImapClient,
+    folder: &str,
+) -> Result<Vec<RawMessage>, ImapError> {
+    let selected = select_folder_info(client, folder).await?;
+    if selected.exists == 0 {
+        return Ok(Vec::new());
+    }
+
+    let uid_sets = if let Some(last_uid) = selected.last_uid() {
+        crate::migrate::uid_range_batches(1, last_uid, crate::migrate::DEFAULT_BATCH_SIZE)
+    } else {
+        let uids = list_selected_uids(client).await?;
+        crate::migrate::uid_sequence_set_batches(&uids, crate::migrate::DEFAULT_BATCH_SIZE)
+    };
+
+    let mut out = Vec::new();
+    for uid_set in uid_sets {
+        out.extend(fetch_raw_messages_selected_uid_set(client, folder, &uid_set).await?);
+    }
+    Ok(out)
+}
+
+/// Return all UIDs in the currently selected mailbox.
+pub async fn list_selected_uids(client: &mut ImapClient) -> Result<Vec<u32>, ImapError> {
+    let uid_set = client
+        .session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID SEARCH ALL: {e}")))?;
+    let mut uids: Vec<u32> = uid_set.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
+}
+
+/// Fetch a batch of raw messages from the currently selected folder.
+pub async fn fetch_raw_messages_selected_uid_set(
+    client: &mut ImapClient,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<RawMessage>, ImapError> {
+    validate_imap_input(folder)?;
+    validate_uid_set(uid_set)?;
+
+    let messages = client
+        .session
+        .uid_fetch(uid_set, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])")
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set}: {e}")))?;
+    let mut out = Vec::new();
+    let mut stream = messages;
+    while let Some(item) = stream.next().await {
+        let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+        let uid = fetch
+            .uid
+            .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
+        let body = fetch
+            .body()
+            .ok_or_else(|| missing_body_protocol_error(folder, uid_set, Some(uid)))?;
+        let parsed = mail_parser::MessageParser::default().parse(body);
+        out.push(RawMessage {
+            uid,
+            message_id: parsed.and_then(|m| m.message_id().map(|s| s.to_string())),
+            flags: fetch.flags().map(|f| format!("{f:?}")).collect(),
+            internal_date: fetch.internal_date(),
+            size: fetch.size.unwrap_or(body.len() as u32),
+            rfc822: body.to_vec(),
+        });
+    }
+    Ok(out)
+}
+
+/// Build a protocol error for a UID FETCH response that has no `BODY.PEEK[]`
+/// section. Migration must surface this rather than silently under-counting —
+/// every fetched UID has to round-trip a body or fail loudly.
+pub(crate) fn missing_body_protocol_error(
+    folder: &str,
+    uid_set: &str,
+    uid: Option<u32>,
+) -> ImapError {
+    let location = match uid {
+        Some(uid) => format!("UID {uid}"),
+        None => "unknown UID".to_string(),
+    };
+    ImapError::Protocol(format!(
+        "UID FETCH {folder} {uid_set} returned no BODY.PEEK[] for {location}"
+    ))
+}
+
+/// Fetch only migration-planning headers for a batch of source UIDs.
+pub async fn fetch_message_headers_selected_uid_set(
+    client: &mut ImapClient,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<MessageHeader>, ImapError> {
+    validate_imap_input(folder)?;
+    validate_uid_set(uid_set)?;
+
+    let messages = client
+        .session
+        .uid_fetch(
+            uid_set,
+            "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set} HEADER: {e}")))?;
+    let mut out = Vec::new();
+    let mut stream = messages;
+    while let Some(item) = stream.next().await {
+        let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+        let uid = fetch
+            .uid
+            .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
+        let message_id = fetch.body().and_then(|body| {
+            mail_parser::MessageParser::default()
+                .parse(body)
+                .and_then(|m| m.message_id().map(|s| s.to_string()))
+        });
+        out.push(MessageHeader {
+            uid,
+            message_id,
+            size: fetch.size,
+        });
+    }
+    Ok(out)
+}
+
+fn validate_uid_set(uid_set: &str) -> Result<(), ImapError> {
+    if uid_set.is_empty()
+        || !uid_set
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b',' | b'*'))
+    {
+        return Err(ImapError::Protocol("invalid UID set".to_string()));
+    }
     Ok(())
 }
 
@@ -489,7 +719,6 @@ pub async fn find_uid_by_message_id(
     message_id: &str,
 ) -> Result<Option<u32>, ImapError> {
     validate_imap_input(folder)?;
-    validate_imap_input(message_id)?;
 
     client
         .session
@@ -497,7 +726,7 @@ pub async fn find_uid_by_message_id(
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
-    let search_query = format!("HEADER Message-ID {message_id}");
+    let search_query = message_id_search_query(message_id)?;
     let uid_set = client
         .session
         .uid_search(&search_query)
@@ -506,6 +735,26 @@ pub async fn find_uid_by_message_id(
 
     let uid = uid_set.into_iter().next();
     Ok(uid)
+}
+
+fn message_id_search_query(message_id: &str) -> Result<String, ImapError> {
+    Ok(format!(
+        "HEADER Message-ID {}",
+        imap_quoted_string_arg(message_id)?
+    ))
+}
+
+fn imap_quoted_string_arg(value: &str) -> Result<String, ImapError> {
+    if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+        return Err(ImapError::Protocol(
+            "invalid characters in quoted IMAP string".to_string(),
+        ));
+    }
+
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', r"\\").replace('"', "\\\"")
+    ))
 }
 
 /// Fetch List-Unsubscribe and List-Unsubscribe-Post headers for a message.
@@ -995,6 +1244,64 @@ mod tests {
     #[test]
     fn test_imap_mailbox_arg_escapes_quoted_string_metacharacters() {
         assert_eq!(imap_mailbox_arg(r#"Foo\"Bar"#), r#""Foo\\\"Bar""#);
+    }
+
+    #[test]
+    fn test_message_id_search_query_quotes_plain_message_id() {
+        assert_eq!(
+            message_id_search_query("<abc@example.com>").unwrap(),
+            r#"HEADER Message-ID "<abc@example.com>""#
+        );
+    }
+
+    #[test]
+    fn test_message_id_search_query_escapes_untrusted_syntax() {
+        assert_eq!(
+            message_id_search_query(r#"<a" OR ALL \ "b@example.com>"#).unwrap(),
+            r#"HEADER Message-ID "<a\" OR ALL \\ \"b@example.com>""#
+        );
+    }
+
+    #[test]
+    fn test_message_id_search_query_rejects_crlf() {
+        assert!(message_id_search_query("<a@example.com>\r\nALL").is_err());
+    }
+
+    #[test]
+    fn test_missing_body_protocol_error_includes_uid_and_folder() {
+        let err = missing_body_protocol_error("Junk E-mail", "1:25", Some(42));
+        let ImapError::Protocol(msg) = err else {
+            panic!("expected Protocol variant");
+        };
+        assert!(
+            msg.contains("Junk E-mail"),
+            "expected folder in message: {msg}"
+        );
+        assert!(msg.contains("1:25"), "expected uid set in message: {msg}");
+        assert!(msg.contains("UID 42"), "expected UID in message: {msg}");
+        assert!(
+            msg.contains("BODY.PEEK"),
+            "expected reason in message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_body_protocol_error_handles_unknown_uid() {
+        let err = missing_body_protocol_error("INBOX", "1:25", None);
+        let ImapError::Protocol(msg) = err else {
+            panic!("expected Protocol variant");
+        };
+        assert!(
+            msg.contains("unknown UID"),
+            "expected unknown-uid placeholder: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_uid_set_accepts_generated_sequence_sets_only() {
+        assert!(validate_uid_set("1:25,30,*").is_ok());
+        assert!(validate_uid_set("1 UID SEARCH ALL").is_err());
+        assert!(validate_uid_set("").is_err());
     }
 
     /// Regression guard: reading a message must NEVER auto-set the \Seen flag.

@@ -85,6 +85,16 @@ pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow
             delete(handlers::messages::delete),
         )
         .route("/accounts/{id}/search", get(handlers::messages::search))
+        // Rules
+        .route("/accounts/{id}/rules", get(handlers::rules::list))
+        .route(
+            "/accounts/{id}/rules/run",
+            post(handlers::rules::run_enabled),
+        )
+        .route(
+            "/accounts/{id}/rules/test/{uid}",
+            get(handlers::rules::test_message),
+        )
         // Attachments
         .route(
             "/accounts/{id}/messages/{uid}/attachments/{filename}",
@@ -293,7 +303,11 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
 
 async fn index_page() -> Response {
     match Assets::get_file("index.html") {
-        Some(bytes) => Html(String::from_utf8_lossy(&bytes).to_string()).into_response(),
+        Some(bytes) => {
+            let html = String::from_utf8_lossy(&bytes)
+                .replace("__ENVELOPE_VERSION__", env!("CARGO_PKG_VERSION"));
+            Html(html).into_response()
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "index.html missing from embedded assets",

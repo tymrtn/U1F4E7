@@ -14,6 +14,7 @@ pub mod compose;
 pub mod drafts;
 pub mod folders;
 pub mod messages;
+pub mod rules;
 pub mod snoozed;
 pub mod stats;
 pub mod threads;

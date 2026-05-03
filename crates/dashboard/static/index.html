@@ -49,7 +49,7 @@
         </svg>
       </div>
       <h1 class="text-lg font-semibold tracking-tight">Envelope</h1>
-      <span class="text-[10px] font-mono text-mid uppercase tracking-[0.15em]">v0.3.0</span>
+      <span class="text-[10px] font-mono text-mid uppercase tracking-[0.15em]">v__ENVELOPE_VERSION__</span>
     </div>
     <div class="flex items-center gap-3">
       <select id="account-switcher" class="input-field !py-1.5 !text-xs w-[240px]">
@@ -74,7 +74,7 @@
         <p id="stat-accounts" class="text-xl font-semibold tabular-nums font-mono">--</p>
       </div>
       <div class="bg-paper px-5 py-3">
-        <p class="section-label mb-0.5">Inbox Unread</p>
+        <p class="section-label mb-0.5">Current inbox unread</p>
         <p id="stat-unread" class="text-xl font-semibold tabular-nums font-mono text-accent">--</p>
       </div>
       <div class="bg-paper px-5 py-3">
@@ -82,7 +82,7 @@
         <p id="stat-snoozed" class="text-xl font-semibold tabular-nums font-mono text-pending">--</p>
       </div>
       <div class="bg-paper px-5 py-3">
-        <p class="section-label mb-0.5">Drafts</p>
+        <p class="section-label mb-0.5">Current drafts</p>
         <p id="stat-drafts" class="text-xl font-semibold tabular-nums font-mono">--</p>
       </div>
     </div>
@@ -104,6 +104,23 @@
       </div>
 
       <div>
+        <div class="flex items-center justify-between mb-2">
+          <p class="section-label">Rules Control Plane</p>
+          <button id="btn-refresh-rules" type="button" class="text-[10px] font-mono text-mid hover:text-ink uppercase tracking-[0.15em]">Refresh</button>
+        </div>
+        <div id="rules-summary" class="border border-rule bg-white px-3 py-2 text-xs text-mid font-mono">select an account</div>
+        <div class="rules-runner mt-2 border border-rule bg-white p-2 space-y-2">
+          <div class="flex items-center gap-2">
+            <input id="rules-run-limit" type="number" min="1" max="200" value="50" class="input-field !py-1 !px-2 !text-xs" title="How many latest messages in the current folder to process. Max 200.">
+            <button id="btn-run-rules" type="button" class="btn-ghost text-xs whitespace-nowrap">Run enabled</button>
+          </div>
+          <div id="rules-run-status" class="text-[11px] font-mono text-mid">Runs enabled rules against the current folder.</div>
+          <div id="rules-run-log" class="hidden rules-run-log"></div>
+        </div>
+        <div id="rules-list" class="mt-2 space-y-2"></div>
+      </div>
+
+      <div>
         <p class="section-label mb-2">Accounts</p>
         <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule bg-white"></div>
         <button id="btn-add-account" type="button" class="btn-ghost text-xs mt-2 w-full">+ Add account</button>
@@ -118,8 +135,10 @@
           <span id="list-count" class="text-xs text-mid font-mono"></span>
         </div>
         <div class="flex items-center gap-2">
-          <input type="text" id="search-input" placeholder="IMAP search (e.g. FROM alice)" class="input-field !py-1.5 !text-xs w-[280px]">
+          <span id="search-active" class="hidden text-[10px] font-mono text-accent uppercase tracking-[0.12em]"></span>
+          <input type="text" id="search-input" placeholder="IMAP search, e.g. FROM alice SUBJECT invoice" class="input-field !py-1.5 !text-xs w-[320px]" title="Uses IMAP SEARCH syntax. Press Enter to search; Clear resets the folder view.">
           <button id="btn-search" type="button" class="btn-ghost text-xs">Search</button>
+          <button id="btn-search-clear" type="button" class="btn-ghost text-xs hidden">Clear</button>
         </div>
       </div>
 
@@ -138,11 +157,12 @@
       <p id="reader-subject" class="text-sm font-semibold truncate max-w-[380px]"></p>
     </div>
     <div class="flex items-center gap-1 text-xs font-mono">
-      <button id="btn-reader-reply" type="button" class="btn-ghost">Reply</button>
-      <button id="btn-reader-reply-all" type="button" class="btn-ghost">Reply All</button>
-      <button id="btn-reader-snooze" type="button" class="btn-ghost">Snooze</button>
-      <button id="btn-reader-mark-read" type="button" class="btn-ghost">Mark Read</button>
-      <button id="btn-reader-delete" type="button" class="btn-ghost text-warn">Delete</button>
+      <button id="btn-reader-reply" type="button" class="btn-ghost whitespace-nowrap">Reply</button>
+      <button id="btn-reader-reply-all" type="button" class="btn-ghost whitespace-nowrap">Reply All</button>
+      <button id="btn-reader-test-rules" type="button" class="btn-ghost whitespace-nowrap">Test Rules</button>
+      <button id="btn-reader-snooze" type="button" class="btn-ghost whitespace-nowrap">Snooze</button>
+      <button id="btn-reader-mark-read" type="button" class="btn-ghost whitespace-nowrap">Mark Read</button>
+      <button id="btn-reader-delete" type="button" class="btn-ghost text-warn whitespace-nowrap">Delete</button>
     </div>
   </header>
   <div class="px-5 py-3 border-b border-rule text-xs font-mono text-mid space-y-0.5">
@@ -151,6 +171,7 @@
     <div id="reader-cc-row" class="hidden"><span class="text-ink">Cc:</span> <span id="reader-cc"></span></div>
     <div><span class="text-ink">Date:</span> <span id="reader-date"></span></div>
   </div>
+  <div id="reader-rules-panel" class="hidden border-b border-rule px-5 py-3 bg-white"></div>
   <div id="reader-body" class="flex-1 overflow-auto px-5 py-4 text-sm leading-relaxed"></div>
   <div id="reader-attachments" class="border-t border-rule px-5 py-3 hidden"></div>
 </aside>

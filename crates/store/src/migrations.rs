@@ -350,6 +350,111 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
+        // ── Migration 5: migration_uid_map (v0.6.0 mailbox migration) ──
+        // Tracks copy-only IMAP-to-IMAP migrations so reruns are idempotent.
+        // No deletes are ever recorded here — source mailboxes are never
+        // mutated by the migrate command.
+        M::up(
+            "
+            CREATE TABLE IF NOT EXISTS migration_uid_map (
+                src_account_id TEXT NOT NULL,
+                dst_account_id TEXT NOT NULL,
+                src_folder TEXT NOT NULL,
+                src_uid INTEGER NOT NULL,
+                dst_folder TEXT NOT NULL,
+                dst_uid INTEGER,
+                message_id TEXT,
+                size INTEGER,
+                copied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (src_account_id, dst_account_id, src_folder, src_uid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_migration_uid_map_dst
+                ON migration_uid_map(dst_account_id, dst_folder);
+            CREATE INDEX IF NOT EXISTS idx_migration_uid_map_pair
+                ON migration_uid_map(src_account_id, dst_account_id);
+            ",
+        ),
+        // ── Migration 6: add source UIDVALIDITY to migration identity ──
+        //
+        // UID values are only stable within a folder's UIDVALIDITY epoch. Rebuild
+        // the table so future migrations can safely copy the same numeric UID
+        // after a source folder is recreated. Existing rows are assigned epoch 0
+        // because older migration records did not know their source UIDVALIDITY.
+        M::up_with_hook("", |tx: &Transaction| {
+            let has_src_uidvalidity = tx
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('migration_uid_map')
+                     WHERE name = 'src_uidvalidity'",
+                )
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                > 0;
+            if has_src_uidvalidity {
+                return Ok(());
+            }
+
+            tx.execute_batch(
+                "
+                ALTER TABLE migration_uid_map RENAME TO migration_uid_map_old;
+
+                CREATE TABLE migration_uid_map (
+                    src_account_id TEXT NOT NULL,
+                    dst_account_id TEXT NOT NULL,
+                    src_folder TEXT NOT NULL,
+                    src_uidvalidity INTEGER NOT NULL DEFAULT 0,
+                    src_uid INTEGER NOT NULL,
+                    dst_folder TEXT NOT NULL,
+                    dst_uidvalidity INTEGER,
+                    dst_uid INTEGER,
+                    message_id TEXT,
+                    size INTEGER,
+                    copied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (
+                        src_account_id,
+                        dst_account_id,
+                        src_folder,
+                        src_uidvalidity,
+                        src_uid
+                    )
+                );
+
+                INSERT INTO migration_uid_map (
+                    src_account_id,
+                    dst_account_id,
+                    src_folder,
+                    src_uidvalidity,
+                    src_uid,
+                    dst_folder,
+                    dst_uidvalidity,
+                    dst_uid,
+                    message_id,
+                    size,
+                    copied_at
+                )
+                SELECT
+                    src_account_id,
+                    dst_account_id,
+                    src_folder,
+                    0,
+                    src_uid,
+                    dst_folder,
+                    NULL,
+                    dst_uid,
+                    message_id,
+                    size,
+                    copied_at
+                FROM migration_uid_map_old;
+
+                DROP TABLE migration_uid_map_old;
+
+                CREATE INDEX IF NOT EXISTS idx_migration_uid_map_dst
+                    ON migration_uid_map(dst_account_id, dst_folder);
+                CREATE INDEX IF NOT EXISTS idx_migration_uid_map_pair
+                    ON migration_uid_map(src_account_id, dst_account_id);
+                ",
+            )?;
+            Ok(())
+        }),
     ])
 }
 
@@ -383,6 +488,40 @@ mod tests {
         assert!(tables.contains(&"rules".to_string()));
         assert!(tables.contains(&"event_routes".to_string()));
         assert!(tables.contains(&"event_deliveries".to_string()));
+        assert!(tables.contains(&"migration_uid_map".to_string()));
+    }
+
+    #[test]
+    fn migration_uid_map_columns_exist() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('migration_uid_map') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for required in [
+            "src_account_id",
+            "dst_account_id",
+            "src_folder",
+            "src_uidvalidity",
+            "src_uid",
+            "dst_folder",
+            "dst_uidvalidity",
+            "dst_uid",
+            "message_id",
+            "size",
+            "copied_at",
+        ] {
+            assert!(
+                columns.contains(&required.to_string()),
+                "missing column: {required}"
+            );
+        }
     }
 
     #[test]
@@ -391,6 +530,55 @@ mod tests {
         run(&mut conn).unwrap();
         // Running again should be a no-op
         run(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn migration_uid_map_v5_rows_upgrade_with_epoch_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE migration_uid_map (
+                src_account_id TEXT NOT NULL,
+                dst_account_id TEXT NOT NULL,
+                src_folder TEXT NOT NULL,
+                src_uid INTEGER NOT NULL,
+                dst_folder TEXT NOT NULL,
+                dst_uid INTEGER,
+                message_id TEXT,
+                size INTEGER,
+                copied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (src_account_id, dst_account_id, src_folder, src_uid)
+            );
+            INSERT INTO migration_uid_map (
+                src_account_id, dst_account_id, src_folder, src_uid,
+                dst_folder, dst_uid, message_id, size, copied_at
+            ) VALUES ('a', 'b', 'INBOX', 42, 'INBOX', NULL, NULL, 10, '2026-01-01 00:00:00');
+            PRAGMA user_version = 6;
+            ",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let row: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT src_uidvalidity, dst_uidvalidity FROM migration_uid_map
+                 WHERE src_account_id = 'a' AND dst_account_id = 'b'
+                   AND src_folder = 'INBOX' AND src_uid = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (0, None));
+
+        conn.execute(
+            "INSERT INTO migration_uid_map (
+                src_account_id, dst_account_id, src_folder, src_uidvalidity, src_uid,
+                dst_folder, dst_uidvalidity, dst_uid, message_id, size
+             ) VALUES ('a', 'b', 'INBOX', 999, 42, 'INBOX', NULL, NULL, NULL, 10)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

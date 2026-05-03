@@ -225,6 +225,12 @@ enum Commands {
         account: Option<String>,
     },
 
+    /// Copy mail between two configured IMAP accounts
+    Migrate {
+        #[command(subcommand)]
+        subcommand: MigrateCmd,
+    },
+
     /// Manage attachments
     Attachment {
         #[command(subcommand)]
@@ -834,6 +840,46 @@ enum RuleCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum MigrateCmd {
+    /// Show source folders selected for migration
+    Folders {
+        /// Source account ID or email
+        #[arg(long = "from")]
+        from: String,
+        /// Destination account ID or email
+        #[arg(long = "to")]
+        to: String,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+    },
+    /// Copy selected folders/messages from source to destination
+    Run {
+        /// Source account ID or email
+        #[arg(long = "from")]
+        from: String,
+        /// Destination account ID or email
+        #[arg(long = "to")]
+        to: String,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Plan only; do not append or write migration state
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of source messages fetched and appended per batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+}
+
 #[derive(Subcommand)]
 enum ContactsCmd {
     /// Add a contact
@@ -1019,6 +1065,7 @@ fn main() {
         Commands::Folders { account } => {
             commands::folders::run(account.as_deref(), cli.json, backend)
         }
+        Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
                 uid,

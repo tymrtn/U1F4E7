@@ -12,6 +12,7 @@ pub mod errors;
 pub mod event_routes;
 pub mod events;
 pub mod license_store;
+pub mod migration;
 pub mod migrations;
 pub mod models;
 pub mod rule_store;

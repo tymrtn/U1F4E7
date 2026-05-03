@@ -23,6 +23,8 @@ const state = {
   pendingAttachments: [],
   bodyFormat: 'text',
   showAllAccounts: false,
+  searchQuery: '',
+  rules: [],
 };
 
 // ── Fetch helper ───────────────────────────────────────────────────
@@ -68,15 +70,297 @@ function toast(message, kind = '') {
   setTimeout(() => t.remove(), 4000);
 }
 
-function setRefresh(text) { $('last-refresh').textContent = text; }
+function setRefresh(text) {
+  const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  $('last-refresh').textContent = text === 'ok' ? `ok · ${stamp}` : text;
+}
+
+function setStat(id, value) {
+  $(id).textContent = value === undefined || value === null ? 'unavailable' : String(value);
+}
+
+function normalizeFolderName(name) {
+  return String(name || '').toLowerCase().replace(/^\[gmail\]\//, '').replace(/^\[mailbox\]\//, '');
+}
+
+function displayFolderName(name) {
+  const raw = String(name || '');
+  const normalized = normalizeFolderName(raw);
+  const aliases = {
+    'inbox': 'Inbox',
+    'all mail': 'All Mail',
+    'sent mail': 'Sent',
+    'sent': 'Sent',
+    'drafts': 'Drafts',
+    'spam': 'Spam',
+    'junk': 'Junk',
+    'trash': 'Trash',
+    'bin': 'Trash',
+  };
+  return aliases[normalized] || raw.replace(/^\[Gmail\]\//, '').replace(/^\[Mailbox\]\//, '');
+}
+
+function folderMeta(folderName) {
+  return state.folders.find(f => f.folder === folderName) || null;
+}
+
+function findFolderByKind(kind) {
+  return state.folders.find(f => normalizeFolderName(f.folder) === kind) || null;
+}
+
+function folderCountText(f) {
+  if (!f) return 'unavailable';
+  const unseen = f.unseen || 0;
+  const exists = f.exists || 0;
+  return unseen > 0 ? `${unseen} unread / ${exists} total` : `${exists} total`;
+}
+
+function updateCurrentFolderStats() {
+  const inbox = findFolderByKind('inbox');
+  const drafts = findFolderByKind('drafts');
+  setStat('stat-unread', inbox ? (inbox.unseen || 0) : null);
+  setStat('stat-drafts', drafts ? (drafts.exists || 0) : null);
+}
+
+function setSearchState(query) {
+  state.searchQuery = query || '';
+  const active = $('search-active');
+  const clear = $('btn-search-clear');
+  if (state.searchQuery) {
+    active.textContent = 'filtered';
+    active.title = state.searchQuery;
+    active.classList.remove('hidden');
+    clear.classList.remove('hidden');
+  } else {
+    active.textContent = '';
+    active.title = '';
+    active.classList.add('hidden');
+    clear.classList.add('hidden');
+  }
+}
+
+function ruleActionText(action) {
+  if (!action) return 'no action';
+  try {
+    const parsed = typeof action === 'string' ? JSON.parse(action) : action;
+    if (typeof parsed === 'string') return parsed;
+    const entries = Object.entries(parsed);
+    if (entries.length === 0) return JSON.stringify(parsed);
+    const [kind, value] = entries[0];
+    if (value === null || value === undefined) return kind;
+    return `${kind} → ${value}`;
+  } catch (_) {
+    return String(action);
+  }
+}
+
+function ruleMatchText(matchExpr) {
+  if (!matchExpr) return 'match expression unavailable';
+  try {
+    const parsed = typeof matchExpr === 'string' ? JSON.parse(matchExpr) : matchExpr;
+    return JSON.stringify(parsed);
+  } catch (_) {
+    return String(matchExpr);
+  }
+}
+
+function currentRulesCli() {
+  if (!state.currentAccount) return '';
+  return `envelope rule list --account ${state.currentAccount.username || state.currentAccount.id} --json`;
+}
+
+function copyText(text) {
+  if (!text) return;
+  navigator.clipboard?.writeText(text).then(
+    () => toast('Copied CLI command', 'success'),
+    () => toast(text, 'error')
+  );
+}
+
+// ── Rules ──────────────────────────────────────────────────────────
+async function loadRules() {
+  const summary = $('rules-summary');
+  const list = $('rules-list');
+  clear(list);
+  if (!state.currentAccount) {
+    summary.textContent = 'select an account';
+    state.rules = [];
+    return;
+  }
+  summary.textContent = 'loading rules…';
+  try {
+    const data = await api('GET', `/accounts/${state.currentAccount.id}/rules`);
+    state.rules = data.rules || [];
+    renderRules();
+  } catch (e) {
+    state.rules = [];
+    summary.textContent = 'rules unavailable';
+    toast('Rules: ' + e.message, 'error');
+  }
+}
+
+function renderRules() {
+  const summary = $('rules-summary');
+  const list = $('rules-list');
+  clear(list);
+  const enabled = state.rules.filter(r => r.enabled).length;
+  summary.textContent = `${state.rules.length} rule${state.rules.length === 1 ? '' : 's'} · ${enabled} enabled`;
+  $('btn-run-rules').disabled = !state.currentAccount || enabled === 0;
+
+  const cli = el('button', { class: 'btn-ghost text-xs w-full', text: 'Copy equivalent CLI' });
+  cli.onclick = () => copyText(currentRulesCli());
+  list.appendChild(cli);
+
+  if (state.rules.length === 0) {
+    list.appendChild(el('div', { class: 'rules-empty', text: 'No rules yet. Create from CLI today; visual builder is next.' }));
+    return;
+  }
+
+  for (const rule of state.rules) {
+    const card = el('div', { class: `rule-card ${rule.enabled ? 'enabled' : 'disabled'}` });
+    card.appendChild(el('div', { class: 'rule-title', text: rule.name || '(unnamed rule)', title: rule.id || '' }));
+    card.appendChild(el('div', { class: 'rule-meta', text: `priority ${rule.priority} · ${rule.enabled ? 'enabled' : 'disabled'} · ${rule.stop ? 'stop' : 'continue'} · ${rule.hit_count || 0} hits` }));
+    card.appendChild(el('div', { class: 'rule-action', text: ruleActionText(rule.action), title: rule.action || '' }));
+    card.appendChild(el('div', { class: 'rule-match', text: ruleMatchText(rule.match_expr), title: rule.match_expr || '' }));
+    list.appendChild(card);
+  }
+}
+
+function currentRulesRunCli(limit) {
+  if (!state.currentAccount) return '';
+  const account = state.currentAccount.username || state.currentAccount.id;
+  return `envelope rule run --account ${account} --folder ${state.currentFolder} --limit ${limit} --json`;
+}
+
+function boundedRulesLimit() {
+  const input = $('rules-run-limit');
+  const raw = Number.parseInt(input.value, 10);
+  const limit = Number.isFinite(raw) ? Math.max(1, Math.min(200, raw)) : 50;
+  input.value = String(limit);
+  return limit;
+}
+
+async function runEnabledRulesForCurrentFolder() {
+  if (!state.currentAccount) {
+    toast('Select an account first', 'error');
+    return;
+  }
+  if (state.currentFolder === '__snoozed__') {
+    toast('Rules run against real IMAP folders, not Snoozed', 'error');
+    return;
+  }
+  const enabled = state.rules.filter(r => r.enabled).length;
+  if (enabled === 0) {
+    toast('No enabled rules for this account', 'error');
+    return;
+  }
+  const limit = boundedRulesLimit();
+  const folderLabel = displayFolderName(state.currentFolder);
+  if (!confirm(`Run ${enabled} enabled rule${enabled === 1 ? '' : 's'} against latest ${limit} message${limit === 1 ? '' : 's'} in ${folderLabel}?`)) return;
+
+  $('btn-run-rules').disabled = true;
+  $('rules-run-status').textContent = `running ${enabled} rule${enabled === 1 ? '' : 's'} on ${folderLabel}…`;
+  const log = $('rules-run-log');
+  clear(log);
+  log.classList.add('hidden');
+
+  try {
+    const result = await api('POST', `/accounts/${state.currentAccount.id}/rules/run`, {
+      folder: state.currentFolder,
+      limit,
+    });
+    renderRuleRunResult(result, limit);
+    await loadRules();
+    await loadMessages();
+    await loadFolders();
+  } catch (e) {
+    $('rules-run-status').textContent = 'rule run failed';
+    toast('Rule run: ' + e.message, 'error');
+  } finally {
+    $('btn-run-rules').disabled = !state.currentAccount || state.rules.filter(r => r.enabled).length === 0;
+  }
+}
+
+function renderRuleRunResult(result, limit) {
+  const processed = result.processed || 0;
+  const actions = result.actions || 0;
+  $('rules-run-status').textContent = `processed ${processed}/${limit} · ${actions} action${actions === 1 ? '' : 's'}`;
+  const log = $('rules-run-log');
+  clear(log);
+  const entries = (result.log || []).slice(0, 8);
+  if (entries.length === 0) {
+    log.appendChild(el('div', { class: 'rule-run-empty', text: result.message || 'No rules matched.' }));
+  } else {
+    for (const entry of entries) {
+      const line = entry.status === 'ok'
+        ? `UID ${entry.uid}: ${entry.rule} → ${entry.action}`
+        : `UID ${entry.uid}: ${entry.rule} failed — ${entry.error}`;
+      log.appendChild(el('div', { class: `rule-run-line ${entry.status === 'ok' ? 'ok' : 'error'}`, text: line }));
+    }
+    if ((result.log || []).length > entries.length) {
+      log.appendChild(el('div', { class: 'rule-run-more', text: `+ ${(result.log || []).length - entries.length} more` }));
+    }
+  }
+  log.classList.remove('hidden');
+  toast(`Rules run complete: ${actions} action${actions === 1 ? '' : 's'}`, actions ? 'success' : '');
+}
+
+async function testRulesForCurrentMessage() {
+  if (!state.currentAccount || !state.currentMessage) return;
+  const panel = $('reader-rules-panel');
+  clear(panel);
+  panel.classList.remove('hidden');
+  panel.appendChild(el('div', { class: 'text-xs font-mono text-mid', text: 'Dry-running enabled rules…' }));
+  try {
+    const data = await api(
+      'GET',
+      `/accounts/${state.currentAccount.id}/rules/test/${state.currentMessage.uid}?folder=${encodeURIComponent(state.currentFolder)}`
+    );
+    renderRuleTestResult(data);
+  } catch (e) {
+    clear(panel);
+    panel.appendChild(el('div', { class: 'text-xs font-mono text-warn', text: 'Rule dry-run failed: ' + e.message }));
+  }
+}
+
+function renderRuleTestResult(data) {
+  const panel = $('reader-rules-panel');
+  clear(panel);
+  const matches = data.matches || [];
+  panel.appendChild(el('p', { class: 'section-label mb-2', text: 'Rule dry-run' }));
+  panel.appendChild(el('div', {
+    class: 'text-xs font-mono text-mid mb-2',
+    text: `${data.rules_evaluated || 0} enabled rule${data.rules_evaluated === 1 ? '' : 's'} evaluated · ${matches.length} match${matches.length === 1 ? '' : 'es'}`,
+  }));
+  if (matches.length === 0) {
+    panel.appendChild(el('div', { class: 'rule-test-empty', text: 'No rules would touch this message.' }));
+    return;
+  }
+  for (const match of matches) {
+    const row = el('div', { class: 'rule-test-match' });
+    row.appendChild(el('span', { class: 'rule-test-name', text: match.rule_name || '(unnamed rule)' }));
+    row.appendChild(el('span', { class: 'rule-test-action', text: ruleActionText(match.action) + (match.stop ? ' · stop' : '') }));
+    panel.appendChild(row);
+  }
+}
+
+function clearRuleTestPanel() {
+  const panel = $('reader-rules-panel');
+  clear(panel);
+  panel.classList.add('hidden');
+}
 
 // ── Stats ──────────────────────────────────────────────────────────
 async function loadStats() {
   try {
     const stats = await api('GET', '/stats');
-    $('stat-accounts').textContent = stats.accounts ?? 0;
-    $('stat-snoozed').textContent = stats.snoozed ?? 0;
-  } catch (e) { console.error('loadStats', e); }
+    setStat('stat-accounts', stats.accounts ?? 0);
+    setStat('stat-snoozed', stats.snoozed ?? 0);
+  } catch (e) {
+    setStat('stat-accounts', 'error');
+    setStat('stat-snoozed', 'error');
+    console.error('loadStats', e);
+  }
 }
 
 // ── Accounts ───────────────────────────────────────────────────────
@@ -151,7 +435,10 @@ function renderAccountsList() {
 async function selectAccount(acct) {
   state.currentAccount = acct;
   state.currentFolder = 'INBOX';
+  setSearchState('');
+  $('search-input').value = '';
   renderAccountSwitcher();
+  await loadRules();
   // Sequential — folders first (creates the IMAP connection), then messages reuse it.
   await loadFolders();
   await loadMessages();
@@ -161,6 +448,8 @@ async function selectAccount(acct) {
 async function loadFolders() {
   if (!state.currentAccount) return;
   setRefresh('loading folders…');
+  setStat('stat-unread', 'loading');
+  setStat('stat-drafts', 'loading');
   // Show loading state immediately
   const list = $('folder-list');
   clear(list);
@@ -176,6 +465,7 @@ async function loadFolders() {
       setRefresh('ok');
     }
     renderFolders(data);
+    updateCurrentFolderStats();
   } catch (e) {
     clear(list);
     const retry = el('button', { class: 'btn-ghost text-xs mt-2', text: 'Retry' });
@@ -183,6 +473,8 @@ async function loadFolders() {
     list.appendChild(el('div', { class: 'px-3 py-4 text-xs text-warn font-mono', text: 'Failed to load folders' }));
     list.appendChild(retry);
     setRefresh('error');
+    setStat('stat-unread', 'error');
+    setStat('stat-drafts', 'error');
     toast('Folders: ' + e.message, 'error');
   }
 }
@@ -200,11 +492,13 @@ function renderFolders(data) {
     const item = el('div', { class: 'folder-item' });
     if (f.folder === state.currentFolder) item.classList.add('active');
     if (f.unseen && f.unseen > 0) item.classList.add('has-unseen');
-    const unseenLabel = f.unseen && f.unseen > 0 ? `${f.unseen}/${f.exists}` : `${f.exists}`;
-    item.appendChild(el('span', { class: 'name', text: f.folder }));
+    const unseenLabel = f.unseen && f.unseen > 0 ? `${f.unseen} unread / ${f.exists}` : `${f.exists}`;
+    item.appendChild(el('span', { class: 'name', text: displayFolderName(f.folder), title: f.folder }));
     item.appendChild(el('span', { class: 'count', text: unseenLabel }));
     item.onclick = () => {
       state.currentFolder = f.folder;
+      setSearchState('');
+      $('search-input').value = '';
       loadMessages();
       renderFolders(data);
     };
@@ -230,7 +524,7 @@ function renderFolders(data) {
 async function loadMessages() {
   if (!state.currentAccount) return;
   const acctLabel = state.currentAccount ? state.currentAccount.username : '';
-  const folderLabel = state.currentFolder === '__snoozed__' ? '★ Snoozed' : state.currentFolder;
+  const folderLabel = state.currentFolder === '__snoozed__' ? '★ Snoozed' : displayFolderName(state.currentFolder);
   $('list-title').textContent = acctLabel ? `${folderLabel} — ${acctLabel}` : folderLabel;
   if (state.currentFolder === '__snoozed__') return loadSnoozed();
 
@@ -247,7 +541,9 @@ async function loadMessages() {
     );
     state.messages = data.messages || [];
     renderMessages();
-    $('list-count').textContent = `${state.messages.length} message${state.messages.length === 1 ? '' : 's'}`;
+    const meta = folderMeta(state.currentFolder);
+    const total = meta ? ` / ${folderCountText(meta)}` : '';
+    $('list-count').textContent = `Showing ${state.messages.length} latest${total}`;
     setRefresh('ok');
   } catch (e) {
     clear(list);
@@ -304,6 +600,7 @@ async function openMessage(uid) {
   $('reader-to').textContent = '';
   $('reader-date').textContent = '';
   clear($('reader-body'));
+  clearRuleTestPanel();
   $('reader-body').appendChild(el('div', { class: 'text-center text-mid py-12', text: 'Loading message…' }));
   $('reader').classList.add('show');
   try {
@@ -381,6 +678,7 @@ function formatSize(bytes) {
 function closeReader() {
   $('reader').classList.remove('show');
   state.currentMessage = null;
+  clearRuleTestPanel();
 }
 
 // ── Snoozed view ───────────────────────────────────────────────────
@@ -617,7 +915,11 @@ async function markCurrentRead() {
 async function runSearch() {
   if (!state.currentAccount) return;
   const q = $('search-input').value.trim();
-  if (!q) { loadMessages(); return; }
+  if (!q) {
+    clearSearch();
+    return;
+  }
+  setSearchState(q);
   setRefresh('searching…');
   try {
     const data = await api(
@@ -626,12 +928,20 @@ async function runSearch() {
     );
     state.messages = data.messages || [];
     renderMessages();
-    $('list-count').textContent = `${state.messages.length} results`;
+    const meta = folderMeta(state.currentFolder);
+    const scope = meta ? ` in ${folderCountText(meta)}` : '';
+    $('list-count').textContent = `${state.messages.length} search result${state.messages.length === 1 ? '' : 's'}${scope}`;
     setRefresh('ok');
   } catch (e) {
     setRefresh('error');
     toast('Search: ' + e.message, 'error');
   }
+}
+
+function clearSearch() {
+  $('search-input').value = '';
+  setSearchState('');
+  loadMessages();
 }
 
 // ── Event wiring ───────────────────────────────────────────────────
@@ -641,6 +951,8 @@ function wireEvents() {
     if (acct) selectAccount(acct);
   };
   $('btn-refresh-folders').onclick = () => { loadFolders(); loadMessages(); };
+  $('btn-refresh-rules').onclick = loadRules;
+  $('btn-run-rules').onclick = runEnabledRulesForCurrentFolder;
   $('btn-add-account').onclick = openAddAccount;
   $('btn-add-account-close').onclick = closeAddAccount;
   $('btn-discover').onclick = runDiscover;
@@ -665,17 +977,19 @@ function wireEvents() {
   $('btn-reader-close').onclick = closeReader;
   $('btn-reader-reply').onclick = () => openComposer('reply', state.currentMessage);
   $('btn-reader-reply-all').onclick = () => openComposer('reply-all', state.currentMessage);
+  $('btn-reader-test-rules').onclick = testRulesForCurrentMessage;
   $('btn-reader-delete').onclick = deleteCurrentMessage;
   $('btn-reader-mark-read').onclick = markCurrentRead;
   $('btn-reader-snooze').onclick = openSnoozeModal;
 
   $('btn-snooze-cancel').onclick = closeSnoozeModal;
   $('btn-snooze-confirm').onclick = () => {
-    toast('Snooze endpoint not yet wired in v0.3.0 dashboard — use CLI: envelope snooze set <uid> --until ...', 'error');
+    toast('Snooze from CLI for now: envelope snooze set <uid> --until ...', 'error');
     closeSnoozeModal();
   };
 
   $('btn-search').onclick = runSearch;
+  $('btn-search-clear').onclick = clearSearch;
   $('search-input').onkeydown = (e) => { if (e.key === 'Enter') runSearch(); };
 }
 
