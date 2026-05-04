@@ -546,6 +546,32 @@ pub async fn select_folder_info(
     })
 }
 
+/// Open a folder read-only via IMAP `EXAMINE` and return the same metadata
+/// as `select_folder_info`.
+///
+/// `EXAMINE` is identical to `SELECT` except the mailbox is opened read-only
+/// for the lifetime of the selected state — the server will not mutate
+/// `\Recent` or set `\Seen` on subsequent fetches, and any `STORE`/`APPEND`
+/// in this session is rejected. Backup export uses this so a source mailbox
+/// can never be mutated by Envelope while we're reading it.
+pub async fn examine_folder_info(
+    client: &mut ImapClient,
+    folder: &str,
+) -> Result<SelectedMailbox, ImapError> {
+    validate_imap_input(folder)?;
+    let mailbox = client
+        .session
+        .examine(folder)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("EXAMINE {folder}: {e}")))?;
+
+    Ok(SelectedMailbox {
+        exists: mailbox.exists,
+        uid_validity: mailbox.uid_validity,
+        uid_next: mailbox.uid_next,
+    })
+}
+
 /// Create a folder if it does not already exist.
 pub async fn create_folder_if_missing(
     client: &mut ImapClient,

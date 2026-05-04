@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod actions;
 pub mod attachments;
+pub mod backup;
 pub mod code;
 pub mod common;
 pub mod contacts;

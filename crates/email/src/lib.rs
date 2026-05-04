@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+pub mod backup;
 pub mod code_extractor;
 pub mod discovery;
 pub mod errors;

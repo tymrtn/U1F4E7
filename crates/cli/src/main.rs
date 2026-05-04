@@ -231,6 +231,12 @@ enum Commands {
         subcommand: MigrateCmd,
     },
 
+    /// Stage a mailbox to a local RFC822 archive (export / verify / restore)
+    Backup {
+        #[command(subcommand)]
+        subcommand: BackupCmd,
+    },
+
     /// Manage attachments
     Attachment {
         #[command(subcommand)]
@@ -841,6 +847,69 @@ enum RuleCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum BackupCmd {
+    /// Read source IMAP folders into a local RFC822 archive directory.
+    /// Source mailbox is read-only; export does not mutate flags or delete.
+    Export {
+        /// Account ID or email for the source mailbox
+        #[arg(long)]
+        account: String,
+        /// Destination archive directory (created if missing)
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Number of source messages fetched per IMAP batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+    /// Validate an archive's manifest, file presence, sizes, and SHA-256 checksums.
+    /// Pure local operation — does not contact any IMAP server.
+    Verify {
+        /// Archive directory previously produced by `backup export`
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Treat unreferenced ("extra") files in the archive as a hard failure
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Append archived messages to a destination IMAP account.
+    /// Append-only; no folders or messages are deleted on the destination.
+    /// `--dry-run` plans the run without contacting IMAP for APPENDs.
+    Restore {
+        /// Account ID or email for the destination mailbox
+        #[arg(long)]
+        account: String,
+        /// Archive directory previously produced by `backup export`
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Folder rename rule "SRC=DST" (repeatable). Common provider
+        /// normalizations (Junk E-mail->Junk, Sent Items->Sent,
+        /// Deleted Items->Trash) are exposed as `backup::COMMON_PROVIDER_MAPPINGS`
+        /// for documentation; restore only rewrites folders the operator passes
+        /// explicitly via this flag.
+        #[arg(long = "map")]
+        map: Vec<String>,
+        /// Plan only; do not append, create folders, or write restore state
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of messages processed per restore batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum MigrateCmd {
     /// Show source folders selected for migration
     Folders {
@@ -1066,6 +1135,7 @@ fn main() {
             commands::folders::run(account.as_deref(), cli.json, backend)
         }
         Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
+        Commands::Backup { subcommand } => commands::backup::run(subcommand, cli.json, backend),
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
                 uid,

@@ -42,6 +42,7 @@ mail-builder = "0.3"
 keyring = { version = "3", features = ["apple-native"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
+sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 dirs-next = "2"
