@@ -23,10 +23,6 @@ pub async fn list(
     };
     match db.list_drafts(&id, Some("draft"), 100, 0) {
         Ok(drafts) => Json(json!({ "drafts": drafts })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }

@@ -240,6 +240,7 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 | `envelope thread show/list/build` | Conversation threads |
 | `envelope tag set/show/list` | Score and tag messages |
 | `envelope rule create/list/test/run/export` | Mail rules (webhook actions supported) |
+| `envelope backup export/verify/restore` | Stage a mailbox to a local RFC822 archive (offline verify, append-only restore) |
 | `envelope unsubscribe <uid> [--confirm]` | List-Unsubscribe (dry-run default) |
 | `envelope watch [--webhook] [--json]` | IMAP IDLE push — real-time new mail events |
 | `envelope code [--from] [--wait 120]` | Extract verification/OTP codes from email |

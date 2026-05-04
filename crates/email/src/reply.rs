@@ -254,7 +254,10 @@ mod tests {
         let headers = build_reply_headers(&parent);
         assert_eq!(
             headers.references,
-            vec!["msg1@example.com".to_string(), "msg2@example.com".to_string()],
+            vec![
+                "msg1@example.com".to_string(),
+                "msg2@example.com".to_string()
+            ],
             "references must not contain msg2 twice"
         );
     }
@@ -264,7 +267,14 @@ mod tests {
         let parent1 = make_parent("Project update", Some("<m@x>"), "a@x", "b@x", None, None);
         assert_eq!(build_reply_headers(&parent1).subject, "Re: Project update");
 
-        let parent2 = make_parent("Re: Project update", Some("<m@x>"), "a@x", "b@x", None, None);
+        let parent2 = make_parent(
+            "Re: Project update",
+            Some("<m@x>"),
+            "a@x",
+            "b@x",
+            None,
+            None,
+        );
         assert_eq!(build_reply_headers(&parent2).subject, "Re: Project update");
 
         let parent3 = make_parent(

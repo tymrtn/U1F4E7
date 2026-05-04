@@ -8,6 +8,17 @@
 //! leading zeros.
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtpPatternId {
+    ExplicitLabel,
+    OtpStyle,
+    HtmlProminent,
+    Fallback,
+}
 
 /// Extract a verification code from email text and optional HTML body.
 ///
@@ -19,48 +30,104 @@ use regex::Regex;
 ///
 /// Returns the first code found as a String (preserving leading zeros).
 pub fn extract_code(text: &str, html: Option<&str>) -> Option<String> {
-    // 1. Explicit label pattern
-    let explicit = Regex::new(
-        r"(?i)(?:verification|confirmation|security|auth(?:entication)?|login)\s*(?:code|number|pin)\s*(?:is|:)?\s*(\d{4,8})"
-    ).unwrap();
-    if let Some(caps) = explicit.captures(text) {
-        return Some(caps[1].to_string());
+    extract_code_with_pattern(text, html).map(|(code, _)| code)
+}
+
+/// Extract a verification code and the pattern category that matched.
+pub fn extract_code_with_pattern(text: &str, html: Option<&str>) -> Option<(String, OtpPatternId)> {
+    if let Some(caps) = explicit_regex().captures(text) {
+        return Some((caps[1].to_string(), OtpPatternId::ExplicitLabel));
     }
 
-    // 2. OTP-style pattern
-    let otp = Regex::new(
-        r"(?i)(?:one.time|OTP|2FA|two.factor)\s*(?:code|password|passcode|pin)\s*(?:is|:)?\s*(\d{4,8})"
-    ).unwrap();
-    if let Some(caps) = otp.captures(text) {
-        return Some(caps[1].to_string());
+    if let Some(caps) = otp_regex().captures(text) {
+        return Some((caps[1].to_string(), OtpPatternId::OtpStyle));
     }
 
-    // 3. HTML-prominent: check bold or table-cell codes in HTML
-    if let Some(html_body) = html {
-        let html_patterns = Regex::new(
-            r"(?i)<(?:strong|b)>(\d{4,8})</(?:strong|b)>|<td[^>]*>(\d{4,8})</td>"
-        ).unwrap();
-        if let Some(caps) = html_patterns.captures(html_body) {
-            // Return whichever group matched (strong/b or td)
-            let code = caps.get(1).or_else(|| caps.get(2)).unwrap();
-            return Some(code.as_str().to_string());
-        }
+    if let Some(html_body) = html
+        && let Some(caps) = html_regex().captures(html_body)
+    {
+        let code = caps.get(1).or_else(|| caps.get(2)).unwrap();
+        return Some((code.as_str().to_string(), OtpPatternId::HtmlProminent));
     }
 
-    // 4. Fallback: isolated 4-8 digit number on its own line
-    let fallback = Regex::new(r"(?m)^\s*(\d{4,8})\s*$").unwrap();
-    if let Some(caps) = fallback.captures(text) {
-        return Some(caps[1].to_string());
+    if let Some(caps) = fallback_regex().captures(text) {
+        return Some((caps[1].to_string(), OtpPatternId::Fallback));
     }
 
     None
 }
 
+/// Parse expiry hints such as "expires in 10 minutes" or "valid for 30 seconds".
+pub fn parse_expiry_hint(text: &str) -> Option<u32> {
+    let captures = expiry_regex().captures(text)?;
+    let value: u32 = captures.get(1)?.as_str().parse().ok()?;
+    let unit = captures.get(2)?.as_str().to_ascii_lowercase();
+    let seconds = match unit.as_str() {
+        "second" | "seconds" | "sec" | "secs" => value,
+        "minute" | "minutes" | "min" | "mins" => value.saturating_mul(60),
+        "hour" | "hours" | "hr" | "hrs" => value.saturating_mul(60 * 60),
+        _ => return None,
+    };
+    Some(seconds)
+}
+
+/// Redact OTP-shaped digit sequences from text before persistence or event delivery.
+pub fn redact_codes(text: &str) -> String {
+    redaction_regex().replace_all(text, "***").into_owned()
+}
+
+fn redaction_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"\b\d(?:[ -]?\d){3,7}\b|\b\d{3}[- ]?\d{3}\b|\b\d{4,8}\b").unwrap()
+    })
+}
+
+fn explicit_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:verification|confirmation|security|auth(?:entication)?|login)\s*(?:code|number|pin)\s*(?:is|:)?\s*(\d{4,8})",
+        )
+        .unwrap()
+    })
+}
+
+fn otp_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:one.time|OTP|2FA|two.factor)\s*(?:code|password|passcode|pin)\s*(?:is|:)?\s*(\d{4,8})",
+        )
+        .unwrap()
+    })
+}
+
+fn html_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)<(?:strong|b)>(\d{4,8})</(?:strong|b)>|<td[^>]*>(\d{4,8})</td>").unwrap()
+    })
+}
+
+fn fallback_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?m)^\s*(\d{4,8})\s*$").unwrap())
+}
+
+fn expiry_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:expires?|valid(?:ity)?)(?:\s+(?:in|for))?\s+(\d{1,3})\s+(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b",
+        )
+        .unwrap()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Explicit label patterns ────────────────────────────────────
 
     #[test]
     fn explicit_verification_code() {
@@ -92,8 +159,6 @@ mod tests {
         assert_eq!(extract_code(text, None), Some("556677".to_string()));
     }
 
-    // ── OTP-style patterns ─────────────────────────────────────────
-
     #[test]
     fn otp_code() {
         let text = "Your OTP code is 482910";
@@ -111,8 +176,6 @@ mod tests {
         let text = "Use your one-time password 123456 to log in.";
         assert_eq!(extract_code(text, None), Some("123456".to_string()));
     }
-
-    // ── HTML-prominent patterns ────────────────────────────────────
 
     #[test]
     fn html_strong_code() {
@@ -135,8 +198,6 @@ mod tests {
         assert_eq!(extract_code(text, html), Some("77889900".to_string()));
     }
 
-    // ── Fallback: isolated digit line ──────────────────────────────
-
     #[test]
     fn fallback_isolated_line() {
         let text = "Hello,\n\nPlease use the following:\n\n  829104\n\nThanks!";
@@ -149,8 +210,6 @@ mod tests {
         assert_eq!(extract_code(text, None), Some("0042".to_string()));
     }
 
-    // ── No match ───────────────────────────────────────────────────
-
     #[test]
     fn no_code_in_text() {
         let text = "Hello, this is a normal email with no codes.";
@@ -159,19 +218,15 @@ mod tests {
 
     #[test]
     fn short_number_not_matched() {
-        // 3 digits is below the 4-digit minimum
         let text = "Your code is 123";
         assert_eq!(extract_code(text, None), None);
     }
 
     #[test]
     fn long_number_not_matched() {
-        // 9 digits exceeds the 8-digit maximum
         let text = "Your code is 123456789";
         assert_eq!(extract_code(text, None), None);
     }
-
-    // ── Priority ordering ──────────────────────────────────────────
 
     #[test]
     fn explicit_label_takes_priority_over_fallback() {
@@ -184,5 +239,34 @@ mod tests {
         let text = "Your OTP code is 333333";
         let html = Some("<strong>444444</strong>");
         assert_eq!(extract_code(text, html), Some("333333".to_string()));
+    }
+
+    #[test]
+    fn extract_code_reports_pattern() {
+        let (code, pattern) =
+            extract_code_with_pattern("Your verification code is 111111\n222222", None).unwrap();
+        assert_eq!(code, "111111");
+        assert_eq!(pattern, OtpPatternId::ExplicitLabel);
+    }
+
+    #[test]
+    fn parse_expiry_hint_in_minutes() {
+        assert_eq!(
+            parse_expiry_hint("This code expires in 10 minutes."),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn parse_expiry_hint_in_seconds() {
+        assert_eq!(parse_expiry_hint("Valid for 30 seconds"), Some(30));
+    }
+
+    #[test]
+    fn redact_codes_handles_contiguous_and_separated_codes() {
+        assert_eq!(
+            redact_codes("Use 123456 or 123-456 or 123 456 or 1 2 3 4 5 6"),
+            "Use *** or *** or *** or ***"
+        );
     }
 }

@@ -275,14 +275,10 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
         .get("folder")
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(25) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -306,9 +302,8 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -331,24 +326,19 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
         .get("folder")
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(25) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .map_err(|e| e.to_string())?;
 
-    let messages =
-        envelope_email_transport::imap::search(&mut client, folder, query, limit as u32)
-            .await
-            .map_err(|e| e.to_string())?;
+    let messages = envelope_email_transport::imap::search(&mut client, folder, query, limit as u32)
+        .await
+        .map_err(|e| e.to_string())?;
 
     serde_json::to_value(&messages).map_err(|e| e.to_string())
 }
@@ -370,9 +360,8 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     let reply_to = params.get("reply_to").and_then(|v| v.as_str());
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
@@ -414,9 +403,8 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -428,10 +416,7 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
 
     let headers = if reply_all {
-        envelope_email_transport::reply::build_reply_all_headers(
-            &parent,
-            &creds.account.username,
-        )
+        envelope_email_transport::reply::build_reply_all_headers(&parent, &creds.account.username)
     } else {
         envelope_email_transport::reply::build_reply_headers(&parent)
     };
@@ -476,9 +461,8 @@ async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -510,9 +494,8 @@ async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -538,9 +521,8 @@ async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value
 async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -564,9 +546,8 @@ async fn handle_tag(params: &Value, backend: CredentialBackend) -> Result<Value,
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     // Fetch message to get Message-ID
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -637,9 +618,8 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
         .ok_or("action is required")?;
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (db, creds) =
-        crate::commands::common::setup_credentials(account_arg, backend)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
 
     match action {
         "list" => {
@@ -755,11 +735,7 @@ pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = JsonRpcResponse::error(
-                    None,
-                    -32700,
-                    format!("parse error: {e}"),
-                );
+                let resp = JsonRpcResponse::error(None, -32700, format!("parse error: {e}"));
                 let mut out = stdout.lock();
                 serde_json::to_writer(&mut out, &resp)?;
                 out.write_all(b"\n")?;

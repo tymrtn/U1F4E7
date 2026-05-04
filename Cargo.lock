@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -687,6 +687,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -695,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-dashboard"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -705,6 +706,7 @@ dependencies = [
  "envelope-email-transport",
  "futures-util",
  "mime_guess",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
@@ -715,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-store"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -738,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-transport"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -756,6 +758,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -1551,6 +1555,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "litemap"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2204,6 +2214,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2528,6 +2551,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

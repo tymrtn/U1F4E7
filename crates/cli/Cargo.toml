@@ -32,3 +32,6 @@ reqwest.workspace = true
 futures-util.workspace = true
 async-imap.workspace = true
 mime_guess = "2"
+
+[dev-dependencies]
+tempfile = "3"

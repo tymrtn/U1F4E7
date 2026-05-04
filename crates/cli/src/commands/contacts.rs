@@ -109,8 +109,7 @@ pub fn run_list(
             } else {
                 last_seen
             };
-            let tags: Vec<String> =
-                serde_json::from_str(&c.tags).unwrap_or_default();
+            let tags: Vec<String> = serde_json::from_str(&c.tags).unwrap_or_default();
             let tags_display = if tags.is_empty() {
                 "-".to_string()
             } else {
@@ -145,8 +144,7 @@ pub fn run_show(
     if json {
         println!("{}", serde_json::to_string_pretty(&contact)?);
     } else {
-        let tags: Vec<String> =
-            serde_json::from_str(&contact.tags).unwrap_or_default();
+        let tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
         println!("Contact: {}", contact.email);
         println!("  ID:            {}", contact.id);
         println!(
@@ -271,9 +269,7 @@ pub async fn run_import_inbox(
             continue;
         }
 
-        let entry = sender_stats
-            .entry(from)
-            .or_insert((0, None, None));
+        let entry = sender_stats.entry(from).or_insert((0, None, None));
 
         entry.0 += 1;
 

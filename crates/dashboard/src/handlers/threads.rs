@@ -18,11 +18,7 @@ pub async fn list(
     let db = state.db.lock().await;
     match db.list_threads(Some(&account_id), 100) {
         Ok(threads) => Json(json!({ "threads": threads })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
 
@@ -38,17 +34,9 @@ pub async fn show_by_message_id(
                 "messages": messages,
             }))
             .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("db error: {e}"),
-            )
-                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "thread not found").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("db error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }

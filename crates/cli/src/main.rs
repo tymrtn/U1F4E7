@@ -225,6 +225,18 @@ enum Commands {
         account: Option<String>,
     },
 
+    /// Copy mail between two configured IMAP accounts
+    Migrate {
+        #[command(subcommand)]
+        subcommand: MigrateCmd,
+    },
+
+    /// Stage a mailbox to a local RFC822 archive (export / verify / restore)
+    Backup {
+        #[command(subcommand)]
+        subcommand: BackupCmd,
+    },
+
     /// Manage attachments
     Attachment {
         #[command(subcommand)]
@@ -268,6 +280,12 @@ enum Commands {
     Actions {
         #[command(subcommand)]
         subcommand: ActionsCmd,
+    },
+
+    /// View and acknowledge redacted events
+    Events {
+        #[command(subcommand)]
+        subcommand: EventsCmd,
     },
 
     /// Snooze a message, list snoozed, or unsnooze
@@ -542,6 +560,44 @@ enum ActionsCmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Execute a local audit action for an event
+    Exec {
+        /// Event ID
+        #[arg(long)]
+        event_id: String,
+        /// Actor responsible for the action
+        #[arg(long)]
+        actor: String,
+        #[command(subcommand)]
+        subcommand: ActionsExecCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ActionsExecCmd {
+    /// Record an event as handled locally without mutating the mailbox
+    MarkHandled,
+}
+
+#[derive(Subcommand)]
+enum EventsCmd {
+    /// List recent redacted events
+    List {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// Number of entries
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Mark an event as acknowledged
+    Ack {
+        /// Event ID
+        event_id: String,
+        /// Optional actor label for the CLI caller
+        #[arg(long)]
+        actor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -790,6 +846,109 @@ enum RuleCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum BackupCmd {
+    /// Read source IMAP folders into a local RFC822 archive directory.
+    /// Source mailbox is read-only; export does not mutate flags or delete.
+    Export {
+        /// Account ID or email for the source mailbox
+        #[arg(long)]
+        account: String,
+        /// Destination archive directory (created if missing)
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Number of source messages fetched per IMAP batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+    /// Validate an archive's manifest, file presence, sizes, and SHA-256 checksums.
+    /// Pure local operation — does not contact any IMAP server.
+    Verify {
+        /// Archive directory previously produced by `backup export`
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Treat unreferenced ("extra") files in the archive as a hard failure
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Append archived messages to a destination IMAP account.
+    /// Append-only; no folders or messages are deleted on the destination.
+    /// `--dry-run` plans the run without contacting IMAP for APPENDs.
+    Restore {
+        /// Account ID or email for the destination mailbox
+        #[arg(long)]
+        account: String,
+        /// Archive directory previously produced by `backup export`
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Folder rename rule "SRC=DST" (repeatable). Common provider
+        /// normalizations (Junk E-mail->Junk, Sent Items->Sent,
+        /// Deleted Items->Trash) are exposed as `backup::COMMON_PROVIDER_MAPPINGS`
+        /// for documentation; restore only rewrites folders the operator passes
+        /// explicitly via this flag.
+        #[arg(long = "map")]
+        map: Vec<String>,
+        /// Plan only; do not append, create folders, or write restore state
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of messages processed per restore batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MigrateCmd {
+    /// Show source folders selected for migration
+    Folders {
+        /// Source account ID or email
+        #[arg(long = "from")]
+        from: String,
+        /// Destination account ID or email
+        #[arg(long = "to")]
+        to: String,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+    },
+    /// Copy selected folders/messages from source to destination
+    Run {
+        /// Source account ID or email
+        #[arg(long = "from")]
+        from: String,
+        /// Destination account ID or email
+        #[arg(long = "to")]
+        to: String,
+        /// Include folder glob (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude folder glob (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Plan only; do not append or write migration state
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of source messages fetched and appended per batch
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+    },
+}
+
 #[derive(Subcommand)]
 enum ContactsCmd {
     /// Add a contact
@@ -975,6 +1134,8 @@ fn main() {
         Commands::Folders { account } => {
             commands::folders::run(account.as_deref(), cli.json, backend)
         }
+        Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
+        Commands::Backup { subcommand } => commands::backup::run(subcommand, cli.json, backend),
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
                 uid,
@@ -1053,9 +1214,25 @@ fn main() {
             std::process::exit(1);
         }
         Commands::Actions { subcommand } => match subcommand {
-            ActionsCmd::Tail { .. } => {
-                eprintln!("Not yet implemented: actions tail");
-                std::process::exit(1);
+            ActionsCmd::Tail { limit, account } => {
+                commands::actions::run_tail(limit, account.as_deref(), cli.json, backend)
+            }
+            ActionsCmd::Exec {
+                event_id,
+                actor,
+                subcommand,
+            } => match subcommand {
+                ActionsExecCmd::MarkHandled => {
+                    commands::actions::run_exec_mark_handled(&event_id, &actor, cli.json, backend)
+                }
+            },
+        },
+        Commands::Events { subcommand } => match subcommand {
+            EventsCmd::List { account, limit } => {
+                commands::events::run_list(account.as_deref(), limit, cli.json, backend)
+            }
+            EventsCmd::Ack { event_id, actor } => {
+                commands::events::run_ack(&event_id, actor.as_deref(), cli.json, backend)
             }
         },
 
@@ -1109,10 +1286,9 @@ fn main() {
                 folder,
                 account,
             } => commands::thread::run_show(uid, &folder, account.as_deref(), cli.json, backend),
-            ThreadCmd::List {
-                account,
-                limit,
-            } => commands::thread::run_list(account.as_deref(), limit, cli.json, backend),
+            ThreadCmd::List { account, limit } => {
+                commands::thread::run_list(account.as_deref(), limit, cli.json, backend)
+            }
             ThreadCmd::Build { account, limit } => {
                 commands::thread::run_build(account.as_deref(), limit, cli.json, backend)
             }
@@ -1183,9 +1359,7 @@ fn main() {
                 email,
                 tag,
                 account,
-            } => {
-                commands::contacts::run_untag(&email, &tag, account.as_deref(), cli.json, backend)
-            }
+            } => commands::contacts::run_untag(&email, &tag, account.as_deref(), cli.json, backend),
             ContactsCmd::Import { limit, account } => {
                 commands::contacts::run_import_inbox(limit, account.as_deref(), cli.json, backend)
             }
@@ -1233,13 +1407,7 @@ fn main() {
                 folder,
                 limit,
                 account,
-            } => commands::rule::run_apply(
-                &folder,
-                account.as_deref(),
-                limit,
-                cli.json,
-                backend,
-            ),
+            } => commands::rule::run_apply(&folder, account.as_deref(), limit, cli.json, backend),
             RuleCmd::Enable { name, account } => {
                 commands::rule::run_enable(&name, account.as_deref(), cli.json, backend)
             }

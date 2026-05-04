@@ -80,10 +80,81 @@ body { -webkit-font-smoothing: antialiased; }
 .folder-item:last-child { border-bottom: none; }
 .folder-item:hover { background: #f7f6f3; }
 .folder-item.active { background: #0a0a0a; color: #f7f6f3; }
-.folder-item .count { font-size: 10px; color: #8a8780; }
+.folder-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.folder-item .count { font-size: 10px; color: #8a8780; flex-shrink: 0; margin-left: 0.5rem; }
 .folder-item.active .count { color: #d9d7d1; }
 .folder-item.has-unseen .count { color: #1a6b4a; font-weight: 500; }
 .folder-item.active.has-unseen .count { color: #e8f5ee; }
+
+/* Rules control plane */
+.rule-card {
+  border: 1px solid #d9d7d1;
+  background: white;
+  padding: 0.625rem 0.75rem;
+  font-family: 'DM Mono', monospace;
+  font-size: 0.6875rem;
+  line-height: 1.35;
+}
+.rule-card.enabled { border-left: 3px solid #1a6b4a; }
+.rule-card.disabled { opacity: 0.58; border-left: 3px solid #8a8780; }
+.rule-title {
+  color: #0a0a0a;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-meta { color: #8a8780; margin-top: 0.2rem; }
+.rule-action {
+  color: #1a6b4a;
+  margin-top: 0.35rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-match {
+  color: #8a8780;
+  margin-top: 0.25rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rules-empty, .rule-test-empty, .rule-run-empty {
+  border: 1px dashed #d9d7d1;
+  background: #f7f6f3;
+  color: #8a8780;
+  padding: 0.75rem;
+  font-family: 'DM Mono', monospace;
+  font-size: 0.75rem;
+}
+.rules-run-log {
+  max-height: 9rem;
+  overflow: auto;
+  border-top: 1px solid #d9d7d1;
+  padding-top: 0.5rem;
+}
+.rule-run-line, .rule-run-more {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.6875rem;
+  line-height: 1.35;
+  padding: 0.25rem 0;
+  color: #8a8780;
+}
+.rule-run-line.ok { color: #1a6b4a; }
+.rule-run-line.error { color: #c4421a; }
+.rule-run-more { color: #8a8780; }
+.rule-test-match {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-top: 1px solid #d9d7d1;
+  padding: 0.5rem 0;
+  font-family: 'DM Mono', monospace;
+  font-size: 0.75rem;
+}
+.rule-test-name { color: #0a0a0a; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-test-action { color: #1a6b4a; flex-shrink: 0; }
 
 /* Message list rows */
 .msg-row {
