@@ -9,10 +9,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use envelope_email_store::CredentialBackend;
+use envelope_email_store::{CredentialBackend, app_data_dir};
 use envelope_email_transport::backup::{
     self, ArchiveAccount, ArchiveFolderRecord, ArchiveManifest, ArchiveMessageRecord, BackupError,
     BackupEvent, FolderMapping, PlannedAppend, RestorePlan,
@@ -24,6 +25,78 @@ use crate::BackupCmd;
 
 const TOOL_NAME: &str = "envelope";
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ARCHIVES_DIR_NAME: &str = "archives";
+
+// ---------------------------------------------------------------------------
+// Default archive-dir resolution
+// ---------------------------------------------------------------------------
+
+/// Replace non-alphanumeric chars (except `-`, `_`, `.`) with `_` and lowercase.
+fn sanitize_account_for_filename(account: &str) -> String {
+    account
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Build the default archive directory path:
+/// `<app_data_dir>/archives/<sanitized_account>-<compact_utc_timestamp>-<pid>`
+fn default_archive_dir(account: &str) -> PathBuf {
+    let sanitized = sanitize_account_for_filename(account);
+    let now = chrono::Utc::now();
+    let timestamp = format!(
+        "{}{:03}Z",
+        now.format("%Y%m%dT%H%M%S"),
+        now.timestamp_subsec_millis()
+    );
+    let pid = std::process::id();
+    app_data_dir()
+        .join(ARCHIVES_DIR_NAME)
+        .join(format!("{sanitized}-{timestamp}-{pid}"))
+}
+
+/// Resolve the final archive directory from the optional `--out` flag.
+///
+/// - `Some(path)` → use it directly.
+/// - `None` + JSON mode or non-interactive stdin → use default silently.
+/// - `None` + interactive TTY → prompt the user to accept, reject, or override.
+fn resolve_export_dir(out: Option<PathBuf>, account: &str, json_output: bool) -> Result<PathBuf> {
+    if let Some(path) = out {
+        return Ok(path);
+    }
+
+    let default_path = default_archive_dir(account);
+
+    // Non-interactive: use default without prompting.
+    if json_output || !io::stdin().is_terminal() {
+        return Ok(default_path);
+    }
+
+    // Interactive TTY prompt.
+    eprintln!("Archive will be saved to: {}", default_path.display());
+    eprint!("Accept default? [Y/n/custom path]: ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read from stdin")?;
+    let input = input.trim();
+
+    if input.is_empty() || input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
+        Ok(default_path)
+    } else if input.eq_ignore_ascii_case("n") || input.eq_ignore_ascii_case("no") {
+        bail!("export aborted by user")
+    } else {
+        Ok(PathBuf::from(input))
+    }
+}
 
 /// Typed export args, matched to the Clap shape but easier to pass than a long
 /// positional argument list. Keeping a record-style struct also avoids adding
@@ -31,7 +104,7 @@ const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// handoff explicitly called out.
 struct ExportArgs {
     account: String,
-    out: PathBuf,
+    out: Option<PathBuf>,
     include: Vec<String>,
     exclude: Vec<String>,
     batch_size: u32,
@@ -116,13 +189,19 @@ async fn run_export(args: ExportArgs, json_output: bool, backend: CredentialBack
     } = args;
     let batch_size = migrate::validate_batch_size(batch_size).map_err(anyhow::Error::msg)?;
 
+    let (_db, src) = setup_credentials(Some(&account), backend)?;
+    let account_identity = if src.account.username.trim().is_empty() {
+        src.account.id.as_str()
+    } else {
+        src.account.username.as_str()
+    };
+    let out = resolve_export_dir(out, account_identity, json_output)?;
+
     // Refuse to write into a non-empty existing output directory. This guards
     // against stale manifests, symlinks pointing outside the archive, or
     // unrelated files masquerading as archive contents — any of which could
     // make a later verify or restore behave incorrectly.
     backup::validate_export_output_dir(&out).map_err(|e| backup_error_to_anyhow(e, &out))?;
-
-    let (_db, src) = setup_credentials(Some(&account), backend)?;
 
     fs::create_dir_all(&out).with_context(|| format!("create archive dir {}", out.display()))?;
     fs::create_dir_all(out.join("messages"))
@@ -908,16 +987,16 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn backup_export_requires_account_and_out() {
-        // Missing both required flags must surface a parse error.
+    fn backup_export_requires_account() {
+        // --account is still required; --out is now optional.
         let err = match crate::Cli::try_parse_from(["envelope", "backup", "export"]) {
             Ok(_) => panic!("expected parse error"),
             Err(err) => err,
         };
         let s = err.to_string();
         assert!(
-            s.contains("--account") || s.contains("--out"),
-            "expected required-flag error, got: {s}"
+            s.contains("--account"),
+            "expected required-flag error for --account, got: {s}"
         );
     }
 
@@ -953,7 +1032,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(account, "user@example.com");
-                assert_eq!(out, PathBuf::from("/tmp/archive"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/archive")));
                 assert_eq!(include, vec!["INBOX", "Sent*"]);
                 assert_eq!(exclude, vec!["Junk*"]);
                 assert_eq!(batch_size, 10);
@@ -980,6 +1059,124 @@ mod tests {
             } => assert_eq!(batch_size, migrate::DEFAULT_BATCH_SIZE),
             _ => panic!("expected backup export"),
         }
+    }
+
+    #[test]
+    fn backup_export_parses_without_out() {
+        let cli = crate::Cli::try_parse_from([
+            "envelope",
+            "backup",
+            "export",
+            "--account",
+            "user@example.com",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::Commands::Backup {
+                subcommand: BackupCmd::Export { account, out, .. },
+            } => {
+                assert_eq!(account, "user@example.com");
+                assert!(out.is_none(), "out should be None when --out is omitted");
+            }
+            _ => panic!("expected backup export"),
+        }
+    }
+
+    #[test]
+    fn backup_export_help_mentions_default_archive() {
+        let err = match crate::Cli::try_parse_from(["envelope", "backup", "export", "--help"]) {
+            Ok(_) => panic!("--help should cause early exit"),
+            Err(e) => e,
+        };
+        let help = err.to_string();
+        assert!(
+            help.contains("app-data") || help.contains("archives") || help.contains("Defaults to"),
+            "help text should mention default archive path, got: {help}"
+        );
+    }
+
+    #[test]
+    fn sanitize_account_for_filename_handles_special_chars() {
+        assert_eq!(
+            sanitize_account_for_filename("user@example.com"),
+            "user_example.com"
+        );
+        assert_eq!(
+            sanitize_account_for_filename("User+Tag@EXAMPLE.COM"),
+            "user_tag_example.com"
+        );
+        assert_eq!(sanitize_account_for_filename("simple"), "simple");
+        assert_eq!(sanitize_account_for_filename("a/b\\c:d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn default_archive_dir_under_app_data() {
+        let dir = default_archive_dir("user@example.com");
+        let archives = app_data_dir().join(ARCHIVES_DIR_NAME);
+        assert!(
+            dir.starts_with(&archives),
+            "expected dir under {}, got {}",
+            archives.display(),
+            dir.display()
+        );
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("user_example.com-"),
+            "expected sanitized account prefix, got: {name}"
+        );
+        // Timestamp + pid suffix: YYYYMMDDTHHMMSSmmmZ-<pid>
+        let suffix = &name["user_example.com-".len()..];
+        let (timestamp_part, pid_part) = suffix
+            .split_once('-')
+            .expect("default archive name should include pid suffix");
+        assert_eq!(timestamp_part.len(), 19, "timestamp part: {timestamp_part}");
+        assert!(timestamp_part.ends_with('Z'));
+        assert!(!pid_part.is_empty(), "pid suffix should not be empty");
+    }
+
+    #[test]
+    fn resolve_export_dir_returns_explicit_path() {
+        let explicit = PathBuf::from("/tmp/my-archive");
+        let result = resolve_export_dir(Some(explicit.clone()), "user@example.com", false).unwrap();
+        assert_eq!(result, explicit);
+    }
+
+    #[test]
+    fn resolve_export_dir_explicit_path_ignores_json_flag() {
+        let explicit = PathBuf::from("/tmp/my-archive");
+        let result = resolve_export_dir(Some(explicit.clone()), "user@example.com", true).unwrap();
+        assert_eq!(result, explicit);
+    }
+
+    #[test]
+    fn resolve_export_dir_uses_default_in_json_mode() {
+        let result = resolve_export_dir(None, "user@example.com", true).unwrap();
+        let archives = app_data_dir().join(ARCHIVES_DIR_NAME);
+        assert!(
+            result.starts_with(&archives),
+            "expected path under {}, got {}",
+            archives.display(),
+            result.display()
+        );
+    }
+
+    #[test]
+    fn resolve_export_dir_uses_default_when_not_tty() {
+        // In CI / test harness, stdin is piped (not a terminal), so the
+        // non-interactive path fires and returns the default silently.
+        let result = resolve_export_dir(None, "test@host.org", false).unwrap();
+        let archives = app_data_dir().join(ARCHIVES_DIR_NAME);
+        assert!(
+            result.starts_with(&archives),
+            "expected path under {}, got {}",
+            archives.display(),
+            result.display()
+        );
+        let name = result.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("test_host.org-"),
+            "expected sanitized account prefix, got: {name}"
+        );
     }
 
     #[test]

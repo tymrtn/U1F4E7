@@ -864,13 +864,15 @@ enum RuleCmd {
 pub enum BackupCmd {
     /// Read source IMAP folders into a local RFC822 archive directory.
     /// Source mailbox is read-only; export does not mutate flags or delete.
+    /// When --out is omitted, archives to <app-data>/archives/<account>-<timestamp>.
     Export {
         /// Account ID or email for the source mailbox
         #[arg(long)]
         account: String,
-        /// Destination archive directory (created if missing)
+        /// Destination archive directory (created if missing).
+        /// Defaults to <app-data>/archives/<account>-<timestamp> when omitted.
         #[arg(long)]
-        out: std::path::PathBuf,
+        out: Option<std::path::PathBuf>,
         /// Include folder glob (repeatable)
         #[arg(long = "include")]
         include: Vec<String>,
