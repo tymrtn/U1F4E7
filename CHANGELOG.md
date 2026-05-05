@@ -5,6 +5,16 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Path diagnostics** — `envelope paths` (alias: `envelope doctor`)
+  prints the resolved database path, file credential path, config/app-data
+  directory, current `HOME`, and warnings when those locations are under
+  agent-harness directories such as `/private/tmp`, `/tmp`, `/var/folders`,
+  or `.codex`.
+
 ## [0.5.0] — 2026-04-19
 
 ### Added

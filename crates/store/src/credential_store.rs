@@ -11,6 +11,7 @@
 //!   GNOME Keyring / KWallet on Linux). Requires the `keychain` cargo feature.
 
 use crate::errors::{Result, StoreError};
+use crate::paths;
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, OsRng},
@@ -20,7 +21,6 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -74,11 +74,6 @@ struct CredentialFile {
     entries: HashMap<String, String>,
 }
 
-fn credentials_path() -> PathBuf {
-    let config_dir = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-    config_dir.join("envelope-email").join("credentials.json")
-}
-
 /// Derive the master passphrase for file-based storage.
 ///
 /// Priority:
@@ -109,7 +104,7 @@ fn file_master_key() -> Result<String> {
 }
 
 fn read_credential_file() -> Result<CredentialFile> {
-    let path = credentials_path();
+    let path = paths::credential_file_path();
     if !path.exists() {
         return Ok(CredentialFile::default());
     }
@@ -121,7 +116,7 @@ fn read_credential_file() -> Result<CredentialFile> {
 }
 
 fn write_credential_file(cf: &CredentialFile) -> Result<()> {
-    let path = credentials_path();
+    let path = paths::credential_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             StoreError::Config(format!(
