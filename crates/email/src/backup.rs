@@ -103,15 +103,62 @@ pub struct ArchiveMessageRecord {
     pub rel_path: String,
 }
 
-/// One line of the restore-state NDJSON sidecar. Written after every successful
-/// destination append. Keys identify a message uniquely within an archive.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// Lifecycle status of a restore-state record. Written to the NDJSON sidecar
+/// to implement crash-safe idempotency (issue #19).
+///
+/// - `Pending`: written BEFORE the IMAP APPEND. If the process crashes after
+///   APPEND but before the `Done` line lands, the pending record is enough to
+///   prevent a duplicate on rerun (conservative skip + warning).
+/// - `Done`: written AFTER a successful APPEND (or after a destination
+///   duplicate-skip). This is the terminal state.
+///
+/// Old-format state files lack the field entirely; `serde(default)` maps the
+/// absent key to `Done`, preserving backward compatibility.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreStatus {
+    Pending,
+    #[default]
+    Done,
+}
+
+/// One line of the restore-state NDJSON sidecar. Written before and after every
+/// destination append. The `(folder, uidvalidity, uid, sha256)` tuple is the
+/// identity key; `status` tracks the pending/done lifecycle but is excluded
+/// from `Hash` and `Eq` so both phases resolve to the same set entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreStateRecord {
     pub folder: String,
     pub uidvalidity: u32,
     pub uid: u32,
     pub sha256: String,
+    #[serde(default)]
+    pub status: RestoreStatus,
 }
+
+// Manual Hash/PartialEq/Eq: identity is (folder, uidvalidity, uid, sha256).
+// `status` is lifecycle metadata, not identity — a Pending and Done record
+// for the same message must hash and compare equally so a HashSet<_> lookup
+// treats them as the same entry.
+impl std::hash::Hash for RestoreStateRecord {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.folder.hash(state);
+        self.uidvalidity.hash(state);
+        self.uid.hash(state);
+        self.sha256.hash(state);
+    }
+}
+
+impl PartialEq for RestoreStateRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.folder == other.folder
+            && self.uidvalidity == other.uidvalidity
+            && self.uid == other.uid
+            && self.sha256 == other.sha256
+    }
+}
+
+impl Eq for RestoreStateRecord {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderMapping {
@@ -222,6 +269,11 @@ pub enum BackupEvent {
         folders: u32,
         would_append: u32,
         would_skip: u32,
+    },
+    /// Issue #19: machine-readable warning about restore-state anomalies
+    /// (malformed lines, pending records from a prior crash).
+    RestoreStateWarning {
+        warning: String,
     },
 }
 
@@ -765,6 +817,18 @@ pub fn restore_state_key(record: &ArchiveMessageRecord) -> RestoreStateRecord {
         uidvalidity: record.uidvalidity,
         uid: record.uid,
         sha256: record.sha256.clone(),
+        status: RestoreStatus::Done,
+    }
+}
+
+/// Build a pending-state record for write-ahead logging before IMAP APPEND.
+pub fn restore_state_key_pending(record: &ArchiveMessageRecord) -> RestoreStateRecord {
+    RestoreStateRecord {
+        folder: record.folder.clone(),
+        uidvalidity: record.uidvalidity,
+        uid: record.uid,
+        sha256: record.sha256.clone(),
+        status: RestoreStatus::Pending,
     }
 }
 
@@ -864,30 +928,81 @@ pub fn append_restore_state_line(
     Ok(())
 }
 
-pub fn load_restore_state(path: &Path) -> Result<HashSet<RestoreStateRecord>, BackupError> {
-    let mut out = HashSet::new();
+/// Machine-readable warning emitted by `load_restore_state` so callers can
+/// surface idempotency-relevant anomalies without silently degrading safety.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreStateWarning {
+    /// A NDJSON line that could not be parsed. Previous behavior silently
+    /// swallowed these; issue #19 requires a machine-readable signal.
+    MalformedLine { line_number: usize, content: String },
+    /// A record was written with `status: pending` but no subsequent `done`
+    /// line exists. This means the process likely crashed after (or during)
+    /// IMAP APPEND. The record is conservatively included in the loaded set
+    /// to prevent duplication on rerun.
+    PendingWithoutDone { record: RestoreStateRecord },
+}
+
+/// Result of loading the restore-state sidecar. Carries both the usable
+/// record set and any warnings that callers should surface.
+#[derive(Debug, Clone)]
+pub struct RestoreStateOutcome {
+    pub records: HashSet<RestoreStateRecord>,
+    pub warnings: Vec<RestoreStateWarning>,
+}
+
+pub fn load_restore_state(path: &Path) -> Result<RestoreStateOutcome, BackupError> {
+    let mut done_set: HashSet<RestoreStateRecord> = HashSet::new();
+    let mut pending_set: HashSet<RestoreStateRecord> = HashSet::new();
+    let mut warnings: Vec<RestoreStateWarning> = Vec::new();
+
     if !path.exists() {
-        return Ok(out);
+        return Ok(RestoreStateOutcome {
+            records: done_set,
+            warnings,
+        });
     }
     let raw = fs::read_to_string(path)?;
-    for line in raw.lines() {
+    for (idx, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         match serde_json::from_str::<RestoreStateRecord>(trimmed) {
-            Ok(rec) => {
-                out.insert(rec);
-            }
+            Ok(rec) => match rec.status {
+                RestoreStatus::Pending => {
+                    pending_set.insert(rec);
+                }
+                RestoreStatus::Done => {
+                    done_set.insert(rec);
+                }
+            },
             Err(_) => {
-                // Tolerate malformed lines (partial write before crash) — caller
-                // can audit via the file directly. Idempotency degrades safely:
-                // a missed entry just means we re-search/re-Message-ID-match.
-                continue;
+                warnings.push(RestoreStateWarning::MalformedLine {
+                    line_number: idx + 1,
+                    content: trimmed.to_string(),
+                });
             }
         }
     }
-    Ok(out)
+
+    // Pending records not superseded by a done record indicate a crash
+    // between the pending write and the done write. Promote them into the
+    // done set (conservative skip) and emit a warning per record.
+    for pending in &pending_set {
+        if !done_set.contains(pending) {
+            warnings.push(RestoreStateWarning::PendingWithoutDone {
+                record: pending.clone(),
+            });
+            let mut promoted = pending.clone();
+            promoted.status = RestoreStatus::Done;
+            done_set.insert(promoted);
+        }
+    }
+
+    Ok(RestoreStateOutcome {
+        records: done_set,
+        warnings,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -1584,27 +1699,29 @@ mod tests {
             uidvalidity: 1,
             uid: 1,
             sha256: "a".into(),
+            status: RestoreStatus::Done,
         };
         let r2 = RestoreStateRecord {
             folder: "INBOX".into(),
             uidvalidity: 1,
             uid: 2,
             sha256: "b".into(),
+            status: RestoreStatus::Done,
         };
         append_restore_state_line(&path, &r1).unwrap();
         append_restore_state_line(&path, &r2).unwrap();
-        let loaded = load_restore_state(&path).unwrap();
-        assert!(loaded.contains(&r1));
-        assert!(loaded.contains(&r2));
-        assert_eq!(loaded.len(), 2);
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.contains(&r1));
+        assert!(outcome.records.contains(&r2));
+        assert_eq!(outcome.records.len(), 2);
     }
 
     #[test]
     fn load_restore_state_treats_missing_file_as_empty_set() {
         let dir = tempfile::tempdir().unwrap();
         let path = restore_state_path(dir.path(), "no-such-account");
-        let loaded = load_restore_state(&path).unwrap();
-        assert!(loaded.is_empty());
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.is_empty());
     }
 
     #[test]
@@ -1616,6 +1733,7 @@ mod tests {
             uidvalidity: 1,
             uid: 1,
             sha256: "a".into(),
+            status: RestoreStatus::Done,
         };
         append_restore_state_line(&path, &r1).unwrap();
         // Append a junk line as if the prior process crashed mid-write.
@@ -1630,11 +1748,12 @@ mod tests {
             uidvalidity: 1,
             uid: 2,
             sha256: "b".into(),
+            status: RestoreStatus::Done,
         };
         append_restore_state_line(&path, &r2).unwrap();
-        let loaded = load_restore_state(&path).unwrap();
-        assert!(loaded.contains(&r1));
-        assert!(loaded.contains(&r2));
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.contains(&r1));
+        assert!(outcome.records.contains(&r2));
     }
 
     #[test]
@@ -1659,6 +1778,182 @@ mod tests {
         assert_eq!(plan.planned_appends.len(), 1);
         assert_eq!(plan.planned_appends[0].uid(), 2);
         assert_eq!(plan.skipped_already_restored, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #19: crash-safe restore for messages without Message-ID
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn restore_state_pending_without_done_is_included_in_loaded_set() {
+        // Simulates a crash after APPEND but before done-state write.
+        // The pending record must be included in the loaded set so reruns
+        // skip it rather than duplicating.
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_state_path(dir.path(), "acct-crash");
+        let record = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 42,
+            sha256: sha256_hex(b"crash-test"),
+            status: RestoreStatus::Pending,
+        };
+        append_restore_state_line(&path, &record).unwrap();
+
+        let outcome = load_restore_state(&path).unwrap();
+        let key = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 42,
+            sha256: sha256_hex(b"crash-test"),
+            status: RestoreStatus::Done,
+        };
+        assert!(
+            outcome.records.contains(&key),
+            "pending-without-done record must be in the loaded set"
+        );
+        assert!(
+            !outcome.warnings.is_empty(),
+            "pending-without-done must produce a warning"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| matches!(w, RestoreStateWarning::PendingWithoutDone { .. })),
+            "warning must be PendingWithoutDone variant"
+        );
+    }
+
+    #[test]
+    fn restore_state_pending_superseded_by_done_produces_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_state_path(dir.path(), "acct-ok");
+        let pending = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 7,
+            sha256: sha256_hex(b"normal"),
+            status: RestoreStatus::Pending,
+        };
+        let done = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 7,
+            sha256: sha256_hex(b"normal"),
+            status: RestoreStatus::Done,
+        };
+        append_restore_state_line(&path, &pending).unwrap();
+        append_restore_state_line(&path, &done).unwrap();
+
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.contains(&done));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| !matches!(w, RestoreStateWarning::PendingWithoutDone { .. })),
+            "pending superseded by done should not warn"
+        );
+    }
+
+    #[test]
+    fn restore_state_backward_compat_no_status_field_treated_as_done() {
+        // Old-format state files lack the "status" field. They must deserialize
+        // as Done for backward compatibility.
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_state_path(dir.path(), "acct-old");
+        // Write raw JSON without status field.
+        let line = r#"{"folder":"INBOX","uidvalidity":1,"uid":1,"sha256":"aa"}"#;
+        fs::write(&path, format!("{line}\n")).unwrap();
+
+        let outcome = load_restore_state(&path).unwrap();
+        assert_eq!(outcome.records.len(), 1);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| !matches!(w, RestoreStateWarning::PendingWithoutDone { .. })),
+            "old-format lines are Done, no pending warning"
+        );
+    }
+
+    #[test]
+    fn load_restore_state_emits_warning_for_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_state_path(dir.path(), "acct-bad");
+        let good = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 1,
+            sha256: "a".repeat(64),
+            status: RestoreStatus::Done,
+        };
+        append_restore_state_line(&path, &good).unwrap();
+        // Append a malformed line.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{not json").unwrap();
+
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.contains(&good));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| matches!(w, RestoreStateWarning::MalformedLine { .. })),
+            "malformed line must produce a MalformedLine warning"
+        );
+    }
+
+    #[test]
+    fn plan_restore_skips_message_covered_by_pending_only_state() {
+        // Issue #19 crash simulation: message_id=None, pending state only.
+        // plan_restore must skip this message to prevent duplication.
+        let mut m = sample_manifest();
+        // Replace the sample message with one that has no message_id.
+        m.messages[0].message_id = None;
+
+        let pending_key = RestoreStateRecord {
+            folder: m.messages[0].folder.clone(),
+            uidvalidity: m.messages[0].uidvalidity,
+            uid: m.messages[0].uid,
+            sha256: m.messages[0].sha256.clone(),
+            status: RestoreStatus::Done, // load_restore_state promotes pending to done
+        };
+        let state: HashSet<RestoreStateRecord> = std::iter::once(pending_key).collect();
+        let plan = plan_restore(&m.messages, &state, &[], &[], &[]);
+        assert!(
+            plan.planned_appends.is_empty(),
+            "message covered by pending-only state must be skipped"
+        );
+        assert_eq!(plan.skipped_already_restored, 1);
+    }
+
+    #[test]
+    fn restore_state_record_eq_ignores_status_field() {
+        let a = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 1,
+            sha256: "abc".into(),
+            status: RestoreStatus::Pending,
+        };
+        let b = RestoreStateRecord {
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 1,
+            sha256: "abc".into(),
+            status: RestoreStatus::Done,
+        };
+        assert_eq!(a, b, "status must not affect equality");
+        // They must also produce the same hash.
+        use std::hash::{Hash, Hasher};
+        let hash_of = |r: &RestoreStateRecord| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            r.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&a), hash_of(&b), "status must not affect hash");
     }
 
     #[test]
