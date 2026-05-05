@@ -436,8 +436,21 @@ async fn run_restore(
     )
     .map_err(|e| backup_error_to_anyhow(e, &from))?;
     let state_path = backup::restore_state_path(&from, &dst.account.id);
-    let mut state = backup::load_restore_state(&state_path)
+    let state_outcome = backup::load_restore_state(&state_path)
         .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
+
+    // Issue #19: surface restore-state warnings (malformed lines, pending
+    // records from a prior crash) as machine-readable events before planning.
+    for warning in &state_outcome.warnings {
+        emit(
+            json_output,
+            BackupEvent::RestoreStateWarning {
+                warning: format!("{warning:?}"),
+            },
+        )?;
+    }
+
+    let mut state = state_outcome.records;
 
     let plan: RestorePlan =
         backup::plan_restore(&manifest.messages, &state, &mappings, &include, &exclude);
@@ -618,6 +631,18 @@ async fn run_restore(
                         continue;
                     }
                 }
+                // Issue #19: write pending state BEFORE APPEND so that a
+                // crash after APPEND but before the done-state write still
+                // leaves a recoverable breadcrumb. On reload the pending
+                // record is promoted to "done" (conservative skip + warning)
+                // rather than silently re-appending a duplicate.
+                if let Err(e) = persist_state_pending(&state_path, record) {
+                    return Err(e.context(format!(
+                        "failed to write pending restore state for {} UID {} before APPEND",
+                        source,
+                        action.uid()
+                    )));
+                }
                 let flags = migrate::append_flags(&record.flags);
                 let internal_date = backup::parse_internal_date(record.internal_date.as_deref());
                 match imap::append_message_with_date(
@@ -719,6 +744,16 @@ fn persist_state(
     let key = backup::restore_state_key(record);
     backup::append_restore_state_line(path, &key).map_err(|e| backup_error_to_anyhow(e, path))?;
     in_memory.insert(key);
+    Ok(())
+}
+
+/// Issue #19: write a pending-state record BEFORE IMAP APPEND. If the process
+/// crashes after APPEND but before `persist_state` writes the done record,
+/// `load_restore_state` will find the pending line and promote it to done on
+/// the next run — preventing a duplicate for messages without Message-ID.
+fn persist_state_pending(path: &Path, record: &ArchiveMessageRecord) -> Result<()> {
+    let key = backup::restore_state_key_pending(record);
+    backup::append_restore_state_line(path, &key).map_err(|e| backup_error_to_anyhow(e, path))?;
     Ok(())
 }
 
@@ -859,6 +894,9 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
             } => println!(
                 "restore dry-run: folders={folders} would_append={would_append} would_skip={would_skip}"
             ),
+            BackupEvent::RestoreStateWarning { warning } => {
+                eprintln!("restore state warning: {warning}")
+            }
         }
     }
     Ok(())
@@ -1183,9 +1221,15 @@ mod tests {
         preflight_verify_archive_for_restore(&archive_dir, true, false)?;
         let mappings = parse_mappings(&map)?;
         let state_path = backup::restore_state_path(&archive_dir, account_id);
-        let state = backup::load_restore_state(&state_path)
+        let state_outcome = backup::load_restore_state(&state_path)
             .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
-        let plan = backup::plan_restore(&manifest.messages, &state, &mappings, &[], &[]);
+        let plan = backup::plan_restore(
+            &manifest.messages,
+            &state_outcome.records,
+            &mappings,
+            &[],
+            &[],
+        );
         emit(
             false,
             BackupEvent::RestoreDryRunDone {
@@ -1221,8 +1265,8 @@ mod tests {
         // Simulate a partial restore having already happened for UID 1.
         backup::append_restore_state_line(&state_path, &backup::restore_state_key(&m.messages[0]))
             .unwrap();
-        let state = backup::load_restore_state(&state_path).unwrap();
-        let plan = backup::plan_restore(&m.messages, &state, &[], &[], &[]);
+        let state_outcome = backup::load_restore_state(&state_path).unwrap();
+        let plan = backup::plan_restore(&m.messages, &state_outcome.records, &[], &[], &[]);
         assert_eq!(plan.planned_appends.len(), 1);
         assert_eq!(plan.planned_appends[0].uid(), 2);
         assert_eq!(plan.skipped_already_restored, 1);
@@ -1329,6 +1373,7 @@ mod tests {
             uidvalidity: 1,
             uid: 1,
             sha256: backup::sha256_hex(b"x"),
+            status: backup::RestoreStatus::Done,
         };
         backup::append_restore_state_line(&path, &r).unwrap();
         let before = fs::read_to_string(&path).unwrap();
