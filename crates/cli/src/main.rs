@@ -1236,7 +1236,16 @@ fn main() {
             commands::folders::run(account.as_deref(), cli.json, backend)
         }
         Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
-        Commands::Backup { subcommand } => commands::backup::run(subcommand, cli.json, backend),
+        Commands::Backup { subcommand } => {
+            let result = commands::backup::run(subcommand, cli.json, backend);
+            if result.is_err() && cli.json {
+                // backup::run already emitted a JSON fatal_error event to
+                // stdout; suppress the plain-text stderr duplicate so agents
+                // see only machine-readable output.
+                std::process::exit(1);
+            }
+            result
+        }
         Commands::Evidence { subcommand } => commands::evidence::run(subcommand, cli.json, backend),
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
