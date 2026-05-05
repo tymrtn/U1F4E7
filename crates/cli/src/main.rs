@@ -908,7 +908,8 @@ pub enum BackupCmd {
         /// explicitly via this flag.
         #[arg(long = "map")]
         map: Vec<String>,
-        /// Plan only; do not append, create folders, or write restore state
+        /// Plan only; verify archive bytes before reporting `would_append`,
+        /// then do not append, create folders, or write restore state
         #[arg(long)]
         dry_run: bool,
         /// Number of messages processed per restore batch

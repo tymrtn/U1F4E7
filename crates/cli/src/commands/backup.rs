@@ -365,6 +365,36 @@ fn run_verify(from: PathBuf, strict: bool, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+fn preflight_verify_archive_for_restore(
+    from: &Path,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if dry_run {
+        // Dry-run is the operator's safety gate before a live restore, so it
+        // must prove the archive bytes still match the manifest before it ever
+        // reports `would_append`. Reuse `backup verify` so JSON callers get the
+        // same machine-readable verify events on success/failure.
+        run_verify(from.to_path_buf(), false, json_output)
+            .with_context(|| format!("preflight verify of archive {}", from.display()))?;
+    } else {
+        // Live restore keeps the existing preflight behavior: refuse to start
+        // if the archive has missing/corrupt message bytes, but don't fail on
+        // unreferenced extra files unless the operator runs `backup verify`.
+        let outcome = backup::verify_archive(from)
+            .with_context(|| format!("preflight verify of {}", from.display()))?;
+        if !outcome.ok {
+            bail!(
+                "preflight verify of archive {} failed: missing={} corrupt={}",
+                from.display(),
+                outcome.missing.len(),
+                outcome.corrupt.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Restore
 // -----------------------------------------------------------------------------
@@ -390,21 +420,11 @@ async fn run_restore(
     // rel_paths, no duplicates, and matching folder counts.
     let manifest = backup::read_manifest(&from).map_err(|e| backup_error_to_anyhow(e, &from))?;
 
-    // Preflight verify (HP #6): refuse to start a restore against an archive
-    // whose bytes don't match its manifest. Doing this before connecting to
-    // IMAP also means we don't open a destination session just to fail.
-    if !dry_run {
-        let outcome = backup::verify_archive(&from)
-            .with_context(|| format!("preflight verify of {}", from.display()))?;
-        if !outcome.ok {
-            bail!(
-                "preflight verify of archive {} failed: missing={} corrupt={}",
-                from.display(),
-                outcome.missing.len(),
-                outcome.corrupt.len()
-            );
-        }
-    }
+    // Preflight verify (HP #6 + issue #10): refuse to start a restore plan
+    // against an archive whose bytes no longer match its manifest. Dry-run
+    // must verify before reporting `would_append`; live restore keeps its
+    // existing missing/corrupt-only gate.
+    preflight_verify_archive_for_restore(&from, dry_run, json_output)?;
 
     let (_db, dst) = setup_credentials(Some(&account), backend)?;
     let state_path = backup::restore_state_path(&from, &dst.account.id);
@@ -1141,6 +1161,7 @@ mod tests {
         // helpers run_restore uses; locks dry-run honesty.
         let manifest = backup::read_manifest(&archive_dir)
             .map_err(|e| backup_error_to_anyhow(e, &archive_dir))?;
+        preflight_verify_archive_for_restore(&archive_dir, true, false)?;
         let mappings = parse_mappings(&map)?;
         let state_path = backup::restore_state_path(&archive_dir, account_id);
         let state = backup::load_restore_state(&state_path)
@@ -1178,6 +1199,33 @@ mod tests {
         assert_eq!(plan.planned_appends.len(), 1);
         assert_eq!(plan.planned_appends[0].uid(), 2);
         assert_eq!(plan.skipped_already_restored, 1);
+    }
+
+    #[test]
+    fn smoke_dry_run_restore_fails_when_message_missing() {
+        let dir = build_smoke_archive();
+        let manifest = backup::read_manifest(dir.path()).unwrap();
+        let record = &manifest.messages[0];
+        fs::remove_file(dir.path().join(&record.rel_path)).unwrap();
+
+        let err =
+            run_restore_dry_run_only(dir.path().to_path_buf(), "smoke-dst", vec![]).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("verify failed"));
+    }
+
+    #[test]
+    fn smoke_dry_run_restore_fails_when_message_corrupted() {
+        let dir = build_smoke_archive();
+        let manifest = backup::read_manifest(dir.path()).unwrap();
+        let record = &manifest.messages[0];
+        let corrupted = vec![b'Z'; record.size as usize];
+        fs::write(dir.path().join(&record.rel_path), corrupted).unwrap();
+
+        let err =
+            run_restore_dry_run_only(dir.path().to_path_buf(), "smoke-dst", vec![]).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("verify failed"));
     }
 
     #[test]
