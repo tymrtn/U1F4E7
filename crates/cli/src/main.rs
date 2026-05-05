@@ -230,6 +230,10 @@ enum Commands {
     },
 
     /// Copy mail between two configured IMAP accounts
+    ///
+    /// Requires simultaneous access to both source and destination IMAP accounts.
+    /// For provider handoffs where the destination mailbox is not available yet,
+    /// use `backup export`, `backup verify`, and later `backup restore` instead.
     Migrate {
         #[command(subcommand)]
         subcommand: MigrateCmd,
@@ -1512,5 +1516,17 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("paths"));
         assert!(help.contains("doctor"));
+    }
+
+    #[test]
+    fn migrate_help_mentions_simultaneous_access_and_backup_restore() {
+        let mut command = Cli::command();
+        let migrate = command
+            .find_subcommand_mut("migrate")
+            .expect("migrate subcommand should exist");
+        let help = migrate.render_long_help().to_string();
+        assert!(help.contains("simultaneous access"));
+        assert!(help.contains("backup export"));
+        assert!(help.contains("backup restore"));
     }
 }
