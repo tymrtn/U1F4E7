@@ -2,8 +2,8 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use crate::errors::{Result, StoreError};
+use crate::paths;
 use rusqlite::Connection;
-use std::path::PathBuf;
 
 pub struct Database {
     conn: Connection,
@@ -13,7 +13,7 @@ impl Database {
     /// Open or create the database at the default location.
     /// Default: ~/.config/envelope-email/envelope.db
     pub fn open_default() -> Result<Self> {
-        let path = Self::default_path();
+        let path = paths::database_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| StoreError::Config(format!("cannot create config dir: {e}")))?;
@@ -49,11 +49,6 @@ impl Database {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    fn default_path() -> PathBuf {
-        let config_dir = dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"));
-        config_dir.join("envelope-email").join("envelope.db")
     }
 
     // ── Detected folder cache ────────────────────────────────────────

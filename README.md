@@ -92,6 +92,9 @@ envelope unsubscribe 99
 
 # Open the local dashboard
 envelope serve
+
+# See where Envelope is storing local state
+envelope paths
 ```
 
 ## Why not Himalaya / Cloudflare / Resend?
@@ -244,6 +247,7 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 | `envelope unsubscribe <uid> [--confirm]` | List-Unsubscribe (dry-run default) |
 | `envelope watch [--webhook] [--json]` | IMAP IDLE push — real-time new mail events |
 | `envelope code [--from] [--wait 120]` | Extract verification/OTP codes from email |
+| `envelope paths` | Show resolved database/credential paths and HOME drift warnings |
 | `envelope mcp [--config]` | MCP server (stdio) for Claude Code, Cursor, Zed |
 | `envelope send --at "monday 9am"` | Scheduled send with flexible datetime |
 | `envelope scheduled list/cancel` | Manage scheduled messages |

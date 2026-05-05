@@ -58,6 +58,10 @@ AGENT WORKFLOWS
   Use Envelope as an MCP server (Claude Code, Cursor, Zed):
     envelope mcp --config
 
+  Inspect the resolved local state paths:
+    envelope paths
+    envelope paths --json
+
   Every command supports --json for machine consumption:
     envelope inbox --json | jq '.[0].subject'
     envelope folders --json | jq '.[] | {name: .folder, unseen}'
@@ -380,6 +384,10 @@ enum Commands {
         #[arg(long)]
         run_rules: bool,
     },
+
+    /// Show resolved local state paths and HOME drift warnings
+    #[command(visible_alias = "doctor")]
+    Paths,
 
     /// Start the MCP (Model Context Protocol) server over stdio
     Mcp {
@@ -1464,6 +1472,8 @@ fn main() {
             backend,
         ),
 
+        Commands::Paths => commands::paths::run(cli.json, backend),
+
         Commands::Mcp { config } => {
             if config {
                 mcp::print_config();
@@ -1482,5 +1492,24 @@ fn main() {
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn doctor_alias_parses_to_paths_command() {
+        let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor alias should parse");
+        assert!(matches!(cli.command, Commands::Paths));
+    }
+
+    #[test]
+    fn help_lists_paths_command() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("paths"));
+        assert!(help.contains("doctor"));
     }
 }

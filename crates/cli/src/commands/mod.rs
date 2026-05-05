@@ -16,6 +16,7 @@ pub mod folders;
 pub mod inbox;
 pub mod messages;
 pub mod migrate;
+pub mod paths;
 pub mod read;
 pub mod rule;
 pub mod scheduled;
