@@ -10,6 +10,46 @@ use std::collections::HashSet;
 use super::common::setup_credentials;
 use crate::MigrateCmd;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderOpenMode {
+    Examine,
+    Select,
+}
+
+fn source_folder_open_mode() -> FolderOpenMode {
+    FolderOpenMode::Examine
+}
+
+fn destination_folder_open_mode() -> FolderOpenMode {
+    FolderOpenMode::Select
+}
+
+async fn open_folder_info(
+    client: &mut imap::ImapClient,
+    folder: &str,
+    mode: FolderOpenMode,
+) -> Result<imap::SelectedMailbox> {
+    match mode {
+        FolderOpenMode::Examine => imap::examine_folder_info(client, folder).await,
+        FolderOpenMode::Select => imap::select_folder_info(client, folder).await,
+    }
+    .map_err(anyhow::Error::from)
+}
+
+async fn open_source_folder_info(
+    client: &mut imap::ImapClient,
+    folder: &str,
+) -> Result<imap::SelectedMailbox> {
+    open_folder_info(client, folder, source_folder_open_mode()).await
+}
+
+async fn open_destination_folder_info(
+    client: &mut imap::ImapClient,
+    folder: &str,
+) -> Result<imap::SelectedMailbox> {
+    open_folder_info(client, folder, destination_folder_open_mode()).await
+}
+
 #[tokio::main]
 pub async fn run(
     subcommand: MigrateCmd,
@@ -108,7 +148,7 @@ pub async fn run(
                     continue;
                 }
                 total_folders += 1;
-                let src_info = imap::select_folder_info(&mut src_client, &folder.folder).await?;
+                let src_info = open_source_folder_info(&mut src_client, &folder.folder).await?;
                 let src_uidvalidity = src_info.uidvalidity_key();
                 emit(
                     json_output,
@@ -134,7 +174,7 @@ pub async fn run(
                             format!("destination folder listing failed for {}", folder.folder)
                         })?;
                     if destination_exists {
-                        imap::select_folder_info(&mut dst_client, &folder.folder)
+                        open_destination_folder_info(&mut dst_client, &folder.folder)
                             .await
                             .with_context(|| {
                                 format!("destination SELECT failed for {}", folder.folder)
@@ -199,7 +239,7 @@ pub async fn run(
 
                 let dst_client = &mut dst_client;
                 imap::create_folder_if_missing(dst_client, &folder.folder).await?;
-                let dst_info = imap::select_folder_info(dst_client, &folder.folder).await?;
+                let dst_info = open_destination_folder_info(dst_client, &folder.folder).await?;
                 let mut copied = 0u32;
                 let mut skipped = 0u32;
                 let mut failed = 0u32;
@@ -553,5 +593,20 @@ mod tests {
     #[test]
     fn batch_size_zero_is_rejected_at_validation() {
         assert!(migrate::validate_batch_size(0).is_err());
+    }
+
+    #[test]
+    fn migrate_source_folder_opens_read_only() {
+        assert_eq!(source_folder_open_mode(), FolderOpenMode::Examine);
+    }
+
+    #[test]
+    fn migrate_destination_folder_opens_with_select() {
+        assert_eq!(destination_folder_open_mode(), FolderOpenMode::Select);
+    }
+
+    #[test]
+    fn migrate_source_and_destination_open_modes_stay_distinct() {
+        assert_ne!(source_folder_open_mode(), destination_folder_open_mode());
     }
 }
