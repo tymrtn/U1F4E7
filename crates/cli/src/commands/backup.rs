@@ -436,7 +436,7 @@ async fn run_restore(
     )
     .map_err(|e| backup_error_to_anyhow(e, &from))?;
     let state_path = backup::restore_state_path(&from, &dst.account.id);
-    let mut state = backup::load_restore_state(&state_path)
+    let mut state = backup::load_restore_state(&from, &dst.account.id)
         .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
 
     let plan: RestorePlan =
@@ -484,7 +484,7 @@ async fn run_restore(
     // HP #7: surface any restore-state writability problem (permissions, full
     // disk, read-only filesystem) before we ever touch the destination IMAP.
     // touch_restore_state writes nothing if the file already exists.
-    touch_restore_state(&state_path).with_context(|| {
+    touch_restore_state(&from, &dst.account.id).with_context(|| {
         format!(
             "preflight: cannot write restore state {}",
             state_path.display()
@@ -599,7 +599,7 @@ async fn run_restore(
                     let already =
                         imap::find_uid_by_message_id(&mut client, &destination, message_id).await?;
                     if already.is_some() {
-                        if let Err(e) = persist_state(&state_path, record, &mut state) {
+                        if let Err(e) = persist_state(&from, &dst.account.id, record, &mut state) {
                             return Err(e.context(format!(
                                 "failed to persist restore state for {} UID {}",
                                 source,
@@ -633,7 +633,7 @@ async fn run_restore(
                         // HP #7: state write failure after a successful APPEND
                         // is a hard error — we already mutated the destination
                         // and would otherwise re-append on rerun.
-                        if let Err(e) = persist_state(&state_path, record, &mut state) {
+                        if let Err(e) = persist_state(&from, &dst.account.id, record, &mut state) {
                             return Err(e.context(format!(
                                 "APPEND succeeded for {} UID {} but persisting restore state failed; aborting before subsequent appends would silently duplicate",
                                 source,
@@ -712,22 +712,28 @@ fn parse_mappings(map: &[String]) -> Result<Vec<FolderMapping>> {
 /// keeping the in-memory state in sync makes the bug impossible by
 /// construction.
 fn persist_state(
-    path: &Path,
+    archive_dir: &Path,
+    dest_account_id: &str,
     record: &ArchiveMessageRecord,
     in_memory: &mut HashSet<backup::RestoreStateRecord>,
 ) -> Result<()> {
     let key = backup::restore_state_key(record);
-    backup::append_restore_state_line(path, &key).map_err(|e| backup_error_to_anyhow(e, path))?;
+    let state_path = backup::restore_state_path(archive_dir, dest_account_id);
+    backup::append_restore_state_line(archive_dir, dest_account_id, &key)
+        .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
     in_memory.insert(key);
     Ok(())
 }
 
-/// Surface restore-state file writability before we ever touch IMAP. Opens
-/// the path with append+create and immediately closes it. If the file
-/// already exists this is a no-op; if it can't be created (read-only
-/// filesystem, missing parent, permission denied) we get the failure here
-/// instead of after a partial APPEND.
-fn touch_restore_state(path: &Path) -> Result<()> {
+/// Surface restore-state file writability before we ever touch IMAP. Validates
+/// confinement (issue #18), then opens the path with append+create and
+/// immediately closes it. If the file already exists this is a no-op; if it
+/// can't be created (read-only filesystem, missing parent, permission denied)
+/// we get the failure here instead of after a partial APPEND.
+fn touch_restore_state(archive_dir: &Path, dest_account_id: &str) -> Result<()> {
+    let path = backup::validate_restore_state_path(archive_dir, dest_account_id).map_err(|e| {
+        backup_error_to_anyhow(e, &backup::restore_state_path(archive_dir, dest_account_id))
+    })?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create restore state parent dir {}", parent.display()))?;
@@ -735,7 +741,7 @@ fn touch_restore_state(path: &Path) -> Result<()> {
     fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .with_context(|| format!("open restore state {}", path.display()))?;
     Ok(())
 }
@@ -1183,7 +1189,7 @@ mod tests {
         preflight_verify_archive_for_restore(&archive_dir, true, false)?;
         let mappings = parse_mappings(&map)?;
         let state_path = backup::restore_state_path(&archive_dir, account_id);
-        let state = backup::load_restore_state(&state_path)
+        let state = backup::load_restore_state(&archive_dir, account_id)
             .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
         let plan = backup::plan_restore(&manifest.messages, &state, &mappings, &[], &[]);
         emit(
@@ -1217,11 +1223,14 @@ mod tests {
     fn smoke_dry_run_restore_honors_state_sidecar() {
         let dir = build_smoke_archive();
         let m = backup::read_manifest(dir.path()).unwrap();
-        let state_path = backup::restore_state_path(dir.path(), "smoke-dst");
         // Simulate a partial restore having already happened for UID 1.
-        backup::append_restore_state_line(&state_path, &backup::restore_state_key(&m.messages[0]))
-            .unwrap();
-        let state = backup::load_restore_state(&state_path).unwrap();
+        backup::append_restore_state_line(
+            dir.path(),
+            "smoke-dst",
+            &backup::restore_state_key(&m.messages[0]),
+        )
+        .unwrap();
+        let state = backup::load_restore_state(dir.path(), "smoke-dst").unwrap();
         let plan = backup::plan_restore(&m.messages, &state, &[], &[], &[]);
         assert_eq!(plan.planned_appends.len(), 1);
         assert_eq!(plan.planned_appends[0].uid(), 2);
@@ -1312,9 +1321,11 @@ mod tests {
     #[test]
     fn touch_restore_state_creates_parent_and_empty_file() {
         let dir = tempfile::tempdir().unwrap();
-        // Nested missing parent — must be created by touch_restore_state.
-        let path = dir.path().join("nested/sub/.restore-state-acct.ndjson");
-        touch_restore_state(&path).unwrap();
+        // Use a sub-directory as the archive root so touch must create it.
+        let archive = dir.path().join("nested/sub");
+        fs::create_dir_all(&archive).unwrap();
+        touch_restore_state(&archive, "acct").unwrap();
+        let path = backup::restore_state_path(&archive, "acct");
         assert!(path.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
     }
@@ -1322,7 +1333,6 @@ mod tests {
     #[test]
     fn touch_restore_state_is_idempotent_when_file_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let path = backup::restore_state_path(dir.path(), "acct");
         // Pre-populate one line.
         let r = backup::RestoreStateRecord {
             folder: "INBOX".into(),
@@ -1330,9 +1340,10 @@ mod tests {
             uid: 1,
             sha256: backup::sha256_hex(b"x"),
         };
-        backup::append_restore_state_line(&path, &r).unwrap();
+        backup::append_restore_state_line(dir.path(), "acct", &r).unwrap();
+        let path = backup::restore_state_path(dir.path(), "acct");
         let before = fs::read_to_string(&path).unwrap();
-        touch_restore_state(&path).unwrap();
+        touch_restore_state(dir.path(), "acct").unwrap();
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "touch must not mutate existing state");
     }
@@ -1344,7 +1355,6 @@ mod tests {
     #[test]
     fn persist_state_updates_in_memory_set() {
         let dir = tempfile::tempdir().unwrap();
-        let path = backup::restore_state_path(dir.path(), "acct");
         let mut state = HashSet::new();
         let record = ArchiveMessageRecord {
             folder: "INBOX".into(),
@@ -1357,13 +1367,14 @@ mod tests {
             sha256: backup::sha256_hex(b"x"),
             rel_path: "messages/INBOX/1-7.eml".into(),
         };
-        persist_state(&path, &record, &mut state).unwrap();
+        persist_state(dir.path(), "acct", &record, &mut state).unwrap();
         let key = backup::restore_state_key(&record);
         assert!(
             state.contains(&key),
             "persist_state must mirror the new record in the in-memory set"
         );
         // And the line should be on disk too.
+        let path = backup::restore_state_path(dir.path(), "acct");
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"uid\":7"));
     }

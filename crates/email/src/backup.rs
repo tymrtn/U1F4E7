@@ -56,6 +56,8 @@ pub enum BackupError {
     UnsafeOutputDir { path: PathBuf, reason: String },
     #[error("restore destination is unsafe: {0}")]
     UnsafeRestoreDestination(String),
+    #[error("unsafe restore-state path {path}: {reason}")]
+    UnsafeRestoreState { path: PathBuf, reason: String },
 }
 
 /// Top-level archive manifest, written atomically as `manifest.json`.
@@ -847,10 +849,69 @@ pub fn restore_state_path(archive_dir: &Path, dest_account_id: &str) -> PathBuf 
     archive_dir.join(restore_state_filename(dest_account_id))
 }
 
+/// Validate that the restore-state sidecar path derived from `archive_dir` and
+/// `dest_account_id` is confined to the archive root, that the archive root is
+/// not a symlink, and that any existing sidecar file is a regular file (not a
+/// symlink). Returns the validated path on success.
+pub fn validate_restore_state_path(
+    archive_dir: &Path,
+    dest_account_id: &str,
+) -> Result<PathBuf, BackupError> {
+    let fail = |reason: String| BackupError::UnsafeRestoreState {
+        path: archive_dir.join(restore_state_filename(dest_account_id)),
+        reason,
+    };
+
+    // Reject account IDs that could escape the archive directory.
+    if dest_account_id.contains('/')
+        || dest_account_id.contains('\\')
+        || dest_account_id.contains('\0')
+        || dest_account_id.contains("..")
+    {
+        return Err(fail(
+            "destination account ID contains path separator or traversal sequence".into(),
+        ));
+    }
+
+    // The archive directory itself must be a real directory, not a symlink.
+    let archive_meta = fs::symlink_metadata(archive_dir).map_err(BackupError::Io)?;
+    if archive_meta.file_type().is_symlink() {
+        return Err(fail(
+            "archive directory is a symlink — refusing to follow outside the archive".into(),
+        ));
+    }
+
+    let path = restore_state_path(archive_dir, dest_account_id);
+
+    // If the sidecar already exists, it must be a regular file (not a symlink).
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(fail(
+                    "restore-state sidecar is a symlink — refusing to follow".into(),
+                ));
+            }
+            if !meta.file_type().is_file() {
+                return Err(fail(
+                    "restore-state sidecar exists but is not a regular file".into(),
+                ));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // File doesn't exist yet — that's fine, it will be created.
+        }
+        Err(e) => return Err(BackupError::Io(e)),
+    }
+
+    Ok(path)
+}
+
 pub fn append_restore_state_line(
-    path: &Path,
+    archive_dir: &Path,
+    dest_account_id: &str,
     record: &RestoreStateRecord,
 ) -> Result<(), BackupError> {
+    let path = validate_restore_state_path(archive_dir, dest_account_id)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -858,18 +919,22 @@ pub fn append_restore_state_line(
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
+        .open(&path)?;
     writeln!(f, "{line}")?;
     f.sync_all()?;
     Ok(())
 }
 
-pub fn load_restore_state(path: &Path) -> Result<HashSet<RestoreStateRecord>, BackupError> {
+pub fn load_restore_state(
+    archive_dir: &Path,
+    dest_account_id: &str,
+) -> Result<HashSet<RestoreStateRecord>, BackupError> {
+    let path = validate_restore_state_path(archive_dir, dest_account_id)?;
     let mut out = HashSet::new();
     if !path.exists() {
         return Ok(out);
     }
-    let raw = fs::read_to_string(path)?;
+    let raw = fs::read_to_string(&path)?;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1578,7 +1643,6 @@ mod tests {
     #[test]
     fn restore_state_round_trip_via_ndjson_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let path = restore_state_path(dir.path(), "acct-123");
         let r1 = RestoreStateRecord {
             folder: "INBOX".into(),
             uidvalidity: 1,
@@ -1591,9 +1655,9 @@ mod tests {
             uid: 2,
             sha256: "b".into(),
         };
-        append_restore_state_line(&path, &r1).unwrap();
-        append_restore_state_line(&path, &r2).unwrap();
-        let loaded = load_restore_state(&path).unwrap();
+        append_restore_state_line(dir.path(), "acct-123", &r1).unwrap();
+        append_restore_state_line(dir.path(), "acct-123", &r2).unwrap();
+        let loaded = load_restore_state(dir.path(), "acct-123").unwrap();
         assert!(loaded.contains(&r1));
         assert!(loaded.contains(&r2));
         assert_eq!(loaded.len(), 2);
@@ -1602,8 +1666,7 @@ mod tests {
     #[test]
     fn load_restore_state_treats_missing_file_as_empty_set() {
         let dir = tempfile::tempdir().unwrap();
-        let path = restore_state_path(dir.path(), "no-such-account");
-        let loaded = load_restore_state(&path).unwrap();
+        let loaded = load_restore_state(dir.path(), "no-such-account").unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -1617,7 +1680,7 @@ mod tests {
             uid: 1,
             sha256: "a".into(),
         };
-        append_restore_state_line(&path, &r1).unwrap();
+        append_restore_state_line(dir.path(), "acct-123", &r1).unwrap();
         // Append a junk line as if the prior process crashed mid-write.
         let mut f = fs::OpenOptions::new()
             .append(true)
@@ -1631,8 +1694,8 @@ mod tests {
             uid: 2,
             sha256: "b".into(),
         };
-        append_restore_state_line(&path, &r2).unwrap();
-        let loaded = load_restore_state(&path).unwrap();
+        append_restore_state_line(dir.path(), "acct-123", &r2).unwrap();
+        let loaded = load_restore_state(dir.path(), "acct-123").unwrap();
         assert!(loaded.contains(&r1));
         assert!(loaded.contains(&r2));
     }
@@ -2088,5 +2151,116 @@ mod tests {
         fs::write(&out, b"x").unwrap();
         let err = validate_export_output_dir(&out).unwrap_err();
         assert!(matches!(err, BackupError::UnsafeOutputDir { .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #18: Restore-state sidecar confinement
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn validate_restore_state_path_rejects_symlinked_sidecar_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let external_file = external.path().join("evil.ndjson");
+            fs::write(&external_file, b"").unwrap();
+            // Place a symlink where the sidecar would live.
+            let sidecar = archive.path().join(".restore-state-acct.ndjson");
+            unix_fs::symlink(&external_file, &sidecar).unwrap();
+            let err = validate_restore_state_path(archive.path(), "acct").unwrap_err();
+            match err {
+                BackupError::UnsafeRestoreState { reason, .. } => {
+                    assert!(reason.contains("symlink"), "reason was: {reason}");
+                }
+                other => panic!("expected UnsafeRestoreState, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_restore_state_path_rejects_symlinked_parent_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let root = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            // Archive root itself is a symlink.
+            let archive_link = root.path().join("archive");
+            unix_fs::symlink(external.path(), &archive_link).unwrap();
+            let err = validate_restore_state_path(&archive_link, "acct").unwrap_err();
+            match err {
+                BackupError::UnsafeRestoreState { reason, .. } => {
+                    assert!(reason.contains("symlink"), "reason was: {reason}");
+                }
+                other => panic!("expected UnsafeRestoreState, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_restore_state_path_rejects_traversal_in_account_id() {
+        let archive = tempfile::tempdir().unwrap();
+        let err = validate_restore_state_path(archive.path(), "../etc/evil").unwrap_err();
+        assert!(matches!(err, BackupError::UnsafeRestoreState { .. }));
+    }
+
+    #[test]
+    fn validate_restore_state_path_accepts_missing_sidecar() {
+        let archive = tempfile::tempdir().unwrap();
+        let path = validate_restore_state_path(archive.path(), "acct-123").unwrap();
+        assert_eq!(path, archive.path().join(".restore-state-acct-123.ndjson"));
+    }
+
+    #[test]
+    fn validate_restore_state_path_accepts_existing_regular_file() {
+        let archive = tempfile::tempdir().unwrap();
+        let sidecar = archive.path().join(".restore-state-acct.ndjson");
+        fs::write(&sidecar, b"").unwrap();
+        let path = validate_restore_state_path(archive.path(), "acct").unwrap();
+        assert_eq!(path, sidecar);
+    }
+
+    #[test]
+    fn append_restore_state_line_rejects_symlinked_sidecar() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let external_file = external.path().join("evil.ndjson");
+            fs::write(&external_file, b"").unwrap();
+            let sidecar = archive.path().join(".restore-state-acct.ndjson");
+            unix_fs::symlink(&external_file, &sidecar).unwrap();
+            let rec = RestoreStateRecord {
+                folder: "INBOX".into(),
+                uidvalidity: 1,
+                uid: 1,
+                sha256: "a".into(),
+            };
+            let err = append_restore_state_line(archive.path(), "acct", &rec).unwrap_err();
+            assert!(matches!(err, BackupError::UnsafeRestoreState { .. }));
+        }
+    }
+
+    #[test]
+    fn load_restore_state_rejects_symlinked_sidecar() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let external_file = external.path().join("evil.ndjson");
+            fs::write(
+                &external_file,
+                b"{\"folder\":\"X\",\"uidvalidity\":1,\"uid\":1,\"sha256\":\"a\"}\n",
+            )
+            .unwrap();
+            let sidecar = archive.path().join(".restore-state-acct.ndjson");
+            unix_fs::symlink(&external_file, &sidecar).unwrap();
+            let err = load_restore_state(archive.path(), "acct").unwrap_err();
+            assert!(matches!(err, BackupError::UnsafeRestoreState { .. }));
+        }
     }
 }
