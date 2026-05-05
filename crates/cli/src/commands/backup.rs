@@ -427,6 +427,14 @@ async fn run_restore(
     preflight_verify_archive_for_restore(&from, dry_run, json_output)?;
 
     let (_db, dst) = setup_credentials(Some(&account), backend)?;
+    backup::validate_restore_destination(
+        &manifest.account,
+        &dst.account.id,
+        &dst.account.imap_host,
+        dst.account.imap_port,
+        dst.effective_imap_username(),
+    )
+    .map_err(|e| backup_error_to_anyhow(e, &from))?;
     let state_path = backup::restore_state_path(&from, &dst.account.id);
     let mut state = backup::load_restore_state(&state_path)
         .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
@@ -1154,6 +1162,9 @@ mod tests {
     fn run_restore_dry_run_only(
         archive_dir: PathBuf,
         account_id: &str,
+        imap_host: &str,
+        imap_port: u16,
+        imap_username: &str,
         map: Vec<String>,
     ) -> Result<()> {
         // Mirror the dry-run restore path *without* the credential resolution
@@ -1161,6 +1172,14 @@ mod tests {
         // helpers run_restore uses; locks dry-run honesty.
         let manifest = backup::read_manifest(&archive_dir)
             .map_err(|e| backup_error_to_anyhow(e, &archive_dir))?;
+        backup::validate_restore_destination(
+            &manifest.account,
+            account_id,
+            imap_host,
+            imap_port,
+            imap_username,
+        )
+        .map_err(|e| backup_error_to_anyhow(e, &archive_dir))?;
         preflight_verify_archive_for_restore(&archive_dir, true, false)?;
         let mappings = parse_mappings(&map)?;
         let state_path = backup::restore_state_path(&archive_dir, account_id);
@@ -1183,7 +1202,15 @@ mod tests {
     #[test]
     fn smoke_dry_run_restore_plans_against_synthetic_archive() {
         let dir = build_smoke_archive();
-        run_restore_dry_run_only(dir.path().to_path_buf(), "smoke-dst", vec![]).unwrap();
+        run_restore_dry_run_only(
+            dir.path().to_path_buf(),
+            "smoke-dst",
+            "imap.destination.example.com",
+            993,
+            "smoke-dst@example.com",
+            vec![],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1208,8 +1235,15 @@ mod tests {
         let record = &manifest.messages[0];
         fs::remove_file(dir.path().join(&record.rel_path)).unwrap();
 
-        let err =
-            run_restore_dry_run_only(dir.path().to_path_buf(), "smoke-dst", vec![]).unwrap_err();
+        let err = run_restore_dry_run_only(
+            dir.path().to_path_buf(),
+            "smoke-dst",
+            "imap.destination.example.com",
+            993,
+            "smoke-dst@example.com",
+            vec![],
+        )
+        .unwrap_err();
         let rendered = format!("{err:#}");
         assert!(rendered.contains("verify failed"));
     }
@@ -1222,10 +1256,57 @@ mod tests {
         let corrupted = vec![b'Z'; record.size as usize];
         fs::write(dir.path().join(&record.rel_path), corrupted).unwrap();
 
-        let err =
-            run_restore_dry_run_only(dir.path().to_path_buf(), "smoke-dst", vec![]).unwrap_err();
+        let err = run_restore_dry_run_only(
+            dir.path().to_path_buf(),
+            "smoke-dst",
+            "imap.destination.example.com",
+            993,
+            "smoke-dst@example.com",
+            vec![],
+        )
+        .unwrap_err();
         let rendered = format!("{err:#}");
         assert!(rendered.contains("verify failed"));
+    }
+
+    #[test]
+    fn smoke_dry_run_restore_rejects_same_source_account_before_loading_state() {
+        let dir = build_smoke_archive();
+        let poison_path = backup::restore_state_path(dir.path(), "acct-smoke");
+        fs::create_dir_all(&poison_path).unwrap();
+        let err = run_restore_dry_run_only(
+            dir.path().to_path_buf(),
+            "acct-smoke",
+            "imap.destination.example.com",
+            993,
+            "other@example.com",
+            vec![],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("same account"),
+            "expected same-account guard, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn smoke_dry_run_restore_rejects_same_source_mailbox_before_loading_state() {
+        let dir = build_smoke_archive();
+        let poison_path = backup::restore_state_path(dir.path(), "acct-dst");
+        fs::create_dir_all(&poison_path).unwrap();
+        let err = run_restore_dry_run_only(
+            dir.path().to_path_buf(),
+            "acct-dst",
+            " IMAP.EXAMPLE.COM ",
+            993,
+            " SMOKE@example.com ",
+            vec![],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("same IMAP mailbox"),
+            "expected same-mailbox guard, got: {err:#}"
+        );
     }
 
     #[test]

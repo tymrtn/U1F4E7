@@ -54,6 +54,8 @@ pub enum BackupError {
     UnsafeRelPath { rel_path: String, reason: String },
     #[error("export output directory {path} is not safe to use: {reason}")]
     UnsafeOutputDir { path: PathBuf, reason: String },
+    #[error("restore destination is unsafe: {0}")]
+    UnsafeRestoreDestination(String),
 }
 
 /// Top-level archive manifest, written atomically as `manifest.json`.
@@ -726,6 +728,34 @@ pub fn apply_folder_mapping(source: &str, mappings: &[FolderMapping]) -> String 
 }
 
 // -----------------------------------------------------------------------------
+// Restore destination validation
+// -----------------------------------------------------------------------------
+
+/// Reject restoring an archive back into its source mailbox, whether that is
+/// expressed via the same logical account ID or via a distinct account record
+/// that still resolves to the same physical IMAP mailbox.
+pub fn validate_restore_destination(
+    source: &ArchiveAccount,
+    dest_account_id: &str,
+    dest_imap_host: &str,
+    dest_imap_port: u16,
+    dest_imap_username: &str,
+) -> Result<(), BackupError> {
+    crate::migrate::validate_distinct_accounts(&source.id, dest_account_id)
+        .map_err(BackupError::UnsafeRestoreDestination)?;
+    crate::migrate::validate_distinct_imap_endpoints(
+        &source.imap_host,
+        source.imap_port,
+        &source.imap_username,
+        dest_imap_host,
+        dest_imap_port,
+        dest_imap_username,
+    )
+    .map_err(BackupError::UnsafeRestoreDestination)?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Restore plan
 // -----------------------------------------------------------------------------
 
@@ -1147,6 +1177,57 @@ mod tests {
         assert!(names.contains(&"Junk E-mail"));
         assert!(names.contains(&"Sent Items"));
         assert!(names.contains(&"Deleted Items"));
+    }
+
+    #[test]
+    fn validate_restore_destination_rejects_same_source_account_id() {
+        let manifest = sample_manifest();
+        let err = validate_restore_destination(
+            &manifest.account,
+            "acct-123",
+            "imap.other.example.com",
+            993,
+            "other@example.com",
+        )
+        .unwrap_err();
+        match err {
+            BackupError::UnsafeRestoreDestination(msg) => {
+                assert!(msg.contains("same account"), "unexpected error: {msg}");
+            }
+            other => panic!("expected UnsafeRestoreDestination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_restore_destination_rejects_same_source_imap_mailbox() {
+        let manifest = sample_manifest();
+        let err = validate_restore_destination(
+            &manifest.account,
+            "acct-other",
+            " IMAP.EXAMPLE.COM ",
+            993,
+            " USER@example.com ",
+        )
+        .unwrap_err();
+        match err {
+            BackupError::UnsafeRestoreDestination(msg) => {
+                assert!(msg.contains("same IMAP mailbox"), "unexpected error: {msg}");
+            }
+            other => panic!("expected UnsafeRestoreDestination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_restore_destination_allows_distinct_destination() {
+        let manifest = sample_manifest();
+        validate_restore_destination(
+            &manifest.account,
+            "acct-other",
+            "imap.other.example.com",
+            993,
+            "other@example.com",
+        )
+        .unwrap();
     }
 
     #[test]
