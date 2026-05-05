@@ -114,7 +114,7 @@ async fn run_export(args: ExportArgs, json_output: bool, backend: CredentialBack
         exclude,
         batch_size,
     } = args;
-    let batch_size = migrate::validate_batch_size(batch_size).map_err(anyhow::Error::msg)?;
+    let batch_size = backup::validate_export_batch_size(batch_size).map_err(anyhow::Error::msg)?;
 
     // Refuse to write into a non-empty existing output directory. This guards
     // against stale manifests, symlinks pointing outside the archive, or
@@ -925,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_export_uses_migrate_default_batch_size() {
+    fn backup_export_uses_export_specific_default_batch_size() {
         let cli = crate::Cli::try_parse_from([
             "envelope",
             "backup",
@@ -939,7 +939,11 @@ mod tests {
         match cli.command {
             crate::Commands::Backup {
                 subcommand: BackupCmd::Export { batch_size, .. },
-            } => assert_eq!(batch_size, migrate::DEFAULT_BATCH_SIZE),
+            } => {
+                assert_eq!(batch_size, backup::DEFAULT_EXPORT_BATCH_SIZE);
+                // Must be lower than migrate's default for memory safety
+                assert!(batch_size < migrate::DEFAULT_BATCH_SIZE);
+            }
             _ => panic!("expected backup export"),
         }
     }

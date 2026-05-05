@@ -379,6 +379,41 @@ pub fn relative_message_path(folder: &str, uidvalidity: u32, uid: u32) -> String
 /// tampering or filesystem corruption.
 pub const MAX_MESSAGE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
+// -----------------------------------------------------------------------------
+// Export batch size (issue #20)
+// -----------------------------------------------------------------------------
+
+/// Conservative default batch size for backup export. Export materializes full
+/// RFC822 bodies in memory for each batch before writing to disk. With messages
+/// up to ~50 MB each (provider attachment limits), 5 messages × 50 MB = 250 MB
+/// peak heap per batch — safe on typical operator hardware.
+///
+/// Operators with small-message mailboxes can raise via `--batch-size` up to
+/// `MAX_EXPORT_BATCH_SIZE`.
+pub const DEFAULT_EXPORT_BATCH_SIZE: u32 = 5;
+
+/// Upper bound for export batch size. Kept well below migrate's 500 because
+/// export holds full RFC822 bodies in memory simultaneously. At 50 messages ×
+/// 50 MB worst-case = 2.5 GB — already aggressive; operators who hit this
+/// should monitor RSS.
+pub const MAX_EXPORT_BATCH_SIZE: u32 = 50;
+
+/// Validate a user-supplied `--batch-size` for backup export. Returns the
+/// validated value or a human-readable error string suitable for CLI display.
+pub fn validate_export_batch_size(batch_size: u32) -> Result<u32, String> {
+    if batch_size == 0 {
+        return Err("--batch-size must be greater than zero".to_string());
+    }
+    if batch_size > MAX_EXPORT_BATCH_SIZE {
+        return Err(format!(
+            "--batch-size {batch_size} exceeds the safe upper bound of {MAX_EXPORT_BATCH_SIZE} for export; \
+             export materializes full RFC822 bodies in memory per batch — \
+             large batches of big messages can exhaust available RAM"
+        ));
+    }
+    Ok(batch_size)
+}
+
 /// Validate that a manifest `rel_path` is safe to join with the archive root
 /// AND that it matches exactly the canonical path for the (folder,
 /// uidvalidity, uid) tuple. Refuses absolute paths, parent-traversal
@@ -1910,6 +1945,55 @@ mod tests {
     // -------------------------------------------------------------------------
     // Critical #2: manifest structural validation
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Issue #20: export-specific batch size validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn export_default_batch_size_is_conservative_for_large_messages() {
+        // Export materializes full RFC822 bodies in memory per batch. The
+        // default must be small enough that even worst-case messages (≈50 MB
+        // each) don't blow up heap: DEFAULT_EXPORT_BATCH_SIZE * 50 MB should
+        // stay well under 1 GB.
+        assert!(DEFAULT_EXPORT_BATCH_SIZE <= 10);
+        assert!(DEFAULT_EXPORT_BATCH_SIZE >= 1);
+    }
+
+    #[test]
+    fn export_max_batch_size_is_lower_than_migrate_max() {
+        // Export holds bodies; migrate streams them. Export's ceiling must be
+        // tighter than migrate's 500.
+        assert!(MAX_EXPORT_BATCH_SIZE < crate::migrate::MAX_BATCH_SIZE);
+        assert!(MAX_EXPORT_BATCH_SIZE >= DEFAULT_EXPORT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn validate_export_batch_size_accepts_default() {
+        assert_eq!(
+            validate_export_batch_size(DEFAULT_EXPORT_BATCH_SIZE).unwrap(),
+            DEFAULT_EXPORT_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn validate_export_batch_size_rejects_zero() {
+        assert!(validate_export_batch_size(0).is_err());
+    }
+
+    #[test]
+    fn validate_export_batch_size_rejects_above_max() {
+        let err = validate_export_batch_size(MAX_EXPORT_BATCH_SIZE + 1).unwrap_err();
+        assert!(err.contains(&MAX_EXPORT_BATCH_SIZE.to_string()), "{err}");
+    }
+
+    #[test]
+    fn validate_export_batch_size_accepts_max() {
+        assert_eq!(
+            validate_export_batch_size(MAX_EXPORT_BATCH_SIZE).unwrap(),
+            MAX_EXPORT_BATCH_SIZE
+        );
+    }
 
     #[test]
     fn validate_manifest_accepts_well_formed_sample() {

@@ -871,8 +871,10 @@ pub enum BackupCmd {
         /// Exclude folder glob (repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
-        /// Number of source messages fetched per IMAP batch
-        #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
+        /// Number of source messages fetched per IMAP batch. Export holds full
+        /// RFC822 bodies in memory for each batch; keep low for large-message
+        /// mailboxes to avoid exhausting RAM.
+        #[arg(long = "batch-size", default_value_t = envelope_email_transport::backup::DEFAULT_EXPORT_BATCH_SIZE)]
         batch_size: u32,
     },
     /// Validate an archive's manifest, file presence, sizes, and SHA-256 checksums.
