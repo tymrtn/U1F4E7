@@ -7,15 +7,15 @@ use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct PathsReport {
-    credential_backend: String,
-    credential_file_in_use: bool,
-    database_path: String,
-    credential_file_path: String,
-    app_data_dir: String,
-    home: Option<String>,
-    warnings: Vec<String>,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PathsReport {
+    pub credential_backend: String,
+    pub credential_file_in_use: bool,
+    pub database_path: String,
+    pub credential_file_path: String,
+    pub app_data_dir: String,
+    pub home: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 pub fn run(json: bool, backend: CredentialBackend) -> Result<()> {
@@ -50,7 +50,7 @@ pub fn run(json: bool, backend: CredentialBackend) -> Result<()> {
     Ok(())
 }
 
-fn collect_report(backend: CredentialBackend) -> PathsReport {
+pub fn collect_report(backend: CredentialBackend) -> PathsReport {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let db_path = database_path();
     let file_credential_path = credential_file_path();

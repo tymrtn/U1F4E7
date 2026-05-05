@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod errors;
 pub mod event_pipeline;
 pub mod event_types;
+pub mod evidence;
 pub mod folders;
 pub mod idle;
 pub mod imap;

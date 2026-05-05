@@ -4,7 +4,7 @@
 mod commands;
 mod mcp;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -239,6 +239,12 @@ enum Commands {
     Backup {
         #[command(subcommand)]
         subcommand: BackupCmd,
+    },
+
+    /// Collect and verify local evidence bundles from read-only IMAP searches
+    Evidence {
+        #[command(subcommand)]
+        subcommand: EvidenceCmd,
     },
 
     /// Manage attachments
@@ -919,6 +925,92 @@ pub enum BackupCmd {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum EvidenceCmd {
+    /// Collect raw RFC822 messages into a local evidence bundle.
+    /// Source mailbox is read-only; collection uses EXAMINE and BODY.PEEK[].
+    #[command(group(
+        ArgGroup::new("evidence_filter")
+            .required(true)
+            .multiple(true)
+            .args([
+                "query",
+                "from_address",
+                "to_address",
+                "subject",
+                "since",
+                "before",
+                "body",
+                "keyword",
+            ])
+    ))]
+    Collect {
+        /// Account ID or email for the source mailbox
+        #[arg(long)]
+        account: String,
+        /// Explicit source IMAP folder
+        #[arg(long)]
+        folder: String,
+        /// Raw IMAP SEARCH query. Use ALL explicitly for broad exports.
+        #[arg(long)]
+        query: Option<String>,
+        /// Include header-linked thread ancestors and descendants
+        #[arg(long)]
+        include_thread: bool,
+        /// Maximum messages to fetch while expanding header-linked threads
+        #[arg(
+            long,
+            default_value_t = envelope_email_transport::evidence::DEFAULT_MAX_THREAD_MESSAGES,
+            value_parser = parse_nonzero_usize
+        )]
+        max_thread_messages: usize,
+        /// Destination evidence bundle directory
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Structured FROM search term
+        #[arg(long)]
+        from_address: Option<String>,
+        /// Structured TO search term
+        #[arg(long)]
+        to_address: Option<String>,
+        /// Structured SUBJECT search term
+        #[arg(long)]
+        subject: Option<String>,
+        /// Structured SINCE search term, e.g. 1-Jan-2026
+        #[arg(long)]
+        since: Option<String>,
+        /// Structured BEFORE search term, e.g. 1-Feb-2026
+        #[arg(long)]
+        before: Option<String>,
+        /// Structured BODY search term
+        #[arg(long)]
+        body: Option<String>,
+        /// Structured KEYWORD search term (repeatable)
+        #[arg(long)]
+        keyword: Vec<String>,
+    },
+    /// Validate a local evidence bundle without contacting IMAP.
+    Verify {
+        /// Evidence bundle directory
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Treat unreferenced extra .eml files as a hard failure
+        #[arg(long)]
+        strict: bool,
+    },
+}
+
+fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|e| format!("invalid positive integer: {e}"))?;
+    if parsed == 0 {
+        return Err("must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
+
+#[derive(Subcommand, Debug)]
 pub enum MigrateCmd {
     /// Show source folders selected for migration
     Folders {
@@ -1145,6 +1237,7 @@ fn main() {
         }
         Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
         Commands::Backup { subcommand } => commands::backup::run(subcommand, cli.json, backend),
+        Commands::Evidence { subcommand } => commands::evidence::run(subcommand, cli.json, backend),
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
                 uid,
@@ -1500,6 +1593,7 @@ fn main() {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use clap::Parser;
 
     #[test]
     fn doctor_alias_parses_to_paths_command() {
@@ -1512,5 +1606,204 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("paths"));
         assert!(help.contains("doctor"));
+    }
+
+    #[test]
+    fn evidence_collect_parses_mvp_command_shape() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "[Gmail]/All Mail",
+            "--query",
+            r#"FROM "sender@example.com" SUBJECT "contract""#,
+            "--include-thread",
+            "--max-thread-messages",
+            "25",
+            "--out",
+            "./evidence-bundle",
+        ])
+        .expect("evidence collect MVP shape should parse");
+
+        match cli.command {
+            Commands::Evidence {
+                subcommand:
+                    EvidenceCmd::Collect {
+                        max_thread_messages,
+                        ..
+                    },
+            } => assert_eq!(max_thread_messages, 25),
+            _ => panic!("expected evidence collect command"),
+        }
+    }
+
+    #[test]
+    fn evidence_collect_requires_folder_and_out() {
+        let missing_folder = match Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--query",
+            "ALL",
+            "--out",
+            "./bundle",
+        ]) {
+            Ok(_) => panic!("missing --folder should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            missing_folder.to_string().contains("--folder"),
+            "expected --folder required error, got: {missing_folder}"
+        );
+
+        let missing_out = match Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "INBOX",
+            "--query",
+            "ALL",
+        ]) {
+            Ok(_) => panic!("missing --out should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            missing_out.to_string().contains("--out"),
+            "expected --out required error, got: {missing_out}"
+        );
+    }
+
+    #[test]
+    fn evidence_collect_requires_raw_query_or_structured_filter() {
+        let err = match Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "INBOX",
+            "--out",
+            "./bundle",
+        ]) {
+            Ok(_) => panic!("missing query/filter should fail"),
+            Err(err) => err,
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("--query") || s.contains("--from-address") || s.contains("filter"),
+            "expected query/filter validation error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn evidence_collect_rejects_whitespace_query_after_clap_parsing() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "INBOX",
+            "--query",
+            "   ",
+            "--out",
+            "./bundle",
+        ])
+        .expect("clap group treats present whitespace query as present");
+
+        let Commands::Evidence {
+            subcommand: EvidenceCmd::Collect { query, .. },
+        } = cli.command
+        else {
+            panic!("expected evidence collect command");
+        };
+        let err = envelope_email_transport::evidence::compile_search_query(
+            query.as_deref(),
+            &envelope_email_transport::evidence::EvidenceQueryFilters::default(),
+        )
+        .expect_err("runtime query validation should reject whitespace-only --query");
+
+        assert!(err.to_string().contains("--query must not be empty"));
+    }
+
+    #[test]
+    fn evidence_collect_rejects_zero_max_thread_messages() {
+        let err = match Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "INBOX",
+            "--query",
+            "ALL",
+            "--max-thread-messages",
+            "0",
+            "--out",
+            "./bundle",
+        ]) {
+            Ok(_) => panic!("zero max thread messages should fail clap validation"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--max-thread-messages"));
+    }
+
+    #[test]
+    fn evidence_collect_parses_structured_sugar_filters() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "collect",
+            "--account",
+            "acct-1",
+            "--folder",
+            "INBOX",
+            "--from-address",
+            "sender@example.com",
+            "--to-address",
+            "recipient@example.com",
+            "--subject",
+            "contract",
+            "--since",
+            "1-Jan-2026",
+            "--before",
+            "1-Feb-2026",
+            "--body",
+            "payment terms",
+            "--keyword",
+            "Flagged",
+            "--out",
+            "./bundle",
+        ])
+        .expect("structured filters should satisfy evidence collect query requirement");
+
+        assert!(matches!(cli.command, Commands::Evidence { .. }));
+    }
+
+    #[test]
+    fn evidence_verify_parses_from_and_strict() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "evidence",
+            "verify",
+            "--from",
+            "./evidence-bundle",
+            "--strict",
+        ])
+        .expect("evidence verify should parse");
+
+        assert!(matches!(cli.command, Commands::Evidence { .. }));
     }
 }

@@ -224,6 +224,42 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 - ★ Snoozed virtual folder with overdue highlighting
 - IMAP search
 
+## Evidence bundles
+
+`envelope evidence` collects a query-scoped, local evidence bundle while leaving the source mailbox read-only. Collection opens the requested folder with IMAP `EXAMINE` and fetches canonical raw RFC822 originals with `BODY.PEEK[]`.
+
+```bash
+envelope evidence collect \
+  --account user@example.com \
+  --folder '[Gmail]/All Mail' \
+  --query 'FROM "sender@example.com" SUBJECT "contract"' \
+  --include-thread \
+  --out ./evidence-bundle
+
+envelope evidence verify --from ./evidence-bundle
+envelope evidence verify --from ./evidence-bundle --strict
+```
+
+Structured filters can replace or combine with `--query`: `--from-address`, `--to-address`, `--subject`, `--since`, `--before`, `--body`, and repeatable `--keyword`. At least one filter is required unless the raw query is explicitly `ALL`.
+
+Thread expansion is header-driven and bounded. By default, `--include-thread` fetches at most 500 messages while following Message-ID, In-Reply-To, and References links; adjust with `--max-thread-messages`. If the cap is reached, the bundle records a warning.
+
+Evidence bundles intentionally expose message metadata, account identity, IMAP host/username, and local source paths for provenance. Treat bundles as sensitive even though they do not serialize passwords, OAuth tokens, or credential file paths.
+
+Bundle layout:
+
+```text
+evidence-bundle/
+  manifest.json
+  index.csv
+  README.md
+  SHA256SUMS
+  bundle.sha256
+  messages/<encoded-folder>/<uidvalidity>-<uid>.eml
+```
+
+Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`; subject matching is never used as a fallback. Hash files provide local tamper evidence, not an external signature. Non-goals for the MVP: ZIP packaging, detached signatures, PST/mbox conversion, multi-account collection, mailbox mutation, and restore/import into a mailbox.
+
 ## CLI reference
 
 | Command | Description |
@@ -244,6 +280,7 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 | `envelope tag set/show/list` | Score and tag messages |
 | `envelope rule create/list/test/run/export` | Mail rules (webhook actions supported) |
 | `envelope backup export/verify/restore` | Stage a mailbox to a local RFC822 archive (offline verify, append-only restore) |
+| `envelope evidence collect/verify` | Query-scoped RFC822 evidence bundle with offline verification |
 | `envelope unsubscribe <uid> [--confirm]` | List-Unsubscribe (dry-run default) |
 | `envelope watch [--webhook] [--json]` | IMAP IDLE push — real-time new mail events |
 | `envelope code [--from] [--wait 120]` | Extract verification/OTP codes from email |
