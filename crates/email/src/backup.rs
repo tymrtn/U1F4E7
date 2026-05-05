@@ -223,6 +223,15 @@ pub enum BackupEvent {
         would_append: u32,
         would_skip: u32,
     },
+    /// Emitted when a backup/verify/restore command encounters a fatal error
+    /// and `--json` is active. Allows agents to handle failures
+    /// machine-readably end-to-end without falling through to plain-text
+    /// stderr. Fields intentionally omit credentials and raw message bodies.
+    FatalError {
+        ok: bool,
+        phase: String,
+        error: String,
+    },
 }
 
 /// One row of a restore plan. Same struct used for dry-run planning and live
@@ -1456,6 +1465,59 @@ mod tests {
             }),
             "restore_dry_run_done"
         );
+        assert_eq!(
+            tag_of(&BackupEvent::FatalError {
+                ok: false,
+                phase: "verify".into(),
+                error: "boom".into(),
+            }),
+            "fatal_error"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #21: FatalError event JSON serialization
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fatal_error_event_serializes_with_stable_json_fields() {
+        let event = BackupEvent::FatalError {
+            ok: false,
+            phase: "verify".to_string(),
+            error: "verify failed: missing=1 corrupt=0 extras=0 (strict=false)".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "fatal_error");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["phase"], "verify");
+        assert!(v["error"].as_str().unwrap().contains("verify failed"));
+    }
+
+    #[test]
+    fn fatal_error_event_does_not_expose_credential_fields() {
+        let event = BackupEvent::FatalError {
+            ok: false,
+            phase: "export".to_string(),
+            error: "source IMAP connection failed".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Must not contain any credential-adjacent field names
+        assert!(!json.contains("password"));
+        assert!(!json.contains("token"));
+        assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn fatal_error_event_round_trips_through_serde() {
+        let event = BackupEvent::FatalError {
+            ok: false,
+            phase: "restore".to_string(),
+            error: "restore destination is unsafe".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: BackupEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
     }
 
     #[test]

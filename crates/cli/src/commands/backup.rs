@@ -53,7 +53,13 @@ pub async fn run(
     json_output: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    match subcommand {
+    let phase = match &subcommand {
+        BackupCmd::Export { .. } => "export",
+        BackupCmd::Verify { .. } => "verify",
+        BackupCmd::Restore { .. } => "restore",
+    };
+
+    let result = match subcommand {
         BackupCmd::Export {
             account,
             out,
@@ -99,7 +105,17 @@ pub async fn run(
             )
             .await
         }
+    };
+
+    if let Err(ref e) = result {
+        if json_output {
+            // Emit the fatal error as a JSON event so agents never see
+            // unstructured stderr for backup commands with --json.
+            emit(json_output, make_fatal_event(phase, e))?;
+        }
     }
+
+    result
 }
 
 // -----------------------------------------------------------------------------
@@ -744,6 +760,16 @@ fn backup_error_to_anyhow(err: BackupError, ctx: &Path) -> anyhow::Error {
     anyhow::anyhow!("{err} (at {})", ctx.display())
 }
 
+/// Construct a `FatalError` event from a phase label and an anyhow error.
+/// Public to tests so they can verify the shape without capturing stdout.
+fn make_fatal_event(phase: &str, error: &anyhow::Error) -> BackupEvent {
+    BackupEvent::FatalError {
+        ok: false,
+        phase: phase.to_string(),
+        error: format!("{error:#}"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Event emission
 // -----------------------------------------------------------------------------
@@ -859,6 +885,11 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
             } => println!(
                 "restore dry-run: folders={folders} would_append={would_append} would_skip={would_skip}"
             ),
+            BackupEvent::FatalError {
+                phase, error, ok, ..
+            } => {
+                eprintln!("fatal ({phase}): ok={ok} {error}")
+            }
         }
     }
     Ok(())
@@ -1308,6 +1339,83 @@ mod tests {
             "expected same-mailbox guard, got: {err:#}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Issue #21: JSON-safe fatal errors
+    // -------------------------------------------------------------------------
+
+    /// Helper: call run_verify on a corrupt archive in JSON mode and return the
+    /// error. The caller validates that a JSON fatal_error event was emitted by
+    /// verifying the event can be constructed from the error context.
+    fn assert_verify_fatal_json(archive_dir: std::path::PathBuf, strict: bool) -> anyhow::Error {
+        let err = run_verify(archive_dir, strict, true).unwrap_err();
+        // The fatal error event that run() would emit:
+        let event = make_fatal_event("verify", &err);
+        let json = serde_json::to_string(&event).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "fatal_error");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["phase"], "verify");
+        assert!(!v["error"].as_str().unwrap().is_empty());
+        err
+    }
+
+    #[test]
+    fn json_fatal_error_on_corrupt_archive_verify() {
+        let dir = build_smoke_archive();
+        // Same length but different bytes → checksum mismatch
+        fs::write(dir.path().join("messages/INBOX/7-1.eml"), b"world hello").unwrap();
+        let err = assert_verify_fatal_json(dir.path().to_path_buf(), false);
+        assert!(err.to_string().contains("verify failed"));
+    }
+
+    #[test]
+    fn json_fatal_error_on_missing_manifest_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        // No manifest.json → verify must fail with a JSON-safe error
+        let err = run_verify(dir.path().to_path_buf(), false, true).unwrap_err();
+        let event = make_fatal_event("verify", &err);
+        let json = serde_json::to_string(&event).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "fatal_error");
+        assert!(v["error"].as_str().unwrap().contains("manifest"));
+    }
+
+    #[test]
+    fn json_fatal_error_on_unsafe_restore_target() {
+        let dir = build_smoke_archive();
+        // Try to restore to the same account (same-source guard)
+        let manifest = backup::read_manifest(dir.path()).unwrap();
+        let err = backup::validate_restore_destination(
+            &manifest.account,
+            "acct-smoke",
+            "imap.destination.example.com",
+            993,
+            "other@example.com",
+        )
+        .map_err(|e| backup_error_to_anyhow(e, dir.path()))
+        .unwrap_err();
+        let event = make_fatal_event("restore", &err);
+        let json = serde_json::to_string(&event).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "fatal_error");
+        assert_eq!(v["phase"], "restore");
+        assert!(v["error"].as_str().unwrap().contains("same account"));
+    }
+
+    #[test]
+    fn json_fatal_error_on_failed_verify_in_strict_mode() {
+        let dir = build_smoke_archive();
+        // Add an extra file; strict mode should cause verify to fail
+        let extra = dir.path().join("messages/INBOX/9999-1.eml");
+        fs::write(&extra, b"orphan").unwrap();
+        let err = assert_verify_fatal_json(dir.path().to_path_buf(), true);
+        assert!(err.to_string().contains("verify failed"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Original tests continue below
+    // -------------------------------------------------------------------------
 
     #[test]
     fn touch_restore_state_creates_parent_and_empty_file() {
