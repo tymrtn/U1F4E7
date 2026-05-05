@@ -15,6 +15,9 @@ pub struct FolderPlan {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ProgressEvent {
+    MigrationStatePreflightFailed {
+        error: String,
+    },
     FolderStart {
         source: String,
         destination: String,
@@ -33,6 +36,12 @@ pub enum ProgressEvent {
         reason: String,
     },
     MessageFailed {
+        source: String,
+        destination: String,
+        src_uid: u32,
+        error: String,
+    },
+    MessageStateRecordFailed {
         source: String,
         destination: String,
         src_uid: u32,
@@ -488,6 +497,37 @@ mod tests {
         assert_eq!(json["error"], "APPEND failed: server said no");
     }
 
+    #[test]
+    fn migration_state_preflight_failed_event_serializes_with_event_tag() {
+        let event = ProgressEvent::MigrationStatePreflightFailed {
+            error: "database error: attempt to write a readonly database".to_string(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap())
+            .expect("MigrationStatePreflightFailed must serialize to JSON");
+        assert_eq!(json["event"], "migration_state_preflight_failed");
+        assert_eq!(
+            json["error"],
+            "database error: attempt to write a readonly database"
+        );
+    }
+
+    #[test]
+    fn message_state_record_failed_event_serializes_with_event_tag() {
+        let event = ProgressEvent::MessageStateRecordFailed {
+            source: "INBOX".to_string(),
+            destination: "INBOX".to_string(),
+            src_uid: 42,
+            error: "database error: disk I/O error".to_string(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap())
+            .expect("MessageStateRecordFailed must serialize to JSON");
+        assert_eq!(json["event"], "message_state_record_failed");
+        assert_eq!(json["source"], "INBOX");
+        assert_eq!(json["destination"], "INBOX");
+        assert_eq!(json["src_uid"], 42);
+        assert_eq!(json["error"], "database error: disk I/O error");
+    }
+
     /// Lock the public ProgressEvent JSON taxonomy. If a tag name or required
     /// field changes, downstream automation breaks silently — make any rename
     /// a deliberate, breaking change by failing this test first.
@@ -499,6 +539,12 @@ mod tests {
             v["event"].as_str().unwrap().to_string()
         }
 
+        assert_eq!(
+            tag_of(&ProgressEvent::MigrationStatePreflightFailed {
+                error: "boom".into(),
+            }),
+            "migration_state_preflight_failed"
+        );
         assert_eq!(
             tag_of(&ProgressEvent::FolderStart {
                 source: "INBOX".into(),
@@ -533,6 +579,15 @@ mod tests {
                 error: "boom".into(),
             }),
             "message_failed"
+        );
+        assert_eq!(
+            tag_of(&ProgressEvent::MessageStateRecordFailed {
+                source: "INBOX".into(),
+                destination: "INBOX".into(),
+                src_uid: 1,
+                error: "boom".into(),
+            }),
+            "message_state_record_failed"
         );
         assert_eq!(
             tag_of(&ProgressEvent::FolderDryRun {
