@@ -339,6 +339,14 @@ fn run_verify(from: PathBuf, strict: bool, json_output: bool) -> Result<()> {
             },
         )?;
     }
+    for symlink in &outcome.unsafe_symlinks {
+        emit(
+            json_output,
+            BackupEvent::VerifyUnsafeSymlink {
+                rel_path: symlink.clone(),
+            },
+        )?;
+    }
 
     let strict_extras_fail = strict && !outcome.extras.is_empty();
     let final_ok = outcome.ok && !strict_extras_fail;
@@ -350,15 +358,17 @@ fn run_verify(from: PathBuf, strict: bool, json_output: bool) -> Result<()> {
             missing: outcome.missing.len() as u32,
             corrupt: outcome.corrupt.len() as u32,
             extras: outcome.extras.len() as u32,
+            unsafe_symlinks: outcome.unsafe_symlinks.len() as u32,
         },
     )?;
 
     if !final_ok {
         bail!(
-            "verify failed: missing={} corrupt={} extras={} (strict={})",
+            "verify failed: missing={} corrupt={} extras={} unsafe_symlinks={} (strict={})",
             outcome.missing.len(),
             outcome.corrupt.len(),
             outcome.extras.len(),
+            outcome.unsafe_symlinks.len(),
             strict
         );
     }
@@ -781,6 +791,9 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
             BackupEvent::VerifyExtraFile { rel_path } => {
                 println!("verify extra: {rel_path}")
             }
+            BackupEvent::VerifyUnsafeSymlink { rel_path } => {
+                eprintln!("verify unsafe symlink: {rel_path}")
+            }
             BackupEvent::VerifyMissingFile {
                 folder,
                 uid,
@@ -805,8 +818,11 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
                 missing,
                 corrupt,
                 extras,
+                unsafe_symlinks,
             } => {
-                println!("verify done: ok={ok} missing={missing} corrupt={corrupt} extras={extras}")
+                println!(
+                    "verify done: ok={ok} missing={missing} corrupt={corrupt} extras={extras} unsafe_symlinks={unsafe_symlinks}"
+                )
             }
             BackupEvent::RestoreFolderStart {
                 source,

@@ -158,6 +158,9 @@ pub enum BackupEvent {
     VerifyExtraFile {
         rel_path: String,
     },
+    VerifyUnsafeSymlink {
+        rel_path: String,
+    },
     VerifyMissingFile {
         folder: String,
         uid: u32,
@@ -182,6 +185,7 @@ pub enum BackupEvent {
         missing: u32,
         corrupt: u32,
         extras: u32,
+        unsafe_symlinks: u32,
     },
     RestoreFolderStart {
         source: String,
@@ -273,6 +277,7 @@ pub struct VerifyOutcome {
     pub missing: Vec<MissingFile>,
     pub corrupt: Vec<CorruptFile>,
     pub extras: Vec<String>,
+    pub unsafe_symlinks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -919,22 +924,43 @@ pub fn read_manifest(archive_dir: &Path) -> Result<ArchiveManifest, BackupError>
 /// Walk every `.eml` under `<archive_dir>/messages/` and return paths relative
 /// to `archive_dir`, normalized with forward slashes for stable comparison
 /// against manifest `rel_path`.
-fn list_archive_eml_files(archive_dir: &Path) -> io::Result<Vec<String>> {
+///
+/// Any symlinked entry (file or directory) is skipped and its relative path is
+/// appended to `unsafe_symlinks` so the caller can report it.
+fn list_archive_eml_files(
+    archive_dir: &Path,
+    unsafe_symlinks: &mut Vec<String>,
+) -> io::Result<Vec<String>> {
     let mut out = Vec::new();
     let messages = archive_dir.join("messages");
     if !messages.exists() {
         return Ok(out);
     }
-    walk_dir(&messages, archive_dir, &mut out)?;
+    walk_dir(&messages, archive_dir, &mut out, unsafe_symlinks)?;
     Ok(out)
 }
 
-fn walk_dir(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Result<()> {
+fn walk_dir(
+    dir: &Path,
+    root: &Path,
+    out: &mut Vec<String>,
+    unsafe_symlinks: &mut Vec<String>,
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            walk_dir(&path, root, out)?;
+        // Use symlink_metadata (lstat) so we see the symlink itself rather
+        // than following it. This prevents traversal outside the archive
+        // and protects against symlink loops.
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.is_symlink() {
+            let rel = path.strip_prefix(root).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("strip_prefix: {e}"))
+            })?;
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            unsafe_symlinks.push(rel_str);
+        } else if meta.is_dir() {
+            walk_dir(&path, root, out, unsafe_symlinks)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("eml") {
             let rel = path.strip_prefix(root).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("strip_prefix: {e}"))
@@ -1008,20 +1034,23 @@ pub fn verify_archive(archive_dir: &Path) -> Result<VerifyOutcome, BackupError> 
         }
     }
 
-    let on_disk = list_archive_eml_files(archive_dir)?;
+    let mut unsafe_symlinks = Vec::new();
+    let on_disk = list_archive_eml_files(archive_dir, &mut unsafe_symlinks)?;
     let mut extras: Vec<String> = on_disk
         .into_iter()
         .filter(|p| !referenced.contains(p))
         .collect();
     extras.sort();
+    unsafe_symlinks.sort();
 
-    let ok = missing.is_empty() && corrupt.is_empty();
+    let ok = missing.is_empty() && corrupt.is_empty() && unsafe_symlinks.is_empty();
     Ok(VerifyOutcome {
         ok,
         manifest_message_count: manifest.messages.len() as u32,
         missing,
         corrupt,
         extras,
+        unsafe_symlinks,
     })
 }
 
@@ -1358,6 +1387,7 @@ mod tests {
                 missing: 0,
                 corrupt: 0,
                 extras: 0,
+                unsafe_symlinks: 0,
             }),
             "verify_done"
         );
@@ -2088,5 +2118,103 @@ mod tests {
         fs::write(&out, b"x").unwrap();
         let err = validate_export_output_dir(&out).unwrap_err();
         assert!(matches!(err, BackupError::UnsafeOutputDir { .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #17: harden extra-file enumeration against symlinks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn verify_reports_symlinked_extra_directory_as_unsafe() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let (dir, _m) = build_tempdir_archive(b"hello world");
+
+            // Create an external directory with a stray .eml file.
+            let external = tempfile::tempdir().unwrap();
+            let ext_sub = external.path().join("Drafts");
+            fs::create_dir(&ext_sub).unwrap();
+            fs::write(ext_sub.join("99-1.eml"), b"external payload").unwrap();
+
+            // Symlink messages/Drafts -> external/Drafts inside the archive.
+            unix_fs::symlink(&ext_sub, dir.path().join("messages/Drafts")).unwrap();
+
+            let outcome = verify_archive(dir.path()).unwrap();
+            // The symlinked directory must NOT be traversed: no extras from it.
+            assert!(
+                outcome.extras.is_empty(),
+                "must not enumerate files through symlinked directory"
+            );
+            // Must be reported as an unsafe symlink.
+            assert!(
+                !outcome.unsafe_symlinks.is_empty(),
+                "symlinked directory must appear in unsafe_symlinks"
+            );
+            assert!(!outcome.ok, "archive with unsafe symlinks must not be ok");
+        }
+    }
+
+    #[test]
+    fn verify_reports_symlink_loop_as_unsafe_without_hanging() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let (dir, _m) = build_tempdir_archive(b"hello world");
+
+            // Create a symlink loop: messages/loop -> messages/loop
+            let loop_path = dir.path().join("messages/loop");
+            unix_fs::symlink(&loop_path, &loop_path).unwrap();
+
+            let outcome = verify_archive(dir.path()).unwrap();
+            assert!(
+                !outcome.unsafe_symlinks.is_empty(),
+                "symlink loop must appear in unsafe_symlinks"
+            );
+            assert!(!outcome.ok, "archive with symlink loop must not be ok");
+        }
+    }
+
+    #[test]
+    fn verify_reports_symlinked_extra_file_as_unsafe() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let (dir, _m) = build_tempdir_archive(b"hello world");
+
+            // Create an external file and symlink to it inside the archive.
+            let external = tempfile::tempdir().unwrap();
+            let ext_file = external.path().join("stolen.eml");
+            fs::write(&ext_file, b"external data").unwrap();
+            unix_fs::symlink(&ext_file, dir.path().join("messages/INBOX/fake.eml")).unwrap();
+
+            let outcome = verify_archive(dir.path()).unwrap();
+            // The symlinked file must NOT appear in extras.
+            assert!(
+                outcome.extras.is_empty(),
+                "symlinked file must not appear as a regular extra"
+            );
+            assert!(
+                !outcome.unsafe_symlinks.is_empty(),
+                "symlinked file must appear in unsafe_symlinks"
+            );
+            assert!(
+                !outcome.ok,
+                "archive with unsafe symlink file must not be ok"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_still_reports_normal_extra_file_correctly() {
+        // Ensure the fix doesn't regress normal extra-file detection.
+        let (dir, _m) = build_tempdir_archive(b"hello world");
+        let extra = dir.path().join("messages/INBOX/99999-99.eml");
+        fs::write(&extra, b"orphan").unwrap();
+        let outcome = verify_archive(dir.path()).unwrap();
+        assert!(outcome.ok, "extras alone don't fail verify");
+        assert_eq!(outcome.extras.len(), 1);
+        assert!(outcome.extras[0].ends_with("99999-99.eml"));
+        assert!(outcome.unsafe_symlinks.is_empty());
     }
 }
