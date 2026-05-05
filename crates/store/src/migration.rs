@@ -11,6 +11,9 @@ use crate::db::Database;
 use crate::errors::Result;
 use rusqlite::{OptionalExtension, params};
 
+const PREFLIGHT_ACCOUNT_ID: &str = "__envelope_migration_preflight__";
+const PREFLIGHT_FOLDER: &str = "__envelope_migration_preflight__";
+
 /// One row in the `migration_uid_map` table.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MigrationUidEntry {
@@ -83,6 +86,42 @@ impl Database {
                 record.size.map(|s| s as i64),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Prove that `migration_uid_map` is writable before any destination
+    /// APPEND mutates a mailbox. The probe uses a real insert inside a
+    /// transaction and then rolls it back so successful preflight leaves no
+    /// persistent state behind.
+    pub fn preflight_migration_state_write(&mut self) -> Result<()> {
+        let tx = self.conn_mut().transaction()?;
+        tx.execute(
+            "INSERT INTO migration_uid_map (
+                src_account_id, dst_account_id, src_folder, src_uidvalidity, src_uid,
+                dst_folder, dst_uidvalidity, dst_uid, message_id, size
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(src_account_id, dst_account_id, src_folder, src_uidvalidity, src_uid)
+             DO UPDATE SET
+                dst_folder = excluded.dst_folder,
+                dst_uidvalidity = excluded.dst_uidvalidity,
+                dst_uid = excluded.dst_uid,
+                message_id = excluded.message_id,
+                size = excluded.size,
+                copied_at = datetime('now')",
+            params![
+                PREFLIGHT_ACCOUNT_ID,
+                PREFLIGHT_ACCOUNT_ID,
+                PREFLIGHT_FOLDER,
+                0u32,
+                0u32,
+                PREFLIGHT_FOLDER,
+                Option::<u32>::None,
+                Option::<u32>::None,
+                Option::<&str>::None,
+                Option::<i64>::None,
+            ],
+        )?;
+        tx.rollback()?;
         Ok(())
     }
 
@@ -325,6 +364,48 @@ mod tests {
         }
         let uids = db.list_migrated_uids(scope(Some(100))).unwrap();
         assert_eq!(uids, vec![1, 3, 7, 10]);
+    }
+
+    #[test]
+    fn preflight_migration_state_write_rolls_back_probe_row() {
+        let mut db = Database::open_memory().unwrap();
+        db.preflight_migration_state_write().unwrap();
+        assert_eq!(
+            db.count_migrated(MigrationScope {
+                src_account_id: PREFLIGHT_ACCOUNT_ID,
+                dst_account_id: PREFLIGHT_ACCOUNT_ID,
+                src_folder: Some(PREFLIGHT_FOLDER),
+                src_uidvalidity: Some(0),
+            })
+            .unwrap(),
+            0,
+            "preflight must not leave a sentinel migration row behind"
+        );
+    }
+
+    #[test]
+    fn preflight_migration_state_write_surfaces_insert_failures() {
+        let mut db = Database::open_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_migration_preflight
+                BEFORE INSERT ON migration_uid_map
+                BEGIN
+                    SELECT RAISE(FAIL, 'preflight insert blocked');
+                END;
+                ",
+            )
+            .unwrap();
+
+        let err = db
+            .preflight_migration_state_write()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("preflight insert blocked"),
+            "expected trigger failure to surface through preflight: {err}"
+        );
     }
 
     #[test]

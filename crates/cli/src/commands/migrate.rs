@@ -113,7 +113,7 @@ pub async fn run(
         } => {
             let batch_size =
                 migrate::validate_batch_size(batch_size).map_err(anyhow::Error::msg)?;
-            let (db, src) = setup_credentials(Some(&from), backend)?;
+            let (mut db, src) = setup_credentials(Some(&from), backend)?;
             let (_dst_db, dst) = setup_credentials(Some(&to), backend)?;
             migrate::validate_distinct_accounts(&src.account.id, &dst.account.id)
                 .map_err(anyhow::Error::msg)?;
@@ -126,6 +126,9 @@ pub async fn run(
                 dst.effective_imap_username(),
             )
             .map_err(anyhow::Error::msg)?;
+            if !dry_run {
+                preflight_migration_state_write(&mut db, json_output)?;
+            }
             let mut src_client = imap::connect(&src)
                 .await
                 .context("source IMAP connection failed")?;
@@ -314,14 +317,21 @@ pub async fn run(
                         .await
                         {
                             Ok(()) => {
-                                db.record_migration(MigrationRecord {
-                                    key,
-                                    dst_folder: &folder.folder,
-                                    dst_uidvalidity: dst_info.uid_validity,
-                                    dst_uid: None,
-                                    message_id: msg.message_id.as_deref(),
-                                    size: Some(msg.size as u64),
-                                })?;
+                                record_migration_after_append(
+                                    &db,
+                                    MigrationRecord {
+                                        key,
+                                        dst_folder: &folder.folder,
+                                        dst_uidvalidity: dst_info.uid_validity,
+                                        dst_uid: None,
+                                        message_id: msg.message_id.as_deref(),
+                                        size: Some(msg.size as u64),
+                                    },
+                                    json_output,
+                                    &folder.folder,
+                                    &folder.folder,
+                                    msg.uid,
+                                )?;
                                 copied += 1;
                                 emit(
                                     json_output,
@@ -390,6 +400,55 @@ pub async fn run(
     Ok(())
 }
 
+fn preflight_migration_state_write(
+    db: &mut envelope_email_store::Database,
+    json_output: bool,
+) -> Result<()> {
+    match db.preflight_migration_state_write() {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let err_text = err.to_string();
+            emit(
+                json_output,
+                migrate::ProgressEvent::MigrationStatePreflightFailed {
+                    error: err_text.clone(),
+                },
+            )?;
+            Err(anyhow::Error::new(err).context(format!(
+                "preflight: cannot write migration state before destination APPEND: {err_text}"
+            )))
+        }
+    }
+}
+
+fn record_migration_after_append(
+    db: &envelope_email_store::Database,
+    record: MigrationRecord<'_>,
+    json_output: bool,
+    source: &str,
+    destination: &str,
+    src_uid: u32,
+) -> Result<()> {
+    match db.record_migration(record) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let err_text = err.to_string();
+            emit(
+                json_output,
+                migrate::ProgressEvent::MessageStateRecordFailed {
+                    source: source.to_string(),
+                    destination: destination.to_string(),
+                    src_uid,
+                    error: err_text.clone(),
+                },
+            )?;
+            Err(anyhow::Error::new(err).context(format!(
+                "APPEND succeeded for {source} UID {src_uid} but recording migration state failed; aborting before subsequent appends would silently duplicate: {err_text}"
+            )))
+        }
+    }
+}
+
 fn fail_if_any_message_failed(total_failed: u32) -> Result<()> {
     if total_failed > 0 {
         anyhow::bail!("migration completed with {total_failed} failed message(s)");
@@ -402,6 +461,9 @@ fn emit(json_output: bool, event: migrate::ProgressEvent) -> Result<()> {
         println!("{}", serde_json::to_string(&event)?);
     } else {
         match event {
+            migrate::ProgressEvent::MigrationStatePreflightFailed { error } => {
+                eprintln!("fatal: migration-state preflight failed: {error}")
+            }
             migrate::ProgressEvent::FolderStart {
                 source, messages, ..
             } => println!("Migrating {source} ({messages} messages)"),
@@ -422,6 +484,14 @@ fn emit(json_output: bool, event: migrate::ProgressEvent) -> Result<()> {
                 error,
                 ..
             } => eprintln!("fail {source} UID {src_uid}: {error}"),
+            migrate::ProgressEvent::MessageStateRecordFailed {
+                source,
+                src_uid,
+                error,
+                ..
+            } => eprintln!(
+                "fatal {source} UID {src_uid}: APPEND succeeded but recording migration state failed: {error}"
+            ),
             migrate::ProgressEvent::FolderDryRun {
                 source,
                 messages,
@@ -466,6 +536,7 @@ fn emit(json_output: bool, event: migrate::ProgressEvent) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use envelope_email_store::Database;
 
     #[test]
     fn migrate_run_requires_from_and_to() {
@@ -552,6 +623,73 @@ mod tests {
     }
 
     #[test]
+    fn migration_state_preflight_failure_is_fatal() {
+        let mut db = Database::open_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_migration_preflight_cli
+                BEFORE INSERT ON migration_uid_map
+                BEGIN
+                    SELECT RAISE(FAIL, 'cli preflight blocked');
+                END;
+                ",
+            )
+            .unwrap();
+
+        let err = preflight_migration_state_write(&mut db, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preflight: cannot write migration state"));
+        assert!(err.contains("cli preflight blocked"));
+    }
+
+    #[test]
+    fn post_append_state_record_failure_is_fatal() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_migration_record_cli
+                BEFORE INSERT ON migration_uid_map
+                BEGIN
+                    SELECT RAISE(FAIL, 'cli record blocked');
+                END;
+                ",
+            )
+            .unwrap();
+        let key = MigrationKey {
+            src_account_id: "src",
+            dst_account_id: "dst",
+            src_folder: "INBOX",
+            src_uidvalidity: 7,
+            src_uid: 42,
+        };
+
+        let err = record_migration_after_append(
+            &db,
+            MigrationRecord {
+                key,
+                dst_folder: "INBOX",
+                dst_uidvalidity: Some(9),
+                dst_uid: None,
+                message_id: None,
+                size: Some(123),
+            },
+            false,
+            "INBOX",
+            "INBOX",
+            42,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("APPEND succeeded for INBOX UID 42"));
+        assert!(err.contains("cli record blocked"));
+        assert!(!db.is_migrated(key).unwrap());
+    }
+
+    #[test]
     fn message_failed_event_serializes_with_event_tag() {
         let event = migrate::ProgressEvent::MessageFailed {
             source: "Junk E-mail".to_string(),
@@ -565,6 +703,37 @@ mod tests {
         assert_eq!(parsed["source"], "Junk E-mail");
         assert_eq!(parsed["src_uid"], 99);
         assert_eq!(parsed["error"], "APPEND rejected");
+    }
+
+    #[test]
+    fn migration_state_preflight_failed_event_serializes_with_event_tag() {
+        let event = migrate::ProgressEvent::MigrationStatePreflightFailed {
+            error: "database error: attempt to write a readonly database".to_string(),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["event"], "migration_state_preflight_failed");
+        assert_eq!(
+            parsed["error"],
+            "database error: attempt to write a readonly database"
+        );
+    }
+
+    #[test]
+    fn message_state_record_failed_event_serializes_with_event_tag() {
+        let event = migrate::ProgressEvent::MessageStateRecordFailed {
+            source: "Junk E-mail".to_string(),
+            destination: "Junk E-mail".to_string(),
+            src_uid: 99,
+            error: "database error: disk I/O error".to_string(),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["event"], "message_state_record_failed");
+        assert_eq!(parsed["source"], "Junk E-mail");
+        assert_eq!(parsed["destination"], "Junk E-mail");
+        assert_eq!(parsed["src_uid"], 99);
+        assert_eq!(parsed["error"], "database error: disk I/O error");
     }
 
     #[test]

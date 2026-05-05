@@ -51,6 +51,10 @@ impl Database {
         &self.conn
     }
 
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     // ── Detected folder cache ────────────────────────────────────────
 
     /// Get the cached drafts folder name for an account.
