@@ -11,6 +11,7 @@ pub mod contacts;
 pub mod datetime;
 pub mod drafts;
 pub mod events;
+pub mod evidence;
 pub mod flags;
 pub mod folders;
 pub mod inbox;

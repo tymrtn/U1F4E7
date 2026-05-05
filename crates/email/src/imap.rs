@@ -407,6 +407,15 @@ fn decode_q_encoding(input: &str) -> Vec<u8> {
 /// test will fail. That's intentional — do not silently loosen this.
 pub const FETCH_MESSAGE_DESCRIPTOR: &str = "(UID FLAGS BODY.PEEK[])";
 
+/// Evidence collection must open source folders read-only.
+pub const EVIDENCE_MAILBOX_OPEN_COMMAND: &str = "EXAMINE";
+
+/// Full-message evidence capture descriptor.
+///
+/// This is intentionally identical to the backup raw fetch descriptor: UID and
+/// metadata plus raw RFC822 bytes via BODY.PEEK[] so no \Seen mutation occurs.
+pub const EVIDENCE_RAW_FETCH_DESCRIPTOR: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";
+
 /// Fetch a full message by UID, parsing the body with mail-parser.
 ///
 /// Uses `BODY.PEEK[]` so reading a message does NOT auto-mark it as seen.
@@ -572,6 +581,14 @@ pub async fn examine_folder_info(
     })
 }
 
+/// Evidence-specific wrapper around EXAMINE for readability at call sites.
+pub async fn examine_folder_for_evidence(
+    client: &mut ImapClient,
+    folder: &str,
+) -> Result<SelectedMailbox, ImapError> {
+    examine_folder_info(client, folder).await
+}
+
 /// Create a folder if it does not already exist.
 pub async fn create_folder_if_missing(
     client: &mut ImapClient,
@@ -644,7 +661,7 @@ pub async fn fetch_raw_messages_selected_uid_set(
 
     let messages = client
         .session
-        .uid_fetch(uid_set, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])")
+        .uid_fetch(uid_set, EVIDENCE_RAW_FETCH_DESCRIPTOR)
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set}: {e}")))?;
     let mut out = Vec::new();
@@ -763,11 +780,52 @@ pub async fn find_uid_by_message_id(
     Ok(uid)
 }
 
+/// Search the currently selected/examined mailbox for evidence collection.
+///
+/// Callers must open the mailbox with `examine_folder_for_evidence` first.
+pub async fn evidence_search_selected_uids(
+    client: &mut ImapClient,
+    query: &str,
+) -> Result<Vec<u32>, ImapError> {
+    validate_imap_input(query)?;
+    let uid_set = client
+        .session
+        .uid_search(query)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {query}: {e}")))?;
+    let mut uids: Vec<u32> = uid_set.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
+}
+
+/// Search the currently selected/examined mailbox by one of the RFC5322
+/// threading headers used for evidence expansion.
+pub async fn evidence_search_selected_header_uids(
+    client: &mut ImapClient,
+    header_name: &str,
+    value: &str,
+) -> Result<Vec<u32>, ImapError> {
+    let query = evidence_header_search_query(header_name, value)?;
+    evidence_search_selected_uids(client, &query).await
+}
+
 fn message_id_search_query(message_id: &str) -> Result<String, ImapError> {
     Ok(format!(
         "HEADER Message-ID {}",
         imap_quoted_string_arg(message_id)?
     ))
+}
+
+pub fn evidence_header_search_query(header_name: &str, value: &str) -> Result<String, ImapError> {
+    match header_name {
+        "Message-ID" | "In-Reply-To" | "References" => Ok(format!(
+            "HEADER {header_name} {}",
+            imap_quoted_string_arg(value)?
+        )),
+        _ => Err(ImapError::Protocol(format!(
+            "unsupported evidence thread header {header_name:?}"
+        ))),
+    }
 }
 
 fn imap_quoted_string_arg(value: &str) -> Result<String, ImapError> {
@@ -1354,6 +1412,39 @@ mod tests {
                 || FETCH_MESSAGE_DESCRIPTOR.contains("BODY.PEEK["),
             "fetch descriptor must not contain BODY[ without .PEEK"
         );
+    }
+
+    #[test]
+    fn evidence_mailbox_access_is_read_only_examine() {
+        assert_eq!(EVIDENCE_MAILBOX_OPEN_COMMAND, "EXAMINE");
+    }
+
+    #[test]
+    fn evidence_raw_fetch_descriptor_uses_body_peek() {
+        assert_eq!(
+            EVIDENCE_RAW_FETCH_DESCRIPTOR, "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])",
+            "evidence raw capture must use BODY.PEEK[] to preserve unread state"
+        );
+        assert!(EVIDENCE_RAW_FETCH_DESCRIPTOR.contains("BODY.PEEK[]"));
+        assert!(!EVIDENCE_RAW_FETCH_DESCRIPTOR.contains("BODY[]"));
+    }
+
+    #[test]
+    fn evidence_header_search_query_allows_only_thread_headers_and_escapes_values() {
+        assert_eq!(
+            evidence_header_search_query("References", r#"<a" OR ALL \ "b@example.com>"#).unwrap(),
+            r#"HEADER References "<a\" OR ALL \\ \"b@example.com>""#
+        );
+        assert_eq!(
+            evidence_header_search_query("In-Reply-To", "<parent@example.com>").unwrap(),
+            r#"HEADER In-Reply-To "<parent@example.com>""#
+        );
+    }
+
+    #[test]
+    fn evidence_header_search_query_rejects_subject_fallback_and_crlf() {
+        assert!(evidence_header_search_query("Subject", "Contract").is_err());
+        assert!(evidence_header_search_query("Message-ID", "<a@example.com>\r\nALL").is_err());
     }
 
     #[test]
