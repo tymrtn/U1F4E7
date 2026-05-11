@@ -12,6 +12,49 @@ use tracing::warn;
 
 use super::common::{resolve_account, setup_credentials};
 
+const DEFAULT_DASHBOARD_BASE_URL: &str = "http://localhost:3141";
+
+fn dashboard_base_url() -> String {
+    std::env::var("ENVELOPE_DASHBOARD_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_DASHBOARD_BASE_URL.to_string())
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn draft_dashboard_path(account_id: &str, draft_id: &str) -> String {
+    format!(
+        "/accounts/{}/drafts/{}",
+        encode_path_segment(account_id),
+        encode_path_segment(draft_id)
+    )
+}
+
+fn draft_dashboard_url_with_base(base_url: &str, account_id: &str, draft_id: &str) -> String {
+    format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        draft_dashboard_path(account_id, draft_id)
+    )
+}
+
+fn draft_dashboard_url(account_id: &str, draft_id: &str) -> String {
+    draft_dashboard_url_with_base(&dashboard_base_url(), account_id, draft_id)
+}
+
 /// Build an RFC822-formatted draft message suitable for IMAP APPEND.
 ///
 /// Returns (rfc822_bytes, message_id).
@@ -170,6 +213,9 @@ fn run_list_local(db: &Database, account_id: &str, json: bool) -> Result<()> {
                     "updated_at": d.updated_at,
                     "imap_uid": d.imap_uid,
                     "source": "local",
+                    "dashboard_path": draft_dashboard_path(&d.account_id, &d.id),
+                    "dashboard_url": draft_dashboard_url(&d.account_id, &d.id),
+                    "review_url": draft_dashboard_url(&d.account_id, &d.id),
                 })
             })
             .collect();
@@ -340,6 +386,9 @@ pub async fn run_create(
         let _ = db.mark_draft_message_id(&draft.id, &message_id);
     }
 
+    let dashboard_path = draft_dashboard_path(&creds.account.id, &draft.id);
+    let dashboard_url = draft_dashboard_url(&creds.account.id, &draft.id);
+
     if json {
         println!(
             "{}",
@@ -354,6 +403,14 @@ pub async fn run_create(
                 "imap_uid": imap_uid,
                 "imap_folder": if imap_synced { Some(&drafts_folder_name) } else { None },
                 "local_only": !imap_synced,
+                "dashboard_path": dashboard_path,
+                "dashboard_url": dashboard_url,
+                "review_url": dashboard_url,
+                "metadata": {
+                    "dashboard_path": dashboard_path,
+                    "dashboard_url": dashboard_url,
+                    "review_url": dashboard_url,
+                },
                 "warning": if !imap_synced && has_imap {
                     Some("IMAP sync failed — draft saved locally only. Retry with draft create or check IMAP connectivity.")
                 } else if !has_imap {
@@ -372,6 +429,7 @@ pub async fn run_create(
         if let Some(c) = cc {
             println!("  CC:      {c}");
         }
+        println!("  Review:  {dashboard_url}");
         if imap_synced {
             if let Some(uid) = imap_uid {
                 println!("  IMAP:    synced to {} (UID {})", drafts_folder_name, uid);
@@ -695,4 +753,29 @@ pub async fn run_discard(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draft_dashboard_path_encodes_account_and_draft_segments() {
+        assert_eq!(
+            draft_dashboard_path("editor@spainexpat.com", "draft id/1"),
+            "/accounts/editor%40spainexpat.com/drafts/draft%20id%2F1"
+        );
+    }
+
+    #[test]
+    fn draft_dashboard_url_uses_supplied_base_without_double_slash() {
+        assert_eq!(
+            draft_dashboard_url_with_base(
+                "http://localhost:1111/",
+                "editor@spainexpat.com",
+                "draft-123",
+            ),
+            "http://localhost:1111/accounts/editor%40spainexpat.com/drafts/draft-123"
+        );
+    }
 }
