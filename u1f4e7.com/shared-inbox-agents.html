@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Envelope — agents for shared inboxes</title>
+  <meta name="description" content="Add agents to existing shared inboxes like support@, ops@, editor@, or hello@ without changing addresses, folders, or provider.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="index.html#top">✉️ Envelope</a>
+      <nav>
+        <a href="index.html#use-cases">Use cases</a>
+        <a href="index.html#workflows">What it does</a>
+        <a href="index.html#control">Human control</a>
+        <a href="index.html#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7">Repo</a>
+      </nav>
+    </div>
+  </header>
+  <main id="top">
+
+    <section class="hero"><div class="wrap hero-grid"><div><p class="eyebrow">Shared inbox agents</p><h1>Add an agent to the inbox your team already uses.</h1><p class="lede">Support@, ops@, editor@, hello@ — the address stays the same. Humans keep working as before. Envelope gives the agent structured access, draft approval, reviewable rules, and a cockpit so everyone can see what happened.</p><div class="cta-row"><a class="button" href="https://github.com/tymrtn/U1F4E7">Get the repo</a><a class="button button-secondary" href="index.html#pricing">Commercial license</a></div></div><aside class="callout code-panel"><pre><code># Watch a shared inbox
+envelope watch --account support@example.com --json
+
+# Preview rules before moving anything
+envelope rule preview --account support@example.com --limit 100 --json
+
+# Draft first, send after approval
+envelope draft create --to customer@example.com</code></pre></aside></div></section>
+    <section class="section section-dark"><div class="wrap two-col"><div><h2>The workflow does not change.</h2><p>The mailbox is still the shared workspace. Envelope does not ask the team to move to a new app or route mail through a new provider. The agent joins the existing flow and works under human review.</p></div><div class="card"><h3>What the agent can do</h3><ul class="checklist"><li>Watch for new mail</li><li>Extract codes and confirmations</li><li>Draft replies</li><li>Suggest cleanup rules</li><li>Export evidence bundles</li></ul></div></div></section>
+    <section class="section"><div class="wrap"><h2>Built for mixed human/agent ownership</h2><div class="cards three-up" style="margin-top:1.5rem"><article class="card"><h3>Draft approval</h3><p>The agent writes; a human approves, edits, or discards.</p></article><article class="card"><h3>Reviewable rules</h3><p>See affected messages before a cleanup rule moves anything.</p></article><article class="card"><h3>Audit trail</h3><p>Rule runs, drafts, watches, and send decisions are visible instead of implicit.</p></article></div></div></section>
+
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope — BYO email for agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing">Licensing</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
