@@ -17,6 +17,7 @@ const state = {
   messages: [],
   currentMessage: null,
   drafts: [],
+  currentDraft: null,
   snoozed: [],
   composeMode: 'new',
   composeParent: null,
@@ -25,7 +26,66 @@ const state = {
   showAllAccounts: false,
   searchQuery: '',
   rules: [],
+  route: null,
+  cockpitStatus: 'select an account',
+  cockpitMessage: null,
 };
+
+// ── Dashboard routes ───────────────────────────────────────────────
+function safeDecodeSegment(segment) {
+  try { return decodeURIComponent(segment); }
+  catch (_) { return segment; }
+}
+
+function parseDashboardRoute(pathname) {
+  const parts = String(pathname || '/').split('/').filter(Boolean).map(safeDecodeSegment);
+  if (parts.length === 0) return null;
+
+  if (parts[0] === 'accounts' && parts.length >= 3) {
+    if (parts[2] === 'drafts' && parts[3]) {
+      return { kind: 'draft', accountSlug: parts[1], draftId: parts[3] };
+    }
+    if (parts[2] === 'cockpit') {
+      return { kind: 'cockpit', accountSlug: parts[1] };
+    }
+  }
+
+  if (parts[1] === 'drafts' && parts[2]) {
+    return { kind: 'draft', accountSlug: parts[0], draftId: parts[2] };
+  }
+  if (parts[1] === 'cockpit') {
+    return { kind: 'cockpit', accountSlug: parts[0] };
+  }
+
+  return null;
+}
+
+function normalizeSlug(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function resolveAccountSlug(slug) {
+  const wanted = normalizeSlug(slug);
+  if (!wanted) return null;
+  return state.accounts.find(acct => {
+    return [acct.id, acct.username, acct.name, acct.display_name]
+      .filter(Boolean)
+      .some(value => normalizeSlug(value) === wanted);
+  }) || null;
+}
+
+function dashboardPathForDraft(draft) {
+  const accountId = draft.account_id || (state.currentAccount && state.currentAccount.id);
+  if (!accountId || !draft.id) return '#';
+  return `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draft.id)}`;
+}
+
+function focusAgentCockpit() {
+  const panel = $('agent-cockpit');
+  if (!panel) return;
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  panel.focus({ preventScroll: true });
+}
 
 // ── Fetch helper ───────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -371,7 +431,24 @@ async function loadAccounts() {
     renderAccountSwitcher();
     renderAccountsList();
     if (!state.currentAccount && state.accounts.length > 0) {
-      selectAccount(state.accounts[0]);
+      const routeAccount = state.route ? resolveAccountSlug(state.route.accountSlug) : null;
+      if (state.route && !routeAccount) {
+        state.cockpitStatus = 'deep link account not found';
+        state.cockpitMessage = {
+          kind: 'error',
+          text: `No dashboard account matched "${state.route.accountSlug}".`,
+        };
+        renderDrafts();
+        focusAgentCockpit();
+        toast('Deep link account not found', 'error');
+        return;
+      }
+      await selectAccount(routeAccount || state.accounts[0]);
+      await applyDashboardRoute();
+    } else if (state.accounts.length === 0) {
+      state.cockpitStatus = 'no accounts';
+      state.cockpitMessage = { kind: 'error', text: 'No accounts are configured in this dashboard.' };
+      renderDrafts();
     }
   } catch (e) {
     toast('Failed to load accounts: ' + e.message, 'error');
@@ -435,6 +512,8 @@ function renderAccountsList() {
 async function selectAccount(acct) {
   state.currentAccount = acct;
   state.currentFolder = 'INBOX';
+  state.currentDraft = null;
+  state.cockpitMessage = null;
   setSearchState('');
   $('search-input').value = '';
   renderAccountSwitcher();
@@ -442,6 +521,7 @@ async function selectAccount(acct) {
   // Sequential — folders first (creates the IMAP connection), then messages reuse it.
   await loadFolders();
   await loadMessages();
+  await loadDrafts();
 }
 
 // ── Folders ────────────────────────────────────────────────────────
@@ -724,7 +804,207 @@ function renderSnoozed() {
   }
 }
 
+// ── Agent Cockpit drafts ───────────────────────────────────────────
+async function applyDashboardRoute() {
+  const route = state.route;
+  if (!route || !state.currentAccount) return;
+
+  if (route.kind === 'draft') {
+    await openDraftDeepLink(route.draftId);
+  } else if (route.kind === 'cockpit') {
+    focusAgentCockpit();
+  }
+}
+
+async function loadDrafts() {
+  if (!state.currentAccount) {
+    state.drafts = [];
+    state.cockpitStatus = 'select an account';
+    renderDrafts();
+    return;
+  }
+
+  state.cockpitStatus = 'loading drafts...';
+  renderDrafts();
+  try {
+    const data = await api('GET', `/accounts/${state.currentAccount.id}/drafts`);
+    state.drafts = data.drafts || [];
+    state.cockpitStatus = `${state.drafts.length} draft${state.drafts.length === 1 ? '' : 's'}`;
+    renderDrafts();
+  } catch (e) {
+    state.drafts = [];
+    state.cockpitStatus = 'drafts unavailable';
+    state.cockpitMessage = { kind: 'error', text: 'Drafts: ' + e.message };
+    renderDrafts();
+  }
+}
+
+async function openDraftDeepLink(draftId) {
+  state.cockpitStatus = 'loading draft...';
+  state.cockpitMessage = null;
+  renderDrafts();
+  try {
+    const data = await api(
+      'GET',
+      `/accounts/${state.currentAccount.id}/drafts/${encodeURIComponent(draftId)}`
+    );
+    state.currentDraft = data.draft;
+    upsertDraft(data.draft);
+    state.cockpitStatus = 'draft opened';
+    renderDrafts();
+    focusAgentCockpit();
+  } catch (e) {
+    state.currentDraft = null;
+    state.cockpitStatus = 'draft not found';
+    state.cockpitMessage = {
+      kind: 'error',
+      text: `Draft "${draftId}" was not found for ${state.currentAccount.username}.`,
+    };
+    renderDrafts();
+    focusAgentCockpit();
+    toast('Draft deep link not found', 'error');
+  }
+}
+
+function upsertDraft(draft) {
+  if (!draft || !draft.id) return;
+  const idx = state.drafts.findIndex(d => d.id === draft.id);
+  if (idx >= 0) {
+    state.drafts[idx] = draft;
+  } else {
+    state.drafts.unshift(draft);
+  }
+}
+
+function renderDrafts() {
+  const status = $('cockpit-status');
+  const message = $('cockpit-message');
+  const list = $('cockpit-drafts');
+  if (!status || !message || !list) return;
+
+  status.textContent = state.cockpitStatus || '';
+  clear(message);
+  if (state.cockpitMessage && state.cockpitMessage.text) {
+    message.className = `cockpit-message ${state.cockpitMessage.kind || ''}`;
+    message.textContent = state.cockpitMessage.text;
+    message.classList.remove('hidden');
+  } else {
+    message.className = 'cockpit-message hidden';
+  }
+
+  clear(list);
+  if (!state.currentAccount) {
+    list.appendChild(el('div', { class: 'draft-empty', text: 'Select an account to see local drafts.' }));
+    return;
+  }
+
+  if (state.currentDraft) {
+    list.appendChild(renderDraftDetail(state.currentDraft, true));
+  }
+
+  const remaining = state.drafts.filter(d => !state.currentDraft || d.id !== state.currentDraft.id);
+  if (remaining.length === 0 && !state.currentDraft) {
+    list.appendChild(el('div', { class: 'draft-empty', text: 'No local drafts for this account.' }));
+    return;
+  }
+
+  for (const draft of remaining) {
+    list.appendChild(renderDraftSummary(draft));
+  }
+}
+
+function renderDraftSummary(draft) {
+  const row = el('div', { class: 'draft-row' });
+  const path = dashboardPathForDraft(draft);
+  const link = document.createElement('a');
+  link.href = path;
+  link.className = 'draft-row-subject';
+  link.textContent = draft.subject || '(no subject)';
+  link.title = draft.id || '';
+  link.onclick = (e) => {
+    e.preventDefault();
+    history.pushState({}, '', path);
+    state.route = parseDashboardRoute(window.location.pathname);
+    openDraftDeepLink(draft.id);
+  };
+
+  row.appendChild(link);
+  row.appendChild(el('span', { class: 'draft-row-to', text: draft.to_addr || '(no recipient)' }));
+  row.appendChild(el('span', { class: 'draft-row-date', text: formatDate(draft.updated_at) }));
+  return row;
+}
+
+function renderDraftDetail(draft, highlighted = false) {
+  const card = el('article', {
+    class: `draft-card ${highlighted ? 'highlight' : ''}`,
+    data: { draftId: draft.id || '' },
+  });
+
+  const header = el('div', { class: 'draft-card-header' });
+  header.appendChild(el('div', { class: 'draft-card-subject', text: draft.subject || '(no subject)' }));
+  header.appendChild(el('div', { class: 'draft-card-status', text: draft.status || 'draft' }));
+  card.appendChild(header);
+
+  const meta = el('div', { class: 'draft-meta' });
+  addDraftMeta(meta, 'To', draft.to_addr);
+  addDraftMeta(meta, 'Cc', draft.cc_addr);
+  addDraftMeta(meta, 'Bcc', draft.bcc_addr);
+  addDraftMeta(meta, 'Reply-To', draft.reply_to);
+  addDraftMeta(meta, 'Created by', draft.created_by);
+  addDraftMeta(meta, 'Updated', draft.updated_at);
+  addDraftMeta(meta, 'Send after', draft.send_after);
+  card.appendChild(meta);
+
+  const body = draft.text_content || draft.html_content || '(empty body)';
+  card.appendChild(el('pre', { class: 'draft-body', text: body }));
+
+  const actions = el('div', { class: 'draft-actions' });
+  const edit = el('button', { class: 'btn-primary text-xs', text: 'Edit copy' });
+  edit.onclick = () => openComposerFromDraft(draft);
+  actions.appendChild(edit);
+
+  const sendCli = el('button', { class: 'btn-ghost text-xs', text: 'Copy send CLI' });
+  sendCli.onclick = () => copyText(currentDraftCli('send', draft));
+  actions.appendChild(sendCli);
+
+  const discardCli = el('button', { class: 'btn-ghost text-xs', text: 'Copy discard CLI' });
+  discardCli.onclick = () => copyText(currentDraftCli('discard', draft));
+  actions.appendChild(discardCli);
+
+  const permalink = document.createElement('a');
+  permalink.href = dashboardPathForDraft(draft);
+  permalink.className = 'btn-ghost text-xs';
+  permalink.textContent = 'Permalink';
+  actions.appendChild(permalink);
+
+  card.appendChild(actions);
+  return card;
+}
+
+function addDraftMeta(parent, label, value) {
+  if (value === undefined || value === null || value === '') return;
+  const row = el('div', { class: 'draft-meta-row' });
+  row.appendChild(el('span', { class: 'draft-meta-label', text: label + ':' }));
+  row.appendChild(el('span', { class: 'draft-meta-value', text: String(value), title: String(value) }));
+  parent.appendChild(row);
+}
+
+function currentDraftCli(action, draft) {
+  const account = state.currentAccount ? (state.currentAccount.username || state.currentAccount.id) : draft.account_id;
+  return `envelope draft ${action} ${draft.id} --account ${account}`;
+}
+
 // ── Composer ───────────────────────────────────────────────────────
+function setBodyFormat(format) {
+  state.bodyFormat = format === 'html' ? 'html' : 'text';
+  $('format-text').className = state.bodyFormat === 'text'
+    ? 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper'
+    : 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
+  $('format-html').className = state.bodyFormat === 'html'
+    ? 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper'
+    : 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
+}
+
 function openComposer(mode = 'new', parent = null) {
   state.composeMode = mode;
   state.composeParent = parent;
@@ -750,6 +1030,17 @@ function openComposer(mode = 'new', parent = null) {
   $('composer-status').textContent = '';
   $('composer').classList.add('show');
 }
+
+function openComposerFromDraft(draft) {
+  openComposer('new');
+  $('composer-to').value = draft.to_addr || '';
+  $('composer-cc').value = draft.cc_addr || '';
+  $('composer-subject').value = draft.subject || '';
+  $('composer-body').value = draft.text_content || draft.html_content || '';
+  setBodyFormat(draft.html_content && !draft.text_content ? 'html' : 'text');
+  toast('Draft loaded into composer', 'success');
+}
+
 
 function prefixRe(subject) {
   return /^re:\s/i.test(subject) ? subject : 'Re: ' + subject;
@@ -963,16 +1254,8 @@ function wireEvents() {
   $('btn-composer-send').onclick = sendComposer;
   $('composer-attach').onchange = handleAttachmentChange;
 
-  $('format-text').onclick = () => {
-    state.bodyFormat = 'text';
-    $('format-text').className = 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper';
-    $('format-html').className = 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
-  };
-  $('format-html').onclick = () => {
-    state.bodyFormat = 'html';
-    $('format-html').className = 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper';
-    $('format-text').className = 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
-  };
+  $('format-text').onclick = () => setBodyFormat('text');
+  $('format-html').onclick = () => setBodyFormat('html');
 
   $('btn-reader-close').onclick = closeReader;
   $('btn-reader-reply').onclick = () => openComposer('reply', state.currentMessage);
@@ -995,7 +1278,9 @@ function wireEvents() {
 
 // ── Boot ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+  state.route = parseDashboardRoute(window.location.pathname);
   wireEvents();
+  renderDrafts();
   await loadStats();
   await loadAccounts();
   setRefresh('ready');

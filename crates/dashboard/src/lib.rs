@@ -55,6 +55,38 @@ pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow
         ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT]);
 
+    let app = dashboard_router(state.clone()).layer(cors);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
+
+    info!("dashboard listening on http://localhost:{port}");
+    println!("Envelope dashboard running at http://localhost:{port}");
+    println!("Background unsnooze + scheduled-send sweep running every 60s");
+
+    // Spawn background ticker (checks every 60s for due snoozes and scheduled sends)
+    tokio::spawn(async move {
+        let ticker_state = state;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
+                tracing::warn!("unsnooze sweep error: {e}");
+            }
+            if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
+                tracing::warn!("scheduled send sweep error: {e}");
+            }
+        }
+    });
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("server error: {e}"))
+}
+
+fn dashboard_router(state: AppState) -> Router {
     let api = Router::new()
         // Accounts
         .route(
@@ -108,6 +140,10 @@ pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow
         )
         // Drafts
         .route("/accounts/{id}/drafts", get(handlers::drafts::list))
+        .route(
+            "/accounts/{id}/drafts/{draft_id}",
+            get(handlers::drafts::show),
+        )
         // Snoozed
         .route("/accounts/{id}/snoozed", get(handlers::snoozed::list))
         .route(
@@ -123,40 +159,15 @@ pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow
         // Stats
         .route("/stats", get(handlers::stats::get));
 
-    let app = Router::new()
+    Router::new()
         .route("/", get(index_page))
+        .route("/{account}/drafts/{draft_id}", get(index_page))
+        .route("/accounts/{account}/drafts/{draft_id}", get(index_page))
+        .route("/{account}/cockpit", get(index_page))
+        .route("/accounts/{account}/cockpit", get(index_page))
         .route("/static/{*path}", get(static_asset))
         .nest("/api", api)
-        .layer(cors)
-        .with_state(state.clone());
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
-
-    info!("dashboard listening on http://localhost:{port}");
-    println!("Envelope dashboard running at http://localhost:{port}");
-    println!("Background unsnooze + scheduled-send sweep running every 60s");
-
-    // Spawn background ticker (checks every 60s for due snoozes and scheduled sends)
-    tokio::spawn(async move {
-        let ticker_state = state;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
-                tracing::warn!("unsnooze sweep error: {e}");
-            }
-            if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
-                tracing::warn!("scheduled send sweep error: {e}");
-            }
-        }
-    });
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("server error: {e}"))
+        .with_state(state)
 }
 
 // ── Background unsnooze sweep ────────────────────────────────────────
@@ -328,5 +339,131 @@ async fn static_asset(axum::extract::Path(path): axum::extract::Path<String>) ->
                 .unwrap()
         }
         None => (StatusCode::NOT_FOUND, format!("asset not found: {path}")).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use envelope_email_store::{CredentialBackend, Database};
+    use tower::ServiceExt;
+
+    fn test_state() -> (AppState, String, String) {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Spain Expat', 'editor@spainexpat.com', 'spainexpat.com',
+                         'smtp.spainexpat.com', 587, 'imap.spainexpat.com', 993, 'encrypted'),
+                        ('acc2', 'Other', 'other@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+
+        let draft = db
+            .create_draft(
+                "acc1",
+                "tyler@example.com",
+                Some("Review this Spain Expat reply"),
+                Some("Looks ready to send."),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let other_draft = db
+            .create_draft(
+                "acc2",
+                "tyler@example.com",
+                Some("Wrong account"),
+                Some("This must not leak across accounts."),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        (
+            AppState::new(db, CredentialBackend::File),
+            draft.id,
+            other_draft.id,
+        )
+    }
+
+    #[tokio::test]
+    async fn drafts_single_endpoint_resolves_account_by_username_and_is_account_scoped() {
+        let (state, draft_id, other_draft_id) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/accounts/editor@spainexpat.com/drafts/{draft_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["draft"]["id"], draft_id);
+        assert_eq!(json["draft"]["account_id"], "acc1");
+        assert_eq!(
+            json["dashboard_url"],
+            format!("/accounts/acc1/drafts/{draft_id}")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/accounts/editor@spainexpat.com/drafts/{other_draft_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn assets_spa_fallback_serves_index_for_draft_deep_link_route() {
+        let (state, draft_id, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/editor@spainexpat.com/drafts/{draft_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<title>Envelope</title>"));
+        assert!(html.contains("/static/dashboard.js"));
     }
 }
