@@ -89,6 +89,51 @@ fn build_message_context(
     })
 }
 
+/// Build a `MessageContext` from a fetched message summary + its tags/scores in the store.
+///
+/// This avoids downloading full RFC822 bodies during batch rule preview/run. Header-only
+/// rules only need fields already present in `MessageSummary` from the initial batch FETCH.
+fn build_message_context_from_summary(
+    summary: &envelope_email_store::MessageSummary,
+    db: &envelope_email_store::Database,
+    account_id: &str,
+) -> Result<MessageContext> {
+    let message_id = summary.message_id.as_deref().unwrap_or("");
+
+    let tags: Vec<String> = if !message_id.is_empty() {
+        db.get_tags(account_id, message_id)
+            .context("failed to get tags")?
+            .into_iter()
+            .map(|t| t.tag)
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let scores: HashMap<String, f64> = if !message_id.is_empty() {
+        db.get_scores(account_id, message_id)
+            .context("failed to get scores")?
+            .into_iter()
+            .map(|s| (s.dimension, s.value))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let contact_tags = db
+        .get_contact_tags(account_id, &summary.from_addr)
+        .context("failed to get contact tags")?;
+
+    Ok(MessageContext {
+        from_addr: summary.from_addr.clone(),
+        to_addr: summary.to_addr.clone(),
+        subject: summary.subject.clone(),
+        tags,
+        scores,
+        contact_tags,
+    })
+}
+
 /// `envelope rule create` — create a new rule.
 #[allow(clippy::too_many_arguments)]
 pub fn run_create(
@@ -370,19 +415,9 @@ pub async fn run_apply(
     let mut actions_taken = 0u32;
     let mut action_log: Vec<serde_json::Value> = Vec::new();
 
-    // We need to process messages one at a time because actions (move/delete)
-    // change UIDs. Collect UIDs first, then fetch full messages individually.
-    let uids: Vec<u32> = summaries.iter().map(|s| s.uid).collect();
-
-    for (i, &uid) in uids.iter().enumerate() {
-        // Fetch the full message for rule evaluation
-        let msg = match imap::fetch_message(&mut client, folder, uid).await {
-            Ok(Some(m)) => m,
-            Ok(None) => continue, // message may have been moved/deleted by a prior action
-            Err(_) => continue,
-        };
-
-        let ctx = build_message_context(&msg, &db, &account_id)?;
+    for (i, summary) in summaries.iter().enumerate() {
+        let uid = summary.uid;
+        let ctx = build_message_context_from_summary(summary, &db, &account_id)?;
 
         // Evaluate all enabled rules (in priority order, stop on first stop rule)
         for rule in &enabled_rules {
@@ -685,6 +720,70 @@ mod tests {
     fn parse_score_filter_invalid() {
         assert!(parse_score_filter("nope").is_err());
         assert!(parse_score_filter("bad=xyz").is_err());
+    }
+
+    #[test]
+    fn build_context_from_summary_maps_fields() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let summary = envelope_email_store::MessageSummary {
+            uid: 42,
+            message_id: Some("<test@example.com>".to_string()),
+            from_addr: "alice@example.com".to_string(),
+            to_addr: "bob@example.com".to_string(),
+            subject: "Hello from Alice".to_string(),
+            date: None,
+            flags: vec![],
+            size: 1024,
+        };
+
+        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+
+        assert_eq!(ctx.from_addr, "alice@example.com");
+        assert_eq!(ctx.to_addr, "bob@example.com");
+        assert_eq!(ctx.subject, "Hello from Alice");
+        assert!(ctx.tags.is_empty());
+        assert!(ctx.scores.is_empty());
+        assert!(ctx.contact_tags.is_empty());
+    }
+
+    #[test]
+    fn rule_subject_glob_matches_context_from_summary() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let summary = envelope_email_store::MessageSummary {
+            uid: 1,
+            message_id: None,
+            from_addr: "sender@example.com".to_string(),
+            to_addr: "recipient@example.com".to_string(),
+            subject: "Important Test Message".to_string(),
+            date: None,
+            flags: vec![],
+            size: 512,
+        };
+
+        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let expr = rules::MatchExpr::Subject("*Test*".to_string());
+
+        assert!(rules::evaluate(&expr, &ctx));
+    }
+
+    #[test]
+    fn rule_from_glob_matches_context_from_summary() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let summary = envelope_email_store::MessageSummary {
+            uid: 2,
+            message_id: None,
+            from_addr: "noreply@spam.com".to_string(),
+            to_addr: "victim@example.com".to_string(),
+            subject: "You won!".to_string(),
+            date: None,
+            flags: vec![],
+            size: 256,
+        };
+
+        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let expr = rules::MatchExpr::From("*@spam.com".to_string());
+
+        assert!(rules::evaluate(&expr, &ctx));
     }
 }
 
