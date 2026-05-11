@@ -46,7 +46,10 @@ pub async fn connect_session(account: &AccountWithCredentials) -> Result<ImapSes
         .await
         .map_err(|e| ImapError::Connection(format!("TLS handshake with {host}: {e}")))?;
 
-    let client = async_imap::Client::new(tls_stream);
+    let mut client = async_imap::Client::new(tls_stream);
+
+    // Drain the untagged greeting before LOGIN — same race fix as `imap::connect`.
+    crate::imap::read_imap_greeting(&mut client, host).await?;
 
     let session = client
         .login(username, password)

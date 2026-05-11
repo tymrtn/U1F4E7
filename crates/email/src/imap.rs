@@ -122,7 +122,14 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
         .await
         .map_err(|e| ImapError::Connection(format!("TLS handshake with {host}: {e}")))?;
 
-    let client = async_imap::Client::new(tls_stream);
+    let mut client = async_imap::Client::new(tls_stream);
+
+    // Drain the server greeting before issuing LOGIN. async-imap's `Client::new`
+    // does not consume the untagged `* OK ...` greeting; if we pipeline LOGIN
+    // before reading it, some Dovecot-compatible servers can reset the
+    // connection. The canonical async-imap pattern is to read the
+    // greeting first — see the crate's lib.rs docs.
+    read_imap_greeting(&mut client, host).await?;
 
     let session = client
         .login(username, password)
@@ -131,6 +138,26 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
 
     debug!("IMAP session established for {username}@{host}");
     Ok(ImapClient { session })
+}
+
+/// Read and discard the untagged `* OK ...` greeting from a freshly constructed
+/// `async_imap::Client`. Returns an `ImapError::Connection` if the server closes
+/// the stream without a greeting or returns an I/O error mid-greeting.
+///
+/// `host` is used only for error context and never logged with credentials.
+pub(crate) async fn read_imap_greeting<T>(
+    client: &mut async_imap::Client<T>,
+    host: &str,
+) -> Result<(), ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let _greeting = client
+        .read_response()
+        .await
+        .ok_or_else(|| ImapError::Connection(format!("no IMAP greeting from {host}")))?
+        .map_err(|e| ImapError::Connection(format!("greeting from {host}: {e}")))?;
+    Ok(())
 }
 
 /// List all mailbox folders.
@@ -1498,5 +1525,53 @@ mod tests {
     fn test_decode_q_encoding_hex_escape() {
         let decoded = decode_q_encoding("caf=C3=A9");
         assert_eq!(String::from_utf8_lossy(&decoded), "caf\u{00e9}");
+    }
+
+    /// `read_imap_greeting` must consume the `* OK ...` line so that a
+    /// subsequent `LOGIN` is not framed alongside greeting bytes still
+    /// sitting in the buffer (the bug that took down mail.inbox.eu).
+    #[tokio::test]
+    async fn read_imap_greeting_drains_ok_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+
+        let server = tokio::spawn(async move {
+            server_io
+                .write_all(b"* OK [CAPABILITY IMAP4rev1] greeting\r\n")
+                .await
+                .unwrap();
+            // Hold the stream open so the client's read_response sees a full line.
+            server_io
+        });
+
+        let mut client = async_imap::Client::new(client_io);
+        let result = read_imap_greeting(&mut client, "test.example").await;
+        assert!(result.is_ok(), "greeting drain failed: {result:?}");
+
+        let _server_io = server.await.unwrap();
+    }
+
+    /// If the server closes immediately without sending a greeting, surface a
+    /// clear `Connection` error rather than masquerading as auth failure.
+    #[tokio::test]
+    async fn read_imap_greeting_reports_connection_error_on_eof() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        // Drop the server side without writing anything → EOF.
+        drop(server_io);
+
+        let mut client = async_imap::Client::new(client_io);
+        let err = read_imap_greeting(&mut client, "test.example")
+            .await
+            .expect_err("expected connection error on EOF greeting");
+        match err {
+            ImapError::Connection(msg) => {
+                assert!(
+                    msg.contains("test.example"),
+                    "error should include host context: {msg}"
+                );
+            }
+            other => panic!("expected Connection error, got: {other:?}"),
+        }
     }
 }

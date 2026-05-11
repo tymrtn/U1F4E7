@@ -681,6 +681,7 @@ dependencies = [
  "envelope-email-store",
  "envelope-email-transport",
  "futures-util",
+ "hickory-resolver",
  "mail-builder",
  "mime_guess",
  "reqwest",
