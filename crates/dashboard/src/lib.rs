@@ -410,6 +410,7 @@ mod tests {
                     .uri(format!(
                         "/api/accounts/editor@spainexpat.com/drafts/{draft_id}"
                     ))
+                    .header("host", "localhost:1111")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -424,9 +425,15 @@ mod tests {
         assert_eq!(json["draft"]["id"], draft_id);
         assert_eq!(json["draft"]["account_id"], "acc1");
         assert_eq!(
-            json["dashboard_url"],
+            json["dashboard_path"],
             format!("/accounts/acc1/drafts/{draft_id}")
         );
+        assert_eq!(
+            json["dashboard_url"],
+            format!("http://localhost:1111/accounts/acc1/drafts/{draft_id}")
+        );
+        assert_eq!(json["review_url"], json["dashboard_url"]);
+        assert_eq!(json["metadata"]["dashboard_url"], json["dashboard_url"]);
 
         let response = app
             .oneshot(
