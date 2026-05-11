@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Envelope — BYO email for agents</title>
+  <meta name="description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, agent cockpit, CLI + JSON + MCP.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="#top">✉️ Envelope</a>
+      <nav>
+        <a href="#use-cases">Use cases</a>
+        <a href="#workflows">What it does</a>
+        <a href="#control">Human control</a>
+        <a href="#why-not">Why not hosted</a>
+        <a href="#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7">Repo</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <p class="eyebrow">BYO email for agents</p>
+          <h1>Add an agent to your email. Don't change your email.</h1>
+          <p class="lede">
+            Envelope connects to the mailbox you already use — same address, same folders, same habits. Your agent reads OTPs, handles replies, runs rules, and drafts for your approval. Nothing moves until you say so.
+          </p>
+          <div class="cta-row">
+            <a class="button" href="https://github.com/tymrtn/U1F4E7">Get the repo</a>
+            <a class="button button-secondary" href="#pricing">Buy an annual license</a>
+          </div>
+          <ul class="hero-points">
+            <li>Bring your own mailbox</li>
+            <li>Claude Code, Codex, OpenHands, Hermes</li>
+            <li>CLI + JSON + MCP</li>
+            <li>Human in the loop by default</li>
+          </ul>
+        </div>
+        <aside class="callout code-panel">
+<pre><code># Add your existing mailbox
+envelope accounts add \
+  --email you@example.com \
+  --password &lt;app-password&gt;
+
+# Wait for an OTP, hand it to your agent
+CODE=$(envelope code --wait 60)
+
+# Watch for new mail via IMAP IDLE
+envelope watch --json
+
+# MCP server for Claude Code, Cursor, Zed
+envelope mcp --config</code></pre>
+        </aside>
+      </div>
+    </section>
+
+
+    <section id="use-cases" class="section">
+      <div class="wrap">
+        <p class="eyebrow">Use cases</p>
+        <h2>One runtime. Several buying moments.</h2>
+        <div class="cards three-up" style="margin-top:1.5rem">
+          <article class="card">
+            <h3>Shared inbox agents</h3>
+            <p>Add an agent to support@, ops@, editor@, or your personal inbox. Same mailbox, same workflows, better coverage.</p>
+            <a href="shared-inbox-agents.html">Read the shared inbox page →</a>
+          </article>
+          <article class="card">
+            <h3>Mailgun replacement</h3>
+            <p>Stop paying for a simple SMTP/API layer your own server can run. Keep app email close to the product and under your control.</p>
+            <a href="mailgun-alternative.html">Read the Mailgun alternative page →</a>
+          </article>
+          <article class="card">
+            <h3>Agent email infrastructure</h3>
+            <p>Claude Code, Codex, Hermes, and OpenHands need mailboxes for OTPs, replies, confirmations, and long-running workflows.</p>
+            <a href="agent-email-infrastructure.html">Read the agent infrastructure page →</a>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflows" class="section section-dark">
+      <div class="wrap">
+        <p class="eyebrow">Named workflows</p>
+        <h2>The things agents actually need from email.</h2>
+        <div class="cards two-up-features">
+
+          <article class="card feature-card">
+            <h3>OTP Relay</h3>
+            <p>Your agent calls <code>envelope code --wait 60</code> and blocks. When the OTP arrives, the CLI returns it. No polling loop, no parser, no race condition against your own inbox.</p>
+          </article>
+
+          <article class="card feature-card">
+            <h3>Reviewable Rules</h3>
+            <p>Agent proposes rules based on what it found in your inbox. You see exactly which messages each rule would touch before anything moves. Confirm, edit, or reject. Rules export to Sieve if your server supports it.</p>
+          </article>
+
+          <article class="card feature-card">
+            <h3>Agent Cockpit</h3>
+            <p>A local dashboard showing everything the agent touched: drafts queued for your approval, rule run history, watch state, failed auth, and event timeline. You can approve, edit, or discard from here.</p>
+          </article>
+
+          <article class="card feature-card">
+            <h3>Evidence Bundle</h3>
+            <p>Export a thread as raw RFC822 files with a manifest and checksums. Useful when you need a verifiable record — for legal holds, compliance review, or a paper trail your agent assembled during an investigation.</p>
+          </article>
+
+        </div>
+      </div>
+    </section>
+
+    <section id="control" class="section">
+      <div class="wrap two-col">
+        <div>
+          <p class="eyebrow">Human control</p>
+          <h2>The agent doesn't send anything you haven't approved.</h2>
+          <p>
+            By default, every draft goes into a review queue. Rule runs preview affected messages before anything moves. The cockpit shows the full history. You can pause, override, or stop any workflow.
+          </p>
+          <p>
+            This isn't a safety flag bolted on at the end. Agent contexts default to <code>draft-only</code> mode. Autonomous send is an option, but you have to opt in explicitly — and every action is logged either way.
+          </p>
+        </div>
+        <div class="card accent-card">
+          <h3>Send modes</h3>
+          <ul class="checklist">
+            <li><strong>draft-only</strong> — agent composes, you send (default)</li>
+            <li><strong>confirm-send</strong> — agent sends after you approve</li>
+            <li><strong>allowlisted-send</strong> — autonomous send to approved recipients</li>
+            <li><strong>autonomous-send</strong> — explicit opt-in, everything logged</li>
+          </ul>
+          <p class="muted" style="font-size:0.9rem;margin-top:0.75rem">Every send decision produces a policy audit event. No secrets in the logs.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-dark">
+      <div class="wrap">
+        <p class="eyebrow">Works with your existing stack</p>
+        <h2>Any harness. Any IMAP provider.</h2>
+        <p class="lede" style="margin-bottom:1.5rem">If it can run a CLI command or speak MCP, it works with Envelope. The same JSON surface works from a shell script, a Hermes pipeline, a Claude Code tool call, or a Codex exec loop.</p>
+        <div class="cards five-up">
+          <article class="card"><h3>Claude Code</h3><p>Drop in via MCP. Full inbox access as a tool call.</p></article>
+          <article class="card"><h3>OpenAI Codex</h3><p>CLI + JSON surface for terminal-native autonomous loops.</p></article>
+          <article class="card"><h3>Hermes</h3><p>First-class skill for Hermes profiles and multi-agent pipelines.</p></article>
+          <article class="card"><h3>OCPlatform</h3><p>OTP handling, watch events, and thread-aware follow-up.</p></article>
+          <article class="card"><h3>OpenHands</h3><p>Long-running loops that wait on email before continuing.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="why-not" class="section">
+      <div class="wrap">
+        <p class="eyebrow">Why not the alternatives?</p>
+        <h2>Hosted services ask you to change. Envelope doesn't.</h2>
+        <div class="cards three-up" style="margin-top:1.5rem">
+          <div class="card">
+            <h3>Robotomail, Cloudflare Agentic Inbox, and similar</h3>
+            <p>These provision a <em>new</em> mailbox on their infrastructure. New address. DNS changes. Your mail in someone else's system. If your agent needs to operate on the inbox your contacts already use, you're at the wrong starting point.</p>
+            <p>Envelope connects to the mailbox you already have. Nothing migrates.</p>
+          </div>
+          <div class="card">
+            <h3>Mailgun, SendGrid, Postmark, Resend</h3>
+            <p>If all you need is authenticated SMTP and a small API for product email, paying a third-party relay can be pure duplicate infrastructure. Envelope gives your own server a simple mail runtime without surrendering the mailbox or adding another vendor bill.</p>
+            <p>For huge marketing sends, use a bulk sender. For ordinary app email and agent workflows, BYO email is saner.</p>
+          </div>
+          <div class="card">
+            <h3>Himalaya and other IMAP CLIs</h3>
+            <p>Solid tools built for humans reading their own mail. Envelope is built for the case where an agent is the primary consumer: IMAP IDLE watch, OTP extraction, JSON everywhere, reviewable rules, and a control plane for the human sharing the inbox with the agent.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pricing" class="section section-dark">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Annual licensing</p>
+            <h2>Personal use is free. Commercial rollout is a flat annual license.</h2>
+          </div>
+          <p class="muted maxw">Annual bands sized by mailbox users on your domain. No per-message metering, no seat trickery.</p>
+        </div>
+
+        <div class="cards pricing-grid">
+          <article class="card pricing-card pricing-free">
+            <p class="plan-label">Personal</p>
+            <h3>Free</h3>
+            <p class="price-note">For individuals running their own mailbox</p>
+            <ul class="checklist">
+              <li>Personal, non-commercial use on your own mailboxes</li>
+              <li>Full CLI, dashboard, and MCP surface</li>
+              <li>Community support via GitHub issues</li>
+            </ul>
+            <a class="button button-secondary full" href="https://github.com/tymrtn/U1F4E7">Get the repo</a>
+          </article>
+
+          <article class="card pricing-card">
+            <p class="plan-label">Team</p>
+            <h3>$240 <span>/year</span></h3>
+            <p class="price-note">Up to 10 mailbox users on one domain</p>
+            <ul class="checklist">
+              <li>Commercial use license for one organization</li>
+              <li>Up to 10 mailbox users across one primary domain</li>
+              <li>Email support, best-effort next-business-day response</li>
+              <li>Annual renewal, invoiced</li>
+            </ul>
+            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Team%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20">Request annual license</a>
+          </article>
+
+          <article class="card pricing-card">
+            <p class="plan-label">Growth</p>
+            <h3>$960 <span>/year</span></h3>
+            <p class="price-note">Up to 25 mailbox users, one domain</p>
+            <ul class="checklist">
+              <li>Commercial use license for one organization</li>
+              <li>Up to 25 mailbox users across one primary domain</li>
+              <li>Priority email support, next-business-day response target</li>
+              <li>Annual renewal, invoiced</li>
+            </ul>
+            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Growth%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20">Request annual license</a>
+          </article>
+
+          <article class="card pricing-card">
+            <p class="plan-label">Enterprise</p>
+            <h3>Contact us</h3>
+            <p class="price-note">26+ users, multi-domain, or embedded/OEM</p>
+            <ul class="checklist">
+              <li>Multi-domain or large-team deployments</li>
+              <li>Embedded/OEM and reseller terms available</li>
+              <li>Custom support agreement and security review</li>
+            </ul>
+            <a class="button full button-secondary" href="mailto:ty@tmrtn.com?subject=Envelope%20Enterprise%20licensing&amp;body=Company%3A%20%0ADomains%3A%20%0AApprox%20mailbox%20users%3A%20%0AUse%20case%3A%20">Talk to sales</a>
+          </article>
+        </div>
+
+        <p class="pricing-footnote muted">Licenses are billed annually. Quotes and invoices on request; payment by card or bank transfer. Email ty@tmrtn.com for anything not covered above.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope — BYO email for agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing">Licensing</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
