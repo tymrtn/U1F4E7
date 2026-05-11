@@ -247,6 +247,12 @@ enum Commands {
         subcommand: EvidenceCmd,
     },
 
+    /// Check DNS posture for BYO email deliverability
+    Deliverability {
+        #[command(subcommand)]
+        subcommand: DeliverabilityCmd,
+    },
+
     /// Manage attachments
     Attachment {
         #[command(subcommand)]
@@ -1002,6 +1008,16 @@ pub enum EvidenceCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum DeliverabilityCmd {
+    /// Check read-only DNS records for an email domain
+    Check {
+        /// Domain to inspect
+        #[arg(long)]
+        domain: String,
+    },
+}
+
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -1240,6 +1256,9 @@ fn main() {
         Commands::Migrate { subcommand } => commands::migrate::run(subcommand, cli.json, backend),
         Commands::Backup { subcommand } => commands::backup::run(subcommand, cli.json, backend),
         Commands::Evidence { subcommand } => commands::evidence::run(subcommand, cli.json, backend),
+        Commands::Deliverability { subcommand } => {
+            commands::deliverability::run(subcommand, cli.json)
+        }
         Commands::Attachment { subcommand } => match subcommand {
             AttachmentCmd::List {
                 uid,
@@ -1601,6 +1620,27 @@ mod tests {
     fn doctor_alias_parses_to_paths_command() {
         let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor alias should parse");
         assert!(matches!(cli.command, Commands::Paths));
+    }
+
+    #[test]
+    fn deliverability_check_command_parses_domain_and_json_flag() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "deliverability",
+            "check",
+            "--domain",
+            "example.com",
+            "--json",
+        ])
+        .expect("deliverability check should parse");
+
+        assert!(cli.json);
+        match cli.command {
+            Commands::Deliverability {
+                subcommand: DeliverabilityCmd::Check { domain },
+            } => assert_eq!(domain, "example.com"),
+            _ => panic!("expected deliverability check command"),
+        }
     }
 
     #[test]

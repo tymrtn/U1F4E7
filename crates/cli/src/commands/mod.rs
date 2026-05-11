@@ -9,6 +9,7 @@ pub mod code;
 pub mod common;
 pub mod contacts;
 pub mod datetime;
+pub mod deliverability;
 pub mod drafts;
 pub mod events;
 pub mod evidence;
