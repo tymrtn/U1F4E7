@@ -119,7 +119,7 @@ impl Database {
 
     // ── Thread Message CRUD ──────────────────────────────────────────
 
-    /// Insert or update a thread message (upsert by message_id + folder).
+    /// Insert or update a thread message (upsert by message_id + folder within an account).
     /// Returns the thread_message id.
     pub fn upsert_thread_message(
         &self,
@@ -141,8 +141,14 @@ impl Database {
             let id: Option<i64> = self
                 .conn()
                 .query_row(
-                    "SELECT id FROM thread_messages WHERE message_id = ?1 AND folder = ?2",
-                    params![mid, folder],
+                    "SELECT tm.id FROM thread_messages tm \
+                     INNER JOIN threads existing_thread ON existing_thread.thread_id = tm.thread_id \
+                     INNER JOIN threads target_thread ON target_thread.thread_id = ?3 \
+                     WHERE tm.message_id = ?1 \
+                       AND tm.folder = ?2 \
+                       AND existing_thread.account_id = target_thread.account_id \
+                     LIMIT 1",
+                    params![mid, folder, thread_id],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -238,13 +244,21 @@ impl Database {
         Ok(thread_id)
     }
 
-    /// Find which thread a message belongs to, by UID and folder.
-    pub fn find_thread_by_uid(&self, uid: u32, folder: &str) -> Result<Option<String>> {
+    /// Find which thread a message belongs to, by UID and folder within an account.
+    pub fn find_thread_by_uid(
+        &self,
+        uid: u32,
+        folder: &str,
+        account_id: &str,
+    ) -> Result<Option<String>> {
         let thread_id: Option<String> = self
             .conn()
             .query_row(
-                "SELECT thread_id FROM thread_messages WHERE uid = ?1 AND folder = ?2 LIMIT 1",
-                params![uid as i64, folder],
+                "SELECT tm.thread_id FROM thread_messages tm \
+                 INNER JOIN threads t ON t.thread_id = tm.thread_id \
+                 WHERE tm.uid = ?1 AND tm.folder = ?2 AND t.account_id = ?3 \
+                 LIMIT 1",
+                params![uid as i64, folder, account_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -290,8 +304,9 @@ impl Database {
         &self,
         uid: u32,
         folder: &str,
+        account_id: &str,
     ) -> Result<Option<ThreadContext>> {
-        let thread_id = match self.find_thread_by_uid(uid, folder)? {
+        let thread_id = match self.find_thread_by_uid(uid, folder, account_id)? {
             Some(tid) => tid,
             None => return Ok(None),
         };
@@ -704,7 +719,7 @@ mod tests {
         db.refresh_thread_stats(&thread.thread_id).unwrap();
 
         let ctx = db
-            .get_thread_context_for_uid(100, "INBOX")
+            .get_thread_context_for_uid(100, "INBOX", "acct1")
             .unwrap()
             .unwrap();
         assert_eq!(ctx.thread_count, 2);
@@ -872,6 +887,123 @@ mod tests {
             db.get_thread_messages(&thread.thread_id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn find_thread_by_uid_is_scoped_to_account_with_duplicate_uids() {
+        let db = Database::open_memory().unwrap();
+
+        let thread_a = db
+            .create_thread(
+                "alice thread",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "account-alice",
+            )
+            .unwrap();
+        let thread_b = db
+            .create_thread(
+                "bob thread",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "account-bob",
+            )
+            .unwrap();
+
+        for (thread, account_name) in [(&thread_a, "alice"), (&thread_b, "bob")] {
+            db.upsert_thread_message(
+                &thread.thread_id,
+                42,
+                Some(&format!("<{account_name}-msg@example.com>")),
+                None,
+                None,
+                "INBOX",
+                &format!("{account_name}@example.com"),
+                "recipient@example.com",
+                "2026-03-28T10:00:00",
+                "Duplicate UID",
+                false,
+                None,
+            )
+            .unwrap();
+        }
+
+        let found_alice = db.find_thread_by_uid(42, "INBOX", "account-alice").unwrap();
+        assert_eq!(found_alice, Some(thread_a.thread_id.clone()));
+
+        let found_bob = db.find_thread_by_uid(42, "INBOX", "account-bob").unwrap();
+        assert_eq!(found_bob, Some(thread_b.thread_id.clone()));
+
+        let found_unknown = db
+            .find_thread_by_uid(42, "INBOX", "account-charlie")
+            .unwrap();
+        assert!(found_unknown.is_none());
+    }
+
+    #[test]
+    fn upsert_dedup_by_message_id_is_scoped_to_thread_account() {
+        let db = Database::open_memory().unwrap();
+
+        let thread_a = db
+            .create_thread(
+                "alice thread",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "account-alice",
+            )
+            .unwrap();
+        let thread_b = db
+            .create_thread(
+                "bob thread",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "account-bob",
+            )
+            .unwrap();
+
+        let alice_id = db
+            .upsert_thread_message(
+                &thread_a.thread_id,
+                100,
+                Some("<shared-msg@example.com>"),
+                None,
+                None,
+                "INBOX",
+                "sender@example.com",
+                "alice@example.com",
+                "2026-03-28T10:00:00",
+                "Shared Message",
+                false,
+                Some("alice copy"),
+            )
+            .unwrap();
+
+        let bob_id = db
+            .upsert_thread_message(
+                &thread_b.thread_id,
+                100,
+                Some("<shared-msg@example.com>"),
+                None,
+                None,
+                "INBOX",
+                "sender@example.com",
+                "bob@example.com",
+                "2026-03-28T10:00:00",
+                "Shared Message",
+                false,
+                Some("bob copy"),
+            )
+            .unwrap();
+
+        assert_ne!(alice_id, bob_id);
+        assert_eq!(
+            db.get_thread_messages(&thread_a.thread_id).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_thread_messages(&thread_b.thread_id).unwrap().len(),
+            1
         );
     }
 
