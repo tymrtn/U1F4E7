@@ -20,7 +20,7 @@ pub async fn run_show(
 
     // First, try to find the thread by UID in our local DB
     let thread_id = db
-        .find_thread_by_uid(uid, folder)
+        .find_thread_by_uid(uid, folder, &creds.account.id)
         .context("database error")?;
 
     let thread_id = match thread_id {
@@ -34,7 +34,7 @@ pub async fn run_show(
 
             // Try again
             match db
-                .find_thread_by_uid(uid, folder)
+                .find_thread_by_uid(uid, folder, &creds.account.id)
                 .context("database error")?
             {
                 Some(tid) => tid,
@@ -50,6 +50,14 @@ pub async fn run_show(
         .get_thread(&thread_id)
         .context("database error")?
         .context("thread not found in database")?;
+
+    if thread.account_id != creds.account.id {
+        bail!(
+            "thread {thread_id} belongs to account {}, not selected account {}",
+            thread.account_id,
+            creds.account.id
+        );
+    }
 
     let messages = db
         .get_thread_messages(&thread_id)
