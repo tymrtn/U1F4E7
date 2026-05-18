@@ -2,7 +2,7 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use anyhow::{Context, Result, bail};
-use envelope_email_store::CredentialBackend;
+use envelope_email_store::{CredentialBackend, models::Message};
 
 use super::common::setup_credentials;
 
@@ -25,7 +25,7 @@ pub async fn run(
     match message {
         Some(msg) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&msg)?);
+                println!("{}", serialize_message_json(&msg)?);
             } else {
                 println!("From: {}", msg.from_addr);
                 println!("To: {}", msg.to_addr);
@@ -53,4 +53,55 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn serialize_message_json(message: &Message) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message_with_bodies(text_body: &str, html_body: &str) -> Message {
+        Message {
+            uid: 42,
+            message_id: Some("<message@example.com>".to_string()),
+            from_addr: "Sender <sender@example.com>".to_string(),
+            to_addr: "Recipient <recipient@example.com>".to_string(),
+            cc_addr: Some("Copy <copy@example.com>".to_string()),
+            subject: "strict json body regression".to_string(),
+            date: Some("2026-05-18T00:00:00+00:00".to_string()),
+            text_body: Some(text_body.to_string()),
+            html_body: Some(html_body.to_string()),
+            in_reply_to: Some("<parent@example.com>".to_string()),
+            references: Some("<root@example.com> <parent@example.com>".to_string()),
+            flags: vec!["Seen".to_string()],
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn json_output_round_trips_message_bodies_with_control_chars() {
+        let text_body = "first line\nsecond line\r\ncontains nul \0 and tab\t";
+        let html_body = "<p>first</p>\n<script>\"quoted\"\0</script>";
+        let message = message_with_bodies(text_body, html_body);
+
+        let rendered = serialize_message_json(&message).unwrap();
+
+        assert!(!rendered.contains('\0'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\t"));
+        assert!(rendered.contains("\\u0000"));
+
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["text_body"], text_body);
+        assert_eq!(parsed["html_body"], html_body);
+
+        let round_tripped: Message = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(round_tripped.text_body.as_deref(), Some(text_body));
+        assert_eq!(round_tripped.html_body.as_deref(), Some(html_body));
+    }
 }
