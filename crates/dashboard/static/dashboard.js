@@ -1330,6 +1330,10 @@ function renderAccountSwitcher() {
   }
 }
 
+// States that mean "something needs the operator's attention." A healthy
+// or in-flight account has no remediation action to expose.
+const HEALTH_NEEDS_ACTION = new Set(['auth_failed', 'unavailable', 'stale', 'reconnecting']);
+
 function renderAccountHealthPanel(acct, primitive) {
   const status = primitive.state.status;
   const panel = el('div', { class: `account-health-panel ${status}` });
@@ -1347,22 +1351,27 @@ function renderAccountHealthPanel(acct, primitive) {
     text: primitive.state.provider_capabilities || 'capabilities unknown',
     title: primitive.state.provider_capabilities || 'capabilities unknown',
   }));
-  const reconnectRow = el('div', { class: 'account-health-actions' });
-  const reconnectStatus = el('span', { class: 'account-reconnect-status' });
-  const reconnect = el('button', {
-    class: 'account-reconnect',
-    text: 'Reconnect',
-    title: 'Re-verify IMAP and SMTP credentials',
-    type: 'button',
-  });
-  reconnect.onclick = (event) => {
-    event.stopPropagation();
-    reconnectStatus.textContent = 'Reconnect coming in v0.10.0.';
-    toast('Reconnect is coming in the next dashboard release.', 'pending');
-  };
-  reconnectRow.appendChild(reconnect);
-  reconnectRow.appendChild(reconnectStatus);
-  panel.appendChild(reconnectRow);
+  // Contextual affordance: the Reconnect button only renders when the
+  // account is actually unhealthy. Healthy / syncing accounts have nothing
+  // to reconnect.
+  if (HEALTH_NEEDS_ACTION.has(status)) {
+    const reconnectRow = el('div', { class: 'account-health-actions' });
+    const reconnectStatus = el('span', { class: 'account-reconnect-status' });
+    const reconnect = el('button', {
+      class: 'account-reconnect',
+      text: 'Reconnect',
+      title: 'Re-verify IMAP and SMTP credentials',
+      type: 'button',
+    });
+    reconnect.onclick = (event) => {
+      event.stopPropagation();
+      reconnectStatus.textContent = 'Reconnect coming in v0.10.0.';
+      toast('Reconnect is coming in the next dashboard release.', 'pending');
+    };
+    reconnectRow.appendChild(reconnect);
+    reconnectRow.appendChild(reconnectStatus);
+    panel.appendChild(reconnectRow);
+  }
   return panel;
 }
 

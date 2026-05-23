@@ -242,10 +242,21 @@ fn dashboard_account_sidebar_renders_health_badges_and_recovery_actions() {
             "account hierarchy should expose account health UI marker: {marker}"
         );
     }
+    // Reconnect must exist as an account-health affordance, and the agent
+    // contract for the primitive must remain honest that the recovery flow
+    // isn't wired yet (per CLAUDE.md aggregate-cockpit invariants).
     assert!(
         DASHBOARD_JS.contains("Reconnect")
             && DASHBOARD_JS.contains("not_available: reconnect flow is not wired yet"),
-        "reconnect should be visible but honest until recovery flow is wired"
+        "reconnect primitive contract should remain honest until recovery flow is wired"
+    );
+    // Contextual affordance regression guard: the Reconnect button must
+    // only render when an account is actually unhealthy — never on a
+    // healthy account.
+    assert!(
+        DASHBOARD_JS.contains("HEALTH_NEEDS_ACTION")
+            && DASHBOARD_JS.contains("HEALTH_NEEDS_ACTION.has(status)"),
+        "Reconnect button must be gated on an unhealthy status, not rendered unconditionally"
     );
 }
 
