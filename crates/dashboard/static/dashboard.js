@@ -829,6 +829,144 @@ function reportBulkActionUnavailable(action) {
   toast(`Bulk ${action} arrives in the next dashboard release.`, 'pending');
 }
 
+// Resolve canonical folder names (Archive, Trash, Spam) from the loaded
+// folder list for an account. Returns the first matching name or null.
+const FOLDER_CANDIDATES = {
+  archive: ['Archive', 'All Mail', '[Gmail]/All Mail', 'INBOX.Archive', 'Archives'],
+  trash: ['Trash', 'Bin', 'Deleted', 'Deleted Messages', 'Deleted Items', '[Gmail]/Trash', 'INBOX.Trash'],
+  spam: ['Spam', 'Junk', 'Junk Mail', 'Junk E-mail', '[Gmail]/Spam', 'INBOX.Spam', 'INBOX.Junk'],
+};
+
+function detectAccountFolder(accountId, canonical) {
+  const data = currentAccountFolderData(accountId);
+  const folderNames = new Set((data?.folders || []).map(f => f.name || f));
+  for (const candidate of (FOLDER_CANDIDATES[canonical] || [])) {
+    if (folderNames.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Run a bulk per-message operation with bounded concurrency and per-row
+// progress reporting. `perItem(message)` must return a Promise that
+// resolves on success / rejects on failure. The caller is responsible
+// for triggering a list refresh after a successful batch.
+async function runBulkOp({ label, perItem, concurrency = 4 }) {
+  const messages = selectedRenderedMessages();
+  if (messages.length === 0) {
+    setBulkStatus('Select messages to enable bulk actions.');
+    return { ok: 0, failed: [] };
+  }
+  setBulkStatus(`${label}: 0/${messages.length}`, 'pending');
+  let okCount = 0;
+  const failed = [];
+  let index = 0;
+
+  const worker = async () => {
+    while (index < messages.length) {
+      const i = index++;
+      const m = messages[i];
+      try {
+        await perItem(m);
+        okCount += 1;
+      } catch (e) {
+        failed.push({ message: m, error: e.message || String(e) });
+      }
+      setBulkStatus(
+        `${label}: ${okCount + failed.length}/${messages.length}${failed.length ? ` · ${failed.length} failed` : ''}`,
+        failed.length ? 'warning' : 'pending',
+      );
+    }
+  };
+
+  const workers = Array.from({ length: Math.min(concurrency, messages.length) }, worker);
+  await Promise.all(workers);
+
+  const summary = failed.length === 0
+    ? `${label}: all ${okCount} message${okCount === 1 ? '' : 's'} succeeded.`
+    : `${label}: ${okCount} succeeded, ${failed.length} failed.`;
+  setBulkStatus(summary, failed.length ? 'warning' : 'success');
+  toast(summary, failed.length ? 'error' : 'success');
+  if (failed.length) {
+    for (const item of failed.slice(0, 3)) {
+      console.error(`[bulk ${label}] uid=${item.message?.uid} folder=${messageFolder(item.message)}: ${item.error}`);
+    }
+  }
+  return { ok: okCount, failed };
+}
+
+async function bulkDelete() {
+  const messages = selectedRenderedMessages();
+  if (messages.length === 0) {
+    setBulkStatus('Select messages to enable bulk actions.');
+    return;
+  }
+  const result = await runBulkOp({
+    label: 'Delete',
+    perItem: async (m) => {
+      const accountId = messageAccountId(m);
+      const folder = messageFolder(m) || 'INBOX';
+      const uid = Number(m?.uid);
+      if (!accountId || !uid) throw new Error('missing account/uid');
+      await api('DELETE', `/accounts/${accountId}/messages/${uid}?folder=${encodeURIComponent(folder)}`);
+    },
+  });
+  // Refresh list so the deleted rows disappear
+  if (result.ok > 0) {
+    state.selectedMessages.clear();
+    if (isUnifiedView()) await loadUnifiedInbox({ refresh: true });
+    else await loadMessages();
+  }
+}
+
+async function bulkArchive() {
+  const messages = selectedRenderedMessages();
+  if (messages.length === 0) {
+    setBulkStatus('Select messages to enable bulk actions.');
+    return;
+  }
+  // Group by account so we can detect each account's Archive folder once
+  const byAccount = new Map();
+  for (const m of messages) {
+    const acct = messageAccountId(m);
+    if (!acct) continue;
+    if (!byAccount.has(acct)) byAccount.set(acct, []);
+    byAccount.get(acct).push(m);
+  }
+  // Pre-resolve archive folder per account, fail-fast if any account has none
+  const archiveFolderByAccount = new Map();
+  const missing = [];
+  for (const acct of byAccount.keys()) {
+    const target = detectAccountFolder(acct, 'archive');
+    if (!target) missing.push(acct);
+    else archiveFolderByAccount.set(acct, target);
+  }
+  if (missing.length) {
+    const msg = `No Archive/All Mail folder found for ${missing.length} account${missing.length === 1 ? '' : 's'}. Refresh folders first.`;
+    setBulkStatus(msg, 'warning');
+    toast(msg, 'error');
+    return;
+  }
+  const result = await runBulkOp({
+    label: 'Archive',
+    perItem: async (m) => {
+      const accountId = messageAccountId(m);
+      const folder = messageFolder(m) || 'INBOX';
+      const uid = Number(m?.uid);
+      const toFolder = archiveFolderByAccount.get(accountId);
+      if (!accountId || !uid || !toFolder) throw new Error('missing account/uid/archive');
+      await api('POST', `/accounts/${accountId}/messages/${uid}/move`, {
+        folder,
+        to_folder: toFolder,
+      });
+    },
+  });
+  if (result.ok > 0) {
+    state.selectedMessages.clear();
+    if (isUnifiedView()) await loadUnifiedInbox({ refresh: true });
+    else await loadMessages();
+  }
+}
+
 function selectedPrimitiveCliPacket() {
   const primitives = selectedRenderedMessages().map(messagePrimitive);
   if (primitives.length === 0) return '';
@@ -868,16 +1006,26 @@ function wireBulkToolbar() {
   const selectAll = $('select-all-messages');
   if (!selectAll) return;
   selectAll.onchange = (event) => toggleVisibleMessageSelection(event.target.checked);
+
+  // Wired bulk actions (Phase 1.3 + 1.4): real backend mutations via
+  // existing per-message endpoints with bounded concurrency.
+  const archive = $('bulk-archive');
+  if (archive) archive.onclick = bulkArchive;
+  const del = $('bulk-delete');
+  if (del) del.onclick = bulkDelete;
+
+  // Honestly-stubbed actions until v0.11 ships the folder picker /
+  // label input / spam-rule wiring. These announce when they'll arrive,
+  // never claim to mutate mail.
   for (const [id, action] of [
-    ['bulk-archive', 'archive'],
     ['bulk-move', 'move'],
     ['bulk-label', 'label'],
     ['bulk-spam', 'spam'],
-    ['bulk-delete', 'delete'],
   ]) {
     const button = $(id);
     if (button) button.onclick = () => reportBulkActionUnavailable(action);
   }
+
   const copy = $('copy-equivalent-cli');
   if (copy) copy.onclick = copySelectedEquivalentCli;
   updateBulkToolbar();
