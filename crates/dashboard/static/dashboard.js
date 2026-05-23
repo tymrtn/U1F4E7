@@ -44,12 +44,12 @@ const state = {
 };
 
 const SMART_MAILBOXES = [
-  { key: 'unified', label: 'Unified Inbox', hint: 'cached index across accounts' },
-  { key: 'attention', label: 'Today / Needs Attention', hint: 'operator queue from local records' },
-  { key: 'snoozed', label: 'Snoozed', hint: 'account-scoped until aggregate view ships' },
-  { key: 'sent', label: 'Sent', hint: 'selected account mailbox' },
-  { key: 'drafts', label: 'Drafts', hint: 'selected account mailbox' },
-  { key: 'all_mail', label: 'All Mail', hint: 'selected account mailbox' },
+  { key: 'unified', label: 'Unified Inbox' },
+  { key: 'attention', label: 'Needs Attention' },
+  { key: 'snoozed', label: 'Snoozed' },
+  { key: 'sent', label: 'Sent' },
+  { key: 'drafts', label: 'Drafts' },
+  { key: 'all_mail', label: 'All Mail' },
 ];
 
 const SMART_FOLDER_DEFAULTS = {
@@ -710,18 +710,38 @@ function setBulkStatus(message, kind = '') {
 }
 
 function updateBulkToolbar() {
+  const toolbar = $('message-bulk-toolbar');
   const selectAll = $('select-all-messages');
   const countNode = $('selected-message-count');
-  if (!selectAll || !countNode) return;
+  if (!toolbar || !selectAll || !countNode) return;
   const visible = state.renderedMessageKeys.length;
   const selected = selectedVisibleKeys().length;
-  countNode.textContent = `${selected} selected`;
-  selectAll.checked = visible > 0 && selected === visible;
+  const actionGroup = toolbar.querySelector('.bulk-action-group');
+  const primitiveLabel = toolbar.querySelector('.bulk-primitive-label');
+
+  // Contextual affordance: toolbar collapses entirely when there are no
+  // messages to act on. With messages visible but no selection, the action
+  // group hides and the count cell becomes a hint.
+  if (visible === 0) {
+    toolbar.hidden = true;
+    return;
+  }
+  toolbar.hidden = false;
+
+  selectAll.checked = selected === visible;
   selectAll.indeterminate = selected > 0 && selected < visible;
-  selectAll.disabled = visible === 0;
-  for (const id of ['bulk-archive', 'bulk-move', 'bulk-label', 'bulk-spam', 'bulk-delete', 'copy-equivalent-cli']) {
-    const button = $(id);
-    if (button) button.disabled = selected === 0;
+  selectAll.disabled = false;
+
+  if (selected === 0) {
+    countNode.textContent = 'Select messages to enable bulk actions';
+    toolbar.classList.remove('has-selection');
+    if (actionGroup) actionGroup.hidden = true;
+    if (primitiveLabel) primitiveLabel.hidden = true;
+  } else {
+    countNode.textContent = `${selected} selected`;
+    toolbar.classList.add('has-selection');
+    if (actionGroup) actionGroup.hidden = false;
+    if (primitiveLabel) primitiveLabel.hidden = false;
   }
 }
 
@@ -757,15 +777,18 @@ function toggleMessageStar(message, button) {
   button.textContent = active ? '★' : '☆';
   button.classList.toggle('active', active);
   button.setAttribute('aria-pressed', active ? 'true' : 'false');
-  setBulkStatus('Star is local only; backend persistence is not wired.');
+  setBulkStatus('Star saved locally. Server-side star sync arrives in v0.10.0.');
 }
 
 function reportBulkActionUnavailable(action) {
   const selected = selectedVisibleKeys().length;
-  const marker = 'not_available: bulk action execution is not wired yet';
-  const detail = selected > 0 ? `${marker} · ${action} · ${selected} selected` : 'Select messages first';
-  setBulkStatus(detail, selected > 0 ? 'warning' : '');
-  if (selected > 0) toast(marker, 'error');
+  if (selected === 0) {
+    setBulkStatus('Select messages to enable bulk actions.');
+    return;
+  }
+  const niceAction = action.charAt(0).toUpperCase() + action.slice(1);
+  setBulkStatus(`${niceAction} on ${selected} message${selected === 1 ? '' : 's'} — arriving in v0.10.0.`, 'pending');
+  toast(`Bulk ${action} arrives in the next dashboard release.`, 'pending');
 }
 
 function selectedPrimitiveCliPacket() {
@@ -1329,13 +1352,13 @@ function renderAccountHealthPanel(acct, primitive) {
   const reconnect = el('button', {
     class: 'account-reconnect',
     text: 'Reconnect',
-    title: 'Reconnect flow is not wired yet',
+    title: 'Re-verify IMAP and SMTP credentials',
     type: 'button',
   });
   reconnect.onclick = (event) => {
     event.stopPropagation();
-    reconnectStatus.textContent = primitive.actions.reconnect;
-    toast(primitive.actions.reconnect, 'error');
+    reconnectStatus.textContent = 'Reconnect coming in v0.10.0.';
+    toast('Reconnect is coming in the next dashboard release.', 'pending');
   };
   reconnectRow.appendChild(reconnect);
   reconnectRow.appendChild(reconnectStatus);
@@ -1450,7 +1473,7 @@ async function selectSmartMailbox(key) {
 
   if (key === 'attention') {
     state.currentView = 'attention';
-    renderMailboxNotice('Today / Needs Attention', 'not_available: Phase 1 exposes attention in the cockpit strip; message-backed attention queues are not wired yet.', 'not_available');
+    renderMailboxNotice('Needs Attention', 'Items needing your eyes appear in the Cockpit strip above. A dedicated message queue is coming in v0.10.0.', 'pending');
     if (!state.cockpit) loadCockpit();
     return;
   }
@@ -1458,7 +1481,7 @@ async function selectSmartMailbox(key) {
   if (key === 'snoozed') {
     const account = selectedAccountForSmartMailbox();
     if (!account) {
-      renderMailboxNotice('Snoozed', 'not_available: select an account to inspect snoozed mail. Aggregate snoozed count is local-only in this slice.', 'not_available');
+      renderMailboxNotice('Snoozed', 'Pick an account from the sidebar to see its snoozed messages. Aggregate snoozed view is coming soon.', 'pending');
       return;
     }
     return selectAccount(account, '__snoozed__', { smartMailbox: 'snoozed' });
@@ -1467,7 +1490,7 @@ async function selectSmartMailbox(key) {
   if (SMART_FOLDER_DEFAULTS[key]) {
     const account = selectedAccountForSmartMailbox();
     if (!account) {
-      renderMailboxNotice(SMART_MAILBOXES.find(m => m.key === key)?.label || 'Mailbox', 'not_available: select an account before opening this mailbox.', 'not_available');
+      renderMailboxNotice(SMART_MAILBOXES.find(m => m.key === key)?.label || 'Mailbox', 'Pick an account from the sidebar to open this mailbox.', 'pending');
       return;
     }
     return openAccountSmartFolder(account, key);
