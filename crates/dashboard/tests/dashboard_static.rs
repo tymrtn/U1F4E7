@@ -78,10 +78,13 @@ fn dashboard_phase1_shell_uses_three_pane_mail_layout() {
             && DASHBOARD_JS.contains("renderAccountMailboxButtons"),
         "accounts should render as mailbox groups with nested folders when available"
     );
+    // Mail shell still uses a fixed three-pane grid; sidebar width may vary
+    // (260px desktop / 240px ≤1280) so the assertion is structural, not
+    // pixel-exact.
     assert!(
         DASHBOARD_CSS.contains(".mail-shell")
-            && DASHBOARD_CSS.contains("grid-template-columns: 280px")
-            && DASHBOARD_CSS.contains(".reader-pane"),
+            && DASHBOARD_CSS.contains(".reader-pane")
+            && DASHBOARD_CSS.contains(".mail-shell {\n  min-height: 0;\n  display: grid;\n  grid-template-columns:"),
         "CSS should size the operator mail shell as fixed dashboard panes"
     );
 }

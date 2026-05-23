@@ -418,6 +418,10 @@ function cockpitAccountItems(collection, acct) {
 
 function classifyAccountHealthFailure(reason, fallback = 'unavailable') {
   const text = String(reason || '').toLowerCase();
+  // "cache missing / refresh required" is an informational state — the
+  // local cache hasn't been populated yet. It's not an auth or connectivity
+  // failure, so classify it as its own state (not in HEALTH_NEEDS_ACTION).
+  if (text.includes('cache missing') || text.includes('refresh required')) return 'cache_missing';
   if (/(rate|throttl|too many|429|quota|limit exceeded)/.test(text)) return 'rate_limited';
   if (/(auth|credential|password|login|oauth|unauthorized|forbidden|permission|sasl)/.test(text)) return 'auth_failed';
   if (/(reconnect|reconnecting)/.test(text)) return 'reconnecting';
@@ -430,15 +434,16 @@ function sanitizedAccountHealthReason(reason, status) {
     healthy: 'local signals healthy',
     syncing: 'loading local metadata',
     stale: 'cached index is stale',
+    cache_missing: 'click Refresh to load mailbox',
     auth_failed: 'authentication failed',
     rate_limited: 'provider rate limited',
     unavailable: 'mailbox unavailable',
     reconnecting: 'reconnecting',
   };
   if (!text) return defaults[status] || 'status unknown';
+  if (text.includes('cache missing') || text.includes('refresh required')) return defaults.cache_missing;
   if (/(rate|throttl|too many|429|quota|limit exceeded)/.test(text)) return defaults.rate_limited;
   if (/(auth|credential|password|login|oauth|unauthorized|forbidden|permission|sasl)/.test(text)) return defaults.auth_failed;
-  if (text.includes('cache missing')) return 'cache missing';
   if (text.includes('cache freshness unknown')) return 'cache freshness unknown';
   if (/(timeout|network|dns|tls|certificate|connection|imap)/.test(text)) return defaults.unavailable;
   return defaults[status] || 'status unknown';
@@ -460,6 +465,12 @@ function accountFolderSummary(acct) {
 }
 
 function accountSyncMeta(acct, health) {
+  // For cache_missing accounts, suppress the "unavailable · 0 unread · ..."
+  // noise. A single helpful hint is enough — the badge already signals
+  // state, and the Refresh button is the action.
+  if (health.state === 'cache_missing') {
+    return 'click Refresh to load mailbox';
+  }
   const unified = unifiedAccountSignal(acct);
   const folderState = state.folderLoadState[acct?.id];
   const parts = [];
@@ -1342,20 +1353,25 @@ function renderMailboxNotice(title, message, kind = 'not_available') {
 
 function smartMailboxCount(key) {
   if (key === 'unified') {
-    if (state.unifiedMeta?.unread_count !== undefined) return `${state.unifiedMeta.unread_count} unread`;
-    return state.unifiedMeta?.status || 'cached';
+    if (state.unifiedMeta?.unread_count !== undefined) {
+      return state.unifiedMeta.unread_count > 0 ? `${state.unifiedMeta.unread_count} unread` : '';
+    }
+    return '';
   }
   if (key === 'attention') {
     const count = state.cockpit?.summary?.needs_attention_events;
-    return count === undefined ? 'not_available' : `${count} attention`;
+    if (count === undefined || count === 0) return '';
+    return `${count} attention`;
   }
   if (key === 'snoozed') {
-    return state.stats?.snoozed === undefined ? 'not_available' : String(state.stats.snoozed);
+    const n = state.stats?.snoozed;
+    if (n === undefined || n === 0) return '';
+    return String(n);
   }
   const account = selectedAccountForSmartMailbox();
-  if (!account) return 'select account';
+  if (!account) return '';
   const folder = findFolderForSmart(key);
-  if (!folder) return 'not_available';
+  if (!folder) return '';
   return folderCountText(folder);
 }
 
@@ -1380,15 +1396,13 @@ function renderSmartMailboxes() {
   if (!list) return;
   clear(list);
   for (const mailbox of SMART_MAILBOXES) {
-    const unavailable = ['attention', 'snoozed', 'sent', 'drafts', 'all_mail'].includes(mailbox.key)
-      && smartMailboxCount(mailbox.key) === 'not_available';
     list.appendChild(mailboxItem({
       key: mailbox.key,
       label: mailbox.label,
       hint: mailbox.hint,
       count: smartMailboxCount(mailbox.key),
       active: state.currentSmartMailbox === mailbox.key,
-      unavailable,
+      unavailable: false,
       onclick: () => selectSmartMailbox(mailbox.key),
     }));
   }
@@ -1777,9 +1791,8 @@ async function loadFolders() {
     renderSmartMailboxes();
     renderAccountsList();
     const unread = state.unifiedMeta?.unread_count;
-    const freshness = state.unifiedMeta?.freshness || state.unifiedMeta?.status || 'loading';
-    setStat('stat-unread', unread === undefined ? freshness : `${unread} · ${freshness}`);
-    setStat('stat-drafts', 'select account');
+    setStat('stat-unread', unread === undefined ? '—' : String(unread));
+    setStat('stat-drafts', '—');
     return;
   }
   if (!state.currentAccount) return;
@@ -1874,11 +1887,22 @@ async function loadUnifiedInbox({ refresh = false } = {}) {
     renderMessages();
     const accounts = data.accounts || [];
     const okCount = accounts.filter(a => a.ok).length;
+    const errors = data.errors || [];
+    const allCacheMissing = errors.length > 0
+      && errors.every(e => /cache missing|refresh required/i.test(e.error || ''));
     const accountText = accounts.length ? ` across ${okCount}/${accounts.length} account${accounts.length === 1 ? '' : 's'}` : '';
-    const statusText = data.status === 'partial' ? ' · partial' : data.status === 'error' ? ' · all accounts failed' : '';
+    // Don't shout "all accounts failed" when it's just an unwarmed cache.
+    const statusText = allCacheMissing
+      ? ''
+      : (data.status === 'partial' ? ' · partial' : data.status === 'error' ? ' · some accounts failed' : '');
     const unreadText = data.unread_count !== undefined ? ` · ${data.unread_count} unread` : '';
-    $('list-count').textContent = `Showing ${state.messages.length} latest${accountText}${unreadText}${statusText}`;
-    setStat('stat-unread', data.unread_count === undefined ? (data.freshness || data.status) : `${data.unread_count} · ${data.freshness || data.status}`);
+    if (allCacheMissing) {
+      // Notice box below already shows the CTA; keep the count line blank.
+      $('list-count').textContent = '';
+    } else {
+      $('list-count').textContent = `Showing ${state.messages.length} latest${accountText}${unreadText}${statusText}`;
+    }
+    setStat('stat-unread', data.unread_count === undefined ? '—' : String(data.unread_count));
     renderUnifiedFolders();
     setRefresh(data.status === 'partial' ? 'partial' : data.status === 'error' ? 'error' : 'ok');
   } catch (e) {
@@ -1905,12 +1929,12 @@ function renderMessages() {
     state.renderedMessageKeys = [];
     pruneSelectedMessagesToRendered();
     updateBulkToolbar();
-    const emptyText = unified && meta.status === 'error'
-      ? 'Unified Inbox failed for all accounts.'
-      : unified
-        ? 'No messages in Unified Inbox.'
-        : 'No messages.';
-    list.appendChild(el('div', { class: `px-4 py-12 text-center text-sm ${meta.status === 'error' ? 'text-warn' : 'text-mid'}`, text: emptyText }));
+    // Only show an empty-state placeholder when there isn't already a
+    // notice rendered above (cache_missing CTA, partial failure list, etc.).
+    if (!unified || (errors.length === 0 && meta.status !== 'error')) {
+      const emptyText = unified ? 'No messages in Unified Inbox.' : 'No messages.';
+      list.appendChild(el('div', { class: 'px-4 py-12 text-center text-sm text-mid', text: emptyText }));
+    }
     return;
   }
   const sorted = unified ? [...state.messages] : [...state.messages].sort((a, b) => (b.uid || 0) - (a.uid || 0));
@@ -2018,8 +2042,32 @@ function renderMessages() {
 }
 
 function appendUnifiedErrorNotice(list, status, errors) {
+  // When every account has the same cache-missing problem, collapse the
+  // 17-line red wall into one calm CTA. This isn't a failure — it's an
+  // empty cache that needs a refresh.
+  const allCacheMissing = errors.length > 0
+    && errors.every(err => /cache missing|refresh required/i.test(err.error || ''));
+  if (allCacheMissing) {
+    const box = el('div', { class: 'message-notice pending' });
+    box.appendChild(el('div', { class: 'message-notice-title', text: 'Mailbox cache is empty.' }));
+    const action = el('div', { class: 'message-notice-line' });
+    const refresh = el('button', {
+      class: 'btn-ghost text-xs',
+      text: 'Refresh now',
+      type: 'button',
+    });
+    refresh.onclick = () => loadUnifiedInbox({ refresh: true });
+    action.appendChild(document.createTextNode('Click '));
+    action.appendChild(refresh);
+    action.appendChild(document.createTextNode(' to populate the unified inbox across all accounts.'));
+    box.appendChild(action);
+    list.appendChild(box);
+    return;
+  }
+
+  // Otherwise show the per-account failure breakdown.
   const title = status === 'error'
-    ? 'All accounts failed to load.'
+    ? 'Some inboxes failed to load.'
     : 'Some accounts failed to load.';
   const box = el('div', { class: `message-notice ${status === 'error' ? 'error' : 'partial'}` });
   box.appendChild(el('div', { class: 'message-notice-title', text: title }));
