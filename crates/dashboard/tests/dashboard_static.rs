@@ -268,8 +268,21 @@ fn dashboard_account_health_uses_local_signals_without_first_paint_auth_probe() 
             && DASHBOARD_JS.contains("state.cockpit"),
         "account health should derive from cached unified/cockpit signals before live recovery exists"
     );
+    // First-paint regression guard: the `deriveAccountHealth` render path
+    // must not call `/verify`. The verify URL IS now wired into the
+    // reconnect click handler — which is a deliberate user action, not
+    // first-paint render. We check that by locating `deriveAccountHealth`
+    // and ensuring the verify URL doesn't appear inside its function body.
+    let derive_start = DASHBOARD_JS
+        .find("function deriveAccountHealth(")
+        .expect("deriveAccountHealth function present");
+    let derive_body_end = DASHBOARD_JS[derive_start..]
+        .find("\n}\n")
+        .map(|offset| derive_start + offset)
+        .unwrap_or(DASHBOARD_JS.len());
+    let derive_body = &DASHBOARD_JS[derive_start..derive_body_end];
     assert!(
-        !DASHBOARD_JS.contains("/accounts/${acct.id}/verify"),
-        "rendering account health must not fire live auth probes from first-paint sidebar rendering"
+        !derive_body.contains("/verify"),
+        "deriveAccountHealth must not call the /verify endpoint from the render path"
     );
 }

@@ -768,16 +768,54 @@ function toggleVisibleMessageSelection(selected) {
   renderMessages();
 }
 
-function toggleMessageStar(message, button) {
+function isMessageStarred(message) {
+  if (!message) return false;
+  if (state.starredMessages.has(messageKey(message))) return true;
+  return Array.isArray(message.flags)
+    && message.flags.some(f => String(f).toLowerCase() === '\\flagged');
+}
+
+async function toggleMessageStar(message, button) {
   const key = messageKey(message);
-  const starred = state.starredMessages.has(key);
-  if (starred) state.starredMessages.delete(key);
+  const wasStarred = isMessageStarred(message);
+  const accountId = messageAccountId(message);
+  const folder = messageFolder(message) || 'INBOX';
+  const uid = Number(message?.uid);
+  if (!accountId || !uid || folder === '__snoozed__') {
+    toast('Cannot star — message has no account/uid context.', 'error');
+    return;
+  }
+
+  // Optimistic update: flip UI state immediately, revert on API failure.
+  if (wasStarred) state.starredMessages.delete(key);
   else state.starredMessages.add(key);
-  const active = !starred;
-  button.textContent = active ? '★' : '☆';
-  button.classList.toggle('active', active);
-  button.setAttribute('aria-pressed', active ? 'true' : 'false');
-  setBulkStatus('Star saved locally. Server-side star sync arrives in v0.10.0.');
+  button.textContent = wasStarred ? '☆' : '★';
+  button.classList.toggle('active', !wasStarred);
+  button.setAttribute('aria-pressed', wasStarred ? 'false' : 'true');
+  button.disabled = true;
+
+  try {
+    await api('POST', `/accounts/${accountId}/messages/${uid}/flags`, {
+      folder,
+      add: wasStarred ? [] : ['\\Flagged'],
+      remove: wasStarred ? ['\\Flagged'] : [],
+    });
+    // Mirror to message.flags so subsequent renders stay correct.
+    const flags = Array.isArray(message.flags) ? message.flags.slice() : [];
+    const filtered = flags.filter(f => String(f).toLowerCase() !== '\\flagged');
+    message.flags = wasStarred ? filtered : [...filtered, '\\Flagged'];
+    setBulkStatus(wasStarred ? 'Star removed.' : 'Starred.', 'success');
+  } catch (e) {
+    // Revert optimistic update on failure.
+    if (wasStarred) state.starredMessages.add(key);
+    else state.starredMessages.delete(key);
+    button.textContent = wasStarred ? '★' : '☆';
+    button.classList.toggle('active', wasStarred);
+    button.setAttribute('aria-pressed', wasStarred ? 'true' : 'false');
+    toast(`Star failed: ${e.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function reportBulkActionUnavailable(action) {
@@ -1360,13 +1398,36 @@ function renderAccountHealthPanel(acct, primitive) {
     const reconnect = el('button', {
       class: 'account-reconnect',
       text: 'Reconnect',
-      title: 'Re-verify IMAP and SMTP credentials',
+      title: 'Re-verify IMAP credentials and clear the failed-auth record',
       type: 'button',
     });
-    reconnect.onclick = (event) => {
+    reconnect.onclick = async (event) => {
       event.stopPropagation();
-      reconnectStatus.textContent = 'Reconnect coming in v0.10.0.';
-      toast('Reconnect is coming in the next dashboard release.', 'pending');
+      reconnect.disabled = true;
+      const originalText = reconnect.textContent;
+      reconnect.textContent = 'Verifying…';
+      reconnectStatus.textContent = '';
+      try {
+        const result = await api('POST', `/accounts/${acct.id}/verify`);
+        if (result && result.ok && result.imap) {
+          reconnectStatus.textContent = 'IMAP verified ✓';
+          toast(`Verified ${acct.username}.`, 'success');
+          // Refresh accounts + cockpit so the health badge updates
+          // immediately. autoSelect=false keeps the user's current view.
+          await loadAccounts({ autoSelect: false });
+          await loadCockpit();
+        } else {
+          const msg = (result && result.error) || 'Verify failed';
+          reconnectStatus.textContent = msg;
+          toast(`Verify failed: ${msg}`, 'error');
+        }
+      } catch (e) {
+        reconnectStatus.textContent = e.message || 'request failed';
+        toast(`Reconnect error: ${e.message}`, 'error');
+      } finally {
+        reconnect.disabled = false;
+        reconnect.textContent = originalText;
+      }
     };
     reconnectRow.appendChild(reconnect);
     reconnectRow.appendChild(reconnectStatus);
@@ -1712,7 +1773,7 @@ function renderMessages() {
     const primitive = messagePrimitive(m);
     const key = messageKey(m);
     const selected = state.selectedMessages.has(key);
-    const starred = state.starredMessages.has(key);
+    const starred = isMessageStarred(m);
     const row = el('div', {
       class: `msg-row ${unified ? 'unified' : ''}`,
       data: { primitive: primitive.primitive, messageKey: key },
@@ -1740,10 +1801,10 @@ function renderMessages() {
     const star = el('button', {
       class: `msg-star ${starred ? 'active' : ''}`,
       text: starred ? '★' : '☆',
-      title: 'Local star only; backend persistence is not wired.',
+      title: starred ? 'Unstar (removes IMAP \\Flagged)' : 'Star (sets IMAP \\Flagged)',
       type: 'button',
     });
-    star.setAttribute('aria-label', starred ? 'Unstar message locally' : 'Star message locally');
+    star.setAttribute('aria-label', starred ? 'Unstar message' : 'Star message');
     star.setAttribute('aria-pressed', starred ? 'true' : 'false');
     star.onclick = (event) => {
       event.stopPropagation();
