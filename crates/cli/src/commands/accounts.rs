@@ -2,6 +2,7 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use crate::AccountsCmd;
+use crate::commands::ui;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
 use envelope_email_store::credential_store::{self, CredentialBackend};
@@ -22,6 +23,27 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
         ),
         AccountsCmd::List => list(json),
         AccountsCmd::Remove { id } => remove(&id, json),
+        AccountsCmd::ImportKeychain {
+            email,
+            name,
+            imap_host,
+            smtp_host,
+            imap_port,
+            smtp_port,
+            confirm_read,
+            import,
+        } => crate::commands::keychain_import::run(
+            &email,
+            name,
+            imap_host,
+            smtp_host,
+            imap_port,
+            smtp_port,
+            confirm_read,
+            import,
+            json,
+            backend,
+        ),
     }
 }
 
@@ -104,7 +126,8 @@ async fn add(
         .context("failed to create account")?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&account)?);
+        let value = ui::with_ui(&account, ui::account_ui(&account.id));
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("Account added: {} ({})", account.username, account.id);
     }
@@ -117,7 +140,11 @@ fn list(json: bool) -> Result<()> {
     let accounts = db.list_accounts().context("failed to list accounts")?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&accounts)?);
+        let enriched: Vec<serde_json::Value> = accounts
+            .iter()
+            .map(|a| ui::with_ui(a, ui::account_ui(&a.id)))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
         return Ok(());
     }
 
@@ -170,7 +197,11 @@ fn remove(id_or_email: &str, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::json!({ "deleted": account.id, "email": account.username })
+            serde_json::json!({
+                "deleted": account.id,
+                "email": account.username,
+                "ui": ui::root_ui(),
+            })
         );
     } else {
         println!("Removed account: {} ({})", account.username, account.id);

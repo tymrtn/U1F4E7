@@ -62,6 +62,10 @@ AGENT WORKFLOWS
     envelope paths
     envelope paths --json
 
+  Share dashboard URLs for agent handoffs:
+    export ENVELOPE_DASHBOARD_BASE_URL=https://your-node.tailnet.ts.net
+    envelope config set dashboard.base_url https://your-node.tailnet.ts.net
+
   Every command supports --json for machine consumption:
     envelope inbox --json | jq '.[0].subject'
     envelope folders --json | jq '.[] | {name: .folder, unseen}'
@@ -102,8 +106,8 @@ enum Commands {
         /// IMAP folder to list
         #[arg(long, default_value = "INBOX")]
         folder: String,
-        /// Maximum messages to return
-        #[arg(long, default_value = "25")]
+        /// Maximum messages to return (1..=1000)
+        #[arg(long, default_value = "25", value_parser = parse_agent_list_limit)]
         limit: u32,
         /// Account ID or email
         #[arg(long)]
@@ -129,8 +133,8 @@ enum Commands {
         /// IMAP folder
         #[arg(long, default_value = "INBOX")]
         folder: String,
-        /// Maximum results
-        #[arg(long, default_value = "25")]
+        /// Maximum results (1..=1000)
+        #[arg(long, default_value = "25", value_parser = parse_agent_list_limit)]
         limit: u32,
         /// Account ID or email
         #[arg(long)]
@@ -172,6 +176,15 @@ enum Commands {
         /// Schedule send for a future time (ISO 8601, relative, or natural like "monday 9am")
         #[arg(long)]
         at: Option<String>,
+        /// Send safety mode: draft-only, confirm-send, allowlisted-send, or autonomous-send
+        #[arg(long, default_value = "autonomous-send")]
+        send_mode: String,
+        /// Required when --send-mode confirm-send is used
+        #[arg(long)]
+        confirm_send: bool,
+        /// Allowed recipient email address or domain for --send-mode allowlisted-send (repeatable)
+        #[arg(long = "allow-recipient")]
+        allow_recipients: Vec<String>,
     },
 
     /// Move a message to another folder
@@ -270,6 +283,10 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value = "3141")]
         port: u16,
+
+        /// Disable background unsnooze and scheduled-send sweeps (desktop diagnostics / read-only shell)
+        #[arg(long)]
+        no_background_sweeps: bool,
     },
 
     /// Compose a new email (licensed tier)
@@ -401,6 +418,41 @@ enum Commands {
     #[command(visible_alias = "doctor")]
     Paths,
 
+    /// Manage persistent Envelope configuration
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigCmd,
+    },
+
+    /// Verify Envelope HOME, account, IMAP auth, and read-only inbox peek
+    #[command(
+        after_help = "EXIT CODES\n  0 ok\n  1 paths/internal failure\n  2 account missing or not found\n  3 IMAP auth/connect failure\n  4 inbox peek failure"
+    )]
+    Quickstart {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// IMAP folder to peek
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Headers-only messages to peek (capped at 25)
+        #[arg(long, default_value = "5")]
+        peek_limit: u32,
+        /// Per-network-phase timeout in seconds (capped at 60)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
+        /// Run only local paths/account phases; no IMAP sockets
+        #[arg(long)]
+        skip_network: bool,
+    },
+
+    /// Show the versioned agent JSON/MCP contract
+    Contract {
+        /// Limit output to one named surface (for example: inbox, read, send, evidence)
+        #[arg(long)]
+        surface: Option<String>,
+    },
+
     /// Start the MCP (Model Context Protocol) server over stdio
     Mcp {
         /// Print a ready-to-paste MCP config snippet and exit
@@ -435,12 +487,60 @@ enum AccountsCmd {
         #[arg(long)]
         imap_port: Option<u16>,
     },
+    /// Discover/import matching macOS Mail.app/Keychain internet-password entries
+    ImportKeychain {
+        /// Email address to match in Keychain internet-password entries
+        #[arg(long)]
+        email: String,
+        /// Account display name to store if imported
+        #[arg(long)]
+        name: Option<String>,
+        /// IMAP host to search (defaults to imap.<domain>)
+        #[arg(long)]
+        imap_host: Option<String>,
+        /// SMTP host to search (defaults to smtp.<domain>)
+        #[arg(long)]
+        smtp_host: Option<String>,
+        /// IMAP port for verification/storage
+        #[arg(long)]
+        imap_port: Option<u16>,
+        /// SMTP port for verification/storage
+        #[arg(long)]
+        smtp_port: Option<u16>,
+        /// Explicitly permit reading password values from Keychain for auth verification
+        #[arg(long)]
+        confirm_read: bool,
+        /// Store/update Envelope account after both IMAP and SMTP verify
+        #[arg(long)]
+        import: bool,
+    },
     /// List configured accounts
     List,
     /// Remove an account
     Remove {
         /// Account ID or email address
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Get a persistent config value
+    Get {
+        /// Supported key: dashboard.base_url
+        key: String,
+    },
+    /// Set a persistent config value
+    Set {
+        /// Supported key: dashboard.base_url
+        key: String,
+        /// Value to store
+        value: String,
+    },
+    /// Unset a persistent config value
+    Unset {
+        /// Supported key: dashboard.base_url
+        key: String,
     },
 }
 
@@ -801,6 +901,9 @@ enum RuleCmd {
         /// Stop evaluating further rules after this one fires
         #[arg(long)]
         stop: bool,
+        /// Create disabled so a human can review/preview before enabling
+        #[arg(long)]
+        disabled: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -822,7 +925,19 @@ enum RuleCmd {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Batch-apply rules to messages in a folder
+    /// Preview enabled rules across a folder without mutating the mailbox
+    Preview {
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Maximum messages to inspect
+        #[arg(long, default_value = "50")]
+        limit: u32,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Batch-apply rules to messages in a folder (requires --confirm)
     Run {
         /// IMAP folder
         #[arg(long, default_value = "INBOX")]
@@ -833,6 +948,9 @@ enum RuleCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Confirm this mutating mailbox operation
+        #[arg(long)]
+        confirm: bool,
     },
     /// Enable a rule by name
     Enable {
@@ -863,6 +981,30 @@ enum RuleCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+    },
+    /// Publish the exported Sieve script to a ManageSieve server (e.g. Migadu)
+    PublishSieve {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// Script name on the ManageSieve server
+        #[arg(long, default_value = "envelope-rules")]
+        script_name: String,
+        /// ManageSieve host override (defaults: sieve.migadu.com for Migadu, else IMAP host)
+        #[arg(long)]
+        host: Option<String>,
+        /// ManageSieve port override (default: 4190)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Per-network-phase timeout in seconds (capped at 60)
+        #[arg(long, default_value = "20")]
+        timeout_secs: u64,
+        /// Plan only; render the script and ManageSieve endpoint without uploading
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the mutating upload (PUTSCRIPT + SETACTIVE against the live server)
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -929,6 +1071,30 @@ pub enum BackupCmd {
         /// Number of messages processed per restore batch
         #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
         batch_size: u32,
+    },
+    /// Audit a destination's restore-state sidecar against the archive manifest
+    /// without contacting any IMAP server. Reports pending-without-done rows
+    /// classified as planned / unknown_no_message_id / state_not_in_manifest.
+    AuditState {
+        /// Destination account ID or email whose `.restore-state-<id>.ndjson`
+        /// sidecar should be audited.
+        #[arg(long)]
+        account: String,
+        /// Archive directory previously produced by `backup export`.
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Include source folder glob (repeatable). Filters the SOURCE folder
+        /// name (pre-mapping), matching `backup restore`'s convention.
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude source folder glob (repeatable). Wins over --include.
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Folder rename rule "SRC=DST" (repeatable). Used to compute the
+        /// destination folder name in the audit output; identical semantics
+        /// to `backup restore --map`.
+        #[arg(long = "map")]
+        map: Vec<String>,
     },
 }
 
@@ -1024,6 +1190,22 @@ fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
         .map_err(|e| format!("invalid positive integer: {e}"))?;
     if parsed == 0 {
         return Err("must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_agent_list_limit(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|e| format!("--limit invalid integer: {e}"))?;
+    if parsed == 0 {
+        return Err("--limit must be at least 1".to_string());
+    }
+    if parsed > commands::contract::MAX_AGENT_LIST_LIMIT {
+        return Err(format!(
+            "--limit must be at most {} for agent/CLI read-only list/search surfaces",
+            commands::contract::MAX_AGENT_LIST_LIMIT
+        ));
     }
     Ok(parsed)
 }
@@ -1177,6 +1359,9 @@ fn main() {
             attach,
             account,
             at,
+            send_mode,
+            confirm_send,
+            allow_recipients,
         } => commands::send::run(
             &to,
             &subject,
@@ -1191,6 +1376,9 @@ fn main() {
             cli.json,
             backend,
             at.as_deref(),
+            &send_mode,
+            confirm_send,
+            &allow_recipients,
         ),
 
         Commands::Move {
@@ -1317,7 +1505,10 @@ fn main() {
             }
         },
 
-        Commands::Serve { port } => commands::serve::run(port),
+        Commands::Serve {
+            port,
+            no_background_sweeps,
+        } => commands::serve::run(port, no_background_sweeps),
         Commands::Compose { .. } => {
             eprintln!("License required — visit https://envelope-email.dev");
             std::process::exit(1);
@@ -1501,6 +1692,7 @@ fn main() {
                 action,
                 priority,
                 stop,
+                disabled,
                 account,
             } => commands::rule::run_create(
                 &name,
@@ -1514,6 +1706,7 @@ fn main() {
                 &action,
                 priority,
                 stop,
+                !disabled,
                 account.as_deref(),
                 cli.json,
                 backend,
@@ -1526,11 +1719,24 @@ fn main() {
                 folder,
                 account,
             } => commands::rule::run_test(uid, &folder, account.as_deref(), cli.json, backend),
+            RuleCmd::Preview {
+                folder,
+                limit,
+                account,
+            } => commands::rule::run_preview(&folder, account.as_deref(), limit, cli.json, backend),
             RuleCmd::Run {
                 folder,
                 limit,
                 account,
-            } => commands::rule::run_apply(&folder, account.as_deref(), limit, cli.json, backend),
+                confirm,
+            } => commands::rule::run_apply(
+                &folder,
+                account.as_deref(),
+                limit,
+                confirm,
+                cli.json,
+                backend,
+            ),
             RuleCmd::Enable { name, account } => {
                 commands::rule::run_enable(&name, account.as_deref(), cli.json, backend)
             }
@@ -1543,6 +1749,25 @@ fn main() {
             RuleCmd::Export { account } => {
                 commands::rule::run_export(account.as_deref(), cli.json, backend)
             }
+            RuleCmd::PublishSieve {
+                account,
+                script_name,
+                host,
+                port,
+                timeout_secs,
+                dry_run,
+                confirm,
+            } => commands::rule::run_publish_sieve(
+                account.as_deref(),
+                &script_name,
+                host.as_deref(),
+                port,
+                timeout_secs,
+                dry_run,
+                confirm,
+                cli.json,
+                backend,
+            ),
         },
 
         Commands::Unsubscribe {
@@ -1588,6 +1813,26 @@ fn main() {
         ),
 
         Commands::Paths => commands::paths::run(cli.json, backend),
+
+        Commands::Config { subcommand } => commands::config::run(subcommand, cli.json),
+
+        Commands::Quickstart {
+            account,
+            folder,
+            peek_limit,
+            timeout_secs,
+            skip_network,
+        } => commands::quickstart::run(
+            cli.json,
+            account.as_deref(),
+            &folder,
+            peek_limit,
+            timeout_secs,
+            skip_network,
+            backend,
+        ),
+
+        Commands::Contract { surface } => commands::contract::run(surface.as_deref()),
 
         Commands::Mcp { config } => {
             if config {
@@ -1648,6 +1893,65 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("paths"));
         assert!(help.contains("doctor"));
+    }
+
+    #[test]
+    fn config_command_parses_dashboard_base_url_set() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "config",
+            "set",
+            "dashboard.base_url",
+            "https://dash.example.test/",
+        ])
+        .expect("config command should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Config {
+                subcommand: ConfigCmd::Set {
+                    ref key,
+                    ref value
+                }
+            } if key == "dashboard.base_url" && value == "https://dash.example.test/"
+        ));
+    }
+
+    #[test]
+    fn contract_command_parses_and_lists_agent_surfaces() {
+        let cli = Cli::try_parse_from(["envelope", "contract", "--surface", "inbox"])
+            .expect("contract command should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Contract {
+                surface: Some(ref surface)
+            } if surface == "inbox"
+        ));
+
+        let contract = commands::contract::agent_contract();
+        assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+        let surfaces = contract["surfaces"].as_array().expect("surfaces array");
+        for required in [
+            "inbox", "read", "search", "thread", "draft", "send", "watch", "otp", "rules",
+            "evidence",
+        ] {
+            assert!(
+                surfaces.iter().any(|surface| surface["name"] == required),
+                "missing contract surface: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tools_are_derived_from_agent_contract_schemas() {
+        let tools = mcp::tool_list();
+        let tool_entries = tools["tools"].as_array().expect("mcp tools array");
+        let inbox = tool_entries
+            .iter()
+            .find(|tool| tool["name"] == "inbox")
+            .expect("inbox MCP tool");
+        let contract_inbox = commands::contract::surface("inbox").expect("inbox contract surface");
+        assert_eq!(inbox["inputSchema"], contract_inbox["input_schema"]);
     }
 
     #[test]
@@ -1847,5 +2151,178 @@ mod tests {
         .expect("evidence verify should parse");
 
         assert!(matches!(cli.command, Commands::Evidence { .. }));
+    }
+
+    #[test]
+    fn rule_publish_sieve_dry_run_parses() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "rule",
+            "publish-sieve",
+            "--account",
+            "acct-1",
+            "--script-name",
+            "envelope-rules",
+            "--dry-run",
+        ])
+        .expect("publish-sieve dry-run should parse");
+
+        match cli.command {
+            Commands::Rule {
+                subcommand:
+                    RuleCmd::PublishSieve {
+                        ref account,
+                        ref script_name,
+                        host,
+                        port,
+                        dry_run,
+                        confirm,
+                        ..
+                    },
+            } => {
+                assert_eq!(account.as_deref(), Some("acct-1"));
+                assert_eq!(script_name, "envelope-rules");
+                assert!(host.is_none());
+                assert!(port.is_none());
+                assert!(dry_run);
+                assert!(!confirm);
+            }
+            _ => panic!("expected rule publish-sieve command"),
+        }
+    }
+
+    #[test]
+    fn rule_publish_sieve_confirm_parses_with_overrides() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "rule",
+            "publish-sieve",
+            "--account",
+            "acct-1",
+            "--host",
+            "sieve.alt.example",
+            "--port",
+            "4191",
+            "--timeout-secs",
+            "30",
+            "--confirm",
+        ])
+        .expect("publish-sieve confirm should parse");
+
+        match cli.command {
+            Commands::Rule {
+                subcommand:
+                    RuleCmd::PublishSieve {
+                        host,
+                        port,
+                        timeout_secs,
+                        confirm,
+                        ref script_name,
+                        ..
+                    },
+            } => {
+                assert_eq!(host.as_deref(), Some("sieve.alt.example"));
+                assert_eq!(port, Some(4191));
+                assert_eq!(timeout_secs, 30);
+                assert!(confirm);
+                // default name preserved
+                assert_eq!(script_name, "envelope-rules");
+            }
+            _ => panic!("expected rule publish-sieve command"),
+        }
+    }
+
+    #[test]
+    fn rule_publish_sieve_defaults_to_dry_run_safe_state() {
+        // Without --dry-run or --confirm the parse must still succeed; the
+        // handler is responsible for treating absent --confirm as
+        // non-mutating. This test exercises clap's defaults so the runtime
+        // safety check is not bypassed by clap accidentally requiring one
+        // of the flags via group config.
+        let cli = Cli::try_parse_from(["envelope", "rule", "publish-sieve", "--account", "acct-1"])
+            .expect("publish-sieve should parse without an explicit mode flag");
+
+        match cli.command {
+            Commands::Rule {
+                subcommand:
+                    RuleCmd::PublishSieve {
+                        dry_run, confirm, ..
+                    },
+            } => {
+                assert!(!dry_run);
+                assert!(!confirm);
+            }
+            _ => panic!("expected rule publish-sieve command"),
+        }
+    }
+
+    #[test]
+    fn inbox_accepts_limit_at_agent_max() {
+        let cli = Cli::try_parse_from(["envelope", "inbox", "--limit", "1000"])
+            .expect("inbox --limit 1000 should parse");
+        match cli.command {
+            Commands::Inbox { limit, .. } => assert_eq!(limit, 1000),
+            _ => panic!("expected inbox command"),
+        }
+    }
+
+    #[test]
+    fn inbox_rejects_limit_above_agent_max() {
+        let err = match Cli::try_parse_from(["envelope", "inbox", "--limit", "1001"]) {
+            Ok(_) => panic!("inbox --limit 1001 must be rejected by clap before any IMAP work"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--limit") && msg.contains("1000"),
+            "expected --limit max-of-1000 error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn inbox_rejects_zero_limit() {
+        let err = match Cli::try_parse_from(["envelope", "inbox", "--limit", "0"]) {
+            Ok(_) => panic!("inbox --limit 0 must be rejected by clap"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("--limit"),
+            "expected --limit validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn search_accepts_limit_at_agent_max() {
+        let cli = Cli::try_parse_from(["envelope", "search", "ALL", "--limit", "1000"])
+            .expect("search --limit 1000 should parse");
+        match cli.command {
+            Commands::Search { limit, .. } => assert_eq!(limit, 1000),
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_rejects_limit_above_agent_max() {
+        let err = match Cli::try_parse_from(["envelope", "search", "ALL", "--limit", "1001"]) {
+            Ok(_) => panic!("search --limit 1001 must be rejected by clap before any IMAP work"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--limit") && msg.contains("1000"),
+            "expected --limit max-of-1000 error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_rejects_zero_limit() {
+        let err = match Cli::try_parse_from(["envelope", "search", "ALL", "--limit", "0"]) {
+            Ok(_) => panic!("search --limit 0 must be rejected by clap"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("--limit"),
+            "expected --limit validation error, got: {err}"
+        );
     }
 }

@@ -22,7 +22,8 @@ pub fn run(json: bool, backend: CredentialBackend) -> Result<()> {
     let report = collect_report(backend);
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let value = super::ui::with_ui(&report, super::ui::root_ui());
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 

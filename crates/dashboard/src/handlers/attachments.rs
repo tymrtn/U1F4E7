@@ -15,10 +15,17 @@ use crate::state::AppState;
 pub struct DownloadQuery {
     #[serde(default = "default_folder")]
     pub folder: String,
+    #[serde(default)]
+    pub inline: bool,
 }
 
 fn default_folder() -> String {
     "INBOX".to_string()
+}
+
+fn attachment_disposition(filename: &str, inline: bool) -> String {
+    let disposition = if inline { "inline" } else { "attachment" };
+    format!("{disposition}; filename=\"{}\"", filename.replace('"', "_"))
 }
 
 pub async fn download(
@@ -50,7 +57,7 @@ pub async fn download(
                 .header(header::CONTENT_TYPE, content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{fname}\""),
+                    attachment_disposition(&fname, q.inline),
                 )
                 .body(Body::from(data))
                 .unwrap()
@@ -59,5 +66,26 @@ pub async fn download(
             state.evict_imap(&account_id).await;
             (StatusCode::BAD_GATEWAY, format!("download: {e}")).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_defaults_to_download_and_supports_inline_rendering() {
+        assert_eq!(
+            attachment_disposition("report.pdf", false),
+            "attachment; filename=\"report.pdf\""
+        );
+        assert_eq!(
+            attachment_disposition("logo.png", true),
+            "inline; filename=\"logo.png\""
+        );
+        assert_eq!(
+            attachment_disposition("bad\"name.png", true),
+            "inline; filename=\"bad_name.png\""
+        );
     }
 }

@@ -7,13 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-20
+
 ### Added
 
+- **Dashboard Phase 1 Core Shell** — rebuilt the localhost dashboard as an
+  operator mail client with a left mailbox sidebar, middle message list, and
+  permanent right reader pane. The sidebar exposes Unified Inbox,
+  Today/Needs Attention, Snoozed, Sent, Drafts, All Mail, and account mailbox
+  groups with nested folders when folder metadata is available.
+- **Agent Cockpit attention strip** — the cockpit now starts as a compact
+  read-only attention strip and expands into the existing watches, event
+  buckets, drafts/actions, auth/action errors, rule runs, and due snoozes
+  panels.
+- **Message primitive rows and bulk triage shell** — message list rows now carry
+  a shared `message` primitive shape with state, actions, audit event,
+  render hint, rollback token, and concise equivalent CLI metadata. The message
+  list adds dense mail-client controls for selection, local star affordance,
+  sender, subject, snippet, labels, attachment hints, date, and an honest
+  bulk toolbar that stays non-mutating until backend execution is wired.
+- **Account health primitive and sidebar badges** — account rows now expose a
+  local-only `account_health` primitive with compact health badges, sync
+  freshness, provider capability hints, sanitized failure reasons, and an honest
+  reconnect affordance that stays non-mutating until recovery is wired.
 - **Path diagnostics** — `envelope paths` (alias: `envelope doctor`)
   prints the resolved database path, file credential path, config/app-data
   directory, current `HOME`, and warnings when those locations are under
   agent-harness directories such as `/private/tmp`, `/tmp`, `/var/folders`,
   or `.codex`.
+
+### Changed
+
+- Workspace and active desktop shell versions bumped to 0.9.0.
+- Dashboard first paint now lands on the cached Unified Inbox/local operator
+  surfaces and avoids automatic account selection that would probe live IMAP
+  folders or messages.
+
+[0.9.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.9.0
 
 ## [0.5.0] — 2026-04-19
 

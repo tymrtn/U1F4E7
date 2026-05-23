@@ -288,14 +288,15 @@ fn emit_event(event: &Event, webhook: Option<&str>, http_client: Option<&reqwest
         let client = client.clone();
         let body = json_line;
         tokio::spawn(async move {
-            if let Err(e) = client
+            if client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .body(body)
                 .send()
                 .await
+                .is_err()
             {
-                warn!("webhook POST failed: {e}");
+                warn!("webhook POST failed");
             }
         });
     }

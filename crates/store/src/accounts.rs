@@ -46,6 +46,73 @@ impl Database {
             .ok_or_else(|| StoreError::AccountNotFound(id))
     }
 
+    /// Create or update an account with encrypted credentials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_account_credentials(
+        &self,
+        name: &str,
+        username: &str,
+        password: &str,
+        smtp_password: Option<&str>,
+        smtp_host: &str,
+        smtp_port: u16,
+        imap_host: &str,
+        imap_port: u16,
+        passphrase: &str,
+    ) -> Result<Account> {
+        let domain = username.split('@').nth(1).unwrap_or("unknown").to_string();
+        let encrypted_password = crypto::encrypt(password, passphrase)?;
+        let encrypted_smtp_password = smtp_password
+            .filter(|pw| *pw != password)
+            .map(|pw| crypto::encrypt(pw, passphrase))
+            .transpose()?;
+
+        if let Some(existing) = self.find_account_by_email(username)? {
+            self.conn().execute(
+                "UPDATE accounts SET name = ?1, domain = ?2, smtp_host = ?3, smtp_port = ?4,
+                 imap_host = ?5, imap_port = ?6, encrypted_password = ?7,
+                 encrypted_smtp_password = ?8, encrypted_imap_password = NULL
+                 WHERE id = ?9",
+                params![
+                    name,
+                    domain,
+                    smtp_host,
+                    smtp_port,
+                    imap_host,
+                    imap_port,
+                    encrypted_password,
+                    encrypted_smtp_password,
+                    existing.id
+                ],
+            )?;
+            return self
+                .get_account(&existing.id)?
+                .ok_or_else(|| StoreError::AccountNotFound(existing.id));
+        }
+
+        let id = Uuid::new_v4().to_string();
+        self.conn().execute(
+            "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+             imap_host, imap_port, encrypted_password, encrypted_smtp_password)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                name,
+                username,
+                domain,
+                smtp_host,
+                smtp_port,
+                imap_host,
+                imap_port,
+                encrypted_password,
+                encrypted_smtp_password
+            ],
+        )?;
+
+        self.get_account(&id)?
+            .ok_or_else(|| StoreError::AccountNotFound(id))
+    }
+
     /// List all accounts (without credentials).
     pub fn list_accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn().prepare(
@@ -260,7 +327,7 @@ mod tests {
             .create_account(
                 "Test Gmail",
                 "test@gmail.com",
-                "app-password-123",
+                "fixture-login-value",
                 "smtp.gmail.com",
                 587,
                 "imap.gmail.com",
@@ -278,6 +345,48 @@ mod tests {
     }
 
     #[test]
+    fn upsert_account_credentials_updates_existing_without_plaintext_output() {
+        let db = Database::open_memory().unwrap();
+        let passphrase = "test-passphrase";
+
+        let created = db
+            .upsert_account_credentials(
+                "Original",
+                "user@example.com",
+                "fixture-imap-value-one",
+                Some("fixture-smtp-value-one"),
+                "smtp.example.com",
+                587,
+                "imap.example.com",
+                993,
+                passphrase,
+            )
+            .unwrap();
+        let updated = db
+            .upsert_account_credentials(
+                "Updated",
+                "user@example.com",
+                "fixture-imap-value-two",
+                Some("fixture-smtp-value-two"),
+                "smtp2.example.com",
+                465,
+                "imap2.example.com",
+                993,
+                passphrase,
+            )
+            .unwrap();
+
+        assert_eq!(created.id, updated.id);
+        assert_eq!(updated.name, "Updated");
+        assert_eq!(updated.smtp_host, "smtp2.example.com");
+        let creds = db
+            .get_account_with_credentials(&updated.id, passphrase)
+            .unwrap();
+        assert_eq!(creds.effective_imap_password(), "fixture-imap-value-two");
+        assert_eq!(creds.effective_smtp_password(), "fixture-smtp-value-two");
+    }
+
+    #[test]
     fn get_account_with_credentials() {
         let db = Database::open_memory().unwrap();
         let passphrase = "test-passphrase";
@@ -286,7 +395,7 @@ mod tests {
             .create_account(
                 "Test",
                 "user@example.com",
-                "secret-password",
+                "fixture-login-value",
                 "smtp.example.com",
                 587,
                 "imap.example.com",
@@ -298,7 +407,7 @@ mod tests {
         let creds = db
             .get_account_with_credentials(&account.id, passphrase)
             .unwrap();
-        assert_eq!(creds.password, "secret-password");
+        assert_eq!(creds.password, "fixture-login-value");
         assert_eq!(creds.effective_smtp_username(), "user@example.com");
     }
 

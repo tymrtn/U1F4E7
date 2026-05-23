@@ -64,6 +64,38 @@ pub enum Action {
     AddTag(String),
     /// POST message context as JSON to this URL when the rule matches.
     Webhook(String),
+    /// Server-side Sieve `reject` with a reason. Sieve/export-only — the
+    /// runtime must never simulate a bounce on already-delivered mail.
+    Reject(String),
+    /// Server-side Sieve `ereject` with a reason. Preferred over `reject`
+    /// where supported because it refuses the message at SMTP time and
+    /// avoids generating a backscatter MDN. Sieve/export-only.
+    Ereject(String),
+}
+
+/// Stable skip reason emitted when a server-side-only action is encountered
+/// during local post-delivery rule execution. Surfaced in audit logs and
+/// JSON output, so the wording is part of the contract.
+pub const SERVER_SIDE_ONLY_SKIP_REASON: &str = "server-side Sieve action; export via 'envelope rule export' and upload to ManageSieve — \
+     not executed locally to avoid post-delivery fake bounces";
+
+impl Action {
+    /// Whether this action can only be executed by the mail server via
+    /// Sieve. Local rule execution must skip these — Envelope never
+    /// fabricates a bounce or MDN for already-delivered mail.
+    pub fn is_server_side_only(&self) -> bool {
+        matches!(self, Action::Reject(_) | Action::Ereject(_))
+    }
+
+    /// Stable skip reason for server-side-only actions, or `None` when the
+    /// action can be executed locally.
+    pub fn local_execution_skip_reason(&self) -> Option<&'static str> {
+        if self.is_server_side_only() {
+            Some(SERVER_SIDE_ONLY_SKIP_REASON)
+        } else {
+            None
+        }
+    }
 }
 
 /// Context about a message for rule evaluation.
@@ -366,12 +398,74 @@ mod tests {
             Action::Delete,
             Action::Unsubscribe,
             Action::AddTag("processed".to_string()),
+            Action::Reject("Address closed".to_string()),
+            Action::Ereject("Address closed".to_string()),
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();
             let parsed: Action = serde_json::from_str(&json).unwrap();
             assert_eq!(action, parsed);
         }
+    }
+
+    #[test]
+    fn reject_action_serializes_with_reason() {
+        let a = Action::Reject("Mailbox no longer monitored".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"reject":"Mailbox no longer monitored"}"#);
+    }
+
+    #[test]
+    fn ereject_action_serializes_with_reason() {
+        let a = Action::Ereject("Mailbox no longer monitored".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"ereject":"Mailbox no longer monitored"}"#);
+    }
+
+    #[test]
+    fn reject_and_ereject_are_server_side_only() {
+        assert!(Action::Reject("x".to_string()).is_server_side_only());
+        assert!(Action::Ereject("x".to_string()).is_server_side_only());
+    }
+
+    #[test]
+    fn other_actions_are_not_server_side_only() {
+        assert!(!Action::Move("Junk".to_string()).is_server_side_only());
+        assert!(!Action::Flag("flagged".to_string()).is_server_side_only());
+        assert!(!Action::Delete.is_server_side_only());
+        assert!(!Action::Unsubscribe.is_server_side_only());
+        assert!(!Action::AddTag("t".to_string()).is_server_side_only());
+        assert!(!Action::Webhook("https://example.test".to_string()).is_server_side_only());
+        assert!(!Action::Snooze("1d".to_string()).is_server_side_only());
+        assert!(!Action::Unflag("seen".to_string()).is_server_side_only());
+    }
+
+    #[test]
+    fn server_side_only_skip_reason_is_stable() {
+        let reason = Action::Reject("x".to_string())
+            .local_execution_skip_reason()
+            .expect("reject must have a skip reason");
+        assert!(
+            reason.contains("server-side") && reason.contains("Sieve"),
+            "skip reason must say it's server-side Sieve: {reason}"
+        );
+        // Same stable string for ereject.
+        assert_eq!(
+            reason,
+            Action::Ereject("y".to_string())
+                .local_execution_skip_reason()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn non_server_side_actions_have_no_skip_reason() {
+        assert!(
+            Action::Move("Junk".to_string())
+                .local_execution_skip_reason()
+                .is_none()
+        );
+        assert!(Action::Delete.local_execution_skip_reason().is_none());
     }
 
     // ── build_match_expr helper ─────────────────────────────────────

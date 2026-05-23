@@ -6,10 +6,17 @@
 //! Implements the MCP stdio transport: reads JSON-RPC requests from stdin,
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
-use envelope_email_store::{CredentialBackend, Database};
+use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
+use crate::commands::ui;
+use envelope_email_store::{CredentialBackend, Database, Event};
+use envelope_email_transport::{
+    SendMode, SendPolicyDecision, SendPolicyInput, SendRuntime, audit_event_for,
+    default_mode_for_runtime, evaluate,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
+use std::str::FromStr;
 
 // ── JSON-RPC types ──────────────────────────────────────────────────
 
@@ -81,163 +88,25 @@ fn server_info() -> Value {
     })
 }
 
-fn tool_list() -> Value {
-    json!({
-        "tools": [
-            {
-                "name": "inbox",
-                "description": "List messages in a mailbox folder. Returns message summaries with UID, from, subject, date, and flags.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "folder": { "type": "string", "description": "IMAP folder name", "default": "INBOX" },
-                        "limit": { "type": "integer", "description": "Maximum messages to return", "default": 25 },
-                        "account": { "type": "string", "description": "Account email address (uses default if omitted)" }
-                    }
-                }
-            },
-            {
-                "name": "read",
-                "description": "Read a full email message by UID. Returns headers, text body, HTML body, and attachment metadata. Does not mark the message as read.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uid": { "type": "integer", "description": "Message UID" },
-                        "folder": { "type": "string", "description": "IMAP folder", "default": "INBOX" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["uid"]
-                }
-            },
-            {
-                "name": "search",
-                "description": "Search messages using IMAP search syntax. Examples: 'FROM boss@company.com', 'SUBJECT invoice', 'UNSEEN'.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "IMAP search query" },
-                        "folder": { "type": "string", "description": "IMAP folder", "default": "INBOX" },
-                        "limit": { "type": "integer", "description": "Maximum results", "default": 25 },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "send",
-                "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "to": { "type": "string", "description": "Recipient email address" },
-                        "subject": { "type": "string", "description": "Email subject" },
-                        "body": { "type": "string", "description": "Plain text body" },
-                        "html": { "type": "string", "description": "HTML body (optional, sent alongside text)" },
-                        "cc": { "type": "string", "description": "CC recipient(s)" },
-                        "bcc": { "type": "string", "description": "BCC recipient(s)" },
-                        "reply_to": { "type": "string", "description": "Reply-To address" },
-                        "from": { "type": "string", "description": "Override sender identity" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["to", "subject"]
-                }
-            },
-            {
-                "name": "reply",
-                "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uid": { "type": "integer", "description": "UID of message to reply to" },
-                        "body": { "type": "string", "description": "Reply text body" },
-                        "html": { "type": "string", "description": "Reply HTML body" },
-                        "reply_all": { "type": "boolean", "description": "Reply to all recipients", "default": false },
-                        "folder": { "type": "string", "description": "IMAP folder of original message", "default": "INBOX" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["uid", "body"]
-                }
-            },
-            {
-                "name": "move_message",
-                "description": "Move a message to another IMAP folder.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uid": { "type": "integer", "description": "Message UID" },
-                        "to_folder": { "type": "string", "description": "Destination folder" },
-                        "from_folder": { "type": "string", "description": "Source folder", "default": "INBOX" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["uid", "to_folder"]
-                }
-            },
-            {
-                "name": "flag",
-                "description": "Add or remove IMAP flags on a message. Common flags: \\Seen, \\Flagged, \\Answered, \\Draft, \\Deleted.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uid": { "type": "integer", "description": "Message UID" },
-                        "action": { "type": "string", "enum": ["add", "remove"], "description": "Add or remove the flag" },
-                        "flag": { "type": "string", "description": "IMAP flag name (e.g. \\Seen, \\Flagged)" },
-                        "folder": { "type": "string", "description": "IMAP folder", "default": "INBOX" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["uid", "action", "flag"]
-                }
-            },
-            {
-                "name": "folders",
-                "description": "List IMAP folders with message counts (exists/unseen).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "account": { "type": "string", "description": "Account email address" }
-                    }
-                }
-            },
-            {
-                "name": "tag",
-                "description": "Set tags and scores on a message. Tags are freeform strings, scores are named dimensions with float values (0.0-1.0). Used by the rules engine.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uid": { "type": "integer", "description": "Message UID" },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags to add" },
-                        "scores": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Score dimensions (e.g. {\"urgent\": 0.9})" },
-                        "folder": { "type": "string", "description": "IMAP folder", "default": "INBOX" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["uid"]
-                }
-            },
-            {
-                "name": "contacts",
-                "description": "Manage contacts. Supports list, add, show, and tag operations.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["list", "add", "show", "tag", "untag"], "description": "Contact operation" },
-                        "email": { "type": "string", "description": "Contact email address (required for add/show/tag/untag)" },
-                        "name": { "type": "string", "description": "Contact name (for add)" },
-                        "tag": { "type": "string", "description": "Tag to add/remove (for tag/untag), or filter (for list)" },
-                        "notes": { "type": "string", "description": "Notes (for add)" },
-                        "account": { "type": "string", "description": "Account email address" }
-                    },
-                    "required": ["action"]
-                }
-            },
-            {
-                "name": "accounts",
-                "description": "List configured email accounts.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        ]
-    })
+pub(crate) fn tool_list() -> Value {
+    crate::commands::contract::mcp_tool_list()
+}
+
+/// Validate an MCP `limit` parameter for read-only list/search surfaces.
+///
+/// Returns the resolved limit as `u32`. Rejects 0 and any value above
+/// `MAX_AGENT_LIST_LIMIT` before any IMAP work occurs.
+fn validate_agent_list_limit(raw: Option<u64>) -> Result<u32, String> {
+    let value = raw.unwrap_or(DEFAULT_AGENT_LIST_LIMIT as u64);
+    if value == 0 {
+        return Err("limit must be at least 1".to_string());
+    }
+    if value > MAX_AGENT_LIST_LIMIT as u64 {
+        return Err(format!(
+            "limit must be at most {MAX_AGENT_LIST_LIMIT} for agent read-only list/search surfaces"
+        ));
+    }
+    Ok(value as u32)
 }
 
 // ── Tool dispatch ───────────────────────────────────────────────────
@@ -266,16 +135,21 @@ async fn handle_tool_call(
 async fn handle_accounts(_backend: CredentialBackend) -> Result<Value, String> {
     let db = Database::open_default().map_err(|e| e.to_string())?;
     let accounts = db.list_accounts().map_err(|e| e.to_string())?;
-    serde_json::to_value(&accounts).map_err(|e| e.to_string())
+    Ok(Value::Array(
+        accounts
+            .iter()
+            .map(|account| ui::with_ui(account, ui::account_ui(&account.id)))
+            .collect(),
+    ))
 }
 
 async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let limit = validate_agent_list_limit(params.get("limit").and_then(|v| v.as_u64()))?;
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let folder = params
         .get("folder")
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
 
     let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -284,11 +158,21 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
         .await
         .map_err(|e| e.to_string())?;
 
-    let messages = envelope_email_transport::imap::fetch_inbox(&mut client, folder, limit as u32)
+    let messages = envelope_email_transport::imap::fetch_inbox(&mut client, folder, limit)
         .await
         .map_err(|e| e.to_string())?;
 
-    serde_json::to_value(&messages).map_err(|e| e.to_string())
+    Ok(Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                ui::with_ui(
+                    message,
+                    ui::message_ui(&creds.account.id, message.uid, folder),
+                )
+            })
+            .collect(),
+    ))
 }
 
 async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -314,7 +198,10 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
 
-    serde_json::to_value(&message).map_err(|e| e.to_string())
+    Ok(ui::with_ui(
+        &message,
+        ui::message_ui(&creds.account.id, message.uid, folder),
+    ))
 }
 
 async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -322,11 +209,11 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("query is required")?;
+    let limit = validate_agent_list_limit(params.get("limit").and_then(|v| v.as_u64()))?;
     let folder = params
         .get("folder")
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
@@ -336,11 +223,21 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
         .await
         .map_err(|e| e.to_string())?;
 
-    let messages = envelope_email_transport::imap::search(&mut client, folder, query, limit as u32)
+    let messages = envelope_email_transport::imap::search(&mut client, folder, query, limit)
         .await
         .map_err(|e| e.to_string())?;
 
-    serde_json::to_value(&messages).map_err(|e| e.to_string())
+    Ok(Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                ui::with_ui(
+                    message,
+                    ui::message_ui(&creds.account.id, message.uid, folder),
+                )
+            })
+            .collect(),
+    ))
 }
 
 async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -359,9 +256,75 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     let bcc = params.get("bcc").and_then(|v| v.as_str());
     let reply_to = params.get("reply_to").and_then(|v| v.as_str());
     let account_arg = params.get("account").and_then(|v| v.as_str());
+    let send_mode = params
+        .get("send_mode")
+        .and_then(|v| v.as_str())
+        .map(SendMode::from_str)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
+    let confirm_send = params
+        .get("confirm_send")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let allow_recipients = params
+        .get("allow_recipient")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
+    let policy_input = SendPolicyInput {
+        to,
+        cc,
+        bcc,
+        confirm_send,
+        allow_recipients: &allow_recipients,
+    };
+
+    let decision = evaluate(send_mode, &policy_input);
+    record_send_policy_event(&db, &creds.account.id, send_mode, &decision, &policy_input);
+
+    match decision {
+        SendPolicyDecision::Allowed => {}
+        SendPolicyDecision::DraftOnly => {
+            let draft = db
+                .create_draft(
+                    &creds.account.id,
+                    to,
+                    Some(subject),
+                    body,
+                    html,
+                    None,
+                    cc,
+                    bcc,
+                    Some("mcp"),
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({
+                "sent": false,
+                "status": "drafted",
+                "send_mode": send_mode,
+                "draft_id": draft.id,
+                "ui": ui::draft_ui(&creds.account.id, &draft.id),
+            }));
+        }
+        SendPolicyDecision::Denied(denial) => {
+            return Err(json!({
+                "status": "denied",
+                "error": denial,
+                "send_mode": send_mode,
+                "ui": ui::account_ui(&creds.account.id),
+            })
+            .to_string());
+        }
+    }
 
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
@@ -380,7 +343,39 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(json!({ "sent": true, "message_id": message_id }))
+    Ok(json!({
+        "sent": true,
+        "message_id": message_id,
+        "ui": ui::account_ui(&creds.account.id),
+    }))
+}
+
+fn record_send_policy_event(
+    db: &Database,
+    account_id: &str,
+    mode: SendMode,
+    decision: &SendPolicyDecision,
+    input: &SendPolicyInput<'_>,
+) {
+    let audit = audit_event_for(mode, decision, input);
+    let now = chrono::Utc::now().to_rfc3339();
+    let event = Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        account_id: account_id.to_string(),
+        event_type: audit.event.to_string(),
+        folder: "policy".to_string(),
+        uid: None,
+        message_id: None,
+        from_addr: None,
+        subject: None,
+        snippet: None,
+        payload: Some(audit.payload.to_string()),
+        idempotency_key: None,
+        secure_pending: false,
+        acked_at: Some(now.clone()),
+        created_at: now,
+    };
+    let _ = db.insert_event(&event);
 }
 
 async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -402,8 +397,29 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
+    let send_mode = params
+        .get("send_mode")
+        .and_then(|v| v.as_str())
+        .map(SendMode::from_str)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
+    let confirm_send = params
+        .get("confirm_send")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let allow_recipients = params
+        .get("allow_recipient")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -426,6 +442,52 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     } else {
         Some(headers.cc.join(", "))
     };
+    let policy_input = SendPolicyInput {
+        to: &headers.to,
+        cc: cc_str.as_deref(),
+        bcc: None,
+        confirm_send,
+        allow_recipients: &allow_recipients,
+    };
+    let decision = evaluate(send_mode, &policy_input);
+    record_send_policy_event(&db, &creds.account.id, send_mode, &decision, &policy_input);
+
+    match decision {
+        SendPolicyDecision::Allowed => {}
+        SendPolicyDecision::DraftOnly => {
+            let draft = db
+                .create_draft(
+                    &creds.account.id,
+                    &headers.to,
+                    Some(&headers.subject),
+                    Some(body),
+                    html,
+                    headers.in_reply_to.as_deref(),
+                    cc_str.as_deref(),
+                    None,
+                    Some("mcp"),
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({
+                "sent": false,
+                "status": "drafted",
+                "send_mode": send_mode,
+                "draft_id": draft.id,
+                "in_reply_to": headers.in_reply_to,
+                "ui": ui::draft_ui(&creds.account.id, &draft.id),
+            }));
+        }
+        SendPolicyDecision::Denied(denial) => {
+            return Err(json!({
+                "status": "denied",
+                "error": denial,
+                "send_mode": send_mode,
+                "ui": ui::message_ui(&creds.account.id, uid, folder),
+            })
+            .to_string());
+        }
+    }
+
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
         &headers.to,
@@ -443,7 +505,12 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(json!({ "sent": true, "message_id": message_id, "in_reply_to": headers.in_reply_to }))
+    Ok(json!({
+        "sent": true,
+        "message_id": message_id,
+        "in_reply_to": headers.in_reply_to,
+        "ui": ui::message_ui(&creds.account.id, uid, folder),
+    }))
 }
 
 async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -472,7 +539,13 @@ async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(json!({ "moved": true, "uid": uid, "from": from_folder, "to": to_folder }))
+    Ok(json!({
+        "moved": true,
+        "uid": uid,
+        "from": from_folder,
+        "to": to_folder,
+        "ui": ui::message_ui(&creds.account.id, uid, to_folder),
+    }))
 }
 
 async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -515,7 +588,13 @@ async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value
         _ => return Err("action must be 'add' or 'remove'".to_string()),
     }
 
-    Ok(json!({ "flagged": true, "uid": uid, "action": action, "flag": flag }))
+    Ok(json!({
+        "flagged": true,
+        "uid": uid,
+        "action": action,
+        "flag": flag,
+        "ui": ui::message_ui(&creds.account.id, uid, folder),
+    }))
 }
 
 async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -532,7 +611,10 @@ async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Va
         .await
         .map_err(|e| e.to_string())?;
 
-    serde_json::to_value(&stats).map_err(|e| e.to_string())
+    Ok(json!({
+        "folders": stats,
+        "ui": ui::account_ui(&creds.account.id),
+    }))
 }
 
 async fn handle_tag(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -608,6 +690,7 @@ async fn handle_tag(params: &Value, backend: CredentialBackend) -> Result<Value,
         "message_id": message_id,
         "tags": current_tags,
         "scores": current_scores.iter().map(|s| json!({"dimension": s.dimension, "value": s.value})).collect::<Vec<_>>(),
+        "ui": ui::message_ui(&creds.account.id, uid, folder),
     }))
 }
 
@@ -627,7 +710,12 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
             let contacts = db
                 .list_contacts(&creds.account.id, tag_filter)
                 .map_err(|e| e.to_string())?;
-            serde_json::to_value(&contacts).map_err(|e| e.to_string())
+            Ok(Value::Array(
+                contacts
+                    .iter()
+                    .map(|contact| ui::with_ui(contact, ui::account_ui(&creds.account.id)))
+                    .collect(),
+            ))
         }
         "show" => {
             let email = params
@@ -637,7 +725,7 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
             let contact = db
                 .get_contact(&creds.account.id, email)
                 .map_err(|e| e.to_string())?;
-            serde_json::to_value(&contact).map_err(|e| e.to_string())
+            Ok(ui::with_ui(&contact, ui::account_ui(&creds.account.id)))
         }
         "add" => {
             let email = params
@@ -668,7 +756,7 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 updated_at: now,
             };
             db.upsert_contact(&contact).map_err(|e| e.to_string())?;
-            serde_json::to_value(&contact).map_err(|e| e.to_string())
+            Ok(ui::with_ui(&contact, ui::account_ui(&creds.account.id)))
         }
         "tag" => {
             let email = params
@@ -681,7 +769,12 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 .ok_or("tag is required")?;
             db.add_contact_tag(&creds.account.id, email, tag)
                 .map_err(|e| e.to_string())?;
-            Ok(json!({ "tagged": true, "email": email, "tag": tag }))
+            Ok(json!({
+                "tagged": true,
+                "email": email,
+                "tag": tag,
+                "ui": ui::account_ui(&creds.account.id),
+            }))
         }
         "untag" => {
             let email = params
@@ -694,7 +787,12 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 .ok_or("tag is required")?;
             db.remove_contact_tag(&creds.account.id, email, tag)
                 .map_err(|e| e.to_string())?;
-            Ok(json!({ "untagged": true, "email": email, "tag": tag }))
+            Ok(json!({
+                "untagged": true,
+                "email": email,
+                "tag": tag,
+                "ui": ui::account_ui(&creds.account.id),
+            }))
         }
         _ => Err(format!("unknown contacts action: {action}")),
     }
@@ -702,44 +800,207 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
 
 // ── Config output ───────────────────────────────────────────────────
 
-/// Print a ready-to-paste MCP config snippet.
+/// Print a ready-to-paste MCP config and runtime setup hints.
 pub fn print_config() {
+    println!("{}", serde_json::to_string_pretty(&config_json()).unwrap());
+}
+
+pub(crate) fn config_json() -> Value {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "envelope".to_string());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let env = if home.is_empty() {
+        json!({})
+    } else {
+        json!({ "HOME": home.clone() })
+    };
+    let server = json!({
+        "command": exe.clone(),
+        "args": ["mcp"],
+        "env": env,
+    });
+    let draft_only_safety = "Send/reply tools default to draft-only for agent contexts; Envelope creates reviewable drafts and does not send live mail unless an operator explicitly opts into confirm-send, allowlisted-send, or autonomous-send.";
+    let server_config = json!({ "mcpServers": { "envelope": server.clone() } });
+    let server_compact = serde_json::to_string(&server).unwrap_or_default();
+    let server_pretty = serde_json::to_string_pretty(&server_config).unwrap_or_default();
+    let codex_snippet = codex_config_snippet(&exe, &home);
 
-    let config = json!({
+    json!({
         "mcpServers": {
-            "envelope": {
-                "command": exe,
-                "args": ["mcp"]
+            "envelope": server.clone()
+        },
+        "envelopeAgentSetup": {
+            "sendSafety": draft_only_safety,
+            "claudeCode": {
+                "target": "Claude Code MCP server config",
+                "commandPath": exe.clone(),
+                "args": ["mcp"],
+                "env": server["env"].clone(),
+                "draftOnlySafety": draft_only_safety,
+                "snippet": format!("claude mcp add-json envelope {}", shell_quote(&server_compact)),
+                "command": "claude mcp add-json envelope '<paste the mcpServers.envelope object from this output>'",
+                "config": { "mcpServers": { "envelope": server.clone() } }
+            },
+            "codex": {
+                "target": "Codex MCP server config.toml",
+                "commandPath": exe.clone(),
+                "args": ["mcp"],
+                "env": server["env"].clone(),
+                "draftOnlySafety": draft_only_safety,
+                "snippet": codex_snippet,
+                "config": { "mcpServers": { "envelope": server.clone() } }
+            },
+            "hermes": {
+                "target": "Hermes profile MCP/tool server config",
+                "commandPath": exe,
+                "args": ["mcp"],
+                "env": server["env"].clone(),
+                "draftOnlySafety": draft_only_safety,
+                "snippet": server_pretty,
+                "config": { "mcpServers": { "envelope": server } }
             }
         }
-    });
+    })
+}
 
-    println!("{}", serde_json::to_string_pretty(&config).unwrap());
+fn codex_config_snippet(command_path: &str, home: &str) -> String {
+    let mut snippet = format!(
+        "[mcp_servers.envelope]\ncommand = {}\nargs = [\"mcp\"]",
+        toml_string(command_path)
+    );
+    if !home.is_empty() {
+        snippet.push_str(&format!(
+            "\n\n[mcp_servers.envelope.env]\nHOME = {}",
+            toml_string(home)
+        ));
+    }
+    snippet
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
 
-pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+fn read_mcp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    loop {
+        let mut first_line = String::new();
+        let bytes = reader.read_line(&mut first_line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+        let trimmed = first_line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
             continue;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                let content_length = value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid MCP Content-Length header",
+                    )
+                })?;
+
+                loop {
+                    let mut header_line = String::new();
+                    let bytes = reader.read_line(&mut header_line)?;
+                    if bytes == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF while reading MCP headers",
+                        ));
+                    }
+                    if header_line == "\r\n" || header_line == "\n" {
+                        break;
+                    }
+                }
+
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body)?;
+                return String::from_utf8(body).map(Some).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "MCP body is not UTF-8")
+                });
+            }
+        }
+
+        // Compatibility for old Envelope toy clients that sent newline-delimited JSON-RPC.
+        return Ok(Some(first_line));
+    }
+}
+
+fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_list_limit_accepts_default() {
+        assert_eq!(validate_agent_list_limit(Some(25)).unwrap(), 25);
+    }
+
+    #[test]
+    fn agent_list_limit_uses_default_when_absent() {
+        assert_eq!(validate_agent_list_limit(None).unwrap(), 25);
+    }
+
+    #[test]
+    fn agent_list_limit_accepts_max_cap() {
+        assert_eq!(validate_agent_list_limit(Some(1000)).unwrap(), 1000);
+    }
+
+    #[test]
+    fn agent_list_limit_rejects_above_cap() {
+        let err =
+            validate_agent_list_limit(Some(1001)).expect_err("limit above 1000 must be rejected");
+        assert!(
+            err.contains("limit") && err.contains("1000"),
+            "expected limit/1000 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_list_limit_rejects_zero() {
+        let err = validate_agent_list_limit(Some(0)).expect_err("limit 0 must be rejected");
+        assert!(
+            err.contains("limit"),
+            "expected limit error mentioning bound, got: {err}"
+        );
+    }
+}
+
+pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut out = stdout.lock();
+
+    while let Some(message) = read_mcp_message(&mut input)? {
+        let message = message.trim();
+        if message.is_empty() {
+            continue;
+        }
+
+        let request: JsonRpcRequest = match serde_json::from_str(message) {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("parse error: {e}"));
-                let mut out = stdout.lock();
-                serde_json::to_writer(&mut out, &resp)?;
-                out.write_all(b"\n")?;
-                out.flush()?;
+                write_mcp_message(&mut out, &resp)?;
                 continue;
             }
         };
@@ -793,10 +1054,7 @@ pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
             ),
         };
 
-        let mut out = stdout.lock();
-        serde_json::to_writer(&mut out, &response)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+        write_mcp_message(&mut out, &response)?;
     }
 
     Ok(())

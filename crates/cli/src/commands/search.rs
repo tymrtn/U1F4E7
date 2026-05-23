@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use envelope_email_store::CredentialBackend;
 
 use super::common::setup_credentials;
+use super::ui;
 
 #[tokio::main]
 pub async fn run(
@@ -25,7 +26,12 @@ pub async fn run(
         envelope_email_transport::imap::search(&mut client, folder, query, limit).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&messages)?);
+        let account_id = creds.account.id.as_str();
+        let enriched: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| ui::with_ui(m, ui::message_ui(account_id, m.uid, folder)))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
     } else {
         if messages.is_empty() {
             println!("No messages matching: {query}");

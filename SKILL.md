@@ -218,9 +218,18 @@ envelope-email serve
 
 # Custom port
 envelope-email serve --port 8080
+
+# Share dashboard URLs with agents on your tailnet
+tailscale serve --bg 3141
+envelope-email config set dashboard.base_url https://your-node.your-tailnet.ts.net
 ```
 
-Opens an account management dashboard at `http://localhost:3141`.
+Opens an account management dashboard at `http://localhost:3141`. JSON `ui`
+metadata uses `ENVELOPE_DASHBOARD_BASE_URL` first, then the legacy
+`ENVELOPE_DASHBOARD_URL`, then persistent `dashboard.base_url`, then localhost.
+Use Tailscale Serve for tailnet-only handoff URLs. Tailscale Funnel publishes
+the dashboard on the public internet; do not use Funnel for mailbox dashboards
+unless that exposure is intentional.
 
 ## Account Resolution
 

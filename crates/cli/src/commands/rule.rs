@@ -10,6 +10,7 @@ use envelope_email_transport::rules::{self, Action, MessageContext};
 use tracing::info;
 
 use super::common::setup_credentials;
+use super::ui;
 
 /// Parse a `key=value` score pair (e.g. `urgent=0.7`).
 fn parse_score_filter(s: &str) -> Result<(String, f64)> {
@@ -23,6 +24,13 @@ fn parse_score_filter(s: &str) -> Result<(String, f64)> {
 }
 
 /// Parse a `type=arg` action pair (e.g. `move=Archive`, `flag=seen`, `delete`).
+///
+/// `reject=<reason>` and `ereject=<reason>` produce server-side Sieve
+/// actions that Envelope only emits via `envelope rule export`. They are
+/// not executed locally — Envelope never fabricates a bounce against
+/// already-delivered mail. Prefer `ereject` where the server supports it
+/// (RFC 5429): it refuses the message at SMTP time and avoids generating
+/// a backscatter MDN.
 fn parse_action(s: &str) -> Result<Action> {
     if let Some((kind, arg)) = s.split_once('=') {
         match kind.to_lowercase().as_str() {
@@ -32,18 +40,36 @@ fn parse_action(s: &str) -> Result<Action> {
             "snooze" => Ok(Action::Snooze(arg.to_string())),
             "add_tag" | "addtag" | "tag" => Ok(Action::AddTag(arg.to_string())),
             "webhook" => Ok(Action::Webhook(arg.to_string())),
+            "reject" => Ok(Action::Reject(arg.to_string())),
+            "ereject" => Ok(Action::Ereject(arg.to_string())),
             _ => bail!(
-                "unknown action type '{kind}'. Use: move, flag, unflag, snooze, tag, webhook, delete, unsubscribe"
+                "unknown action type '{kind}'. Use: move, flag, unflag, snooze, tag, webhook, delete, unsubscribe, reject (server-side Sieve), ereject (server-side Sieve)"
             ),
         }
     } else {
         match s.to_lowercase().as_str() {
             "delete" => Ok(Action::Delete),
             "unsubscribe" => Ok(Action::Unsubscribe),
+            "reject" | "ereject" => bail!(
+                "action '{s}' requires a reason; use {s}=<reason> (server-side Sieve action; prefer ereject to avoid backscatter)"
+            ),
             _ => {
-                bail!("unknown action '{s}'. Use: move=<folder>, flag=<name>, delete, unsubscribe")
+                bail!(
+                    "unknown action '{s}'. Use: move=<folder>, flag=<name>, delete, unsubscribe, reject=<reason>, ereject=<reason>"
+                )
             }
         }
+    }
+}
+
+fn sanitize_action_display(action: &str) -> String {
+    match serde_json::from_str::<Action>(action) {
+        Ok(Action::Webhook(_)) => serde_json::to_string(&Action::Webhook("[redacted]".to_string()))
+            .unwrap_or_else(|_| "{\"webhook\":\"[redacted]\"}".to_string()),
+        Ok(parsed) => {
+            serde_json::to_string(&parsed).unwrap_or_else(|_| "[invalid action]".to_string())
+        }
+        Err(_) => "[invalid action]".to_string(),
     }
 }
 
@@ -148,6 +174,7 @@ pub fn run_create(
     action_str: &str,
     priority: i64,
     stop: bool,
+    enabled: bool,
     account: Option<&str>,
     json: bool,
     _backend: CredentialBackend,
@@ -193,22 +220,25 @@ pub fn run_create(
     }
 
     let rule = db
-        .create_rule(
+        .create_rule_with_enabled(
             account_id,
             name,
             &match_expr_json,
             &action_json,
             priority,
             stop,
+            enabled,
         )
         .context("failed to create rule")?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rule)?);
+        let value = ui::with_ui(&rule, ui::rules_ui(account_id));
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("Created rule: {}", rule.name);
         println!("  ID:       {}", rule.id);
         println!("  Priority: {}", rule.priority);
+        println!("  Enabled:  {}", rule.enabled);
         println!("  Stop:     {}", rule.stop);
         println!(
             "  Sieve:    {}",
@@ -229,7 +259,29 @@ pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) 
     let rules = db.list_rules(&acct.id).context("failed to list rules")?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rules)?);
+        let rules_ui_meta = ui::rules_ui(&acct.id);
+        let safe_rules: Vec<_> = rules
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "account_id": r.account_id,
+                    "name": r.name,
+                    "match_expr": r.match_expr,
+                    "action": sanitize_action_display(&r.action),
+                    "enabled": r.enabled,
+                    "priority": r.priority,
+                    "stop": r.stop,
+                    "sieve_exportable": r.sieve_exportable,
+                    "hit_count": r.hit_count,
+                    "last_hit_at": r.last_hit_at,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
+                    "ui": rules_ui_meta,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&safe_rules)?);
     } else {
         if rules.is_empty() {
             println!("No rules configured");
@@ -258,7 +310,7 @@ pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) 
                 r.hit_count,
                 sieve_mark,
                 name_display,
-                r.action,
+                sanitize_action_display(&r.action),
             );
         }
         println!("\n{} rule(s)", rules.len());
@@ -306,7 +358,8 @@ pub async fn run_test(
                 "rule_id": rule.id,
                 "rule_name": rule.name,
                 "priority": rule.priority,
-                "action": rule.action,
+                "action": sanitize_action_display(&rule.action),
+                "enabled": rule.enabled,
                 "stop": rule.stop,
             }));
 
@@ -328,6 +381,7 @@ pub async fn run_test(
                 "scores": ctx.scores,
                 "rules_evaluated": enabled_rules.len(),
                 "matches": matches,
+                "ui": ui::message_ui(&account_id, uid, folder),
             }))?
         );
     } else {
@@ -373,6 +427,87 @@ pub async fn run_test(
     Ok(())
 }
 
+/// `envelope rule preview` — batch preview rules without mailbox mutation.
+#[allow(clippy::too_many_arguments)]
+#[tokio::main]
+pub async fn run_preview(
+    folder: &str,
+    account: Option<&str>,
+    limit: u32,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    let (db, creds) = setup_credentials(account, backend)?;
+    let account_id = creds.account.id.clone();
+
+    let mut client = imap::connect(&creds)
+        .await
+        .context("IMAP connection failed")?;
+    let summaries = imap::fetch_inbox(&mut client, folder, limit)
+        .await
+        .context("failed to fetch messages")?;
+    let preview_rules = db.list_rules(&account_id).context("failed to list rules")?;
+
+    let total = summaries.len();
+    let mut matches: Vec<serde_json::Value> = Vec::new();
+    for summary in &summaries {
+        let ctx = build_message_context_from_summary(summary, &db, &account_id)?;
+        for rule in &preview_rules {
+            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !rules::evaluate(&match_expr, &ctx) {
+                continue;
+            }
+            matches.push(serde_json::json!({
+                "uid": summary.uid,
+                "from": summary.from_addr,
+                "subject": summary.subject,
+                "rule": rule.name,
+                "action": sanitize_action_display(&rule.action),
+                "enabled": rule.enabled,
+                "stop": rule.stop,
+            }));
+            if rule.stop && rule.enabled {
+                break;
+            }
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": "preview",
+                "folder": folder,
+                "processed": total,
+                "matches": matches,
+                "mutated": false,
+                "ui": ui::rules_ui(&account_id),
+            }))?
+        );
+    } else if matches.is_empty() {
+        println!(
+            "Preview: no rules would touch {total} message(s) in {folder}; no mailbox changes made"
+        );
+    } else {
+        println!(
+            "Preview: {} proposed action(s) across {total} message(s) in {folder}; no mailbox changes made",
+            matches.len()
+        );
+        for m in &matches {
+            println!(
+                "  UID {}: {} -> {}",
+                m["uid"],
+                m["rule"].as_str().unwrap_or("?"),
+                m["action"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `envelope rule run` — batch apply rules to messages in a folder.
 #[allow(clippy::too_many_arguments)]
 #[tokio::main]
@@ -380,9 +515,15 @@ pub async fn run_apply(
     folder: &str,
     account: Option<&str>,
     limit: u32,
+    confirm: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
+    if !confirm {
+        bail!(
+            "rule run mutates the mailbox; preview first with `envelope rule preview`, then rerun with --confirm"
+        );
+    }
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
 
@@ -403,7 +544,12 @@ pub async fn run_apply(
         if json {
             println!(
                 "{}",
-                serde_json::json!({"processed": 0, "actions": 0, "message": "no enabled rules"})
+                serde_json::json!({
+                    "processed": 0,
+                    "actions": 0,
+                    "message": "no enabled rules",
+                    "ui": ui::rules_ui(&account_id),
+                })
             );
         } else {
             println!("No enabled rules — nothing to do");
@@ -492,6 +638,7 @@ pub async fn run_apply(
                 "processed": total,
                 "actions": actions_taken,
                 "log": action_log,
+                "ui": ui::rules_ui(&account_id),
             }))?
         );
     } else {
@@ -502,6 +649,10 @@ pub async fn run_apply(
 }
 
 /// Execute a single rule action against a message.
+///
+/// Server-side Sieve actions (`reject`, `ereject`) are export-only: when
+/// encountered here they record a stable non-mutating skip instead of
+/// trying to fabricate a bounce on already-delivered mail.
 async fn execute_action(
     client: &mut imap::ImapClient,
     action: &Action,
@@ -510,6 +661,9 @@ async fn execute_action(
     rule_name: Option<&str>,
     ctx: Option<&MessageContext>,
 ) -> Result<String> {
+    if let Some(skip) = action.local_execution_skip_reason() {
+        return Ok(format!("skipped: {skip}"));
+    }
     match action {
         Action::Move(dest) => {
             imap::move_message(client, uid, folder, dest)
@@ -574,9 +728,14 @@ async fn execute_action(
                 .send()
                 .await
             {
-                Ok(resp) => Ok(format!("webhook {url}: {}", resp.status())),
-                Err(e) => Err(anyhow::anyhow!("webhook {url} failed: {e}")),
+                Ok(resp) => Ok(format!("webhook: {}", resp.status())),
+                Err(_) => Err(anyhow::anyhow!("webhook failed")),
             }
+        }
+        // Server-side Sieve actions are intercepted at the top of this
+        // function — these arms are unreachable but kept exhaustive.
+        Action::Reject(_) | Action::Ereject(_) => {
+            Ok(format!("skipped: {}", rules::SERVER_SIDE_ONLY_SKIP_REASON))
         }
     }
 }
@@ -601,7 +760,12 @@ pub fn run_enable(
     if json {
         println!(
             "{}",
-            serde_json::json!({"action": "enable", "name": name, "id": rule.id})
+            serde_json::json!({
+                "action": "enable",
+                "name": name,
+                "id": rule.id,
+                "ui": ui::rules_ui(&acct.id),
+            })
         );
     } else {
         println!("Enabled rule: {name}");
@@ -631,7 +795,12 @@ pub fn run_disable(
     if json {
         println!(
             "{}",
-            serde_json::json!({"action": "disable", "name": name, "id": rule.id})
+            serde_json::json!({
+                "action": "disable",
+                "name": name,
+                "id": rule.id,
+                "ui": ui::rules_ui(&acct.id),
+            })
         );
     } else {
         println!("Disabled rule: {name}");
@@ -660,7 +829,12 @@ pub fn run_delete(
     if json {
         println!(
             "{}",
-            serde_json::json!({"action": "delete", "name": name, "id": rule.id})
+            serde_json::json!({
+                "action": "delete",
+                "name": name,
+                "id": rule.id,
+                "ui": ui::rules_ui(&acct.id),
+            })
         );
     } else {
         println!("Deleted rule: {name}");
@@ -707,6 +881,38 @@ mod tests {
     fn parse_action_unknown() {
         assert!(parse_action("banana=split").is_err());
         assert!(parse_action("banana").is_err());
+    }
+
+    #[test]
+    fn parse_action_reject() {
+        let a = parse_action("reject=No such address").unwrap();
+        assert_eq!(a, Action::Reject("No such address".to_string()));
+    }
+
+    #[test]
+    fn parse_action_ereject() {
+        let a = parse_action("ereject=Mailbox closed").unwrap();
+        assert_eq!(a, Action::Ereject("Mailbox closed".to_string()));
+    }
+
+    #[test]
+    fn parse_action_reject_requires_reason() {
+        // reject without `=<reason>` should fail with a clear error, since
+        // the Sieve `reject` action requires a reason string.
+        let err = parse_action("reject").unwrap_err().to_string();
+        assert!(
+            err.contains("reject") && err.contains("reason"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_action_unknown_message_mentions_reject_and_ereject() {
+        let err = parse_action("banana=split").unwrap_err().to_string();
+        assert!(
+            err.contains("reject") && err.contains("ereject"),
+            "expected reject/ereject in error hint, got: {err}"
+        );
     }
 
     #[test]
@@ -787,14 +993,180 @@ mod tests {
     }
 }
 
+/// Hard ceiling on user-supplied ManageSieve network timeout. Matches the
+/// quickstart cap; keeps a typo'd `--timeout-secs 999999` from blocking a
+/// CLI invocation indefinitely.
+const MAX_MANAGESIEVE_TIMEOUT_SECS: u64 = 60;
+const MIN_MANAGESIEVE_TIMEOUT_SECS: u64 = 1;
+
+/// Validate a user-supplied script name. ManageSieve allows quoted strings
+/// containing arbitrary bytes, but Envelope refuses anything that would
+/// require the literal form here — CR/LF/NUL are rejected outright, and
+/// empty names are rejected because Pigeonhole maps them to "the default
+/// script" which is not what an operator passing `--script-name` expects.
+fn validate_script_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("--script-name must not be empty");
+    }
+    if name.contains(['\r', '\n', '\0']) {
+        bail!("--script-name must not contain control characters");
+    }
+    if name.len() > 128 {
+        bail!("--script-name must be 128 characters or fewer");
+    }
+    Ok(())
+}
+
+/// `envelope rule publish-sieve` — render the export and (optionally)
+/// upload it to a ManageSieve server.
+///
+/// Safety contract:
+/// - When neither `--dry-run` nor `--confirm` is provided, runs in
+///   dry-run mode so the default surface is non-mutating.
+/// - `--confirm` is mandatory before any network upload happens.
+/// - Dry-run JSON includes the resolved endpoint and the generated script
+///   so an operator can diff it against the server's current `envelope-rules`
+///   without exposing credentials.
+#[allow(clippy::too_many_arguments)]
+#[tokio::main]
+pub async fn run_publish_sieve(
+    account: Option<&str>,
+    script_name: &str,
+    host: Option<&str>,
+    port: Option<u16>,
+    timeout_secs: u64,
+    dry_run: bool,
+    confirm: bool,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    validate_script_name(script_name)?;
+
+    if dry_run && confirm {
+        bail!("--dry-run and --confirm are mutually exclusive");
+    }
+
+    let timeout_secs =
+        timeout_secs.clamp(MIN_MANAGESIEVE_TIMEOUT_SECS, MAX_MANAGESIEVE_TIMEOUT_SECS);
+
+    let db = envelope_email_store::Database::open_default().context("failed to open database")?;
+    let acct = super::common::resolve_account(&db, account)?;
+    let account_id = acct.id.clone();
+    let imap_host = acct.imap_host.clone();
+
+    let rules = db
+        .list_enabled_rules(&account_id)
+        .context("failed to list rules")?;
+    let (script, skipped) = envelope_email_transport::sieve::export_sieve(&rules);
+    let exported_count = rules.len() - skipped.len();
+
+    let (resolved_host, resolved_port) =
+        envelope_email_transport::managesieve::resolve_sieve_endpoint(&imap_host, host, port);
+
+    if !confirm {
+        let plan = envelope_email_transport::managesieve::build_plan(
+            &account_id,
+            &resolved_host,
+            resolved_port,
+            script_name,
+            script,
+            skipped,
+            exported_count,
+        );
+        if json {
+            let value = ui::with_ui(&plan, ui::rules_ui(&account_id));
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "ManageSieve dry-run for {account_id}: would PUTSCRIPT \"{name}\" + SETACTIVE on {host}:{port} ({count} rule(s), {sk} skipped). Rerun with --confirm to upload.",
+                name = script_name,
+                host = resolved_host,
+                port = resolved_port,
+                count = exported_count,
+                sk = plan.skipped.len(),
+            );
+            if !plan.skipped.is_empty() {
+                eprintln!("Skipped local-only rules: {}", plan.skipped.join(", "));
+            }
+        }
+        return Ok(());
+    }
+
+    if exported_count == 0 {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "no_exportable_rules",
+                    "account_id": account_id,
+                    "host": resolved_host,
+                    "port": resolved_port,
+                    "script_name": script_name,
+                    "exported_count": 0,
+                    "skipped": skipped,
+                    "network_used": false,
+                    "ui": ui::rules_ui(&account_id),
+                })
+            );
+        } else {
+            println!("No exportable rules — nothing to upload to {resolved_host}:{resolved_port}");
+            if !skipped.is_empty() {
+                eprintln!("Skipped local-only rules: {}", skipped.join(", "));
+            }
+        }
+        return Ok(());
+    }
+
+    let creds = {
+        let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(backend)
+            .context("credential store error")?;
+        db.get_account_with_credentials(&account_id, &passphrase)
+            .context("failed to decrypt credentials")?
+    };
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let result = envelope_email_transport::managesieve::publish_script(
+        &creds,
+        &resolved_host,
+        resolved_port,
+        script_name,
+        &script,
+        exported_count,
+        skipped,
+        timeout,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if json {
+        let value = ui::with_ui(&result, ui::rules_ui(&account_id));
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "Uploaded {count} rule(s) as \"{name}\" to {host}:{port} ({sk} skipped, active script set to \"{active}\")",
+            count = result.exported_count,
+            name = result.script_name,
+            host = result.host,
+            port = result.port,
+            sk = result.skipped.len(),
+            active = result.active_script,
+        );
+        if !result.skipped.is_empty() {
+            eprintln!("Skipped local-only rules: {}", result.skipped.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
 /// Export rules as a Sieve script.
 pub fn run_export(account: Option<&str>, json: bool, _backend: CredentialBackend) -> Result<()> {
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
-    let account_email = acct.username;
+    let account_id = acct.id;
 
     let rules = db
-        .list_enabled_rules(&account_email)
+        .list_enabled_rules(&account_id)
         .context("failed to list rules")?;
 
     let (script, skipped) = envelope_email_transport::sieve::export_sieve(&rules);
@@ -806,6 +1178,7 @@ pub fn run_export(account: Option<&str>, json: bool, _backend: CredentialBackend
                 "script": script,
                 "skipped": skipped,
                 "exported_count": rules.len() - skipped.len(),
+                "ui": ui::rules_ui(&account_id),
             })
         );
     } else {

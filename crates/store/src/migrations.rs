@@ -455,6 +455,94 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
+        // ── Migration 7: Agent Cockpit operational primitives ─────────
+        M::up(
+            "
+            CREATE TABLE IF NOT EXISTS watch_registry (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                status TEXT NOT NULL,
+                process_id INTEGER,
+                schedule TEXT,
+                last_heartbeat_at TEXT,
+                last_event_at TEXT,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(account_id, folder)
+            );
+            CREATE INDEX IF NOT EXISTS idx_watch_registry_account
+                ON watch_registry(account_id, status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS failed_auth_history (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                retry_guidance TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_failed_auth_account
+                ON failed_auth_history(account_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS rule_run_audit (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                rule_id TEXT,
+                rule_name TEXT,
+                uid INTEGER,
+                folder TEXT,
+                action TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_rule_run_audit_account
+                ON rule_run_audit(account_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_rule_run_audit_rule
+                ON rule_run_audit(rule_id, created_at)
+                WHERE rule_id IS NOT NULL;
+            ",
+        ),
+        // ── Migration 8: indexed dashboard message-summary read model ──
+        M::up(
+            "
+            CREATE TABLE IF NOT EXISTS indexed_message_summaries (
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                uidvalidity INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                message_id TEXT,
+                from_addr TEXT NOT NULL DEFAULT '',
+                to_addr TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL DEFAULT '',
+                date TEXT,
+                flags_json TEXT NOT NULL DEFAULT '[]',
+                size INTEGER NOT NULL DEFAULT 0,
+                snippet TEXT,
+                thread_id TEXT,
+                indexed_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, folder, uidvalidity, uid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_indexed_message_summaries_folder_date
+                ON indexed_message_summaries(folder, date DESC, uid DESC);
+            CREATE INDEX IF NOT EXISTS idx_indexed_message_summaries_account_folder
+                ON indexed_message_summaries(account_id, folder, indexed_at);
+            CREATE INDEX IF NOT EXISTS idx_indexed_message_summaries_thread
+                ON indexed_message_summaries(thread_id)
+                WHERE thread_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS message_index_state (
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                uidvalidity INTEGER,
+                indexed_at TEXT,
+                last_error TEXT,
+                PRIMARY KEY (account_id, folder)
+            );
+            ",
+        ),
     ])
 }
 

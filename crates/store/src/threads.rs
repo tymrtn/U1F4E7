@@ -336,6 +336,7 @@ impl Database {
         Ok(Some(ThreadContext {
             thread_id,
             thread_count: thread.message_count as u32,
+            last_activity: thread.last_activity,
             has_reply,
             reply_uid,
             reply_folder,
@@ -480,6 +481,7 @@ impl Database {
 pub struct ThreadContext {
     pub thread_id: String,
     pub thread_count: u32,
+    pub last_activity: String,
     pub has_reply: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_uid: Option<u32>,

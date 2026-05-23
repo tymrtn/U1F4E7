@@ -2,12 +2,17 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use anyhow::{Context, Result};
-use envelope_email_store::CredentialBackend;
+use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::SmtpSender;
 use envelope_email_transport::smtp::Attachment;
+use envelope_email_transport::{
+    SendMode, SendPolicyDecision, SendPolicyInput, audit_event_for, evaluate,
+};
+use std::str::FromStr;
 
 use super::common::setup_credentials;
 use super::datetime::parse_until;
+use super::ui;
 
 /// Send an email immediately, or schedule it for later with `--at`.
 #[tokio::main]
@@ -25,8 +30,78 @@ pub async fn run(
     json: bool,
     backend: CredentialBackend,
     at: Option<&str>,
+    send_mode: &str,
+    confirm_send: bool,
+    allow_recipients: &[String],
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let mode = SendMode::from_str(send_mode).map_err(|e| anyhow::anyhow!(e))?;
+    let policy_input = SendPolicyInput {
+        to,
+        cc,
+        bcc,
+        confirm_send,
+        allow_recipients,
+    };
+    let decision = evaluate(mode, &policy_input);
+    record_send_policy_event(&db, &creds.account.id, mode, &decision, &policy_input);
+
+    match &decision {
+        SendPolicyDecision::Allowed => {}
+        SendPolicyDecision::DraftOnly => {
+            if !attach_paths.is_empty() {
+                anyhow::bail!(
+                    "--attach is not supported with --send-mode draft-only (draft storage does not persist attachments yet)"
+                );
+            }
+            let draft = db
+                .create_draft(
+                    &creds.account.id,
+                    to,
+                    Some(subject),
+                    body,
+                    html,
+                    None,
+                    cc,
+                    bcc,
+                    Some("cli"),
+                )
+                .context("failed to create send-policy draft")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "drafted",
+                        "send_mode": mode,
+                        "draft_id": draft.id,
+                        "to": to,
+                        "subject": subject,
+                        "ui": ui::draft_ui(&creds.account.id, &draft.id),
+                    })
+                );
+            } else {
+                println!(
+                    "Drafted instead of sending ({mode}). Draft ID: {}",
+                    draft.id
+                );
+            }
+            return Ok(());
+        }
+        SendPolicyDecision::Denied(denial) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "denied",
+                        "error": denial,
+                        "send_mode": mode,
+                        "ui": ui::account_ui(&creds.account.id),
+                    })
+                );
+            }
+            anyhow::bail!("send denied by policy: {} ({})", denial.reason, denial.code);
+        }
+    }
 
     // ── Scheduled send path ──
     if let Some(at_str) = at {
@@ -67,6 +142,7 @@ pub async fn run(
                     "scheduled": true,
                     "send_at": send_at,
                     "draft_id": draft.id,
+                    "ui": ui::draft_ui(&creds.account.id, &draft.id),
                 })
             );
         } else {
@@ -129,6 +205,7 @@ pub async fn run(
                     "content_type": a.content_type,
                     "size": a.data.len(),
                 })).collect::<Vec<_>>(),
+                "ui": ui::account_ui(&creds.account.id),
             })
         );
     } else {
@@ -149,4 +226,31 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn record_send_policy_event(
+    db: &Database,
+    account_id: &str,
+    mode: SendMode,
+    decision: &SendPolicyDecision,
+    input: &SendPolicyInput<'_>,
+) {
+    let audit = audit_event_for(mode, decision, input);
+    let event = Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        account_id: account_id.to_string(),
+        event_type: audit.event.to_string(),
+        folder: "policy".to_string(),
+        uid: None,
+        message_id: None,
+        from_addr: None,
+        subject: None,
+        snippet: None,
+        payload: Some(audit.payload.to_string()),
+        idempotency_key: None,
+        secure_pending: false,
+        acked_at: Some(chrono::Utc::now().to_rfc3339()),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = db.insert_event(&event);
 }

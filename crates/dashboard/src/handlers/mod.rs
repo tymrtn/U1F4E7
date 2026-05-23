@@ -10,6 +10,7 @@
 
 pub mod accounts;
 pub mod attachments;
+pub mod cockpit;
 pub mod compose;
 pub mod drafts;
 pub mod folders;

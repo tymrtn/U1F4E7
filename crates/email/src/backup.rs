@@ -275,6 +275,34 @@ pub enum BackupEvent {
     RestoreStateWarning {
         warning: String,
     },
+    /// Per-row audit output from `backup audit-state`. Emitted once per
+    /// pending-without-done sidecar entry. `destination_uid` and `error` are
+    /// reserved for a future live-IMAP verifier; the planner-only variant
+    /// always serializes them as absent (`skip_serializing_if`).
+    RestoreStateAuditRecord {
+        source: String,
+        destination: String,
+        uidvalidity: u32,
+        uid: u32,
+        sha256: String,
+        message_id_present: bool,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_uid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Run summary for `backup audit-state`. `present`, `missing`, and
+    /// `errors` are reserved for the future live-verifier seam and stay 0
+    /// in the planner-only path.
+    RestoreStateAuditDone {
+        pending: u32,
+        present: u32,
+        missing: u32,
+        unknown: u32,
+        state_not_in_manifest: u32,
+        errors: u32,
+    },
 }
 
 /// One row of a restore plan. Same struct used for dry-run planning and live
@@ -868,6 +896,100 @@ pub fn plan_restore(
     }
 
     plan
+}
+
+// -----------------------------------------------------------------------------
+// Restore-state audit (read-only; no IMAP)
+// -----------------------------------------------------------------------------
+
+/// Classification of a single pending-without-done sidecar entry against the
+/// archive manifest. The serialized snake_case form is part of the public CLI
+/// contract and lives on the `RestoreStateAuditRecord.status` field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    /// The sidecar references a `(folder, uidvalidity, uid, sha256)` tuple
+    /// that the manifest does not contain. Archive and sidecar have drifted.
+    StateNotInManifest,
+    /// Manifest lookup succeeded but the message has no Message-ID, so live
+    /// presence in the destination cannot be proven by header search.
+    UnknownNoMessageId,
+    /// Matched a manifest record with a Message-ID; ready for a future live
+    /// IMAP `UID SEARCH HEADER Message-ID` audit. The planner does NOT call
+    /// IMAP itself in this surface.
+    Planned,
+}
+
+/// Single audit row emitted by `plan_restore_state_audit`. Pure planner output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditedRestoreRow {
+    pub source: String,
+    pub destination: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
+    pub sha256: String,
+    pub message_id_present: bool,
+    pub status: AuditStatus,
+}
+
+impl AuditStatus {
+    /// Snake-case status string used on the wire (stable CLI contract).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            AuditStatus::StateNotInManifest => "state_not_in_manifest",
+            AuditStatus::UnknownNoMessageId => "unknown_no_message_id",
+            AuditStatus::Planned => "planned",
+        }
+    }
+}
+
+/// Pure, deterministic audit planner. Drives off the
+/// `RestoreStateOutcome.warnings` produced by `load_restore_state` so that
+/// pending-without-done is the canonical signal — we never re-derive it from
+/// the raw NDJSON. Folder include/exclude globs filter on the SOURCE folder
+/// name (pre-mapping), matching `plan_restore`'s convention.
+pub fn plan_restore_state_audit(
+    manifest: &ArchiveManifest,
+    outcome: &RestoreStateOutcome,
+    mappings: &[FolderMapping],
+    includes: &[String],
+    excludes: &[String],
+) -> Vec<AuditedRestoreRow> {
+    use crate::migrate::folder_selected;
+
+    let mut out = Vec::new();
+    for warning in &outcome.warnings {
+        let RestoreStateWarning::PendingWithoutDone { record } = warning else {
+            continue;
+        };
+        if !folder_selected(&record.folder, includes, excludes) {
+            continue;
+        }
+        let manifest_hit = manifest.messages.iter().find(|m| {
+            m.folder == record.folder
+                && m.uidvalidity == record.uidvalidity
+                && m.uid == record.uid
+                && m.sha256 == record.sha256
+        });
+        let destination = apply_folder_mapping(&record.folder, mappings);
+        let (status, message_id_present) = match manifest_hit {
+            None => (AuditStatus::StateNotInManifest, false),
+            Some(m) => match m.message_id.as_deref() {
+                Some(_) => (AuditStatus::Planned, true),
+                None => (AuditStatus::UnknownNoMessageId, false),
+            },
+        };
+        out.push(AuditedRestoreRow {
+            source: record.folder.clone(),
+            destination,
+            uidvalidity: record.uidvalidity,
+            uid: record.uid,
+            sha256: record.sha256.clone(),
+            message_id_present,
+            status,
+        });
+    }
+    out
 }
 
 // -----------------------------------------------------------------------------
@@ -2383,5 +2505,243 @@ mod tests {
         fs::write(&out, b"x").unwrap();
         let err = validate_export_output_dir(&out).unwrap_err();
         assert!(matches!(err, BackupError::UnsafeOutputDir { .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // `backup audit-state` planner (read-only; no IMAP)
+    // -------------------------------------------------------------------------
+
+    fn audit_record(folder: &str, uidvalidity: u32, uid: u32, sha: &str) -> RestoreStateRecord {
+        RestoreStateRecord {
+            folder: folder.to_string(),
+            uidvalidity,
+            uid,
+            sha256: sha.to_string(),
+            status: RestoreStatus::Pending,
+        }
+    }
+
+    fn audit_outcome(warnings: Vec<RestoreStateWarning>) -> RestoreStateOutcome {
+        RestoreStateOutcome {
+            records: HashSet::new(),
+            warnings,
+        }
+    }
+
+    #[test]
+    fn plan_restore_state_audit_returns_empty_when_no_pending_warnings() {
+        let manifest = sample_manifest();
+        let outcome = audit_outcome(vec![RestoreStateWarning::MalformedLine {
+            line_number: 1,
+            content: "{not json".to_string(),
+        }]);
+
+        let rows = plan_restore_state_audit(&manifest, &outcome, &[], &[], &[]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn plan_restore_state_audit_selects_only_pending_without_done() {
+        // Build a manifest that contains the pending message; outcome carries
+        // both a `MalformedLine` (must be ignored) and one
+        // `PendingWithoutDone` warning (the only row we audit).
+        let manifest = sample_manifest();
+        let pending = audit_record(
+            &manifest.messages[0].folder,
+            manifest.messages[0].uidvalidity,
+            manifest.messages[0].uid,
+            &manifest.messages[0].sha256,
+        );
+        let outcome = audit_outcome(vec![
+            RestoreStateWarning::MalformedLine {
+                line_number: 1,
+                content: "{not json".to_string(),
+            },
+            RestoreStateWarning::PendingWithoutDone {
+                record: pending.clone(),
+            },
+        ]);
+
+        let rows = plan_restore_state_audit(&manifest, &outcome, &[], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uid, pending.uid);
+        assert_eq!(rows[0].source, pending.folder);
+    }
+
+    #[test]
+    fn plan_restore_state_audit_joins_manifest_by_identity_tuple() {
+        let manifest = sample_manifest();
+        let m = &manifest.messages[0];
+        let outcome = audit_outcome(vec![RestoreStateWarning::PendingWithoutDone {
+            record: audit_record(&m.folder, m.uidvalidity, m.uid, &m.sha256),
+        }]);
+        let rows = plan_restore_state_audit(&manifest, &outcome, &[], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AuditStatus::Planned);
+        assert!(rows[0].message_id_present);
+        assert_eq!(rows[0].source, m.folder);
+        assert_eq!(rows[0].destination, m.folder);
+        assert_eq!(rows[0].uidvalidity, m.uidvalidity);
+        assert_eq!(rows[0].uid, m.uid);
+        assert_eq!(rows[0].sha256, m.sha256);
+    }
+
+    #[test]
+    fn plan_restore_state_audit_classifies_state_not_in_manifest() {
+        let manifest = sample_manifest();
+        // Same folder & uid as the manifest message, but a different sha256
+        // (and arbitrarily different uidvalidity). The identity tuple must
+        // not match, so we should get StateNotInManifest.
+        let outcome = audit_outcome(vec![RestoreStateWarning::PendingWithoutDone {
+            record: audit_record("INBOX", 99999, 999, &sha256_hex(b"drift")),
+        }]);
+        let rows = plan_restore_state_audit(&manifest, &outcome, &[], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AuditStatus::StateNotInManifest);
+        assert!(!rows[0].message_id_present);
+    }
+
+    #[test]
+    fn plan_restore_state_audit_classifies_unknown_no_message_id() {
+        let mut manifest = sample_manifest();
+        manifest.messages[0].message_id = None;
+        let m = &manifest.messages[0];
+        let outcome = audit_outcome(vec![RestoreStateWarning::PendingWithoutDone {
+            record: audit_record(&m.folder, m.uidvalidity, m.uid, &m.sha256),
+        }]);
+        let rows = plan_restore_state_audit(&manifest, &outcome, &[], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, AuditStatus::UnknownNoMessageId);
+        assert!(!rows[0].message_id_present);
+    }
+
+    #[test]
+    fn plan_restore_state_audit_applies_folder_mapping() {
+        let manifest = sample_manifest();
+        let m = &manifest.messages[0];
+        let outcome = audit_outcome(vec![RestoreStateWarning::PendingWithoutDone {
+            record: audit_record(&m.folder, m.uidvalidity, m.uid, &m.sha256),
+        }]);
+        let mappings = vec![FolderMapping {
+            source: "INBOX".to_string(),
+            destination: "Archive/INBOX-2024".to_string(),
+        }];
+        let rows = plan_restore_state_audit(&manifest, &outcome, &mappings, &[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "INBOX");
+        assert_eq!(rows[0].destination, "Archive/INBOX-2024");
+    }
+
+    #[test]
+    fn plan_restore_state_audit_respects_include_exclude() {
+        // Two pending-without-done warnings — one in INBOX (kept by include
+        // INBOX*), one in Junk E-mail (dropped by exclude Junk*).
+        let mut manifest = sample_manifest();
+        manifest.folders.push(ArchiveFolderRecord {
+            name: "Junk E-mail".to_string(),
+            uidvalidity: 678,
+            encoded_dir: encode_folder_for_disk("Junk E-mail"),
+            message_count: 1,
+        });
+        manifest.messages.push(ArchiveMessageRecord {
+            folder: "Junk E-mail".to_string(),
+            uid: 2,
+            uidvalidity: 678,
+            message_id: None,
+            internal_date: None,
+            flags: vec![],
+            size: 3,
+            sha256: sha256_hex(b"junk"),
+            rel_path: "messages/Junk%20E-mail/678-2.eml".to_string(),
+        });
+        let m_inbox = &manifest.messages[0];
+        let m_junk = &manifest.messages[1];
+        let outcome = audit_outcome(vec![
+            RestoreStateWarning::PendingWithoutDone {
+                record: audit_record(
+                    &m_inbox.folder,
+                    m_inbox.uidvalidity,
+                    m_inbox.uid,
+                    &m_inbox.sha256,
+                ),
+            },
+            RestoreStateWarning::PendingWithoutDone {
+                record: audit_record(
+                    &m_junk.folder,
+                    m_junk.uidvalidity,
+                    m_junk.uid,
+                    &m_junk.sha256,
+                ),
+            },
+        ]);
+        let rows = plan_restore_state_audit(
+            &manifest,
+            &outcome,
+            &[],
+            &["INBOX*".to_string(), "Junk*".to_string()],
+            &["Junk*".to_string()],
+        );
+        assert_eq!(rows.len(), 1, "exclude must override include");
+        assert_eq!(rows[0].source, "INBOX");
+    }
+
+    #[test]
+    fn restore_state_audit_record_event_serializes_with_event_tag() {
+        let event = BackupEvent::RestoreStateAuditRecord {
+            source: "INBOX".to_string(),
+            destination: "INBOX".to_string(),
+            uidvalidity: 1,
+            uid: 7,
+            sha256: "a".repeat(64),
+            message_id_present: true,
+            status: AuditStatus::Planned.as_wire_str().to_string(),
+            destination_uid: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "restore_state_audit_record");
+        // Field set lock.
+        for key in [
+            "source",
+            "destination",
+            "uidvalidity",
+            "uid",
+            "sha256",
+            "message_id_present",
+            "status",
+        ] {
+            assert!(parsed.get(key).is_some(), "missing field {key}");
+        }
+        assert!(
+            parsed.get("destination_uid").is_none(),
+            "destination_uid must be skipped when None"
+        );
+        assert!(
+            parsed.get("error").is_none(),
+            "error must be skipped when None"
+        );
+        assert_eq!(parsed["status"], "planned");
+    }
+
+    #[test]
+    fn restore_state_audit_done_event_serializes_with_event_tag() {
+        let event = BackupEvent::RestoreStateAuditDone {
+            pending: 3,
+            present: 0,
+            missing: 0,
+            unknown: 1,
+            state_not_in_manifest: 1,
+            errors: 0,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "restore_state_audit_done");
+        assert_eq!(parsed["pending"], 3);
+        assert_eq!(parsed["present"], 0);
+        assert_eq!(parsed["missing"], 0);
+        assert_eq!(parsed["unknown"], 1);
+        assert_eq!(parsed["state_not_in_manifest"], 1);
+        assert_eq!(parsed["errors"], 0);
     }
 }

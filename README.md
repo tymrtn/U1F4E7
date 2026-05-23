@@ -12,12 +12,13 @@
   <a href="#rules-engine">Rules</a> •
   <a href="#why-not-himalaya--cloudflare--resend">vs. Alternatives</a> •
   <a href="#dashboard">Dashboard</a> •
+  <a href="#commercial-licensing">Commercial licensing</a> •
   <a href="LICENSE">License</a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.5.0-green.svg" alt="v0.5.0">
+  <img src="https://img.shields.io/badge/version-0.9.0-green.svg" alt="v0.9.0">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -85,7 +86,7 @@ envelope rule create --name "VIP" --match-contact-tag vip --action flag=\\Flagge
 # Agent scores a message, creates a rule, Envelope enforces it forever
 envelope tag set 42 --score urgent=0.1 --tag newsletter
 envelope rule create --name "Junk newsletters" --match-tag newsletter --match-score-below interesting=0.3 --action move=Junk
-envelope rule run
+envelope rule run --confirm
 
 # Unsubscribe from a mailing list (dry-run by default)
 envelope unsubscribe 99
@@ -93,9 +94,26 @@ envelope unsubscribe 99
 # Open the local dashboard
 envelope serve
 
+# Share dashboard URLs with agents on your tailnet
+tailscale serve --bg 3141
+envelope config set dashboard.base_url https://your-node.your-tailnet.ts.net
+
 # See where Envelope is storing local state
 envelope paths
 ```
+
+The dashboard opens as a three-pane mail shell. Unified Inbox is the default
+read-only surface and loads from the local message index; explicit refreshes
+or account/folder selections are what touch live IMAP mailboxes.
+
+Dashboard URL metadata in `--json` output defaults to
+`http://localhost:3141`. For agent handoffs across devices, set
+`ENVELOPE_DASHBOARD_BASE_URL` or persist it with
+`envelope config set dashboard.base_url <base-url>`. The older
+`ENVELOPE_DASHBOARD_URL` name is still honored when the primary env var is
+absent. Tailscale Serve keeps the dashboard tailnet-only; Tailscale Funnel
+publishes it on the public internet, so do not use Funnel for a mailbox
+dashboard unless that exposure is intentional.
 
 ## Why not Himalaya / Cloudflare / Resend?
 
@@ -204,8 +222,10 @@ envelope rule create --name "Junk newsletters" \
   --match-tag newsletter --match-score-below interesting=0.3 \
   --action move=Junk
 
-# 3. Rules execute forever — no LLM needed
-envelope rule run
+# 3. Preview, then explicitly confirm rule execution
+# Preview is read-only; --confirm is required for mailbox mutation.
+envelope rule preview
+envelope rule run --confirm
 
 # 4. Export to Sieve for server-side filtering
 envelope rule export
@@ -217,12 +237,29 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 
 `envelope serve` starts a localhost web UI at [http://localhost:3141](http://localhost:3141).
 
-- Folder sidebar with live unread counts
-- Inbox list with message reader
+- Left mailbox sidebar with Unified Inbox, Today/Needs Attention, Snoozed,
+  Sent, Drafts, All Mail, and account mailboxes
+- Middle message list with a permanent right-side reader
+- Agent Cockpit attention strip with expandable operator details
 - Reply / Reply-all with automatic header threading
 - Compose with text/html toggle and file attachments
 - ★ Snoozed virtual folder with overdue highlighting
 - IMAP search
+
+## Commercial licensing
+
+Personal use is free. Commercial rollout is a flat annual license sized by the number of mailbox users on one primary domain:
+
+| Plan | Price | Scope | Support |
+|---|---:|---|---|
+| Personal | Free | Individual, non-commercial use on mailboxes you personally own and operate | Community support via GitHub issues |
+| Team | $240/year | Commercial use for one organization, up to 10 mailbox users on one primary domain | Email support, best-effort next-business-day response |
+| Growth | $960/year | Commercial use for one organization, up to 25 mailbox users on one primary domain | Priority email support, next-business-day response target |
+| Enterprise | Contact us | 26+ users, multi-domain deployments, embedded/OEM, reseller terms, or custom security review | Custom support agreement |
+
+"Commercial use" means any use of Envelope by or for a company, team, agency, or paid project, including internal operations, customer workflows, or embedding Envelope in a product. "Mailbox users" means distinct human or service mailbox identities on the licensed domain that Envelope is configured to read, send, or automate. One person with multiple aliases on the same mailbox counts as one user. "Domain" means one primary email domain; subdomains of that primary domain are included, and additional unrelated domains require Enterprise.
+
+Licenses are annual, non-transferable across organizations, and renew on the anniversary of issue. Request an annual license at [ty@tmrtn.com](mailto:ty@tmrtn.com?subject=Envelope%20licensing).
 
 ## Evidence bundles
 
@@ -285,6 +322,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope watch [--webhook] [--json]` | IMAP IDLE push — real-time new mail events |
 | `envelope code [--from] [--wait 120]` | Extract verification/OTP codes from email |
 | `envelope paths` | Show resolved database/credential paths and HOME drift warnings |
+| `envelope contract [--surface <name>]` | Export the versioned agent JSON/MCP contract |
 | `envelope mcp [--config]` | MCP server (stdio) for Claude Code, Cursor, Zed |
 | `envelope send --at "monday 9am"` | Scheduled send with flexible datetime |
 | `envelope scheduled list/cancel` | Manage scheduled messages |
@@ -320,8 +358,10 @@ See [CHANGELOG.md](CHANGELOG.md) for per-release notes.
 
 ## License
 
-[FSL-1.1-ALv2](LICENSE) — source-available, non-commercial use allowed,
-no competing services. Becomes Apache 2.0 two years after each release.
+[FSL-1.1-ALv2](LICENSE) — source-available, no competing services.
+Separate annual commercial licenses are available for organizational rollout,
+support, Enterprise/OEM terms, and uses outside the public license. The public
+license becomes Apache 2.0 two years after each release.
 
 Copyright © 2026 Tyler Martin.
 

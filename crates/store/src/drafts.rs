@@ -140,6 +140,50 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_draft_content(
+        &self,
+        id: &str,
+        to_addr: Option<&str>,
+        cc_addr: Option<&str>,
+        bcc_addr: Option<&str>,
+        subject: Option<&str>,
+        text_content: Option<&str>,
+        html_content: Option<&str>,
+    ) -> Result<Draft> {
+        let current = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        if !current.status.is_editable() {
+            return Err(StoreError::DraftNotEditable(
+                current.status.as_str().to_string(),
+            ));
+        }
+
+        self.conn().execute(
+            "UPDATE drafts SET
+                to_addr = COALESCE(?1, to_addr),
+                cc_addr = ?2,
+                bcc_addr = ?3,
+                subject = COALESCE(?4, subject),
+                text_content = COALESCE(?5, text_content),
+                html_content = COALESCE(?6, html_content),
+                updated_at = datetime('now')
+             WHERE id = ?7",
+            params![
+                to_addr,
+                cc_addr,
+                bcc_addr,
+                subject,
+                text_content,
+                html_content,
+                id
+            ],
+        )?;
+
+        self.get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+    }
+
     pub fn mark_draft_sent(&self, id: &str, message_id: Option<&str>) -> Result<()> {
         self.conn().execute(
             "UPDATE drafts SET status = 'sent', message_id = ?1,
