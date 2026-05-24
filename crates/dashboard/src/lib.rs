@@ -14,6 +14,7 @@
 pub mod assets;
 pub mod handlers;
 pub mod state;
+mod ui_paths;
 
 use std::net::SocketAddr;
 

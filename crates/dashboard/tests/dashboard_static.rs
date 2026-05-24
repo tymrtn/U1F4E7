@@ -84,7 +84,9 @@ fn dashboard_phase1_shell_uses_three_pane_mail_layout() {
     assert!(
         DASHBOARD_CSS.contains(".mail-shell")
             && DASHBOARD_CSS.contains(".reader-pane")
-            && DASHBOARD_CSS.contains(".mail-shell {\n  min-height: 0;\n  display: grid;\n  grid-template-columns:"),
+            && DASHBOARD_CSS.contains(
+                ".mail-shell {\n  min-height: 0;\n  display: grid;\n  grid-template-columns:"
+            ),
         "CSS should size the operator mail shell as fixed dashboard panes"
     );
 }

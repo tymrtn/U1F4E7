@@ -14,27 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::state::AppState;
-
-fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-fn draft_dashboard_path(account_id: &str, draft_id: &str) -> String {
-    format!(
-        "/accounts/{}/drafts/{}",
-        encode_path_segment(account_id),
-        encode_path_segment(draft_id)
-    )
-}
+use crate::ui_paths::draft_dashboard_path;
 
 fn dashboard_base_url(headers: &HeaderMap) -> Option<String> {
     let host = headers.get("host")?.to_str().ok()?.trim();

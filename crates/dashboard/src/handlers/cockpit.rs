@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use crate::ui_paths::message_dashboard_path;
 
 #[derive(Debug, Deserialize)]
 pub struct CockpitQuery {
@@ -295,12 +296,9 @@ fn cockpit_event_json(event: &Event, accounts: &[Account]) -> Value {
                 .to_string()
         })
         .unwrap_or_else(|| event.account_id.clone());
-    let message_link = event.uid.map(|uid| {
-        format!(
-            "#account={}&folder={}&uid={}",
-            event.account_id, event.folder, uid
-        )
-    });
+    let message_link = event
+        .uid
+        .map(|uid| message_dashboard_path(&event.account_id, &event.folder, uid));
 
     json!({
         "id": event.id,
@@ -490,7 +488,7 @@ mod tests {
         assert_eq!(payload["events"]["recent"][0]["outcome"], "needs_review");
         assert_eq!(
             payload["events"]["recent"][0]["message_link"],
-            "#account=acc1&folder=INBOX&uid=101"
+            "/accounts/acc1/messages/101?folder=INBOX"
         );
         assert_eq!(payload["events"]["recent"][0]["ack_state"], "pending");
     }

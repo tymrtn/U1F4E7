@@ -63,12 +63,16 @@ pub struct UnifiedInboxMessage {
 }
 
 impl UnifiedInboxMessage {
-    fn from_indexed(indexed: IndexedMessageSummary, sort_index: usize) -> Self {
+    fn from_indexed(
+        indexed: IndexedMessageSummary,
+        sort_index: usize,
+        thread_context: Option<ThreadContext>,
+    ) -> Self {
         let unread = summary_is_unread(&indexed.summary);
         Self {
             summary: indexed.summary,
             unread,
-            thread_context: None,
+            thread_context,
             account_id: indexed.account_id,
             account_username: indexed.account_username,
             account_display_name: indexed.account_display_name,
@@ -375,7 +379,13 @@ async fn load_indexed_unified_inbox(
     let messages: Vec<UnifiedInboxMessage> = indexed
         .into_iter()
         .enumerate()
-        .map(|(idx, row)| UnifiedInboxMessage::from_indexed(row, idx))
+        .map(|(idx, row)| {
+            let thread_context = db
+                .get_thread_context_for_uid(row.summary.uid, &row.folder, &row.account_id)
+                .ok()
+                .flatten();
+            UnifiedInboxMessage::from_indexed(row, idx, thread_context)
+        })
         .collect();
 
     let account_results = accounts
@@ -948,6 +958,45 @@ mod tests {
                 [],
             )
             .unwrap();
+        let thread = db
+            .create_thread(
+                "cached first paint",
+                "2026-05-12T12:00:00Z",
+                "2026-05-12T13:00:00Z",
+                "acct-a",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            42,
+            Some("<cached@example.test>"),
+            None,
+            None,
+            "INBOX",
+            "sender@example.test",
+            "me@example.test",
+            "2026-05-12T12:00:00Z",
+            "cached first paint",
+            false,
+            Some("cached preview"),
+        )
+        .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            7,
+            Some("<reply@example.test>"),
+            Some("<cached@example.test>"),
+            Some("<cached@example.test>"),
+            "Sent",
+            "me@example.test",
+            "sender@example.test",
+            "2026-05-12T13:00:00Z",
+            "Re: cached first paint",
+            true,
+            Some("sent reply"),
+        )
+        .unwrap();
+        db.refresh_thread_stats(&thread.thread_id).unwrap();
         db.upsert_indexed_message_summaries(
             "acct-a",
             "INBOX",
@@ -962,7 +1011,7 @@ mod tests {
                 flags: Vec::new(),
                 size: 123,
                 snippet: Some("cached preview".to_string()),
-                thread_id: Some("thread-cached".to_string()),
+                thread_id: Some(thread.thread_id.clone()),
             }],
         )
         .unwrap();
@@ -977,7 +1026,20 @@ mod tests {
         assert_eq!(messages[0].account_id, "acct-a");
         assert_eq!(messages[0].uidvalidity, 88);
         assert_eq!(messages[0].snippet.as_deref(), Some("cached preview"));
-        assert_eq!(messages[0].thread_id.as_deref(), Some("thread-cached"));
+        assert_eq!(
+            messages[0].thread_id.as_deref(),
+            Some(thread.thread_id.as_str())
+        );
+        let thread_context = messages[0]
+            .thread_context
+            .as_ref()
+            .expect("indexed unified rows should carry cached thread context when available");
+        assert_eq!(thread_context.thread_id, thread.thread_id);
+        assert_eq!(thread_context.thread_count, 2);
+        assert_eq!(thread_context.last_activity, "2026-05-12T13:00:00Z");
+        assert!(thread_context.has_reply);
+        assert_eq!(thread_context.reply_uid, Some(7));
+        assert_eq!(thread_context.reply_folder.as_deref(), Some("Sent"));
         assert_eq!(messages[0].index_freshness, "fresh");
         assert_eq!(accounts.len(), 2);
         assert!(

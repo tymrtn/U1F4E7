@@ -17,6 +17,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::state::AppState;
+use crate::ui_paths::message_dashboard_path;
 
 #[derive(Deserialize)]
 pub struct RuleTestQuery {
@@ -256,7 +257,7 @@ pub async fn preview(
                     "subject": summary.subject,
                     "date": summary.date,
                     "unread": unread,
-                    "message_link": format!("#account={}&folder={}&uid={}", account_id, folder, summary.uid),
+                    "message_link": message_dashboard_path(&account_id, &folder, summary.uid),
                 }));
             }
         }

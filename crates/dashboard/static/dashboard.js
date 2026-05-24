@@ -1340,11 +1340,14 @@ async function loadStats() {
 
 function renderMailboxNotice(title, message, kind = 'not_available') {
   $('list-title').textContent = title;
-  $('list-count').textContent = kind;
+  // Notice box below holds the message; keep the count cell clean.
+  $('list-count').textContent = '';
   state.messages = [];
   const list = $('message-list');
   clear(list);
-  const tone = kind === 'loading' ? 'text-mid' : kind === 'empty' ? 'text-mid' : 'text-warn';
+  // 'pending' (coming-soon) and 'empty' are neutral tones; only true
+  // 'error'/'not_available' should look warning-colored.
+  const tone = (kind === 'loading' || kind === 'empty' || kind === 'pending') ? 'text-mid' : 'text-warn';
   const box = el('div', { class: `px-4 py-12 text-center text-sm ${tone}` });
   box.appendChild(el('div', { class: 'font-semibold mb-1', text: title }));
   box.appendChild(el('div', { class: 'font-mono text-xs', text: message }));
