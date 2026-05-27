@@ -96,8 +96,13 @@ pub(crate) fn tool_list() -> Value {
 ///
 /// Returns the resolved limit as `u32`. Rejects 0 and any value above
 /// `MAX_AGENT_LIST_LIMIT` before any IMAP work occurs.
-fn validate_agent_list_limit(raw: Option<u64>) -> Result<u32, String> {
-    let value = raw.unwrap_or(DEFAULT_AGENT_LIST_LIMIT as u64);
+fn validate_agent_list_limit(raw: Option<&Value>) -> Result<u32, String> {
+    let value = match raw {
+        None => DEFAULT_AGENT_LIST_LIMIT as u64,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            "limit must be an unsigned integer for agent read-only list/search surfaces".to_string()
+        })?,
+    };
     if value == 0 {
         return Err("limit must be at least 1".to_string());
     }
@@ -144,7 +149,7 @@ async fn handle_accounts(_backend: CredentialBackend) -> Result<Value, String> {
 }
 
 async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
-    let limit = validate_agent_list_limit(params.get("limit").and_then(|v| v.as_u64()))?;
+    let limit = validate_agent_list_limit(params.get("limit"))?;
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let folder = params
         .get("folder")
@@ -209,7 +214,7 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("query is required")?;
-    let limit = validate_agent_list_limit(params.get("limit").and_then(|v| v.as_u64()))?;
+    let limit = validate_agent_list_limit(params.get("limit"))?;
     let folder = params
         .get("folder")
         .and_then(|v| v.as_str())
@@ -951,7 +956,10 @@ mod tests {
 
     #[test]
     fn agent_list_limit_accepts_default() {
-        assert_eq!(validate_agent_list_limit(Some(25)).unwrap(), 25);
+        assert_eq!(
+            validate_agent_list_limit(Some(&serde_json::json!(25))).unwrap(),
+            25
+        );
     }
 
     #[test]
@@ -961,13 +969,16 @@ mod tests {
 
     #[test]
     fn agent_list_limit_accepts_max_cap() {
-        assert_eq!(validate_agent_list_limit(Some(1000)).unwrap(), 1000);
+        assert_eq!(
+            validate_agent_list_limit(Some(&serde_json::json!(1000))).unwrap(),
+            1000
+        );
     }
 
     #[test]
     fn agent_list_limit_rejects_above_cap() {
-        let err =
-            validate_agent_list_limit(Some(1001)).expect_err("limit above 1000 must be rejected");
+        let err = validate_agent_list_limit(Some(&serde_json::json!(1001)))
+            .expect_err("limit above 1000 must be rejected");
         assert!(
             err.contains("limit") && err.contains("1000"),
             "expected limit/1000 error, got: {err}"
@@ -976,11 +987,28 @@ mod tests {
 
     #[test]
     fn agent_list_limit_rejects_zero() {
-        let err = validate_agent_list_limit(Some(0)).expect_err("limit 0 must be rejected");
+        let err = validate_agent_list_limit(Some(&serde_json::json!(0)))
+            .expect_err("limit 0 must be rejected");
         assert!(
             err.contains("limit"),
             "expected limit error mentioning bound, got: {err}"
         );
+    }
+
+    #[test]
+    fn agent_list_limit_rejects_present_wrong_json_types() {
+        for raw in [
+            serde_json::json!("100"),
+            serde_json::json!(25.5),
+            serde_json::json!(-1),
+        ] {
+            let err = validate_agent_list_limit(Some(&raw))
+                .expect_err("present non-u64 limit must be rejected, not treated as absent");
+            assert!(
+                err.contains("limit") && err.contains("integer"),
+                "expected limit/integer type error for {raw}, got: {err}"
+            );
+        }
     }
 }
 

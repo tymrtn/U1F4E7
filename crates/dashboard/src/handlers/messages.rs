@@ -123,6 +123,7 @@ impl UnifiedInboxAccountResult {
         freshness: &str,
     ) -> Self {
         let (ok, freshness, error) = match freshness {
+            "fresh" if message_count == 0 => (true, UnifiedAccountFreshness::Empty, None),
             "fresh" => (true, UnifiedAccountFreshness::Fresh, None),
             "stale" | "expired" => (true, UnifiedAccountFreshness::Stale, None),
             "missing" => (
@@ -130,6 +131,7 @@ impl UnifiedInboxAccountResult {
                 UnifiedAccountFreshness::Unavailable,
                 Some("cache missing; refresh required".to_string()),
             ),
+            "empty" => (true, UnifiedAccountFreshness::Empty, None),
             _ => (
                 false,
                 UnifiedAccountFreshness::Unavailable,
@@ -430,21 +432,7 @@ fn build_unified_inbox_response(
 ) -> UnifiedInboxResponse {
     let status = unified_inbox_status(&accounts);
     let unread_count = accounts.iter().map(|account| account.unread_count).sum();
-    let freshness = match status {
-        UnifiedInboxStatus::Ok => {
-            if accounts
-                .iter()
-                .all(|account| account.freshness == UnifiedAccountFreshness::Empty)
-            {
-                UnifiedAccountFreshness::Empty
-            } else {
-                UnifiedAccountFreshness::Fresh
-            }
-        }
-        UnifiedInboxStatus::Partial => UnifiedAccountFreshness::Partial,
-        UnifiedInboxStatus::Empty => UnifiedAccountFreshness::Empty,
-        UnifiedInboxStatus::Error => UnifiedAccountFreshness::Unavailable,
-    };
+    let freshness = unified_inbox_freshness(&accounts, status);
     let errors = accounts
         .iter()
         .filter_map(|account| {
@@ -468,6 +456,50 @@ fn build_unified_inbox_response(
         unread_count,
         freshness,
         errors,
+    }
+}
+
+fn unified_inbox_freshness(
+    accounts: &[UnifiedInboxAccountResult],
+    status: UnifiedInboxStatus,
+) -> UnifiedAccountFreshness {
+    match status {
+        UnifiedInboxStatus::Empty => UnifiedAccountFreshness::Empty,
+        UnifiedInboxStatus::Partial => UnifiedAccountFreshness::Partial,
+        UnifiedInboxStatus::Error => UnifiedAccountFreshness::Unavailable,
+        UnifiedInboxStatus::Ok => {
+            if accounts
+                .iter()
+                .all(|account| account.freshness == UnifiedAccountFreshness::Empty)
+            {
+                return UnifiedAccountFreshness::Empty;
+            }
+
+            let has_stale = accounts
+                .iter()
+                .any(|account| account.freshness == UnifiedAccountFreshness::Stale);
+            if has_stale {
+                return if accounts
+                    .iter()
+                    .all(|account| account.freshness == UnifiedAccountFreshness::Stale)
+                {
+                    UnifiedAccountFreshness::Stale
+                } else {
+                    UnifiedAccountFreshness::Partial
+                };
+            }
+
+            if accounts.iter().any(|account| {
+                matches!(
+                    account.freshness,
+                    UnifiedAccountFreshness::Partial | UnifiedAccountFreshness::Unavailable
+                )
+            }) {
+                UnifiedAccountFreshness::Partial
+            } else {
+                UnifiedAccountFreshness::Fresh
+            }
+        }
     }
 }
 
@@ -884,6 +916,24 @@ mod tests {
         ok: bool,
         error: Option<&str>,
     ) -> UnifiedInboxAccountResult {
+        account_result_with_freshness(
+            account_id,
+            ok,
+            if ok {
+                UnifiedAccountFreshness::Fresh
+            } else {
+                UnifiedAccountFreshness::Unavailable
+            },
+            error,
+        )
+    }
+
+    fn account_result_with_freshness(
+        account_id: &str,
+        ok: bool,
+        freshness: UnifiedAccountFreshness,
+        error: Option<&str>,
+    ) -> UnifiedInboxAccountResult {
         UnifiedInboxAccountResult {
             account_id: account_id.to_string(),
             account_username: format!("{account_id}@example.test"),
@@ -897,11 +947,7 @@ mod tests {
             } else {
                 None
             },
-            freshness: if ok {
-                UnifiedAccountFreshness::Fresh
-            } else {
-                UnifiedAccountFreshness::Unavailable
-            },
+            freshness,
             indexed_at: ok.then(|| "2026-05-12T12:00:00Z".to_string()),
             error: error.map(str::to_string),
         }
@@ -1053,6 +1099,89 @@ mod tests {
                 && account.freshness == UnifiedAccountFreshness::Unavailable
                 && account.error.as_deref() == Some("cache missing; refresh required")
         }));
+    }
+
+    #[tokio::test]
+    async fn indexed_unified_inbox_surfaces_refreshed_empty_account_as_empty_ok() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-empty', 'Empty Account', 'empty@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db.upsert_indexed_message_summaries("acct-empty", "INBOX", 321, &[])
+            .unwrap();
+        let accounts = db.list_accounts().unwrap();
+        let state = AppState::new(db, CredentialBackend::File);
+
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10)
+            .await
+            .unwrap();
+
+        assert!(messages.is_empty());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, "acct-empty");
+        assert!(accounts[0].ok);
+        assert_eq!(accounts[0].message_count, 0);
+        assert_eq!(accounts[0].freshness, UnifiedAccountFreshness::Empty);
+        assert!(accounts[0].indexed_at.is_some());
+        assert!(accounts[0].error.is_none());
+    }
+
+    #[test]
+    fn unified_response_reports_stale_top_level_when_all_accounts_are_stale() {
+        let response = build_unified_inbox_response(
+            "INBOX".to_string(),
+            50,
+            vec![unified(
+                "acct-a",
+                7,
+                Some("Tue, 12 May 2026 12:00:00 +0000"),
+                0,
+            )],
+            vec![
+                account_result_with_freshness("acct-a", true, UnifiedAccountFreshness::Stale, None),
+                account_result_with_freshness("acct-b", true, UnifiedAccountFreshness::Stale, None),
+            ],
+        );
+
+        assert_eq!(response.status, UnifiedInboxStatus::Ok);
+        assert_eq!(response.freshness, UnifiedAccountFreshness::Stale);
+    }
+
+    #[test]
+    fn unified_response_reports_partial_top_level_when_freshness_is_mixed() {
+        let response = build_unified_inbox_response(
+            "INBOX".to_string(),
+            50,
+            vec![unified(
+                "acct-fresh",
+                7,
+                Some("Tue, 12 May 2026 12:00:00 +0000"),
+                0,
+            )],
+            vec![
+                account_result_with_freshness(
+                    "acct-fresh",
+                    true,
+                    UnifiedAccountFreshness::Fresh,
+                    None,
+                ),
+                account_result_with_freshness(
+                    "acct-stale",
+                    true,
+                    UnifiedAccountFreshness::Stale,
+                    None,
+                ),
+            ],
+        );
+
+        assert_eq!(response.status, UnifiedInboxStatus::Ok);
+        assert_eq!(response.freshness, UnifiedAccountFreshness::Partial);
     }
 
     #[test]

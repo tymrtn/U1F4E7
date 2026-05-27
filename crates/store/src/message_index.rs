@@ -124,17 +124,19 @@ impl Database {
         let mut stmt = self.conn().prepare(
             "SELECT a.id, ?1 AS folder,
                     COUNT(ims.uid) AS message_count,
-                    MAX(ims.indexed_at) AS indexed_at,
+                    COALESCE(mis.indexed_at, MAX(ims.indexed_at)) AS indexed_at,
                     CASE
-                        WHEN MAX(ims.indexed_at) IS NULL THEN 'missing'
-                        WHEN strftime('%s','now') - strftime('%s', MAX(ims.indexed_at)) <= ?2 THEN 'fresh'
-                        WHEN strftime('%s','now') - strftime('%s', MAX(ims.indexed_at)) <= ?3 THEN 'stale'
+                        WHEN COALESCE(mis.indexed_at, MAX(ims.indexed_at)) IS NULL THEN 'missing'
+                        WHEN strftime('%s','now') - strftime('%s', COALESCE(mis.indexed_at, MAX(ims.indexed_at))) <= ?2 THEN 'fresh'
+                        WHEN strftime('%s','now') - strftime('%s', COALESCE(mis.indexed_at, MAX(ims.indexed_at))) <= ?3 THEN 'stale'
                         ELSE 'expired'
                     END AS freshness
              FROM accounts a
+             LEFT JOIN message_index_state mis
+               ON mis.account_id = a.id AND mis.folder = ?1
              LEFT JOIN indexed_message_summaries ims
                ON ims.account_id = a.id AND ims.folder = ?1
-             GROUP BY a.id
+             GROUP BY a.id, mis.indexed_at
              ORDER BY a.created_at",
         )?;
         let rows = stmt.query_map(
@@ -178,4 +180,40 @@ fn map_indexed_message_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inde
         indexed_at: row.get(15)?,
         freshness: row.get(16)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_empty_mailbox_reports_freshness_from_index_state() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-empty", "empty@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-missing", "missing@example.test")
+            .unwrap();
+
+        db.upsert_indexed_message_summaries("acct-empty", "INBOX", 123, &[])
+            .unwrap();
+
+        let rows = db.list_message_index_account_freshness("INBOX").unwrap();
+        let empty = rows
+            .iter()
+            .find(|row| row.account_id == "acct-empty")
+            .expect("refreshed empty account should be present");
+
+        assert_eq!(empty.folder, "INBOX");
+        assert_eq!(empty.message_count, 0);
+        assert!(empty.indexed_at.is_some());
+        assert_eq!(empty.freshness, "fresh");
+
+        let missing = rows
+            .iter()
+            .find(|row| row.account_id == "acct-missing")
+            .expect("unrefreshed account should still be present");
+        assert_eq!(missing.message_count, 0);
+        assert!(missing.indexed_at.is_none());
+        assert_eq!(missing.freshness, "missing");
+    }
 }

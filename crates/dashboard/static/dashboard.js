@@ -2159,7 +2159,7 @@ function cidAttachmentMap(msg) {
   const map = new Map();
   for (const attachment of msg?.attachments || []) {
     const key = normalizeContentId(attachment.content_id);
-    if (key && attachment.filename) map.set(key, attachment);
+    if (key && attachment.filename && isInlineAttachment(attachment)) map.set(key, attachment);
   }
   return map;
 }
@@ -2169,16 +2169,46 @@ function transparentImageDataUrl() {
 }
 
 function stripDangerousEmailNodes(doc) {
-  doc.querySelectorAll('script, form, input, button, textarea, select, iframe, object, embed, applet, meta, base').forEach(node => node.remove());
+  doc.querySelectorAll('script, style, link, form, input, button, textarea, select, iframe, object, embed, applet, meta, base, svg, image').forEach(node => node.remove());
   doc.querySelectorAll('*').forEach(node => {
     for (const attr of Array.from(node.attributes || [])) {
       const name = attr.name.toLowerCase();
       const value = attr.value || '';
+      const tag = node.tagName.toLowerCase();
       if (name.startsWith('on')) node.removeAttribute(attr.name);
-      if ((name === 'href' || name === 'src') && /^javascript:/i.test(value.trim())) node.removeAttribute(attr.name);
-      if (name === 'style' && /url\s*\(\s*['"]?(?:https?:|cid:|data:text\/html)/i.test(value)) node.removeAttribute(attr.name);
+      if (name === 'background') node.removeAttribute(attr.name);
+      if (name === 'srcset') node.removeAttribute(attr.name);
+      if ((name === 'href' || name === 'xlink:href') && isDangerousNavigationUrl(value)) node.removeAttribute(attr.name);
+      if ((name === 'href' || name === 'xlink:href') && (name === 'xlink:href' || tag === 'image' || tag === 'use') && isBlockedEmailUrl(value)) node.removeAttribute(attr.name);
+      if (name === 'src' && tag !== 'img' && isBlockedEmailUrl(value)) node.removeAttribute(attr.name);
+      if (name === 'style' && hasCssUrlLoad(value)) node.removeAttribute(attr.name);
     }
   });
+}
+
+function isRemoteHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || '').trim());
+}
+
+function isProtocolRelativeUrl(value) {
+  return /^\/\//.test(String(value || '').trim());
+}
+
+function isDangerousNavigationUrl(value) {
+  const trimmed = String(value || '').trim();
+  return /^javascript:/i.test(trimmed) || /^data:text\/html/i.test(trimmed);
+}
+
+function isBlockedEmailUrl(value) {
+  const trimmed = String(value || '').trim();
+  return isDangerousNavigationUrl(trimmed)
+    || isProtocolRelativeUrl(trimmed)
+    || isRemoteHttpUrl(trimmed);
+}
+
+function hasCssUrlLoad(value) {
+  const css = String(value || '');
+  return /@import\b/i.test(css) || /url\s*\(/i.test(css);
 }
 
 function sanitizeEmailHtml(html, msg, loadRemoteImages = false) {
@@ -2203,7 +2233,7 @@ function sanitizeEmailHtml(html, msg, loadRemoteImages = false) {
       }
       return;
     }
-    if (/^https?:\/\//i.test(trimmed)) {
+    if (isRemoteHttpUrl(trimmed)) {
       if (!loadRemoteImages) {
         img.setAttribute('data-remote-src', trimmed);
         img.setAttribute('src', transparentImageDataUrl());
@@ -2213,7 +2243,7 @@ function sanitizeEmailHtml(html, msg, loadRemoteImages = false) {
       }
       return;
     }
-    if (/^data:text\/html/i.test(trimmed)) img.removeAttribute('src');
+    if (isBlockedEmailUrl(trimmed)) img.removeAttribute('src');
   });
 
   const safeBody = doc.body ? doc.body.innerHTML : '';

@@ -1514,8 +1514,20 @@ fn main() {
             std::process::exit(1);
         }
         Commands::License { subcommand } => match subcommand {
-            LicenseCmd::Activate { key } => {
-                eprintln!("Not yet implemented: license activate (key: {key})");
+            LicenseCmd::Activate { key: _ } => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "not_implemented",
+                            "command": "license activate",
+                            "message": "license activation is not yet implemented"
+                        }))
+                        .expect("serialize license activation status")
+                    );
+                } else {
+                    eprintln!("Not yet implemented: license activate");
+                }
                 std::process::exit(1);
             }
             LicenseCmd::Status => {

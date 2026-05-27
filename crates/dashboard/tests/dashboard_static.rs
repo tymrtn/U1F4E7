@@ -26,6 +26,27 @@ fn dashboard_rewrites_cid_images_and_blocks_remote_images_by_default() {
 }
 
 #[test]
+fn dashboard_email_sanitizer_blocks_non_img_remote_load_surfaces() {
+    for marker in [
+        "script, style",
+        "svg, image",
+        "name === 'background'",
+        "name === 'srcset'",
+        "xlink:href",
+        "function isProtocolRelativeUrl",
+        "function isBlockedEmailUrl",
+        "function hasCssUrlLoad",
+        "isBlockedEmailUrl(trimmed)",
+        "isInlineAttachment(attachment)",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(marker),
+            "email sanitizer should fail closed for remote-load surface marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn dashboard_reader_sizing_is_not_fixed_to_legacy_400px_iframe() {
     assert!(
         !DASHBOARD_JS.contains("minHeight = '400px'")
