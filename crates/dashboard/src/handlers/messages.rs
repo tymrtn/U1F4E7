@@ -407,10 +407,13 @@ async fn load_indexed_unified_inbox(
                 .max_by(|a, b| compare_message_dates(a, b))
                 .cloned();
             let account_freshness = freshness.iter().find(|row| row.account_id == account.id);
+            let indexed_message_count = account_freshness
+                .map(|row| row.message_count)
+                .unwrap_or(account_messages.len());
             UnifiedInboxAccountResult::cached(
                 account,
                 folder,
-                account_messages.len(),
+                indexed_message_count,
                 unread_count,
                 latest_message_date,
                 account_freshness.and_then(|row| row.indexed_at.clone()),
@@ -1128,6 +1131,53 @@ mod tests {
         assert!(accounts[0].ok);
         assert_eq!(accounts[0].message_count, 0);
         assert_eq!(accounts[0].freshness, UnifiedAccountFreshness::Empty);
+        assert!(accounts[0].indexed_at.is_some());
+        assert!(accounts[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn indexed_unified_inbox_uses_freshness_count_when_global_limit_hides_account_rows() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-hidden', 'Hidden Account', 'hidden@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-hidden",
+            "INBOX",
+            444,
+            &[IndexedMessageInput {
+                uid: 99,
+                message_id: Some("<hidden@example.test>".to_string()),
+                from_addr: "sender@example.test".to_string(),
+                to_addr: "hidden@example.test".to_string(),
+                subject: "hidden by zero limit".to_string(),
+                date: Some("Tue, 12 May 2026 12:00:00 +0000".to_string()),
+                flags: Vec::new(),
+                size: 123,
+                snippet: Some("cached preview".to_string()),
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+        let accounts = db.list_accounts().unwrap();
+        let state = AppState::new(db, CredentialBackend::File);
+
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 0)
+            .await
+            .unwrap();
+
+        assert!(messages.is_empty());
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, "acct-hidden");
+        assert!(accounts[0].ok);
+        assert_eq!(accounts[0].message_count, 1);
+        assert_eq!(accounts[0].freshness, UnifiedAccountFreshness::Fresh);
         assert!(accounts[0].indexed_at.is_some());
         assert!(accounts[0].error.is_none());
     }

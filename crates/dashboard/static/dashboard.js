@@ -70,29 +70,6 @@ function safeDecodeSegment(segment) {
   catch (_) { return segment; }
 }
 
-function parseDashboardRoute(pathname) {
-  const parts = String(pathname || '/').split('/').filter(Boolean).map(safeDecodeSegment);
-  if (parts.length === 0) return null;
-
-  if (parts[0] === 'accounts' && parts.length >= 3) {
-    if (parts[2] === 'drafts' && parts[3]) {
-      return { kind: 'draft', accountSlug: parts[1], draftId: parts[3] };
-    }
-    if (parts[2] === 'cockpit') {
-      return { kind: 'cockpit', accountSlug: parts[1] };
-    }
-  }
-
-  if (parts[1] === 'drafts' && parts[2]) {
-    return { kind: 'draft', accountSlug: parts[0], draftId: parts[2] };
-  }
-  if (parts[1] === 'cockpit') {
-    return { kind: 'cockpit', accountSlug: parts[0] };
-  }
-
-  return null;
-}
-
 function normalizeSlug(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -1487,7 +1464,7 @@ async function loadAccounts({ autoSelect = true } = {}) {
     }
     // Deep-link routing: if a route was parsed from the URL, resolve the
     // account slug and bail out gracefully when no account matches.
-    const routeAccount = state.route ? resolveAccountSlug(state.route.accountSlug) : null;
+    const routeAccount = state.route ? resolveAccountSlug(state.route.accountSlug || state.route.accountId) : null;
     if (state.route && !routeAccount) {
       state.cockpitStatus = 'deep link account not found';
       state.cockpitMessage = {
@@ -2178,6 +2155,7 @@ function stripDangerousEmailNodes(doc) {
       if (name.startsWith('on')) node.removeAttribute(attr.name);
       if (name === 'background') node.removeAttribute(attr.name);
       if (name === 'srcset') node.removeAttribute(attr.name);
+      if (name === 'poster' && isBlockedEmailUrl(value)) node.removeAttribute(attr.name);
       if ((name === 'href' || name === 'xlink:href') && isDangerousNavigationUrl(value)) node.removeAttribute(attr.name);
       if ((name === 'href' || name === 'xlink:href') && (name === 'xlink:href' || tag === 'image' || tag === 'use') && isBlockedEmailUrl(value)) node.removeAttribute(attr.name);
       if (name === 'src' && tag !== 'img' && isBlockedEmailUrl(value)) node.removeAttribute(attr.name);
@@ -2405,17 +2383,6 @@ function renderSnoozed() {
 }
 
 // ── Agent Cockpit drafts ───────────────────────────────────────────
-async function applyDashboardRoute() {
-  const route = state.route;
-  if (!route || !state.currentAccount) return;
-
-  if (route.kind === 'draft') {
-    await openDraftDeepLink(route.draftId);
-  } else if (route.kind === 'cockpit') {
-    focusAgentCockpit();
-  }
-}
-
 async function loadDrafts() {
   if (!state.currentAccount) {
     state.drafts = [];

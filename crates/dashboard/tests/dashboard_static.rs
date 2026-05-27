@@ -32,6 +32,7 @@ fn dashboard_email_sanitizer_blocks_non_img_remote_load_surfaces() {
         "svg, image",
         "name === 'background'",
         "name === 'srcset'",
+        "name === 'poster'",
         "xlink:href",
         "function isProtocolRelativeUrl",
         "function isBlockedEmailUrl",
@@ -73,6 +74,36 @@ fn dashboard_attachment_list_labels_inline_images_separately() {
     assert!(
         DASHBOARD_JS.contains("Inline images") && DASHBOARD_JS.contains("Downloadable attachments"),
         "attachment list should distinguish inline images from true downloads"
+    );
+}
+
+#[test]
+fn dashboard_message_deep_links_are_route_first_without_legacy_slug_gate() {
+    assert_eq!(
+        DASHBOARD_JS.matches("function parseDashboardRoute").count(),
+        1,
+        "dashboard should have one route parser; duplicate declarations can mask direct-message behavior"
+    );
+    assert_eq!(
+        DASHBOARD_JS
+            .matches("async function applyDashboardRoute")
+            .count(),
+        1,
+        "dashboard should have one route applier; duplicate declarations make route-first review fragile"
+    );
+    assert!(
+        DASHBOARD_JS.contains("kind: 'message'")
+            && DASHBOARD_JS.contains("await openMessage(route.uid, route.accountId"),
+        "message deep links should parse `/accounts/<id>/messages/<uid>` and open the target message directly"
+    );
+    assert!(
+        DASHBOARD_JS.contains("loadAccounts({ autoSelect: false })")
+            && DASHBOARD_JS.contains("const routed = await applyDashboardRoute(route)"),
+        "deep-link boot should load only account metadata before applying the target route"
+    );
+    assert!(
+        !DASHBOARD_JS.contains("resolveAccountSlug(state.route.accountSlug)"),
+        "account-id message routes must not pass through the old accountSlug gate before route application"
     );
 }
 
