@@ -343,3 +343,71 @@ fn dashboard_account_health_uses_local_signals_without_first_paint_auth_probe() 
         "deriveAccountHealth must not call the /verify endpoint from the render path"
     );
 }
+
+#[test]
+fn dashboard_ships_gmail_keyboard_shortcut_layer() {
+    // Single source of truth for shortcuts plus a discoverable cheat sheet.
+    assert!(
+        DASHBOARD_JS.contains("const KEYBOARD_SHORTCUTS")
+            && DASHBOARD_JS.contains("function handleGlobalKeydown"),
+        "dashboard should define a keyboard shortcut table and global handler"
+    );
+    assert!(
+        DASHBOARD_JS.contains("addEventListener('keydown', handleGlobalKeydown)"),
+        "global keydown handler must be wired during event setup"
+    );
+    // Typing in inputs/textareas must never trigger navigation shortcuts.
+    assert!(
+        DASHBOARD_JS.contains("function isTextEntryFocused"),
+        "keyboard handler must suppress shortcuts while text entry is focused"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("id=\"shortcut-sheet\"")
+            && DASHBOARD_HTML.contains("id=\"shortcut-sheet-list\""),
+        "index.html should contain the keyboard cheat-sheet modal"
+    );
+}
+
+#[test]
+fn dashboard_supports_shift_click_range_select_and_focus_nav() {
+    assert!(
+        DASHBOARD_JS.contains("function selectMessageRange"),
+        "dashboard should support shift-click range selection like Gmail"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function moveMessageFocus")
+            && DASHBOARD_JS.contains("state.focusedMessageKey"),
+        "dashboard should track and move a focused message row for j/k navigation"
+    );
+    assert!(
+        DASHBOARD_CSS.contains(".msg-row.focused"),
+        "focused message row needs a visible affordance"
+    );
+}
+
+#[test]
+fn dashboard_reader_frame_autosizes_without_enabling_scripts() {
+    assert!(
+        DASHBOARD_JS.contains("function sizeReaderFrameToContent"),
+        "HTML email iframe should size to its content height"
+    );
+    // Security invariant: same-origin may be granted for measurement, but
+    // scripts must never be enabled on the email iframe. Guard against the
+    // actual sandbox token (quoted), not prose mentioning the flag.
+    assert!(
+        !DASHBOARD_JS.contains("allow-scripts'") && !DASHBOARD_JS.contains("allow-scripts "),
+        "email iframe must never enable the allow-scripts sandbox token"
+    );
+    assert!(
+        DASHBOARD_JS.contains("setAttribute('sandbox', 'allow-same-origin')"),
+        "email iframe uses allow-same-origin only, for height measurement"
+    );
+}
+
+#[test]
+fn dashboard_bulk_status_auto_clears_terminal_results() {
+    assert!(
+        DASHBOARD_JS.contains("autoClear") && DASHBOARD_JS.contains("state.bulkStatusTimer"),
+        "terminal bulk-status summaries should auto-clear instead of lingering"
+    );
+}

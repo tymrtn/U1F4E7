@@ -2,8 +2,13 @@
 // Licensed under FSL-1.1-ALv2
 //
 // Safe rendering notes:
-// - HTML email bodies render inside a sandboxed iframe (no scripts, no
-//   same-origin access). Never assigned to innerHTML on the dashboard DOM.
+// - HTML email bodies render inside a sandboxed iframe (no scripts, no forms,
+//   no top-navigation). Never assigned to innerHTML on the dashboard DOM.
+//   The sandbox grants `allow-same-origin` ONLY so we can read the rendered
+//   document height and size the frame to its content (Gmail-style). This is
+//   safe because `allow-scripts` is never set and sanitizeEmailHtml() strips
+//   <script>/<style>/<form>/etc — no email-controlled code can ever execute,
+//   so same-origin confers no escape path.
 // - Every piece of user-supplied text (subjects, addresses, filenames,
 //   body excerpts) goes through textContent, never innerHTML.
 // - DOM trees are built with createElement/appendChild, not template strings.
@@ -41,6 +46,9 @@ const state = {
   selectedMessages: new Set(),
   starredMessages: new Set(),
   renderedMessageKeys: [],
+  focusedMessageKey: null,
+  lastSelectedIndex: -1,
+  bulkStatusTimer: null,
 };
 
 const SMART_MAILBOXES = [
@@ -690,11 +698,27 @@ function selectedRenderedMessages() {
   return selectedVisibleKeys().map(key => messages.get(key)).filter(Boolean);
 }
 
-function setBulkStatus(message, kind = '') {
+function setBulkStatus(message, kind = '', { autoClear = false } = {}) {
   const status = $('bulk-status');
   if (!status) return;
+  if (state.bulkStatusTimer) {
+    clearTimeout(state.bulkStatusTimer);
+    state.bulkStatusTimer = null;
+  }
   status.textContent = message || '';
   status.className = `bulk-status ${kind}`.trim();
+  // Terminal results (success/partial counts) shouldn't linger forever; in-flight
+  // progress messages persist until the next setBulkStatus call replaces them.
+  if (message && autoClear) {
+    state.bulkStatusTimer = setTimeout(() => {
+      const node = $('bulk-status');
+      if (node) {
+        node.textContent = '';
+        node.className = 'bulk-status';
+      }
+      state.bulkStatusTimer = null;
+    }, 6000);
+  }
 }
 
 function updateBulkToolbar() {
@@ -754,6 +778,168 @@ function toggleVisibleMessageSelection(selected) {
     else state.selectedMessages.delete(key);
   }
   renderMessages();
+}
+
+// Shift-click range select: set every row between `from` and `to` (inclusive)
+// to `selected`, matching Gmail's range-toggle behavior.
+function selectMessageRange(from, to, selected) {
+  const keys = state.renderedMessageKeys;
+  const lo = Math.max(0, Math.min(from, to));
+  const hi = Math.min(keys.length - 1, Math.max(from, to));
+  for (let i = lo; i <= hi; i++) {
+    const key = keys[i];
+    if (selected) state.selectedMessages.add(key);
+    else state.selectedMessages.delete(key);
+  }
+  renderMessages();
+}
+
+// ── Keyboard navigation ────────────────────────────────────────────
+function focusedMessageRow() {
+  if (!state.focusedMessageKey) return null;
+  const list = $('message-list');
+  if (!list) return null;
+  return Array.from(list.querySelectorAll('.msg-row'))
+    .find(r => r.dataset.messageKey === state.focusedMessageKey) || null;
+}
+
+function focusedMessageObject() {
+  if (!state.focusedMessageKey) return null;
+  return state.messages.find(m => messageKey(m) === state.focusedMessageKey) || null;
+}
+
+function setFocusedMessageIndex(index) {
+  const keys = state.renderedMessageKeys;
+  if (keys.length === 0) return;
+  const clamped = Math.max(0, Math.min(index, keys.length - 1));
+  state.focusedMessageKey = keys[clamped];
+  // Repaint focus class without a full data reload.
+  const list = $('message-list');
+  if (list) {
+    list.querySelectorAll('.msg-row.focused').forEach(r => r.classList.remove('focused'));
+    const row = Array.from(list.querySelectorAll('.msg-row'))
+      .find(r => r.dataset.messageKey === state.focusedMessageKey);
+    if (row) {
+      row.classList.add('focused');
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  }
+}
+
+function moveMessageFocus(delta) {
+  const keys = state.renderedMessageKeys;
+  if (keys.length === 0) return;
+  const current = state.focusedMessageKey ? keys.indexOf(state.focusedMessageKey) : -1;
+  const next = current < 0 ? (delta > 0 ? 0 : keys.length - 1) : current + delta;
+  setFocusedMessageIndex(next);
+}
+
+function openFocusedMessage() {
+  const m = focusedMessageObject();
+  if (!m) return;
+  const p = messagePrimitive(m).state;
+  openMessage(p.uid, p.account_id, p.folder);
+}
+
+function toggleFocusedSelection() {
+  const m = focusedMessageObject();
+  if (!m) return;
+  const key = messageKey(m);
+  const selected = !state.selectedMessages.has(key);
+  toggleMessageSelection(m, selected);
+  state.lastSelectedIndex = state.renderedMessageKeys.indexOf(key);
+  renderMessages();
+}
+
+function starFocusedMessage() {
+  const m = focusedMessageObject();
+  if (!m) return;
+  const row = focusedMessageRow();
+  toggleMessageStar(m, row ? row.querySelector('.msg-star') : null);
+}
+
+// Single source of truth for shortcuts — also rendered in the cheat sheet.
+const KEYBOARD_SHORTCUTS = [
+  { keys: 'j / k', label: 'Next / previous message' },
+  { keys: 'Enter / o', label: 'Open focused message' },
+  { keys: 'x', label: 'Select / deselect focused' },
+  { keys: 's', label: 'Star / unstar focused' },
+  { keys: 'e', label: 'Archive selected' },
+  { keys: '#', label: 'Delete selected' },
+  { keys: 'r', label: 'Reply to open message' },
+  { keys: 'a', label: 'Reply all to open message' },
+  { keys: 'c', label: 'Compose new message' },
+  { keys: '/', label: 'Focus search' },
+  { keys: 'Esc', label: 'Close reader / modal' },
+  { keys: '?', label: 'Toggle this shortcut sheet' },
+];
+
+function isTextEntryFocused() {
+  const a = document.activeElement;
+  if (!a) return false;
+  const tag = a.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || a.isContentEditable;
+}
+
+function anyModalOpen() {
+  return ['composer', 'add-account-modal', 'snooze-modal', 'shortcut-sheet']
+    .some(id => $(id)?.classList.contains('show'));
+}
+
+function toggleShortcutSheet(force) {
+  const sheet = $('shortcut-sheet');
+  if (!sheet) return;
+  const show = force === undefined ? !sheet.classList.contains('show') : force;
+  if (show && !sheet.dataset.populated) {
+    const list = $('shortcut-sheet-list');
+    if (list) {
+      clear(list);
+      for (const s of KEYBOARD_SHORTCUTS) {
+        const row = el('div', { class: 'shortcut-row' });
+        row.appendChild(el('kbd', { class: 'shortcut-key', text: s.keys }));
+        row.appendChild(el('span', { class: 'shortcut-label', text: s.label }));
+        list.appendChild(row);
+      }
+    }
+    sheet.dataset.populated = '1';
+  }
+  sheet.classList.toggle('show', show);
+}
+
+function handleGlobalKeydown(event) {
+  // ? toggles the cheat sheet even when nothing is focused.
+  if (event.key === '?' && !isTextEntryFocused()) {
+    event.preventDefault();
+    toggleShortcutSheet();
+    return;
+  }
+  // Escape always closes the topmost surface.
+  if (event.key === 'Escape') {
+    if ($('shortcut-sheet')?.classList.contains('show')) { toggleShortcutSheet(false); return; }
+    if ($('composer')?.classList.contains('show')) { closeComposer(); return; }
+    if ($('snooze-modal')?.classList.contains('show')) { closeSnoozeModal(); return; }
+    if ($('add-account-modal')?.classList.contains('show')) { closeAddAccount(); return; }
+    if ($('reader')?.classList.contains('show')) { closeReader(); return; }
+    return;
+  }
+  // All other shortcuts are suppressed while typing or in a modal.
+  if (isTextEntryFocused() || anyModalOpen()) return;
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+  switch (event.key) {
+    case 'j': event.preventDefault(); moveMessageFocus(1); break;
+    case 'k': event.preventDefault(); moveMessageFocus(-1); break;
+    case 'o': case 'Enter': event.preventDefault(); openFocusedMessage(); break;
+    case 'x': event.preventDefault(); toggleFocusedSelection(); break;
+    case 's': event.preventDefault(); starFocusedMessage(); break;
+    case 'e': event.preventDefault(); if (selectedRenderedMessages().length) bulkArchive(); break;
+    case '#': event.preventDefault(); if (selectedRenderedMessages().length) bulkDelete(); break;
+    case 'r': event.preventDefault(); if (state.currentMessage) openComposer('reply', state.currentMessage); break;
+    case 'a': event.preventDefault(); if (state.currentMessage) openComposer('reply-all', state.currentMessage); break;
+    case 'c': event.preventDefault(); openComposer('new'); break;
+    case '/': event.preventDefault(); $('search-input')?.focus(); break;
+    default: break;
+  }
 }
 
 function isMessageStarred(message) {
@@ -872,7 +1058,7 @@ async function runBulkOp({ label, perItem, concurrency = 4 }) {
   const summary = failed.length === 0
     ? `${label}: all ${okCount} message${okCount === 1 ? '' : 's'} succeeded.`
     : `${label}: ${okCount} succeeded, ${failed.length} failed.`;
-  setBulkStatus(summary, failed.length ? 'warning' : 'success');
+  setBulkStatus(summary, failed.length ? 'warning' : 'success', { autoClear: true });
   toast(summary, failed.length ? 'error' : 'success');
   if (failed.length) {
     for (const item of failed.slice(0, 3)) {
@@ -1920,7 +2106,12 @@ function renderMessages() {
   const sorted = unified ? [...state.messages] : [...state.messages].sort((a, b) => (b.uid || 0) - (a.uid || 0));
   state.renderedMessageKeys = sorted.map(messageKey);
   pruneSelectedMessagesToRendered();
+  if (state.focusedMessageKey && !state.renderedMessageKeys.includes(state.focusedMessageKey)) {
+    state.focusedMessageKey = null;
+  }
+  let renderIndex = -1;
   for (const m of sorted) {
+    const rowIndex = ++renderIndex;
     const unread = isMessageUnread(m);
     const primitive = messagePrimitive(m);
     const key = messageKey(m);
@@ -1931,9 +2122,11 @@ function renderMessages() {
       data: { primitive: primitive.primitive, messageKey: key },
     });
     row.setAttribute('data-primitive', 'message');
+    row.dataset.rowIndex = String(rowIndex);
     row.messagePrimitive = primitive;
     if (unread) row.classList.add('unseen');
     if (selected) row.classList.add('selected');
+    if (key === state.focusedMessageKey) row.classList.add('focused');
 
     const controls = el('div', { class: 'msg-controls' });
     controls.onclick = (event) => event.stopPropagation();
@@ -1943,10 +2136,21 @@ function renderMessages() {
     selectBox.className = 'msg-select';
     selectBox.checked = selected;
     selectBox.setAttribute('aria-label', `Select ${primitive.state.subject || 'message'}`);
-    selectBox.onclick = (event) => event.stopPropagation();
+    // Capture shift state on click (onchange doesn't carry modifier keys).
+    let rangeExtend = false;
+    selectBox.onclick = (event) => {
+      event.stopPropagation();
+      rangeExtend = event.shiftKey && state.lastSelectedIndex >= 0;
+    };
     selectBox.onchange = (event) => {
       event.stopPropagation();
-      toggleMessageSelection(m, event.target.checked, row);
+      const checked = event.target.checked;
+      if (rangeExtend) {
+        selectMessageRange(state.lastSelectedIndex, rowIndex, checked);
+      } else {
+        toggleMessageSelection(m, checked, row);
+      }
+      state.lastSelectedIndex = rowIndex;
     };
     controls.appendChild(selectBox);
 
@@ -2281,9 +2485,12 @@ function renderReader() {
     const rendered = sanitizeEmailHtml(msg.html_body, msg, state.loadRemoteImages);
     renderRemoteImageControl(body, rendered.remoteBlocked);
     const frame = document.createElement('iframe');
-    frame.setAttribute('sandbox', ''); // strict sandbox: no scripts, no forms, no same-origin
+    // Same-origin is granted for height measurement only; scripts/forms/top-nav
+    // stay blocked (see file header). Email-controlled code never runs.
+    frame.setAttribute('sandbox', 'allow-same-origin');
     frame.className = 'email-frame';
     frame.srcdoc = rendered.html;
+    frame.addEventListener('load', () => sizeReaderFrameToContent(frame));
     body.appendChild(frame);
   } else if (msg.text_body) {
     body.appendChild(el('pre', { text: msg.text_body }));
@@ -2322,6 +2529,37 @@ function renderReader() {
   }
 
   $('reader').classList.add('show');
+}
+
+// Shrink/grow the HTML email iframe to fit its rendered content (Gmail-style),
+// so short messages don't sit inside a tall empty box. Clamped to a sane max
+// so enormous newsletters still scroll within the reader rather than the page.
+function sizeReaderFrameToContent(frame) {
+  try {
+    const doc = frame.contentDocument || frame.contentWindow?.document;
+    if (!doc || !doc.documentElement) return;
+    // Neutralize the CSS min-height/height first and collapse the frame, so
+    // scrollHeight reflects the TRUE content height rather than the forced
+    // viewport height the CSS would otherwise report back.
+    frame.style.minHeight = '0';
+    frame.style.height = '0px';
+    void frame.offsetHeight; // force reflow before measuring
+    const contentHeight = Math.max(
+      doc.documentElement.scrollHeight,
+      doc.body ? doc.body.scrollHeight : 0,
+    );
+    if (!contentHeight) {
+      frame.style.height = '';
+      frame.style.minHeight = '';
+      return;
+    }
+    const clamped = Math.min(Math.max(contentHeight + 24, 120), 760);
+    frame.style.height = `${clamped}px`;
+  } catch (_) {
+    // Cross-origin or detached frame — restore the CSS default height.
+    frame.style.height = '';
+    frame.style.minHeight = '';
+  }
 }
 
 function formatSize(bytes) {
@@ -2573,6 +2811,13 @@ function setBodyFormat(format) {
 }
 
 function openComposer(mode = 'new', parent = null) {
+  // Reply/Reply-All require a parent message. Guard against being invoked
+  // (e.g. via keyboard shortcut) with nothing selected — fall back to a
+  // friendly toast instead of opening an empty "reply" with no recipient.
+  if ((mode === 'reply' || mode === 'reply-all') && !parent) {
+    toast('Open a message first to reply', '');
+    return;
+  }
   state.composeMode = mode;
   state.composeParent = parent;
   state.pendingAttachments = [];
@@ -2879,6 +3124,15 @@ function wireEvents() {
   $('btn-search').onclick = runSearch;
   $('btn-search-clear').onclick = clearSearch;
   $('search-input').onkeydown = (e) => { if (e.key === 'Enter') runSearch(); };
+
+  // Gmail-style keyboard shortcuts + discoverable cheat sheet.
+  document.addEventListener('keydown', handleGlobalKeydown);
+  const sheetClose = $('btn-shortcut-sheet-close');
+  if (sheetClose) sheetClose.onclick = () => toggleShortcutSheet(false);
+  const sheet = $('shortcut-sheet');
+  if (sheet) sheet.addEventListener('click', (e) => { if (e.target === sheet) toggleShortcutSheet(false); });
+  const hint = $('btn-shortcut-hint');
+  if (hint) hint.onclick = () => toggleShortcutSheet(true);
 }
 
 // ── Dashboard deep links ───────────────────────────────────────────

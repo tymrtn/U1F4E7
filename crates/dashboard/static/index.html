@@ -56,6 +56,7 @@
         <option value="">Select account...</option>
       </select>
       <button id="btn-compose" type="button" class="btn-primary text-xs">Compose</button>
+      <button id="btn-shortcut-hint" type="button" class="btn-ghost text-xs font-mono" title="Keyboard shortcuts (?)" aria-label="Show keyboard shortcuts">?</button>
       <div id="refresh-indicator" class="flex items-center gap-1.5 text-xs text-mid font-mono">
         <span class="w-1.5 h-1.5 rounded-full bg-accent pulse-dot"></span>
         <span id="last-refresh">idle</span>
@@ -289,6 +290,17 @@
       <button id="btn-snooze-confirm" type="button" class="btn-primary text-xs">Snooze</button>
       <button id="btn-snooze-cancel" type="button" class="btn-ghost text-xs">Cancel</button>
     </div>
+  </div>
+</div>
+
+<!-- Keyboard shortcut cheat sheet -->
+<div id="shortcut-sheet" class="shortcut-sheet" role="dialog" aria-modal="true" aria-labelledby="shortcut-sheet-title">
+  <div class="shortcut-sheet-card">
+    <div class="flex items-center justify-between mb-3">
+      <p id="shortcut-sheet-title" class="text-sm font-semibold">Keyboard shortcuts</p>
+      <button id="btn-shortcut-sheet-close" type="button" class="text-mid hover:text-ink" aria-label="Close">&times;</button>
+    </div>
+    <div id="shortcut-sheet-list" class="shortcut-sheet-list"></div>
   </div>
 </div>
 

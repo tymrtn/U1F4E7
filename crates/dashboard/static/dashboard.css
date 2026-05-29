@@ -621,6 +621,8 @@ body {
 .msg-row:last-child { border-bottom: none; }
 .msg-row:hover { background: #f7f6f3; }
 .msg-row.selected { background: #e8f5ee; }
+.msg-row.focused { box-shadow: inset 3px 0 0 0 var(--env-accent, #1a6b4a); background: #f0f6f2; }
+.msg-row.focused.selected { background: #e3f1e9; }
 .msg-row.unseen { background: #fffdf7; }
 .msg-row.selected.unseen { background: #eef8f1; }
 .msg-row.unseen .from,
@@ -1146,3 +1148,45 @@ body {
 #composer.show {
   display: flex;
 }
+
+/* Keyboard shortcut cheat sheet */
+.shortcut-sheet {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(10, 10, 10, 0.4);
+  align-items: center;
+  justify-content: center;
+}
+.shortcut-sheet.show { display: flex; }
+.shortcut-sheet-card {
+  background: var(--env-paper, #f7f6f3);
+  border: 1px solid var(--env-rule, #d9d7d1);
+  width: 420px;
+  max-width: calc(100vw - 2rem);
+  padding: 1.25rem;
+  box-shadow: 0 12px 40px rgba(10, 10, 10, 0.18);
+}
+.shortcut-sheet-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.375rem;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.8125rem;
+}
+.shortcut-key {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.6875rem;
+  min-width: 78px;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid var(--env-rule, #d9d7d1);
+  background: #fff;
+  text-align: center;
+  white-space: nowrap;
+}
+.shortcut-label { color: #525252; }
