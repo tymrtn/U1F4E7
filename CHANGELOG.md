@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-30
+
+The dashboard's interaction model is now fully baked: the half-wired
+controls from the Phase 1 shell either do what they imply or are hidden
+when they don't apply, and a Gmail-class keyboard/selection layer lands on
+top. Every interaction in this release was verified in-browser against a
+real cached-message dataset before shipping.
+
+### Added
+
+- **Gmail-style keyboard shortcuts** — `j`/`k` move the focused row,
+  `Enter`/`o` open it, `x` selects, `s` stars, `e` archives, `#` deletes,
+  `r`/`a` reply / reply-all, `c` composes, `/` focuses search, `Esc` closes
+  the topmost surface, and `?` toggles a discoverable cheat-sheet modal
+  (also reachable from the header). Shortcuts are suppressed while typing in
+  an input or while a modal is open. A single shortcut table drives both the
+  handler and the cheat sheet.
+- **Shift-click range selection** — selecting a row and shift-clicking
+  another toggles the whole contiguous range, matching Gmail.
+- **Focused message row** — the active row for keyboard navigation has a
+  visible affordance and scrolls into view.
+
+### Changed
+
+- **Contextual affordances are now a first-class rule.** Controls that have
+  no useful action in the current state are hidden rather than rendered
+  broken. The account "Reconnect" control only appears when an account is
+  actually unhealthy; the bulk toolbar collapses to a hint when nothing is
+  selected. Architectural status notes no longer leak into button labels or
+  accessible names.
+- **Star toggling persists to IMAP `\Flagged`** through the existing flags
+  endpoint, instead of being local-only.
+- **Account reconnect runs the real IMAP/SMTP `verify` flow** and refreshes
+  the health badge, instead of returning a "not wired yet" string.
+- **Bulk archive and delete are wired** to the existing per-message
+  endpoints with bounded concurrency, per-item failure reporting, and
+  terminal status summaries that auto-clear instead of lingering.
+- **HTML email reader auto-sizes to its content** (collapse-then-measure,
+  clamped to 760px) so short messages no longer sit inside a tall empty
+  box. The email iframe grants `allow-same-origin` solely for height
+  measurement; scripts/forms remain disabled and message HTML is still
+  sanitized, so no email-controlled code can run.
+- **Cache-missing accounts read as an unwarmed cache**, not a hard failure:
+  no false "all accounts failed" wall, no spurious Reconnect buttons, and a
+  clean single refresh CTA.
+
+### Fixed
+
+- Reply / Reply-All no longer open an empty composer when no message is
+  selected; they surface a friendly prompt instead.
+
+### Preserved
+
+- Agent Cockpit aggregate endpoints remain read-only — no live auth probes,
+  IMAP mutations, or draft sends from aggregate load. Per-account draft
+  actions stay the mutating surface.
+
 ## [0.9.0] — 2026-05-20
 
 ### Added
