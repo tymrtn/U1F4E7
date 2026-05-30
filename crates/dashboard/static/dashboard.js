@@ -47,7 +47,7 @@ const state = {
   starredMessages: new Set(),
   renderedMessageKeys: [],
   focusedMessageKey: null,
-  lastSelectedIndex: -1,
+  lastSelectedKey: null,
   bulkStatusTimer: null,
 };
 
@@ -846,8 +846,10 @@ function toggleFocusedSelection() {
   if (!m) return;
   const key = messageKey(m);
   const selected = !state.selectedMessages.has(key);
-  toggleMessageSelection(m, selected);
-  state.lastSelectedIndex = state.renderedMessageKeys.indexOf(key);
+  if (selected) state.selectedMessages.add(key);
+  else state.selectedMessages.delete(key);
+  state.lastSelectedKey = key;
+  // Single repaint — updateBulkToolbar runs inside renderMessages.
   renderMessages();
 }
 
@@ -2137,20 +2139,27 @@ function renderMessages() {
     selectBox.checked = selected;
     selectBox.setAttribute('aria-label', `Select ${primitive.state.subject || 'message'}`);
     // Capture shift state on click (onchange doesn't carry modifier keys).
+    // The anchor is stored as a message KEY, not a raw index, so it survives
+    // list re-sorts/re-renders — resolved to a live index at click time.
     let rangeExtend = false;
     selectBox.onclick = (event) => {
       event.stopPropagation();
-      rangeExtend = event.shiftKey && state.lastSelectedIndex >= 0;
+      rangeExtend = event.shiftKey
+        && state.lastSelectedKey != null
+        && state.renderedMessageKeys.includes(state.lastSelectedKey);
     };
     selectBox.onchange = (event) => {
       event.stopPropagation();
       const checked = event.target.checked;
-      if (rangeExtend) {
-        selectMessageRange(state.lastSelectedIndex, rowIndex, checked);
+      const anchorIndex = state.lastSelectedKey != null
+        ? state.renderedMessageKeys.indexOf(state.lastSelectedKey)
+        : -1;
+      if (rangeExtend && anchorIndex >= 0) {
+        selectMessageRange(anchorIndex, rowIndex, checked);
       } else {
         toggleMessageSelection(m, checked, row);
       }
-      state.lastSelectedIndex = rowIndex;
+      state.lastSelectedKey = key;
     };
     controls.appendChild(selectBox);
 
