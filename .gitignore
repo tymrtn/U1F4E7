@@ -8,3 +8,15 @@
 *.db-shm
 *.db-wal
 .DS_Store
+
+# Agent harness / working artifacts — never committed
+.clawpatch/
+_internal/
+worktrees/
+.hermes/
+
+# Out-of-scope subprojects (tracked separately or deferred)
+apps/
+
+# Stray scratch files
+*.tif

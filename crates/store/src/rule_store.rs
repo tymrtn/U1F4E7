@@ -7,6 +7,15 @@ use crate::models::Rule;
 use rusqlite::params;
 use uuid::Uuid;
 
+fn is_sieve_exportable(match_expr: &str, action: &str) -> bool {
+    const LOCAL_MATCH_KEYS: [&str; 4] =
+        ["has_tag", "score_above", "score_below", "contact_has_tag"];
+    const LOCAL_ACTION_KEYS: [&str; 4] = ["webhook", "snooze", "unsubscribe", "add_tag"];
+
+    !LOCAL_MATCH_KEYS.iter().any(|key| match_expr.contains(key))
+        && !LOCAL_ACTION_KEYS.iter().any(|key| action.contains(key))
+}
+
 impl Database {
     pub fn create_rule(
         &self,
@@ -17,25 +26,32 @@ impl Database {
         priority: i64,
         stop: bool,
     ) -> Result<Rule> {
-        let id = Uuid::new_v4().to_string();
+        self.create_rule_with_enabled(account_id, name, match_expr, action, priority, stop, true)
+    }
 
-        // Compute sieve_exportable: true if match_expr only uses from/to/subject
-        // (no tags, no scores) and action is IMAP-native (no webhook/snooze/etc).
-        // Simple heuristic: check if the JSON contains non-exportable markers.
-        let sieve_exportable = !match_expr.contains("has_tag")
-            && !match_expr.contains("score_above")
-            && !match_expr.contains("score_below")
-            && !action.contains("webhook");
+    pub fn create_rule_with_enabled(
+        &self,
+        account_id: &str,
+        name: &str,
+        match_expr: &str,
+        action: &str,
+        priority: i64,
+        stop: bool,
+        enabled: bool,
+    ) -> Result<Rule> {
+        let id = Uuid::new_v4().to_string();
+        let sieve_exportable = is_sieve_exportable(match_expr, action);
 
         self.conn().execute(
-            "INSERT INTO rules (id, account_id, name, match_expr, action, priority, stop, sieve_exportable)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO rules (id, account_id, name, match_expr, action, enabled, priority, stop, sieve_exportable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 account_id,
                 name,
                 match_expr,
                 action,
+                enabled as i32,
                 priority,
                 stop as i32,
                 sieve_exportable as i32,
@@ -238,5 +254,49 @@ mod tests {
 
         let not_found = db.find_rule_by_name("acct1", "nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn reviewable_rule_can_be_created_disabled() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule_with_enabled(
+                "acct1",
+                "Agent suggestion",
+                r#"{"from":"*@notifications.example"}"#,
+                r#"{"move":"Archive"}"#,
+                100,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(!rule.enabled);
+        assert_eq!(db.list_enabled_rules("acct1").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sieve_exportable_false_for_local_only_actions_and_contact_tags() {
+        let db = Database::open_memory().unwrap();
+        let cases = [
+            (
+                "contact",
+                r#"{"contact_has_tag":"vip"}"#,
+                r#"{"move":"VIP"}"#,
+            ),
+            ("snooze", r#"{"from":"*@x"}"#, r#"{"snooze":"tomorrow"}"#),
+            ("unsubscribe", r#"{"from":"*@x"}"#, r#""unsubscribe""#),
+            ("tag", r#"{"from":"*@x"}"#, r#"{"add_tag":"processed"}"#),
+            (
+                "webhook",
+                r#"{"from":"*@x"}"#,
+                r#"{"webhook":"https://example.com"}"#,
+            ),
+        ];
+        for (name, match_expr, action) in cases {
+            let rule = db
+                .create_rule("acct1", name, match_expr, action, 100, false)
+                .unwrap();
+            assert!(!rule.sieve_exportable, "{name} should be local-only");
+        }
     }
 }

@@ -1,0 +1,1585 @@
+{
+  "compatibility": {
+    "breaking_change_policy": "Field removals, required-field additions, type changes, and semantic renames require a new schema id. New optional fields are backward-compatible.",
+    "output_contract": "Existing CLI --json output is not changed by this contract export.",
+    "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval."
+  },
+  "consumers": [
+    "cli",
+    "mcp",
+    "hermes",
+    "codex"
+  ],
+  "mcp_tools": [
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "List messages in a mailbox folder. Returns message summaries with UID, from, subject, date, and flags.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address; default account if omitted",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder name",
+            "type": "string"
+          },
+          "limit": {
+            "default": 25,
+            "description": "Maximum messages to return",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "inbox"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Read a full email message by UID. Returns headers, text body, HTML body, and attachment metadata. Does not mark the message as read.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "name": "read"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Search messages using IMAP search syntax. Examples: 'FROM boss@company.com', 'SUBJECT invoice', 'UNSEEN'.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "limit": {
+            "default": 25,
+            "description": "Maximum results",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "IMAP search query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "allow_recipient": {
+            "items": {
+              "description": "Allowed email address or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bcc": {
+            "description": "BCC recipients",
+            "type": "string"
+          },
+          "body": {
+            "description": "Plain text body",
+            "type": "string"
+          },
+          "cc": {
+            "description": "CC recipients",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required when send_mode is confirm-send",
+            "type": "boolean"
+          },
+          "from": {
+            "description": "Override sender identity",
+            "type": "string"
+          },
+          "html": {
+            "description": "HTML body sent alongside text",
+            "type": "string"
+          },
+          "reply_to": {
+            "description": "Reply-To address",
+            "type": "string"
+          },
+          "send_mode": {
+            "default": "draft-only",
+            "description": "MCP send safety mode; defaults to draft-only for agent contexts",
+            "enum": [
+              "draft-only",
+              "confirm-send",
+              "allowlisted-send",
+              "autonomous-send"
+            ],
+            "type": "string"
+          },
+          "subject": {
+            "description": "Email subject",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient email address",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "name": "send"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "allow_recipient": {
+            "items": {
+              "description": "Allowed recipient email or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "body": {
+            "description": "Reply text body",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required when send_mode is confirm-send",
+            "type": "boolean"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of original message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Reply HTML body",
+            "type": "string"
+          },
+          "reply_all": {
+            "default": false,
+            "description": "Reply to all recipients",
+            "type": "boolean"
+          },
+          "send_mode": {
+            "default": "draft-only",
+            "description": "MCP reply safety mode",
+            "enum": [
+              "draft-only",
+              "confirm-send",
+              "allowlisted-send",
+              "autonomous-send"
+            ],
+            "type": "string"
+          },
+          "uid": {
+            "description": "UID of message to reply to",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "reply"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Move a message to another IMAP folder.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "from_folder": {
+            "default": "INBOX",
+            "description": "Source folder",
+            "type": "string"
+          },
+          "to_folder": {
+            "description": "Destination folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "to_folder"
+        ],
+        "type": "object"
+      },
+      "name": "move_message"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Add or remove IMAP flags on a message. Common flags: \\Seen, \\Flagged, \\Answered, \\Draft, \\Deleted.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "action": {
+            "description": "Add or remove the flag",
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "type": "string"
+          },
+          "flag": {
+            "description": "IMAP flag name",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "action",
+          "flag"
+        ],
+        "type": "object"
+      },
+      "name": "flag"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "List IMAP folders with message counts (exists/unseen).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "folders"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Set tags and scores on a message. Tags are freeform strings, scores are named dimensions with float values (0.0-1.0). Used by the rules engine.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "scores": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Score dimensions",
+            "type": "object"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "name": "tag"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Manage contacts. Supports list, add, show, and tag operations.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "action": {
+            "description": "Contact operation",
+            "enum": [
+              "list",
+              "add",
+              "show",
+              "tag",
+              "untag"
+            ],
+            "type": "string"
+          },
+          "email": {
+            "description": "Contact email address",
+            "type": "string"
+          },
+          "name": {
+            "description": "Contact name",
+            "type": "string"
+          },
+          "notes": {
+            "description": "Contact notes",
+            "type": "string"
+          },
+          "tag": {
+            "description": "Contact tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "contacts"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "List configured email accounts.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "accounts"
+    }
+  ],
+  "schema": "envelope.agent_contract.v1",
+  "surfaces": [
+    {
+      "cli": {
+        "command": "envelope inbox --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Message summary fields mirror transport EmailSummary serialization.",
+        "Agent/CLI limit is capped at 1000; dashboard endpoints keep their own lower caps."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address; default account if omitted",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder name",
+            "type": "string"
+          },
+          "limit": {
+            "default": 25,
+            "description": "Maximum messages to return",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "inbox"
+      },
+      "name": "inbox",
+      "output_schema": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "date": {
+              "description": "Message date",
+              "type": "string"
+            },
+            "flags": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "from_addr": {
+              "description": "Sender address",
+              "type": "string"
+            },
+            "message_id": {
+              "description": "Message-ID header when available",
+              "type": "string"
+            },
+            "subject": {
+              "description": "Subject",
+              "type": "string"
+            },
+            "uid": {
+              "description": "Message UID",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope read <uid> --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Read uses non-mutating fetch behavior and must not mark messages read."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "read"
+      },
+      "name": "read",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachments": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "date": {
+            "description": "Message date",
+            "type": "string"
+          },
+          "from_addr": {
+            "description": "Sender address",
+            "type": "string"
+          },
+          "html_body": {
+            "description": "HTML body",
+            "type": "string"
+          },
+          "in_reply_to": {
+            "description": "In-Reply-To header when available",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "Message-ID header when available",
+            "type": "string"
+          },
+          "references": {
+            "description": "References header when available",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject",
+            "type": "string"
+          },
+          "text_body": {
+            "description": "Plain-text body",
+            "type": "string"
+          },
+          "to_addr": {
+            "description": "Recipient address",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope search <query> --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Search syntax is passed through to the IMAP server.",
+        "Agent/CLI limit is capped at 1000; dashboard endpoints keep their own lower caps."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "limit": {
+            "default": 25,
+            "description": "Maximum results",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "IMAP search query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "search"
+      },
+      "name": "search",
+      "output_schema": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "date": {
+              "description": "Message date",
+              "type": "string"
+            },
+            "flags": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "from_addr": {
+              "description": "Sender address",
+              "type": "string"
+            },
+            "message_id": {
+              "description": "Message-ID header when available",
+              "type": "string"
+            },
+            "subject": {
+              "description": "Subject",
+              "type": "string"
+            },
+            "uid": {
+              "description": "Message UID",
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope send --to --subject --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "No output fields contain SMTP credentials or attachment bytes."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "allow_recipient": {
+            "items": {
+              "description": "Allowed email address or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bcc": {
+            "description": "BCC recipients",
+            "type": "string"
+          },
+          "body": {
+            "description": "Plain text body",
+            "type": "string"
+          },
+          "cc": {
+            "description": "CC recipients",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required when send_mode is confirm-send",
+            "type": "boolean"
+          },
+          "from": {
+            "description": "Override sender identity",
+            "type": "string"
+          },
+          "html": {
+            "description": "HTML body sent alongside text",
+            "type": "string"
+          },
+          "reply_to": {
+            "description": "Reply-To address",
+            "type": "string"
+          },
+          "send_mode": {
+            "default": "autonomous-send",
+            "description": "CLI send safety mode; MCP defaults this field to draft-only",
+            "enum": [
+              "draft-only",
+              "confirm-send",
+              "allowlisted-send",
+              "autonomous-send"
+            ],
+            "type": "string"
+          },
+          "subject": {
+            "description": "Email subject",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient email address",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "send"
+      },
+      "name": "send",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "draft_id": {
+            "description": "Local draft id when scheduled or draft-only",
+            "type": "string"
+          },
+          "error": {
+            "description": "Stable denial object for denied sends",
+            "type": "object"
+          },
+          "message_id": {
+            "description": "SMTP Message-ID when sent immediately",
+            "type": "string"
+          },
+          "send_mode": {
+            "description": "Applied send safety mode when policy was evaluated",
+            "type": "string"
+          },
+          "sent": {
+            "description": "MCP send/reply result flag when available",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "sent, scheduled, drafted, or denied",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient address",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope thread show/list/build --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Evidence thread expansion remains header-based and bounded."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Maximum threads/messages",
+            "type": "integer"
+          },
+          "uid": {
+            "description": "Message UID for thread show/build source",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "thread",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "message_count": {
+            "description": "Message count",
+            "type": "integer"
+          },
+          "messages": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "subject": {
+            "description": "Normalized thread subject",
+            "type": "string"
+          },
+          "thread_id": {
+            "description": "Stable local thread identifier",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope draft create/list/send/discard --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Agent send flows should draft first, then send only after explicit human approval."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "bcc": {
+            "description": "BCC recipients",
+            "type": "string"
+          },
+          "body": {
+            "description": "Plain-text draft body",
+            "type": "string"
+          },
+          "cc": {
+            "description": "CC recipients",
+            "type": "string"
+          },
+          "in_reply_to": {
+            "description": "Optional message UID or Message-ID to reply to",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Draft subject",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient email address",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "draft",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          },
+          "imap_uid": {
+            "description": "IMAP Drafts UID when present",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message_id": {
+            "description": "SMTP Message-ID for sent drafts",
+            "type": "string"
+          },
+          "status": {
+            "description": "created, sent, discarded, or stored status",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope watch --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Watch emits newline-delimited JSON events; consumers must parse per line."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder to watch",
+            "type": "string"
+          },
+          "run_rules": {
+            "default": false,
+            "description": "Run rules against new messages when implemented",
+            "type": "boolean"
+          },
+          "webhook": {
+            "description": "Optional URL receiving the same JSON event",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "watch",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "description": "Account id",
+            "type": "string"
+          },
+          "event_id": {
+            "description": "Local event id",
+            "type": "string"
+          },
+          "event_type": {
+            "description": "new_message or otp_detected",
+            "type": "string"
+          },
+          "folder": {
+            "description": "Folder",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Stable event dedupe key",
+            "type": "string"
+          },
+          "secure_payload": {
+            "description": "Redacted structured payload; OTP values are not emitted in watch events",
+            "type": "object"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope code --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Watch/event payloads redact OTP value; envelope code may return it."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "from": {
+            "description": "Sender address/domain substring filter",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject substring filter",
+            "type": "string"
+          },
+          "wait": {
+            "default": 120,
+            "description": "Seconds to wait before timeout",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "otp",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "description": "Verification code returned only by explicit OTP command",
+            "type": "string"
+          },
+          "confidence": {
+            "description": "Extractor confidence 0.0-1.0",
+            "type": "number"
+          },
+          "source_pattern": {
+            "description": "Extractor pattern id",
+            "type": "string"
+          },
+          "source_uid": {
+            "description": "Message UID containing code",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope rule create/list/test/run/export --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Webhook actions must redact secrets in display, logs, docs, and tests."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "action": {
+            "description": "Rule action expression",
+            "type": "string"
+          },
+          "match_from": {
+            "description": "From substring predicate",
+            "type": "string"
+          },
+          "match_subject": {
+            "description": "Subject substring predicate",
+            "type": "string"
+          },
+          "match_tag": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "match_to": {
+            "description": "To substring predicate",
+            "type": "string"
+          },
+          "name": {
+            "description": "Rule name",
+            "type": "string"
+          },
+          "priority": {
+            "default": 100,
+            "description": "Rule priority",
+            "type": "integer"
+          },
+          "stop": {
+            "default": false,
+            "description": "Stop after match",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "rules",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "actions": {
+            "description": "Actions taken by run",
+            "type": "integer"
+          },
+          "log": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "matches": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "processed": {
+            "description": "Messages processed by run",
+            "type": "integer"
+          },
+          "rule_id": {
+            "description": "Rule id",
+            "type": "string"
+          },
+          "rule_name": {
+            "description": "Rule name",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope evidence collect/verify --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "Collection must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files remain canonical evidence."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "include_thread": {
+            "default": false,
+            "description": "Include bounded header-linked thread expansion",
+            "type": "boolean"
+          },
+          "max_thread_messages": {
+            "default": 500,
+            "description": "Maximum messages in thread expansion",
+            "type": "integer"
+          },
+          "out": {
+            "description": "Output bundle path",
+            "type": "string"
+          },
+          "query": {
+            "description": "IMAP search query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "out"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "evidence",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "checksums": {
+            "description": "Manifest/index/hash material",
+            "type": "object"
+          },
+          "manifest_path": {
+            "description": "Manifest path",
+            "type": "string"
+          },
+          "message_count": {
+            "description": "Canonical .eml count",
+            "type": "integer"
+          },
+          "schema": {
+            "description": "Evidence manifest schema id",
+            "type": "string"
+          },
+          "status": {
+            "description": "collected or verified",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "allow_recipient": {
+            "items": {
+              "description": "Allowed recipient email or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "body": {
+            "description": "Reply text body",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required when send_mode is confirm-send",
+            "type": "boolean"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of original message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Reply HTML body",
+            "type": "string"
+          },
+          "reply_all": {
+            "default": false,
+            "description": "Reply to all recipients",
+            "type": "boolean"
+          },
+          "send_mode": {
+            "default": "draft-only",
+            "description": "MCP reply safety mode",
+            "enum": [
+              "draft-only",
+              "confirm-send",
+              "allowlisted-send",
+              "autonomous-send"
+            ],
+            "type": "string"
+          },
+          "uid": {
+            "description": "UID of message to reply to",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "body"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "reply"
+      },
+      "name": "reply",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "from_folder": {
+            "default": "INBOX",
+            "description": "Source folder",
+            "type": "string"
+          },
+          "to_folder": {
+            "description": "Destination folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "to_folder"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "move_message"
+      },
+      "name": "move_message",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "action": {
+            "description": "Add or remove the flag",
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "type": "string"
+          },
+          "flag": {
+            "description": "IMAP flag name",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "action",
+          "flag"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "flag"
+      },
+      "name": "flag",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "folders"
+      },
+      "name": "folders",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "scores": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Score dimensions",
+            "type": "object"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "tag"
+      },
+      "name": "tag",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "action": {
+            "description": "Contact operation",
+            "enum": [
+              "list",
+              "add",
+              "show",
+              "tag",
+              "untag"
+            ],
+            "type": "string"
+          },
+          "email": {
+            "description": "Contact email address",
+            "type": "string"
+          },
+          "name": {
+            "description": "Contact name",
+            "type": "string"
+          },
+          "notes": {
+            "description": "Contact notes",
+            "type": "string"
+          },
+          "tag": {
+            "description": "Contact tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "contacts"
+      },
+      "name": "contacts",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "accounts"
+      },
+      "name": "accounts",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    }
+  ]
+}

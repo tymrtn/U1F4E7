@@ -10,13 +10,14 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use envelope_email_store::{Database, Message, Rule};
+use envelope_email_store::{Database, Message, MessageSummary, Rule};
 use envelope_email_transport::rules::{self, Action, MessageContext};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
 use crate::state::AppState;
+use crate::ui_paths::message_dashboard_path;
 
 #[derive(Deserialize)]
 pub struct RuleTestQuery {
@@ -32,7 +33,7 @@ fn default_run_limit() -> u32 {
     50
 }
 
-fn sanitized_action_json(action: &str) -> String {
+pub(crate) fn sanitized_action_json(action: &str) -> String {
     match serde_json::from_str::<Action>(action) {
         Ok(Action::Webhook(_)) => serde_json::to_string(&Action::Webhook("[redacted]".to_string()))
             .unwrap_or_else(|_| "{\"webhook\":\"[redacted]\"}".to_string()),
@@ -162,11 +163,132 @@ pub async fn test_message(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RulePreviewRequest {
+    #[serde(default = "default_folder")]
+    pub folder: String,
+    #[serde(default = "default_run_limit")]
+    pub limit: u32,
+}
+
+/// Non-mutating blast-radius preview for one rule.
+pub async fn preview(
+    State(state): State<AppState>,
+    Path((account_id, rule_id)): Path<(String, String)>,
+    Json(req): Json<RulePreviewRequest>,
+) -> impl IntoResponse {
+    let folder = req.folder.trim().to_string();
+    if folder.is_empty() {
+        return (StatusCode::BAD_REQUEST, "folder is required").into_response();
+    }
+    if !(1..=1000).contains(&req.limit) {
+        return (StatusCode::BAD_REQUEST, "limit must be between 1 and 1000").into_response();
+    }
+
+    let rule = {
+        let db = state.db.lock().await;
+        match db.get_rule(&rule_id) {
+            Ok(Some(rule)) if rule.account_id == account_id => rule,
+            Ok(Some(_)) | Ok(None) => {
+                return (StatusCode::NOT_FOUND, "rule not found").into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("rules: {e}")).into_response();
+            }
+        }
+    };
+    let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
+        Ok(expr) => expr,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid match expression: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response(),
+    };
+
+    let summaries = {
+        let mut client = client_arc.lock().await;
+        match envelope_email_transport::imap::fetch_folder_summaries_read_only(
+            &mut client,
+            &folder,
+            req.limit,
+        )
+        .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                state.evict_imap(&account_id).await;
+                return (StatusCode::BAD_GATEWAY, format!("preview fetch: {e}")).into_response();
+            }
+        }
+    };
+
+    let mut matched = 0u32;
+    let mut unread_matched = 0u32;
+    let mut samples = Vec::new();
+    {
+        let db = state.db.lock().await;
+        for summary in &summaries {
+            let ctx = match build_summary_context(summary, &db, &account_id) {
+                Ok(ctx) => ctx,
+                Err(_) => continue,
+            };
+            if !rules::evaluate(&match_expr, &ctx) {
+                continue;
+            }
+            matched += 1;
+            let unread = !summary
+                .flags
+                .iter()
+                .any(|flag| flag.to_lowercase().contains("seen"));
+            if unread {
+                unread_matched += 1;
+            }
+            if samples.len() < 5 {
+                samples.push(json!({
+                    "uid": summary.uid,
+                    "from": summary.from_addr,
+                    "subject": summary.subject,
+                    "date": summary.date,
+                    "unread": unread,
+                    "message_link": message_dashboard_path(&account_id, &folder, summary.uid),
+                }));
+            }
+        }
+    }
+
+    Json(json!({
+        "rule_id": rule.id,
+        "rule_name": rule.name,
+        "account_id": account_id,
+        "folder": folder,
+        "limit": req.limit,
+        "processed": summaries.len(),
+        "matched": matched,
+        "unread_matched": unread_matched,
+        "mutated": false,
+        "action": sanitized_action_json(&rule.action),
+        "enabled": rule.enabled,
+        "samples": samples,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleRunRequest {
     #[serde(default = "default_folder")]
     pub folder: String,
     #[serde(default = "default_run_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 /// Batch apply enabled rules to messages in a folder (mutating).
@@ -185,6 +307,13 @@ pub async fn run_enabled(
     }
     if !(1..=200).contains(&req.limit) {
         return (StatusCode::BAD_REQUEST, "limit must be between 1 and 200").into_response();
+    }
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            "rules run mutates the mailbox; preview/review first and send confirm=true",
+        )
+            .into_response();
     }
 
     let enabled_rules = {
@@ -283,6 +412,16 @@ pub async fn run_enabled(
                     {
                         let db = state.db.lock().await;
                         let _ = db.increment_rule_hit(&rule.id);
+                        let _ = db.record_rule_run(envelope_email_store::RuleRunAuditInput {
+                            account_id: &account_id,
+                            rule_id: Some(&rule.id),
+                            rule_name: Some(&rule.name),
+                            uid: Some(uid as i64),
+                            folder: Some(&folder),
+                            action: Some(desc),
+                            status: "ok",
+                            error: None,
+                        });
                     }
                     action_log.push(json!({
                         "uid": uid,
@@ -292,6 +431,20 @@ pub async fn run_enabled(
                     }));
                 }
                 Err(e) => {
+                    {
+                        let db = state.db.lock().await;
+                        let err = format!("{e}");
+                        let _ = db.record_rule_run(envelope_email_store::RuleRunAuditInput {
+                            account_id: &account_id,
+                            rule_id: Some(&rule.id),
+                            rule_name: Some(&rule.name),
+                            uid: Some(uid as i64),
+                            folder: Some(&folder),
+                            action: None,
+                            status: "error",
+                            error: Some(&err),
+                        });
+                    }
                     action_log.push(json!({
                         "uid": uid,
                         "rule": rule.name,
@@ -323,6 +476,9 @@ async fn execute_action(
     rule_name: Option<&str>,
     ctx: Option<&MessageContext>,
 ) -> anyhow::Result<String> {
+    if let Some(skip) = action.local_execution_skip_reason() {
+        return Ok(format!("skipped: {skip}"));
+    }
     match action {
         Action::Move(dest) => {
             envelope_email_transport::imap::move_message(client, uid, folder, dest)
@@ -380,6 +536,11 @@ async fn execute_action(
                 Err(_) => Err(anyhow::anyhow!("webhook delivery failed")),
             }
         }
+        // Server-side Sieve actions are intercepted at the top of this
+        // function — these arms are unreachable but kept exhaustive.
+        Action::Reject(_) | Action::Ereject(_) => {
+            Ok(format!("skipped: {}", rules::SERVER_SIDE_ONLY_SKIP_REASON))
+        }
     }
 }
 
@@ -420,9 +581,64 @@ fn build_message_context(
     })
 }
 
+fn build_summary_context(
+    summary: &MessageSummary,
+    db: &Database,
+    account_id: &str,
+) -> anyhow::Result<MessageContext> {
+    let message_id = summary.message_id.as_deref().unwrap_or("");
+
+    let tags: Vec<String> = if message_id.is_empty() {
+        Vec::new()
+    } else {
+        db.get_tags(account_id, message_id)?
+            .into_iter()
+            .map(|t| t.tag)
+            .collect()
+    };
+
+    let scores: HashMap<String, f64> = if message_id.is_empty() {
+        HashMap::new()
+    } else {
+        db.get_scores(account_id, message_id)?
+            .into_iter()
+            .map(|s| (s.dimension, s.value))
+            .collect()
+    };
+
+    let contact_tags = db.get_contact_tags(account_id, &summary.from_addr)?;
+
+    Ok(MessageContext {
+        from_addr: summary.from_addr.clone(),
+        to_addr: summary.to_addr.clone(),
+        subject: summary.subject.clone(),
+        tags,
+        scores,
+        contact_tags,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitized_action_json;
+    use super::{RuleRunRequest, sanitized_action_json};
+
+    #[test]
+    fn rule_run_request_requires_explicit_confirmation_by_default() {
+        let req: RuleRunRequest = serde_json::from_value(serde_json::json!({
+            "folder": "INBOX",
+            "limit": 25,
+        }))
+        .unwrap();
+        assert!(!req.confirm);
+
+        let confirmed: RuleRunRequest = serde_json::from_value(serde_json::json!({
+            "folder": "INBOX",
+            "limit": 25,
+            "confirm": true,
+        }))
+        .unwrap();
+        assert!(confirmed.confirm);
+    }
 
     #[test]
     fn sanitized_action_json_redacts_webhook_urls() {

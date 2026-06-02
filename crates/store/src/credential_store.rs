@@ -221,6 +221,14 @@ pub fn get_or_create_passphrase(backend: CredentialBackend) -> Result<String> {
     }
 }
 
+/// Read the existing master passphrase without creating or mutating credential storage.
+pub fn get_passphrase(backend: CredentialBackend) -> Result<String> {
+    match backend {
+        CredentialBackend::File => file_get_passphrase(),
+        CredentialBackend::Keychain => keychain_get_passphrase(),
+    }
+}
+
 /// File backend: the passphrase is deterministic from the machine seed or env var,
 /// but we also store a random passphrase in the credential file for DB encryption.
 /// This way `get_or_create_passphrase` returns a stable passphrase across calls.
@@ -246,6 +254,15 @@ fn file_get_or_create_passphrase() -> Result<String> {
     Ok(passphrase)
 }
 
+fn file_get_passphrase() -> Result<String> {
+    let master = file_master_key()?;
+    let cf = read_credential_file()?;
+    let encrypted = cf.entries.get(MASTER_KEY_ENTRY).ok_or_else(|| {
+        StoreError::Config("credential file does not contain an Envelope master key".to_string())
+    })?;
+    decrypt_value(encrypted, &master)
+}
+
 /// Keychain backend: uses OS keyring.
 fn keychain_get_or_create_passphrase() -> Result<String> {
     #[cfg(feature = "keychain")]
@@ -266,6 +283,27 @@ fn keychain_get_or_create_passphrase() -> Result<String> {
             }
             Err(e) => Err(StoreError::Keyring(e.to_string())),
         }
+    }
+
+    #[cfg(not(feature = "keychain"))]
+    {
+        Err(StoreError::Config(
+            "keychain backend requires the 'keychain' cargo feature. \
+             Rebuild with: cargo build --features keychain\n\
+             Or use the default file backend: --credential-store file"
+                .to_string(),
+        ))
+    }
+}
+
+fn keychain_get_passphrase() -> Result<String> {
+    #[cfg(feature = "keychain")]
+    {
+        let entry = keyring::Entry::new(SERVICE_NAME, MASTER_KEY_ENTRY)
+            .map_err(|e| StoreError::Keyring(e.to_string()))?;
+        entry
+            .get_password()
+            .map_err(|e| StoreError::Keyring(e.to_string()))
     }
 
     #[cfg(not(feature = "keychain"))]

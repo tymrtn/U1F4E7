@@ -65,6 +65,18 @@ pub struct MessageHeader {
     pub size: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PeekHeaderSummary {
+    pub uid: u32,
+    pub from_addr: Option<String>,
+    pub subject: Option<String>,
+    pub date: Option<String>,
+}
+
+pub const QUICKSTART_PEEK_FETCH_DESCRIPTOR: &str =
+    "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])";
+pub const FETCH_SUMMARY_DESCRIPTOR: &str = "(UID FLAGS ENVELOPE RFC822.SIZE)";
+
 #[derive(Debug, Clone, Copy)]
 pub struct SelectedMailbox {
     pub exists: u32,
@@ -235,6 +247,9 @@ pub async fn fetch_inbox(
     limit: u32,
 ) -> Result<Vec<MessageSummary>, ImapError> {
     validate_imap_input(folder)?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
 
     let mailbox = client
         .session
@@ -256,7 +271,7 @@ pub async fn fetch_inbox(
 
     let messages = client
         .session
-        .fetch(&range, "(UID FLAGS ENVELOPE RFC822.SIZE)")
+        .fetch(&range, FETCH_SUMMARY_DESCRIPTOR)
         .await
         .map_err(|e| ImapError::Protocol(format!("FETCH {range}: {e}")))?;
 
@@ -264,49 +279,91 @@ pub async fn fetch_inbox(
     let mut stream = messages;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(fetch) => {
-                let uid = fetch.uid.unwrap_or(0);
-                let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-                let size = fetch.size.unwrap_or(0);
-
-                let (from_addr, to_addr, subject, date, message_id) =
-                    if let Some(env) = fetch.envelope() {
-                        let from = imap_envelope_addresses(&env.from);
-                        let to = imap_envelope_addresses(&env.to);
-                        let subj = env
-                            .subject
-                            .as_ref()
-                            .map(|s| decode_rfc2047(s))
-                            .unwrap_or_default();
-                        let dt = env
-                            .date
-                            .as_ref()
-                            .map(|d| String::from_utf8_lossy(d).to_string());
-                        let mid = env
-                            .message_id
-                            .as_ref()
-                            .map(|m| String::from_utf8_lossy(m).to_string());
-                        (from, to, subj, dt, mid)
-                    } else {
-                        (String::new(), String::new(), String::new(), None, None)
-                    };
-
-                summaries.push(MessageSummary {
-                    uid,
-                    message_id,
-                    from_addr,
-                    to_addr,
-                    subject,
-                    date,
-                    flags,
-                    size,
-                });
-            }
+            Ok(fetch) => summaries.push(message_summary_from_fetch(&fetch)),
             Err(e) => return Err(ImapError::Protocol(format!("FETCH parse error: {e}"))),
         }
     }
 
     Ok(summaries)
+}
+
+/// Fetch message summaries after opening the folder read-only with IMAP
+/// `EXAMINE`.
+///
+/// This returns the same envelope-only shape as [`fetch_inbox`] without
+/// selecting the mailbox read-write. It is intended for dashboard and aggregate
+/// views that only need list metadata and must not mutate mailbox state.
+pub async fn fetch_folder_summaries_read_only(
+    client: &mut ImapClient,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, ImapError> {
+    let selected = examine_folder_info(client, folder).await?;
+    if selected.exists == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let start = if selected.exists > limit {
+        selected.exists - limit + 1
+    } else {
+        1
+    };
+    let range = format!("{start}:{}", selected.exists);
+
+    let messages = client
+        .session
+        .fetch(&range, FETCH_SUMMARY_DESCRIPTOR)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("FETCH {range}: {e}")))?;
+
+    let mut summaries = Vec::new();
+    let mut stream = messages;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(fetch) => summaries.push(message_summary_from_fetch(&fetch)),
+            Err(e) => return Err(ImapError::Protocol(format!("FETCH parse error: {e}"))),
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
+    let uid = fetch.uid.unwrap_or(0);
+    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
+    let size = fetch.size.unwrap_or(0);
+
+    let (from_addr, to_addr, subject, date, message_id) = if let Some(env) = fetch.envelope() {
+        let from = imap_envelope_addresses(&env.from);
+        let to = imap_envelope_addresses(&env.to);
+        let subj = env
+            .subject
+            .as_ref()
+            .map(|s| decode_rfc2047(s))
+            .unwrap_or_default();
+        let dt = env
+            .date
+            .as_ref()
+            .map(|d| String::from_utf8_lossy(d).to_string());
+        let mid = env
+            .message_id
+            .as_ref()
+            .map(|m| String::from_utf8_lossy(m).to_string());
+        (from, to, subj, dt, mid)
+    } else {
+        (String::new(), String::new(), String::new(), None, None)
+    };
+
+    MessageSummary {
+        uid,
+        message_id,
+        from_addr,
+        to_addr,
+        subject,
+        date,
+        flags,
+        size,
+    }
 }
 
 /// Decode RFC 2047 encoded words in IMAP ENVELOPE fields.
@@ -729,6 +786,60 @@ pub(crate) fn missing_body_protocol_error(
     ImapError::Protocol(format!(
         "UID FETCH {folder} {uid_set} returned no BODY.PEEK[] for {location}"
     ))
+}
+
+/// Fetch only recent headers after opening a mailbox read-only with EXAMINE.
+pub async fn peek_folder_headers_read_only(
+    client: &mut ImapClient,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<PeekHeaderSummary>, ImapError> {
+    let selected = examine_folder_info(client, folder).await?;
+    if selected.exists == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit = limit.min(25);
+    let start = if selected.exists > limit {
+        selected.exists - limit + 1
+    } else {
+        1
+    };
+    let range = format!("{start}:{}", selected.exists);
+    let messages = client
+        .session
+        .fetch(&range, QUICKSTART_PEEK_FETCH_DESCRIPTOR)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("FETCH {range} HEADER: {e}")))?;
+
+    let mut out = Vec::new();
+    let mut stream = messages;
+    while let Some(item) = stream.next().await {
+        let fetch = item.map_err(|e| ImapError::Protocol(format!("FETCH parse error: {e}")))?;
+        let uid = fetch.uid.unwrap_or(0);
+        let (from_addr, subject, date) = fetch
+            .body()
+            .and_then(|body| mail_parser::MessageParser::default().parse(body))
+            .map(|parsed| {
+                let from = parsed
+                    .from()
+                    .and_then(|a| a.first())
+                    .and_then(|a| a.address())
+                    .map(|s| s.to_string());
+                let subject = parsed.subject().map(|s| s.to_string());
+                let date = parsed.date().map(|d| d.to_rfc3339());
+                (from, subject, date)
+            })
+            .unwrap_or((None, None, None));
+        out.push(PeekHeaderSummary {
+            uid,
+            from_addr,
+            subject,
+            date,
+        });
+    }
+    out.sort_by(|a, b| b.uid.cmp(&a.uid));
+    Ok(out)
 }
 
 /// Fetch only migration-planning headers for a batch of source UIDs.
@@ -1439,6 +1550,24 @@ mod tests {
                 || FETCH_MESSAGE_DESCRIPTOR.contains("BODY.PEEK["),
             "fetch descriptor must not contain BODY[ without .PEEK"
         );
+    }
+
+    #[test]
+    fn quickstart_peek_descriptor_uses_body_peek_headers_only() {
+        assert_eq!(
+            QUICKSTART_PEEK_FETCH_DESCRIPTOR,
+            "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])"
+        );
+        assert!(QUICKSTART_PEEK_FETCH_DESCRIPTOR.contains("BODY.PEEK["));
+        assert!(!QUICKSTART_PEEK_FETCH_DESCRIPTOR.contains("BODY[]"));
+        assert!(!QUICKSTART_PEEK_FETCH_DESCRIPTOR.contains("BODY["));
+    }
+
+    #[test]
+    fn summary_fetch_descriptor_is_envelope_only() {
+        assert_eq!(FETCH_SUMMARY_DESCRIPTOR, "(UID FLAGS ENVELOPE RFC822.SIZE)");
+        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY["));
+        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY.PEEK[]"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ reqwest.workspace = true
 futures-util.workspace = true
 async-imap.workspace = true
 hickory-resolver.workspace = true
+lettre.workspace = true
 mime_guess = "2"
 
 [dev-dependencies]

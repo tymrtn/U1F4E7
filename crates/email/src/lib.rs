@@ -11,10 +11,12 @@ pub mod evidence;
 pub mod folders;
 pub mod idle;
 pub mod imap;
+pub mod managesieve;
 pub mod migrate;
 pub mod provider;
 pub mod reply;
 pub mod rules;
+pub mod send_policy;
 pub mod sieve;
 pub mod smtp;
 pub mod threading;
@@ -26,5 +28,9 @@ pub use folders::{detect_drafts_folder, detect_sent_folder};
 pub use imap::ImapClient;
 pub use provider::{ProviderType, detect_provider, resolve_folder};
 pub use reply::{ReplyHeaders, build_reply_all_headers, build_reply_headers};
+pub use send_policy::{
+    SendMode, SendPolicyAuditEvent, SendPolicyDecision, SendPolicyDenial, SendPolicyInput,
+    SendRuntime, audit_event_for, default_mode_for_runtime, evaluate,
+};
 pub use smtp::SmtpSender;
 pub use threading::{ThreadBuildResult, build_threads, normalize_subject};

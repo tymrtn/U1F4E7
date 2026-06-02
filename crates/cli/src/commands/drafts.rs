@@ -11,6 +11,7 @@ use mail_builder::MessageBuilder;
 use tracing::warn;
 
 use super::common::{resolve_account, setup_credentials};
+use super::ui;
 
 const DEFAULT_DASHBOARD_BASE_URL: &str = "http://localhost:3141";
 
@@ -156,6 +157,7 @@ pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBack
                             "flags": s.flags,
                             "source": "imap",
                             "folder": drafts_folder,
+                            "ui": ui::message_ui(&acct.id, s.uid, &drafts_folder),
                         })
                     })
                     .collect();
@@ -216,6 +218,7 @@ fn run_list_local(db: &Database, account_id: &str, json: bool) -> Result<()> {
                     "dashboard_path": draft_dashboard_path(&d.account_id, &d.id),
                     "dashboard_url": draft_dashboard_url(&d.account_id, &d.id),
                     "review_url": draft_dashboard_url(&d.account_id, &d.id),
+                    "ui": ui::draft_ui(account_id, &d.id),
                 })
             })
             .collect();
@@ -418,6 +421,7 @@ pub async fn run_create(
                 } else {
                     None
                 },
+                "ui": ui::draft_ui(&creds.account.id, &draft.id),
             })
         );
     } else {
@@ -641,6 +645,7 @@ pub async fn run_send(
                 "subject": subject,
                 "message_id": message_id,
                 "imap_draft_deleted": imap_uid.is_some(),
+                "ui": ui::draft_ui(&acct.id, id),
             })
         );
     } else {
@@ -736,6 +741,10 @@ pub async fn run_discard(
     }
 
     if json {
+        let ui_meta = local_draft
+            .as_ref()
+            .map(|d| ui::draft_ui(&d.account_id, id))
+            .unwrap_or_else(ui::root_ui);
         println!(
             "{}",
             serde_json::json!({
@@ -743,6 +752,7 @@ pub async fn run_discard(
                 "draft_id": id,
                 "imap_deleted": imap_uid.is_some(),
                 "local_deleted": local_draft.is_some(),
+                "ui": ui_meta,
             })
         );
     } else {

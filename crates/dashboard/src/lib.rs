@@ -14,6 +14,7 @@
 pub mod assets;
 pub mod handlers;
 pub mod state;
+mod ui_paths;
 
 use std::net::SocketAddr;
 
@@ -33,11 +34,52 @@ use crate::state::AppState;
 /// Opens the default database, builds an [`AppState`] with an IMAP connection
 /// pool, mounts the router, and blocks serving until shutdown.
 pub async fn serve(port: u16) -> anyhow::Result<()> {
-    serve_with_backend(port, CredentialBackend::File).await
+    serve_with_options(port, ServeOptions::default()).await
 }
 
 /// Start the dashboard server with a specific credential backend.
 pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow::Result<()> {
+    serve_with_backend_and_options(port, backend, ServeOptions::default()).await
+}
+
+/// Runtime options for the dashboard server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeOptions {
+    /// Whether to run the periodic unsnooze and scheduled-send sweeps.
+    ///
+    /// Normal CLI/dashboard serving keeps this enabled. Diagnostic shells can
+    /// disable it so merely opening the desktop app cannot move mail or send a
+    /// scheduled draft.
+    pub background_sweeps: bool,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            background_sweeps: true,
+        }
+    }
+}
+
+impl ServeOptions {
+    pub fn without_background_sweeps() -> Self {
+        Self {
+            background_sweeps: false,
+        }
+    }
+}
+
+/// Start the dashboard server with explicit runtime options.
+pub async fn serve_with_options(port: u16, options: ServeOptions) -> anyhow::Result<()> {
+    serve_with_backend_and_options(port, CredentialBackend::File, options).await
+}
+
+/// Start the dashboard server with a specific credential backend and options.
+pub async fn serve_with_backend_and_options(
+    port: u16,
+    backend: CredentialBackend,
+    options: ServeOptions,
+) -> anyhow::Result<()> {
     let db = Database::open_default().map_err(|e| anyhow::anyhow!("{e}"))?;
     let state = AppState::new(db, backend);
 
@@ -64,22 +106,24 @@ pub async fn serve_with_backend(port: u16, backend: CredentialBackend) -> anyhow
 
     info!("dashboard listening on http://localhost:{port}");
     println!("Envelope dashboard running at http://localhost:{port}");
-    println!("Background unsnooze + scheduled-send sweep running every 60s");
-
-    // Spawn background ticker (checks every 60s for due snoozes and scheduled sends)
-    tokio::spawn(async move {
-        let ticker_state = state;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
-                tracing::warn!("unsnooze sweep error: {e}");
+    if options.background_sweeps {
+        println!("Background unsnooze + scheduled-send sweep running every 60s");
+        let ticker_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
+                    tracing::warn!("unsnooze sweep error: {e}");
+                }
+                if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
+                    tracing::warn!("scheduled send sweep error: {e}");
+                }
             }
-            if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
-                tracing::warn!("scheduled send sweep error: {e}");
-            }
-        }
-    });
+        });
+    } else {
+        println!("Background unsnooze + scheduled-send sweeps disabled for diagnostic mode");
+    }
 
     axum::serve(listener, app)
         .await
@@ -96,9 +140,20 @@ fn dashboard_router(state: AppState) -> Router {
         .route("/accounts/{id}", delete(handlers::accounts::delete))
         .route("/accounts/{id}/verify", post(handlers::accounts::verify))
         .route("/accounts/discover", post(handlers::accounts::discover))
+        // Agent Cockpit
+        .route("/cockpit", get(handlers::cockpit::get))
+        .route(
+            "/accounts/{id}/cockpit",
+            get(handlers::cockpit::get_for_account),
+        )
         // Folders
         .route("/accounts/{id}/folders", get(handlers::folders::list))
         // Messages
+        .route("/messages/unified", get(handlers::messages::unified_inbox))
+        .route(
+            "/messages/unified/refresh",
+            post(handlers::messages::refresh_unified_inbox),
+        )
         .route("/accounts/{id}/messages", get(handlers::messages::list))
         .route(
             "/accounts/{id}/messages/{uid}",
@@ -124,6 +179,10 @@ fn dashboard_router(state: AppState) -> Router {
             post(handlers::rules::run_enabled),
         )
         .route(
+            "/accounts/{id}/rules/{rule_id}/preview",
+            post(handlers::rules::preview),
+        )
+        .route(
             "/accounts/{id}/rules/test/{uid}",
             get(handlers::rules::test_message),
         )
@@ -144,6 +203,26 @@ fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/drafts/{draft_id}",
             get(handlers::drafts::show),
         )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/approve",
+            post(handlers::drafts::approve),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/edit",
+            post(handlers::drafts::edit),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/discard",
+            post(handlers::drafts::discard),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/block",
+            post(handlers::drafts::block),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/send",
+            post(handlers::drafts::send),
+        )
         // Snoozed
         .route("/accounts/{id}/snoozed", get(handlers::snoozed::list))
         .route(
@@ -161,10 +240,16 @@ fn dashboard_router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(index_page))
+        // Frontend deep links emitted by CLI/MCP `ui` metadata. These must
+        // serve the SPA shell, not 404, so links like
+        // `/accounts/<id>/messages/<uid>?folder=INBOX` open cleanly. Legacy
+        // back-compat paths without the `/accounts/` prefix are kept too.
         .route("/{account}/drafts/{draft_id}", get(index_page))
         .route("/accounts/{account}/drafts/{draft_id}", get(index_page))
         .route("/{account}/cockpit", get(index_page))
-        .route("/accounts/{account}/cockpit", get(index_page))
+        .route("/accounts/{id}/cockpit", get(index_page))
+        .route("/accounts/{id}/rules", get(index_page))
+        .route("/accounts/{id}/messages/{uid}", get(index_page))
         .route("/static/{*path}", get(static_asset))
         .nest("/api", api)
         .with_state(state)
@@ -344,6 +429,7 @@ async fn static_asset(axum::extract::Path(path): axum::extract::Path<String>) ->
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -472,5 +558,15 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("<title>Envelope</title>"));
         assert!(html.contains("/static/dashboard.js"));
+    }
+
+    #[test]
+    fn serve_options_keep_background_sweeps_enabled_by_default() {
+        assert!(ServeOptions::default().background_sweeps);
+    }
+
+    #[test]
+    fn diagnostic_serve_options_disable_background_sweeps() {
+        assert!(!ServeOptions::without_background_sweeps().background_sweeps);
     }
 }

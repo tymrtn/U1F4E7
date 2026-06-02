@@ -136,6 +136,45 @@ pub struct ActionLog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchRecord {
+    pub id: String,
+    pub account_id: String,
+    pub folder: String,
+    pub status: String,
+    pub process_id: Option<i64>,
+    pub schedule: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub last_event_at: Option<String>,
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedAuthAttempt {
+    pub id: String,
+    pub account_id: String,
+    pub backend: String,
+    pub reason: String,
+    pub retry_guidance: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleRunAudit {
+    pub id: String,
+    pub account_id: String,
+    pub rule_id: Option<String>,
+    pub rule_name: Option<String>,
+    pub uid: Option<i64>,
+    pub folder: Option<String>,
+    pub action: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredLicense {
     pub id: String,
     pub token: String,
@@ -156,6 +195,47 @@ pub struct MessageSummary {
     pub date: Option<String>,
     pub flags: Vec<String>,
     pub size: u32,
+}
+
+/// Input for updating the local dashboard message-summary read model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedMessageInput {
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub from_addr: String,
+    pub to_addr: String,
+    pub subject: String,
+    pub date: Option<String>,
+    pub flags: Vec<String>,
+    pub size: u32,
+    pub snippet: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// Cached/indexed message summary used for dashboard first paint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedMessageSummary {
+    pub account_id: String,
+    pub account_username: String,
+    pub account_display_name: Option<String>,
+    pub folder: String,
+    pub uidvalidity: u64,
+    #[serde(flatten)]
+    pub summary: MessageSummary,
+    pub snippet: Option<String>,
+    pub thread_id: Option<String>,
+    pub indexed_at: Option<String>,
+    pub freshness: String,
+}
+
+/// Per-account cached summary freshness shown by aggregate dashboard surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageIndexAccountFreshness {
+    pub account_id: String,
+    pub folder: String,
+    pub message_count: usize,
+    pub indexed_at: Option<String>,
+    pub freshness: String,
 }
 
 /// Full IMAP message with body.

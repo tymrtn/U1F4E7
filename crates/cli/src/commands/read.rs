@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use envelope_email_store::{CredentialBackend, models::Message};
 
 use super::common::setup_credentials;
+use super::ui;
 
 #[tokio::main]
 pub async fn run(
@@ -25,7 +26,10 @@ pub async fn run(
     match message {
         Some(msg) => {
             if json {
-                println!("{}", serialize_message_json(&msg)?);
+                println!(
+                    "{}",
+                    serialize_message_json(&msg, &creds.account.id, folder)?
+                );
             } else {
                 println!("From: {}", msg.from_addr);
                 println!("To: {}", msg.to_addr);
@@ -55,8 +59,13 @@ pub async fn run(
     Ok(())
 }
 
-fn serialize_message_json(message: &Message) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(message)
+fn serialize_message_json(
+    message: &Message,
+    account_id: &str,
+    folder: &str,
+) -> serde_json::Result<String> {
+    let value = ui::with_ui(message, ui::message_ui(account_id, message.uid, folder));
+    serde_json::to_string_pretty(&value)
 }
 
 #[cfg(test)]
@@ -87,7 +96,7 @@ mod tests {
         let html_body = "<p>first</p>\n<script>\"quoted\"\0</script>";
         let message = message_with_bodies(text_body, html_body);
 
-        let rendered = serialize_message_json(&message).unwrap();
+        let rendered = serialize_message_json(&message, "acct-1", "INBOX").unwrap();
 
         assert!(!rendered.contains('\0'));
         assert!(!rendered.contains('\r'));
@@ -99,9 +108,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["text_body"], text_body);
         assert_eq!(parsed["html_body"], html_body);
-
-        let round_tripped: Message = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(round_tripped.text_body.as_deref(), Some(text_body));
-        assert_eq!(round_tripped.html_body.as_deref(), Some(html_body));
+        assert!(parsed["ui"].is_object());
     }
 }

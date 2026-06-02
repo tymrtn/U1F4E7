@@ -39,8 +39,8 @@
 <div id="toast-region" class="fixed top-4 right-4 z-50 space-y-2 pointer-events-none"></div>
 
 <!-- Header -->
-<header id="header" class="border-b border-rule bg-paper sticky top-0 z-30">
-  <div class="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+<header id="header" class="shell-header">
+  <div class="shell-header-inner">
     <div class="flex items-center gap-3">
       <div class="w-8 h-8 border-2 border-ink flex items-center justify-center">
         <svg width="14" height="10" viewBox="0 0 14 10" fill="none">
@@ -56,6 +56,7 @@
         <option value="">Select account...</option>
       </select>
       <button id="btn-compose" type="button" class="btn-primary text-xs">Compose</button>
+      <button id="btn-shortcut-hint" type="button" class="btn-ghost text-xs font-mono" title="Keyboard shortcuts (?)" aria-label="Show keyboard shortcuts">?</button>
       <div id="refresh-indicator" class="flex items-center gap-1.5 text-xs text-mid font-mono">
         <span class="w-1.5 h-1.5 rounded-full bg-accent pulse-dot"></span>
         <span id="last-refresh">idle</span>
@@ -64,51 +65,85 @@
   </div>
 </header>
 
-<main class="max-w-[1400px] mx-auto px-6 py-6">
+<div class="dashboard-frame">
 
   <!-- Stats strip -->
-  <section id="stats-section" class="mb-6">
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-px bg-rule border border-rule">
-      <div class="bg-paper px-5 py-3">
+  <section id="stats-section" class="ops-metrics" aria-label="Local dashboard state">
+      <div class="ops-metric">
         <p class="section-label mb-0.5">Accounts</p>
         <p id="stat-accounts" class="text-xl font-semibold tabular-nums font-mono">--</p>
       </div>
-      <div class="bg-paper px-5 py-3">
+      <div class="ops-metric">
         <p class="section-label mb-0.5">Current inbox unread</p>
         <p id="stat-unread" class="text-xl font-semibold tabular-nums font-mono text-accent">--</p>
       </div>
-      <div class="bg-paper px-5 py-3">
+      <div class="ops-metric">
         <p class="section-label mb-0.5">Snoozed</p>
         <p id="stat-snoozed" class="text-xl font-semibold tabular-nums font-mono text-pending">--</p>
       </div>
-      <div class="bg-paper px-5 py-3">
+      <div class="ops-metric">
         <p class="section-label mb-0.5">Current drafts</p>
         <p id="stat-drafts" class="text-xl font-semibold tabular-nums font-mono">--</p>
       </div>
+  </section>
+
+  <!-- Agent Cockpit attention strip -->
+  <section id="agent-cockpit" class="attention-strip" aria-labelledby="cockpit-title">
+    <div class="attention-strip-main">
+      <div class="attention-heading">
+        <p class="section-label mb-1">Agent Cockpit</p>
+        <h2 id="cockpit-title" class="text-sm font-semibold tracking-tight">Attention</h2>
+        <span id="cockpit-account" class="attention-account">all accounts</span>
+      </div>
+      <div id="cockpit-summary" class="cockpit-summary strip-summary">
+        <div class="cockpit-loading">Cockpit state loads from local operator records.</div>
+      </div>
+      <div class="attention-actions">
+        <button id="btn-refresh-cockpit" type="button" class="btn-ghost text-xs">Refresh</button>
+        <button id="btn-toggle-cockpit" type="button" class="btn-ghost text-xs" aria-expanded="false" aria-controls="cockpit-panel">Expand</button>
+      </div>
+    </div>
+    <div id="cockpit-panel" class="cockpit-panel-shell" hidden>
+    <div class="cockpit-grid">
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Watches</p><span id="cockpit-watches-status" class="cockpit-pill">loading</span></div><div id="cockpit-watches" class="cockpit-list"></div></div>
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Operator event buckets</p><span id="cockpit-events-count" class="cockpit-pill">0 attention</span></div><div id="cockpit-events" class="cockpit-list"></div></div>
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Pending drafts / actions</p><span id="cockpit-drafts-count" class="cockpit-pill">0</span></div><div id="cockpit-drafts" class="cockpit-list"></div></div>
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Failed auth / action errors</p><span id="cockpit-errors-count" class="cockpit-pill">0</span></div><div id="cockpit-errors" class="cockpit-list"></div></div>
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Rule runs</p><span id="cockpit-rules-count" class="cockpit-pill">0</span></div><div id="cockpit-rules" class="cockpit-list"></div></div>
+      <div class="cockpit-panel"><div class="cockpit-panel-head"><p class="section-label">Due snoozes</p><span id="cockpit-snoozes-count" class="cockpit-pill">0</span></div><div id="cockpit-snoozes" class="cockpit-list"></div></div>
+    </div>
     </div>
   </section>
 
-  <!-- Three column: sidebar + list + reader -->
-  <div class="grid grid-cols-[240px_1fr] gap-6">
+  <!-- Three-pane mail shell -->
+  <main class="mail-shell" aria-label="Envelope mail client">
 
     <!-- Sidebar -->
-    <aside class="space-y-4">
-      <div>
-        <div class="flex items-center justify-between mb-2">
-          <p class="section-label">Folders</p>
-          <button id="btn-refresh-folders" type="button" class="text-[10px] font-mono text-mid hover:text-ink uppercase tracking-[0.15em]">Refresh</button>
+    <aside id="mail-sidebar" class="mail-sidebar" aria-label="Mailboxes and controls">
+      <section class="sidebar-section">
+        <div class="sidebar-section-head">
+          <p class="section-label">Mailboxes</p>
+          <button id="btn-refresh-folders" type="button" class="sidebar-link">Refresh</button>
         </div>
-        <div id="folder-list" class="space-y-0 border border-rule bg-white">
-          <div class="px-3 py-2 text-xs text-mid font-mono">no account selected</div>
-        </div>
-      </div>
+        <nav id="folder-list" class="mailbox-nav" aria-label="Primary mailboxes">
+          <div class="mailbox-empty">loading local mailbox state...</div>
+        </nav>
+      </section>
 
-      <div>
-        <div class="flex items-center justify-between mb-2">
-          <p class="section-label">Rules Control Plane</p>
-          <button id="btn-refresh-rules" type="button" class="text-[10px] font-mono text-mid hover:text-ink uppercase tracking-[0.15em]">Refresh</button>
+      <section class="sidebar-section">
+        <div class="sidebar-section-head">
+          <p class="section-label">Accounts</p>
+          <button id="btn-add-account" type="button" class="sidebar-link">Add</button>
         </div>
-        <div id="rules-summary" class="border border-rule bg-white px-3 py-2 text-xs text-mid font-mono">select an account</div>
+        <div id="accounts-list" class="account-tree" aria-label="Accounts and account mailboxes"></div>
+      </section>
+
+      <section class="sidebar-section rules-section">
+        <div class="sidebar-section-head">
+          <p class="section-label">Rules Control Plane</p>
+          <button id="btn-refresh-rules" type="button" class="sidebar-link">Refresh</button>
+        </div>
+        <div id="rules-summary" class="rules-summary">select an account</div>
         <div class="rules-runner mt-2 border border-rule bg-white p-2 space-y-2">
           <div class="flex items-center gap-2">
             <input id="rules-run-limit" type="number" min="1" max="200" value="50" class="input-field !py-1 !px-2 !text-xs" title="How many latest messages in the current folder to process. Max 200.">
@@ -118,53 +153,51 @@
           <div id="rules-run-log" class="hidden rules-run-log"></div>
         </div>
         <div id="rules-list" class="mt-2 space-y-2"></div>
-      </div>
-
-      <div>
-        <p class="section-label mb-2">Accounts</p>
-        <div id="accounts-list" class="space-y-0 divide-y divide-rule border border-rule bg-white"></div>
-        <button id="btn-add-account" type="button" class="btn-ghost text-xs mt-2 w-full">+ Add account</button>
-      </div>
+      </section>
     </aside>
 
-    <!-- Message list + reader -->
-    <section class="min-w-0">
-      <div class="flex items-center justify-between mb-3">
+    <!-- Message list -->
+    <section id="message-pane" class="message-pane" aria-label="Message list">
+      <div class="message-toolbar">
         <div class="flex items-center gap-3">
           <h2 id="list-title" class="section-label">Select a folder</h2>
           <span id="list-count" class="text-xs text-mid font-mono"></span>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="message-search">
           <span id="search-active" class="hidden text-[10px] font-mono text-accent uppercase tracking-[0.12em]"></span>
-          <input type="text" id="search-input" placeholder="IMAP search, e.g. FROM alice SUBJECT invoice" class="input-field !py-1.5 !text-xs w-[320px]" title="Uses IMAP SEARCH syntax. Press Enter to search; Clear resets the folder view.">
+          <input type="text" id="search-input" placeholder="IMAP search" class="input-field !py-1.5 !text-xs" title="Uses IMAP SEARCH syntax. Press Enter to search; Clear resets the folder view.">
           <button id="btn-search" type="button" class="btn-ghost text-xs">Search</button>
           <button id="btn-search-clear" type="button" class="btn-ghost text-xs hidden">Clear</button>
         </div>
       </div>
 
-      <section id="agent-cockpit" class="cockpit-panel mb-4" tabindex="-1">
-        <div class="cockpit-header">
-          <p class="section-label">Agent Cockpit</p>
-          <span id="cockpit-status" class="text-xs text-mid font-mono">select an account</span>
+      <div id="message-bulk-toolbar" class="message-bulk-toolbar" aria-label="Message bulk triage toolbar">
+        <label class="bulk-select-all" for="select-all-messages">
+          <input id="select-all-messages" type="checkbox">
+          <span id="selected-message-count">0 selected</span>
+        </label>
+        <span class="bulk-primitive-label">Selected message primitives</span>
+        <div class="bulk-action-group" role="group" aria-label="Bulk message actions">
+          <button id="bulk-archive" type="button" class="btn-ghost text-xs">Archive</button>
+          <button id="bulk-move" type="button" class="btn-ghost text-xs">Move</button>
+          <button id="bulk-label" type="button" class="btn-ghost text-xs">Label</button>
+          <button id="bulk-spam" type="button" class="btn-ghost text-xs">Spam</button>
+          <button id="bulk-delete" type="button" class="btn-ghost text-xs text-warn">Delete</button>
+          <button id="copy-equivalent-cli" type="button" class="btn-ghost text-xs">Copy CLI</button>
         </div>
-        <div id="cockpit-message" class="cockpit-message hidden"></div>
-        <div id="cockpit-drafts" class="cockpit-drafts">
-          <div class="draft-empty">Select an account to see local drafts.</div>
-        </div>
-      </section>
+        <div id="bulk-status" class="bulk-status" aria-live="polite"></div>
+      </div>
 
-      <div id="message-list" class="border border-rule bg-white overflow-hidden">
-        <div class="px-4 py-12 text-center text-sm text-mid">Pick a folder from the sidebar.</div>
+      <div id="message-list" class="message-list-surface">
+        <div class="px-4 py-12 text-center text-sm text-mid">Pick a mailbox from the sidebar.</div>
       </div>
     </section>
-  </div>
-</main>
 
-<!-- Message reader drawer -->
-<aside id="reader" class="fixed inset-y-0 right-0 w-full md:w-[620px] bg-paper border-l border-rule shadow-xl z-40 hidden flex-col">
-  <header class="border-b border-rule px-5 py-3 flex items-center justify-between">
+    <!-- Message reader -->
+    <aside id="reader" class="reader-pane" aria-label="Message reader">
+  <header class="reader-header">
     <div class="flex items-center gap-2">
-      <button id="btn-reader-close" type="button" class="text-mid hover:text-ink">&times;</button>
+      <button id="btn-reader-close" type="button" class="reader-close" title="Clear reader">&times;</button>
       <p id="reader-subject" class="text-sm font-semibold truncate max-w-[380px]"></p>
     </div>
     <div class="flex items-center gap-1 text-xs font-mono">
@@ -176,16 +209,21 @@
       <button id="btn-reader-delete" type="button" class="btn-ghost text-warn whitespace-nowrap">Delete</button>
     </div>
   </header>
-  <div class="px-5 py-3 border-b border-rule text-xs font-mono text-mid space-y-0.5">
+  <div class="reader-meta">
     <div><span class="text-ink">From:</span> <span id="reader-from"></span></div>
     <div><span class="text-ink">To:</span> <span id="reader-to"></span></div>
     <div id="reader-cc-row" class="hidden"><span class="text-ink">Cc:</span> <span id="reader-cc"></span></div>
     <div><span class="text-ink">Date:</span> <span id="reader-date"></span></div>
+    <div id="reader-read-row"><span class="text-ink">State:</span> <span id="reader-read-state"></span></div>
+    <div id="reader-thread-row" class="hidden"><span class="text-ink">Thread:</span> <span id="reader-thread"></span> <a id="reader-thread-link" class="text-accent hover:underline" href="#">context</a></div>
+    <div id="reader-account-row" class="hidden"><span class="text-ink">Mailbox:</span> <span id="reader-account"></span></div>
   </div>
   <div id="reader-rules-panel" class="hidden border-b border-rule px-5 py-3 bg-white"></div>
   <div id="reader-body" class="flex-1 overflow-auto px-5 py-4 text-sm leading-relaxed"></div>
   <div id="reader-attachments" class="border-t border-rule px-5 py-3 hidden"></div>
 </aside>
+  </main>
+</div>
 
 <!-- Compose / Reply drawer -->
 <aside id="composer" class="fixed inset-y-0 right-0 w-full md:w-[640px] bg-paper border-l border-rule shadow-xl z-50 hidden flex-col">
@@ -252,6 +290,17 @@
       <button id="btn-snooze-confirm" type="button" class="btn-primary text-xs">Snooze</button>
       <button id="btn-snooze-cancel" type="button" class="btn-ghost text-xs">Cancel</button>
     </div>
+  </div>
+</div>
+
+<!-- Keyboard shortcut cheat sheet -->
+<div id="shortcut-sheet" class="shortcut-sheet" role="dialog" aria-modal="true" aria-labelledby="shortcut-sheet-title">
+  <div class="shortcut-sheet-card">
+    <div class="flex items-center justify-between mb-3">
+      <p id="shortcut-sheet-title" class="text-sm font-semibold">Keyboard shortcuts</p>
+      <button id="btn-shortcut-sheet-close" type="button" class="text-mid hover:text-ink" aria-label="Close">&times;</button>
+    </div>
+    <div id="shortcut-sheet-list" class="shortcut-sheet-list"></div>
   </div>
 </div>
 

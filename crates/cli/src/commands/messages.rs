@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use envelope_email_store::CredentialBackend;
 
 use super::common::setup_credentials;
+use super::ui;
 
 #[tokio::main]
 pub async fn run_move(
@@ -31,6 +32,7 @@ pub async fn run_move(
                 "uid": uid,
                 "from": folder,
                 "to": to_folder,
+                "ui": ui::message_ui(&creds.account.id, uid, to_folder),
             })
         );
     } else {
@@ -65,6 +67,7 @@ pub async fn run_copy(
                 "uid": uid,
                 "from": folder,
                 "to": to_folder,
+                "ui": ui::message_ui(&creds.account.id, uid, to_folder),
             })
         );
     } else {
@@ -97,6 +100,7 @@ pub async fn run_delete(
                 "action": "delete",
                 "uid": uid,
                 "folder": folder,
+                "ui": ui::account_ui(&creds.account.id),
             })
         );
     } else {

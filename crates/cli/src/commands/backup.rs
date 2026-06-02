@@ -120,6 +120,14 @@ struct RestoreArgs {
     batch_size: u32,
 }
 
+struct AuditStateArgs {
+    account: String,
+    from: PathBuf,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    map: Vec<String>,
+}
+
 #[tokio::main]
 pub async fn run(
     subcommand: BackupCmd,
@@ -172,6 +180,22 @@ pub async fn run(
             )
             .await
         }
+        BackupCmd::AuditState {
+            account,
+            from,
+            include,
+            exclude,
+            map,
+        } => run_audit_state(
+            AuditStateArgs {
+                account,
+                from,
+                include,
+                exclude,
+                map,
+            },
+            json_output,
+        ),
     }
 }
 
@@ -801,6 +825,66 @@ async fn run_restore(
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Audit-state (read-only; no IMAP)
+// -----------------------------------------------------------------------------
+
+fn run_audit_state(args: AuditStateArgs, json_output: bool) -> Result<()> {
+    let AuditStateArgs {
+        account,
+        from,
+        include,
+        exclude,
+        map,
+    } = args;
+    let mappings = parse_mappings(&map)?;
+    let manifest = backup::read_manifest(&from).map_err(|e| backup_error_to_anyhow(e, &from))?;
+    let state_path = backup::restore_state_path(&from, &account);
+    let state_outcome = backup::load_restore_state(&state_path)
+        .map_err(|e| backup_error_to_anyhow(e, &state_path))?;
+
+    let rows =
+        backup::plan_restore_state_audit(&manifest, &state_outcome, &mappings, &include, &exclude);
+
+    let mut unknown = 0u32;
+    let mut state_not_in_manifest = 0u32;
+    for row in &rows {
+        match row.status {
+            backup::AuditStatus::UnknownNoMessageId => unknown = unknown.saturating_add(1),
+            backup::AuditStatus::StateNotInManifest => {
+                state_not_in_manifest = state_not_in_manifest.saturating_add(1)
+            }
+            backup::AuditStatus::Planned => {}
+        }
+        emit(
+            json_output,
+            BackupEvent::RestoreStateAuditRecord {
+                source: row.source.clone(),
+                destination: row.destination.clone(),
+                uidvalidity: row.uidvalidity,
+                uid: row.uid,
+                sha256: row.sha256.clone(),
+                message_id_present: row.message_id_present,
+                status: row.status.as_wire_str().to_string(),
+                destination_uid: None,
+                error: None,
+            },
+        )?;
+    }
+    emit(
+        json_output,
+        BackupEvent::RestoreStateAuditDone {
+            pending: rows.len() as u32,
+            present: 0,
+            missing: 0,
+            unknown,
+            state_not_in_manifest,
+            errors: 0,
+        },
+    )?;
+    Ok(())
+}
+
 fn parse_mappings(map: &[String]) -> Result<Vec<FolderMapping>> {
     let mut out = Vec::with_capacity(map.len());
     for raw in map {
@@ -975,6 +1059,30 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
             ),
             BackupEvent::RestoreStateWarning { warning } => {
                 eprintln!("restore state warning: {warning}")
+            }
+            BackupEvent::RestoreStateAuditRecord {
+                source,
+                destination,
+                uidvalidity,
+                uid,
+                status,
+                ..
+            } => {
+                println!(
+                    "audit-state: {source} (uidvalidity={uidvalidity}, uid={uid}) -> {destination} [{status}]"
+                )
+            }
+            BackupEvent::RestoreStateAuditDone {
+                pending,
+                present,
+                missing,
+                unknown,
+                state_not_in_manifest,
+                errors,
+            } => {
+                println!(
+                    "audit-state done: pending={pending} present={present} missing={missing} unknown={unknown} state_not_in_manifest={state_not_in_manifest} errors={errors}"
+                )
             }
         }
     }
@@ -1582,6 +1690,72 @@ mod tests {
     // -------------------------------------------------------------------------
     // HP #7: in-memory state update mirrors disk after persist_state
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn audit_state_parses_required_args_and_filters() {
+        let cli = crate::Cli::try_parse_from([
+            "envelope",
+            "backup",
+            "audit-state",
+            "--account",
+            "x",
+            "--from",
+            "/tmp/a",
+            "--include",
+            "INBOX",
+            "--exclude",
+            "Trash",
+            "--map",
+            "A=B",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::Commands::Backup {
+                subcommand:
+                    BackupCmd::AuditState {
+                        account,
+                        from,
+                        include,
+                        exclude,
+                        map,
+                    },
+            } => {
+                assert_eq!(account, "x");
+                assert_eq!(from, PathBuf::from("/tmp/a"));
+                assert_eq!(include, vec!["INBOX".to_string()]);
+                assert_eq!(exclude, vec!["Trash".to_string()]);
+                assert_eq!(map, vec!["A=B".to_string()]);
+            }
+            _ => panic!("expected backup audit-state"),
+        }
+    }
+
+    #[test]
+    fn audit_state_runs_against_synthetic_archive_with_pending_state() {
+        // End-to-end smoke for the read-only audit handler. Builds a synthetic
+        // archive, drops a pending-only sidecar line for the message that has
+        // no Message-ID, and confirms the handler completes without error and
+        // without touching IMAP.
+        let dir = build_smoke_archive();
+        let manifest = backup::read_manifest(dir.path()).unwrap();
+        // UID 2 in the smoke archive has message_id: None.
+        let target = &manifest.messages[1];
+        let pending = backup::restore_state_key_pending(target);
+        let state_path = backup::restore_state_path(dir.path(), "audit-acct");
+        backup::append_restore_state_line(&state_path, &pending).unwrap();
+
+        run_audit_state(
+            AuditStateArgs {
+                account: "audit-acct".to_string(),
+                from: dir.path().to_path_buf(),
+                include: vec![],
+                exclude: vec![],
+                map: vec![],
+            },
+            true,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn persist_state_updates_in_memory_set() {

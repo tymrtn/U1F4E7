@@ -131,13 +131,31 @@ pub async fn verify(State(state): State<AppState>, Path(id): Path<String>) -> im
             })
             .into_response()
         }
-        Err(e) => Json(VerifyResult {
-            ok: false,
-            imap: false,
-            smtp: false,
-            error: Some(e.to_string()),
-        })
-        .into_response(),
+        Err(e) => {
+            let reason = e.to_string();
+            {
+                let db = state.db.lock().await;
+                let account_id = db
+                    .find_account_by_email(&id)
+                    .ok()
+                    .flatten()
+                    .map(|acct| acct.id)
+                    .unwrap_or_else(|| id.clone());
+                let _ = db.record_failed_auth(
+                    &account_id,
+                    "imap",
+                    &reason,
+                    Some("Verify the stored credential or provider app-password requirements."),
+                );
+            }
+            Json(VerifyResult {
+                ok: false,
+                imap: false,
+                smtp: false,
+                error: Some(reason),
+            })
+            .into_response()
+        }
     }
 }
 

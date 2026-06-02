@@ -3,7 +3,7 @@
 
 use crate::errors::{Result, StoreError};
 use crate::paths;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 pub struct Database {
     conn: Connection,
@@ -40,6 +40,21 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Open an existing database read-only without creating directories, creating
+    /// a database file, switching journal mode, changing permissions, or running
+    /// migrations. Returns `Ok(None)` when the default database path is absent.
+    pub fn open_default_readonly_existing() -> Result<Option<Self>> {
+        let path = paths::database_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Some(Self { conn }))
+    }
+
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
@@ -53,6 +68,18 @@ impl Database {
 
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_account_row(&self, id: &str, username: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+             imap_host, imap_port, encrypted_password)
+             VALUES (?1, ?2, ?3, 'example.test', 'smtp.example.test', 587,
+                     'imap.example.test', 993, 'encrypted')",
+            rusqlite::params![id, username, username],
+        )?;
+        Ok(())
     }
 
     // ── Detected folder cache ────────────────────────────────────────
@@ -133,5 +160,85 @@ impl Database {
             rusqlite::params![account_id, provider_type],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::IndexedMessageInput;
+
+    #[test]
+    fn indexed_message_summaries_round_trip_and_sort_from_local_db() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-a", "a@example.test")
+            .unwrap();
+
+        db.upsert_indexed_message_summaries(
+            "acct-a",
+            "INBOX",
+            99,
+            &[
+                IndexedMessageInput {
+                    uid: 10,
+                    message_id: Some("<old@example.test>".to_string()),
+                    from_addr: "old@example.test".to_string(),
+                    to_addr: "me@example.test".to_string(),
+                    subject: "old".to_string(),
+                    date: Some("Tue, 12 May 2026 10:00:00 +0000".to_string()),
+                    flags: vec!["\\Seen".to_string()],
+                    size: 100,
+                    snippet: Some("old preview".to_string()),
+                    thread_id: Some("thread-old".to_string()),
+                },
+                IndexedMessageInput {
+                    uid: 11,
+                    message_id: Some("<new@example.test>".to_string()),
+                    from_addr: "new@example.test".to_string(),
+                    to_addr: "me@example.test".to_string(),
+                    subject: "new".to_string(),
+                    date: Some("Tue, 12 May 2026 12:00:00 +0000".to_string()),
+                    flags: Vec::new(),
+                    size: 200,
+                    snippet: Some("new preview".to_string()),
+                    thread_id: Some("thread-new".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].account_id, "acct-a");
+        assert_eq!(rows[0].uidvalidity, 99);
+        assert_eq!(rows[0].summary.uid, 11);
+        assert_eq!(rows[0].snippet.as_deref(), Some("new preview"));
+        assert_eq!(rows[0].thread_id.as_deref(), Some("thread-new"));
+        assert_eq!(rows[0].freshness, "fresh");
+        assert!(rows[0].indexed_at.is_some());
+
+        db.upsert_indexed_message_summaries(
+            "acct-a",
+            "INBOX",
+            99,
+            &[IndexedMessageInput {
+                uid: 12,
+                message_id: Some("<replacement@example.test>".to_string()),
+                from_addr: "replacement@example.test".to_string(),
+                to_addr: "me@example.test".to_string(),
+                subject: "replacement".to_string(),
+                date: Some("Tue, 12 May 2026 13:00:00 +0000".to_string()),
+                flags: Vec::new(),
+                size: 300,
+                snippet: None,
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.uid, 12);
     }
 }

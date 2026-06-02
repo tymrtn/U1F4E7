@@ -87,5 +87,165 @@ mod tests {
             js.contains("testRulesForCurrentMessage"),
             "dashboard JS should dry-run rules for the selected message"
         );
+        assert!(
+            js.contains("previewRuleBlastRadius") && js.contains("renderRulePreviewResult"),
+            "rules control plane should explicitly preview a rule's blast radius before live runs"
+        );
+        assert!(
+            js.contains("mutated=false") && js.contains("preview-sample-link"),
+            "preview rendering must label non-mutation proof and expose message sample links"
+        );
+        assert!(
+            js.contains("ruleActionRisk") && js.contains("high-risk"),
+            "high-risk rule actions need stronger visual warnings before live run"
+        );
+        assert!(
+            lib.contains("/accounts/{id}/rules/{rule_id}/preview")
+                && lib.contains("handlers::rules::preview"),
+            "dashboard router should wire a non-mutating rule preview endpoint"
+        );
+    }
+
+    #[test]
+    fn dashboard_static_assets_expose_unified_inbox_default_scope() {
+        let index = include_str!("../static/index.html");
+        let js = include_str!("../static/dashboard.js");
+        let lib = include_str!("lib.rs");
+
+        assert!(
+            js.contains("Unified Inbox"),
+            "dashboard account switcher should expose the merged inbox scope"
+        );
+        assert!(
+            js.contains("/messages/unified"),
+            "dashboard JS should fetch the unified inbox endpoint"
+        );
+        assert!(
+            js.contains("selectUnifiedInbox"),
+            "dashboard should be able to switch back to the unified inbox"
+        );
+        assert!(
+            js.contains("account-scope"),
+            "unified message rows should render account/folder identity"
+        );
+        assert!(
+            index.contains("reader-account"),
+            "reader should preserve visible mailbox context after opening unified rows"
+        );
+        assert!(
+            lib.contains("/messages/unified") && lib.contains("handlers::messages::unified_inbox"),
+            "dashboard router should wire the unified inbox endpoint"
+        );
+    }
+
+    #[test]
+    fn dashboard_static_assets_expose_read_state_and_thread_context() {
+        let index = include_str!("../static/index.html");
+        let js = include_str!("../static/dashboard.js");
+        let css = include_str!("../static/dashboard.css");
+
+        assert!(
+            js.contains("isMessageUnread") && js.contains("read-toggle"),
+            "message rows should derive unread state from flags and expose an explicit toggle"
+        );
+        assert!(
+            css.contains(".msg-row.unseen") && css.contains(".read-toggle.unread"),
+            "unread rows need visible bold/dot styling"
+        );
+        assert!(
+            index.contains("reader-read-state") && js.contains("opening does not mark read"),
+            "opening a message should show read state without implying passive mutation"
+        );
+        assert!(
+            index.contains("reader-thread-row")
+                && js.contains("threadMetaText")
+                && js.contains("threadContextUrl"),
+            "dashboard should display thread metadata and link to thread context"
+        );
+    }
+
+    #[test]
+    fn dashboard_static_assets_support_cli_deep_links() {
+        let js = include_str!("../static/dashboard.js");
+        let lib = include_str!("lib.rs");
+
+        assert!(
+            js.contains("parseDashboardRoute"),
+            "dashboard JS should parse CLI/MCP deep-link paths"
+        );
+        assert!(
+            js.contains("/accounts\\/([^/]+)\\/messages\\/(\\d+)"),
+            "dashboard JS should recognize account-scoped message links"
+        );
+        assert!(
+            js.contains("applyDashboardRoute"),
+            "dashboard boot should apply parsed deep links after accounts load"
+        );
+        assert!(
+            js.contains("await openMessage(route.uid, route.accountId"),
+            "message deep links should open the reader for the target UID"
+        );
+        assert!(
+            lib.contains("/accounts/{id}/messages/{uid}")
+                && lib.contains("/accounts/{id}/cockpit")
+                && lib.contains("/accounts/{id}/rules")
+                && lib.contains("/accounts/{id}/drafts/{draft_id}"),
+            "dashboard router should serve the SPA shell for CLI/MCP UI deep links"
+        );
+
+        // Route-first boot regression guards
+        assert!(
+            js.contains("autoSelect"),
+            "loadAccounts must accept an autoSelect option to skip eager account/inbox selection"
+        );
+        assert!(
+            js.contains("loadAccounts({ autoSelect: false })"),
+            "route-first boot must call loadAccounts with autoSelect disabled for deep links"
+        );
+        assert!(
+            js.contains("const route = parseDashboardRoute()"),
+            "boot must parse the deep-link route before deciding the account load strategy"
+        );
+        assert!(
+            !js.contains("await openMessage(route.uid, route.accountId, route.folder || 'INBOX');\n    loadRules();"),
+            "message deep links must open the target message before any rules/folders/messages/cockpit hydration"
+        );
+        assert!(
+            !js.contains("await loadStats();\n  await loadAccounts();\n  const routed = await applyDashboardRoute()"),
+            "boot must not block on loadStats + auto-selecting loadAccounts before applying the deep route"
+        );
+    }
+
+    #[test]
+    fn dashboard_static_assets_render_operator_event_buckets() {
+        let index = include_str!("../static/index.html");
+        let js = include_str!("../static/dashboard.js");
+
+        assert!(
+            index.contains("Operator event buckets"),
+            "cockpit should label events as operator-filtered buckets, not raw audit telemetry"
+        );
+        assert!(
+            js.contains("Needs attention")
+                && js.contains("Mailbox/watch events")
+                && js.contains("Recent agent actions"),
+            "dashboard JS should render the three operator event buckets"
+        );
+        assert!(
+            js.contains("routine audit event") && js.contains("Audit Log/debug filter"),
+            "routine audit telemetry should be hidden behind audit/debug copy"
+        );
+        assert!(
+            js.contains("account_label")
+                && js.contains("actor")
+                && js.contains("outcome")
+                && js.contains("message_link")
+                && js.contains("ack_state"),
+            "event rows should render account, actor, outcome, message link, and ack state"
+        );
+        assert!(
+            js.contains("Create an OTP watch") && js.contains("Review pending drafts"),
+            "empty event buckets should offer useful operator next steps"
+        );
     }
 }
