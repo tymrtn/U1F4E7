@@ -120,17 +120,31 @@ impl Database {
         account_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<FailedAuthAttempt>> {
-        let sql = if account_id.is_some() {
+        // Only surface failures from the last 4 hours.  Older rows remain in
+        // the table for audit purposes but must not cause the dashboard to
+        // classify an otherwise-healthy account as UNAVAILABLE indefinitely.
+        // A successful verify (or time passing) should naturally clear the
+        // health badge without requiring the operator to manually purge rows.
+        //
+        // `datetime('now', '-4 hours')` is a SQLite compile-time constant
+        // expression, not user input — safe to inline into the query string.
+        let (sql_with_account, sql_all) = (
             "SELECT id, account_id, backend, reason, retry_guidance, created_at
              FROM failed_auth_history
              WHERE account_id = ?1
+               AND created_at >= datetime('now', '-4 hours')
              ORDER BY created_at DESC
-             LIMIT ?2"
-        } else {
+             LIMIT ?2",
             "SELECT id, account_id, backend, reason, retry_guidance, created_at
              FROM failed_auth_history
+             WHERE created_at >= datetime('now', '-4 hours')
              ORDER BY created_at DESC
-             LIMIT ?1"
+             LIMIT ?1",
+        );
+        let sql = if account_id.is_some() {
+            sql_with_account
+        } else {
+            sql_all
         };
         let mut stmt = self.conn().prepare(sql)?;
         let rows = if let Some(id) = account_id {
@@ -308,5 +322,44 @@ mod tests {
             Some(12)
         );
         assert_eq!(db.list_rule_runs(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_failed_auth_excludes_old_rows_outside_recency_window() {
+        let db = Database::open_memory().unwrap();
+
+        // Insert a row with a timestamp well outside the 4-hour window.
+        // We bypass `record_failed_auth` to set an explicit old timestamp.
+        db.conn()
+            .execute(
+                "INSERT INTO failed_auth_history
+                 (id, account_id, backend, reason, retry_guidance, created_at)
+                 VALUES ('old-1', 'acc1', 'imap', 'LOGIN failed', NULL,
+                         datetime('now', '-5 hours'))",
+                [],
+            )
+            .unwrap();
+
+        // That old row must NOT appear in the recency-filtered query.
+        assert_eq!(
+            db.list_failed_auth(Some("acc1"), 10).unwrap().len(),
+            0,
+            "old auth failure (5 h ago) should be outside the 4-hour window"
+        );
+        assert_eq!(
+            db.list_failed_auth(None, 10).unwrap().len(),
+            0,
+            "all-accounts query should also exclude rows older than 4 hours"
+        );
+
+        // A fresh row (using record_failed_auth which stamps with datetime('now'))
+        // must appear immediately.
+        db.record_failed_auth("acc1", "imap", "LOGIN failed again", None)
+            .unwrap();
+        assert_eq!(
+            db.list_failed_auth(Some("acc1"), 10).unwrap().len(),
+            1,
+            "recent auth failure should be within the 4-hour window"
+        );
     }
 }
