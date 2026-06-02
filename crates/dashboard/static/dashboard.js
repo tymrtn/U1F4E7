@@ -3220,6 +3220,15 @@ function wireEvents() {
   if (sheet) sheet.addEventListener('click', (e) => { if (e.target === sheet) toggleShortcutSheet(false); });
   const hint = $('btn-shortcut-hint');
   if (hint) hint.onclick = () => toggleShortcutSheet(true);
+
+  // Restart the auto-refresh timer when the tab becomes visible again after
+  // being hidden, so polling resumes without waiting a full extra interval.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && autoRefreshTimer === null) {
+      const delayMs = isUnifiedView() ? 90_000 : 120_000;
+      scheduleAutoRefresh(delayMs);
+    }
+  });
 }
 
 // ── Dashboard deep links ───────────────────────────────────────────
