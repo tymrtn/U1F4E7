@@ -397,10 +397,22 @@ fn decode_rfc2047(raw: &[u8]) -> String {
         result.push_str(&remaining[..start]);
         remaining = &remaining[start..];
 
-        // Find the end of the encoded word: =?charset?encoding?text?=
-        if let Some(end) = remaining[2..].find("?=") {
-            let encoded_word = &remaining[2..end + 2]; // charset?encoding?text
-            remaining = &remaining[end + 4..]; // skip past ?=
+        // Parse the RFC 2047 encoded word: =?charset?encoding?text?=
+        //
+        // We must locate the three `?` delimiters precisely rather than
+        // searching for the first `?=` substring.  The naive `find("?=")`
+        // approach fires on the `?=` formed by the `?` separator between
+        // the encoding type and the encoded text when the text begins with
+        // `=` (e.g. Q-encoded `=?UTF-8?Q?=C2=A1...?=` has `?=` at the
+        // boundary between `Q` and `=C2`, not just at the closing `?=`).
+        //
+        // Algorithm: starting just past `=?`, walk forward to find:
+        //   1. first  `?`  → end of charset
+        //   2. second `?`  → end of encoding (single char, B or Q)
+        //   3. closing `?=`→ end of encoded text
+        if let Some(word) = parse_encoded_word(remaining) {
+            let (charset, encoding_char, text, word_len) = word;
+            remaining = &remaining[word_len..];
 
             // Strip whitespace between consecutive encoded words (RFC 2047 §6.2)
             if remaining.starts_with(' ') || remaining.starts_with('\t') {
@@ -409,33 +421,21 @@ fn decode_rfc2047(raw: &[u8]) -> String {
                 }
             }
 
-            // Parse: charset?encoding?text
-            let parts: Vec<&str> = encoded_word.splitn(3, '?').collect();
-            if parts.len() == 3 {
-                let _charset = parts[0]; // TODO: proper charset conversion for non-UTF-8
-                let encoding = parts[1].to_uppercase();
-                let text = parts[2];
+            let _ = charset; // TODO: proper charset conversion for non-UTF-8
+            let decoded_bytes = match encoding_char.to_ascii_uppercase() {
+                b'Q' => decode_q_encoding(text),
+                b'B' => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(text)
+                        .unwrap_or_else(|_| text.as_bytes().to_vec())
+                }
+                _ => text.as_bytes().to_vec(),
+            };
 
-                let decoded_bytes = match encoding.as_str() {
-                    "Q" => decode_q_encoding(text),
-                    "B" => {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(text)
-                            .unwrap_or_else(|_| text.as_bytes().to_vec())
-                    }
-                    _ => text.as_bytes().to_vec(),
-                };
-
-                result.push_str(&String::from_utf8_lossy(&decoded_bytes));
-            } else {
-                // Malformed — emit as-is
-                result.push_str("=?");
-                result.push_str(encoded_word);
-                result.push_str("?=");
-            }
+            result.push_str(&String::from_utf8_lossy(&decoded_bytes));
         } else {
-            // No closing ?= — emit remainder as-is
+            // No valid encoded word at this position — emit as-is and advance
             result.push_str(remaining);
             remaining = "";
         }
@@ -443,6 +443,43 @@ fn decode_rfc2047(raw: &[u8]) -> String {
 
     result.push_str(remaining);
     result
+}
+
+/// Parse one RFC 2047 encoded word at the start of `s`.
+///
+/// Returns `(charset, encoding_byte, encoded_text, total_word_len)` or
+/// `None` if `s` does not begin with a well-formed encoded word.
+///
+/// The format is `=?<charset>?<encoding>?<text>?=` where `<encoding>` is a
+/// single byte (`B` or `Q`, case-insensitive) and `<text>` does not contain
+/// `?` characters.  We locate the three `?` delimiters explicitly so that
+/// any `?=` substring inside `<text>` (which cannot occur for B/Q, but may
+/// occur in malformed input) does not cause premature termination.
+fn parse_encoded_word(s: &str) -> Option<(&str, u8, &str, usize)> {
+    // Must start with =?
+    let rest = s.strip_prefix("=?")?;
+
+    // Find first ? → end of charset
+    let charset_end = rest.find('?')?;
+    let charset = &rest[..charset_end];
+
+    // After charset?, find second ? → end of encoding (must be exactly 1 byte)
+    let after_charset = &rest[charset_end + 1..];
+    let encoding_end = after_charset.find('?')?;
+    if encoding_end != 1 {
+        // Encoding must be a single character (B or Q)
+        return None;
+    }
+    let encoding_char = after_charset.as_bytes()[0];
+
+    // After encoding?, find closing ?= → end of encoded text
+    let after_encoding = &after_charset[2..]; // skip "X?"
+    let text_end = after_encoding.find("?=")?;
+    let text = &after_encoding[..text_end];
+
+    // Total consumed = "=?" + charset + "?" + encoding + "?" + text + "?="
+    let total = 2 + charset_end + 1 + 1 + 1 + text_end + 2;
+    Some((charset, encoding_char, text, total))
 }
 
 /// Decode Q-encoding (RFC 2047 variant of quoted-printable for headers).
@@ -1642,6 +1679,40 @@ mod tests {
         let result = decode_rfc2047(input);
         assert!(result.contains("Hello"));
         assert!(result.contains("World"));
+    }
+
+    /// Regression: Q-encoded text that starts with `=XX` (multibyte UTF-8
+    /// sequences, accented chars, emoji bytes) used to be truncated because the
+    /// naive `find("?=")` in `remaining[2..]` would fire on the `?=` formed by
+    /// the `?` charset/encoding separator followed by the leading `=` of `=XX`.
+    /// e.g. `=?UTF-8?Q?=C2=A1Ey!?=` → `¡Ey!`
+    #[test]
+    fn test_decode_rfc2047_q_starts_with_hex_escape() {
+        // ¡ = U+00A1 = bytes C2 A1 in UTF-8; É = U+00C9 = bytes C3 89
+        let input = b"=?UTF-8?Q?=C2=A1Ey!_=C3=89chal?=";
+        let result = decode_rfc2047(input);
+        assert_eq!(result, "\u{00A1}Ey! \u{00C9}chal");
+    }
+
+    /// Regression: base64-encoded subject should decode fully including when
+    /// the base64 payload happens to pad with `=`.
+    #[test]
+    fn test_decode_rfc2047_b_encoding_with_padding() {
+        use base64::Engine as _;
+        // base64("📧 Inbox") — 📧 = F0 9F 93 A7
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode("📧 Inbox");
+        let input = format!("=?UTF-8?B?{b64}?=");
+        let result = decode_rfc2047(input.as_bytes());
+        assert_eq!(result, "📧 Inbox");
+    }
+
+    /// Regression: uppercase charset/encoding identifiers must be accepted.
+    #[test]
+    fn test_decode_rfc2047_uppercase_encoding_label() {
+        let input = b"=?UTF-8?Q?caf=C3=A9?=";
+        let result = decode_rfc2047(input);
+        assert_eq!(result, "caf\u{00e9}");
     }
 
     #[test]
