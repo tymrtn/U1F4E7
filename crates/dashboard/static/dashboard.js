@@ -1620,6 +1620,7 @@ function renderReaderEmpty(message = 'Select a message to read. Opening a messag
   $('reader-to').textContent = '';
   $('reader-date').textContent = '';
   $('reader-read-state').textContent = '';
+  $('reader-meta').classList.add('hidden');
   $('reader-account-row').classList.add('hidden');
   $('reader-thread-row').classList.add('hidden');
   $('reader-cc-row').classList.add('hidden');
@@ -2460,6 +2461,7 @@ function renderRemoteImageControl(body, blockedCount) {
 function renderReader() {
   const msg = state.currentMessage;
   if (!msg) return;
+  $('reader-meta').classList.remove('hidden');
   $('reader-subject').textContent = msg.subject || '(no subject)';
   $('reader-from').textContent = msg.from_addr || '';
   $('reader-to').textContent = msg.to_addr || '';
