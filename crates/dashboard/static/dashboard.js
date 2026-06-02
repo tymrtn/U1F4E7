@@ -2392,6 +2392,13 @@ async function openMessage(uid, accountId = null, folder = null) {
       folder: effectiveFolder,
     });
     state.loadRemoteImages = false;
+    // Messages in a Drafts folder should open as editable drafts, not in the
+    // read-only reader.  Gmail itself does this — opening a draft opens the
+    // composer, not the message view.
+    if (folderMatchesSmart(effectiveFolder, 'drafts')) {
+      openComposerFromImap(state.currentMessage);
+      return;
+    }
     renderReader();
   } catch (e) {
     $('reader-subject').textContent = 'Error';
@@ -2940,6 +2947,22 @@ function openComposerFromDraft(draft) {
   toast('Draft loaded into composer', 'success');
 }
 
+
+// Open a raw IMAP message (fetched from a Drafts folder) in the composer so the
+// user can edit and resend it.  The original IMAP draft is NOT deleted here — the
+// user should delete it manually or via a follow-up rule once they've sent.
+function openComposerFromImap(msg) {
+  openComposer('new');
+  $('composer-to').value = msg.to_addr || '';
+  $('composer-cc').value = msg.cc_addr || '';
+  $('composer-subject').value = msg.subject || '';
+  // Prefer plain text; fall back to stripping HTML if only html_body is present.
+  $('composer-body').value = msg.text_body
+    || (msg.html_body ? msg.html_body.replace(/<[^>]+>/g, '') : '');
+  setBodyFormat(msg.html_body && !msg.text_body ? 'html' : 'text');
+  $('composer-title').textContent = 'Edit Draft';
+  toast('IMAP draft loaded — edit and send. Delete the original draft in your mail client.', '');
+}
 
 function prefixRe(subject) {
   return /^re:\s/i.test(subject) ? subject : 'Re: ' + subject;
