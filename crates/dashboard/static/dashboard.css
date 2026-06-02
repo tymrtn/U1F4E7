@@ -25,6 +25,8 @@ body {
   height: 64px;
   border-bottom: 1px solid var(--env-rule);
   background: var(--env-paper);
+  /* Prevent header content from pushing outside the viewport */
+  overflow: hidden;
 }
 .shell-header-inner {
   height: 100%;
@@ -33,6 +35,33 @@ body {
   justify-content: space-between;
   gap: 1rem;
   padding: 0 1rem;
+  min-width: 0;
+}
+/* Logo/title group: min-width:0 so it can cede space to the right side */
+.shell-header-inner > :first-child {
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+}
+/* Right-side controls group: allow shrinking but guard against full collapse */
+.shell-header-inner > :last-child {
+  min-width: 0;
+  flex-shrink: 1;
+  flex-wrap: nowrap;
+}
+/* Account switcher: carries the flex budget; shrinks from 240px → 120px.
+   Compose/?/status indicator are flex-shrink:0 in the HTML so they stay visible. */
+#account-switcher {
+  min-width: 120px;
+  max-width: 240px;
+  width: 240px;
+  flex-shrink: 1;
+}
+/* Compose, hint, and status indicator must never disappear */
+#btn-compose,
+#btn-shortcut-hint,
+#refresh-indicator {
+  flex-shrink: 0;
 }
 .dashboard-frame {
   height: calc(100vh - 64px);
@@ -47,11 +76,19 @@ body {
   gap: 1px;
   border: 1px solid var(--env-rule);
   background: var(--env-rule);
+  /* Prevent tiles from overflowing at constrained viewport widths */
+  overflow: hidden;
 }
 .ops-metric {
   min-width: 0;
   background: var(--env-paper);
   padding: 0.55rem 0.875rem;
+  overflow: hidden;
+}
+.ops-metric p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ops-metric p:last-child {
   line-height: 1.1;
@@ -351,10 +388,14 @@ body {
 .attention-strip {
   border: 1px solid #d9d7d1;
   background: white;
+  /* Prevent cockpit from overflowing its container */
+  overflow: hidden;
 }
 .attention-strip-main {
   display: grid;
-  grid-template-columns: minmax(10rem, 13rem) minmax(0, 1fr) auto;
+  /* Actions column is bounded so it never squeezes the summary strip.
+     Label column is bounded; summary strip takes all remaining space. */
+  grid-template-columns: minmax(10rem, 13rem) minmax(0, 1fr) minmax(0, 10.5rem);
   align-items: stretch;
   gap: 1px;
   background: #d9d7d1;
@@ -378,6 +419,10 @@ body {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: wrap;
+  /* Reduce horizontal padding to give buttons more room in bounded column */
+  padding-left: 0.625rem;
+  padding-right: 0.625rem;
 }
 .cockpit-summary {
   display: grid;
@@ -667,7 +712,11 @@ body {
   min-height: 1rem;
 }
 .msg-row .thread-meta { margin-top: 0.2rem; color: #8a8780; font-family: 'DM Mono', monospace; font-size: 0.625rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* account-scope chip: hidden by default in unified rows to reduce visual noise
+   at scale; revealed on row hover so the account origin remains discoverable. */
 .msg-row .account-scope { color: #8a8780; font-family: 'DM Mono', monospace; font-size: 0.6875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-row.unified .account-scope { display: none; }
+.msg-row.unified:hover .account-scope { display: inline; }
 .msg-row .date { color: #8a8780; font-family: 'DM Mono', monospace; font-size: 0.6875rem; text-align: right; }
 .msg-labels {
   display: flex;

@@ -51,6 +51,46 @@ const state = {
   bulkStatusTimer: null,
 };
 
+// ── Auto-refresh ───────────────────────────────────────────────────
+let autoRefreshTimer = null;
+
+function scheduleAutoRefresh(delayMs) {
+  clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = null;
+  if (document.visibilityState !== 'visible') return;
+  autoRefreshTimer = setTimeout(async () => {
+    autoRefreshTimer = null;
+    if (document.visibilityState !== 'visible') {
+      scheduleAutoRefresh(delayMs);
+      return;
+    }
+    if (state.searchQuery || anyModalOpen()) {
+      scheduleAutoRefresh(delayMs);
+      return;
+    }
+    if (state.selectedMessages.size > 0) {
+      // Don't interrupt mid-selection or in-flight bulk operations.
+      scheduleAutoRefresh(delayMs);
+      return;
+    }
+    try {
+      if (isUnifiedView()) {
+        await loadUnifiedInbox({ refresh: false });
+      } else if (state.currentAccount) {
+        await loadMessages();
+      }
+    } catch (_) {
+      // Background refresh errors are silent; next cycle will retry.
+    }
+    scheduleAutoRefresh(delayMs);
+  }, delayMs);
+}
+
+function cancelAutoRefresh() {
+  clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = null;
+}
+
 const SMART_MAILBOXES = [
   { key: 'unified', label: 'Unified Inbox' },
   { key: 'attention', label: 'Needs Attention' },
@@ -214,9 +254,9 @@ function folderCountText(f) {
 
 function updateCurrentFolderStats() {
   const inbox = findFolderByKind('inbox');
-  const drafts = findFolderByKind('drafts');
   setStat('stat-unread', inbox ? (inbox.unseen || 0) : null);
-  setStat('stat-drafts', drafts ? (drafts.exists || 0) : null);
+  // stat-drafts counts local DB active drafts (status: draft/pending_review),
+  // loaded via /stats — not the IMAP Drafts folder message count.
 }
 
 function selectedAccountForSmartMailbox() {
@@ -232,6 +272,8 @@ function setSearchState(query) {
     active.title = state.searchQuery;
     active.classList.remove('hidden');
     clear.classList.remove('hidden');
+    // Suspend auto-refresh while a search is active to avoid clobbering results.
+    cancelAutoRefresh();
   } else {
     active.textContent = '';
     active.title = '';
@@ -1495,10 +1537,12 @@ async function loadStats() {
     state.stats = stats || {};
     setStat('stat-accounts', stats.accounts ?? 0);
     setStat('stat-snoozed', stats.snoozed ?? 0);
+    setStat('stat-drafts', stats.drafts ?? 0);
     renderSmartMailboxes();
   } catch (e) {
     setStat('stat-accounts', 'error');
     setStat('stat-snoozed', 'error');
+    setStat('stat-drafts', 'error');
     console.error('loadStats', e);
   }
 }
@@ -1720,49 +1764,82 @@ function renderAccountHealthPanel(acct, primitive) {
     text: primitive.state.provider_capabilities || 'capabilities unknown',
     title: primitive.state.provider_capabilities || 'capabilities unknown',
   }));
-  // Contextual affordance: the Reconnect button only renders when the
-  // account is actually unhealthy. Healthy / syncing accounts have nothing
-  // to reconnect.
+  // Contextual affordance: an action button only renders when the account
+  // needs operator attention. Healthy / syncing accounts show nothing.
+  // stale    → cached index is old but auth is fine; Refresh reloads folders
+  //            and messages without touching credentials.
+  // all others (auth_failed, unavailable, reconnecting) → Reconnect runs the
+  //            /verify probe to re-check IMAP credentials.
   if (HEALTH_NEEDS_ACTION.has(status)) {
-    const reconnectRow = el('div', { class: 'account-health-actions' });
-    const reconnectStatus = el('span', { class: 'account-reconnect-status' });
-    const reconnect = el('button', {
-      class: 'account-reconnect',
-      text: 'Reconnect',
-      title: 'Re-verify IMAP credentials and clear the failed-auth record',
-      type: 'button',
-    });
-    reconnect.onclick = async (event) => {
-      event.stopPropagation();
-      reconnect.disabled = true;
-      const originalText = reconnect.textContent;
-      reconnect.textContent = 'Verifying…';
-      reconnectStatus.textContent = '';
-      try {
-        const result = await api('POST', `/accounts/${acct.id}/verify`);
-        if (result && result.ok && result.imap) {
-          reconnectStatus.textContent = 'IMAP verified ✓';
-          toast(`Verified ${acct.username}.`, 'success');
-          // Refresh accounts + cockpit so the health badge updates
-          // immediately. autoSelect=false keeps the user's current view.
-          await loadAccounts({ autoSelect: false });
-          await loadCockpit();
-        } else {
-          const msg = (result && result.error) || 'Verify failed';
-          reconnectStatus.textContent = msg;
-          toast(`Verify failed: ${msg}`, 'error');
+    const actionRow = el('div', { class: 'account-health-actions' });
+    const actionStatus = el('span', { class: 'account-reconnect-status' });
+
+    if (status === 'stale') {
+      const refreshBtn = el('button', {
+        class: 'account-reconnect',
+        text: 'Refresh',
+        title: 'Reload folder list and messages to clear the stale cache',
+        type: 'button',
+      });
+      refreshBtn.onclick = async (event) => {
+        event.stopPropagation();
+        refreshBtn.disabled = true;
+        const originalText = refreshBtn.textContent;
+        refreshBtn.textContent = 'Refreshing…';
+        actionStatus.textContent = '';
+        try {
+          await selectAccount(acct);
+          actionStatus.textContent = 'Refreshed ✓';
+          toast(`Refreshed ${acct.username}.`, 'success');
+        } catch (e) {
+          actionStatus.textContent = e.message || 'refresh failed';
+          toast(`Refresh error: ${e.message}`, 'error');
+        } finally {
+          refreshBtn.disabled = false;
+          refreshBtn.textContent = originalText;
         }
-      } catch (e) {
-        reconnectStatus.textContent = e.message || 'request failed';
-        toast(`Reconnect error: ${e.message}`, 'error');
-      } finally {
-        reconnect.disabled = false;
-        reconnect.textContent = originalText;
-      }
-    };
-    reconnectRow.appendChild(reconnect);
-    reconnectRow.appendChild(reconnectStatus);
-    panel.appendChild(reconnectRow);
+      };
+      actionRow.appendChild(refreshBtn);
+    } else {
+      const reconnect = el('button', {
+        class: 'account-reconnect',
+        text: 'Reconnect',
+        title: 'Re-verify IMAP credentials and clear the failed-auth record',
+        type: 'button',
+      });
+      reconnect.onclick = async (event) => {
+        event.stopPropagation();
+        reconnect.disabled = true;
+        const originalText = reconnect.textContent;
+        reconnect.textContent = 'Verifying…';
+        actionStatus.textContent = '';
+        try {
+          const result = await api('POST', `/accounts/${acct.id}/verify`);
+          if (result && result.ok && result.imap) {
+            actionStatus.textContent = 'IMAP verified ✓';
+            toast(`Verified ${acct.username}.`, 'success');
+            // Refresh accounts + cockpit so the health badge updates
+            // immediately. autoSelect=false keeps the user's current view.
+            await loadAccounts({ autoSelect: false });
+            await loadCockpit();
+          } else {
+            const msg = (result && result.error) || 'Verify failed';
+            actionStatus.textContent = msg;
+            toast(`Verify failed: ${msg}`, 'error');
+          }
+        } catch (e) {
+          actionStatus.textContent = e.message || 'request failed';
+          toast(`Reconnect error: ${e.message}`, 'error');
+        } finally {
+          reconnect.disabled = false;
+          reconnect.textContent = originalText;
+        }
+      };
+      actionRow.appendChild(reconnect);
+    }
+
+    actionRow.appendChild(actionStatus);
+    panel.appendChild(actionRow);
   }
   return panel;
 }
@@ -1961,13 +2038,11 @@ async function loadFolders() {
     renderAccountsList();
     const unread = state.unifiedMeta?.unread_count;
     setStat('stat-unread', unread === undefined ? '—' : String(unread));
-    setStat('stat-drafts', '—');
     return;
   }
   if (!state.currentAccount) return;
   setRefresh('loading folders…');
   setStat('stat-unread', 'loading');
-  setStat('stat-drafts', 'loading');
   state.folderLoadState[state.currentAccount.id] = 'loading';
   renderAccountsList();
   try {
@@ -1989,7 +2064,6 @@ async function loadFolders() {
     renderAccountsList();
     setRefresh('error');
     setStat('stat-unread', 'error');
-    setStat('stat-drafts', 'error');
     toast('Folders: ' + e.message, 'error');
   }
 }
