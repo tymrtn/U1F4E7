@@ -14,9 +14,11 @@ pub async fn get(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let account_count = db.list_accounts().map(|v| v.len()).unwrap_or(0);
     let snoozed_count = db.list_snoozed(None).map(|v| v.len()).unwrap_or(0);
+    let active_drafts = db.count_active_drafts(None).unwrap_or(0);
 
     Json(json!({
         "accounts": account_count,
         "snoozed": snoozed_count,
+        "drafts": active_drafts,
     }))
 }

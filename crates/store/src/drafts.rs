@@ -238,6 +238,26 @@ impl Database {
         Ok(())
     }
 
+    /// Count drafts with actionable/pending status: `draft` or `pending_review`.
+    /// Pass `None` to count across all accounts.
+    pub fn count_active_drafts(&self, account_id: Option<&str>) -> Result<u64> {
+        let count: i64 = if let Some(aid) = account_id {
+            self.conn().query_row(
+                "SELECT COUNT(*) FROM drafts
+                 WHERE account_id = ?1 AND status IN ('draft', 'pending_review')",
+                params![aid],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn().query_row(
+                "SELECT COUNT(*) FROM drafts WHERE status IN ('draft', 'pending_review')",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count as u64)
+    }
+
     /// Store the RFC822 Message-ID for a draft (set during IMAP APPEND).
     pub fn mark_draft_message_id(&self, id: &str, message_id: &str) -> Result<()> {
         self.conn().execute(
@@ -406,6 +426,41 @@ mod tests {
             .unwrap();
         let fetched = db.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(fetched.message_id, Some("<test@example.com>".to_string()));
+    }
+
+    #[test]
+    fn count_active_drafts_excludes_sent_and_discarded() {
+        let db = setup();
+
+        // Create two active drafts
+        let d1 = db
+            .create_draft("acc1", "a@test.com", Some("Active"), None, None, None, None, None, None)
+            .unwrap();
+        let _d2 = db
+            .create_draft("acc1", "b@test.com", Some("Active2"), None, None, None, None, None, None)
+            .unwrap();
+
+        // Promote one to pending_review
+        db.update_draft_status(&d1.id, DraftStatus::PendingReview).unwrap();
+
+        // Create a sent draft and a discarded draft (historical, should not count)
+        let sent = db
+            .create_draft("acc1", "c@test.com", Some("Sent"), None, None, None, None, None, None)
+            .unwrap();
+        db.mark_draft_sent(&sent.id, None).unwrap();
+
+        let discard = db
+            .create_draft("acc1", "d@test.com", Some("Discarded"), None, None, None, None, None, None)
+            .unwrap();
+        db.discard_draft(&discard.id).unwrap();
+
+        // Only the two active drafts (draft + pending_review) should count
+        let count = db.count_active_drafts(None).unwrap();
+        assert_eq!(count, 2);
+
+        // Account-scoped count matches
+        let scoped = db.count_active_drafts(Some("acc1")).unwrap();
+        assert_eq!(scoped, 2);
     }
 
     #[test]
