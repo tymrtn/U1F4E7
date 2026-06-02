@@ -1941,6 +1941,7 @@ async function selectUnifiedInbox({ refresh = false } = {}) {
   await loadRules();
   await loadUnifiedInbox({ refresh });
   loadCockpit();
+  scheduleAutoRefresh(90_000);
 }
 
 async function selectSmartMailbox(key) {
@@ -2029,6 +2030,7 @@ async function selectAccount(acct, folder = 'INBOX', options = {}) {
     );
   }
   if (loadCockpitPanel) loadCockpit();
+  scheduleAutoRefresh(120_000);
 }
 
 // ── Folders ────────────────────────────────────────────────────────
