@@ -258,6 +258,21 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Replace the draft's `metadata` JSON blob.
+    ///
+    /// Used to persist contextual reply/forward state (draft_kind, source
+    /// folder/uid/message_id, references, quote/forward block, signature state,
+    /// preview metadata) so the full draft can be reconstructed and sent later
+    /// without the original message in context.
+    pub fn set_draft_metadata(&self, id: &str, metadata: &serde_json::Value) -> Result<()> {
+        let serialized = serde_json::to_string(metadata)?;
+        self.conn().execute(
+            "UPDATE drafts SET metadata = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![serialized, id],
+        )?;
+        Ok(())
+    }
+
     /// Store the RFC822 Message-ID for a draft (set during IMAP APPEND).
     pub fn mark_draft_message_id(&self, id: &str, message_id: &str) -> Result<()> {
         self.conn().execute(
@@ -434,23 +449,64 @@ mod tests {
 
         // Create two active drafts
         let d1 = db
-            .create_draft("acc1", "a@test.com", Some("Active"), None, None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "a@test.com",
+                Some("Active"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let _d2 = db
-            .create_draft("acc1", "b@test.com", Some("Active2"), None, None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "b@test.com",
+                Some("Active2"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         // Promote one to pending_review
-        db.update_draft_status(&d1.id, DraftStatus::PendingReview).unwrap();
+        db.update_draft_status(&d1.id, DraftStatus::PendingReview)
+            .unwrap();
 
         // Create a sent draft and a discarded draft (historical, should not count)
         let sent = db
-            .create_draft("acc1", "c@test.com", Some("Sent"), None, None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "c@test.com",
+                Some("Sent"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         db.mark_draft_sent(&sent.id, None).unwrap();
 
         let discard = db
-            .create_draft("acc1", "d@test.com", Some("Discarded"), None, None, None, None, None, None)
+            .create_draft(
+                "acc1",
+                "d@test.com",
+                Some("Discarded"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         db.discard_draft(&discard.id).unwrap();
 
@@ -461,6 +517,38 @@ mod tests {
         // Account-scoped count matches
         let scoped = db.count_active_drafts(Some("acc1")).unwrap();
         assert_eq!(scoped, 2);
+    }
+
+    #[test]
+    fn set_and_read_draft_metadata_round_trips() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let meta = serde_json::json!({
+            "draft_kind": "reply",
+            "source": {"folder": "INBOX", "uid": 42, "message_id": "parent@x"},
+            "references": ["a@x", "parent@x"],
+            "signature_applied": false,
+        });
+        db.set_draft_metadata(&draft.id, &meta).unwrap();
+
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        let stored = fetched.metadata.expect("metadata persisted");
+        assert_eq!(stored["draft_kind"], "reply");
+        assert_eq!(stored["source"]["uid"], 42);
+        assert_eq!(stored["references"][1], "parent@x");
     }
 
     #[test]

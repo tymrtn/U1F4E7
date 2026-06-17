@@ -12,6 +12,8 @@ use std::str::FromStr;
 
 use super::common::setup_credentials;
 use super::datetime::parse_until;
+use super::drafts::{find_sent_mail_by_message_id, sent_mail_proof_json};
+use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
 
 /// Send an email immediately, or schedule it for later with `--at`.
@@ -33,7 +35,10 @@ pub async fn run(
     send_mode: &str,
     confirm_send: bool,
     allow_recipients: &[String],
+    confirm_new_re_subject: bool,
 ) -> Result<()> {
+    check_new_re_subject_guard(Some(subject), false, confirm_new_re_subject, json)?;
+
     let (db, creds) = setup_credentials(account, backend)?;
     let mode = SendMode::from_str(send_mode).map_err(|e| anyhow::anyhow!(e))?;
     let policy_input = SendPolicyInput {
@@ -192,6 +197,10 @@ pub async fn run(
     .await
     .context("failed to send email")?;
 
+    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
+    let sent_ui = sent_mail_proof.ui(&creds.account.id);
+
     if json {
         println!(
             "{}",
@@ -200,18 +209,36 @@ pub async fn run(
                 "to": to,
                 "subject": subject,
                 "message_id": message_id,
+                "sent_folder": sent_mail_proof.folder.clone(),
+                "sent_uid": sent_mail_proof.uid,
+                "sent_message_url": sent_message_url,
+                "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
                 "attachments": attachments.iter().map(|a| serde_json::json!({
                     "filename": a.filename,
                     "content_type": a.content_type,
                     "size": a.data.len(),
                 })).collect::<Vec<_>>(),
-                "ui": ui::account_ui(&creds.account.id),
+                "ui": sent_ui,
             })
         );
     } else {
         println!("Sent to {to}");
         println!("Subject: {subject}");
         println!("Message-ID: {message_id}");
+        match (sent_mail_proof.folder.as_deref(), sent_mail_proof.uid) {
+            (Some(folder), Some(uid)) => {
+                println!("Sent UID: {uid} ({folder})");
+                if let Some(url) = sent_mail_proof.message_url(&creds.account.id) {
+                    println!("Sent URL: {url}");
+                }
+            }
+            (Some(folder), None) => println!(
+                "Sent UID: unavailable in {folder} ({})",
+                sent_mail_proof.lookup_status
+            ),
+            (None, None) => println!("Sent UID: unavailable ({})", sent_mail_proof.lookup_status),
+            (None, Some(uid)) => println!("Sent UID: {uid}"),
+        }
         if !attachments.is_empty() {
             println!("Attachments: {}", attachments.len());
             for a in &attachments {

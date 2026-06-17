@@ -240,6 +240,190 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v1",
+      "description": "Create a Mail.app-style contextual reply draft with populated threading headers, preserved quoted context, and abridged preview.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "default": false,
+            "description": "Append the account signature when available",
+            "type": "boolean"
+          },
+          "body": {
+            "description": "Initial agent-authored plain-text body",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of original message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Initial agent-authored HTML body",
+            "type": "string"
+          },
+          "reply_all": {
+            "default": false,
+            "description": "Reply to all recipients",
+            "type": "boolean"
+          },
+          "uid": {
+            "description": "UID of message to reply to",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "name": "create_reply_draft"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Create a Mail.app-style contextual forward draft with forwarded-message context and abridged preview.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "default": false,
+            "description": "Append the account signature when available",
+            "type": "boolean"
+          },
+          "body": {
+            "description": "Initial agent-authored plain-text body",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of source message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Initial agent-authored HTML body",
+            "type": "string"
+          },
+          "to": {
+            "description": "Optional forward recipient; may be left empty for later edit",
+            "type": "string"
+          },
+          "uid": {
+            "description": "UID of message to forward",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "name": "create_forward_draft"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Modify the agent-authored portion of a contextual draft while preserving quote/forward context and threading metadata.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "description": "Override signature application for this edit",
+            "type": "boolean"
+          },
+          "bcc": {
+            "description": "BCC override",
+            "type": "string"
+          },
+          "body": {
+            "description": "Replacement agent-authored plain-text body",
+            "type": "string"
+          },
+          "cc": {
+            "description": "CC override",
+            "type": "string"
+          },
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          },
+          "html": {
+            "description": "Replacement agent-authored HTML body",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject override",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient override",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "name": "modify_draft"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Fetch a stored draft envelope with metadata and abridged contextual preview.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_draft"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
+      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required to send a draft from MCP",
+            "type": "boolean"
+          },
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "name": "send_draft"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v1",
       "description": "Move a message to another IMAP folder.",
       "inputSchema": {
         "additionalProperties": false,
@@ -777,6 +961,25 @@
             "description": "MCP send/reply result flag when available",
             "type": "boolean"
           },
+          "sent_folder": {
+            "description": "Sent folder containing the sent message when resolved",
+            "type": "string"
+          },
+          "sent_mail": {
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui",
+            "type": "object"
+          },
+          "sent_message_url": {
+            "description": "Dashboard URL for the sent message when resolved",
+            "type": "string"
+          },
+          "sent_uid": {
+            "description": "Sent-folder IMAP UID when resolved",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "status": {
             "description": "sent, scheduled, drafted, or denied",
             "type": "string"
@@ -925,6 +1128,25 @@
           "message_id": {
             "description": "SMTP Message-ID for sent drafts",
             "type": "string"
+          },
+          "sent_folder": {
+            "description": "Sent folder containing the sent message when resolved",
+            "type": "string"
+          },
+          "sent_mail": {
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui",
+            "type": "object"
+          },
+          "sent_message_url": {
+            "description": "Dashboard URL for the sent message when resolved",
+            "type": "string"
+          },
+          "sent_uid": {
+            "description": "Sent-folder IMAP UID when resolved",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "status": {
             "description": "created, sent, discarded, or stored status",
@@ -1325,6 +1547,245 @@
         "tool": "reply"
       },
       "name": "reply",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "default": false,
+            "description": "Append the account signature when available",
+            "type": "boolean"
+          },
+          "body": {
+            "description": "Initial agent-authored plain-text body",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of original message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Initial agent-authored HTML body",
+            "type": "string"
+          },
+          "reply_all": {
+            "default": false,
+            "description": "Reply to all recipients",
+            "type": "boolean"
+          },
+          "uid": {
+            "description": "UID of message to reply to",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "create_reply_draft"
+      },
+      "name": "create_reply_draft",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "default": false,
+            "description": "Append the account signature when available",
+            "type": "boolean"
+          },
+          "body": {
+            "description": "Initial agent-authored plain-text body",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder of source message",
+            "type": "string"
+          },
+          "html": {
+            "description": "Initial agent-authored HTML body",
+            "type": "string"
+          },
+          "to": {
+            "description": "Optional forward recipient; may be left empty for later edit",
+            "type": "string"
+          },
+          "uid": {
+            "description": "UID of message to forward",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "create_forward_draft"
+      },
+      "name": "create_forward_draft",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "add_signature": {
+            "description": "Override signature application for this edit",
+            "type": "boolean"
+          },
+          "bcc": {
+            "description": "BCC override",
+            "type": "string"
+          },
+          "body": {
+            "description": "Replacement agent-authored plain-text body",
+            "type": "string"
+          },
+          "cc": {
+            "description": "CC override",
+            "type": "string"
+          },
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          },
+          "html": {
+            "description": "Replacement agent-authored HTML body",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject override",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient override",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "modify_draft"
+      },
+      "name": "modify_draft",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "get_draft"
+      },
+      "name": "get_draft",
+      "output_schema": {
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "mcp-only",
+        "json_output": true
+      },
+      "compatibility_notes": [],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address",
+            "type": "string"
+          },
+          "confirm_send": {
+            "default": false,
+            "description": "Required to send a draft from MCP",
+            "type": "boolean"
+          },
+          "draft_id": {
+            "description": "Local draft id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "send_draft"
+      },
+      "name": "send_draft",
       "output_schema": {
         "type": "object"
       },

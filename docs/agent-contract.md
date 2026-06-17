@@ -37,6 +37,7 @@ The v1 contract covers:
 - thread
 - draft
 - send
+- contextual draft MCP tools: `create_reply_draft`, `create_forward_draft`, `modify_draft`, `get_draft`, `send_draft`
 - watch
 - otp
 - rules
@@ -56,6 +57,8 @@ Agent-facing send modes are stable strings:
 - `autonomous-send`
 
 MCP defaults agent send/reply flows to `draft-only`. Denials use stable JSON codes and policy audit events avoid secret material and full recipient addresses.
+
+Send surfaces should return proof handles for follow-up automation: `message_id` plus best-effort Sent mailbox proof (`sent_folder`, `sent_uid`, `sent_message_url`, and `sent_mail.lookup_status`). If the Sent UID is not available yet, the field remains `null` and `lookup_status` explains why.
 
 ## Updating
 

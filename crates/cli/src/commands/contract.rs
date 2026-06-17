@@ -134,6 +134,10 @@ fn surfaces() -> Value {
                 "send_mode": string("Applied send safety mode when policy was evaluated"),
                 "error": json!({"type": "object", "description": "Stable denial object for denied sends"}),
                 "message_id": string("SMTP Message-ID when sent immediately"),
+                "sent_folder": string("Sent folder containing the sent message when resolved"),
+                "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
+                "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"}),
                 "draft_id": string("Local draft id when scheduled or draft-only"),
                 "to": string("Recipient address"),
                 "subject": string("Subject")
@@ -187,7 +191,11 @@ fn surfaces() -> Value {
                 "draft_id": string("Local draft id"),
                 "status": string("created, sent, discarded, or stored status"),
                 "imap_uid": json!({"type": ["integer", "null"], "description": "IMAP Drafts UID when present"}),
-                "message_id": string("SMTP Message-ID for sent drafts")
+                "message_id": string("SMTP Message-ID for sent drafts"),
+                "sent_folder": string("Sent folder containing the sent message when resolved"),
+                "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
+                "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"})
             }),
             json!([]),
         ),
@@ -340,6 +348,26 @@ fn mcp_tool_entries() -> Value {
             "reply",
             "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix.",
         ),
+        (
+            "create_reply_draft",
+            "Create a Mail.app-style contextual reply draft with populated threading headers, preserved quoted context, and abridged preview.",
+        ),
+        (
+            "create_forward_draft",
+            "Create a Mail.app-style contextual forward draft with forwarded-message context and abridged preview.",
+        ),
+        (
+            "modify_draft",
+            "Modify the agent-authored portion of a contextual draft while preserving quote/forward context and threading metadata.",
+        ),
+        (
+            "get_draft",
+            "Fetch a stored draft envelope with metadata and abridged contextual preview.",
+        ),
+        (
+            "send_draft",
+            "Send a draft by draft id. Requires explicit confirmation in agent contexts.",
+        ),
         ("move_message", "Move a message to another IMAP folder."),
         (
             "flag",
@@ -406,6 +434,73 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                     "account": string("Account ID or email address")
                 }),
                 json!(["uid", "body"]),
+            ),
+        ),
+        (
+            "create_reply_draft",
+            object(
+                json!({
+                    "uid": integer("UID of message to reply to"),
+                    "folder": string_default("IMAP folder of original message", "INBOX"),
+                    "reply_all": json!({"type": "boolean", "description": "Reply to all recipients", "default": false}),
+                    "body": string("Initial agent-authored plain-text body"),
+                    "html": string("Initial agent-authored HTML body"),
+                    "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["uid"]),
+            ),
+        ),
+        (
+            "create_forward_draft",
+            object(
+                json!({
+                    "uid": integer("UID of message to forward"),
+                    "folder": string_default("IMAP folder of source message", "INBOX"),
+                    "to": string("Optional forward recipient; may be left empty for later edit"),
+                    "body": string("Initial agent-authored plain-text body"),
+                    "html": string("Initial agent-authored HTML body"),
+                    "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["uid"]),
+            ),
+        ),
+        (
+            "modify_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id"),
+                    "body": string("Replacement agent-authored plain-text body"),
+                    "html": string("Replacement agent-authored HTML body"),
+                    "to": string("Recipient override"),
+                    "cc": string("CC override"),
+                    "bcc": string("BCC override"),
+                    "subject": string("Subject override"),
+                    "add_signature": json!({"type": "boolean", "description": "Override signature application for this edit"}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["draft_id"]),
+            ),
+        ),
+        (
+            "get_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id")
+                }),
+                json!(["draft_id"]),
+            ),
+        ),
+        (
+            "send_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id"),
+                    "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP", "default": false}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["draft_id"]),
             ),
         ),
         (

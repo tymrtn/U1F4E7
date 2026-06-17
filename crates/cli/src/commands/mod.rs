@@ -23,6 +23,7 @@ pub mod messages;
 pub mod migrate;
 pub mod paths;
 pub mod quickstart;
+pub mod re_subject_guard;
 pub mod read;
 pub mod rule;
 pub mod scheduled;

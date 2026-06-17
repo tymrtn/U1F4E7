@@ -3,6 +3,7 @@
 
 pub mod backup;
 pub mod code_extractor;
+pub mod compose;
 pub mod discovery;
 pub mod errors;
 pub mod event_pipeline;
@@ -22,6 +23,10 @@ pub mod smtp;
 pub mod threading;
 pub mod unsubscribe;
 
+pub use compose::{
+    AssembledBody, ContextBlock, DraftKind, abridge_words, assemble_body, build_forward_context,
+    build_reply_context, message_preview_source, prefix_forward_subject,
+};
 pub use discovery::{DiscoveryCandidate, discover};
 pub use errors::{DiscoveryError, ImapError, SmtpError};
 pub use folders::{detect_drafts_folder, detect_sent_folder};

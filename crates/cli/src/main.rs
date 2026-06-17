@@ -185,6 +185,9 @@ enum Commands {
         /// Allowed recipient email address or domain for --send-mode allowlisted-send (repeatable)
         #[arg(long = "allow-recipient")]
         allow_recipients: Vec<String>,
+        /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
+        #[arg(long)]
+        confirm_new_re_subject: bool,
     },
 
     /// Move a message to another folder
@@ -633,6 +636,89 @@ enum DraftCmd {
         /// In-Reply-To Message-ID (for replies)
         #[arg(long)]
         in_reply_to: Option<String>,
+        /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
+        #[arg(long)]
+        confirm_new_re_subject: bool,
+    },
+    /// Create a contextual reply draft from a message (quotes the parent)
+    Reply {
+        /// Source message UID
+        uid: u32,
+        /// Source folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Reply to all recipients (excludes self from Cc)
+        #[arg(long)]
+        all: bool,
+        /// Agent-authored reply body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// Agent-authored reply body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Append the account signature
+        #[arg(long)]
+        signature: bool,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Create a contextual forward draft from a message (includes forwarded block)
+    Forward {
+        /// Source message UID
+        uid: u32,
+        /// Source folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Recipient(s) for the forward
+        #[arg(long)]
+        to: Option<String>,
+        /// Agent-authored intro body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// Agent-authored intro body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Append the account signature
+        #[arg(long)]
+        signature: bool,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Edit a draft's authored body (preserves the quoted/forwarded block)
+    Edit {
+        /// Draft ID (local UUID)
+        id: String,
+        /// New authored body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// New authored body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Override the To recipient(s)
+        #[arg(long)]
+        to: Option<String>,
+        /// Override the Cc recipient(s)
+        #[arg(long)]
+        cc: Option<String>,
+        /// Override the Bcc recipient(s)
+        #[arg(long)]
+        bcc: Option<String>,
+        /// Override the subject
+        #[arg(long)]
+        subject: Option<String>,
+        /// Apply the account signature (omit to preserve prior state)
+        #[arg(long)]
+        signature: Option<bool>,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show a draft's metadata and abridged quote/forward preview
+    Show {
+        /// Draft ID (local UUID)
+        id: String,
     },
     /// List drafts (IMAP-first: fetches from server Drafts folder)
     List {
@@ -1362,6 +1448,7 @@ fn main() {
             send_mode,
             confirm_send,
             allow_recipients,
+            confirm_new_re_subject,
         } => commands::send::run(
             &to,
             &subject,
@@ -1379,6 +1466,7 @@ fn main() {
             &send_mode,
             confirm_send,
             &allow_recipients,
+            confirm_new_re_subject,
         ),
 
         Commands::Move {
@@ -1485,6 +1573,7 @@ fn main() {
                 cc,
                 bcc,
                 in_reply_to,
+                confirm_new_re_subject,
             } => commands::drafts::run_create(
                 &to,
                 subject.as_deref(),
@@ -1496,7 +1585,70 @@ fn main() {
                 cc.as_deref(),
                 bcc.as_deref(),
                 in_reply_to.as_deref(),
+                confirm_new_re_subject,
             ),
+            DraftCmd::Reply {
+                uid,
+                folder,
+                all,
+                body,
+                html,
+                signature,
+                account,
+            } => commands::drafts::run_reply(
+                uid,
+                &folder,
+                account.as_deref(),
+                cli.json,
+                backend,
+                all,
+                body.as_deref(),
+                html.as_deref(),
+                signature,
+            ),
+            DraftCmd::Forward {
+                uid,
+                folder,
+                to,
+                body,
+                html,
+                signature,
+                account,
+            } => commands::drafts::run_forward(
+                uid,
+                &folder,
+                account.as_deref(),
+                cli.json,
+                backend,
+                to.as_deref(),
+                body.as_deref(),
+                html.as_deref(),
+                signature,
+            ),
+            DraftCmd::Edit {
+                id,
+                body,
+                html,
+                to,
+                cc,
+                bcc,
+                subject,
+                signature,
+                account,
+            } => commands::drafts::run_edit(
+                &id,
+                account.as_deref(),
+                cli.json,
+                backend,
+                body.as_deref(),
+                html.as_deref(),
+                to.as_deref(),
+                cc.as_deref(),
+                bcc.as_deref(),
+                subject.as_deref(),
+                signature,
+            ),
+            DraftCmd::Show { id } => commands::drafts::run_show(&id, cli.json),
             DraftCmd::Send { id, account } => {
                 commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
             }

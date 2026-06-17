@@ -7,6 +7,7 @@
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
+use crate::commands::drafts::{find_sent_mail_by_message_id, sent_mail_proof_json};
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::{
@@ -128,6 +129,11 @@ async fn handle_tool_call(
         "search" => handle_search(params, backend).await,
         "send" => handle_send(params, backend).await,
         "reply" => handle_reply(params, backend).await,
+        "create_reply_draft" => handle_create_reply_draft(params, backend).await,
+        "create_forward_draft" => handle_create_forward_draft(params, backend).await,
+        "modify_draft" => handle_modify_draft(params, backend).await,
+        "get_draft" => handle_get_draft(params, backend).await,
+        "send_draft" => handle_send_draft(params, backend).await,
         "move_message" => handle_move(params, backend).await,
         "flag" => handle_flag(params, backend).await,
         "folders" => handle_folders(params, backend).await,
@@ -348,10 +354,18 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     .await
     .map_err(|e| e.to_string())?;
 
+    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
+    let sent_ui = sent_mail_proof.ui(&creds.account.id);
+
     Ok(json!({
         "sent": true,
         "message_id": message_id,
-        "ui": ui::account_ui(&creds.account.id),
+        "sent_folder": sent_mail_proof.folder.clone(),
+        "sent_uid": sent_mail_proof.uid,
+        "sent_message_url": sent_message_url,
+        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+        "ui": sent_ui,
     }))
 }
 
@@ -381,6 +395,25 @@ fn record_send_policy_event(
         created_at: now,
     };
     let _ = db.insert_event(&event);
+}
+
+fn required_str<'a>(params: &'a Value, name: &str) -> Result<&'a str, String> {
+    params
+        .get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{name} is required"))
+}
+
+fn optional_str<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
+    params.get(name).and_then(|v| v.as_str())
+}
+
+fn required_uid(params: &Value) -> Result<u32, String> {
+    params
+        .get("uid")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .ok_or_else(|| "uid is required".to_string())
 }
 
 async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -510,11 +543,155 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     .await
     .map_err(|e| e.to_string())?;
 
+    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
+    let sent_ui = sent_mail_proof.ui(&creds.account.id);
+
     Ok(json!({
         "sent": true,
         "message_id": message_id,
+        "sent_folder": sent_mail_proof.folder.clone(),
+        "sent_uid": sent_mail_proof.uid,
+        "sent_message_url": sent_message_url,
+        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
         "in_reply_to": headers.in_reply_to,
-        "ui": ui::message_ui(&creds.account.id, uid, folder),
+        "ui": sent_ui,
+        "parent_ui": ui::message_ui(&creds.account.id, uid, folder),
+    }))
+}
+
+async fn handle_create_reply_draft(
+    params: &Value,
+    backend: CredentialBackend,
+) -> Result<Value, String> {
+    let uid = required_uid(params)?;
+    let folder = optional_str(params, "folder").unwrap_or("INBOX");
+    let account_arg = optional_str(params, "account");
+    let reply_all = params
+        .get("reply_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let add_signature = params
+        .get("add_signature")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body = optional_str(params, "body");
+    let html = optional_str(params, "html");
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::create_reply_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        reply_all,
+        body,
+        html,
+        add_signature,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_create_forward_draft(
+    params: &Value,
+    backend: CredentialBackend,
+) -> Result<Value, String> {
+    let uid = required_uid(params)?;
+    let folder = optional_str(params, "folder").unwrap_or("INBOX");
+    let account_arg = optional_str(params, "account");
+    let to = optional_str(params, "to");
+    let add_signature = params
+        .get("add_signature")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body = optional_str(params, "body");
+    let html = optional_str(params, "html");
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::create_forward_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        to,
+        body,
+        html,
+        add_signature,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let account_arg = optional_str(params, "account");
+    let add_signature = params.get("add_signature").and_then(|v| v.as_bool());
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::modify_draft(
+        &db,
+        &creds,
+        id,
+        optional_str(params, "body"),
+        optional_str(params, "html"),
+        optional_str(params, "to"),
+        optional_str(params, "cc"),
+        optional_str(params, "bcc"),
+        optional_str(params, "subject"),
+        add_signature,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_get_draft(params: &Value, _backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let draft = db
+        .get_draft(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("draft not found: {id}"))?;
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_send_draft(params: &Value, _backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let confirm_send = params
+        .get("confirm_send")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !confirm_send {
+        return Ok(json!({
+            "status": "denied",
+            "draft_id": id,
+            "error": {
+                "code": "confirm_send_required",
+                "reason": "send_draft requires confirm_send=true in MCP agent contexts"
+            }
+        }));
+    }
+
+    // Keep MCP protocol output clean: the existing CLI `draft send` path prints
+    // to stdout, so it cannot safely be invoked from the stdio MCP handler yet.
+    // The CLI path itself preserves contextual headers; wiring a silent shared
+    // send primitive is the remaining step for live MCP send-by-draft-id.
+    Ok(json!({
+        "status": "not_available",
+        "draft_id": id,
+        "error": {
+            "code": "mcp_send_draft_not_wired",
+            "reason": "Use envelope draft send for now; MCP send_draft needs a silent shared send primitive to avoid corrupting stdio transport."
+        }
     }))
 }
 

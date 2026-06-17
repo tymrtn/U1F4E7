@@ -1700,8 +1700,7 @@ mod tests {
     fn test_decode_rfc2047_b_encoding_with_padding() {
         use base64::Engine as _;
         // base64("📧 Inbox") — 📧 = F0 9F 93 A7
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode("📧 Inbox");
+        let b64 = base64::engine::general_purpose::STANDARD.encode("📧 Inbox");
         let input = format!("=?UTF-8?B?{b64}?=");
         let result = decode_rfc2047(input.as_bytes());
         assert_eq!(result, "📧 Inbox");

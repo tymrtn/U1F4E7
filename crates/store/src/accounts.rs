@@ -265,6 +265,27 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Set (or clear) an account's signature fields.
+    ///
+    /// Passing `None` for a field clears it. Returns the updated account so
+    /// callers can echo the stored state without a second query.
+    pub fn set_account_signature(
+        &self,
+        id: &str,
+        signature_text: Option<&str>,
+        signature_html: Option<&str>,
+    ) -> Result<Account> {
+        let rows = self.conn().execute(
+            "UPDATE accounts SET signature_text = ?1, signature_html = ?2 WHERE id = ?3",
+            params![signature_text, signature_html, id],
+        )?;
+        if rows == 0 {
+            return Err(StoreError::AccountNotFound(id.to_string()));
+        }
+        self.get_account(id)?
+            .ok_or_else(|| StoreError::AccountNotFound(id.to_string()))
+    }
+
     /// Get the default (first) account, or None if no accounts exist.
     pub fn default_account(&self) -> Result<Option<Account>> {
         let mut stmt = self.conn().prepare(
@@ -317,6 +338,42 @@ impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_and_clear_account_signature() {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Test",
+                "test@example.com",
+                "pw",
+                "smtp.example.com",
+                587,
+                "imap.example.com",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        assert_eq!(account.signature_text, None);
+
+        let updated = db
+            .set_account_signature(&account.id, Some("Tyler\nEnvelope"), None)
+            .unwrap();
+        assert_eq!(updated.signature_text.as_deref(), Some("Tyler\nEnvelope"));
+        assert_eq!(updated.signature_html, None);
+
+        let cleared = db.set_account_signature(&account.id, None, None).unwrap();
+        assert_eq!(cleared.signature_text, None);
+    }
+
+    #[test]
+    fn set_signature_unknown_account_errors() {
+        let db = Database::open_memory().unwrap();
+        let err = db
+            .set_account_signature("nope", Some("x"), None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AccountNotFound(_)));
+    }
 
     #[test]
     fn create_and_list_accounts() {

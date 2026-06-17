@@ -95,8 +95,19 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
     );
     let tools = read_framed(&mut stdout);
     let tool_entries = tools["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tool_entries.len(), 11);
+    assert_eq!(tool_entries.len(), 16);
     assert!(tool_entries.iter().any(|tool| tool["name"] == "send"));
+    assert!(
+        tool_entries
+            .iter()
+            .any(|tool| tool["name"] == "create_reply_draft")
+    );
+    assert!(
+        tool_entries
+            .iter()
+            .any(|tool| tool["name"] == "modify_draft")
+    );
+    assert!(tool_entries.iter().any(|tool| tool["name"] == "send_draft"));
     assert_eq!(
         tool_entries
             .iter()
