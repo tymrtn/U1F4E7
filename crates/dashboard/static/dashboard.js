@@ -31,6 +31,7 @@ const state = {
   snoozed: [],
   composeMode: 'new',
   composeParent: null,
+  composeImapDraft: null,
   pendingAttachments: [],
   bodyFormat: 'text',
   showAllAccounts: false,
@@ -2914,6 +2915,7 @@ function openComposer(mode = 'new', parent = null) {
   }
   state.composeMode = mode;
   state.composeParent = parent;
+  state.composeImapDraft = null;
   state.pendingAttachments = [];
 
   const title = mode === 'reply' ? 'Reply' : mode === 'reply-all' ? 'Reply All' : 'New Message';
@@ -2949,10 +2951,18 @@ function openComposerFromDraft(draft) {
 
 
 // Open a raw IMAP message (fetched from a Drafts folder) in the composer so the
-// user can edit and resend it.  The original IMAP draft is NOT deleted here — the
-// user should delete it manually or via a follow-up rule once they've sent.
+// user can edit and resend it.  We remember the original {accountId, uid, folder}
+// so that, after a successful send, sendComposer() can auto-delete the original
+// IMAP draft from the Drafts folder (issue #61).
 function openComposerFromImap(msg) {
   openComposer('new');
+  // Mark this composition as originating from an IMAP draft so sendComposer()
+  // cleans up the original on success.  openComposer('new') reset composeMode to
+  // 'new'; override it here after the reset.
+  state.composeMode = 'imap-draft';
+  state.composeImapDraft = (msg && msg.account_id && msg.uid != null)
+    ? { accountId: msg.account_id, uid: msg.uid, folder: msg.folder || 'INBOX' }
+    : null;
   $('composer-to').value = msg.to_addr || '';
   $('composer-cc').value = msg.cc_addr || '';
   $('composer-subject').value = msg.subject || '';
@@ -2961,7 +2971,7 @@ function openComposerFromImap(msg) {
     || (msg.html_body ? msg.html_body.replace(/<[^>]+>/g, '') : '');
   setBodyFormat(msg.html_body && !msg.text_body ? 'html' : 'text');
   $('composer-title').textContent = 'Edit Draft';
-  toast('IMAP draft loaded — edit and send. Delete the original draft in your mail client.', '');
+  toast('IMAP draft loaded — edit and send. The original draft will be removed after sending.', '');
 }
 
 function prefixRe(subject) {
@@ -2972,13 +2982,16 @@ function closeComposer() {
   $('composer').classList.remove('show');
   state.composeMode = 'new';
   state.composeParent = null;
+  state.composeImapDraft = null;
   state.pendingAttachments = [];
 }
 
 async function sendComposer() {
   const sendAccountId = state.composeMode === 'new'
     ? state.currentAccount?.id
-    : (state.composeParent?.account_id || state.currentAccount?.id);
+    : state.composeMode === 'imap-draft'
+      ? (state.composeImapDraft?.accountId || state.currentAccount?.id)
+      : (state.composeParent?.account_id || state.currentAccount?.id);
   if (!sendAccountId) {
     toast('No account selected', 'error');
     return;
@@ -3017,6 +3030,22 @@ async function sendComposer() {
         attachments: state.pendingAttachments,
       });
       toast('Sent', 'success');
+      // Issue #61: a composition opened from an IMAP draft leaves the original
+      // message in the Drafts folder. The SMTP send fully succeeded above, so
+      // now remove the original draft. Only attempt when we know the source
+      // {accountId, uid, folder}; a delete failure must not look like a send
+      // failure, so it is reported separately and does not throw.
+      const origin = state.composeMode === 'imap-draft' ? state.composeImapDraft : null;
+      if (origin && origin.uid != null && origin.accountId) {
+        try {
+          await api(
+            'DELETE',
+            `/accounts/${origin.accountId}/messages/${origin.uid}?folder=${encodeURIComponent(origin.folder || 'INBOX')}`
+          );
+        } catch (delErr) {
+          toast('Sent, but the original draft could not be removed: ' + delErr.message, '');
+        }
+      }
     }
     closeComposer();
   } catch (e) {

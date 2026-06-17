@@ -30,8 +30,15 @@ pub async fn run(
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("From: {}", msg.from_addr);
-                println!("To: {}", msg.to_addr);
-                if let Some(ref cc) = msg.cc_addr {
+                let to_line = if msg.to_addrs.is_empty() {
+                    msg.to_addr.clone()
+                } else {
+                    msg.to_addrs.join(", ")
+                };
+                println!("To: {to_line}");
+                if !msg.cc_addrs.is_empty() {
+                    println!("Cc: {}", msg.cc_addrs.join(", "));
+                } else if let Some(ref cc) = msg.cc_addr {
                     println!("Cc: {cc}");
                 }
                 println!("Subject: {}", msg.subject);

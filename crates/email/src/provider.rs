@@ -183,7 +183,7 @@ pub fn classify_folder(name: &str) -> Option<&'static str> {
         "inbox" => Some(canonical::INBOX),
 
         // Drafts
-        "drafts" | "[gmail]/drafts" | "draft" | "inbox.drafts" | "inbox/drafts" => {
+        "drafts" | "[gmail]/drafts" | "draft" | "inbox.drafts" | "inbox/drafts" | "inbox/draft" => {
             Some(canonical::DRAFTS)
         }
 
@@ -194,20 +194,30 @@ pub fn classify_folder(name: &str) -> Option<&'static str> {
         | "sent items"
         | "[gmail]/sent mail"
         | "inbox.sent"
-        | "inbox.sent messages" => Some(canonical::SENT),
+        | "inbox.sent messages"
+        | "inbox/sent"
+        | "inbox/sent mail"
+        | "inbox/sent messages"
+        | "inbox/sent items" => Some(canonical::SENT),
 
         // Trash
-        "trash" | "[gmail]/trash" | "deleted messages" | "deleted items" | "inbox.trash" => {
-            Some(canonical::TRASH)
-        }
+        "trash"
+        | "[gmail]/trash"
+        | "deleted messages"
+        | "deleted items"
+        | "inbox.trash"
+        | "inbox/trash"
+        | "inbox/deleted messages"
+        | "inbox/deleted items" => Some(canonical::TRASH),
 
         // Spam/Junk
-        "junk" | "spam" | "[gmail]/spam" | "junk e-mail" | "inbox.junk" | "inbox.spam" => {
-            Some(canonical::SPAM)
-        }
+        "junk" | "spam" | "[gmail]/spam" | "junk e-mail" | "inbox.junk" | "inbox.spam"
+        | "inbox/junk" | "inbox/spam" | "inbox/junk e-mail" => Some(canonical::SPAM),
 
         // Archive
-        "archive" | "all mail" | "[gmail]/all mail" | "inbox.archive" => Some(canonical::ARCHIVE),
+        "archive" | "all mail" | "[gmail]/all mail" | "inbox.archive" | "inbox/archive" => {
+            Some(canonical::ARCHIVE)
+        }
 
         // Starred (Gmail-specific)
         "[gmail]/starred" => Some(canonical::STARRED),
@@ -453,6 +463,23 @@ mod tests {
         assert_eq!(classify_folder("My Custom Folder"), None);
         assert_eq!(classify_folder("Projects"), None);
         assert_eq!(classify_folder("Newsletters"), None);
+    }
+
+    #[test]
+    fn classify_slash_separated_custom_layouts() {
+        // Issue #38: providers like tyler@martin.fm expose INBOX/sent etc.
+        // which previously fell through to `other`.
+        assert_eq!(classify_folder("INBOX/sent"), Some("sent"));
+        assert_eq!(classify_folder("INBOX/Sent"), Some("sent"));
+        assert_eq!(classify_folder("INBOX/Sent Mail"), Some("sent"));
+        assert_eq!(classify_folder("INBOX/draft"), Some("drafts"));
+        assert_eq!(classify_folder("INBOX/Drafts"), Some("drafts"));
+        assert_eq!(classify_folder("INBOX/trash"), Some("trash"));
+        assert_eq!(classify_folder("INBOX/spam"), Some("spam"));
+        assert_eq!(classify_folder("INBOX/Junk"), Some("spam"));
+        assert_eq!(classify_folder("INBOX/Archive"), Some("archive"));
+        // Gmail layout still classifies correctly (no regression).
+        assert_eq!(classify_folder("[Gmail]/Sent Mail"), Some("sent"));
     }
 
     // ── ProviderType serialization ───────────────────────────────

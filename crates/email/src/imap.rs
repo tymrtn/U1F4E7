@@ -46,6 +46,88 @@ fn imap_mailbox_arg(mailbox: &str) -> String {
     format!("\"{}\"", mailbox.replace('\\', r"\\").replace('"', "\\\""))
 }
 
+/// IMAP `SEARCH` key tokens recognized by RFC 3501 (plus common extensions).
+///
+/// Used to decide whether a user-supplied search string is already a
+/// field-qualified IMAP query (e.g. `FROM bob`, `SUBJECT foo`, `OR ...`) or a
+/// bare free-text term (e.g. `Hillan`, `régimen matrimonial`) that should be
+/// treated as a `TEXT` search instead of being passed through raw — a raw bare
+/// term is not a valid IMAP search key and silently returns zero matches on
+/// most servers. See issue #63.
+const IMAP_SEARCH_KEYS: &[&str] = &[
+    "ALL",
+    "ANSWERED",
+    "BCC",
+    "BEFORE",
+    "BODY",
+    "CC",
+    "DELETED",
+    "DRAFT",
+    "FLAGGED",
+    "FROM",
+    "HEADER",
+    "KEYWORD",
+    "LARGER",
+    "NEW",
+    "NOT",
+    "OLD",
+    "ON",
+    "OR",
+    "RECENT",
+    "SEEN",
+    "SENTBEFORE",
+    "SENTON",
+    "SENTSINCE",
+    "SINCE",
+    "SMALLER",
+    "SUBJECT",
+    "TEXT",
+    "TO",
+    "UID",
+    "UNANSWERED",
+    "UNDELETED",
+    "UNDRAFT",
+    "UNFLAGGED",
+    "UNKEYWORD",
+    "UNSEEN",
+];
+
+/// Normalize a user search query into a valid IMAP `SEARCH` criteria string.
+///
+/// If the query already begins with a recognized IMAP search key (or a `(`
+/// grouping / `*` charset-style construct), it is treated as an already
+/// field-qualified query and passed through unchanged. Otherwise the entire
+/// query is treated as bare free text and wrapped as `TEXT "<query>"` so bare
+/// terms search message text instead of silently matching nothing.
+///
+/// The wrapped form escapes IMAP quoted-string metacharacters. Callers must
+/// still run [`validate_imap_input`] (CRLF/NUL/brace rejection) on the result.
+pub fn normalize_search_query(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    // Grouped or already-structured queries pass through untouched.
+    if trimmed.starts_with('(') {
+        return trimmed.to_string();
+    }
+
+    let first_token = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or(trimmed)
+        .to_ascii_uppercase();
+
+    if IMAP_SEARCH_KEYS.contains(&first_token.as_str()) {
+        return trimmed.to_string();
+    }
+
+    // Bare free-text term: wrap as a TEXT search with a quoted, escaped argument.
+    let escaped = trimmed.replace('\\', r"\\").replace('"', "\\\"");
+    format!("TEXT \"{escaped}\"")
+}
+
 pub type ImapSession = Session<TlsStream<TcpStream>>;
 
 #[derive(Debug, Clone)]
@@ -575,11 +657,12 @@ pub async fn fetch_message(
 
     let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
     let from_addr = mp_first_address(parsed.from());
-    let to_addr = mp_first_address(parsed.to());
-    let cc_addr = {
-        let addr = mp_first_address(parsed.cc());
-        if addr.is_empty() { None } else { Some(addr) }
-    };
+    let to_addrs = mp_all_addresses(parsed.to());
+    let cc_addrs = mp_all_addresses(parsed.cc());
+    // Keep the scalar fields as the first address for backward compatibility;
+    // `to_addrs`/`cc_addrs` carry the complete recipient set.
+    let to_addr = to_addrs.first().cloned().unwrap_or_default();
+    let cc_addr = cc_addrs.first().cloned();
 
     let subject = parsed.subject().unwrap_or_default().to_string();
     let date = parsed.date().map(|d| d.to_rfc3339());
@@ -613,6 +696,8 @@ pub async fn fetch_message(
         from_addr,
         to_addr,
         cc_addr,
+        to_addrs,
+        cc_addrs,
         subject,
         date,
         text_body,
@@ -1091,6 +1176,10 @@ pub async fn search(
     validate_imap_input(folder)?;
     validate_imap_input(query)?;
 
+    // Map bare free-text terms to a TEXT search so they behave like the
+    // field-qualified queries agents expect (issue #63).
+    let search_criteria = normalize_search_query(query);
+
     client
         .session
         .select(folder)
@@ -1099,9 +1188,9 @@ pub async fn search(
 
     let uid_set = client
         .session
-        .uid_search(query)
+        .uid_search(&search_criteria)
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {query}: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {search_criteria}: {e}")))?;
 
     let mut uids: Vec<u32> = uid_set.into_iter().collect();
 
@@ -1444,6 +1533,35 @@ pub async fn download_attachment(
 }
 
 /// Extract first email address from a mail-parser Address.
+/// Extract every address from a mail-parser address header as a list.
+///
+/// Unlike [`mp_first_address`], this preserves the full recipient set so
+/// agent-facing output can expose all `To`/`Cc` recipients rather than only
+/// the first one.
+fn mp_all_addresses(header: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    let mut out = Vec::new();
+    match header {
+        Some(mail_parser::Address::List(list)) => {
+            for a in list.iter() {
+                if let Some(addr) = a.address.as_ref() {
+                    out.push(addr.to_string());
+                }
+            }
+        }
+        Some(mail_parser::Address::Group(groups)) => {
+            for g in groups.iter() {
+                for a in g.addresses.iter() {
+                    if let Some(addr) = a.address.as_ref() {
+                        out.push(addr.to_string());
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    out
+}
+
 fn mp_first_address(header: Option<&mail_parser::Address<'_>>) -> String {
     match header {
         Some(addr) => match addr {
@@ -1503,6 +1621,75 @@ mod tests {
     #[test]
     fn test_imap_mailbox_arg_escapes_quoted_string_metacharacters() {
         assert_eq!(imap_mailbox_arg(r#"Foo\"Bar"#), r#""Foo\\\"Bar""#);
+    }
+
+    #[test]
+    fn test_mp_all_addresses_returns_full_recipient_list() {
+        let raw = b"From: sender@example.com\r\n\
+To: alice@example.com, Bob <bob@example.com>, carol@example.com\r\n\
+Cc: dave@example.com, eve@example.com\r\n\
+Subject: hi\r\n\r\nbody\r\n";
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&raw[..])
+            .expect("parse");
+        assert_eq!(
+            mp_all_addresses(parsed.to()),
+            vec![
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+                "carol@example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            mp_all_addresses(parsed.cc()),
+            vec![
+                "dave@example.com".to_string(),
+                "eve@example.com".to_string()
+            ]
+        );
+        // mp_first_address only returns the first — the bug the list fixes.
+        assert_eq!(mp_first_address(parsed.to()), "alice@example.com");
+    }
+
+    #[test]
+    fn test_normalize_search_wraps_bare_term_as_text() {
+        assert_eq!(normalize_search_query("Hillan"), r#"TEXT "Hillan""#);
+        assert_eq!(
+            normalize_search_query("SL unipersonal"),
+            r#"TEXT "SL unipersonal""#
+        );
+        assert_eq!(
+            normalize_search_query("régimen matrimonial"),
+            r#"TEXT "régimen matrimonial""#
+        );
+    }
+
+    #[test]
+    fn test_normalize_search_passes_through_field_qualified() {
+        assert_eq!(
+            normalize_search_query("FROM bob@example.com"),
+            "FROM bob@example.com"
+        );
+        assert_eq!(normalize_search_query("TEXT Hillan"), "TEXT Hillan");
+        assert_eq!(normalize_search_query("SUBJECT SL"), "SUBJECT SL");
+        // Case-insensitive key detection.
+        assert_eq!(
+            normalize_search_query("from bob@example.com"),
+            "from bob@example.com"
+        );
+        // Grouped queries pass through.
+        assert_eq!(
+            normalize_search_query("(OR FROM a SUBJECT b)"),
+            "(OR FROM a SUBJECT b)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_search_escapes_quotes_in_bare_term() {
+        assert_eq!(
+            normalize_search_query(r#"say "hi""#),
+            r#"TEXT "say \"hi\"""#
+        );
     }
 
     #[test]

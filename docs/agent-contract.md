@@ -47,6 +47,8 @@ The v1 contract covers:
 
 Agent-facing CLI/MCP `inbox` and `search` surfaces default to `limit: 25`, accept `limit: 1..=1000`, and reject out-of-range limits before opening an IMAP connection. Dashboard aggregate endpoints keep their own lower defaults/caps and are not governed by this agent limit.
 
+`search` also accepts an optional `roles` array (`inbox`, `drafts`, `sent`, `trash`, `spam`, `archive`, `starred`). When present it replaces the literal `folder`, resolves provider-specific layouts (e.g. `INBOX/sent`, `[Gmail]/Sent Mail`) to every matching folder, includes the source folder on each result, and errors if a requested role resolves to zero folders. Search stays read-only.
+
 ## Send safety
 
 Agent-facing send modes are stable strings:

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-17
+
+### Added
+
+- **Account signature CLI** — `envelope accounts signature show|set|clear` manages text/HTML account signatures without direct database edits.
+- **Native client setup helper** — `envelope accounts setup-instructions` prints non-secret IMAP/SMTP host, port, security, and username values for Mail.app-style setup.
+- **Role-based search** — `envelope search --role/--roles sent,archive ...` resolves provider/custom folder layouts such as `INBOX/sent` and searches every matching folder.
+- **Canonical agent skill** — `docs/agents/envelope-skill.md` documents Envelope as the runtime for Hermes, Claude Code, Codex, and similar harnesses.
+
+### Changed
+
+- Bare search terms are normalized to IMAP `TEXT` searches so agent queries like `Hillan` no longer silently miss present messages.
+- `read` output now preserves full `to_addrs` and `cc_addrs` recipient lists while keeping scalar compatibility fields.
+- IMAP-draft sends from the dashboard delete the original IMAP draft only after SMTP send succeeds.
+- Backup export help now documents the `--batch-size` memory tradeoff.
+
+### Fixed
+
+- `read --json` strict JSON behavior is regression-tested against control characters.
+- Backup verification now flags symlinked/unsafe extra archive entries instead of traversing them.
+- Restore-state sidecar reads/writes reject symlinked paths and unsafe parents.
+- Backup JSON mode emits machine-readable fatal error events before returning failure.
+- Dashboard deep-link fallback coverage now includes message and cockpit routes.
+
 ## [0.10.0] — 2026-05-30
 
 The dashboard's interaction model is now fully baked: the half-wired
@@ -100,6 +124,8 @@ real cached-message dataset before shipping.
   surfaces and avoids automatic account selection that would probe live IMAP
   folders or messages.
 
+[0.11.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.11.0
+[0.10.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.10.0
 [0.9.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.9.0
 
 ## [0.5.0] — 2026-04-19

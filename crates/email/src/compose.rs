@@ -372,6 +372,8 @@ mod tests {
             from_addr: from.to_string(),
             to_addr: to.to_string(),
             cc_addr: cc.map(str::to_string),
+            to_addrs: vec![to.to_string()],
+            cc_addrs: cc.map(str::to_string).into_iter().collect(),
             subject: subject.to_string(),
             date: Some("Tue, 4 Jun 2026 10:31:00 +0000".to_string()),
             text_body: text.map(str::to_string),

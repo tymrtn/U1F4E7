@@ -411,3 +411,36 @@ fn dashboard_bulk_status_auto_clears_terminal_results() {
         "terminal bulk-status summaries should auto-clear instead of lingering"
     );
 }
+
+#[test]
+fn dashboard_sending_from_imap_draft_deletes_original_draft() {
+    // Issue #61: composing from an IMAP Drafts message must clean up the
+    // original draft after a successful send.
+    assert!(
+        DASHBOARD_JS.contains("composeImapDraft"),
+        "composer state should track the originating IMAP draft {{accountId, uid, folder}}"
+    );
+    assert!(
+        DASHBOARD_JS.contains("'imap-draft'"),
+        "composing from an IMAP draft should use a dedicated compose mode"
+    );
+    assert!(
+        DASHBOARD_JS.contains("state.composeMode = 'imap-draft'"),
+        "openComposerFromImap should mark the composition as imap-draft"
+    );
+    // The cleanup DELETE must run on the send path, scoped to the original
+    // draft's uid/folder, and must not be conflated with the send itself.
+    assert!(
+        DASHBOARD_JS.contains("state.composeMode === 'imap-draft' ? state.composeImapDraft : null"),
+        "send path should only delete when the composition came from an IMAP draft"
+    );
+    assert!(
+        DASHBOARD_JS.contains("`/accounts/${origin.accountId}/messages/${origin.uid}?folder=")
+            && DASHBOARD_JS.contains("'DELETE'"),
+        "successful send from an IMAP draft should DELETE the original draft uid in its folder"
+    );
+    assert!(
+        DASHBOARD_JS.contains("could not be removed"),
+        "a draft-delete failure must be surfaced separately and not reported as a send failure"
+    );
+}

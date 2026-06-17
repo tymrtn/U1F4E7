@@ -560,6 +560,39 @@ mod tests {
         assert!(html.contains("/static/dashboard.js"));
     }
 
+    #[tokio::test]
+    async fn spa_fallback_serves_index_for_message_and_cockpit_deep_links() {
+        // Issue #47: URLs emitted by CLI/MCP `ui` metadata
+        // (`/accounts/<id>/messages/<uid>?folder=INBOX`, `/accounts/<id>/cockpit`)
+        // must resolve to the SPA shell instead of 404 so the links are clickable.
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        for uri in [
+            "/accounts/acc1/messages/57?folder=INBOX",
+            "/accounts/acc1/cockpit",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "deep link {uri} should serve the SPA shell, not 404"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                html.contains("<title>Envelope</title>") && html.contains("/static/dashboard.js"),
+                "deep link {uri} should return the dashboard SPA index"
+            );
+        }
+    }
+
     #[test]
     fn serve_options_keep_background_sweeps_enabled_by_default() {
         assert!(ServeOptions::default().background_sweeps);

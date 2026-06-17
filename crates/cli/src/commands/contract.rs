@@ -112,7 +112,12 @@ fn surfaces() -> Value {
                     1,
                     MAX_AGENT_LIST_LIMIT as u64,
                 ),
-                "account": string("Account ID or email address")
+                "account": string("Account ID or email address"),
+                "roles": json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Folder roles to search instead of --folder: inbox, drafts, sent, trash, spam, archive, starred. Resolves provider-specific layouts (e.g. INBOX/sent, [Gmail]/Sent Mail); results include the source folder. Read-only."
+                })
             }),
             json!(["query"]),
         ),
@@ -120,6 +125,7 @@ fn surfaces() -> Value {
         vec![
             "Search syntax is passed through to the IMAP server.",
             "Agent/CLI limit is capped at 1000; dashboard endpoints keep their own lower caps.",
+            "--role/--roles searches every folder matching the role and errors if a role resolves to zero folders.",
         ],
     ));
     items.push(surface_entry(
@@ -663,7 +669,10 @@ fn message_detail_schema() -> Value {
         json!({
             "uid": integer("Message UID"),
             "from_addr": string("Sender address"),
-            "to_addr": string("Recipient address"),
+            "to_addr": string("First recipient address (compat; see to_addrs for full list)"),
+            "cc_addr": string("First Cc address (compat; see cc_addrs for full list)"),
+            "to_addrs": array_of(json!({"type": "string"})),
+            "cc_addrs": array_of(json!({"type": "string"})),
             "subject": string("Subject"),
             "date": string("Message date"),
             "text_body": string("Plain-text body"),

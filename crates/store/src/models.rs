@@ -246,6 +246,14 @@ pub struct Message {
     pub from_addr: String,
     pub to_addr: String,
     pub cc_addr: Option<String>,
+    /// Full list of `To` recipients (additive; `to_addr` keeps the first for
+    /// backward compatibility). See issue: agent outputs must expose the full
+    /// recipient list.
+    #[serde(default)]
+    pub to_addrs: Vec<String>,
+    /// Full list of `Cc` recipients.
+    #[serde(default)]
+    pub cc_addrs: Vec<String>,
     pub subject: String,
     pub date: Option<String>,
     pub text_body: Option<String>,
@@ -500,4 +508,43 @@ pub struct Contact {
     pub last_seen: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for issue #53: `read --json` must emit strict-JSON-safe output
+    /// even when a message body contains raw control characters. Serializing a
+    /// `Message` via serde_json escapes control characters, so the result must
+    /// round-trip through a strict parser without error.
+    #[test]
+    fn message_with_control_chars_round_trips_strict_json() {
+        let msg = Message {
+            uid: 199999,
+            message_id: Some("<grim@example.com>".to_string()),
+            from_addr: "sender@example.com".to_string(),
+            to_addr: "a@example.com".to_string(),
+            cc_addr: None,
+            to_addrs: vec!["a@example.com".to_string(), "b@example.com".to_string()],
+            cc_addrs: vec![],
+            subject: "The Grim Onboarding: Self-Declaration".to_string(),
+            date: None,
+            // Embed a vertical tab, form feed, NUL, bell, and a bare control byte
+            // alongside normal text — the kinds of bytes that broke strict
+            // json.loads() in the field report.
+            text_body: Some("line1\u{0B}line2\u{0C}\u{0000}\u{0007}\u{001F}done".to_string()),
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            flags: vec!["Seen".to_string()],
+            attachments: vec![],
+        };
+
+        let serialized = serde_json::to_string(&msg).expect("serialize");
+        // Strict re-parse must succeed (no invalid control characters).
+        let reparsed: Message = serde_json::from_str(&serialized).expect("strict parse");
+        assert_eq!(reparsed.text_body, msg.text_body);
+        assert_eq!(reparsed.to_addrs, msg.to_addrs);
+    }
 }

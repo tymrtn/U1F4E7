@@ -130,7 +130,7 @@ enum Commands {
     Search {
         /// IMAP search query
         query: String,
-        /// IMAP folder
+        /// IMAP folder (ignored when --role/--roles is given)
         #[arg(long, default_value = "INBOX")]
         folder: String,
         /// Maximum results (1..=1000)
@@ -139,6 +139,13 @@ enum Commands {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Search by folder role instead of literal --folder. Resolves
+        /// provider-specific layouts (e.g. INBOX/sent, [Gmail]/Sent Mail) to a
+        /// canonical role. Repeatable, or comma-separated. Known roles: inbox,
+        /// drafts, sent, trash, spam, archive, starred. Results include the
+        /// source folder. Read-only.
+        #[arg(long = "role", alias = "roles", value_delimiter = ',', num_args = 1..)]
+        roles: Vec<String>,
     },
 
     /// Send an email
@@ -519,10 +526,64 @@ enum AccountsCmd {
     },
     /// List configured accounts
     List,
+    /// Print safe (non-secret) mail-client setup settings for an account
+    SetupInstructions {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Target mail client (formatting hint only)
+        #[arg(long, default_value = "mailapp")]
+        client: String,
+    },
     /// Remove an account
     Remove {
         /// Account ID or email address
         id: String,
+    },
+    /// View or update an account's outbound signature
+    Signature {
+        #[command(subcommand)]
+        subcommand: SignatureCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SignatureCmd {
+    /// Show the stored signature(s) for an account
+    Show {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+    },
+    /// Set the plain-text and/or HTML signature for an account
+    Set {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Plain-text signature value
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        /// HTML signature value
+        #[arg(long, conflicts_with = "html_file")]
+        html: Option<String>,
+        /// Read the plain-text signature from a file
+        #[arg(long)]
+        text_file: Option<String>,
+        /// Read the HTML signature from a file
+        #[arg(long)]
+        html_file: Option<String>,
+    },
+    /// Clear an account's signature(s); clears both unless --text/--html given
+    Clear {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Clear only the plain-text signature
+        #[arg(long)]
+        text: bool,
+        /// Clear only the HTML signature
+        #[arg(long)]
+        html: bool,
     },
 }
 
@@ -1113,7 +1174,11 @@ pub enum BackupCmd {
         /// Exclude folder glob (repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
-        /// Number of source messages fetched per IMAP batch
+        /// Source messages fetched per IMAP batch (1..=500). Each batch
+        /// materializes that many full RFC822 bodies in memory before they are
+        /// written to disk, so larger values trade memory for fewer round
+        /// trips. Keep the conservative default for mailboxes with large
+        /// attachments; raise it only for small-message mailboxes.
         #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
         batch_size: u32,
     },
@@ -1424,11 +1489,13 @@ fn main() {
             folder,
             limit,
             account,
+            roles,
         } => commands::search::run(
             &query,
             &folder,
             limit,
             account.as_deref(),
+            &roles,
             cli.json,
             backend,
         ),

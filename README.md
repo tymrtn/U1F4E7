@@ -207,6 +207,8 @@ envelope mcp --config
 
 11 tools: `inbox`, `read`, `search`, `send`, `reply`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`. Envelope is the only MCP email server that works against any IMAP provider.
 
+For a single, distribution-ready operating guide to hand a fresh agent, see [the Envelope agent skill](docs/agents/envelope-skill.md).
+
 ## Rules engine
 
 The agent is the intelligence. Envelope is the execution.
