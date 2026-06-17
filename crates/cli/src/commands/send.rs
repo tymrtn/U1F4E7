@@ -110,17 +110,18 @@ pub async fn run(
 
     // ── Scheduled send path ──
     if let Some(at_str) = at {
-        if !attach_paths.is_empty() {
-            anyhow::bail!(
-                "--attach is not supported with --at (scheduled send does not persist attachments yet)"
-            );
-        }
         if from.is_some() {
             anyhow::bail!(
                 "--from is not supported with --at (scheduled send does not persist sender override yet)"
             );
         }
         let send_at = parse_until(at_str).context("failed to parse --at value")?;
+
+        // Snapshot attachment bytes at schedule time so delivery does not depend
+        // on the original files surviving. Bytes are base64-encoded into the
+        // draft's attachments JSON. If a file is unreadable now, fail explicitly
+        // rather than scheduling a send that silently drops the attachment.
+        let scheduled_attachments = snapshot_attachments(attach_paths)?;
 
         // Create a draft with send_after set
         let draft = db
@@ -140,6 +141,11 @@ pub async fn run(
         db.update_draft_send_after(&draft.id, &send_at)
             .context("failed to set send_after on draft")?;
 
+        if !scheduled_attachments.is_empty() {
+            db.update_draft_attachments(&draft.id, &scheduled_attachments)
+                .context("failed to persist scheduled attachments")?;
+        }
+
         if json {
             println!(
                 "{}",
@@ -147,11 +153,25 @@ pub async fn run(
                     "scheduled": true,
                     "send_at": send_at,
                     "draft_id": draft.id,
+                    "attachments": scheduled_attachments_summary(&scheduled_attachments),
                     "ui": ui::draft_ui(&creds.account.id, &draft.id),
                 })
             );
         } else {
             println!("Scheduled for {send_at}. Draft ID: {}", draft.id);
+            if !scheduled_attachments.is_empty() {
+                println!("Attachments: {}", scheduled_attachments.len());
+                for a in &scheduled_attachments {
+                    println!(
+                        "  - {} ({} bytes, {})",
+                        a["filename"].as_str().unwrap_or("attachment"),
+                        a["size"].as_u64().unwrap_or(0),
+                        a["content_type"]
+                            .as_str()
+                            .unwrap_or("application/octet-stream"),
+                    );
+                }
+            }
         }
 
         return Ok(());
@@ -255,6 +275,54 @@ pub async fn run(
     Ok(())
 }
 
+/// Read each `--attach` file and snapshot its bytes into a JSON attachment
+/// entry suitable for storage on a scheduled draft.
+///
+/// Each entry carries `filename`, `content_type`, `size`, and `data_base64`.
+/// Returns an explicit error if any file cannot be read so a scheduled send is
+/// never created with a silently-missing attachment.
+fn snapshot_attachments(attach_paths: &[String]) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+    let mut out = Vec::with_capacity(attach_paths.len());
+    for path_str in attach_paths {
+        let path = std::path::Path::new(path_str);
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read attachment: {path_str}"))?;
+        let content_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        out.push(serde_json::json!({
+            "filename": filename,
+            "content_type": content_type,
+            "size": data.len(),
+            "data_base64": data_base64,
+        }));
+    }
+    Ok(out)
+}
+
+/// Build a non-secret summary of scheduled attachments for JSON output.
+/// Deliberately excludes `data_base64` so attachment bytes never appear in
+/// command output, logs, or audit surfaces.
+fn scheduled_attachments_summary(attachments: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    attachments
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "filename": a["filename"],
+                "content_type": a["content_type"],
+                "size": a["size"],
+            })
+        })
+        .collect()
+}
+
 fn record_send_policy_event(
     db: &Database,
     account_id: &str,
@@ -280,4 +348,51 @@ fn record_send_policy_event(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let _ = db.insert_event(&event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn snapshot_attachments_encodes_bytes_and_metadata() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+
+        let snap = snapshot_attachments(&[path]).unwrap();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0]["size"], 5);
+        // "hello" base64-encoded
+        assert_eq!(snap[0]["data_base64"], "aGVsbG8=");
+        assert!(snap[0]["filename"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn snapshot_attachments_errors_on_missing_file() {
+        let err = snapshot_attachments(&["/no/such/path/at/all.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("failed to read attachment"));
+    }
+
+    #[test]
+    fn empty_attach_paths_snapshot_is_empty() {
+        assert!(snapshot_attachments(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn summary_excludes_attachment_bytes() {
+        let attachments = vec![serde_json::json!({
+            "filename": "secret.txt",
+            "content_type": "text/plain",
+            "size": 5,
+            "data_base64": "aGVsbG8=",
+        })];
+        let summary = scheduled_attachments_summary(&attachments);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("data_base64"));
+        assert!(!serialized.contains("aGVsbG8="));
+        assert!(serialized.contains("secret.txt"));
+        assert!(serialized.contains("text/plain"));
+    }
 }

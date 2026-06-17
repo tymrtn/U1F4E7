@@ -14,6 +14,7 @@ pub mod cockpit;
 pub mod compose;
 pub mod drafts;
 pub mod folders;
+pub mod health;
 pub mod messages;
 pub mod rules;
 pub mod snoozed;

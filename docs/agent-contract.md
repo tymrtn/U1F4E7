@@ -62,6 +62,13 @@ MCP defaults agent send/reply flows to `draft-only`. Denials use stable JSON cod
 
 Send surfaces should return proof handles for follow-up automation: `message_id` plus best-effort Sent mailbox proof (`sent_folder`, `sent_uid`, `sent_message_url`, and `sent_mail.lookup_status`). If the Sent UID is not available yet, the field remains `null` and `lookup_status` explains why.
 
+## Evidence
+
+The `evidence` surface is read-only against source mailboxes (IMAP `EXAMINE` + `BODY.PEEK[]`; the source message is never mutated). It covers three commands:
+
+- `evidence collect` / `evidence verify` — raw RFC822 `.eml` bundles with manifest, index, and checksum material.
+- `evidence attachment export` — source-provenance attachment export. It preserves raw attachment bytes exactly, SHA-256 hashes them, and writes per-source-message output under `<encoded_folder>-<uidvalidity>-<uid>/`: the original bytes under a sanitized normalized filename, `attachment_provenance.json` (machine-readable provenance per attachment), and `SOURCE_NOTE.md` (human-readable source identifiers). Select with `--uid` (optionally `--attachment <exact name>`, or all attachments if omitted) or `--query '<RAW IMAP SEARCH>'` with an optional case-insensitive `--filename-glob`; `--uid` and `--query` are mutually exclusive. With `--extract-text`, DOCX (`word/document.xml`) and `text/*` attachments get a sibling `<normalized>.txt`; extraction failures preserve the original file and record `extraction_error` without failing the export (PDF is recorded as `pdf_extraction_unsupported`).
+
 ## Updating
 
 After intentional contract changes:

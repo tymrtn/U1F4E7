@@ -163,6 +163,18 @@ envelope-email draft discard <draft-id> --json
 
 **Agent pattern:** When composing email on behalf of a user, always create a draft first. Only call `draft send` after explicit human approval.
 
+## Agent Safety Model (read before sending)
+
+Envelope is the **single canonical mail control plane** for agentic email work. It replaces Himalaya and any raw IMAP/SMTP client for reading, searching, threading, drafting, sending, organizing, and rules. Other IMAP/SMTP tools, if used at all, are **read-only diagnostics only** — never a peer mail client, never a draft or send path.
+
+Binding rules:
+
+- **Drafts only via `envelope-email draft create`.** Never write a loose `.eml` file as a draft. `.eml` is allowed only for archive/evidence/export artifacts — never as a draft substitute.
+- **Inspect the thread before drafting a reply.** Use `envelope-email read`/`thread` (or `draft reply`) so the reply has real context.
+- **Never send without explicit approval.** Agent/MCP contexts default to `--send-mode draft-only`. Escalation modes (`confirm-send`, `allowlisted-send`, `autonomous-send`) require an explicitly approved automation policy; do not assume one exists.
+- **Discover accounts; never hard-code them.** Use `envelope-email accounts list --json` and pass explicit `--account`/`--from`. Do not treat any one personal account as a universal sender/CC fallback — CC must be account/profile-scoped. If no approved CC exists for the active sending account, stop and ask rather than guessing.
+- **Use `--json` whenever available.**
+
 ## Message Management
 
 ### Move / Copy / Delete

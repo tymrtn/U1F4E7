@@ -2487,6 +2487,56 @@ function hasCssUrlLoad(value) {
   return /@import\b/i.test(css) || /url\s*\(/i.test(css);
 }
 
+// Detect whether there is any meaningful (non-whitespace) content preceding a
+// node, walking previous siblings up the ancestor chain to <body>. Used to
+// avoid collapsing a message whose entire body IS the quote (nothing would be
+// left visible) — we only collapse quotes that follow a real reply.
+function hasMeaningfulContentBefore(node) {
+  let cur = node;
+  while (cur && cur.parentNode) {
+    let sib = cur.previousSibling;
+    while (sib) {
+      if (sib.nodeType === 3 && (sib.textContent || '').replace(/\s+/g, '').length > 0) return true;
+      if (sib.nodeType === 1) {
+        if ((sib.textContent || '').replace(/\s+/g, '').length > 0) return true;
+        if (sib.querySelector && sib.querySelector('img')) return true;
+      }
+      sib = sib.previousSibling;
+    }
+    cur = cur.parentNode;
+    if (cur && cur.tagName && cur.tagName.toLowerCase() === 'body') break;
+  }
+  return false;
+}
+
+// Wrap quoted-reply blocks in native <details> so they collapse by default and
+// expand on click WITHOUT any script execution inside the email iframe. The
+// parent re-measures on the native `toggle` event (see attachQuoteToggleRemeasure).
+function collapseQuotedReplies(doc) {
+  const body = doc.body;
+  if (!body) return 0;
+  const candidates = Array.from(
+    body.querySelectorAll('blockquote, .gmail_quote, div[class*="gmail_quote"]'),
+  );
+  let wrapped = 0;
+  for (const node of candidates) {
+    if (!node.parentNode) continue;
+    // Skip nested quotes — only wrap the outermost quote block.
+    if (candidates.some(other => other !== node && other.contains(node))) continue;
+    if (!hasMeaningfulContentBefore(node)) continue;
+    const details = doc.createElement('details');
+    details.className = 'envelope-quote';
+    const summary = doc.createElement('summary');
+    summary.className = 'envelope-quote-toggle';
+    summary.textContent = 'Show quoted text';
+    node.parentNode.insertBefore(details, node);
+    details.appendChild(summary);
+    details.appendChild(node);
+    wrapped += 1;
+  }
+  return wrapped;
+}
+
 function sanitizeEmailHtml(html, msg, loadRemoteImages = false) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(String(html || ''), 'text/html');
@@ -2522,9 +2572,11 @@ function sanitizeEmailHtml(html, msg, loadRemoteImages = false) {
     if (isBlockedEmailUrl(trimmed)) img.removeAttribute('src');
   });
 
+  collapseQuotedReplies(doc);
+
   const safeBody = doc.body ? doc.body.innerHTML : '';
   return {
-    html: `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:white;color:#0a0a0a;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;}img{max-width:100%;height:auto;}blockquote{border-left:3px solid #d9d7d1;margin:1em 0;padding-left:1em;color:#525252;}table{max-width:100%;}pre{white-space:pre-wrap;}</style></head><body>${safeBody}</body></html>`,
+    html: `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:white;color:#0a0a0a;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;}img{max-width:100%;height:auto;}blockquote{border-left:3px solid #d9d7d1;margin:1em 0;padding-left:1em;color:#525252;}table{max-width:100%;}pre{white-space:pre-wrap;}details.envelope-quote{margin:1em 0;}summary.envelope-quote-toggle{cursor:pointer;color:#2563eb;font-size:13px;list-style:none;user-select:none;padding:2px 0;outline:none;}summary.envelope-quote-toggle::-webkit-details-marker{display:none;}summary.envelope-quote-toggle::marker{content:'';}</style></head><body>${safeBody}</body></html>`,
     remoteBlocked,
   };
 }
@@ -2585,7 +2637,10 @@ function renderReader() {
     frame.setAttribute('sandbox', 'allow-same-origin');
     frame.className = 'email-frame';
     frame.srcdoc = rendered.html;
-    frame.addEventListener('load', () => sizeReaderFrameToContent(frame));
+    frame.addEventListener('load', () => {
+      sizeReaderFrameToContent(frame);
+      attachQuoteToggleRemeasure(frame);
+    });
     body.appendChild(frame);
   } else if (msg.text_body) {
     body.appendChild(el('pre', { text: msg.text_body }));
@@ -2654,6 +2709,25 @@ function sizeReaderFrameToContent(frame) {
     // Cross-origin or detached frame — restore the CSS default height.
     frame.style.height = '';
     frame.style.minHeight = '';
+  }
+}
+
+// Re-measure the iframe whenever a collapsed quote is expanded/collapsed. The
+// <details> toggle is native (no email script runs); the parent listens via
+// the granted same-origin access and updates the summary label + frame height.
+function attachQuoteToggleRemeasure(frame) {
+  try {
+    const doc = frame.contentDocument || frame.contentWindow?.document;
+    if (!doc) return;
+    doc.querySelectorAll('details.envelope-quote').forEach(details => {
+      details.addEventListener('toggle', () => {
+        const summary = details.querySelector('summary.envelope-quote-toggle');
+        if (summary) summary.textContent = details.open ? 'Hide quoted text' : 'Show quoted text';
+        sizeReaderFrameToContent(frame);
+      });
+    });
+  } catch (_) {
+    // Cross-origin or detached frame — nothing to wire.
   }
 }
 

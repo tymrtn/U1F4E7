@@ -22,7 +22,7 @@ use envelope_email_transport::{imap, migrate, provider};
 
 use super::common::setup_credentials;
 use super::paths;
-use crate::EvidenceCmd;
+use crate::{EvidenceAttachmentCmd, EvidenceCmd};
 
 const TOOL_NAME: &str = "envelope";
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -83,7 +83,206 @@ pub async fn run(
             .await
         }
         EvidenceCmd::Verify { from, strict } => run_verify(from, strict, json_output),
+        EvidenceCmd::Attachment(EvidenceAttachmentCmd::Export {
+            account,
+            folder,
+            uid,
+            attachment,
+            query,
+            filename_glob,
+            out,
+            extract_text,
+        }) => {
+            run_attachment_export(
+                AttachmentExportArgs {
+                    account,
+                    folder,
+                    uid,
+                    attachment,
+                    query,
+                    filename_glob,
+                    out,
+                    extract_text,
+                },
+                json_output,
+                backend,
+            )
+            .await
+        }
     }
+}
+
+struct AttachmentExportArgs {
+    account: String,
+    folder: String,
+    uid: Option<u32>,
+    attachment: Option<String>,
+    query: Option<String>,
+    filename_glob: Option<String>,
+    out: PathBuf,
+    extract_text: bool,
+}
+
+async fn run_attachment_export(
+    args: AttachmentExportArgs,
+    json_output: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    backup::validate_export_output_dir(&args.out)
+        .map_err(|e| anyhow::anyhow!("{e} (at {})", args.out.display()))?;
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("create output dir {}", args.out.display()))?;
+
+    let (_db, src) = setup_credentials(Some(&args.account), backend)?;
+    let account_email = format!("{}@{}", src.account.username, src.account.domain);
+    let mut client = imap::connect(&src)
+        .await
+        .context("source IMAP connection failed")?;
+
+    let selected = imap::examine_folder_for_evidence(&mut client, &args.folder)
+        .await
+        .with_context(|| format!("EXAMINE {}", args.folder))?;
+    let uidvalidity = selected.uidvalidity_key();
+
+    // Resolve the set of source-message UIDs (read-only).
+    let target_uids: Vec<u32> = if let Some(uid) = args.uid {
+        vec![uid]
+    } else {
+        let query = args
+            .query
+            .as_deref()
+            .expect("clap ArgGroup guarantees uid or query");
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            bail!("--query must not be empty");
+        }
+        let mut uids = imap::evidence_search_selected_uids(&mut client, trimmed)
+            .await
+            .with_context(|| format!("UID SEARCH {trimmed}"))?;
+        uids.sort_unstable();
+        uids.dedup();
+        uids
+    };
+
+    let raw_by_uid = fetch_raw_uids(&mut client, &args.folder, &target_uids)
+        .await
+        .with_context(|| format!("fetch messages from {}", args.folder))?;
+
+    let exported_at = evidence_core::exported_at_now_utc();
+    let mut total_attachments = 0u32;
+    let mut messages_with_output = 0u32;
+
+    let mut sorted_uids = target_uids.clone();
+    sorted_uids.sort_unstable();
+    for uid in sorted_uids {
+        let Some(raw) = raw_by_uid.get(&uid) else {
+            // UID requested but not fetched.
+            if args.uid == Some(uid) {
+                bail!(
+                    "source message UID {uid} not found in folder {}",
+                    args.folder
+                );
+            }
+            continue;
+        };
+        let (source, attachments) = evidence_core::extract_message_attachments(
+            &raw.rfc822,
+            &account_email,
+            &args.folder,
+            uidvalidity,
+            raw.uid,
+        );
+
+        // Apply selection: exact --attachment name and/or --filename-glob.
+        let selected: Vec<_> = attachments
+            .iter()
+            .filter(|att| {
+                if let Some(name) = args.attachment.as_deref()
+                    && att.original_filename != name
+                {
+                    return false;
+                }
+                if let Some(glob) = args.filename_glob.as_deref()
+                    && !evidence_core::attachment_filename_glob_match(glob, &att.original_filename)
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        // In single-UID mode an explicit selection that matches nothing is an
+        // explicit error rather than silent success.
+        if args.uid == Some(uid) && selected.is_empty() {
+            if let Some(name) = args.attachment.as_deref() {
+                bail!(
+                    "attachment {name:?} not found in UID {uid} (folder {})",
+                    args.folder
+                );
+            }
+            if args.filename_glob.is_some() {
+                bail!(
+                    "no attachments in UID {uid} matched --filename-glob (folder {})",
+                    args.folder
+                );
+            }
+            bail!(
+                "UID {uid} has no attachments to export (folder {})",
+                args.folder
+            );
+        }
+
+        let mut written = Vec::new();
+        for att in selected {
+            let w = evidence_core::export_one_attachment(
+                &args.out,
+                &source,
+                att,
+                args.extract_text,
+                &exported_at,
+                TOOL_NAME,
+                TOOL_VERSION,
+            )
+            .with_context(|| {
+                format!(
+                    "export attachment {:?} from UID {uid}",
+                    att.original_filename
+                )
+            })?;
+            emit(
+                json_output,
+                EvidenceEvent::AttachmentExported {
+                    folder: args.folder.clone(),
+                    uid: raw.uid,
+                    original_filename: w.provenance.original_filename.clone(),
+                    normalized_filename: w.provenance.normalized_filename.clone(),
+                    sha256: w.provenance.sha256.clone(),
+                    size: w.provenance.size,
+                    extracted_text: w.provenance.extracted_text_filename.is_some(),
+                },
+            )?;
+            written.push(w);
+        }
+
+        if !written.is_empty() {
+            evidence_core::write_attachment_message_notes(&args.out, &source, &written)
+                .with_context(|| format!("write provenance notes for UID {uid}"))?;
+            total_attachments += written.len() as u32;
+            messages_with_output += 1;
+        }
+    }
+
+    emit(
+        json_output,
+        EvidenceEvent::AttachmentExportDone {
+            folder: args.folder.clone(),
+            messages: messages_with_output,
+            attachments: total_attachments,
+            out_dir: args.out.display().to_string(),
+        },
+    )?;
+
+    Ok(())
 }
 
 async fn run_collect(
@@ -578,6 +777,29 @@ fn emit(json_output: bool, event: EvidenceEvent) -> Result<()> {
         }
         EvidenceEvent::VerifyBundleDigestMismatch => {
             eprintln!("evidence verify bundle digest mismatch")
+        }
+        EvidenceEvent::AttachmentExported {
+            folder,
+            uid,
+            original_filename,
+            normalized_filename,
+            size,
+            extracted_text,
+            ..
+        } => {
+            println!(
+                "evidence attachment exported: {folder} UID {uid} {original_filename} -> {normalized_filename} ({size} bytes, extracted_text={extracted_text})"
+            )
+        }
+        EvidenceEvent::AttachmentExportDone {
+            folder,
+            messages,
+            attachments,
+            out_dir,
+        } => {
+            println!(
+                "evidence attachment export done: {folder} messages={messages} attachments={attachments} out={out_dir}"
+            )
         }
         EvidenceEvent::VerifyDone {
             ok,

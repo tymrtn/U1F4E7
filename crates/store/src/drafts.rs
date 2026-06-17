@@ -202,6 +202,26 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Replace the draft's `attachments` JSON array.
+    ///
+    /// For scheduled sends, attachment bytes are snapshotted at schedule time
+    /// (base64-encoded inside each entry) so a later send sweep does not depend
+    /// on the original files still existing. Each entry is expected to carry at
+    /// least `filename`, `content_type`, and `size`; scheduled-send entries also
+    /// carry `data_base64`. Never log or echo the `data_base64` field.
+    pub fn update_draft_attachments(
+        &self,
+        id: &str,
+        attachments: &[serde_json::Value],
+    ) -> Result<()> {
+        let serialized = serde_json::to_string(attachments)?;
+        self.conn().execute(
+            "UPDATE drafts SET attachments = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![serialized, id],
+        )?;
+        Ok(())
+    }
+
     /// Set the `send_after` timestamp on a draft (for scheduled sending).
     pub fn update_draft_send_after(&self, id: &str, send_after: &str) -> Result<()> {
         self.conn().execute(
@@ -549,6 +569,49 @@ mod tests {
         assert_eq!(stored["draft_kind"], "reply");
         assert_eq!(stored["source"]["uid"], 42);
         assert_eq!(stored["references"][1], "parent@x");
+    }
+
+    #[test]
+    fn update_draft_attachments_round_trips() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(draft.attachments.is_empty());
+
+        let attachments = vec![
+            serde_json::json!({
+                "filename": "packet.txt",
+                "content_type": "text/plain",
+                "size": 5,
+                "data_base64": "aGVsbG8=",
+            }),
+            serde_json::json!({
+                "filename": "report.pdf",
+                "content_type": "application/pdf",
+                "size": 3,
+                "data_base64": "Zm9v",
+            }),
+        ];
+        db.update_draft_attachments(&draft.id, &attachments)
+            .unwrap();
+
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(fetched.attachments.len(), 2);
+        assert_eq!(fetched.attachments[0]["filename"], "packet.txt");
+        assert_eq!(fetched.attachments[0]["size"], 5);
+        assert_eq!(fetched.attachments[1]["data_base64"], "Zm9v");
     }
 
     #[test]

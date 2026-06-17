@@ -405,6 +405,42 @@ fn dashboard_reader_frame_autosizes_without_enabling_scripts() {
 }
 
 #[test]
+fn dashboard_reader_collapses_quoted_replies_without_scripts() {
+    // Issue #58: quoted replies should collapse into a native <details> block
+    // so the message body isn't buried under giant quoted threads.
+    assert!(
+        DASHBOARD_JS.contains("function collapseQuotedReplies"),
+        "reader should wrap quoted-reply blocks for collapse/expand"
+    );
+    assert!(
+        DASHBOARD_JS.contains("blockquote, .gmail_quote, div[class*=\"gmail_quote\"]"),
+        "quote detection should cover blockquote and Gmail quote containers"
+    );
+    // Collapse must use a native <details>/<summary> so NO script runs inside
+    // the sandboxed email iframe to drive the toggle.
+    assert!(
+        DASHBOARD_JS.contains("createElement('details')")
+            && DASHBOARD_JS.contains("envelope-quote"),
+        "quoted replies should collapse via native <details>, not in-email scripts"
+    );
+    // A fully-quoted message must not be entirely hidden.
+    assert!(
+        DASHBOARD_JS.contains("function hasMeaningfulContentBefore"),
+        "collapse should only apply when real reply content precedes the quote"
+    );
+    // Expanding/collapsing must re-measure the auto-sized iframe.
+    assert!(
+        DASHBOARD_JS.contains("function attachQuoteToggleRemeasure")
+            && DASHBOARD_JS.contains("addEventListener('toggle'"),
+        "quote toggle must re-measure the iframe height from the parent"
+    );
+    assert!(
+        DASHBOARD_JS.contains("Show quoted text") && DASHBOARD_JS.contains("Hide quoted text"),
+        "quote toggle should expose readable show/hide affordances"
+    );
+}
+
+#[test]
 fn dashboard_bulk_status_auto_clears_terminal_results() {
     assert!(
         DASHBOARD_JS.contains("autoClear") && DASHBOARD_JS.contains("state.bulkStatusTimer"),

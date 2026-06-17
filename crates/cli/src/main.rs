@@ -425,8 +425,32 @@ enum Commands {
     },
 
     /// Show resolved local state paths and HOME drift warnings
-    #[command(visible_alias = "doctor")]
     Paths,
+
+    /// Diagnose Envelope auth/state health and offer bounded, safe repair
+    #[command(
+        after_help = "Classifies why mailbox ops can fail even when account metadata reads fine (e.g. credential_decrypt_failed vs decrypted_but_imap_auth_failed). --repair performs an always-safe backup; riskier repairs are reported as not-available. Never prints secrets; never sends email."
+    )]
+    Doctor {
+        /// Account ID or email to diagnose (defaults to the default account)
+        #[arg(long)]
+        account: Option<String>,
+        /// Also attempt a read-only IMAP login probe (no mailbox mutation, no send)
+        #[arg(long)]
+        check_auth: bool,
+        /// Plan/execute bounded repair (backup-before-mutation; safe steps only)
+        #[arg(long)]
+        repair: bool,
+        /// With --repair, only report planned actions; do not mutate state
+        #[arg(long)]
+        dry_run: bool,
+        /// Directory for state backups (defaults to a timestamped dir under app data)
+        #[arg(long)]
+        backup_dir: Option<String>,
+        /// IMAP probe timeout in seconds (1-60)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
+    },
 
     /// Manage persistent Envelope configuration
     Config {
@@ -534,6 +558,27 @@ enum AccountsCmd {
         /// Target mail client (formatting hint only)
         #[arg(long, default_value = "mailapp")]
         client: String,
+        /// Also copy the account password to the OS clipboard (never printed)
+        #[arg(long)]
+        copy_password: bool,
+        /// Credential kind to copy with --copy-password: password, imap-password, smtp-password
+        #[arg(long, default_value = "auto")]
+        kind: String,
+        /// Auto-clear the clipboard after N seconds (best-effort)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Copy an account credential directly to the OS clipboard (never printed)
+    CopyPassword {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Credential kind: password, imap-password, smtp-password (required if multiple exist)
+        #[arg(long, default_value = "auto")]
+        kind: String,
+        /// Auto-clear the clipboard after N seconds (best-effort)
+        #[arg(long)]
+        ttl: Option<u64>,
     },
     /// Remove an account
     Remove {
@@ -1323,6 +1368,49 @@ pub enum EvidenceCmd {
         #[arg(long)]
         strict: bool,
     },
+    /// Read-only source-provenance attachment export for legal evidence.
+    /// Source mailbox is read-only; export uses EXAMINE and BODY.PEEK[].
+    #[command(subcommand)]
+    Attachment(EvidenceAttachmentCmd),
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum EvidenceAttachmentCmd {
+    /// Export raw attachment bytes with full source-email provenance.
+    #[command(group(
+        ArgGroup::new("evidence_attachment_select")
+            .required(true)
+            .args(["uid", "query"])
+    ))]
+    Export {
+        /// Account ID or email for the source mailbox
+        #[arg(long)]
+        account: String,
+        /// Source IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Single source message UID (mutually exclusive with --query)
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Exact original attachment filename. In --uid mode, omit to export
+        /// ALL attachments of that message.
+        #[arg(long)]
+        attachment: Option<String>,
+        /// Raw IMAP SEARCH query selecting messages to scan for attachments
+        /// (mutually exclusive with --uid)
+        #[arg(long)]
+        query: Option<String>,
+        /// Case-insensitive filename glob (`*`/`?`) filtering attachments
+        #[arg(long)]
+        filename_glob: Option<String>,
+        /// Destination directory for exported attachments
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Extract plain text from DOCX/text attachments alongside originals
+        #[arg(long)]
+        extract_text: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2045,6 +2133,24 @@ fn main() {
 
         Commands::Paths => commands::paths::run(cli.json, backend),
 
+        Commands::Doctor {
+            account,
+            check_auth,
+            repair,
+            dry_run,
+            backup_dir,
+            timeout_secs,
+        } => commands::doctor::run(commands::doctor::DoctorOptions {
+            json: cli.json,
+            backend,
+            account: account.as_deref(),
+            check_auth,
+            repair,
+            dry_run,
+            backup_dir: backup_dir.as_deref(),
+            timeout_secs,
+        }),
+
         Commands::Config { subcommand } => commands::config::run(subcommand, cli.json),
 
         Commands::Quickstart {
@@ -2093,9 +2199,46 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn doctor_alias_parses_to_paths_command() {
-        let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor alias should parse");
-        assert!(matches!(cli.command, Commands::Paths));
+    fn doctor_parses_as_diagnostic_command() {
+        let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                check_auth: false,
+                repair: false,
+                dry_run: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "doctor",
+            "--check-auth",
+            "--repair",
+            "--dry-run",
+            "--account",
+            "user@example.com",
+        ])
+        .expect("doctor repair flags should parse");
+        match cli.command {
+            Commands::Doctor {
+                account,
+                check_auth,
+                repair,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(account.as_deref(), Some("user@example.com"));
+                assert!(check_auth);
+                assert!(repair);
+                assert!(dry_run);
+            }
+            _ => panic!("expected doctor command"),
+        }
     }
 
     #[test]

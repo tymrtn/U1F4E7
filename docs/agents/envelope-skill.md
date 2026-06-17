@@ -57,9 +57,18 @@ it.
 ```bash
 envelope paths --json          # database / credential / HOME / drift warnings
 envelope quickstart --account you@example.com --json   # auth + inbox peek probe
+envelope doctor --json         # classify auth/state health (decrypt test, drift)
+envelope doctor --check-auth --account you@example.com --json   # + read-only IMAP login probe
+envelope doctor --repair --dry-run --json   # plan bounded, backup-first repair (no mutation)
 ```
 
-`envelope doctor` is an alias for `envelope paths`.
+`envelope doctor` is a structured auth/state diagnosis. Unlike `paths` (pure
+path report), it classifies why mailbox operations can fail even when account
+metadata reads fine — distinguishing `credential_decrypt_failed` from
+`decrypted_but_imap_auth_failed`. `--repair` performs an always-safe backup of
+DB/credential files before any mutation; riskier repairs are reported as
+not-available rather than performed silently. It never prints secrets and never
+sends email.
 
 ## 5. Account setup and discovery
 
@@ -73,6 +82,55 @@ envelope accounts setup-instructions --account you@example.com --client mailapp 
 
 `setup-instructions` prints only non-secret IMAP/SMTP host/port/security/username
 for configuring a native mail client. It never prints the password.
+
+### Secure clipboard credential handoff (local keyboard workflows only)
+
+When a local operator is at the keyboard and needs the stored password to paste
+into a native client (Mail.app, a browser login, a provider setup screen), copy
+it straight to the OS clipboard instead of printing it anywhere:
+
+```bash
+# Copy the stored password to the clipboard (never printed to stdout/stderr/logs)
+envelope accounts copy-password --account you@example.com --json
+
+# Pick a specific credential when an account stores distinct IMAP/SMTP passwords
+envelope accounts copy-password --account you@example.com --kind imap-password
+
+# Auto-clear the clipboard after 45 seconds (best-effort)
+envelope accounts copy-password --account you@example.com --ttl 45
+
+# Print setup fields AND copy the password to the clipboard in one step
+envelope accounts setup-instructions --account you@example.com --copy-password --json
+```
+
+Behavior and safety:
+
+- The secret is written only to the OS clipboard tool's stdin (`pbcopy` on
+  macOS; `wl-copy`/`xclip`/`xsel` on Linux). It is never printed, returned, or
+  logged.
+- Output is metadata only: account, credential kind, clipboard backend, and
+  paste guidance. A non-secret `credential.clipboard_handoff` audit event is
+  recorded.
+- If an account stores distinct IMAP/SMTP passwords, `--kind` is required
+  (`password`, `imap-password`, or `smtp-password`).
+- This is transient local convenience, not secure storage, and is intentionally
+  unavailable for any remote/headless delivery path.
+
+### Provider-specific quirks for native client setup
+
+- **Migadu**: IMAP `imap.migadu.com:993` (SSL/TLS), SMTP `smtp.migadu.com:465`
+  (SSL/TLS) or `:587` (STARTTLS). Use the mailbox password, not your Migadu
+  admin account password. The username is the full email address.
+- **Gmail / Google Workspace**: Requires an app password (2FA must be enabled);
+  the regular account password will not authenticate over IMAP/SMTP. IMAP
+  `imap.gmail.com:993`, SMTP `smtp.gmail.com:465`/`:587`. OAuth-only accounts
+  cannot use raw-password clipboard handoff — generate an app password first.
+- **iCloud**: App-specific password required; IMAP `imap.mail.me.com:993`, SMTP
+  `smtp.mail.me.com:587`.
+- **macOS Mail.app**: After entering settings, Apple's flow ends at a "Select
+  apps to use with this account" screen — enable Mail there. If Internet
+  Accounts stalls, configure the account manually with the fields from
+  `setup-instructions` rather than the provider auto-setup.
 
 ## 6. Core mailbox workflows
 
@@ -199,8 +257,8 @@ shapes are safe to depend on within a major contract version.
 | Symptom | First check |
 |---|---|
 | "No accounts" but you expect some | `envelope paths` — HOME/store drift |
-| Metadata lists fine but mailbox ops fail | credential decrypt vs IMAP auth — run `envelope quickstart --json` |
-| Dashboard errors while CLI succeeds | installed dashboard binary/version drift vs current CLI |
+| Metadata lists fine but mailbox ops fail | credential decrypt vs IMAP auth — run `envelope doctor --check-auth --json` |
+| Dashboard errors while CLI succeeds | installed dashboard binary/version drift — compare `GET /api/health` `version`/`binary_path` against `envelope doctor --json`; dashboard folder errors also carry a `diagnostics` block with the running version/backend |
 | `read --json` won't parse | report it; JSON must round-trip — file an issue |
 | Search returns nothing for a present message | try field-qualified (`FROM`/`TEXT`/`SUBJECT`) and the right folder |
 

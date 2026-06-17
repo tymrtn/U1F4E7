@@ -291,7 +291,7 @@ fn surfaces() -> Value {
     ));
     items.push(surface_entry(
         "evidence",
-        "envelope evidence collect/verify --json",
+        "envelope evidence collect/verify/attachment export --json",
         None,
         object(
             json!({
@@ -300,9 +300,13 @@ fn surfaces() -> Value {
                 "query": string("IMAP search query"),
                 "include_thread": json!({"type": "boolean", "description": "Include bounded header-linked thread expansion", "default": false}),
                 "max_thread_messages": integer_default("Maximum messages in thread expansion", 500),
-                "out": string("Output bundle path")
+                "out": string("Output bundle or attachment-export directory"),
+                "uid": integer("Single source UID for attachment export (mutually exclusive with query)"),
+                "attachment": string("Exact original attachment filename for attachment export"),
+                "filename_glob": string("Case-insensitive attachment filename glob for attachment export"),
+                "extract_text": json!({"type": "boolean", "description": "Extract DOCX/text attachment text during attachment export", "default": false})
             }),
-            json!(["query", "out"]),
+            json!(["out"]),
         ),
         object(
             json!({
@@ -315,7 +319,7 @@ fn surfaces() -> Value {
             }),
             json!([]),
         ),
-        vec!["Collection must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files remain canonical evidence."],
+        vec!["Collection and attachment export must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files and raw attachment bytes remain canonical evidence."],
     ));
 
     for (name, schema) in mcp_only_inputs() {

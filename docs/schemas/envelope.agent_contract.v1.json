@@ -1425,17 +1425,30 @@
     },
     {
       "cli": {
-        "command": "envelope evidence collect/verify --json",
+        "command": "envelope evidence collect/verify/attachment export --json",
         "json_output": true
       },
       "compatibility_notes": [
-        "Collection must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files remain canonical evidence."
+        "Collection and attachment export must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files and raw attachment bytes remain canonical evidence."
       ],
       "input_schema": {
         "additionalProperties": false,
         "properties": {
           "account": {
             "description": "Account ID or email address",
+            "type": "string"
+          },
+          "attachment": {
+            "description": "Exact original attachment filename for attachment export",
+            "type": "string"
+          },
+          "extract_text": {
+            "default": false,
+            "description": "Extract DOCX/text attachment text during attachment export",
+            "type": "boolean"
+          },
+          "filename_glob": {
+            "description": "Case-insensitive attachment filename glob for attachment export",
             "type": "string"
           },
           "folder": {
@@ -1454,16 +1467,19 @@
             "type": "integer"
           },
           "out": {
-            "description": "Output bundle path",
+            "description": "Output bundle or attachment-export directory",
             "type": "string"
           },
           "query": {
             "description": "IMAP search query",
             "type": "string"
+          },
+          "uid": {
+            "description": "Single source UID for attachment export (mutually exclusive with query)",
+            "type": "integer"
           }
         },
         "required": [
-          "query",
           "out"
         ],
         "type": "object"

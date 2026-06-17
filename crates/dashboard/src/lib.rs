@@ -132,6 +132,8 @@ pub async fn serve_with_backend_and_options(
 
 fn dashboard_router(state: AppState) -> Router {
     let api = Router::new()
+        // Health / build identity (drift detection, issue #46)
+        .route("/health", get(handlers::health::get))
         // Accounts
         .route(
             "/accounts",
@@ -139,6 +141,10 @@ fn dashboard_router(state: AppState) -> Router {
         )
         .route("/accounts/{id}", delete(handlers::accounts::delete))
         .route("/accounts/{id}/verify", post(handlers::accounts::verify))
+        .route(
+            "/accounts/{id}/setup-instructions",
+            get(handlers::accounts::setup_instructions),
+        )
         .route("/accounts/discover", post(handlers::accounts::discover))
         // Agent Cockpit
         .route("/cockpit", get(handlers::cockpit::get))
@@ -360,17 +366,39 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
         // Drop the IMAP client lock — we only needed creds
         drop(client_arc);
 
-        // Send via SMTP
+        // Rehydrate any attachment bytes snapshotted at schedule time. If the
+        // stored payload is corrupt/undecodable, refuse to send (do not silently
+        // deliver without the attachment); mark the draft blocked so the sweep
+        // stops retrying and the failure is visible in scheduled-send status.
+        let attachments = match decode_scheduled_attachments(&draft.attachments) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    "scheduled send: skipping draft {} — attachment decode failed: {e}",
+                    draft.id
+                );
+                let db = state.db.lock().await;
+                let _ =
+                    db.update_draft_status(&draft.id, envelope_email_store::DraftStatus::Blocked);
+                continue;
+            }
+        };
+
+        // Send via SMTP — use the full send path so attachments are included.
         let subject = draft.subject.as_deref().unwrap_or("");
-        match envelope_email_transport::SmtpSender::send_simple(
+        match envelope_email_transport::SmtpSender::send(
             &creds,
             &draft.to_addr,
             subject,
             draft.text_content.as_deref(),
             draft.html_content.as_deref(),
+            None, // from override — not persisted for scheduled sends
             draft.cc_addr.as_deref(),
             draft.bcc_addr.as_deref(),
             draft.reply_to.as_deref(),
+            None, // in_reply_to
+            None, // references
+            &attachments,
         )
         .await
         {
@@ -393,6 +421,45 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Decode draft attachment JSON entries (as snapshotted at schedule time) back
+/// into transport `Attachment`s with their original bytes.
+///
+/// Entries are expected to carry `filename`, `content_type`, and a base64
+/// `data_base64` payload. Returns an error if any entry is missing its byte
+/// payload or fails to decode, so the caller can refuse to send rather than
+/// silently dropping the attachment.
+fn decode_scheduled_attachments(
+    attachments: &[serde_json::Value],
+) -> anyhow::Result<Vec<envelope_email_transport::smtp::Attachment>> {
+    use base64::Engine as _;
+    let mut out = Vec::with_capacity(attachments.len());
+    for entry in attachments {
+        let filename = entry
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let content_type = entry
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let data_b64 = entry
+            .get("data_base64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("attachment '{filename}' has no data_base64 payload"))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow::anyhow!("attachment '{filename}' base64 decode failed: {e}"))?;
+        out.push(envelope_email_transport::smtp::Attachment {
+            filename,
+            content_type,
+            data,
+        });
+    }
+    Ok(out)
 }
 
 // ── Static asset serving ─────────────────────────────────────────────
@@ -537,6 +604,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_instructions_endpoint_returns_non_secret_fields() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/accounts/editor@spainexpat.com/setup-instructions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["email"], "editor@spainexpat.com");
+        assert_eq!(json["imap"]["host"], "imap.spainexpat.com");
+        assert_eq!(json["imap"]["port"], 993);
+        assert_eq!(json["imap"]["security"], "SSL/TLS");
+        assert_eq!(json["smtp"]["host"], "smtp.spainexpat.com");
+        assert_eq!(json["smtp"]["port"], 587);
+        assert_eq!(json["smtp"]["security"], "STARTTLS");
+        // The encrypted password must never leak into setup output.
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("encrypted"));
+    }
+
+    #[tokio::test]
     async fn assets_spa_fallback_serves_index_for_draft_deep_link_route() {
         let (state, draft_id, _) = test_state();
         let app = dashboard_router(state);
@@ -591,6 +690,56 @@ mod tests {
                 "deep link {uri} should return the dashboard SPA index"
             );
         }
+    }
+
+    #[test]
+    fn decode_scheduled_attachments_round_trips_bytes() {
+        let attachments = vec![
+            serde_json::json!({
+                "filename": "packet.txt",
+                "content_type": "text/plain",
+                "size": 5,
+                "data_base64": "aGVsbG8=",
+            }),
+            serde_json::json!({
+                "filename": "r.bin",
+                "content_type": "application/octet-stream",
+                "size": 3,
+                "data_base64": "Zm9v",
+            }),
+        ];
+        let decoded = decode_scheduled_attachments(&attachments).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].filename, "packet.txt");
+        assert_eq!(decoded[0].data, b"hello");
+        assert_eq!(decoded[1].data, b"foo");
+    }
+
+    #[test]
+    fn decode_scheduled_attachments_errors_on_missing_payload() {
+        let attachments = vec![serde_json::json!({
+            "filename": "packet.txt",
+            "content_type": "text/plain",
+            "size": 5,
+        })];
+        let err = decode_scheduled_attachments(&attachments).unwrap_err();
+        assert!(err.to_string().contains("no data_base64"));
+    }
+
+    #[test]
+    fn decode_scheduled_attachments_errors_on_bad_base64() {
+        let attachments = vec![serde_json::json!({
+            "filename": "packet.txt",
+            "content_type": "text/plain",
+            "data_base64": "!!!not-base64!!!",
+        })];
+        let err = decode_scheduled_attachments(&attachments).unwrap_err();
+        assert!(err.to_string().contains("base64 decode failed"));
+    }
+
+    #[test]
+    fn decode_scheduled_attachments_empty_is_empty() {
+        assert!(decode_scheduled_attachments(&[]).unwrap().is_empty());
     }
 
     #[test]

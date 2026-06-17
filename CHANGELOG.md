@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Scheduled sends can snapshot and deliver attachments safely, with attachment summaries exposed in `scheduled list` and no base64 payload leakage in outputs.
+- `envelope accounts copy-password` provides local secure clipboard credential handoff with non-secret audit metadata.
+- `envelope doctor` now emits structured diagnostics, dry-run repair plans, and safe DB/credential backup repair actions.
+- Dashboard `/api/health` exposes version/binary/backend/path diagnostics for stale-service drift checks.
+- `envelope evidence attachment export` exports attachment bytes with source provenance, hashes, safe paths, optional text extraction, and contract/docs coverage.
+
+### Fixed
+
+- Dashboard email reader collapses quoted replies without enabling scripts and re-measures iframe height on native toggle.
+- Native setup instructions gained password-copy handoff and a read-only dashboard backend endpoint.
+
 ## [0.11.0] — 2026-06-17
 
 ### Added
