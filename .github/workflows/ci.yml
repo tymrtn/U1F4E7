@@ -45,16 +45,17 @@ jobs:
         run: cargo test --all
 
   security-grep:
-    name: Governor re-intro guard
+    name: Governor architecture guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Grep for forbidden identifiers
+      - name: Reject legacy Governor adapters and bypasses
         run: |
           set -e
-          FORBIDDEN='governor::|GovernorAttrs|ENVELOPE_GOVERNOR|--no-governor|GOVERNOR_PATH'
-          if grep -rnE "$FORBIDDEN" crates/ 2>/dev/null; then
-            echo "ERROR: forbidden governor identifiers found above" >&2
+          FORBIDDEN='governor::|GovernorAttrs|--no-governor|GOVERNOR_PATH|governor envelope send|--attr user_requested'
+          if grep -rnE -- "$FORBIDDEN" crates/ 2>/dev/null; then
+            echo "ERROR: legacy Governor adapter or bypass identifiers found above" >&2
             exit 1
           fi
+          grep -rn "score --catalog envelope" crates/ >/dev/null
           echo "Clean."
