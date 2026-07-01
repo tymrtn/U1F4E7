@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.6] — 2026-07-01
+
+### Added
+
+- **Governor blind-attribution send gate** — real SMTP transmission now derives sanitized Envelope-specific attribute keys and calls `governor score --catalog envelope`; Envelope treats Governor's opaque `allow` / `review` / `deny` route as authoritative instead of synthesizing shell-command metadata or shadow-scoring policy.
+- **Outbox-first actual sends** — allowed sends queue into the scheduled-send/outbox path by default with a safety cooldown; immediate SMTP transmission requires an explicit confirmed bypass.
+- **Attachment parity for agent sends and drafts** — send, reply, forward, draft edit/send, scheduled send, and MCP paths snapshot attachment bytes while exposing only safe summaries in JSON and logs.
+
+### Changed
+
+- Dashboard draft approval now queues through the shared outbox/Governor path instead of using a direct SMTP helper, preserving cooldown, attachments, sent-proof bookkeeping, and contextual reply headers.
+- Scheduled-send sweeps re-derive final send attributes from the persisted draft immediately before SMTP and park durable `review` / `deny` verdicts for review rather than retry-storming every sweep.
+- The agent contract documents queued-send fields, immediate-send confirmation fields, attachment inputs, and Governor/outbox semantics.
+
+### Fixed
+
+- Contextual replies keep `In-Reply-To` and `References` through queued delivery, avoiding orphaned `Re:` messages.
+- Successful sends continue to return stable proof handles, including Message-ID and best-effort Sent mailbox lookup status.
+
 ### Added
 
 - Scheduled sends can snapshot and deliver attachments safely, with attachment summaries exposed in `scheduled list` and no base64 payload leakage in outputs.

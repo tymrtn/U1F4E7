@@ -415,6 +415,88 @@ mod tests {
     }
 
     #[test]
+    fn mark_draft_sent_sets_status_and_sent_at() {
+        // Regression for the stale-draft incident: a successful send must move
+        // the local row to status=sent AND stamp sent_at. A draft that has been
+        // "sent" must never remain status=draft with a null sent_at.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(draft.status, DraftStatus::Draft);
+        assert!(draft.sent_at.is_none());
+
+        db.mark_draft_sent(&draft.id, Some("<mid@host>")).unwrap();
+
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(fetched.status, DraftStatus::Sent);
+        assert!(
+            fetched.sent_at.is_some(),
+            "sent_at must be stamped after a successful send"
+        );
+        assert_eq!(fetched.message_id.as_deref(), Some("<mid@host>"));
+    }
+
+    #[test]
+    fn cooldown_queue_defers_send_and_stays_draft() {
+        // Regression for the "agents send too fast" incident: an allowed send
+        // queues into the outbox with a FUTURE send_after instead of
+        // transmitting immediately. Until the cooldown elapses, the draft is
+        // NOT returned by the scheduled-send sweep and remains status=draft
+        // (never sent). A due draft (past send_after) IS returned.
+        let db = setup();
+        let queued = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Queued"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // 1 hour in the future — well past any reasonable default cooldown.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        db.update_draft_send_after(&queued.id, &future).unwrap();
+
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(
+            !due.iter().any(|d| d.id == queued.id),
+            "a queued draft within its cooldown must not be due for send"
+        );
+        let fetched = db.get_draft(&queued.id).unwrap().unwrap();
+        assert_eq!(fetched.status, DraftStatus::Draft);
+        assert!(fetched.sent_at.is_none());
+        assert_eq!(fetched.send_after.as_deref(), Some(future.as_str()));
+
+        // Once the cooldown has elapsed (past send_after), the sweep sees it.
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        db.update_draft_send_after(&queued.id, &past).unwrap();
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(
+            due.iter().any(|d| d.id == queued.id),
+            "a draft past its cooldown must be due for send"
+        );
+    }
+
+    #[test]
     fn update_imap_uid() {
         let db = setup();
         let draft = db

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+pub mod attribution;
 pub mod backup;
 pub mod code_extractor;
 pub mod compose;
@@ -14,6 +15,7 @@ pub mod idle;
 pub mod imap;
 pub mod managesieve;
 pub mod migrate;
+pub mod outbound;
 pub mod provider;
 pub mod reply;
 pub mod rules;
@@ -23,6 +25,10 @@ pub mod smtp;
 pub mod threading;
 pub mod unsubscribe;
 
+pub use attribution::{
+    AttributedSendContext, RecipientSummary, classify_sensitive_attachment,
+    collect_recipient_domains, is_disposable_domain, is_freemail_domain, is_gov_domain,
+};
 pub use compose::{
     AssembledBody, ContextBlock, DraftKind, abridge_words, assemble_body, build_forward_context,
     build_reply_context, message_preview_source, prefix_forward_subject,
@@ -31,6 +37,10 @@ pub use discovery::{DiscoveryCandidate, discover};
 pub use errors::{DiscoveryError, ImapError, SmtpError};
 pub use folders::{detect_drafts_folder, detect_sent_folder};
 pub use imap::ImapClient;
+pub use outbound::{
+    GovernorConfig, GovernorMode, GovernorOutcome, GovernorRequest, SendDisposition, SendSurface,
+    gate as governor_gate, resolve_cooldown_seconds, resolve_disposition,
+};
 pub use provider::{ProviderType, detect_provider, resolve_folder};
 pub use reply::{ReplyHeaders, build_reply_all_headers, build_reply_headers};
 pub use send_policy::{

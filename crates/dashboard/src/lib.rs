@@ -384,8 +384,59 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             }
         };
 
-        // Send via SMTP — use the full send path so attachments are included.
+        // Send via SMTP — use the full send path so attachments and threading
+        // headers are included. This is critical for queued replies: a cooldown
+        // must not turn a contextual reply draft into an orphan `Re:` message.
         let subject = draft.subject.as_deref().unwrap_or("");
+        let (thread_in_reply_to, thread_references) = scheduled_threading(draft);
+        let thread_references_opt = if thread_references.is_empty() {
+            None
+        } else {
+            Some(thread_references.as_slice())
+        };
+
+        // ── Governor gate (fail-closed before any real SMTP) ──
+        //
+        // The scheduled-send sweep is the one place that actually transmits
+        // queued mail, so it must run the Governor gate. When Governor is
+        // required and missing/errors/denies/reviews, the send is refused and
+        // the draft stays queued (the sweep retries next cycle).
+        let gov_outcome = run_governor_gate(state, draft, &creds, subject, &attachments).await;
+        if !gov_outcome.allowed {
+            // A durable Governor verdict (review/deny/block) must not be retried
+            // on every sweep. Leaving the draft in `draft` status with a past
+            // `send_after` would re-select it via `list_drafts_due_for_send` each
+            // cycle, re-running the gate and emitting a fresh
+            // `send_governor.blocked` event forever. Instead, transition the
+            // draft to `pending_review`: the due query only selects
+            // `status = 'draft'`, so the draft durably drops out of the sweep
+            // while remaining preserved, editable, and re-sendable by explicit
+            // human action. Transient gate failures (Governor unavailable) are
+            // left queued so a later sweep can retry once Governor is reachable.
+            let pause_for_review = should_pause_for_review(&gov_outcome);
+            tracing::warn!(
+                "scheduled send: governor blocked draft {} ({}){}",
+                draft.id,
+                gov_outcome
+                    .block_code
+                    .clone()
+                    .unwrap_or_else(|| "governor_blocked".to_string()),
+                if pause_for_review {
+                    " — moving to pending_review"
+                } else {
+                    " — leaving queued for retry"
+                }
+            );
+            if pause_for_review {
+                let db = state.db.lock().await;
+                let _ = db.update_draft_status(
+                    &draft.id,
+                    envelope_email_store::DraftStatus::PendingReview,
+                );
+            }
+            continue;
+        }
+
         match envelope_email_transport::SmtpSender::send(
             &creds,
             &draft.to_addr,
@@ -396,8 +447,8 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             draft.cc_addr.as_deref(),
             draft.bcc_addr.as_deref(),
             draft.reply_to.as_deref(),
-            None, // in_reply_to
-            None, // references
+            thread_in_reply_to.as_deref(),
+            thread_references_opt,
             &attachments,
         )
         .await
@@ -406,21 +457,177 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                 let db = state.db.lock().await;
                 let _ = db.mark_draft_sent(&draft.id, Some(&message_id));
                 info!(
-                    "scheduled send: sent draft {} to {} ({})",
-                    draft.id, draft.to_addr, message_id
+                    "scheduled send: sent draft {} (recipient_count={}, message_id={})",
+                    draft.id,
+                    recipient_count_for_log(
+                        &draft.to_addr,
+                        draft.cc_addr.as_deref(),
+                        draft.bcc_addr.as_deref()
+                    ),
+                    message_id
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    "scheduled send: SMTP failed for draft {} to {}: {e}",
+                    "scheduled send: SMTP failed for draft {} (recipient_count={}): {e}",
                     draft.id,
-                    draft.to_addr
+                    recipient_count_for_log(
+                        &draft.to_addr,
+                        draft.cc_addr.as_deref(),
+                        draft.bcc_addr.as_deref()
+                    )
                 );
             }
         }
     }
 
     Ok(())
+}
+
+fn recipient_count_for_log(to: &str, cc: Option<&str>, bcc: Option<&str>) -> usize {
+    [Some(to), cc, bcc]
+        .into_iter()
+        .flatten()
+        .flat_map(|value| value.split(','))
+        .filter(|token| token.contains('@'))
+        .count()
+}
+
+fn scheduled_threading(draft: &envelope_email_store::Draft) -> (Option<String>, Vec<String>) {
+    let meta = draft.metadata.as_ref();
+    let meta_in_reply_to = meta
+        .and_then(|m| m.get("in_reply_to"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let references = meta
+        .and_then(|m| m.get("references"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    (draft.in_reply_to.clone().or(meta_in_reply_to), references)
+}
+
+/// Decide whether a blocked scheduled draft should be durably paused into
+/// `pending_review` versus left queued for a later retry.
+///
+/// A real Governor verdict (review/deny/block, surfaced as the
+/// `governor_blocked` block code) is durable: the answer will not change on the
+/// next sweep, so the draft must stop retrying and move to `pending_review` for
+/// explicit human action. A transient gate failure (Governor unavailable /
+/// unparseable, surfaced as `governor_unavailable`) is left queued so a later
+/// sweep can retry once Governor is reachable again.
+fn should_pause_for_review(outcome: &envelope_email_transport::outbound::GovernorOutcome) -> bool {
+    !outcome.allowed && outcome.block_code.as_deref() == Some("governor_blocked")
+}
+
+/// Derive the final attributed context for a due scheduled draft from what will
+/// actually be transmitted. Pure and side-effect free: recipients and threading
+/// come from the persisted draft, attachment sensitivity is classified from the
+/// rehydrated snapshot's filenames (class only — bytes are never inspected for
+/// scoring). This is the authoritative context the sweep gates on.
+fn scheduled_send_context(
+    draft: &envelope_email_store::Draft,
+    account_domain: Option<String>,
+    attachments: &[envelope_email_transport::smtp::Attachment],
+) -> envelope_email_transport::attribution::AttributedSendContext {
+    use envelope_email_transport::attribution::{
+        AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
+    };
+    let summary = collect_recipient_domains(
+        &draft.to_addr,
+        draft.cc_addr.as_deref(),
+        draft.bcc_addr.as_deref(),
+    );
+    let sensitive_attachment = attachments
+        .iter()
+        .any(|a| classify_sensitive_attachment(&a.filename, &a.content_type));
+    AttributedSendContext {
+        account_domain,
+        recipient_domains: summary.domains,
+        recipient_count: summary.count,
+        is_reply: draft.in_reply_to.is_some() || scheduled_threading(draft).0.is_some(),
+        has_bcc: summary.has_bcc,
+        attachment_count: attachments.len(),
+        sensitive_attachment,
+        ..Default::default()
+    }
+}
+
+/// Run the Governor gate for a due scheduled draft and record a sanitized audit
+/// event. Returns the outcome; the sweep must refuse SMTP unless allowed.
+async fn run_governor_gate(
+    state: &AppState,
+    draft: &envelope_email_store::Draft,
+    creds: &envelope_email_store::models::AccountWithCredentials,
+    subject: &str,
+    attachments: &[envelope_email_transport::smtp::Attachment],
+) -> envelope_email_transport::outbound::GovernorOutcome {
+    use envelope_email_transport::outbound::{GovernorConfig, GovernorRequest, SendSurface, gate};
+
+    let account_domain = creds
+        .account
+        .username
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty());
+
+    let attachment_sizes: Vec<(String, u64)> = attachments
+        .iter()
+        .map(|a| (a.content_type.clone(), a.data.len() as u64))
+        .collect();
+
+    // Re-derive the FINAL attributed context from the persisted draft just
+    // before SMTP. This is the authoritative gate: recipients, attachments, and
+    // threading are read from what will actually be transmitted.
+    let ctx = scheduled_send_context(draft, account_domain, attachments);
+    let req = GovernorRequest::from_context(
+        &draft.account_id,
+        subject,
+        SendSurface::Scheduled,
+        Some(&draft.id),
+        &attachment_sizes,
+        &ctx,
+    );
+
+    let config = GovernorConfig::from_env();
+    let outcome = gate(&config, &req);
+
+    // Record a sanitized audit event (no bodies, no full addresses, no bytes).
+    let event_type = if outcome.allowed {
+        "send_governor.allowed"
+    } else {
+        "send_governor.blocked"
+    };
+    let payload = serde_json::json!({
+        "request": req.audit_payload(),
+        "outcome": outcome.audit_json(),
+    });
+    let event = envelope_email_store::Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        account_id: draft.account_id.clone(),
+        event_type: event_type.to_string(),
+        folder: "policy".to_string(),
+        uid: None,
+        message_id: None,
+        from_addr: None,
+        subject: None,
+        snippet: None,
+        payload: Some(payload.to_string()),
+        idempotency_key: None,
+        secure_pending: false,
+        acked_at: Some(chrono::Utc::now().to_rfc3339()),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    {
+        let db = state.db.lock().await;
+        let _ = db.insert_event(&event);
+    }
+
+    outcome
 }
 
 /// Decode draft attachment JSON entries (as snapshotted at schedule time) back
@@ -549,6 +756,189 @@ mod tests {
             draft.id,
             other_draft.id,
         )
+    }
+
+    #[test]
+    fn scheduled_threading_preserves_contextual_reply_headers() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "sender@example.net",
+                Some("Re: Threaded"),
+                Some("reply body"),
+                None,
+                Some("parent@example.net"),
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                "draft_kind": "reply",
+                "in_reply_to": "metadata-parent@example.net",
+                "references": ["root@example.net", "parent@example.net"]
+            }),
+        )
+        .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let (in_reply_to, references) = scheduled_threading(&fetched);
+        assert_eq!(in_reply_to.as_deref(), Some("parent@example.net"));
+        assert_eq!(references, vec!["root@example.net", "parent@example.net"]);
+    }
+
+    fn governor_outcome(
+        decision: &str,
+        block_code: Option<&str>,
+    ) -> envelope_email_transport::outbound::GovernorOutcome {
+        envelope_email_transport::outbound::GovernorOutcome {
+            allowed: false,
+            mode: envelope_email_transport::outbound::GovernorMode::Required,
+            decision: decision.to_string(),
+            state: None,
+            score: None,
+            review_ticket_id: None,
+            block_code: block_code.map(str::to_string),
+            block_reason: Some("blocked".to_string()),
+        }
+    }
+
+    #[test]
+    fn review_and_deny_verdicts_pause_for_review_but_unavailable_retries() {
+        // Durable Governor verdicts (block code `governor_blocked`) pause the draft.
+        for decision in ["review", "deny", "block"] {
+            assert!(
+                should_pause_for_review(&governor_outcome(decision, Some("governor_blocked"))),
+                "{decision} should pause for review"
+            );
+        }
+        // Transient gate failure stays queued for a later retry.
+        assert!(!should_pause_for_review(&governor_outcome(
+            "unavailable",
+            Some("governor_unavailable")
+        )));
+        // An allowed outcome never pauses.
+        let mut allowed = governor_outcome("allow", None);
+        allowed.allowed = true;
+        assert!(!should_pause_for_review(&allowed));
+    }
+
+    #[test]
+    fn review_required_scheduled_draft_drops_out_of_sweep_yet_stays_reviewable() {
+        use envelope_email_store::DraftStatus;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "recipient@example.net",
+                Some("Scheduled note"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // Schedule it in the past so it is due now.
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+
+        // Before the Governor pause, the sweep would pick this draft up.
+        let due_before = db.list_drafts_due_for_send().unwrap();
+        assert!(due_before.iter().any(|d| d.id == draft.id));
+
+        // Governor classifies the send as review-required: pause it durably.
+        assert!(should_pause_for_review(&governor_outcome(
+            "review",
+            Some("governor_blocked")
+        )));
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+
+        // It is no longer due — the sweep will not retry it next cycle.
+        let due_after = db.list_drafts_due_for_send().unwrap();
+        assert!(
+            !due_after.iter().any(|d| d.id == draft.id),
+            "paused draft must not be re-selected by the scheduled-send sweep"
+        );
+
+        // But the draft is preserved, still pending review, and re-sendable by
+        // explicit human action (not discarded, still editable).
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(fetched.status, DraftStatus::PendingReview);
+        assert!(fetched.status.is_editable());
+        assert_eq!(fetched.send_after.as_deref(), Some("2000-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn scheduled_send_context_re_derives_final_attributes_from_persisted_draft() {
+        use envelope_email_transport::smtp::Attachment;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@martin.fm', 'martin.fm',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+
+        // A queued reply to an external freemail recipient carrying a contract.
+        let draft = db
+            .create_draft(
+                "acc1",
+                "counterparty@gmail.com",
+                Some("Re: Services agreement"),
+                Some("body"),
+                None,
+                Some("parent@martin.fm"),
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        let attachments = vec![Attachment {
+            filename: "Master-Services-Agreement.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: b"%PDF-1.4 fake".to_vec(),
+        }];
+
+        // The authoritative gate re-derives from what will actually be sent.
+        let ctx = scheduled_send_context(&draft, Some("martin.fm".to_string()), &attachments);
+        let attrs = ctx.to_governor_attrs();
+
+        assert!(attrs.contains(&"reply_to_thread"), "{attrs:?}");
+        assert!(attrs.contains(&"freemail_domain"), "{attrs:?}");
+        assert!(attrs.contains(&"has_attachment"), "{attrs:?}");
+        assert!(attrs.contains(&"sensitive_attachment"), "{attrs:?}");
+        // External recipient — never internal.
+        assert!(!attrs.contains(&"internal_domain"), "{attrs:?}");
     }
 
     #[tokio::test]

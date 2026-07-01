@@ -678,30 +678,52 @@ pub async fn read(
     Path((account_id, uid)): Path<(String, u32)>,
     Query(q): Query<ReadQuery>,
 ) -> impl IntoResponse {
-    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
-        }
-    };
-    let mut client = client_arc.lock().await;
+    // A cached IMAP client can go stale (e.g. a transient
+    // "Can't assign requested address" on SELECT against a synced drafts
+    // folder). Evict the cached client and retry once with a fresh
+    // connection before surfacing a 502. Bounded to a single retry.
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
+            }
+        };
+        let fetched = {
+            let mut client = client_arc.lock().await;
+            envelope_email_transport::imap::fetch_message(&mut client, &q.folder, uid).await
+        };
 
-    match envelope_email_transport::imap::fetch_message(&mut client, &q.folder, uid).await {
-        Ok(Some(msg)) => {
-            let thread_context = thread_context_for_uid(&state, &account_id, &q.folder, uid).await;
-            let message = DashboardMessage {
-                unread: message_is_unread(&msg),
-                message: msg,
-                thread_context,
-            };
-            Json(json!({ "message": message })).into_response()
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "message not found").into_response(),
-        Err(e) => {
-            state.evict_imap(&account_id).await;
-            (StatusCode::BAD_GATEWAY, format!("fetch: {e}")).into_response()
+        match fetched {
+            Ok(Some(msg)) => {
+                let thread_context =
+                    thread_context_for_uid(&state, &account_id, &q.folder, uid).await;
+                let message = DashboardMessage {
+                    unread: message_is_unread(&msg),
+                    message: msg,
+                    thread_context,
+                };
+                return Json(json!({ "message": message })).into_response();
+            }
+            Ok(None) => return (StatusCode::NOT_FOUND, "message not found").into_response(),
+            Err(e) => {
+                // Drop the (possibly stale) cached connection so the next
+                // attempt reconnects. On the final attempt, fall through to
+                // the 502 below.
+                state.evict_imap(&account_id).await;
+                last_err = Some(format!("fetch: {e}"));
+                if attempt == 0 {
+                    continue;
+                }
+            }
         }
     }
+    (
+        StatusCode::BAD_GATEWAY,
+        last_err.unwrap_or_else(|| "fetch: IMAP error".to_string()),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

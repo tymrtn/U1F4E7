@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
 use serde_json::json;
 
-use envelope_email_transport::SmtpSender;
+use envelope_email_transport::outbound::resolve_cooldown_seconds;
 use envelope_email_transport::reply::build_reply_all_headers;
 use envelope_email_transport::reply::build_reply_headers;
 use envelope_email_transport::smtp::Attachment as SmtpAttachment;
@@ -39,6 +39,31 @@ fn decode_attachments(raw: &[AttachmentPayload]) -> Result<Vec<SmtpAttachment>, 
             })
         })
         .collect()
+}
+
+fn attachment_snapshots(
+    raw: &[AttachmentPayload],
+    decoded: &[SmtpAttachment],
+) -> Vec<serde_json::Value> {
+    raw.iter()
+        .zip(decoded.iter())
+        .map(|(raw, decoded)| {
+            json!({
+                "filename": raw.filename,
+                "content_type": raw.content_type,
+                "size": decoded.data.len(),
+                "data_base64": raw.data_b64,
+            })
+        })
+        .collect()
+}
+
+fn cooldown_send_after() -> (i64, String) {
+    let cooldown = resolve_cooldown_seconds(None);
+    let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    (cooldown, send_at)
 }
 
 #[derive(Deserialize)]
@@ -76,25 +101,45 @@ pub async fn send(
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
-    match SmtpSender::send(
-        &creds,
-        &req.to,
-        &req.subject,
-        req.text.as_deref(),
-        req.html.as_deref(),
-        None, // from_override
-        req.cc.as_deref(),
-        req.bcc.as_deref(),
-        req.reply_to.as_deref(),
-        None,
-        None,
-        &attachments,
-    )
-    .await
-    {
-        Ok(message_id) => Json(json!({ "ok": true, "message_id": message_id })).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("send: {e}")).into_response(),
-    }
+    let attachment_snapshots = attachment_snapshots(&req.attachments, &attachments);
+    let (cooldown, send_at) = cooldown_send_after();
+    let draft = {
+        let db = state.db.lock().await;
+        let draft = match db.create_draft(
+            &creds.account.id,
+            &req.to,
+            Some(&req.subject),
+            req.text.as_deref(),
+            req.html.as_deref(),
+            None,
+            req.cc.as_deref(),
+            req.bcc.as_deref(),
+            Some("dashboard"),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("queue draft: {e}")).into_response();
+            }
+        };
+        if let Err(e) = db.update_draft_send_after(&draft.id, &send_at) {
+            return (StatusCode::BAD_GATEWAY, format!("queue send_after: {e}")).into_response();
+        }
+        if !attachment_snapshots.is_empty()
+            && let Err(e) = db.update_draft_attachments(&draft.id, &attachment_snapshots)
+        {
+            return (StatusCode::BAD_GATEWAY, format!("queue attachments: {e}")).into_response();
+        }
+        draft
+    };
+
+    Json(json!({
+        "ok": true,
+        "status": "queued",
+        "draft_id": draft.id,
+        "send_after": send_at,
+        "cooldown_seconds": cooldown,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -164,29 +209,69 @@ pub async fn reply(
         Some(headers.cc.join(", "))
     };
 
-    match SmtpSender::send(
-        &creds,
-        &headers.to,
-        &headers.subject,
-        req.text.as_deref(),
-        req.html.as_deref(),
-        None, // from_override
-        cc_joined.as_deref(),
-        None, // bcc
-        None, // reply_to
-        headers.in_reply_to.as_deref(),
-        Some(&headers.references),
-        &attachments,
-    )
-    .await
-    {
-        Ok(message_id) => Json(json!({
-            "ok": true,
-            "message_id": message_id,
-            "in_reply_to": headers.in_reply_to,
-            "references": headers.references,
-        }))
-        .into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("send reply: {e}")).into_response(),
-    }
+    let attachment_snapshots = attachment_snapshots(&req.attachments, &attachments);
+    let (cooldown, send_at) = cooldown_send_after();
+    let draft = {
+        let db = state.db.lock().await;
+        let draft = match db.create_draft(
+            &creds.account.id,
+            &headers.to,
+            Some(&headers.subject),
+            req.text.as_deref(),
+            req.html.as_deref(),
+            headers.in_reply_to.as_deref(),
+            cc_joined.as_deref(),
+            None,
+            Some("dashboard"),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("queue reply draft: {e}"))
+                    .into_response();
+            }
+        };
+        if let Err(e) = db.set_draft_metadata(
+            &draft.id,
+            &json!({
+                "draft_kind": "reply",
+                "in_reply_to": headers.in_reply_to.clone(),
+                "references": headers.references.clone(),
+                "source": {"folder": req.parent_folder, "uid": req.parent_uid},
+            }),
+        ) {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("queue reply metadata: {e}"),
+            )
+                .into_response();
+        }
+        if let Err(e) = db.update_draft_send_after(&draft.id, &send_at) {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("queue reply send_after: {e}"),
+            )
+                .into_response();
+        }
+        if !attachment_snapshots.is_empty()
+            && let Err(e) = db.update_draft_attachments(&draft.id, &attachment_snapshots)
+        {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("queue reply attachments: {e}"),
+            )
+                .into_response();
+        }
+        draft
+    };
+
+    Json(json!({
+        "ok": true,
+        "status": "queued",
+        "draft_id": draft.id,
+        "send_after": send_at,
+        "cooldown_seconds": cooldown,
+        "in_reply_to": headers.in_reply_to,
+        "references": headers.references,
+    }))
+    .into_response()
 }

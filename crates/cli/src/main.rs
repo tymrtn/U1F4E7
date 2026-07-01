@@ -195,6 +195,16 @@ enum Commands {
         /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
         #[arg(long)]
         confirm_new_re_subject: bool,
+        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        #[arg(long)]
+        cooldown_seconds: Option<i64>,
+        /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
+        /// Must be combined with --confirm-send-now.
+        #[arg(long)]
+        send_now: bool,
+        /// Explicit confirmation required to use --send-now (or --cooldown-seconds 0)
+        #[arg(long)]
+        confirm_send_now: bool,
     },
 
     /// Move a message to another folder
@@ -742,6 +752,10 @@ enum DraftCmd {
         /// In-Reply-To Message-ID (for replies)
         #[arg(long)]
         in_reply_to: Option<String>,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft so
+        /// review and send preserve the attachment.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
         /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
         #[arg(long)]
         confirm_new_re_subject: bool,
@@ -765,6 +779,9 @@ enum DraftCmd {
         /// Append the account signature
         #[arg(long)]
         signature: bool,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -788,6 +805,12 @@ enum DraftCmd {
         /// Append the account signature
         #[arg(long)]
         signature: bool,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Forward the original message's attachments as draft attachments (opt-in)
+        #[arg(long = "include-attachments")]
+        include_attachments: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -817,6 +840,15 @@ enum DraftCmd {
         /// Apply the account signature (omit to preserve prior state)
         #[arg(long)]
         signature: Option<bool>,
+        /// Attach a file to the existing draft (repeatable)
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Remove a stored attachment by filename (repeatable)
+        #[arg(long = "remove-attach", value_name = "FILENAME")]
+        remove_attach: Vec<String>,
+        /// Remove all stored attachments before adding any new --attach files
+        #[arg(long = "clear-attachments")]
+        clear_attachments: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -839,6 +871,16 @@ enum DraftCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        #[arg(long)]
+        cooldown_seconds: Option<i64>,
+        /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
+        /// Must be combined with --confirm-send-now.
+        #[arg(long)]
+        send_now: bool,
+        /// Explicit confirmation required to use --send-now (or --cooldown-seconds 0)
+        #[arg(long)]
+        confirm_send_now: bool,
     },
     /// Discard a draft by local ID or IMAP UID
     Discard {
@@ -1604,6 +1646,9 @@ fn main() {
             confirm_send,
             allow_recipients,
             confirm_new_re_subject,
+            cooldown_seconds,
+            send_now,
+            confirm_send_now,
         } => commands::send::run(
             &to,
             &subject,
@@ -1622,6 +1667,9 @@ fn main() {
             confirm_send,
             &allow_recipients,
             confirm_new_re_subject,
+            cooldown_seconds,
+            send_now,
+            confirm_send_now,
         ),
 
         Commands::Move {
@@ -1728,6 +1776,7 @@ fn main() {
                 cc,
                 bcc,
                 in_reply_to,
+                attach,
                 confirm_new_re_subject,
             } => commands::drafts::run_create(
                 &to,
@@ -1740,6 +1789,7 @@ fn main() {
                 cc.as_deref(),
                 bcc.as_deref(),
                 in_reply_to.as_deref(),
+                &attach,
                 confirm_new_re_subject,
             ),
             DraftCmd::Reply {
@@ -1749,6 +1799,7 @@ fn main() {
                 body,
                 html,
                 signature,
+                attach,
                 account,
             } => commands::drafts::run_reply(
                 uid,
@@ -1760,6 +1811,7 @@ fn main() {
                 body.as_deref(),
                 html.as_deref(),
                 signature,
+                &attach,
             ),
             DraftCmd::Forward {
                 uid,
@@ -1768,6 +1820,8 @@ fn main() {
                 body,
                 html,
                 signature,
+                attach,
+                include_attachments,
                 account,
             } => commands::drafts::run_forward(
                 uid,
@@ -1779,6 +1833,8 @@ fn main() {
                 body.as_deref(),
                 html.as_deref(),
                 signature,
+                &attach,
+                include_attachments,
             ),
             DraftCmd::Edit {
                 id,
@@ -1789,6 +1845,9 @@ fn main() {
                 bcc,
                 subject,
                 signature,
+                attach,
+                remove_attach,
+                clear_attachments,
                 account,
             } => commands::drafts::run_edit(
                 &id,
@@ -1802,11 +1861,26 @@ fn main() {
                 bcc.as_deref(),
                 subject.as_deref(),
                 signature,
+                &attach,
+                &remove_attach,
+                clear_attachments,
             ),
             DraftCmd::Show { id } => commands::drafts::run_show(&id, cli.json),
-            DraftCmd::Send { id, account } => {
-                commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
-            }
+            DraftCmd::Send {
+                id,
+                account,
+                cooldown_seconds,
+                send_now,
+                confirm_send_now,
+            } => commands::drafts::run_send(
+                &id,
+                account.as_deref(),
+                cli.json,
+                backend,
+                cooldown_seconds,
+                send_now,
+                confirm_send_now,
+            ),
             DraftCmd::Discard { id, account } => {
                 commands::drafts::run_discard(&id, cli.json, account.as_deref(), backend)
             }

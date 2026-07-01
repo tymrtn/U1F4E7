@@ -109,7 +109,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v1",
-      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments.",
+      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. By default an allowed send QUEUES into the outbox with a cooldown (default 120s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -120,6 +120,20 @@
           "allow_recipient": {
             "items": {
               "description": "Allowed email address or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot or send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
               "type": "string"
             },
             "type": "array"
@@ -140,6 +154,15 @@
             "default": false,
             "description": "Required when send_mode is confirm-send",
             "type": "boolean"
+          },
+          "confirm_send_now": {
+            "default": false,
+            "description": "Explicit confirmation required to use send_now or cooldown_seconds=0",
+            "type": "boolean"
+          },
+          "cooldown_seconds": {
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "type": "integer"
           },
           "from": {
             "description": "Override sender identity",
@@ -163,6 +186,11 @@
               "autonomous-send"
             ],
             "type": "string"
+          },
+          "send_now": {
+            "default": false,
+            "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now",
+            "type": "boolean"
           },
           "subject": {
             "description": "Email subject",
@@ -194,6 +222,20 @@
           "allow_recipient": {
             "items": {
               "description": "Allowed recipient email or domain for allowlisted-send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot or send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
               "type": "string"
             },
             "type": "array"
@@ -260,6 +302,20 @@
             "description": "Append the account signature when available",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot into the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Initial agent-authored plain-text body",
             "type": "string"
@@ -305,6 +361,20 @@
             "description": "Append the account signature when available",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot into the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Initial agent-authored plain-text body",
             "type": "string"
@@ -317,6 +387,11 @@
           "html": {
             "description": "Initial agent-authored HTML body",
             "type": "string"
+          },
+          "include_attachments": {
+            "default": false,
+            "description": "Forward original source-message attachments into the new draft",
+            "type": "boolean"
           },
           "to": {
             "description": "Optional forward recipient; may be left empty for later edit",
@@ -348,6 +423,20 @@
             "description": "Override signature application for this edit",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to add to the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "bcc": {
             "description": "BCC override",
             "type": "string"
@@ -360,6 +449,11 @@
             "description": "CC override",
             "type": "string"
           },
+          "clear_attachments": {
+            "default": false,
+            "description": "Remove all stored attachments before adding new files",
+            "type": "boolean"
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
@@ -367,6 +461,20 @@
           "html": {
             "description": "Replacement agent-authored HTML body",
             "type": "string"
+          },
+          "remove_attach": {
+            "items": {
+              "description": "Stored attachment filename to remove",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remove_attachments": {
+            "items": {
+              "description": "Stored attachment filename alias for remove_attach",
+              "type": "string"
+            },
+            "type": "array"
           },
           "subject": {
             "description": "Subject override",
@@ -404,7 +512,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v1",
-      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts.",
+      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts. By default it QUEUES the draft into the outbox with a cooldown (default 120s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -417,9 +525,23 @@
             "description": "Required to send a draft from MCP",
             "type": "boolean"
           },
+          "confirm_send_now": {
+            "default": false,
+            "description": "Explicit confirmation required to use send_now or cooldown_seconds=0",
+            "type": "boolean"
+          },
+          "cooldown_seconds": {
+            "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "type": "integer"
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
+          },
+          "send_now": {
+            "default": false,
+            "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now",
+            "type": "boolean"
           }
         },
         "required": [
@@ -615,6 +737,32 @@
       "name": "accounts"
     }
   ],
+  "outbound_safety": {
+    "actual_send_cooldown": {
+      "behavior": "Allowed sends (CLI send, MCP send/reply allowed modes, draft send / send_draft) queue into the outbox with a future send_after by default; real SMTP only happens later when the scheduled-send sweep finds them due. Queued responses include queued_reason_code=safety_cooldown and a human-readable queued_reason so agents know the delay is intentional safety time to report and correct issues.",
+      "bypass": "Immediate transmission requires an explicit, confirmed bypass: send_now (or cooldown_seconds=0) together with confirm_send_now.",
+      "default_seconds": 120,
+      "denial_code": "immediate_send_requires_confirmation",
+      "env": "ENVELOPE_SEND_COOLDOWN_SECONDS"
+    },
+    "governor_gate": {
+      "behavior": "Before any real SMTP send (immediate bypass and scheduled-send sweep), the actual Governor decision engine is consulted using blind attribution: Envelope declares the contextual attribute keys the send exhibits and Governor opaquely scores/routes them against the 'envelope' catalog (allow/review/deny). Envelope never reproduces Governor's weights or thresholds. The scheduled-send sweep re-derives the final attributes from the persisted draft just before SMTP; durable review/deny verdicts park the draft as pending_review (no retry storm) while transient gate failures leave it queued. In required mode it fails closed: missing/error/deny/review all block the send; only an explicit allow permits SMTP. warn records but never blocks; off skips the gate.",
+      "block_code": "governor_blocked",
+      "block_status": "blocked",
+      "default": "required",
+      "env": {
+        "bin": "ENVELOPE_GOVERNOR_BIN",
+        "mode": "ENVELOPE_GOVERNOR_MODE"
+      },
+      "modes": [
+        "required",
+        "warn",
+        "off"
+      ],
+      "redaction": "Blind attribution: Governor receives only the declared envelope-catalog attribute keys plus a content-free justification (surface + draft id) — never recipient addresses, subject text, bodies, attachment bytes, or secrets. Envelope's own send-policy audit event additionally records sanitized metadata (account id/domain, subject hash, recipient count/domains/classes, surface, draft id, attachment count/sizes/types, reply flag) alongside the declared attribute keys and catalog.",
+      "unavailable_code": "governor_unavailable"
+    }
+  },
   "schema": "envelope.agent_contract.v1",
   "surfaces": [
     {
@@ -909,6 +1057,20 @@
             },
             "type": "array"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot or send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "bcc": {
             "description": "BCC recipients",
             "type": "string"
@@ -925,6 +1087,15 @@
             "default": false,
             "description": "Required when send_mode is confirm-send",
             "type": "boolean"
+          },
+          "confirm_send_now": {
+            "default": false,
+            "description": "Explicit confirmation required to use send_now or cooldown_seconds=0",
+            "type": "boolean"
+          },
+          "cooldown_seconds": {
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "type": "integer"
           },
           "from": {
             "description": "Override sender identity",
@@ -949,6 +1120,11 @@
             ],
             "type": "string"
           },
+          "send_now": {
+            "default": false,
+            "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now",
+            "type": "boolean"
+          },
           "subject": {
             "description": "Email subject",
             "type": "string"
@@ -972,16 +1148,42 @@
       "output_schema": {
         "additionalProperties": false,
         "properties": {
+          "attachments": {
+            "description": "Non-secret attachment summaries: filename, content_type, and size only",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "cooldown_seconds": {
+            "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "draft_id": {
             "description": "Local draft id when scheduled or draft-only",
             "type": "string"
           },
           "error": {
-            "description": "Stable denial object for denied sends",
+            "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary",
             "type": "object"
           },
           "message_id": {
             "description": "SMTP Message-ID when sent immediately",
+            "type": "string"
+          },
+          "queued_reason": {
+            "description": "Human-readable explanation that the message is queued in the outbox for the safety cooldown so agents/operators can report and correct issues before SMTP transmission",
+            "type": "string"
+          },
+          "queued_reason_code": {
+            "description": "Stable reason code for queued sends; safety_cooldown means Envelope intentionally delayed SMTP for review/correction time",
+            "type": "string"
+          },
+          "send_after": {
+            "description": "ISO8601 time the queued/scheduled send becomes due for the outbox sweep",
             "type": "string"
           },
           "send_mode": {
@@ -1012,7 +1214,7 @@
             ]
           },
           "status": {
-            "description": "sent, scheduled, drafted, or denied",
+            "description": "queued (default cooldown), sent, scheduled, drafted, denied, or blocked",
             "type": "string"
           },
           "subject": {
@@ -1109,6 +1311,13 @@
             "description": "Account ID or email address",
             "type": "string"
           },
+          "attach": {
+            "description": "File attachment paths to snapshot into draft storage; repeatable as --attach",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "bcc": {
             "description": "BCC recipients",
             "type": "string"
@@ -1121,9 +1330,21 @@
             "description": "CC recipients",
             "type": "string"
           },
+          "clear_attachments": {
+            "default": false,
+            "description": "Remove all stored attachments during draft edit",
+            "type": "boolean"
+          },
           "in_reply_to": {
             "description": "Optional message UID or Message-ID to reply to",
             "type": "string"
+          },
+          "remove_attach": {
+            "description": "Stored attachment filenames to remove during draft edit",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "subject": {
             "description": "Draft subject",
@@ -1145,6 +1366,13 @@
       "output_schema": {
         "additionalProperties": false,
         "properties": {
+          "attachments": {
+            "description": "Non-secret attachment summaries: filename, content_type, and size only",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
@@ -1544,6 +1772,20 @@
             },
             "type": "array"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot or send",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Reply text body",
             "type": "string"
@@ -1617,6 +1859,20 @@
             "description": "Append the account signature when available",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot into the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Initial agent-authored plain-text body",
             "type": "string"
@@ -1673,6 +1929,20 @@
             "description": "Append the account signature when available",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to snapshot into the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Initial agent-authored plain-text body",
             "type": "string"
@@ -1685,6 +1955,11 @@
           "html": {
             "description": "Initial agent-authored HTML body",
             "type": "string"
+          },
+          "include_attachments": {
+            "default": false,
+            "description": "Forward original source-message attachments into the new draft",
+            "type": "boolean"
           },
           "to": {
             "description": "Optional forward recipient; may be left empty for later edit",
@@ -1727,6 +2002,20 @@
             "description": "Override signature application for this edit",
             "type": "boolean"
           },
+          "attach": {
+            "items": {
+              "description": "File attachment path to add to the draft",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "description": "File attachment path alias for attach",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "bcc": {
             "description": "BCC override",
             "type": "string"
@@ -1739,6 +2028,11 @@
             "description": "CC override",
             "type": "string"
           },
+          "clear_attachments": {
+            "default": false,
+            "description": "Remove all stored attachments before adding new files",
+            "type": "boolean"
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
@@ -1746,6 +2040,20 @@
           "html": {
             "description": "Replacement agent-authored HTML body",
             "type": "string"
+          },
+          "remove_attach": {
+            "items": {
+              "description": "Stored attachment filename to remove",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remove_attachments": {
+            "items": {
+              "description": "Stored attachment filename alias for remove_attach",
+              "type": "string"
+            },
+            "type": "array"
           },
           "subject": {
             "description": "Subject override",
@@ -1818,9 +2126,23 @@
             "description": "Required to send a draft from MCP",
             "type": "boolean"
           },
+          "confirm_send_now": {
+            "default": false,
+            "description": "Explicit confirmation required to use send_now or cooldown_seconds=0",
+            "type": "boolean"
+          },
+          "cooldown_seconds": {
+            "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "type": "integer"
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
+          },
+          "send_now": {
+            "default": false,
+            "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now",
+            "type": "boolean"
           }
         },
         "required": [

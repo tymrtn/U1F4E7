@@ -4,17 +4,22 @@
 use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
 use envelope_email_store::credential_store::{self, CredentialBackend};
-use envelope_email_store::models::{AccountWithCredentials, Draft};
+use envelope_email_store::models::{AccountWithCredentials, AttachmentMeta, Draft};
 use envelope_email_transport::SmtpSender;
 use envelope_email_transport::compose::{
     self, ContextBlock, DEFAULT_PREVIEW_WORD_LIMIT, DraftKind,
 };
 use envelope_email_transport::imap;
+use envelope_email_transport::outbound::SendSurface;
 use envelope_email_transport::reply;
+use envelope_email_transport::smtp::Attachment;
 use envelope_email_transport::{detect_drafts_folder, detect_sent_folder};
+use lettre::message::Mailboxes;
 use mail_builder::MessageBuilder;
+use mail_builder::headers::address::Address as BuilderAddress;
 use tracing::warn;
 
+use super::attachments::{attachment_summaries, decode_attachments, snapshot_attachments};
 use super::common::{resolve_account, setup_credentials};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
@@ -222,15 +227,16 @@ pub(crate) fn build_rfc822_full(
     in_reply_to: Option<&str>,
     references: &[String],
     message_id: Option<&str>,
+    attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
     let mut builder = MessageBuilder::new().from(from).subject(subject);
     if !to.trim().is_empty() {
-        builder = builder.to(to);
+        builder = builder.to(builder_address_list(to, "to")?);
     }
 
     if let Some(cc_addr) = cc {
         if !cc_addr.trim().is_empty() {
-            builder = builder.cc(cc_addr);
+            builder = builder.cc(builder_address_list(cc_addr, "cc")?);
         }
     }
     if let Some(irt) = in_reply_to {
@@ -255,6 +261,14 @@ pub(crate) fn build_rfc822_full(
         (None, None) => builder.text_body(""),
     };
 
+    for att in attachments {
+        builder = builder.attachment(
+            att.content_type.clone(),
+            att.filename.clone(),
+            att.data.clone(),
+        );
+    }
+
     let rfc822 = builder
         .write_to_string()
         .context("failed to build RFC822 message")?;
@@ -272,6 +286,89 @@ pub(crate) fn build_rfc822_full(
     Ok((rfc822.into_bytes(), message_id))
 }
 
+/// After a successful immediate SMTP send, append a copy to the account's Sent
+/// folder for providers that do not auto-save SMTP submissions.
+///
+/// Gmail/Google save submitted mail to `[Gmail]/Sent Mail` automatically, so we
+/// skip them to avoid a visible duplicate. Generic IMAP/SMTP providers (martin.fm
+/// / inbox.eu and friends) do not, so without this the message is never visible
+/// in Sent and `find_sent_mail_by_message_id` can only ever report `not_found`.
+///
+/// The appended copy is rebuilt from the same fields and the *same* Message-ID
+/// that was transmitted, so the subsequent proof lookup resolves it. This mirrors
+/// the draft-send path's Sent-copy logic. Best-effort: connection/append failures
+/// are logged and surfaced as not-appended rather than failing the send.
+///
+/// Returns `(appended, skipped_reason)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_sent_copy_for_immediate_send(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    provider_type: Option<&str>,
+    from: &str,
+    to: &str,
+    subject: &str,
+    text: Option<&str>,
+    html: Option<&str>,
+    cc: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: &[String],
+    message_id: &str,
+    attachments: &[Attachment],
+) -> (bool, Option<&'static str>) {
+    let acct = &creds.account;
+    if acct.imap_host.trim().is_empty() {
+        return (false, Some("no_imap"));
+    }
+    if provider_auto_saves_sent(provider_type, &acct.smtp_host) {
+        return (false, Some("provider_auto_saves_sent"));
+    }
+
+    let rfc822 = match build_rfc822_full(
+        from,
+        to,
+        subject,
+        text,
+        html,
+        cc,
+        in_reply_to,
+        references,
+        Some(message_id),
+        attachments,
+    ) {
+        Ok((bytes, _)) => bytes,
+        Err(e) => {
+            warn!("failed to build Sent copy for immediate send: {e}");
+            return (false, Some("rfc822_build_failed"));
+        }
+    };
+
+    let mut client = match imap::connect(creds).await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("failed to connect to IMAP to append Sent copy: {e}");
+            return (false, Some("imap_connect_failed"));
+        }
+    };
+
+    match detect_sent_folder(&mut client, db, &acct.id).await {
+        Ok(Some(sent_folder)) => {
+            match imap::append_message(&mut client, &sent_folder, "(\\Seen)", &rfc822).await {
+                Ok(_) => (true, None),
+                Err(e) => {
+                    warn!("failed to append Sent copy to {sent_folder}: {e}");
+                    (false, Some("append_failed"))
+                }
+            }
+        }
+        Ok(None) => (false, Some("sent_folder_not_found")),
+        Err(e) => {
+            warn!("failed to detect Sent folder for immediate send: {e}");
+            (false, Some("sent_folder_detection_failed"))
+        }
+    }
+}
+
 /// Build an RFC822-formatted draft message suitable for IMAP APPEND.
 ///
 /// Returns (rfc822_bytes, message_id).
@@ -281,15 +378,28 @@ fn build_rfc822_draft(
     subject: Option<&str>,
     body: Option<&str>,
     cc: Option<&str>,
+    bcc: Option<&str>,
     in_reply_to: Option<&str>,
+    attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
     let mut builder = MessageBuilder::new()
         .from(from)
-        .to(to)
         .subject(subject.unwrap_or(""));
 
+    if !to.trim().is_empty() {
+        builder = builder.to(builder_address_list(to, "to")?);
+    }
+
     if let Some(cc_addr) = cc {
-        builder = builder.cc(cc_addr);
+        if !cc_addr.trim().is_empty() {
+            builder = builder.cc(builder_address_list(cc_addr, "cc")?);
+        }
+    }
+
+    if let Some(bcc_addr) = bcc {
+        if !bcc_addr.trim().is_empty() {
+            builder = builder.bcc(builder_address_list(bcc_addr, "bcc")?);
+        }
     }
 
     if let Some(irt) = in_reply_to {
@@ -298,6 +408,14 @@ fn build_rfc822_draft(
 
     let text = body.unwrap_or("");
     builder = builder.text_body(text);
+
+    for att in attachments {
+        builder = builder.attachment(
+            att.content_type.clone(),
+            att.filename.clone(),
+            att.data.clone(),
+        );
+    }
 
     let rfc822 = builder
         .write_to_string()
@@ -315,6 +433,23 @@ fn build_rfc822_draft(
         .unwrap_or_default();
 
     Ok((rfc822.into_bytes(), message_id))
+}
+
+/// Convert an RFC5322 mailbox list into `mail-builder`'s address-list type.
+///
+/// `mail-builder` treats a raw string as one mailbox, so passing
+/// `"a@example.com, b@example.com"` directly produces an invalid single address.
+/// Parse with lettre's RFC5322 mailbox-list parser first, then hand
+/// mail-builder an explicit list so draft RFC822 matches SMTP send behavior.
+fn builder_address_list(value: &str, field: &str) -> Result<BuilderAddress<'static>> {
+    let mailboxes = value
+        .parse::<Mailboxes>()
+        .with_context(|| format!("invalid {field} address"))?;
+    let items = mailboxes
+        .iter()
+        .map(|mailbox| BuilderAddress::new_address(mailbox.name.clone(), mailbox.email.to_string()))
+        .collect::<Vec<_>>();
+    Ok(BuilderAddress::new_list(items))
 }
 
 /// Threading + preserved Message-ID pulled from a local draft's metadata blob.
@@ -484,6 +619,9 @@ struct ContextualDraftSpec {
     context: ContextBlock,
     /// Source body used to compute the abridged preview.
     preview_source: String,
+    /// New attachments explicitly added to this contextual draft.
+    attachment_snapshots: Vec<serde_json::Value>,
+    attachments: Vec<Attachment>,
     attachments_forwarded: bool,
 }
 
@@ -522,6 +660,7 @@ async fn create_contextual_draft(
         spec.in_reply_to.as_deref(),
         &spec.references,
         None,
+        &spec.attachments,
     )?;
 
     let (imap_synced, imap_folder, imap_uid) =
@@ -550,6 +689,10 @@ async fn create_contextual_draft(
     let bare_message_id = strip_brackets(&message_id_hdr);
     if !bare_message_id.is_empty() {
         let _ = db.mark_draft_message_id(&draft.id, &bare_message_id);
+    }
+    if !spec.attachment_snapshots.is_empty() {
+        db.update_draft_attachments(&draft.id, &spec.attachment_snapshots)
+            .context("failed to persist draft attachments")?;
     }
 
     let (preview_text, preview_truncated) =
@@ -605,6 +748,7 @@ pub(crate) async fn create_reply_draft(
     body: Option<&str>,
     html: Option<&str>,
     signature: bool,
+    attach_paths: &[String],
 ) -> Result<Draft> {
     if creds.account.imap_host.is_empty() {
         bail!("reply requires an IMAP account to fetch the parent message");
@@ -629,6 +773,8 @@ pub(crate) async fn create_reply_draft(
     } else {
         Some(headers.cc.join(", "))
     };
+    let attachment_snapshots = snapshot_attachments(attach_paths)?;
+    let attachments = decode_attachments(&attachment_snapshots)?;
 
     let spec = ContextualDraftSpec {
         kind: DraftKind::Reply,
@@ -646,9 +792,46 @@ pub(crate) async fn create_reply_draft(
         signature,
         context: compose::build_reply_context(&parent),
         preview_source: compose::message_preview_source(&parent),
+        attachment_snapshots,
+        attachments,
         attachments_forwarded: false,
     };
     create_contextual_draft(db, creds, spec).await
+}
+
+/// Snapshot original source-message attachments for explicit forward-with-attachments.
+///
+/// This is intentionally opt-in because forwarding source attachments can move
+/// sensitive/large files. The output uses the same draft attachment JSON shape as
+/// CLI `--attach`: metadata plus a base64 payload for later draft send.
+async fn snapshot_source_attachments(
+    creds: &AccountWithCredentials,
+    uid: u32,
+    folder: &str,
+    source_attachments: &[AttachmentMeta],
+) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+
+    if source_attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut client = imap::connect(creds)
+        .await
+        .context("failed to connect to IMAP for source attachments")?;
+    let mut snapshots = Vec::with_capacity(source_attachments.len());
+    for meta in source_attachments {
+        let (filename, data) = imap::download_attachment(&mut client, uid, &meta.filename, folder)
+            .await
+            .with_context(|| format!("failed to download source attachment: {}", meta.filename))?;
+        snapshots.push(serde_json::json!({
+            "filename": filename,
+            "content_type": meta.content_type,
+            "size": data.len(),
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+        }));
+    }
+    Ok(snapshots)
 }
 
 /// Build a contextual forward draft. Shared by the CLI and MCP surfaces.
@@ -662,6 +845,8 @@ pub(crate) async fn create_forward_draft(
     body: Option<&str>,
     html: Option<&str>,
     signature: bool,
+    attach_paths: &[String],
+    include_attachments: bool,
 ) -> Result<Draft> {
     if creds.account.imap_host.is_empty() {
         bail!("forward requires an IMAP account to fetch the source message");
@@ -675,6 +860,13 @@ pub(crate) async fn create_forward_draft(
             .context("failed to fetch source message")?
             .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?
     };
+    let mut attachment_snapshots = if include_attachments {
+        snapshot_source_attachments(creds, uid, folder, &parent.attachments).await?
+    } else {
+        Vec::new()
+    };
+    attachment_snapshots.extend(snapshot_attachments(attach_paths)?);
+    let attachments = decode_attachments(&attachment_snapshots)?;
 
     let spec = ContextualDraftSpec {
         kind: DraftKind::Forward,
@@ -693,7 +885,9 @@ pub(crate) async fn create_forward_draft(
         signature,
         context: compose::build_forward_context(&parent),
         preview_source: compose::message_preview_source(&parent),
-        attachments_forwarded: false,
+        attachment_snapshots,
+        attachments,
+        attachments_forwarded: include_attachments,
     };
     create_contextual_draft(db, creds, spec).await
 }
@@ -712,6 +906,9 @@ pub(crate) async fn modify_draft(
     bcc: Option<&str>,
     subject: Option<&str>,
     add_signature: Option<bool>,
+    attach_paths: &[String],
+    remove_attachments: &[String],
+    clear_attachments: bool,
 ) -> Result<Draft> {
     let draft = db
         .get_draft(id)
@@ -779,6 +976,22 @@ pub(crate) async fn modify_draft(
         .map(str::to_string)
         .or_else(|| draft.subject.clone())
         .unwrap_or_default();
+    let mut attachment_snapshots = if clear_attachments {
+        Vec::new()
+    } else {
+        draft.attachments.clone()
+    };
+    if !remove_attachments.is_empty() {
+        attachment_snapshots.retain(|entry| {
+            let filename = entry.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+            !remove_attachments.iter().any(|name| name == filename)
+        });
+    }
+    if !attach_paths.is_empty() {
+        attachment_snapshots.extend(snapshot_attachments(attach_paths)?);
+    }
+    let attachments =
+        decode_attachments(&attachment_snapshots).context("failed to decode draft attachments")?;
 
     let from = account_from_header(creds);
     let (rfc822, message_id_hdr) = build_rfc822_full(
@@ -791,6 +1004,7 @@ pub(crate) async fn modify_draft(
         meta_in_reply_to.as_deref(),
         &meta_references,
         draft.message_id.as_deref(),
+        &attachments,
     )?;
 
     // Replace the IMAP draft: append the new RFC822, delete the stale copy.
@@ -816,6 +1030,8 @@ pub(crate) async fn modify_draft(
     if let Some(uid) = new_uid {
         let _ = db.update_draft_imap_uid(id, uid);
     }
+    db.update_draft_attachments(id, &attachment_snapshots)
+        .context("failed to update draft attachments")?;
 
     // Update metadata: authored body + signature state + storage. Preserve
     // source/context/preview/references unchanged.
@@ -865,6 +1081,19 @@ fn emit_draft_envelope(draft: &Draft, json: bool) {
     }
     if let Some(ref cc) = draft.cc_addr {
         println!("  CC:      {cc}");
+    }
+    if !draft.attachments.is_empty() {
+        println!("  Attachments: {}", draft.attachments.len());
+        for a in attachment_summaries(&draft.attachments) {
+            println!(
+                "    - {} ({} bytes, {})",
+                a["filename"].as_str().unwrap_or("attachment"),
+                a["size"].as_u64().unwrap_or(0),
+                a["content_type"]
+                    .as_str()
+                    .unwrap_or("application/octet-stream"),
+            );
+        }
     }
     if let Some(preview) = meta.get("preview_text").and_then(|v| v.as_str()) {
         if !preview.is_empty() {
@@ -929,6 +1158,7 @@ pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
             "attachments_forwarded": meta.get("attachments_forwarded").and_then(|v| v.as_bool()).unwrap_or(false),
             "full_content_preserved": true,
         },
+        "attachments": attachment_summaries(&draft.attachments),
         "storage": {
             "imap_synced": imap_synced,
             "imap_folder": storage.and_then(|s| s.get("imap_folder")).cloned().unwrap_or(serde_json::Value::Null),
@@ -954,10 +1184,21 @@ pub async fn run_reply(
     body: Option<&str>,
     html: Option<&str>,
     signature: bool,
+    attach_paths: &[String],
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
-    let draft =
-        create_reply_draft(&db, &creds, uid, folder, reply_all, body, html, signature).await?;
+    let draft = create_reply_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        reply_all,
+        body,
+        html,
+        signature,
+        attach_paths,
+    )
+    .await?;
     emit_draft_envelope(&draft, json);
     Ok(())
 }
@@ -978,9 +1219,23 @@ pub async fn run_forward(
     body: Option<&str>,
     html: Option<&str>,
     signature: bool,
+    attach_paths: &[String],
+    include_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
-    let draft = create_forward_draft(&db, &creds, uid, folder, to, body, html, signature).await?;
+    let draft = create_forward_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        to,
+        body,
+        html,
+        signature,
+        attach_paths,
+        include_attachments,
+    )
+    .await?;
     emit_draft_envelope(&draft, json);
     Ok(())
 }
@@ -1003,6 +1258,9 @@ pub async fn run_edit(
     bcc: Option<&str>,
     subject: Option<&str>,
     add_signature: Option<bool>,
+    attach_paths: &[String],
+    remove_attachments: &[String],
+    clear_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let draft = modify_draft(
@@ -1016,6 +1274,9 @@ pub async fn run_edit(
         bcc,
         subject,
         add_signature,
+        attach_paths,
+        remove_attachments,
+        clear_attachments,
     )
     .await?;
     emit_draft_envelope(&draft, json);
@@ -1199,6 +1460,7 @@ fn run_list_local(db: &Database, account_id: &str, json: bool) -> Result<()> {
 
 // ─── draft create ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 #[tokio::main]
 pub async fn run_create(
     to: &str,
@@ -1211,11 +1473,18 @@ pub async fn run_create(
     cc: Option<&str>,
     bcc: Option<&str>,
     in_reply_to: Option<&str>,
+    attach_paths: &[String],
     confirm_new_re_subject: bool,
 ) -> Result<()> {
     check_new_re_subject_guard(subject, in_reply_to.is_some(), confirm_new_re_subject, json)?;
 
     let (db, creds) = setup_credentials(account, backend)?;
+
+    // Snapshot attachment bytes now so review/send preserve them even if the
+    // source files later change. Fail explicitly if a file is unreadable rather
+    // than creating a draft with a silently-missing attachment.
+    let attachment_snapshots = snapshot_attachments(attach_paths)?;
+    let attachments = decode_attachments(&attachment_snapshots)?;
 
     // Build RFC822 message for IMAP APPEND
     let from_addr = if let Some(f) = from {
@@ -1226,7 +1495,16 @@ pub async fn run_create(
         creds.account.username.clone()
     };
 
-    let (rfc822, message_id) = build_rfc822_draft(&from_addr, to, subject, body, cc, in_reply_to)?;
+    let (rfc822, message_id) = build_rfc822_draft(
+        &from_addr,
+        to,
+        subject,
+        body,
+        cc,
+        bcc,
+        in_reply_to,
+        &attachments,
+    )?;
 
     // Check if this is a send-only account (no IMAP)
     let has_imap = !creds.account.imap_host.is_empty();
@@ -1329,6 +1607,14 @@ pub async fn run_create(
         let _ = db.mark_draft_message_id(&draft.id, &message_id);
     }
 
+    // Persist the (non-secret metadata + base64 payload) attachment snapshots so
+    // a later `draft send` re-includes them rather than silently dropping.
+    if !attachment_snapshots.is_empty() {
+        db.update_draft_attachments(&draft.id, &attachment_snapshots)
+            .context("failed to persist draft attachments")?;
+    }
+    let attachment_summary = attachment_summaries(&attachment_snapshots);
+
     let dashboard_path = draft_dashboard_path(&creds.account.id, &draft.id);
     let dashboard_url = draft_dashboard_url(&creds.account.id, &draft.id);
 
@@ -1342,6 +1628,7 @@ pub async fn run_create(
                 "cc": cc,
                 "bcc": bcc,
                 "in_reply_to": in_reply_to,
+                "attachments": attachment_summary,
                 "imap_synced": imap_synced,
                 "imap_uid": imap_uid,
                 "imap_folder": if imap_synced { Some(&drafts_folder_name) } else { None },
@@ -1373,6 +1660,19 @@ pub async fn run_create(
         if let Some(c) = cc {
             println!("  CC:      {c}");
         }
+        if !attachment_summary.is_empty() {
+            println!("  Attachments: {}", attachment_summary.len());
+            for a in &attachment_summary {
+                println!(
+                    "    - {} ({} bytes, {})",
+                    a["filename"].as_str().unwrap_or("attachment"),
+                    a["size"].as_u64().unwrap_or(0),
+                    a["content_type"]
+                        .as_str()
+                        .unwrap_or("application/octet-stream"),
+                );
+            }
+        }
         println!("  Review:  {dashboard_url}");
         if imap_synced {
             if let Some(uid) = imap_uid {
@@ -1398,7 +1698,123 @@ pub async fn run_send(
     account: Option<&str>,
     json: bool,
     backend: CredentialBackend,
+    cooldown_seconds: Option<i64>,
+    send_now: bool,
+    confirm_send_now: bool,
 ) -> Result<()> {
+    use envelope_email_transport::outbound::{
+        IMMEDIATE_SEND_CONFIRM_CODE, SendDisposition, resolve_cooldown_seconds, resolve_disposition,
+    };
+
+    // ── Default actual-send cooldown (outbox queueing) ──
+    // `draft send` queues by default: it sets send_after on the draft so the
+    // scheduled-send sweep transmits it later (after the Governor gate permits
+    // it). Immediate transmission requires an explicit, confirmed bypass.
+    let cooldown = resolve_cooldown_seconds(cooldown_seconds);
+    match resolve_disposition(cooldown, send_now, confirm_send_now) {
+        SendDisposition::NeedsConfirmation => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "denied",
+                        "draft_id": id,
+                        "error": {
+                            "code": IMMEDIATE_SEND_CONFIRM_CODE,
+                            "reason": "immediate send bypasses the outbox cooldown; pass --send-now together with --confirm-send-now",
+                        },
+                    })
+                );
+            }
+            anyhow::bail!(
+                "immediate send requires confirmation: pass --send-now together with --confirm-send-now"
+            );
+        }
+        SendDisposition::Queue {
+            cooldown_seconds: cd,
+        } => {
+            let db = Database::open_default().context("failed to open database")?;
+            let draft = db
+                .get_draft(id)
+                .context("failed to get draft")?
+                .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
+            let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
+            db.update_draft_send_after(&draft.id, &send_at)
+                .context("failed to set send_after on draft")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "scheduled",
+                        "draft_id": draft.id,
+                        "send_after": send_at,
+                        "cooldown_seconds": cd,
+                        "ui": ui::draft_ui(&draft.account_id, &draft.id),
+                    })
+                );
+            } else {
+                println!(
+                    "Queued draft {id} for send after {cd}s cooldown (at {send_at}). \
+                     Real send happens via the scheduled-send sweep, after the Governor gate."
+                );
+            }
+            return Ok(());
+        }
+        SendDisposition::Immediate => {}
+    }
+
+    let outcome = send_existing_draft(id, account, backend).await?;
+    if json {
+        println!("{}", outcome.json);
+    } else {
+        println!("Draft {id} sent to {}", outcome.to_addr);
+        println!("Subject: {}", outcome.subject);
+        println!("Message-ID: {}", outcome.message_id);
+        match (outcome.sent_folder.as_deref(), outcome.sent_uid) {
+            (Some(folder), Some(uid)) => {
+                println!("Sent UID: {uid} ({folder})");
+                if let Some(ref url) = outcome.sent_url {
+                    println!("Sent URL: {url}");
+                }
+            }
+            (Some(folder), None) => println!(
+                "Sent UID: unavailable in {folder} ({})",
+                outcome.lookup_status
+            ),
+            (None, None) => println!("Sent UID: unavailable ({})", outcome.lookup_status),
+            (None, Some(uid)) => println!("Sent UID: {uid}"),
+        }
+    }
+    Ok(())
+}
+
+/// Structured result of sending an existing draft. Carries both the JSON
+/// contract payload and the discrete fields the human CLI output needs, so the
+/// silent send primitive can serve the CLI, MCP, and any other surface without
+/// printing to stdout (which would corrupt the MCP stdio transport).
+pub(crate) struct SentDraftOutcome {
+    pub json: serde_json::Value,
+    pub to_addr: String,
+    pub subject: String,
+    pub message_id: String,
+    pub sent_folder: Option<String>,
+    pub sent_uid: Option<u32>,
+    pub sent_url: Option<String>,
+    pub lookup_status: &'static str,
+}
+
+/// Send an already-created draft (by local UUID or IMAP UID) without printing
+/// anything. This is the single source of truth for "send this draft": it sends
+/// over SMTP, cleans up the IMAP Drafts copy, optionally appends to Sent, and —
+/// critically — marks the local draft row as sent so the local DB can never be
+/// left at `status=draft` with no `sent_at` after a successful send.
+pub(crate) async fn send_existing_draft(
+    id: &str,
+    account: Option<&str>,
+    backend: CredentialBackend,
+) -> Result<SentDraftOutcome> {
     let db = Database::open_default().context("failed to open database")?;
     let passphrase =
         credential_store::get_or_create_passphrase(backend).context("credential store error")?;
@@ -1536,6 +1952,51 @@ pub async fn run_send(
         bail!("draft not found: {id}");
     };
 
+    // Attachments are snapshotted on the local draft at create time, so a draft
+    // created with `--attach` re-includes them on send even when content is
+    // otherwise fetched from the IMAP copy (which we do not re-parse for bytes).
+    let attachments = match local_draft.as_ref() {
+        Some(d) => {
+            decode_attachments(&d.attachments).context("failed to decode draft attachments")?
+        }
+        None => Vec::new(),
+    };
+
+    // ── Governor gate (fail-closed before any real SMTP) ──
+    //
+    // This primitive is shared by the CLI `draft send` and MCP `send_draft`
+    // surfaces, so both converge on identical blind-attribution semantics. The
+    // draft is a persisted, contextual send: threading and attachments are
+    // re-derived from what will actually be transmitted.
+    {
+        let gov_req = super::governor_gate::governor_request(
+            &acct.id,
+            super::governor_gate::account_domain(&creds.account.username),
+            &subject,
+            &to_addr,
+            cc_addr.as_deref(),
+            bcc_addr.as_deref(),
+            SendSurface::Cli,
+            Some(id),
+            &attachments,
+            in_reply_to.is_some(),
+        );
+        let gov_outcome = super::governor_gate::gate_and_record(&db, &acct.id, &gov_req);
+        if !gov_outcome.allowed {
+            bail!(
+                "send blocked by governor: {} ({})",
+                gov_outcome
+                    .block_reason
+                    .clone()
+                    .unwrap_or_else(|| "governor did not permit this send".to_string()),
+                gov_outcome
+                    .block_code
+                    .clone()
+                    .unwrap_or_else(|| "governor_blocked".to_string())
+            );
+        }
+    }
+
     // ── Send via SMTP (full path so In-Reply-To / References survive) ──
     let references_opt = if references.is_empty() {
         None
@@ -1554,7 +2015,7 @@ pub async fn run_send(
         reply_to.as_deref(),
         in_reply_to.as_deref(),
         references_opt,
-        &[],
+        &attachments,
     )
     .await
     .context("failed to send draft")?;
@@ -1603,6 +2064,7 @@ pub async fn run_send(
                             in_reply_to.as_deref(),
                             &references,
                             Some(&message_id),
+                            &attachments,
                         ) {
                             let sent_result = detect_sent_folder(&mut client, &db, &acct.id).await;
                             if let Ok(Some(sent_folder)) = sent_result {
@@ -1639,47 +2101,33 @@ pub async fn run_send(
     let sent_message_url = sent_mail_proof.message_url(&acct.id);
     let sent_ui = sent_mail_proof.ui(&acct.id);
 
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "status": "sent",
-                "draft_id": id,
-                "to": to_addr,
-                "subject": subject,
-                "message_id": message_id,
-                "imap_draft_deleted": imap_uid.is_some(),
-                "sent_mail_appended": sent_mail_appended,
-                "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
-                "sent_folder": sent_mail_proof.folder.clone(),
-                "sent_uid": sent_mail_proof.uid,
-                "sent_message_url": sent_message_url,
-                "sent_mail": sent_mail_proof_json(&acct.id, &sent_mail_proof),
-                "ui": sent_ui,
-                "draft_ui": ui::draft_ui(&acct.id, id),
-            })
-        );
-    } else {
-        println!("Draft {id} sent to {to_addr}");
-        println!("Subject: {subject}");
-        println!("Message-ID: {message_id}");
-        match (sent_mail_proof.folder.as_deref(), sent_mail_proof.uid) {
-            (Some(folder), Some(uid)) => {
-                println!("Sent UID: {uid} ({folder})");
-                if let Some(url) = sent_mail_proof.message_url(&acct.id) {
-                    println!("Sent URL: {url}");
-                }
-            }
-            (Some(folder), None) => println!(
-                "Sent UID: unavailable in {folder} ({})",
-                sent_mail_proof.lookup_status
-            ),
-            (None, None) => println!("Sent UID: unavailable ({})", sent_mail_proof.lookup_status),
-            (None, Some(uid)) => println!("Sent UID: {uid}"),
-        }
-    }
+    let json = serde_json::json!({
+        "status": "sent",
+        "draft_id": id,
+        "to": to_addr.clone(),
+        "subject": subject.clone(),
+        "message_id": message_id.clone(),
+        "imap_draft_deleted": imap_uid.is_some(),
+        "sent_mail_appended": sent_mail_appended,
+        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
+        "sent_folder": sent_mail_proof.folder.clone(),
+        "sent_uid": sent_mail_proof.uid,
+        "sent_message_url": sent_message_url.clone(),
+        "sent_mail": sent_mail_proof_json(&acct.id, &sent_mail_proof),
+        "ui": sent_ui,
+        "draft_ui": ui::draft_ui(&acct.id, id),
+    });
 
-    Ok(())
+    Ok(SentDraftOutcome {
+        json,
+        to_addr,
+        subject,
+        message_id,
+        sent_folder: sent_mail_proof.folder.clone(),
+        sent_uid: sent_mail_proof.uid,
+        sent_url: sent_message_url,
+        lookup_status: sent_mail_proof.lookup_status,
+    })
 }
 
 // ─── draft discard ───────────────────────────────────────────────────────
@@ -1793,6 +2241,7 @@ pub async fn run_discard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envelope_email_store::models::DraftStatus;
 
     #[test]
     fn draft_dashboard_path_encodes_account_and_draft_segments() {
@@ -1868,5 +2317,93 @@ mod tests {
         assert_eq!(value["lookup_status"], "not_found");
         assert_eq!(value["lookup_error"], "not indexed yet");
         assert!(value["ui"]["cockpit_url"].as_str().is_some());
+    }
+
+    #[test]
+    fn draft_rfc822_accepts_multiple_recipients_and_cc() {
+        let (rfc822, _) = build_rfc822_draft(
+            "Agent <agent@example.com>",
+            "Alice <a@example.com>, b@example.com",
+            Some("Multiple recipients"),
+            Some("hello"),
+            Some("c@example.com, \"Dee Ops\" <d@example.com>"),
+            Some("hidden@example.com"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+
+        assert!(msg.contains("a@example.com"));
+        assert!(msg.contains("b@example.com"));
+        assert!(msg.contains("c@example.com"));
+        assert!(msg.contains("d@example.com"));
+        assert!(msg.contains("hidden@example.com"));
+        assert!(!msg.contains("<a@example.com, b@example.com>"));
+    }
+
+    #[test]
+    fn draft_rfc822_includes_attachments() {
+        let attachment = Attachment {
+            filename: "hello.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: b"hello attachment".to_vec(),
+        };
+        let (rfc822, _) = build_rfc822_draft(
+            "agent@example.com",
+            "a@example.com",
+            Some("Attached"),
+            Some("see attached"),
+            None,
+            None,
+            None,
+            &[attachment],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+
+        assert!(msg.contains("multipart/mixed"));
+        assert!(msg.contains("hello.txt"));
+        assert!(msg.contains("hello attachment") || msg.contains("aGVsbG8gYXR0YWNobWVudA"));
+    }
+
+    #[test]
+    fn draft_envelope_json_reports_attachment_summaries_without_bytes() {
+        let draft = Draft {
+            id: "draft-1".to_string(),
+            account_id: "acct@example.com".to_string(),
+            status: DraftStatus::Draft,
+            to_addr: "a@example.com".to_string(),
+            cc_addr: None,
+            bcc_addr: None,
+            reply_to: None,
+            subject: Some("With attachment".to_string()),
+            text_content: Some("body".to_string()),
+            html_content: None,
+            in_reply_to: None,
+            metadata: Some(serde_json::json!({"draft_kind": "new"})),
+            attachments: vec![serde_json::json!({
+                "filename": "secret.txt",
+                "content_type": "text/plain",
+                "size": 5,
+                "data_base64": "aGVsbG8=",
+            })],
+            message_id: None,
+            send_after: None,
+            snoozed_until: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            sent_at: None,
+            created_by: Some("test".to_string()),
+            imap_uid: None,
+        };
+
+        let value = draft_envelope_json(&draft);
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert_eq!(value["attachments"][0]["filename"], "secret.txt");
+        assert_eq!(value["attachments"][0]["size"], 5);
+        assert!(!serialized.contains("data_base64"));
+        assert!(!serialized.contains("aGVsbG8="));
     }
 }
