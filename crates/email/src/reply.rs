@@ -188,6 +188,8 @@ mod tests {
             from_addr: from.to_string(),
             to_addr: to.to_string(),
             cc_addr: cc.map(|s| s.to_string()),
+            to_addrs: vec![to.to_string()],
+            cc_addrs: cc.map(|s| s.to_string()).into_iter().collect(),
             subject: subject.to_string(),
             date: Some("2026-04-09T10:00:00".to_string()),
             text_body: Some("Hello world".to_string()),

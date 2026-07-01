@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.10.2-green.svg" alt="v0.10.0">
+  <img src="https://img.shields.io/badge/version-0.11.6-green.svg" alt="v0.11.6">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -64,8 +64,8 @@ envelope read 42
 # Send with attachment
 envelope send --to someone@example.com --subject "Report" --body "Attached." --attach report.pdf
 
-# Reply
-envelope send --to sender@example.com --subject "Re: Report" --body "Thanks."
+# Reply in-thread as a reviewable draft
+envelope draft reply 42 --body "Thanks."
 
 # Snooze until Monday
 envelope snooze set 42 --until monday --reason waiting-reply
@@ -105,6 +105,13 @@ envelope paths
 The dashboard opens as a three-pane mail shell. Unified Inbox is the default
 read-only surface and loads from the local message index; explicit refreshes
 or account/folder selections are what touch live IMAP mailboxes.
+
+Actual sends are outbox-first. By default, an allowed send queues with a safety
+cooldown and the scheduled-send sweep performs the SMTP transmission later.
+Immediately before SMTP, Envelope derives sanitized contextual attributes and
+asks Governor to score them with `governor score --catalog envelope`; only an
+opaque Governor `allow` sends in required mode. Message bodies, full recipient
+addresses, attachment bytes, and secrets never enter the Governor request.
 
 Dashboard URL metadata in `--json` output defaults to
 `http://localhost:3141`. For agent handoffs across devices, set
@@ -207,6 +214,8 @@ envelope mcp --config
 
 11 tools: `inbox`, `read`, `search`, `send`, `reply`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`. Envelope is the only MCP email server that works against any IMAP provider.
 
+For a single, distribution-ready operating guide to hand a fresh agent, see [the Envelope agent skill](docs/agents/envelope-skill.md).
+
 ## Rules engine
 
 The agent is the intelligence. Envelope is the execution.
@@ -306,7 +315,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope inbox [--folder] [--limit]` | List messages |
 | `envelope read <uid>` | Read a message (BODY.PEEK — no auto-mark-read) |
 | `envelope search "<query>"` | IMAP search |
-| `envelope send --to --subject --body [--attach]` | Send email |
+| `envelope send --to --subject --body [--attach]` | Queue/send email through the outbox and Governor gate |
 | `envelope move/copy/delete <uid>` | Message management |
 | `envelope flag add/remove <uid> <flag>` | IMAP flags |
 | `envelope attachment list/download <uid>` | Attachments |

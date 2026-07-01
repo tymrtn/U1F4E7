@@ -7,6 +7,22 @@ use envelope_email_store::credential_store::CredentialBackend;
 
 use super::common::resolve_account;
 
+/// Build a non-secret summary (filename, content_type, size) of stored draft
+/// attachments. Never includes `data_base64`, so scheduled-send listings cannot
+/// leak snapshotted attachment bytes.
+fn attachment_summaries(attachments: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    attachments
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "filename": a.get("filename").cloned().unwrap_or(serde_json::Value::Null),
+                "content_type": a.get("content_type").cloned().unwrap_or(serde_json::Value::Null),
+                "size": a.get("size").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
 /// List scheduled messages (drafts with send_after set, still in draft status).
 pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
@@ -54,6 +70,7 @@ pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) 
                     "subject": d.subject,
                     "send_after": d.send_after,
                     "created_at": d.created_at,
+                    "attachments": attachment_summaries(&d.attachments),
                 })
             })
             .collect();
@@ -86,11 +103,44 @@ pub fn run_list(account: Option<&str>, json: bool, _backend: CredentialBackend) 
                 "{:<36}  {:<28}  {:<22}  {}",
                 d.id, to_display, send_at, subject_display,
             );
+            if !d.attachments.is_empty() {
+                for a in attachment_summaries(&d.attachments) {
+                    println!(
+                        "  attachment: {} ({} bytes, {})",
+                        a["filename"].as_str().unwrap_or("attachment"),
+                        a["size"].as_u64().unwrap_or(0),
+                        a["content_type"]
+                            .as_str()
+                            .unwrap_or("application/octet-stream"),
+                    );
+                }
+            }
         }
         println!("\n{} scheduled message(s)", drafts.len());
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_summaries_exclude_bytes() {
+        let attachments = vec![serde_json::json!({
+            "filename": "packet.txt",
+            "content_type": "text/plain",
+            "size": 5,
+            "data_base64": "aGVsbG8=",
+        })];
+        let summaries = attachment_summaries(&attachments);
+        let serialized = serde_json::to_string(&summaries).unwrap();
+        assert!(!serialized.contains("data_base64"));
+        assert!(!serialized.contains("aGVsbG8="));
+        assert!(serialized.contains("packet.txt"));
+        assert_eq!(summaries[0]["size"], 5);
+    }
 }
 
 /// Cancel a scheduled message by discarding the draft.

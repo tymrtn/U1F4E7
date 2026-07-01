@@ -172,6 +172,17 @@ pub struct FolderMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum BackupEvent {
+    /// Terminal fatal-error event so `--json` callers get a machine-readable
+    /// failure instead of a plain-text top-level error (issue #21). `ok` is
+    /// always false. `phase` names the failing command (`export` / `verify` /
+    /// `restore` / `audit_state`) when known. Carries no secrets, tokens, or
+    /// raw message bodies.
+    Error {
+        ok: bool,
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+    },
     ExportFolderStart {
         folder: String,
         messages: u32,
@@ -205,6 +216,11 @@ pub enum BackupEvent {
     VerifyExtraFile {
         rel_path: String,
     },
+    /// A symlinked entry was found under `messages/` and refused rather than
+    /// traversed (issue #17). Always forces verify to fail.
+    VerifyUnsafeEntry {
+        rel_path: String,
+    },
     VerifyMissingFile {
         folder: String,
         uid: u32,
@@ -229,6 +245,11 @@ pub enum BackupEvent {
         missing: u32,
         corrupt: u32,
         extras: u32,
+        /// Count of refused symlinked entries under `messages/` (issue #17).
+        /// Defaults to 0 for archives with no unsafe contents; older JSON
+        /// consumers can ignore it.
+        #[serde(default)]
+        unsafe_entries: u32,
     },
     RestoreFolderStart {
         source: String,
@@ -353,6 +374,12 @@ pub struct VerifyOutcome {
     pub missing: Vec<MissingFile>,
     pub corrupt: Vec<CorruptFile>,
     pub extras: Vec<String>,
+    /// Symlinked entries discovered under `messages/` during extra-file
+    /// enumeration. These are reported (not traversed) so a malicious or
+    /// malformed archive cannot make verify / restore dry-run walk outside the
+    /// archive directory or hang on a symlink loop. Any unsafe entry forces
+    /// `ok = false` (issue #17).
+    pub unsafe_entries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1060,63 @@ pub fn restore_state_path(archive_dir: &Path, dest_account_id: &str) -> PathBuf 
     archive_dir.join(restore_state_filename(dest_account_id))
 }
 
+/// Confine restore-state sidecar IO to a real regular file directly inside the
+/// archive directory before any read, touch, or append (issue #18).
+///
+/// A previous version derived `.restore-state-<dest>.ndjson` and opened it with
+/// no symlink check, so a malicious archive could ship that name as a symlink
+/// (or place it under a symlinked parent) and make dry-run read state from —
+/// or live restore append state to — a path outside the archive. This rejects:
+///
+/// - a sidecar whose parent directory is a symlink;
+/// - an existing sidecar that is a symlink or any non-regular file.
+///
+/// A missing sidecar is fine: it will be created as a regular file. Like
+/// `validate_materialized_message_path`, this does not stat the archive
+/// directory itself — the operator chose that path on the command line.
+pub fn ensure_restore_state_path_safe(path: &Path) -> Result<(), BackupError> {
+    let unsafe_err = |reason: String| BackupError::UnsafeRelPath {
+        rel_path: path.display().to_string(),
+        reason,
+    };
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        match fs::symlink_metadata(parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(unsafe_err(format!(
+                    "restore-state parent {} is a symlink — refusing to follow outside the archive",
+                    parent.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BackupError::Io(e)),
+        }
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(unsafe_err(
+                    "restore-state sidecar is a symlink — refusing to read or write outside the archive"
+                        .to_string(),
+                ));
+            }
+            if !ft.is_file() {
+                return Err(unsafe_err(
+                    "restore-state sidecar exists but is not a regular file".to_string(),
+                ));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BackupError::Io(e)),
+    }
+    Ok(())
+}
+
 pub fn append_restore_state_line(
     path: &Path,
     record: &RestoreStateRecord,
@@ -1040,6 +1124,7 @@ pub fn append_restore_state_line(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    ensure_restore_state_path_safe(path)?;
     let line = serde_json::to_string(record)?;
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -1077,6 +1162,7 @@ pub fn load_restore_state(path: &Path) -> Result<RestoreStateOutcome, BackupErro
     let mut pending_set: HashSet<RestoreStateRecord> = HashSet::new();
     let mut warnings: Vec<RestoreStateWarning> = Vec::new();
 
+    ensure_restore_state_path_safe(path)?;
     if !path.exists() {
         return Ok(RestoreStateOutcome {
             records: done_set,
@@ -1153,33 +1239,57 @@ pub fn read_manifest(archive_dir: &Path) -> Result<ArchiveManifest, BackupError>
     Ok(manifest)
 }
 
+/// Result of enumerating the on-disk `messages/` tree: every `.eml` found plus
+/// any symlinked entries that were refused rather than traversed (issue #17).
+#[derive(Debug, Default)]
+struct ArchiveTreeListing {
+    eml_files: Vec<String>,
+    unsafe_entries: Vec<String>,
+}
+
 /// Walk every `.eml` under `<archive_dir>/messages/` and return paths relative
 /// to `archive_dir`, normalized with forward slashes for stable comparison
 /// against manifest `rel_path`.
-fn list_archive_eml_files(archive_dir: &Path) -> io::Result<Vec<String>> {
-    let mut out = Vec::new();
+///
+/// Symlinks are never followed: `entry.file_type()` reports the link itself
+/// (not its target), so a symlinked directory under `messages/` is recorded as
+/// an unsafe entry instead of being recursed into. This prevents a crafted
+/// archive from escaping the archive root or trapping verify in a symlink loop.
+fn list_archive_eml_files(archive_dir: &Path) -> io::Result<ArchiveTreeListing> {
+    let mut listing = ArchiveTreeListing::default();
     let messages = archive_dir.join("messages");
     if !messages.exists() {
-        return Ok(out);
+        return Ok(listing);
     }
-    walk_dir(&messages, archive_dir, &mut out)?;
-    Ok(out)
+    walk_dir(&messages, archive_dir, &mut listing)?;
+    listing.unsafe_entries.sort();
+    Ok(listing)
 }
 
-fn walk_dir(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Result<()> {
+fn rel_to_root(path: &Path, root: &Path) -> io::Result<String> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("strip_prefix: {e}")))?;
+    // Normalize Windows-style separators to forward slashes for parity with
+    // manifest `rel_path` values.
+    Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn walk_dir(dir: &Path, root: &Path, listing: &mut ArchiveTreeListing) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        // `DirEntry::file_type` does NOT follow symlinks on the platforms we
+        // support, so this classifies the link itself rather than its target.
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if path.is_dir() {
-            walk_dir(&path, root, out)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("eml") {
-            let rel = path.strip_prefix(root).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("strip_prefix: {e}"))
-            })?;
-            // Normalize Windows-style separators to forward slashes for parity
-            // with manifest `rel_path` values.
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            out.push(rel_str);
+        if file_type.is_symlink() {
+            // Report, never traverse. A symlinked directory here could point
+            // outside the archive (escape) or back into the tree (loop).
+            listing.unsafe_entries.push(rel_to_root(&path, root)?);
+        } else if file_type.is_dir() {
+            walk_dir(&path, root, listing)?;
+        } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("eml") {
+            listing.eml_files.push(rel_to_root(&path, root)?);
         }
     }
     Ok(())
@@ -1245,20 +1355,25 @@ pub fn verify_archive(archive_dir: &Path) -> Result<VerifyOutcome, BackupError> 
         }
     }
 
-    let on_disk = list_archive_eml_files(archive_dir)?;
-    let mut extras: Vec<String> = on_disk
+    let listing = list_archive_eml_files(archive_dir)?;
+    let mut extras: Vec<String> = listing
+        .eml_files
         .into_iter()
         .filter(|p| !referenced.contains(p))
         .collect();
     extras.sort();
+    let unsafe_entries = listing.unsafe_entries;
 
-    let ok = missing.is_empty() && corrupt.is_empty();
+    // A symlinked entry under messages/ is always a hard failure: it signals a
+    // crafted/corrupt archive, never a legitimate backup.
+    let ok = missing.is_empty() && corrupt.is_empty() && unsafe_entries.is_empty();
     Ok(VerifyOutcome {
         ok,
         manifest_message_count: manifest.messages.len() as u32,
         missing,
         corrupt,
         extras,
+        unsafe_entries,
     })
 }
 
@@ -1550,6 +1665,36 @@ mod tests {
         }
 
         assert_eq!(
+            tag_of(&BackupEvent::Error {
+                ok: false,
+                error: "boom".into(),
+                phase: Some("export".into()),
+            }),
+            "error"
+        );
+        // Issue #21: the error event carries no secrets and serializes its
+        // stable fields.
+        {
+            let v: serde_json::Value = serde_json::from_str(
+                &serde_json::to_string(&BackupEvent::Error {
+                    ok: false,
+                    error: "boom".into(),
+                    phase: Some("restore".into()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v["ok"], false);
+            assert_eq!(v["error"], "boom");
+            assert_eq!(v["phase"], "restore");
+        }
+        assert_eq!(
+            tag_of(&BackupEvent::VerifyUnsafeEntry {
+                rel_path: "messages/evil".into(),
+            }),
+            "verify_unsafe_entry"
+        );
+        assert_eq!(
             tag_of(&BackupEvent::ExportFolderStart {
                 folder: "INBOX".into(),
                 messages: 5,
@@ -1595,6 +1740,7 @@ mod tests {
                 missing: 0,
                 corrupt: 0,
                 extras: 0,
+                unsafe_entries: 0,
             }),
             "verify_done"
         );
@@ -2278,6 +2424,184 @@ mod tests {
             );
             assert_eq!(outcome.missing[0].uid, 1);
         }
+    }
+
+    /// Materialize a valid single-message archive ("hello" at INBOX/12345-1)
+    /// so extra-file enumeration tests start from a clean, passing archive.
+    #[cfg(unix)]
+    fn write_valid_smoke_archive(dir: &Path) {
+        let m = sample_manifest();
+        let eml = dir.join(&m.messages[0].rel_path);
+        fs::create_dir_all(eml.parent().unwrap()).unwrap();
+        fs::write(&eml, b"hello").unwrap();
+        write_atomic(
+            &manifest_path(dir),
+            serde_json::to_vec_pretty(&m).unwrap().as_slice(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_reports_symlinked_extra_directory_without_traversing() {
+        // Issue #17: a symlinked directory under messages/ must be reported as
+        // an unsafe archive entry, never recursed into (which could escape the
+        // archive or loop forever).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            write_valid_smoke_archive(archive.path());
+
+            // An extra .eml lives in the external dir; if verify followed the
+            // symlink it would surface as an extra (or worse, be hashed).
+            fs::write(external.path().join("99999-99.eml"), b"outside").unwrap();
+            unix_fs::symlink(external.path(), archive.path().join("messages/evil")).unwrap();
+
+            let outcome = verify_archive(archive.path()).unwrap();
+            assert!(!outcome.ok, "unsafe entry must fail verify");
+            assert_eq!(outcome.unsafe_entries.len(), 1);
+            assert_eq!(outcome.unsafe_entries[0], "messages/evil");
+            // The external file must NOT have been enumerated as an extra.
+            assert!(
+                outcome.extras.iter().all(|e| !e.contains("99999-99")),
+                "must not traverse into the symlinked dir: {:?}",
+                outcome.extras
+            );
+            // The legitimate referenced message still verifies cleanly.
+            assert!(outcome.missing.is_empty());
+            assert!(outcome.corrupt.is_empty());
+        }
+    }
+
+    #[test]
+    fn verify_does_not_hang_on_symlink_loop() {
+        // Issue #17: a self-referential symlink loop under messages/ must be
+        // refused, not recursed (which would hang or stack-overflow).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            write_valid_smoke_archive(archive.path());
+            // messages/loop -> messages  (cycle)
+            unix_fs::symlink(
+                archive.path().join("messages"),
+                archive.path().join("messages/loop"),
+            )
+            .unwrap();
+            let outcome = verify_archive(archive.path()).unwrap();
+            assert!(!outcome.ok);
+            assert!(outcome.unsafe_entries.iter().any(|e| e == "messages/loop"));
+        }
+    }
+
+    #[test]
+    fn verify_reports_symlinked_extra_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let archive = tempfile::tempdir().unwrap();
+            write_valid_smoke_archive(archive.path());
+            // A symlinked extra .eml in the same folder dir must be flagged,
+            // not silently treated as a normal extra/regular file.
+            unix_fs::symlink(
+                "/etc/hostname",
+                archive.path().join("messages/INBOX/88888-88.eml"),
+            )
+            .unwrap();
+            let outcome = verify_archive(archive.path()).unwrap();
+            assert!(!outcome.ok);
+            assert!(
+                outcome
+                    .unsafe_entries
+                    .iter()
+                    .any(|e| e == "messages/INBOX/88888-88.eml")
+            );
+        }
+    }
+
+    #[test]
+    fn verify_normal_unreferenced_regular_file_is_a_plain_extra() {
+        // Regression guard: a real (non-symlink) unreferenced .eml stays a
+        // tolerated `extra`, not an `unsafe_entry`.
+        #[cfg(unix)]
+        {
+            let archive = tempfile::tempdir().unwrap();
+            write_valid_smoke_archive(archive.path());
+            fs::write(archive.path().join("messages/INBOX/77777-77.eml"), b"stray").unwrap();
+            let outcome = verify_archive(archive.path()).unwrap();
+            assert!(outcome.unsafe_entries.is_empty());
+            assert_eq!(outcome.extras.len(), 1);
+            assert!(outcome.extras[0].ends_with("77777-77.eml"));
+            // Non-strict verify still passes for a plain extra.
+            assert!(outcome.ok);
+        }
+    }
+
+    #[test]
+    fn restore_state_rejects_symlinked_sidecar() {
+        // Issue #18: an existing restore-state sidecar that is a symlink must
+        // be refused for both read (load) and write (append).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let dir = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let target = external.path().join("leaked-state.ndjson");
+            fs::write(&target, b"").unwrap();
+            let path = restore_state_path(dir.path(), "acct-evil");
+            unix_fs::symlink(&target, &path).unwrap();
+
+            let load_err = load_restore_state(&path).unwrap_err();
+            assert!(matches!(load_err, BackupError::UnsafeRelPath { .. }));
+
+            let rec = RestoreStateRecord {
+                folder: "INBOX".to_string(),
+                uidvalidity: 1,
+                uid: 1,
+                sha256: sha256_hex(b"x"),
+                status: RestoreStatus::Done,
+            };
+            let append_err = append_restore_state_line(&path, &rec).unwrap_err();
+            assert!(matches!(append_err, BackupError::UnsafeRelPath { .. }));
+        }
+    }
+
+    #[test]
+    fn restore_state_rejects_symlinked_parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let root = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            // archive_dir is itself a symlink to an external directory.
+            let archive_link = root.path().join("archive");
+            unix_fs::symlink(external.path(), &archive_link).unwrap();
+            let path = restore_state_path(&archive_link, "acct");
+            let err = ensure_restore_state_path_safe(&path).unwrap_err();
+            assert!(matches!(err, BackupError::UnsafeRelPath { .. }));
+        }
+    }
+
+    #[test]
+    fn restore_state_normal_missing_and_existing_sidecar_ok() {
+        // A normal missing sidecar loads empty; a normal regular-file sidecar
+        // round-trips append + load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_state_path(dir.path(), "acct-ok");
+        let outcome = load_restore_state(&path).unwrap();
+        assert!(outcome.records.is_empty());
+
+        let rec = RestoreStateRecord {
+            folder: "INBOX".to_string(),
+            uidvalidity: 7,
+            uid: 3,
+            sha256: sha256_hex(b"y"),
+            status: RestoreStatus::Done,
+        };
+        append_restore_state_line(&path, &rec).unwrap();
+        let outcome = load_restore_state(&path).unwrap();
+        assert_eq!(outcome.records.len(), 1);
     }
 
     #[test]

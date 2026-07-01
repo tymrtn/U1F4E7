@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.6] — 2026-07-01
+
+### Added
+
+- **Governor blind-attribution send gate** — real SMTP transmission now derives sanitized Envelope-specific attribute keys and calls `governor score --catalog envelope`; Envelope treats Governor's opaque `allow` / `review` / `deny` route as authoritative instead of synthesizing shell-command metadata or shadow-scoring policy.
+- **Outbox-first actual sends** — allowed sends queue into the scheduled-send/outbox path by default with a safety cooldown; immediate SMTP transmission requires an explicit confirmed bypass.
+- **Attachment parity for agent sends and drafts** — send, reply, forward, draft edit/send, scheduled send, and MCP paths snapshot attachment bytes while exposing only safe summaries in JSON and logs.
+
+### Changed
+
+- Dashboard draft approval now queues through the shared outbox/Governor path instead of using a direct SMTP helper, preserving cooldown, attachments, sent-proof bookkeeping, and contextual reply headers.
+- Scheduled-send sweeps re-derive final send attributes from the persisted draft immediately before SMTP and park durable `review` / `deny` verdicts for review rather than retry-storming every sweep.
+- The agent contract documents queued-send fields, immediate-send confirmation fields, attachment inputs, and Governor/outbox semantics.
+
+### Fixed
+
+- Contextual replies keep `In-Reply-To` and `References` through queued delivery, avoiding orphaned `Re:` messages.
+- Successful sends continue to return stable proof handles, including Message-ID and best-effort Sent mailbox lookup status.
+
+### Added
+
+- Scheduled sends can snapshot and deliver attachments safely, with attachment summaries exposed in `scheduled list` and no base64 payload leakage in outputs.
+- `envelope accounts copy-password` provides local secure clipboard credential handoff with non-secret audit metadata.
+- `envelope doctor` now emits structured diagnostics, dry-run repair plans, and safe DB/credential backup repair actions.
+- Dashboard `/api/health` exposes version/binary/backend/path diagnostics for stale-service drift checks.
+- `envelope evidence attachment export` exports attachment bytes with source provenance, hashes, safe paths, optional text extraction, and contract/docs coverage.
+
+### Fixed
+
+- Dashboard email reader collapses quoted replies without enabling scripts and re-measures iframe height on native toggle.
+- Native setup instructions gained password-copy handoff and a read-only dashboard backend endpoint.
+
+## [0.11.0] — 2026-06-17
+
+### Added
+
+- **Account signature CLI** — `envelope accounts signature show|set|clear` manages text/HTML account signatures without direct database edits.
+- **Native client setup helper** — `envelope accounts setup-instructions` prints non-secret IMAP/SMTP host, port, security, and username values for Mail.app-style setup.
+- **Role-based search** — `envelope search --role/--roles sent,archive ...` resolves provider/custom folder layouts such as `INBOX/sent` and searches every matching folder.
+- **Canonical agent skill** — `docs/agents/envelope-skill.md` documents Envelope as the runtime for Hermes, Claude Code, Codex, and similar harnesses.
+
+### Changed
+
+- Bare search terms are normalized to IMAP `TEXT` searches so agent queries like `Hillan` no longer silently miss present messages.
+- `read` output now preserves full `to_addrs` and `cc_addrs` recipient lists while keeping scalar compatibility fields.
+- IMAP-draft sends from the dashboard delete the original IMAP draft only after SMTP send succeeds.
+- Backup export help now documents the `--batch-size` memory tradeoff.
+
+### Fixed
+
+- `read --json` strict JSON behavior is regression-tested against control characters.
+- Backup verification now flags symlinked/unsafe extra archive entries instead of traversing them.
+- Restore-state sidecar reads/writes reject symlinked paths and unsafe parents.
+- Backup JSON mode emits machine-readable fatal error events before returning failure.
+- Dashboard deep-link fallback coverage now includes message and cockpit routes.
+
 ## [0.10.0] — 2026-05-30
 
 The dashboard's interaction model is now fully baked: the half-wired
@@ -100,6 +156,8 @@ real cached-message dataset before shipping.
   surfaces and avoids automatic account selection that would probe live IMAP
   folders or messages.
 
+[0.11.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.11.0
+[0.10.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.10.0
 [0.9.0]: https://github.com/tymrtn/U1F4E7/releases/tag/v0.9.0
 
 ## [0.5.0] — 2026-04-19

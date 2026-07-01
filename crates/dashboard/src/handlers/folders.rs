@@ -32,6 +32,7 @@ pub async fn list(
                             .map(|v| v.len() as u32)
                             .unwrap_or(0)
                     };
+                    let build = envelope_email_store::BuildInfo::current();
                     return Json(json!({
                         "folders": [],
                         "snoozed_virtual": {
@@ -42,6 +43,14 @@ pub async fn list(
                             "virtual": true,
                         },
                         "error": format!("IMAP connection failed: {e}"),
+                        // Build/credential context so operators can tell stale
+                        // dashboard-binary drift apart from real auth failures
+                        // (issue #46). Compare against `envelope doctor`.
+                        "diagnostics": {
+                            "version": build.version,
+                            "binary_path": build.binary_path,
+                            "credential_backend": state.backend.to_string(),
+                        },
                     }))
                     .into_response();
                 }

@@ -10,6 +10,9 @@ use axum::response::IntoResponse;
 use envelope_email_store::DraftStatus;
 use envelope_email_store::models::Account;
 use envelope_email_store::{Database, StoreError};
+use envelope_email_transport::outbound::{
+    OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE, resolve_cooldown_seconds,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -60,6 +63,12 @@ pub struct DraftBlockRequest {
 pub struct DraftSendRequest {
     #[serde(default)]
     pub confirm: bool,
+    /// Optional override for the outbox cooldown (seconds). Omitted → the shared
+    /// default cooldown. Negative values clamp to zero. There is intentionally no
+    /// immediate-SMTP dashboard bypass: the queued draft is transmitted later by
+    /// the shared scheduled-send sweep, after the Governor gate.
+    #[serde(default)]
+    pub cooldown_seconds: Option<i64>,
 }
 
 pub async fn list(
@@ -202,6 +211,45 @@ pub async fn block(
     }
 }
 
+/// Queue an approved draft into the Envelope outbox cooldown instead of
+/// transmitting it inline.
+///
+/// Setting `send_after` (and ensuring the draft stays in sweep-eligible `draft`
+/// status) hands the real send to the shared scheduled-send sweep
+/// (`run_scheduled_send_sweep`), which applies persisted attachment
+/// snapshots, reply threading headers, and the fail-closed Governor gate before
+/// any SMTP — exactly like CLI `draft send` and MCP `send_draft`. The draft is
+/// never marked sent here (that would drop it from the sweep and could strand it
+/// unsent) and never discarded.
+///
+/// Returns the resolved `send_after` timestamp.
+fn queue_draft_for_outbox(
+    db: &Database,
+    draft: &envelope_email_store::Draft,
+    cooldown_seconds: i64,
+) -> envelope_email_store::errors::Result<String> {
+    // `list_drafts_due_for_send` only selects `status='draft'`; a
+    // pending-review draft approved by a human must be promoted so the sweep can
+    // pick it up. Do not silently override blocked/discarded/sent states: those
+    // represent explicit operator decisions or terminal states.
+    match draft.status {
+        DraftStatus::Draft => {}
+        DraftStatus::PendingReview => {
+            db.update_draft_status(&draft.id, DraftStatus::Draft)?;
+        }
+        DraftStatus::Blocked | DraftStatus::Discarded | DraftStatus::Sent => {
+            return Err(envelope_email_store::StoreError::DraftNotEditable(
+                draft.status.as_str().to_string(),
+            ));
+        }
+    }
+    let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_seconds))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    db.update_draft_send_after(&draft.id, &send_at)?;
+    Ok(send_at)
+}
+
 pub async fn send(
     State(state): State<AppState>,
     Path((account_id, draft_id)): Path<(String, String)>,
@@ -215,45 +263,34 @@ pub async fn send(
             .into_response();
     }
 
-    let draft = {
-        let db = state.db.lock().await;
-        match ensure_draft_account(&db, &account_id, &draft_id) {
-            Ok(draft) => draft,
-            Err(e) => return draft_error(e),
-        }
+    let db = state.db.lock().await;
+    let draft = match ensure_draft_account(&db, &account_id, &draft_id) {
+        Ok(draft) => draft,
+        Err(e) => return draft_error(e),
     };
 
-    let (_client_arc, creds) = match state.get_or_create_imap(&draft.account_id).await {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("credentials: {e}")).into_response(),
-    };
+    if draft.status == DraftStatus::Sent {
+        return (StatusCode::CONFLICT, "draft already sent").into_response();
+    }
 
-    let subject = draft.subject.as_deref().unwrap_or("");
-    match envelope_email_transport::SmtpSender::send_simple(
-        &creds,
-        &draft.to_addr,
-        subject,
-        draft.text_content.as_deref(),
-        draft.html_content.as_deref(),
-        draft.cc_addr.as_deref(),
-        draft.bcc_addr.as_deref(),
-        draft.reply_to.as_deref(),
-    )
-    .await
-    {
-        Ok(message_id) => {
-            let db = state.db.lock().await;
-            match db.mark_draft_sent(&draft.id, Some(&message_id)) {
-                Ok(()) => Json(json!({
-                    "draft_id": draft.id,
-                    "status": "sent",
-                    "message_id": message_id
-                }))
-                .into_response(),
-                Err(e) => draft_error(e),
-            }
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("SMTP: {e}")).into_response(),
+    // Do NOT transmit immediately. Queue into the outbox cooldown so the shared
+    // scheduled-send sweep performs the real SMTP send (with attachments,
+    // threading, and the Governor gate). This keeps the dashboard send path
+    // aligned with CLI/MCP/scheduled outbound semantics; there is no immediate
+    // dashboard SMTP bypass.
+    let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
+    match queue_draft_for_outbox(&db, &draft, cooldown) {
+        Ok(send_after) => Json(json!({
+            "draft_id": draft.id,
+            "sent": false,
+            "status": "queued",
+            "send_after": send_after,
+            "cooldown_seconds": cooldown,
+            "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
+            "queued_reason": OUTBOX_COOLDOWN_REASON,
+        }))
+        .into_response(),
+        Err(e) => draft_error(e),
     }
 }
 
@@ -337,5 +374,189 @@ mod tests {
 
     fn seed_account(db: &Database, id: &str, username: &str) {
         db.conn().execute("INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password) VALUES (?1, 'Test', ?2, 'example.com', 'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')", (id, username)).unwrap();
+    }
+
+    /// Regression for issue #68: dashboard draft send must queue into the outbox
+    /// cooldown (handing the real send to the shared scheduled-send sweep) rather
+    /// than transmitting inline. It must never mark the draft sent itself, never
+    /// discard it, and must preserve persisted attachments and reply threading.
+    #[test]
+    fn dashboard_send_queues_into_outbox_without_inline_transmit() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Re: order"),
+                Some("Body"),
+                None,
+                Some("parent-msg-id"),
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        // Persisted attachment snapshot + reply-threading metadata, as a
+        // contextual reply draft would carry them.
+        db.update_draft_attachments(
+            &draft.id,
+            &[serde_json::json!({
+                "filename": "packet.pdf",
+                "content_type": "application/pdf",
+                "size": 5,
+                "data_base64": "aGVsbG8=",
+            })],
+        )
+        .unwrap();
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                "in_reply_to": "<parent-msg-id>",
+                "references": ["<root-id>", "<parent-msg-id>"],
+            }),
+        )
+        .unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let send_at = super::queue_draft_for_outbox(&db, &draft, 120).unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        // Queued, not sent: sweep-eligible status and a future send_after, with no
+        // sent_at stamped by the dashboard path.
+        assert_eq!(reloaded.status, DraftStatus::Draft);
+        assert_eq!(reloaded.send_after.as_deref(), Some(send_at.as_str()));
+        assert!(reloaded.sent_at.is_none());
+
+        // A 120s cooldown means the sweep does not pick it up immediately, proving
+        // there is no inline transmission.
+        let due_now: Vec<_> = db
+            .list_drafts_due_for_send()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.id == reloaded.id)
+            .collect();
+        assert!(
+            due_now.is_empty(),
+            "queued draft must not be due before cooldown"
+        );
+
+        // Attachments and threading survive for the shared sweep send path.
+        assert_eq!(reloaded.attachments.len(), 1);
+        assert_eq!(reloaded.attachments[0]["filename"], "packet.pdf");
+        let (irt, refs) = (
+            reloaded
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("in_reply_to"))
+                .and_then(|v| v.as_str()),
+            reloaded
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("references"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+        );
+        assert_eq!(irt, Some("<parent-msg-id>"));
+        assert_eq!(refs, 2);
+
+        // Once the cooldown elapses the shared sweep query selects it.
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        db.update_draft_send_after(&reloaded.id, &past).unwrap();
+        let due_later: Vec<_> = db
+            .list_drafts_due_for_send()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.id == reloaded.id)
+            .collect();
+        assert_eq!(due_later.len(), 1, "due draft must reach the sweep");
+    }
+
+    /// Queueing must promote a pending-review draft to sweep-eligible `draft`
+    /// status (so the sweep can find it) without ever marking it sent.
+    #[test]
+    fn dashboard_send_promotes_pending_review_draft_to_sweep_eligible() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+
+        super::queue_draft_for_outbox(&db, &draft, 0).unwrap();
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Draft);
+        assert!(reloaded.sent_at.is_none());
+    }
+
+    /// Queueing must not override explicit blocked/discarded terminal operator
+    /// states. A blocked draft means changes were requested; it should not be
+    /// silently promoted into the outbox by an API call.
+    #[test]
+    fn dashboard_send_does_not_queue_blocked_or_discarded_drafts() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        db.update_draft_status(&draft.id, DraftStatus::Blocked)
+            .unwrap();
+        let blocked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(super::queue_draft_for_outbox(&db, &blocked, 0).is_err());
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().status,
+            DraftStatus::Blocked
+        );
+
+        db.update_draft_status(&draft.id, DraftStatus::Discarded)
+            .unwrap();
+        let discarded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(super::queue_draft_for_outbox(&db, &discarded, 0).is_err());
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().status,
+            DraftStatus::Discarded
+        );
+    }
+
+    /// The dashboard send handler source must not call any direct simple-send
+    /// path — that bypasses the cooldown, Governor gate, attachments, and
+    /// threading. This guards against a regression reintroducing it.
+    #[test]
+    fn dashboard_send_does_not_call_direct_simple_send() {
+        let source = include_str!("drafts.rs");
+        // Build the call-form needle by concatenation so this assertion's own
+        // source does not match it.
+        let needle = format!("send_simple{}", "(");
+        assert!(
+            !source.contains(&needle),
+            "dashboard draft send must not call the direct simple-send path"
+        );
     }
 }

@@ -134,6 +134,37 @@ pub async fn run(
     json_output: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
+    // Issue #21: capture the failing phase up front so a fatal error can be
+    // re-emitted as a machine-readable JSON `error` event instead of falling
+    // through to the plain-text top-level handler in main.rs.
+    let phase = match &subcommand {
+        BackupCmd::Export { .. } => "export",
+        BackupCmd::Verify { .. } => "verify",
+        BackupCmd::Restore { .. } => "restore",
+        BackupCmd::AuditState { .. } => "audit_state",
+    };
+    let result = run_inner(subcommand, json_output, backend).await;
+    if json_output && let Err(e) = &result {
+        // Best-effort: never let error reporting itself mask the original
+        // failure. The error string is the anyhow chain, which carries no
+        // secrets/bodies by construction in these paths.
+        let _ = emit(
+            true,
+            BackupEvent::Error {
+                ok: false,
+                error: format!("{e:#}"),
+                phase: Some(phase.to_string()),
+            },
+        );
+    }
+    result
+}
+
+async fn run_inner(
+    subcommand: BackupCmd,
+    json_output: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
     match subcommand {
         BackupCmd::Export {
             account,
@@ -270,6 +301,11 @@ async fn run_export(args: ExportArgs, json_output: bool, backend: CredentialBack
 
         let uids = imap::list_selected_uids(&mut client).await?;
         let mut written = 0u32;
+        // Issue #20: each `uid_set` materializes `batch_size` full RFC822
+        // bodies in memory (the FETCH response Vec). We bound `batch_size` to
+        // MAX_BATCH_SIZE in `validate_batch_size` and write+drop each body to
+        // disk immediately below, so peak memory is ~one batch of bodies, never
+        // the whole folder.
         for uid_set in migrate::uid_sequence_set_batches(&uids, batch_size) {
             let messages =
                 imap::fetch_raw_messages_selected_uid_set(&mut client, &folder.folder, &uid_set)
@@ -442,8 +478,18 @@ fn run_verify(from: PathBuf, strict: bool, json_output: bool) -> Result<()> {
             },
         )?;
     }
+    for unsafe_entry in &outcome.unsafe_entries {
+        emit(
+            json_output,
+            BackupEvent::VerifyUnsafeEntry {
+                rel_path: unsafe_entry.clone(),
+            },
+        )?;
+    }
 
     let strict_extras_fail = strict && !outcome.extras.is_empty();
+    // `outcome.ok` is already false when unsafe entries exist; strict only
+    // promotes otherwise-tolerated extra files into a failure.
     let final_ok = outcome.ok && !strict_extras_fail;
 
     emit(
@@ -453,15 +499,17 @@ fn run_verify(from: PathBuf, strict: bool, json_output: bool) -> Result<()> {
             missing: outcome.missing.len() as u32,
             corrupt: outcome.corrupt.len() as u32,
             extras: outcome.extras.len() as u32,
+            unsafe_entries: outcome.unsafe_entries.len() as u32,
         },
     )?;
 
     if !final_ok {
         bail!(
-            "verify failed: missing={} corrupt={} extras={} (strict={})",
+            "verify failed: missing={} corrupt={} extras={} unsafe_entries={} (strict={})",
             outcome.missing.len(),
             outcome.corrupt.len(),
             outcome.extras.len(),
+            outcome.unsafe_entries.len(),
             strict
         );
     }
@@ -930,6 +978,9 @@ fn touch_restore_state(path: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create restore state parent dir {}", parent.display()))?;
     }
+    // Issue #18: confine the sidecar to a real regular file inside the archive
+    // before we create/open it, so a symlinked path can't redirect state IO.
+    backup::ensure_restore_state_path_safe(path).map_err(|e| backup_error_to_anyhow(e, path))?;
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -979,6 +1030,13 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
             BackupEvent::VerifyExtraFile { rel_path } => {
                 println!("verify extra: {rel_path}")
             }
+            BackupEvent::VerifyUnsafeEntry { rel_path } => {
+                eprintln!("verify unsafe entry (symlink refused): {rel_path}")
+            }
+            BackupEvent::Error { error, phase, .. } => {
+                let phase = phase.as_deref().unwrap_or("backup");
+                eprintln!("{phase} error: {error}")
+            }
             BackupEvent::VerifyMissingFile {
                 folder,
                 uid,
@@ -1003,8 +1061,11 @@ fn emit(json_output: bool, event: BackupEvent) -> Result<()> {
                 missing,
                 corrupt,
                 extras,
+                unsafe_entries,
             } => {
-                println!("verify done: ok={ok} missing={missing} corrupt={corrupt} extras={extras}")
+                println!(
+                    "verify done: ok={ok} missing={missing} corrupt={corrupt} extras={extras} unsafe_entries={unsafe_entries}"
+                )
             }
             BackupEvent::RestoreFolderStart {
                 source,

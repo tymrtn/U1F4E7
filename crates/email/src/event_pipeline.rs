@@ -124,6 +124,8 @@ mod tests {
             from_addr: "noreply@example.com".to_string(),
             to_addr: "user@example.com".to_string(),
             cc_addr: None,
+            to_addrs: vec!["user@example.com".to_string()],
+            cc_addrs: vec![],
             subject: subject.to_string(),
             date: None,
             text_body: text_body.map(str::to_string),

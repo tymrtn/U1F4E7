@@ -159,6 +159,79 @@ pub async fn verify(State(state): State<AppState>, Path(id): Path<String>) -> im
     }
 }
 
+/// Map a well-known IMAP/SMTP port to its transport security label. Mirrors the
+/// CLI `accounts setup-instructions` mapping and defaults to TLS for unknown
+/// ports so setup guidance never suggests an unencrypted client.
+fn imap_security_for_port(port: u16) -> &'static str {
+    match port {
+        143 => "STARTTLS",
+        _ => "SSL/TLS",
+    }
+}
+
+fn smtp_security_for_port(port: u16) -> &'static str {
+    match port {
+        465 => "SSL/TLS",
+        _ => "STARTTLS",
+    }
+}
+
+/// Read-only "Set up in Mail.app" settings for an account detail page.
+///
+/// Emits non-secret IMAP/SMTP fields only — the stored password is never
+/// returned here, matching the CLI `accounts setup-instructions` contract and
+/// the dashboard aggregate read-only invariant (no auth probes, no mutations).
+pub async fn setup_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    let account = db
+        .get_account(&id)
+        .ok()
+        .flatten()
+        .or_else(|| db.find_account_by_email(&id).ok().flatten());
+
+    let account = match account {
+        Some(a) => a,
+        None => {
+            return (StatusCode::NOT_FOUND, format!("account not found: {id}")).into_response();
+        }
+    };
+
+    let imap_username = account
+        .imap_username
+        .as_deref()
+        .unwrap_or(&account.username)
+        .to_string();
+    let smtp_username = account
+        .smtp_username
+        .as_deref()
+        .unwrap_or(&account.username)
+        .to_string();
+
+    Json(json!({
+        "account_id": account.id,
+        "email": account.username,
+        "display_name": account.display_name.as_deref().unwrap_or(&account.name),
+        "client": "mailapp",
+        "imap": {
+            "host": account.imap_host,
+            "port": account.imap_port,
+            "username": imap_username,
+            "security": imap_security_for_port(account.imap_port),
+        },
+        "smtp": {
+            "host": account.smtp_host,
+            "port": account.smtp_port,
+            "username": smtp_username,
+            "security": smtp_security_for_port(account.smtp_port),
+        },
+        "password": "stored in Envelope credential store; not returned. Use `envelope accounts copy-password` to copy it locally.",
+    }))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct DiscoverRequest {
     pub email: String,

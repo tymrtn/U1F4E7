@@ -6,9 +6,18 @@
 //! Implements the MCP stdio transport: reads JSON-RPC requests from stdin,
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
+use crate::commands::attachments::{
+    attachment_summaries, decode_attachments, snapshot_attachments,
+};
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
+use crate::commands::drafts::{find_sent_mail_by_message_id, sent_mail_proof_json};
+use crate::commands::governor_gate::{account_domain, gate_and_record, governor_request};
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
+use envelope_email_transport::outbound::{
+    IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
+    SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
+};
 use envelope_email_transport::{
     SendMode, SendPolicyDecision, SendPolicyInput, SendRuntime, audit_event_for,
     default_mode_for_runtime, evaluate,
@@ -128,6 +137,11 @@ async fn handle_tool_call(
         "search" => handle_search(params, backend).await,
         "send" => handle_send(params, backend).await,
         "reply" => handle_reply(params, backend).await,
+        "create_reply_draft" => handle_create_reply_draft(params, backend).await,
+        "create_forward_draft" => handle_create_forward_draft(params, backend).await,
+        "modify_draft" => handle_modify_draft(params, backend).await,
+        "get_draft" => handle_get_draft(params, backend).await,
+        "send_draft" => handle_send_draft(params, backend).await,
         "move_message" => handle_move(params, backend).await,
         "flag" => handle_flag(params, backend).await,
         "folders" => handle_folders(params, backend).await,
@@ -260,6 +274,7 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     let cc = params.get("cc").and_then(|v| v.as_str());
     let bcc = params.get("bcc").and_then(|v| v.as_str());
     let reply_to = params.get("reply_to").and_then(|v| v.as_str());
+    let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let send_mode = params
         .get("send_mode")
@@ -282,6 +297,15 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
+    let send_now = params
+        .get("send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let confirm_send_now = params
+        .get("confirm_send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -299,6 +323,8 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     match decision {
         SendPolicyDecision::Allowed => {}
         SendPolicyDecision::DraftOnly => {
+            let attachment_snapshots =
+                snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
             let draft = db
                 .create_draft(
                     &creds.account.id,
@@ -312,11 +338,16 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
                     Some("mcp"),
                 )
                 .map_err(|e| e.to_string())?;
+            if !attachment_snapshots.is_empty() {
+                db.update_draft_attachments(&draft.id, &attachment_snapshots)
+                    .map_err(|e| e.to_string())?;
+            }
             return Ok(json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
+                "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
@@ -331,6 +362,89 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         }
     }
 
+    let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+
+    // ── Default actual-send cooldown (outbox queueing) ──
+    // An allowed MCP send queues by default. Real SMTP only happens later via
+    // the scheduled-send sweep, after the Governor gate permits it. Immediate
+    // transmission requires an explicit, confirmed bypass.
+    let cooldown = resolve_cooldown_seconds(cooldown_override);
+    match resolve_disposition(cooldown, send_now, confirm_send_now) {
+        SendDisposition::NeedsConfirmation => {
+            return Err(json!({
+                "status": "denied",
+                "error": {
+                    "code": IMMEDIATE_SEND_CONFIRM_CODE,
+                    "reason": "immediate send bypasses the outbox cooldown; pass send_now=true together with confirm_send_now=true",
+                },
+            })
+            .to_string());
+        }
+        SendDisposition::Queue {
+            cooldown_seconds: cd,
+        } => {
+            let draft = db
+                .create_draft(
+                    &creds.account.id,
+                    to,
+                    Some(subject),
+                    body,
+                    html,
+                    None,
+                    cc,
+                    bcc,
+                    Some("mcp"),
+                )
+                .map_err(|e| e.to_string())?;
+            if !attachment_snapshots.is_empty() {
+                db.update_draft_attachments(&draft.id, &attachment_snapshots)
+                    .map_err(|e| e.to_string())?;
+            }
+            let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
+            db.update_draft_send_after(&draft.id, &send_at)
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({
+                "sent": false,
+                "status": "queued",
+                "send_mode": send_mode,
+                "draft_id": draft.id,
+                "send_after": send_at,
+                "cooldown_seconds": cd,
+                "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
+                "queued_reason": OUTBOX_COOLDOWN_REASON,
+                "attachments": attachment_summaries(&attachment_snapshots),
+                "ui": ui::draft_ui(&creds.account.id, &draft.id),
+            }));
+        }
+        SendDisposition::Immediate => {}
+    }
+
+    let attachments = decode_attachments(&attachment_snapshots).map_err(|e| e.to_string())?;
+
+    // ── Governor gate (fail-closed before any real SMTP) ──
+    let gov_req = governor_request(
+        &creds.account.id,
+        account_domain(&creds.account.username),
+        subject,
+        to,
+        cc,
+        bcc,
+        SendSurface::Mcp,
+        None,
+        &attachments,
+        false,
+    );
+    let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
+    if !gov_outcome.allowed {
+        return Err(json!({
+            "status": "blocked",
+            "error": gov_outcome.denial_json(),
+        })
+        .to_string());
+    }
+
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
         to,
@@ -343,15 +457,55 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         reply_to,
         None,
         None,
-        &[],
+        &attachments,
     )
     .await
     .map_err(|e| e.to_string())?;
 
+    // Append an exact Sent copy for providers that do not auto-save SMTP
+    // submissions, so the message is durably visible and the proof lookup
+    // resolves. Best-effort; never fails the send.
+    let from_for_sent = if let Some(f) = from {
+        f.to_string()
+    } else if let Some(ref display) = creds.account.display_name {
+        format!("{display} <{}>", creds.account.username)
+    } else {
+        creds.account.username.clone()
+    };
+    let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
+    let (sent_mail_appended, sent_mail_append_skipped_reason) =
+        crate::commands::drafts::append_sent_copy_for_immediate_send(
+            &db,
+            &creds,
+            provider_type.as_deref(),
+            &from_for_sent,
+            to,
+            subject,
+            body,
+            html,
+            cc,
+            None,
+            &[],
+            &message_id,
+            &attachments,
+        )
+        .await;
+
+    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
+    let sent_ui = sent_mail_proof.ui(&creds.account.id);
+
     Ok(json!({
         "sent": true,
         "message_id": message_id,
-        "ui": ui::account_ui(&creds.account.id),
+        "sent_mail_appended": sent_mail_appended,
+        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
+        "sent_folder": sent_mail_proof.folder.clone(),
+        "sent_uid": sent_mail_proof.uid,
+        "sent_message_url": sent_message_url,
+        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+        "attachments": attachment_summaries(&attachment_snapshots),
+        "ui": sent_ui,
     }))
 }
 
@@ -383,6 +537,44 @@ fn record_send_policy_event(
     let _ = db.insert_event(&event);
 }
 
+fn required_str<'a>(params: &'a Value, name: &str) -> Result<&'a str, String> {
+    params
+        .get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{name} is required"))
+}
+
+fn optional_str<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
+    params.get(name).and_then(|v| v.as_str())
+}
+
+fn optional_string_array(params: &Value, names: &[&str]) -> Result<Vec<String>, String> {
+    for name in names {
+        if let Some(value) = params.get(*name) {
+            let Some(items) = value.as_array() else {
+                return Err(format!("{name} must be an array of file paths"));
+            };
+            return items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{name} entries must be strings"))
+                })
+                .collect();
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn required_uid(params: &Value) -> Result<u32, String> {
+    params
+        .get("uid")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .ok_or_else(|| "uid is required".to_string())
+}
+
 async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
     let uid = params
         .get("uid")
@@ -402,6 +594,7 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
+    let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
     let send_mode = params
         .get("send_mode")
         .and_then(|v| v.as_str())
@@ -423,6 +616,15 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
+    let send_now = params
+        .get("send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let confirm_send_now = params
+        .get("confirm_send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -460,6 +662,8 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     match decision {
         SendPolicyDecision::Allowed => {}
         SendPolicyDecision::DraftOnly => {
+            let attachment_snapshots =
+                snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
             let draft = db
                 .create_draft(
                     &creds.account.id,
@@ -473,12 +677,27 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
                     Some("mcp"),
                 )
                 .map_err(|e| e.to_string())?;
+            if !attachment_snapshots.is_empty() {
+                db.update_draft_attachments(&draft.id, &attachment_snapshots)
+                    .map_err(|e| e.to_string())?;
+            }
+            db.set_draft_metadata(
+                &draft.id,
+                &json!({
+                    "draft_kind": "reply",
+                    "in_reply_to": headers.in_reply_to.clone(),
+                    "references": headers.references.clone(),
+                    "source": {"folder": folder, "uid": uid},
+                }),
+            )
+            .map_err(|e| e.to_string())?;
             return Ok(json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
                 "in_reply_to": headers.in_reply_to,
+                "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
@@ -493,6 +712,100 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         }
     }
 
+    let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+
+    // ── Default actual-send cooldown (outbox queueing) ──
+    // An allowed MCP reply queues by default; real SMTP happens later via the
+    // scheduled-send sweep, after the Governor gate permits it. Immediate
+    // transmission requires an explicit, confirmed bypass.
+    let cooldown = resolve_cooldown_seconds(cooldown_override);
+    match resolve_disposition(cooldown, send_now, confirm_send_now) {
+        SendDisposition::NeedsConfirmation => {
+            return Err(json!({
+                "status": "denied",
+                "error": {
+                    "code": IMMEDIATE_SEND_CONFIRM_CODE,
+                    "reason": "immediate send bypasses the outbox cooldown; pass send_now=true together with confirm_send_now=true",
+                },
+            })
+            .to_string());
+        }
+        SendDisposition::Queue {
+            cooldown_seconds: cd,
+        } => {
+            let draft = db
+                .create_draft(
+                    &creds.account.id,
+                    &headers.to,
+                    Some(&headers.subject),
+                    Some(body),
+                    html,
+                    headers.in_reply_to.as_deref(),
+                    cc_str.as_deref(),
+                    None,
+                    Some("mcp"),
+                )
+                .map_err(|e| e.to_string())?;
+            if !attachment_snapshots.is_empty() {
+                db.update_draft_attachments(&draft.id, &attachment_snapshots)
+                    .map_err(|e| e.to_string())?;
+            }
+            db.set_draft_metadata(
+                &draft.id,
+                &json!({
+                    "draft_kind": "reply",
+                    "in_reply_to": headers.in_reply_to.clone(),
+                    "references": headers.references.clone(),
+                    "source": {"folder": folder, "uid": uid},
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+            let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
+            db.update_draft_send_after(&draft.id, &send_at)
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({
+                "sent": false,
+                "status": "queued",
+                "send_mode": send_mode,
+                "draft_id": draft.id,
+                "send_after": send_at,
+                "cooldown_seconds": cd,
+                "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
+                "queued_reason": OUTBOX_COOLDOWN_REASON,
+                "in_reply_to": headers.in_reply_to,
+                "attachments": attachment_summaries(&attachment_snapshots),
+                "ui": ui::draft_ui(&creds.account.id, &draft.id),
+            }));
+        }
+        SendDisposition::Immediate => {}
+    }
+
+    let attachments = decode_attachments(&attachment_snapshots).map_err(|e| e.to_string())?;
+
+    // ── Governor gate (fail-closed before any real SMTP) ──
+    let gov_req = governor_request(
+        &creds.account.id,
+        account_domain(&creds.account.username),
+        &headers.subject,
+        &headers.to,
+        cc_str.as_deref(),
+        None,
+        SendSurface::Mcp,
+        None,
+        &attachments,
+        true,
+    );
+    let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
+    if !gov_outcome.allowed {
+        return Err(json!({
+            "status": "blocked",
+            "error": gov_outcome.denial_json(),
+        })
+        .to_string());
+    }
+
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
         &headers.to,
@@ -505,17 +818,259 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         None,
         headers.in_reply_to.as_deref(),
         Some(&headers.references),
-        &[],
+        &attachments,
     )
     .await
     .map_err(|e| e.to_string())?;
 
+    // Append an exact Sent copy for providers that do not auto-save SMTP
+    // submissions, preserving threading headers and the same Message-ID so the
+    // proof lookup resolves. Best-effort; never fails the send.
+    let from_for_sent = if let Some(ref display) = creds.account.display_name {
+        format!("{display} <{}>", creds.account.username)
+    } else {
+        creds.account.username.clone()
+    };
+    let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
+    let (sent_mail_appended, sent_mail_append_skipped_reason) =
+        crate::commands::drafts::append_sent_copy_for_immediate_send(
+            &db,
+            &creds,
+            provider_type.as_deref(),
+            &from_for_sent,
+            &headers.to,
+            &headers.subject,
+            Some(body),
+            html,
+            cc_str.as_deref(),
+            headers.in_reply_to.as_deref(),
+            &headers.references,
+            &message_id,
+            &attachments,
+        )
+        .await;
+
+    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
+    let sent_ui = sent_mail_proof.ui(&creds.account.id);
+
     Ok(json!({
         "sent": true,
         "message_id": message_id,
+        "sent_mail_appended": sent_mail_appended,
+        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
+        "sent_folder": sent_mail_proof.folder.clone(),
+        "sent_uid": sent_mail_proof.uid,
+        "sent_message_url": sent_message_url,
+        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+        "attachments": attachment_summaries(&attachment_snapshots),
         "in_reply_to": headers.in_reply_to,
-        "ui": ui::message_ui(&creds.account.id, uid, folder),
+        "ui": sent_ui,
+        "parent_ui": ui::message_ui(&creds.account.id, uid, folder),
     }))
+}
+
+async fn handle_create_reply_draft(
+    params: &Value,
+    backend: CredentialBackend,
+) -> Result<Value, String> {
+    let uid = required_uid(params)?;
+    let folder = optional_str(params, "folder").unwrap_or("INBOX");
+    let account_arg = optional_str(params, "account");
+    let reply_all = params
+        .get("reply_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let add_signature = params
+        .get("add_signature")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body = optional_str(params, "body");
+    let html = optional_str(params, "html");
+    let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::create_reply_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        reply_all,
+        body,
+        html,
+        add_signature,
+        &attach_paths,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_create_forward_draft(
+    params: &Value,
+    backend: CredentialBackend,
+) -> Result<Value, String> {
+    let uid = required_uid(params)?;
+    let folder = optional_str(params, "folder").unwrap_or("INBOX");
+    let account_arg = optional_str(params, "account");
+    let to = optional_str(params, "to");
+    let add_signature = params
+        .get("add_signature")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body = optional_str(params, "body");
+    let html = optional_str(params, "html");
+    let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let include_attachments = params
+        .get("include_attachments")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::create_forward_draft(
+        &db,
+        &creds,
+        uid,
+        folder,
+        to,
+        body,
+        html,
+        add_signature,
+        &attach_paths,
+        include_attachments,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let account_arg = optional_str(params, "account");
+    let add_signature = params.get("add_signature").and_then(|v| v.as_bool());
+    let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let remove_attachments =
+        optional_string_array(params, &["remove_attach", "remove_attachments"])?;
+    let clear_attachments = params
+        .get("clear_attachments")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let draft = crate::commands::drafts::modify_draft(
+        &db,
+        &creds,
+        id,
+        optional_str(params, "body"),
+        optional_str(params, "html"),
+        optional_str(params, "to"),
+        optional_str(params, "cc"),
+        optional_str(params, "bcc"),
+        optional_str(params, "subject"),
+        add_signature,
+        &attach_paths,
+        &remove_attachments,
+        clear_attachments,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_get_draft(params: &Value, _backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let draft = db
+        .get_draft(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("draft not found: {id}"))?;
+    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+}
+
+async fn handle_send_draft(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let id = required_str(params, "draft_id")?;
+    let account_arg = optional_str(params, "account");
+    let confirm_send = params
+        .get("confirm_send")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !confirm_send {
+        return Ok(json!({
+            "status": "denied",
+            "draft_id": id,
+            "error": {
+                "code": "confirm_send_required",
+                "reason": "send_draft requires confirm_send=true in MCP agent contexts"
+            }
+        }));
+    }
+
+    let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
+    let send_now = params
+        .get("send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let confirm_send_now = params
+        .get("confirm_send_now")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Default actual-send cooldown (outbox queueing) ──
+    // send_draft queues by default: it sets send_after on the draft and leaves
+    // it at status=draft (scheduled). Real SMTP only happens later via the
+    // scheduled-send sweep, after the Governor gate permits it. Immediate
+    // transmission requires an explicit, confirmed bypass.
+    let cooldown = resolve_cooldown_seconds(cooldown_override);
+    match resolve_disposition(cooldown, send_now, confirm_send_now) {
+        SendDisposition::NeedsConfirmation => {
+            return Ok(json!({
+                "status": "denied",
+                "draft_id": id,
+                "error": {
+                    "code": IMMEDIATE_SEND_CONFIRM_CODE,
+                    "reason": "immediate send bypasses the outbox cooldown; pass send_now=true together with confirm_send_now=true",
+                },
+            }));
+        }
+        SendDisposition::Queue {
+            cooldown_seconds: cd,
+        } => {
+            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let draft = db
+                .get_draft(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("draft not found: {id}"))?;
+            let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
+            db.update_draft_send_after(&draft.id, &send_at)
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({
+                "sent": false,
+                "status": "scheduled",
+                "draft_id": draft.id,
+                "send_after": send_at,
+                "cooldown_seconds": cd,
+                "ui": ui::draft_ui(&draft.account_id, &draft.id),
+            }));
+        }
+        SendDisposition::Immediate => {}
+    }
+
+    // Explicit confirmed bypass: drive the silent shared send primitive. It runs
+    // the Governor gate internally before any SMTP, returns structured JSON
+    // (safe over the MCP stdio transport), and marks the local draft row sent so
+    // a successful send can never leave the local DB at status=draft.
+    let outcome = crate::commands::drafts::send_existing_draft(id, account_arg, backend)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(outcome.json)
 }
 
 async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -1009,6 +1564,34 @@ mod tests {
                 "expected limit/integer type error for {raw}, got: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn send_draft_denies_without_confirm_send() {
+        // The MCP send_draft surface must default to draft-safe: without an
+        // explicit confirm_send it returns a stable denial and never touches
+        // SMTP/IMAP. This returns before any DB or network access.
+        let params = serde_json::json!({ "draft_id": "abc-123" });
+        let out = handle_send_draft(&params, CredentialBackend::File)
+            .await
+            .expect("denial path must not error");
+        assert_eq!(out["status"], "denied");
+        assert_eq!(out["error"]["code"], "confirm_send_required");
+        // Regression: the old stub returned this code instead of sending. The
+        // wired path must never advertise itself as unimplemented.
+        assert_ne!(out["error"]["code"], "mcp_send_draft_not_wired");
+    }
+
+    #[tokio::test]
+    async fn send_draft_requires_draft_id() {
+        let params = serde_json::json!({ "confirm_send": true });
+        let err = handle_send_draft(&params, CredentialBackend::File)
+            .await
+            .expect_err("missing draft_id must error");
+        assert!(
+            err.contains("draft_id"),
+            "expected draft_id error, got: {err}"
+        );
     }
 }
 

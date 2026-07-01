@@ -39,6 +39,25 @@ pub fn agent_contract() -> Value {
             "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval."
         },
         "consumers": ["cli", "mcp", "hermes", "codex"],
+        "outbound_safety": {
+            "actual_send_cooldown": {
+                "default_seconds": 120,
+                "env": "ENVELOPE_SEND_COOLDOWN_SECONDS",
+                "behavior": "Allowed sends (CLI send, MCP send/reply allowed modes, draft send / send_draft) queue into the outbox with a future send_after by default; real SMTP only happens later when the scheduled-send sweep finds them due. Queued responses include queued_reason_code=safety_cooldown and a human-readable queued_reason so agents know the delay is intentional safety time to report and correct issues.",
+                "bypass": "Immediate transmission requires an explicit, confirmed bypass: send_now (or cooldown_seconds=0) together with confirm_send_now.",
+                "denial_code": "immediate_send_requires_confirmation"
+            },
+            "governor_gate": {
+                "modes": ["required", "warn", "off"],
+                "default": "required",
+                "env": {"mode": "ENVELOPE_GOVERNOR_MODE", "bin": "ENVELOPE_GOVERNOR_BIN"},
+                "behavior": "Before any real SMTP send (immediate bypass and scheduled-send sweep), the actual Governor decision engine is consulted using blind attribution: Envelope declares the contextual attribute keys the send exhibits and Governor opaquely scores/routes them against the 'envelope' catalog (allow/review/deny). Envelope never reproduces Governor's weights or thresholds. The scheduled-send sweep re-derives the final attributes from the persisted draft just before SMTP; durable review/deny verdicts park the draft as pending_review (no retry storm) while transient gate failures leave it queued. In required mode it fails closed: missing/error/deny/review all block the send; only an explicit allow permits SMTP. warn records but never blocks; off skips the gate.",
+                "block_status": "blocked",
+                "block_code": "governor_blocked",
+                "unavailable_code": "governor_unavailable",
+                "redaction": "Blind attribution: Governor receives only the declared envelope-catalog attribute keys plus a content-free justification (surface + draft id) — never recipient addresses, subject text, bodies, attachment bytes, or secrets. Envelope's own send-policy audit event additionally records sanitized metadata (account id/domain, subject hash, recipient count/domains/classes, surface, draft id, attachment count/sizes/types, reply flag) alongside the declared attribute keys and catalog."
+            }
+        },
         "surfaces": surfaces(),
         "mcp_tools": mcp_tool_entries(),
     })
@@ -112,7 +131,12 @@ fn surfaces() -> Value {
                     1,
                     MAX_AGENT_LIST_LIMIT as u64,
                 ),
-                "account": string("Account ID or email address")
+                "account": string("Account ID or email address"),
+                "roles": json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Folder roles to search instead of --folder: inbox, drafts, sent, trash, spam, archive, starred. Resolves provider-specific layouts (e.g. INBOX/sent, [Gmail]/Sent Mail); results include the source folder. Read-only."
+                })
             }),
             json!(["query"]),
         ),
@@ -120,6 +144,7 @@ fn surfaces() -> Value {
         vec![
             "Search syntax is passed through to the IMAP server.",
             "Agent/CLI limit is capped at 1000; dashboard endpoints keep their own lower caps.",
+            "--role/--roles searches every folder matching the role and errors if a role resolves to zero folders.",
         ],
     ));
     items.push(surface_entry(
@@ -129,11 +154,22 @@ fn surfaces() -> Value {
         send_input_schema(),
         object(
             json!({
-                "status": string("sent, scheduled, drafted, or denied"),
+                "status": string("queued (default cooldown), sent, scheduled, drafted, denied, or blocked"),
                 "sent": json!({"type": "boolean", "description": "MCP send/reply result flag when available"}),
                 "send_mode": string("Applied send safety mode when policy was evaluated"),
-                "error": json!({"type": "object", "description": "Stable denial object for denied sends"}),
+                "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary"}),
+                "send_after": string("ISO8601 time the queued/scheduled send becomes due for the outbox sweep"),
+                "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)"}),
+                "queued_reason_code": string("Stable reason code for queued sends; safety_cooldown means Envelope intentionally delayed SMTP for review/correction time"),
+                "queued_reason": string("Human-readable explanation that the message is queued in the outbox for the safety cooldown so agents/operators can report and correct issues before SMTP transmission"),
                 "message_id": string("SMTP Message-ID when sent immediately"),
+                "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
+                "sent_folder": string("Sent folder containing the sent message when resolved"),
+                "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
+                "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"}),
+                "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a Sent-folder copy after SMTP because the provider does not auto-save submissions"}),
+                "sent_mail_append_skipped_reason": json!({"type": ["string", "null"], "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed"}),
                 "draft_id": string("Local draft id when scheduled or draft-only"),
                 "to": string("Recipient address"),
                 "subject": string("Subject")
@@ -177,6 +213,9 @@ fn surfaces() -> Value {
                 "body": string("Plain-text draft body"),
                 "cc": string("CC recipients"),
                 "bcc": string("BCC recipients"),
+                "attach": json!({"type": "array", "items": {"type": "string"}, "description": "File attachment paths to snapshot into draft storage; repeatable as --attach"}),
+                "remove_attach": json!({"type": "array", "items": {"type": "string"}, "description": "Stored attachment filenames to remove during draft edit"}),
+                "clear_attachments": json!({"type": "boolean", "description": "Remove all stored attachments during draft edit", "default": false}),
                 "in_reply_to": string("Optional message UID or Message-ID to reply to"),
                 "account": string("Account ID or email address")
             }),
@@ -187,7 +226,12 @@ fn surfaces() -> Value {
                 "draft_id": string("Local draft id"),
                 "status": string("created, sent, discarded, or stored status"),
                 "imap_uid": json!({"type": ["integer", "null"], "description": "IMAP Drafts UID when present"}),
-                "message_id": string("SMTP Message-ID for sent drafts")
+                "message_id": string("SMTP Message-ID for sent drafts"),
+                "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
+                "sent_folder": string("Sent folder containing the sent message when resolved"),
+                "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
+                "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"})
             }),
             json!([]),
         ),
@@ -277,7 +321,7 @@ fn surfaces() -> Value {
     ));
     items.push(surface_entry(
         "evidence",
-        "envelope evidence collect/verify --json",
+        "envelope evidence collect/verify/attachment export --json",
         None,
         object(
             json!({
@@ -286,9 +330,13 @@ fn surfaces() -> Value {
                 "query": string("IMAP search query"),
                 "include_thread": json!({"type": "boolean", "description": "Include bounded header-linked thread expansion", "default": false}),
                 "max_thread_messages": integer_default("Maximum messages in thread expansion", 500),
-                "out": string("Output bundle path")
+                "out": string("Output bundle or attachment-export directory"),
+                "uid": integer("Single source UID for attachment export (mutually exclusive with query)"),
+                "attachment": string("Exact original attachment filename for attachment export"),
+                "filename_glob": string("Case-insensitive attachment filename glob for attachment export"),
+                "extract_text": json!({"type": "boolean", "description": "Extract DOCX/text attachment text during attachment export", "default": false})
             }),
-            json!(["query", "out"]),
+            json!(["out"]),
         ),
         object(
             json!({
@@ -301,7 +349,7 @@ fn surfaces() -> Value {
             }),
             json!([]),
         ),
-        vec!["Collection must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files remain canonical evidence."],
+        vec!["Collection and attachment export must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files and raw attachment bytes remain canonical evidence."],
     ));
 
     for (name, schema) in mcp_only_inputs() {
@@ -334,11 +382,31 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send",
-            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments.",
+            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. By default an allowed send QUEUES into the outbox with a cooldown (default 120s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         (
             "reply",
             "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix.",
+        ),
+        (
+            "create_reply_draft",
+            "Create a Mail.app-style contextual reply draft with populated threading headers, preserved quoted context, and abridged preview.",
+        ),
+        (
+            "create_forward_draft",
+            "Create a Mail.app-style contextual forward draft with forwarded-message context and abridged preview.",
+        ),
+        (
+            "modify_draft",
+            "Modify the agent-authored portion of a contextual draft while preserving quote/forward context and threading metadata.",
+        ),
+        (
+            "get_draft",
+            "Fetch a stored draft envelope with metadata and abridged contextual preview.",
+        ),
+        (
+            "send_draft",
+            "Send a draft by draft id. Requires explicit confirmation in agent contexts. By default it QUEUES the draft into the outbox with a cooldown (default 120s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         ("move_message", "Move a message to another IMAP folder."),
         (
@@ -402,10 +470,92 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                     "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "draft-only", "description": "MCP reply safety mode"}),
                     "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
                     "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send"})),
+                    "attach": array_of(string("File attachment path to snapshot or send")),
+                    "attachments": array_of(string("File attachment path alias for attach")),
                     "folder": string_default("IMAP folder of original message", "INBOX"),
                     "account": string("Account ID or email address")
                 }),
                 json!(["uid", "body"]),
+            ),
+        ),
+        (
+            "create_reply_draft",
+            object(
+                json!({
+                    "uid": integer("UID of message to reply to"),
+                    "folder": string_default("IMAP folder of original message", "INBOX"),
+                    "reply_all": json!({"type": "boolean", "description": "Reply to all recipients", "default": false}),
+                    "body": string("Initial agent-authored plain-text body"),
+                    "html": string("Initial agent-authored HTML body"),
+                    "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
+                    "attach": array_of(string("File attachment path to snapshot into the draft")),
+                    "attachments": array_of(string("File attachment path alias for attach")),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["uid"]),
+            ),
+        ),
+        (
+            "create_forward_draft",
+            object(
+                json!({
+                    "uid": integer("UID of message to forward"),
+                    "folder": string_default("IMAP folder of source message", "INBOX"),
+                    "to": string("Optional forward recipient; may be left empty for later edit"),
+                    "body": string("Initial agent-authored plain-text body"),
+                    "html": string("Initial agent-authored HTML body"),
+                    "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
+                    "attach": array_of(string("File attachment path to snapshot into the draft")),
+                    "attachments": array_of(string("File attachment path alias for attach")),
+                    "include_attachments": json!({"type": "boolean", "description": "Forward original source-message attachments into the new draft", "default": false}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["uid"]),
+            ),
+        ),
+        (
+            "modify_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id"),
+                    "body": string("Replacement agent-authored plain-text body"),
+                    "html": string("Replacement agent-authored HTML body"),
+                    "to": string("Recipient override"),
+                    "cc": string("CC override"),
+                    "bcc": string("BCC override"),
+                    "subject": string("Subject override"),
+                    "add_signature": json!({"type": "boolean", "description": "Override signature application for this edit"}),
+                    "attach": array_of(string("File attachment path to add to the draft")),
+                    "attachments": array_of(string("File attachment path alias for attach")),
+                    "remove_attach": array_of(string("Stored attachment filename to remove")),
+                    "remove_attachments": array_of(string("Stored attachment filename alias for remove_attach")),
+                    "clear_attachments": json!({"type": "boolean", "description": "Remove all stored attachments before adding new files", "default": false}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["draft_id"]),
+            ),
+        ),
+        (
+            "get_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id")
+                }),
+                json!(["draft_id"]),
+            ),
+        ),
+        (
+            "send_draft",
+            object(
+                json!({
+                    "draft_id": string("Local draft id"),
+                    "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP", "default": false}),
+                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+                    "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
+                    "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
+                    "account": string("Account ID or email address")
+                }),
+                json!(["draft_id"]),
             ),
         ),
         (
@@ -501,9 +651,14 @@ fn send_input_schema() -> Value {
             "bcc": string("BCC recipients"),
             "reply_to": string("Reply-To address"),
             "from": string("Override sender identity"),
+            "attach": array_of(string("File attachment path to snapshot or send")),
+            "attachments": array_of(string("File attachment path alias for attach")),
             "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "autonomous-send", "description": "CLI send safety mode; MCP defaults this field to draft-only"}),
             "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
             "allow_recipient": array_of(string("Allowed email address or domain for allowlisted-send")),
+            "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+            "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
+            "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
             "account": string("Account ID or email address")
         }),
         json!(["to", "subject"]),
@@ -568,7 +723,10 @@ fn message_detail_schema() -> Value {
         json!({
             "uid": integer("Message UID"),
             "from_addr": string("Sender address"),
-            "to_addr": string("Recipient address"),
+            "to_addr": string("First recipient address (compat; see to_addrs for full list)"),
+            "cc_addr": string("First Cc address (compat; see cc_addrs for full list)"),
+            "to_addrs": array_of(json!({"type": "string"})),
+            "cc_addrs": array_of(json!({"type": "string"})),
             "subject": string("Subject"),
             "date": string("Message date"),
             "text_body": string("Plain-text body"),
@@ -633,5 +791,51 @@ mod tests {
         assert_eq!(limit["default"], json!(25));
         assert_eq!(limit["maximum"], json!(1000));
         assert_eq!(limit["minimum"], json!(1));
+    }
+
+    #[test]
+    fn contract_advertises_cooldown_and_governor() {
+        let contract = agent_contract();
+        let safety = &contract["outbound_safety"];
+        assert_eq!(
+            safety["actual_send_cooldown"]["default_seconds"],
+            json!(120)
+        );
+        assert_eq!(
+            safety["actual_send_cooldown"]["denial_code"],
+            json!("immediate_send_requires_confirmation")
+        );
+        assert_eq!(safety["governor_gate"]["default"], json!("required"));
+        assert_eq!(
+            safety["governor_gate"]["block_code"],
+            json!("governor_blocked")
+        );
+
+        // The send surface input schema advertises the bypass controls.
+        let send = surface("send").expect("send surface");
+        let props = &send["input_schema"]["properties"];
+        assert!(props["cooldown_seconds"].is_object());
+        assert!(props["send_now"].is_object());
+        assert!(props["confirm_send_now"].is_object());
+
+        // The send surface output advertises the queued proof fields.
+        let out = &send["output_schema"]["properties"];
+        assert!(out["send_after"].is_object());
+        assert!(out["cooldown_seconds"].is_object());
+        assert_eq!(out["queued_reason_code"]["type"], "string");
+        assert_eq!(out["queued_reason"]["type"], "string");
+        assert_eq!(out["sent_mail_appended"]["type"], "boolean");
+        assert!(out["sent_mail_append_skipped_reason"].is_object());
+
+        // send_draft tool advertises the bypass controls too.
+        let tools = mcp_tool_list();
+        let entries = tools["tools"].as_array().expect("mcp tools array");
+        let send_draft = entries
+            .iter()
+            .find(|t| t["name"] == "send_draft")
+            .expect("send_draft tool");
+        let sd_props = &send_draft["inputSchema"]["properties"];
+        assert!(sd_props["send_now"].is_object());
+        assert!(sd_props["confirm_send_now"].is_object());
     }
 }

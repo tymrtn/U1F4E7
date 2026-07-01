@@ -405,9 +405,78 @@ fn dashboard_reader_frame_autosizes_without_enabling_scripts() {
 }
 
 #[test]
+fn dashboard_reader_collapses_quoted_replies_without_scripts() {
+    // Issue #58: quoted replies should collapse into a native <details> block
+    // so the message body isn't buried under giant quoted threads.
+    assert!(
+        DASHBOARD_JS.contains("function collapseQuotedReplies"),
+        "reader should wrap quoted-reply blocks for collapse/expand"
+    );
+    assert!(
+        DASHBOARD_JS.contains("blockquote, .gmail_quote, div[class*=\"gmail_quote\"]"),
+        "quote detection should cover blockquote and Gmail quote containers"
+    );
+    // Collapse must use a native <details>/<summary> so NO script runs inside
+    // the sandboxed email iframe to drive the toggle.
+    assert!(
+        DASHBOARD_JS.contains("createElement('details')")
+            && DASHBOARD_JS.contains("envelope-quote"),
+        "quoted replies should collapse via native <details>, not in-email scripts"
+    );
+    // A fully-quoted message must not be entirely hidden.
+    assert!(
+        DASHBOARD_JS.contains("function hasMeaningfulContentBefore"),
+        "collapse should only apply when real reply content precedes the quote"
+    );
+    // Expanding/collapsing must re-measure the auto-sized iframe.
+    assert!(
+        DASHBOARD_JS.contains("function attachQuoteToggleRemeasure")
+            && DASHBOARD_JS.contains("addEventListener('toggle'"),
+        "quote toggle must re-measure the iframe height from the parent"
+    );
+    assert!(
+        DASHBOARD_JS.contains("Show quoted text") && DASHBOARD_JS.contains("Hide quoted text"),
+        "quote toggle should expose readable show/hide affordances"
+    );
+}
+
+#[test]
 fn dashboard_bulk_status_auto_clears_terminal_results() {
     assert!(
         DASHBOARD_JS.contains("autoClear") && DASHBOARD_JS.contains("state.bulkStatusTimer"),
         "terminal bulk-status summaries should auto-clear instead of lingering"
+    );
+}
+
+#[test]
+fn dashboard_sending_from_imap_draft_deletes_original_draft() {
+    // Issue #61: composing from an IMAP Drafts message must clean up the
+    // original draft after a successful send.
+    assert!(
+        DASHBOARD_JS.contains("composeImapDraft"),
+        "composer state should track the originating IMAP draft {{accountId, uid, folder}}"
+    );
+    assert!(
+        DASHBOARD_JS.contains("'imap-draft'"),
+        "composing from an IMAP draft should use a dedicated compose mode"
+    );
+    assert!(
+        DASHBOARD_JS.contains("state.composeMode = 'imap-draft'"),
+        "openComposerFromImap should mark the composition as imap-draft"
+    );
+    // The cleanup DELETE must run on the send path, scoped to the original
+    // draft's uid/folder, and must not be conflated with the send itself.
+    assert!(
+        DASHBOARD_JS.contains("state.composeMode === 'imap-draft' ? state.composeImapDraft : null"),
+        "send path should only delete when the composition came from an IMAP draft"
+    );
+    assert!(
+        DASHBOARD_JS.contains("`/accounts/${origin.accountId}/messages/${origin.uid}?folder=")
+            && DASHBOARD_JS.contains("'DELETE'"),
+        "successful send from an IMAP draft should DELETE the original draft uid in its folder"
+    );
+    assert!(
+        DASHBOARD_JS.contains("could not be removed"),
+        "a draft-delete failure must be surfaced separately and not reported as a send failure"
     );
 }

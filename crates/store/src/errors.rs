@@ -8,6 +8,9 @@ pub enum StoreError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
     #[error("account not found: {0}")]
     AccountNotFound(String),
 

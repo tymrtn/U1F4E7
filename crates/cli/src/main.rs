@@ -130,7 +130,7 @@ enum Commands {
     Search {
         /// IMAP search query
         query: String,
-        /// IMAP folder
+        /// IMAP folder (ignored when --role/--roles is given)
         #[arg(long, default_value = "INBOX")]
         folder: String,
         /// Maximum results (1..=1000)
@@ -139,6 +139,13 @@ enum Commands {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Search by folder role instead of literal --folder. Resolves
+        /// provider-specific layouts (e.g. INBOX/sent, [Gmail]/Sent Mail) to a
+        /// canonical role. Repeatable, or comma-separated. Known roles: inbox,
+        /// drafts, sent, trash, spam, archive, starred. Results include the
+        /// source folder. Read-only.
+        #[arg(long = "role", alias = "roles", value_delimiter = ',', num_args = 1..)]
+        roles: Vec<String>,
     },
 
     /// Send an email
@@ -185,6 +192,19 @@ enum Commands {
         /// Allowed recipient email address or domain for --send-mode allowlisted-send (repeatable)
         #[arg(long = "allow-recipient")]
         allow_recipients: Vec<String>,
+        /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
+        #[arg(long)]
+        confirm_new_re_subject: bool,
+        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        #[arg(long)]
+        cooldown_seconds: Option<i64>,
+        /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
+        /// Must be combined with --confirm-send-now.
+        #[arg(long)]
+        send_now: bool,
+        /// Explicit confirmation required to use --send-now (or --cooldown-seconds 0)
+        #[arg(long)]
+        confirm_send_now: bool,
     },
 
     /// Move a message to another folder
@@ -415,8 +435,32 @@ enum Commands {
     },
 
     /// Show resolved local state paths and HOME drift warnings
-    #[command(visible_alias = "doctor")]
     Paths,
+
+    /// Diagnose Envelope auth/state health and offer bounded, safe repair
+    #[command(
+        after_help = "Classifies why mailbox ops can fail even when account metadata reads fine (e.g. credential_decrypt_failed vs decrypted_but_imap_auth_failed). --repair performs an always-safe backup; riskier repairs are reported as not-available. Never prints secrets; never sends email."
+    )]
+    Doctor {
+        /// Account ID or email to diagnose (defaults to the default account)
+        #[arg(long)]
+        account: Option<String>,
+        /// Also attempt a read-only IMAP login probe (no mailbox mutation, no send)
+        #[arg(long)]
+        check_auth: bool,
+        /// Plan/execute bounded repair (backup-before-mutation; safe steps only)
+        #[arg(long)]
+        repair: bool,
+        /// With --repair, only report planned actions; do not mutate state
+        #[arg(long)]
+        dry_run: bool,
+        /// Directory for state backups (defaults to a timestamped dir under app data)
+        #[arg(long)]
+        backup_dir: Option<String>,
+        /// IMAP probe timeout in seconds (1-60)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
+    },
 
     /// Manage persistent Envelope configuration
     Config {
@@ -516,10 +560,85 @@ enum AccountsCmd {
     },
     /// List configured accounts
     List,
+    /// Print safe (non-secret) mail-client setup settings for an account
+    SetupInstructions {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Target mail client (formatting hint only)
+        #[arg(long, default_value = "mailapp")]
+        client: String,
+        /// Also copy the account password to the OS clipboard (never printed)
+        #[arg(long)]
+        copy_password: bool,
+        /// Credential kind to copy with --copy-password: password, imap-password, smtp-password
+        #[arg(long, default_value = "auto")]
+        kind: String,
+        /// Auto-clear the clipboard after N seconds (best-effort)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Copy an account credential directly to the OS clipboard (never printed)
+    CopyPassword {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Credential kind: password, imap-password, smtp-password (required if multiple exist)
+        #[arg(long, default_value = "auto")]
+        kind: String,
+        /// Auto-clear the clipboard after N seconds (best-effort)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
     /// Remove an account
     Remove {
         /// Account ID or email address
         id: String,
+    },
+    /// View or update an account's outbound signature
+    Signature {
+        #[command(subcommand)]
+        subcommand: SignatureCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SignatureCmd {
+    /// Show the stored signature(s) for an account
+    Show {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+    },
+    /// Set the plain-text and/or HTML signature for an account
+    Set {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Plain-text signature value
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        /// HTML signature value
+        #[arg(long, conflicts_with = "html_file")]
+        html: Option<String>,
+        /// Read the plain-text signature from a file
+        #[arg(long)]
+        text_file: Option<String>,
+        /// Read the HTML signature from a file
+        #[arg(long)]
+        html_file: Option<String>,
+    },
+    /// Clear an account's signature(s); clears both unless --text/--html given
+    Clear {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Clear only the plain-text signature
+        #[arg(long)]
+        text: bool,
+        /// Clear only the HTML signature
+        #[arg(long)]
+        html: bool,
     },
 }
 
@@ -633,6 +752,111 @@ enum DraftCmd {
         /// In-Reply-To Message-ID (for replies)
         #[arg(long)]
         in_reply_to: Option<String>,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft so
+        /// review and send preserve the attachment.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
+        #[arg(long)]
+        confirm_new_re_subject: bool,
+    },
+    /// Create a contextual reply draft from a message (quotes the parent)
+    Reply {
+        /// Source message UID
+        uid: u32,
+        /// Source folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Reply to all recipients (excludes self from Cc)
+        #[arg(long)]
+        all: bool,
+        /// Agent-authored reply body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// Agent-authored reply body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Append the account signature
+        #[arg(long)]
+        signature: bool,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Create a contextual forward draft from a message (includes forwarded block)
+    Forward {
+        /// Source message UID
+        uid: u32,
+        /// Source folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Recipient(s) for the forward
+        #[arg(long)]
+        to: Option<String>,
+        /// Agent-authored intro body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// Agent-authored intro body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Append the account signature
+        #[arg(long)]
+        signature: bool,
+        /// Attach a file (repeatable). Bytes are snapshotted into the draft.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Forward the original message's attachments as draft attachments (opt-in)
+        #[arg(long = "include-attachments")]
+        include_attachments: bool,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Edit a draft's authored body (preserves the quoted/forwarded block)
+    Edit {
+        /// Draft ID (local UUID)
+        id: String,
+        /// New authored body (plain text)
+        #[arg(long)]
+        body: Option<String>,
+        /// New authored body (HTML)
+        #[arg(long)]
+        html: Option<String>,
+        /// Override the To recipient(s)
+        #[arg(long)]
+        to: Option<String>,
+        /// Override the Cc recipient(s)
+        #[arg(long)]
+        cc: Option<String>,
+        /// Override the Bcc recipient(s)
+        #[arg(long)]
+        bcc: Option<String>,
+        /// Override the subject
+        #[arg(long)]
+        subject: Option<String>,
+        /// Apply the account signature (omit to preserve prior state)
+        #[arg(long)]
+        signature: Option<bool>,
+        /// Attach a file to the existing draft (repeatable)
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<String>,
+        /// Remove a stored attachment by filename (repeatable)
+        #[arg(long = "remove-attach", value_name = "FILENAME")]
+        remove_attach: Vec<String>,
+        /// Remove all stored attachments before adding any new --attach files
+        #[arg(long = "clear-attachments")]
+        clear_attachments: bool,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show a draft's metadata and abridged quote/forward preview
+    Show {
+        /// Draft ID (local UUID)
+        id: String,
     },
     /// List drafts (IMAP-first: fetches from server Drafts folder)
     List {
@@ -647,6 +871,16 @@ enum DraftCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        #[arg(long)]
+        cooldown_seconds: Option<i64>,
+        /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
+        /// Must be combined with --confirm-send-now.
+        #[arg(long)]
+        send_now: bool,
+        /// Explicit confirmation required to use --send-now (or --cooldown-seconds 0)
+        #[arg(long)]
+        confirm_send_now: bool,
     },
     /// Discard a draft by local ID or IMAP UID
     Discard {
@@ -1027,7 +1261,11 @@ pub enum BackupCmd {
         /// Exclude folder glob (repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
-        /// Number of source messages fetched per IMAP batch
+        /// Source messages fetched per IMAP batch (1..=500). Each batch
+        /// materializes that many full RFC822 bodies in memory before they are
+        /// written to disk, so larger values trade memory for fewer round
+        /// trips. Keep the conservative default for mailboxes with large
+        /// attachments; raise it only for small-message mailboxes.
         #[arg(long = "batch-size", default_value_t = envelope_email_transport::migrate::DEFAULT_BATCH_SIZE)]
         batch_size: u32,
     },
@@ -1171,6 +1409,49 @@ pub enum EvidenceCmd {
         /// Treat unreferenced extra .eml files as a hard failure
         #[arg(long)]
         strict: bool,
+    },
+    /// Read-only source-provenance attachment export for legal evidence.
+    /// Source mailbox is read-only; export uses EXAMINE and BODY.PEEK[].
+    #[command(subcommand)]
+    Attachment(EvidenceAttachmentCmd),
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum EvidenceAttachmentCmd {
+    /// Export raw attachment bytes with full source-email provenance.
+    #[command(group(
+        ArgGroup::new("evidence_attachment_select")
+            .required(true)
+            .args(["uid", "query"])
+    ))]
+    Export {
+        /// Account ID or email for the source mailbox
+        #[arg(long)]
+        account: String,
+        /// Source IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Single source message UID (mutually exclusive with --query)
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Exact original attachment filename. In --uid mode, omit to export
+        /// ALL attachments of that message.
+        #[arg(long)]
+        attachment: Option<String>,
+        /// Raw IMAP SEARCH query selecting messages to scan for attachments
+        /// (mutually exclusive with --uid)
+        #[arg(long)]
+        query: Option<String>,
+        /// Case-insensitive filename glob (`*`/`?`) filtering attachments
+        #[arg(long)]
+        filename_glob: Option<String>,
+        /// Destination directory for exported attachments
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Extract plain text from DOCX/text attachments alongside originals
+        #[arg(long)]
+        extract_text: bool,
     },
 }
 
@@ -1338,11 +1619,13 @@ fn main() {
             folder,
             limit,
             account,
+            roles,
         } => commands::search::run(
             &query,
             &folder,
             limit,
             account.as_deref(),
+            &roles,
             cli.json,
             backend,
         ),
@@ -1362,6 +1645,10 @@ fn main() {
             send_mode,
             confirm_send,
             allow_recipients,
+            confirm_new_re_subject,
+            cooldown_seconds,
+            send_now,
+            confirm_send_now,
         } => commands::send::run(
             &to,
             &subject,
@@ -1379,6 +1666,10 @@ fn main() {
             &send_mode,
             confirm_send,
             &allow_recipients,
+            confirm_new_re_subject,
+            cooldown_seconds,
+            send_now,
+            confirm_send_now,
         ),
 
         Commands::Move {
@@ -1485,6 +1776,8 @@ fn main() {
                 cc,
                 bcc,
                 in_reply_to,
+                attach,
+                confirm_new_re_subject,
             } => commands::drafts::run_create(
                 &to,
                 subject.as_deref(),
@@ -1496,10 +1789,98 @@ fn main() {
                 cc.as_deref(),
                 bcc.as_deref(),
                 in_reply_to.as_deref(),
+                &attach,
+                confirm_new_re_subject,
             ),
-            DraftCmd::Send { id, account } => {
-                commands::drafts::run_send(&id, account.as_deref(), cli.json, backend)
-            }
+            DraftCmd::Reply {
+                uid,
+                folder,
+                all,
+                body,
+                html,
+                signature,
+                attach,
+                account,
+            } => commands::drafts::run_reply(
+                uid,
+                &folder,
+                account.as_deref(),
+                cli.json,
+                backend,
+                all,
+                body.as_deref(),
+                html.as_deref(),
+                signature,
+                &attach,
+            ),
+            DraftCmd::Forward {
+                uid,
+                folder,
+                to,
+                body,
+                html,
+                signature,
+                attach,
+                include_attachments,
+                account,
+            } => commands::drafts::run_forward(
+                uid,
+                &folder,
+                account.as_deref(),
+                cli.json,
+                backend,
+                to.as_deref(),
+                body.as_deref(),
+                html.as_deref(),
+                signature,
+                &attach,
+                include_attachments,
+            ),
+            DraftCmd::Edit {
+                id,
+                body,
+                html,
+                to,
+                cc,
+                bcc,
+                subject,
+                signature,
+                attach,
+                remove_attach,
+                clear_attachments,
+                account,
+            } => commands::drafts::run_edit(
+                &id,
+                account.as_deref(),
+                cli.json,
+                backend,
+                body.as_deref(),
+                html.as_deref(),
+                to.as_deref(),
+                cc.as_deref(),
+                bcc.as_deref(),
+                subject.as_deref(),
+                signature,
+                &attach,
+                &remove_attach,
+                clear_attachments,
+            ),
+            DraftCmd::Show { id } => commands::drafts::run_show(&id, cli.json),
+            DraftCmd::Send {
+                id,
+                account,
+                cooldown_seconds,
+                send_now,
+                confirm_send_now,
+            } => commands::drafts::run_send(
+                &id,
+                account.as_deref(),
+                cli.json,
+                backend,
+                cooldown_seconds,
+                send_now,
+                confirm_send_now,
+            ),
             DraftCmd::Discard { id, account } => {
                 commands::drafts::run_discard(&id, cli.json, account.as_deref(), backend)
             }
@@ -1826,6 +2207,24 @@ fn main() {
 
         Commands::Paths => commands::paths::run(cli.json, backend),
 
+        Commands::Doctor {
+            account,
+            check_auth,
+            repair,
+            dry_run,
+            backup_dir,
+            timeout_secs,
+        } => commands::doctor::run(commands::doctor::DoctorOptions {
+            json: cli.json,
+            backend,
+            account: account.as_deref(),
+            check_auth,
+            repair,
+            dry_run,
+            backup_dir: backup_dir.as_deref(),
+            timeout_secs,
+        }),
+
         Commands::Config { subcommand } => commands::config::run(subcommand, cli.json),
 
         Commands::Quickstart {
@@ -1874,9 +2273,46 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn doctor_alias_parses_to_paths_command() {
-        let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor alias should parse");
-        assert!(matches!(cli.command, Commands::Paths));
+    fn doctor_parses_as_diagnostic_command() {
+        let cli = Cli::try_parse_from(["envelope", "doctor"]).expect("doctor should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                check_auth: false,
+                repair: false,
+                dry_run: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "doctor",
+            "--check-auth",
+            "--repair",
+            "--dry-run",
+            "--account",
+            "user@example.com",
+        ])
+        .expect("doctor repair flags should parse");
+        match cli.command {
+            Commands::Doctor {
+                account,
+                check_auth,
+                repair,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(account.as_deref(), Some("user@example.com"));
+                assert!(check_auth);
+                assert!(repair);
+                assert!(dry_run);
+            }
+            _ => panic!("expected doctor command"),
+        }
     }
 
     #[test]
