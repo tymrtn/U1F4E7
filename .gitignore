@@ -21,3 +21,31 @@ LAUNCH_READINESS.md
 U1F4E7/
 envelope-email-rs/
 envelope-governor/
+
+# Local Netlify folder
+.netlify
+
+# Canonical Rust product repo (its own git repo: github.com/tymrtn/U1F4E7)
+u1f4e7-repo/
+
+# Agent-lane worktrees and internal working artifacts — never for the public repo
+worktrees/
+u1f4e7-lane-*/
+u1f4e7-next-*/
+u1f4e7-final-*/
+u1f4e7-evidence-export/
+u1f4e7-issue-*/
+_internal/
+wiki/
+.hermes/
+backlog/
+team/
+
+# Internal strays
+ENVELOPE_PY_ARCHIVED.md
+test_imap_creds.py
+*.patch
+u1f4e7-*-docket/
+u1f4e7-*-drift/
+u1f4e7-*-mining/
+u1f4e7-*-subscriptions/
