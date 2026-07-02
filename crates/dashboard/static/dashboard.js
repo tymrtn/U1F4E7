@@ -1044,8 +1044,8 @@ function reportBulkActionUnavailable(action) {
     return;
   }
   const niceAction = action.charAt(0).toUpperCase() + action.slice(1);
-  setBulkStatus(`${niceAction} on ${selected} message${selected === 1 ? '' : 's'} — arriving in v0.10.0.`, 'pending');
-  toast(`Bulk ${action} arrives in the next dashboard release.`, 'pending');
+  setBulkStatus(`${niceAction} on ${selected} message${selected === 1 ? '' : 's'} — bulk actions aren't available yet.`, 'pending');
+  toast(`Bulk ${action} isn't available yet; act on one message at a time for now.`, 'pending');
 }
 
 // Resolve canonical folder names (Archive, Trash, Spam) from the loaded
@@ -1953,7 +1953,7 @@ async function selectSmartMailbox(key) {
 
   if (key === 'attention') {
     state.currentView = 'attention';
-    renderMailboxNotice('Needs Attention', 'Items needing your eyes appear in the Cockpit strip above. A dedicated message queue is coming in v0.10.0.', 'pending');
+    renderMailboxNotice('Needs Attention', 'Items needing your eyes appear in the Cockpit strip above. A dedicated message queue is planned.', 'pending');
     if (!state.cockpit) loadCockpit();
     return;
   }

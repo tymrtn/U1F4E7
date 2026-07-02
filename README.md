@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.11.7-green.svg" alt="v0.11.7">
+  <img src="https://img.shields.io/badge/version-0.12.0-green.svg" alt="v0.12.0">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -91,10 +91,15 @@ envelope rule run --confirm
 # Unsubscribe from a mailing list (dry-run by default)
 envelope unsubscribe 99
 
-# Open the local dashboard
+# Open the local dashboard (loopback, no auth — single-user local trust)
 envelope serve
 
-# Share dashboard URLs with agents on your tailnet
+# Expose it to agents/devices on your tailnet — REQUIRES auth first.
+# Option A (humans): allowlist tailnet identities; `tailscale serve` proves them.
+envelope config set dashboard.tailscale_allow "you@your-tailnet.ts.net,skippy@your-tailnet.ts.net"
+# Option B (agents/scripts): a bearer token (stored 0600, never echoed).
+envelope config set dashboard.auth_token "$(openssl rand -hex 32)"
+
 tailscale serve --bg 3141
 envelope config set dashboard.base_url https://your-node.your-tailnet.ts.net
 
@@ -121,6 +126,29 @@ Dashboard URL metadata in `--json` output defaults to
 absent. Tailscale Serve keeps the dashboard tailnet-only; Tailscale Funnel
 publishes it on the public internet, so do not use Funnel for a mailbox
 dashboard unless that exposure is intentional.
+
+### Authentication (required before any non-loopback exposure)
+
+On `127.0.0.1` the dashboard is an unauthenticated single-user local surface —
+the same trust boundary as your shell. The REST API reads and deletes mail,
+manages accounts, and queues sends, so the moment it is reachable by another
+device (a non-loopback `--bind`, or a `tailscale serve` front-end) it **must**
+require a credential. Configure one of:
+
+- **Tailscale identity allowlist** (`dashboard.tailscale_allow`) — a request
+  whose `Tailscale-User-Login` header (injected by `tailscale serve`) is in the
+  allowlist is authorized. Humans just open the `.ts.net` URL; no token to type.
+  Only safe behind `tailscale serve`, which sets and strips that header.
+- **Bearer token** (`dashboard.auth_token` or `ENVELOPE_DASHBOARD_TOKEN`) —
+  sent as `Authorization: Bearer <token>` (or `X-Envelope-Token`), compared in
+  constant time. The path for Hermes/OpenClaw agents and scripts.
+
+Once either is configured, every `/api` route returns `401` without a valid
+credential — including when `tailscale serve` fronts loopback. `envelope serve
+--bind <non-loopback>` **refuses to start** unless an auth method is configured.
+`/api/health` stays reachable for liveness probes but discloses local
+filesystem paths only to authorized callers. The CORS allowlist is a
+browser-only defense, not the access control.
 
 ## Why not Himalaya / Cloudflare / Resend?
 

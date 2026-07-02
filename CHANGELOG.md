@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-07-02
+
+### Added
+
+- **Dashboard authentication for tailnet/remote exposure.** The dashboard REST API now enforces a credential on every `/api` route whenever an auth method is configured, closing the hole where a `tailscale serve` front-end (or any non-loopback bind) exposed read/delete/send-mail and account management to every reachable device with no authentication.
+  - **Bearer token** — `Authorization: Bearer <token>` or `X-Envelope-Token: <token>`, compared in constant time. The agent path for Hermes/OpenClaw/scripted clients. Configure with `envelope config set dashboard.auth_token <token>` (stored `0600`, never echoed) or `ENVELOPE_DASHBOARD_TOKEN`.
+  - **Tailscale identity allowlist** — a request whose `Tailscale-User-Login` (injected by `tailscale serve`) is allowlisted is authorized without a token, so a human just opens the `.ts.net` URL. Configure with `envelope config set dashboard.tailscale_allow "you@tailnet.ts.net,agent@tailnet.ts.net"` or `ENVELOPE_DASHBOARD_TAILSCALE_ALLOW`.
+- **`envelope serve --bind <addr>`** — bind an explicit address. **Fail-closed:** binding a non-loopback address with no auth configured is refused before the socket opens.
+- **New config keys** `dashboard.auth_token` (secret; presence-only in `get`) and `dashboard.tailscale_allow`, resolved env-first then persisted config.
+
+### Changed
+
+- `GET /api/health` returns a minimal `status`/`service`/`version` payload to unauthenticated callers; absolute filesystem paths (`binary_path`, `database_path`, `app_data_dir`) are disclosed only to authorized callers. Open loopback mode is unchanged, so local `envelope doctor` drift detection still sees full paths.
+- Loopback (`127.0.0.1`) with no auth configured stays open — local dev, the desktop app, and stdio MCP are unaffected.
+- Corrected the dashboard's stale "localhost-only by default" doc claim; the CORS allowlist is documented as a browser-only defense, not the access control.
+
 ## [0.11.7] — 2026-07-02
 
 ### Fixed
@@ -20,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Governor blind-attribution send gate** — real SMTP transmission now derives sanitized Envelope-specific attribute keys and calls `governor score --catalog envelope`; Envelope treats Governor's opaque `allow` / `review` / `deny` route as authoritative instead of synthesizing shell-command metadata or shadow-scoring policy.
 - **Outbox-first actual sends** — allowed sends queue into the scheduled-send/outbox path by default with a safety cooldown; immediate SMTP transmission requires an explicit confirmed bypass.
 - **Attachment parity for agent sends and drafts** — send, reply, forward, draft edit/send, scheduled send, and MCP paths snapshot attachment bytes while exposing only safe summaries in JSON and logs.
+- Scheduled sends can snapshot and deliver attachments safely, with attachment summaries exposed in `scheduled list` and no base64 payload leakage in outputs.
+- `envelope accounts copy-password` provides local secure clipboard credential handoff with non-secret audit metadata.
+- `envelope doctor` now emits structured diagnostics, dry-run repair plans, and safe DB/credential backup repair actions.
+- Dashboard `/api/health` exposes version/binary/backend/path diagnostics for stale-service drift checks.
+- `envelope evidence attachment export` exports attachment bytes with source provenance, hashes, safe paths, optional text extraction, and contract/docs coverage.
 
 ### Changed
 
@@ -31,17 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Contextual replies keep `In-Reply-To` and `References` through queued delivery, avoiding orphaned `Re:` messages.
 - Successful sends continue to return stable proof handles, including Message-ID and best-effort Sent mailbox lookup status.
-
-### Added
-
-- Scheduled sends can snapshot and deliver attachments safely, with attachment summaries exposed in `scheduled list` and no base64 payload leakage in outputs.
-- `envelope accounts copy-password` provides local secure clipboard credential handoff with non-secret audit metadata.
-- `envelope doctor` now emits structured diagnostics, dry-run repair plans, and safe DB/credential backup repair actions.
-- Dashboard `/api/health` exposes version/binary/backend/path diagnostics for stale-service drift checks.
-- `envelope evidence attachment export` exports attachment bytes with source provenance, hashes, safe paths, optional text extraction, and contract/docs coverage.
-
-### Fixed
-
 - Dashboard email reader collapses quoted replies without enabling scripts and re-measures iframe height on native toggle.
 - Native setup instructions gained password-copy handoff and a read-only dashboard backend endpoint.
 

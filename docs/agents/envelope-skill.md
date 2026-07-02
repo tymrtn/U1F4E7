@@ -211,13 +211,30 @@ envelope send --to recipient@example.com --subject "..." --body "..." \
 ## 9. Dashboard / control plane
 
 ```bash
-envelope serve --port 3141     # localhost operator dashboard
+envelope serve --port 3141     # localhost operator dashboard (no auth on loopback)
 ```
 
 Treat the dashboard as a local control plane. Aggregate/read views are
 read-only: loading them must not change flags, send mail, run rules, or decrypt
-credentials. Share it off-box only through an explicitly configured tunnel; do
-not bind it to public interfaces casually.
+credentials.
+
+**Exposure beyond loopback requires authentication.** The `/api` surface reads
+and deletes mail, manages accounts, and queues sends, so it must never be
+reachable by another device without a credential:
+
+- `envelope config set dashboard.auth_token <token>` — Bearer token
+  (`Authorization: Bearer <token>` / `X-Envelope-Token`), constant-time
+  compared. Stored `0600`, never echoed. The agent/script path.
+- `envelope config set dashboard.tailscale_allow "you@tailnet.ts.net,…"` —
+  authorizes requests whose `Tailscale-User-Login` (injected by `tailscale
+  serve`) is allowlisted. The human path — no token to type.
+
+With either configured, every `/api` route returns `401` without a valid
+credential, even when `tailscale serve` fronts loopback. `envelope serve --bind
+<non-loopback>` refuses to start unless auth is configured (fail-closed).
+`GET /api/health` stays reachable for probes but reveals local paths only to
+authorized callers. Do not bind public interfaces; front tailnet access with
+`tailscale serve` (never Funnel) plus one of the auth methods above.
 
 ## 10. Backup, restore, migrate — decision guidance
 

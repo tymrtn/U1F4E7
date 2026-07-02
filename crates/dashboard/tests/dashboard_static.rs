@@ -308,12 +308,13 @@ fn dashboard_bulk_toolbar_prefers_mail_primitives_over_cli_matrix() {
         );
     }
     // Honest about pending capability: the bulk-action handler must report
-    // that mutation is not yet shipping — but it does so with operator-
-    // friendly copy, not raw `not_available` telemetry strings.
+    // that mutation is not yet available — but it does so with operator-
+    // friendly copy, not raw `not_available` telemetry strings, and without
+    // promising a specific (possibly already-past) version number.
     assert!(
-        DASHBOARD_JS.contains("arrives in the next dashboard release")
-            || DASHBOARD_JS.contains("arriving in v0.10.0"),
-        "prototype-only bulk actions should announce when they'll ship, not pretend to mutate mail"
+        DASHBOARD_JS.contains("aren't available yet")
+            || DASHBOARD_JS.contains("isn't available yet"),
+        "prototype-only bulk actions should honestly say they aren't available yet, not pretend to mutate mail"
     );
     assert!(
         !DASHBOARD_JS.contains("toast('not_available")

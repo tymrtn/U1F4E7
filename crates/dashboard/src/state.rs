@@ -14,12 +14,18 @@ use tokio::sync::Mutex;
 use envelope_email_transport::ImapClient;
 use envelope_email_transport::imap;
 
+use crate::auth::AuthConfig;
+
 /// Shared application state injected into every handler.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub imap_pool: Arc<Mutex<HashMap<String, Arc<Mutex<ImapClient>>>>>,
     pub backend: CredentialBackend,
+    /// Authentication policy for exposure beyond loopback. Defaults to
+    /// disabled (open loopback mode); the serve entrypoint injects the resolved
+    /// policy via [`AppState::with_auth`].
+    pub auth: AuthConfig,
 }
 
 impl AppState {
@@ -28,7 +34,14 @@ impl AppState {
             db: Arc::new(Mutex::new(db)),
             imap_pool: Arc::new(Mutex::new(HashMap::new())),
             backend,
+            auth: AuthConfig::disabled(),
         }
+    }
+
+    /// Attach a resolved authentication policy (builder style).
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Resolve credentials for an account and return an Arc-Mutex-wrapped IMAP

@@ -304,6 +304,12 @@ enum Commands {
         #[arg(long, default_value = "3141")]
         port: u16,
 
+        /// Address to bind. Defaults to loopback. Binding a non-loopback address
+        /// (e.g. 0.0.0.0) requires an auth method — set dashboard.auth_token or
+        /// dashboard.tailscale_allow first, or the server refuses to start.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
+
         /// Disable background unsnooze and scheduled-send sweeps (desktop diagnostics / read-only shell)
         #[arg(long)]
         no_background_sweeps: bool,
@@ -1888,8 +1894,9 @@ fn main() {
 
         Commands::Serve {
             port,
+            bind,
             no_background_sweeps,
-        } => commands::serve::run(port, no_background_sweeps),
+        } => commands::serve::run(port, bind, no_background_sweeps),
         Commands::Compose { .. } => {
             eprintln!("License required — visit https://envelope-email.dev");
             std::process::exit(1);

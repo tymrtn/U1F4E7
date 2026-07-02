@@ -20,6 +20,13 @@ pub const DASHBOARD_BASE_URL_KEY: &str = "dashboard.base_url";
 pub const ENV_DASHBOARD_BASE_URL: &str = "ENVELOPE_DASHBOARD_BASE_URL";
 pub const ENV_DASHBOARD_URL_ALIAS: &str = "ENVELOPE_DASHBOARD_URL";
 
+/// Bearer token gating the dashboard REST API when exposed beyond loopback.
+pub const DASHBOARD_AUTH_TOKEN_KEY: &str = "dashboard.auth_token";
+pub const ENV_DASHBOARD_TOKEN: &str = "ENVELOPE_DASHBOARD_TOKEN";
+/// Comma-separated Tailscale identity allowlist (`Tailscale-User-Login` values).
+pub const DASHBOARD_TAILSCALE_ALLOW_KEY: &str = "dashboard.tailscale_allow";
+pub const ENV_DASHBOARD_TAILSCALE_ALLOW: &str = "ENVELOPE_DASHBOARD_TAILSCALE_ALLOW";
+
 const CONFIG_FILE_NAME: &str = "config.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -28,7 +35,19 @@ pub struct ResolvedDashboardBaseUrl {
     pub source: &'static str,
 }
 
+fn cmd_key(cmd: &ConfigCmd) -> &str {
+    match cmd {
+        ConfigCmd::Get { key } | ConfigCmd::Set { key, .. } | ConfigCmd::Unset { key } => key,
+    }
+}
+
 pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
+    // The auth-token and tailscale-allow keys share generic string handling and
+    // must never echo the token value.
+    let key = cmd_key(&cmd).to_string();
+    if key == DASHBOARD_AUTH_TOKEN_KEY || key == DASHBOARD_TAILSCALE_ALLOW_KEY {
+        return run_generic_dashboard_field(cmd, &key, json_output);
+    }
     match cmd {
         ConfigCmd::Get { key } => {
             require_supported_key(&key)?;
@@ -187,10 +206,164 @@ fn normalize_dashboard_base(value: &str) -> Option<String> {
 }
 
 fn require_supported_key(key: &str) -> Result<()> {
-    if key == DASHBOARD_BASE_URL_KEY {
-        Ok(())
-    } else {
-        bail!("unknown config key `{key}`; supported key: {DASHBOARD_BASE_URL_KEY}")
+    match key {
+        DASHBOARD_BASE_URL_KEY | DASHBOARD_AUTH_TOKEN_KEY | DASHBOARD_TAILSCALE_ALLOW_KEY => Ok(()),
+        _ => bail!(
+            "unknown config key `{key}`; supported keys: {DASHBOARD_BASE_URL_KEY}, \
+             {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}"
+        ),
+    }
+}
+
+/// True for keys whose stored value is a secret and must never be printed.
+fn is_secret_key(key: &str) -> bool {
+    key == DASHBOARD_AUTH_TOKEN_KEY
+}
+
+/// The JSON pointer for a `dashboard.<field>` key, e.g. `/dashboard/auth_token`.
+fn dashboard_pointer(key: &str) -> String {
+    format!("/dashboard/{}", key.trim_start_matches("dashboard."))
+}
+
+/// Generic get/set/unset for simple `dashboard.<field>` string config keys.
+/// Secret keys report presence only — the value is never echoed.
+fn run_generic_dashboard_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> {
+    let pointer = dashboard_pointer(key);
+    let secret = is_secret_key(key);
+    match cmd {
+        ConfigCmd::Get { .. } => {
+            let stored = read_dashboard_string(&pointer)?;
+            let present = stored.is_some();
+            if json_output {
+                let mut obj = json!({
+                    "key": key,
+                    "configured": present,
+                    "config_path": display_config_path(),
+                });
+                if !secret {
+                    obj["value"] = stored.clone().map(Value::String).unwrap_or(Value::Null);
+                }
+                let value = super::ui::with_ui(&obj, super::ui::root_ui());
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if secret {
+                println!("{key}={}", if present { "<configured>" } else { "not set" });
+            } else if let Some(value) = stored {
+                println!("{key}={value}");
+            } else {
+                println!("{key} is not set");
+            }
+            Ok(())
+        }
+        ConfigCmd::Set { value, .. } => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                bail!("{key} cannot be empty; use `envelope config unset {key}`");
+            }
+            write_dashboard_string(&pointer, &trimmed)?;
+            if json_output {
+                let obj = json!({
+                    "status": "set",
+                    "key": key,
+                    "configured": true,
+                    "config_path": display_config_path(),
+                });
+                let value = super::ui::with_ui(&obj, super::ui::root_ui());
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if secret {
+                println!("Set {key} (value hidden)");
+            } else {
+                println!("Set {key}={trimmed}");
+            }
+            Ok(())
+        }
+        ConfigCmd::Unset { .. } => {
+            clear_dashboard_string(&pointer)?;
+            if json_output {
+                let obj = json!({
+                    "status": "unset",
+                    "key": key,
+                    "configured": false,
+                    "config_path": display_config_path(),
+                });
+                let value = super::ui::with_ui(&obj, super::ui::root_ui());
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("Unset {key}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_dashboard_string(pointer: &str) -> Result<Option<String>> {
+    let config = read_config_value(&config_file_path())?;
+    match config.pointer(pointer) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        _ => Ok(None),
+    }
+}
+
+fn write_dashboard_string(pointer: &str, value: &str) -> Result<()> {
+    let path = config_file_path();
+    let mut config = read_config_value(&path)?;
+    let field = pointer.trim_start_matches("/dashboard/");
+    let root = config_object(&mut config)?;
+    let dashboard = root
+        .entry("dashboard".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    config_object(dashboard)?.insert(field.to_string(), Value::String(value.to_string()));
+    write_config_value(&path, &config)
+}
+
+fn clear_dashboard_string(pointer: &str) -> Result<()> {
+    let path = config_file_path();
+    let mut config = read_config_value(&path)?;
+    let field = pointer.trim_start_matches("/dashboard/");
+    let root = config_object(&mut config)?;
+    if let Some(dashboard) = root.get_mut("dashboard") {
+        let dashboard = config_object(dashboard)?;
+        dashboard.remove(field);
+        if dashboard.is_empty() {
+            root.remove("dashboard");
+        }
+    }
+    write_config_value(&path, &config)
+}
+
+/// Resolve the dashboard bearer token: env `ENVELOPE_DASHBOARD_TOKEN` wins, then
+/// the persisted `dashboard.auth_token`. Returns `None` when unset.
+pub fn resolved_dashboard_auth_token() -> Option<String> {
+    if let Ok(value) = std::env::var(ENV_DASHBOARD_TOKEN) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    read_dashboard_string(&dashboard_pointer(DASHBOARD_AUTH_TOKEN_KEY))
+        .ok()
+        .flatten()
+}
+
+/// Resolve the Tailscale identity allowlist: env
+/// `ENVELOPE_DASHBOARD_TAILSCALE_ALLOW` wins, then persisted
+/// `dashboard.tailscale_allow`. Returns the parsed entries (possibly empty).
+pub fn resolved_dashboard_tailscale_allow() -> Vec<String> {
+    let raw = std::env::var(ENV_DASHBOARD_TAILSCALE_ALLOW)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            read_dashboard_string(&dashboard_pointer(DASHBOARD_TAILSCALE_ALLOW_KEY))
+                .ok()
+                .flatten()
+        });
+    match raw {
+        Some(value) => value
+            .split([',', '\n', ' ', '\t'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -436,5 +609,61 @@ mod tests {
 
         let err = persistent_dashboard_base_url().unwrap_err().to_string();
         assert!(err.contains("dashboard.base_url must be a string"));
+    }
+
+    #[test]
+    fn auth_token_round_trips_and_preserves_base_url() {
+        let path = test_config_path("auth-token-roundtrip");
+        let _ = fs::remove_file(&path);
+        let _guard = isolated_dashboard_config(path.clone());
+        write_config_value(
+            &path,
+            &json!({"dashboard": {"base_url": "https://dash.example"}}),
+        )
+        .unwrap();
+
+        let ptr = dashboard_pointer(DASHBOARD_AUTH_TOKEN_KEY);
+        assert_eq!(ptr, "/dashboard/auth_token");
+        write_dashboard_string(&ptr, "s3cret").unwrap();
+
+        // Token stored, base_url untouched.
+        assert_eq!(read_dashboard_string(&ptr).unwrap(), Some("s3cret".into()));
+        assert_eq!(
+            persistent_dashboard_base_url().unwrap(),
+            Some("https://dash.example".to_string())
+        );
+
+        // Clearing the token leaves base_url intact.
+        clear_dashboard_string(&ptr).unwrap();
+        assert_eq!(read_dashboard_string(&ptr).unwrap(), None);
+        assert_eq!(
+            persistent_dashboard_base_url().unwrap(),
+            Some("https://dash.example".to_string())
+        );
+    }
+
+    #[test]
+    fn tailscale_allow_config_parses_into_entries() {
+        let path = test_config_path("tailscale-allow-parse");
+        let _ = fs::remove_file(&path);
+        let _guard = isolated_dashboard_config(path.clone());
+        // Env must be unset for the config value to win; the guard clears the
+        // base-url envs but not ours, so set explicitly for the assertion.
+        unsafe { std::env::remove_var(ENV_DASHBOARD_TAILSCALE_ALLOW) };
+        write_dashboard_string(
+            &dashboard_pointer(DASHBOARD_TAILSCALE_ALLOW_KEY),
+            "skippy@tail.ts.net, tyler@tail.ts.net",
+        )
+        .unwrap();
+
+        let allow = resolved_dashboard_tailscale_allow();
+        assert_eq!(allow, vec!["skippy@tail.ts.net", "tyler@tail.ts.net"]);
+    }
+
+    #[test]
+    fn is_secret_key_only_true_for_auth_token() {
+        assert!(is_secret_key(DASHBOARD_AUTH_TOKEN_KEY));
+        assert!(!is_secret_key(DASHBOARD_TAILSCALE_ALLOW_KEY));
+        assert!(!is_secret_key(DASHBOARD_BASE_URL_KEY));
     }
 }

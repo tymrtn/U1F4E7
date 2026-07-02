@@ -8,15 +8,20 @@
 //! - REST API under `/api/*` for accounts, folders, messages, compose,
 //!   drafts, snooze, threads
 //!
-//! Localhost-only by default — the CORS layer only trusts
-//! `http://localhost:*` and `http://127.0.0.1:*` origins.
+//! Binds `127.0.0.1` by default. The REST API mutates real mailboxes, so any
+//! exposure beyond loopback — a non-loopback `--bind`, or a `tailscale serve`
+//! front-end — must be authenticated. See [`auth`]. The dashboard refuses to
+//! bind a non-loopback address unless an auth method is configured, and the
+//! `/api` routes return `401` for unauthorized callers when auth is enforced.
+//! The CORS allowlist is a browser-only defense and is *not* the access control.
 
 pub mod assets;
+pub mod auth;
 pub mod handlers;
 pub mod state;
 mod ui_paths;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::Router;
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -27,6 +32,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
 use crate::assets::Assets;
+use crate::auth::AuthConfig;
 use crate::state::AppState;
 
 /// Start the dashboard server on the given port.
@@ -69,6 +75,29 @@ impl ServeOptions {
     }
 }
 
+/// Full configuration for [`serve_with_config`], the richest serve entrypoint.
+pub struct ServeConfig {
+    pub port: u16,
+    /// Address to bind. Defaults to loopback; a non-loopback bind requires an
+    /// enforced [`AuthConfig`] or the server refuses to start.
+    pub bind: IpAddr,
+    pub backend: CredentialBackend,
+    pub options: ServeOptions,
+    pub auth: AuthConfig,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            port: 3141,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            backend: CredentialBackend::File,
+            options: ServeOptions::default(),
+            auth: AuthConfig::disabled(),
+        }
+    }
+}
+
 /// Start the dashboard server with explicit runtime options.
 pub async fn serve_with_options(port: u16, options: ServeOptions) -> anyhow::Result<()> {
     serve_with_backend_and_options(port, CredentialBackend::File, options).await
@@ -80,8 +109,58 @@ pub async fn serve_with_backend_and_options(
     backend: CredentialBackend,
     options: ServeOptions,
 ) -> anyhow::Result<()> {
+    serve_with_config(ServeConfig {
+        port,
+        backend,
+        options,
+        ..ServeConfig::default()
+    })
+    .await
+}
+
+/// Start the dashboard server with full configuration, including bind address
+/// and authentication policy. Fails closed: a non-loopback bind with no auth
+/// method configured is rejected before the listener opens.
+pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
+    let ServeConfig {
+        port,
+        bind,
+        backend,
+        options,
+        auth,
+    } = cfg;
+
+    // `is_loopback()` returns false for IPv4-mapped IPv6 loopback
+    // (`::ffff:127.0.0.1`), so such a bind is intentionally treated as
+    // non-loopback and requires auth — the safe direction. Do not "fix" this to
+    // treat mapped loopback as loopback; it would loosen the guard.
+    if !bind.is_loopback() && !auth.is_enforced() {
+        anyhow::bail!(
+            "refusing to bind {bind}:{port} with no authentication. The dashboard \
+             mutates real mailboxes; exposing it beyond loopback without a credential \
+             would let any reachable host read and send mail. Set a token \
+             (ENVELOPE_DASHBOARD_TOKEN or `envelope config set dashboard.auth_token <token>`), \
+             or a Tailscale identity allowlist (dashboard.tailscale_allow), before \
+             binding a non-loopback address. To keep it local, drop --bind (defaults to 127.0.0.1)."
+        );
+    }
+
+    // Identity-only auth trusts the `Tailscale-User-Login` header, which any
+    // process that can reach the bound port could forge. That is safe only when
+    // the port is fronted by `tailscale serve` (loopback bind). On a broad bind
+    // the header is forgeable by any reachable host — warn and recommend a token.
+    if !bind.is_loopback() && auth.is_identity_only() {
+        eprintln!(
+            "warning: identity-only auth on a non-loopback bind ({bind}). The \
+             Tailscale-User-Login header is forgeable by anything that can reach \
+             this port. Prefer a bearer token (dashboard.auth_token) for broad \
+             binds, and reserve the identity allowlist for a loopback bind fronted \
+             by `tailscale serve`."
+        );
+    }
+
     let db = Database::open_default().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let state = AppState::new(db, backend);
+    let state = AppState::new(db, backend).with_auth(auth);
 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
@@ -99,13 +178,28 @@ pub async fn serve_with_backend_and_options(
 
     let app = dashboard_router(state.clone()).layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
 
-    info!("dashboard listening on http://localhost:{port}");
-    println!("Envelope dashboard running at http://localhost:{port}");
+    let host_label = if bind.is_loopback() {
+        "localhost".to_string()
+    } else {
+        bind.to_string()
+    };
+    info!(
+        "dashboard listening on http://{host_label}:{port} (auth: {})",
+        state.auth.mode_label()
+    );
+    println!("Envelope dashboard running at http://{host_label}:{port}");
+    println!("Authentication: {}", state.auth.mode_label());
+    if !bind.is_loopback() {
+        println!(
+            "Bound to a non-loopback address — every /api request must present a \
+             valid credential."
+        );
+    }
     if options.background_sweeps {
         println!("Background unsnooze + scheduled-send sweep running every 60s");
         let ticker_state = state.clone();
@@ -131,9 +225,12 @@ pub async fn serve_with_backend_and_options(
 }
 
 fn dashboard_router(state: AppState) -> Router {
-    let api = Router::new()
-        // Health / build identity (drift detection, issue #46)
-        .route("/health", get(handlers::health::get))
+    // Everything under here mutates or reads real mailbox data and is guarded by
+    // the auth middleware when auth is enforced. `/api/health` is deliberately
+    // kept OUT of this sub-router so an unauthenticated liveness probe still
+    // works — it returns a minimal, path-free payload to unauthenticated callers
+    // and the full drift-detection payload only to authorized ones.
+    let protected = Router::new()
         // Accounts
         .route(
             "/accounts",
@@ -242,7 +339,18 @@ fn dashboard_router(state: AppState) -> Router {
             get(handlers::threads::show_by_message_id),
         )
         // Stats
-        .route("/stats", get(handlers::stats::get));
+        .route("/stats", get(handlers::stats::get))
+        // Enforce auth on every protected route (no-op in open loopback mode).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    let api = Router::new()
+        // Health / build identity (drift detection, issue #46). Unauthenticated
+        // callers get a minimal liveness payload; authorized callers get paths.
+        .route("/health", get(handlers::health::get))
+        .merge(protected);
 
     Router::new()
         .route("/", get(index_page))
@@ -991,6 +1099,116 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Dashboard authentication (tailnet exposure guard) ────────────────
+
+    async fn get_api(app: &Router, uri: &str, headers: &[(&str, &str)]) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder().uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn open_mode_allows_protected_api_without_credentials() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+        let (status, _) = get_api(&app, "/api/accounts", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_protected_api_without_valid_bearer() {
+        let (state, _, _) = test_state();
+        let app =
+            dashboard_router(state.with_auth(AuthConfig::from_parts(Some("t0ken".into()), [])));
+
+        let (unauth, body) = get_api(&app, "/api/accounts", &[]).await;
+        assert_eq!(unauth, StatusCode::UNAUTHORIZED, "no credential → 401");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "dashboard_auth_required");
+
+        let (wrong, _) = get_api(&app, "/api/accounts", &[("authorization", "Bearer nope")]).await;
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED, "wrong token → 401");
+
+        let (ok, _) = get_api(&app, "/api/accounts", &[("authorization", "Bearer t0ken")]).await;
+        assert_eq!(ok, StatusCode::OK, "correct bearer → 200");
+
+        let (ok2, _) = get_api(&app, "/api/accounts", &[("x-envelope-token", "t0ken")]).await;
+        assert_eq!(ok2, StatusCode::OK, "fallback header → 200");
+    }
+
+    #[tokio::test]
+    async fn tailscale_identity_allowlist_gates_protected_api() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state.with_auth(AuthConfig::from_parts(
+            None,
+            ["skippy@tail.ts.net".to_string()],
+        )));
+
+        let (denied, _) = get_api(
+            &app,
+            "/api/accounts",
+            &[("tailscale-user-login", "intruder@tail.ts.net")],
+        )
+        .await;
+        assert_eq!(denied, StatusCode::UNAUTHORIZED);
+
+        let (allowed, _) = get_api(
+            &app,
+            "/api/accounts",
+            &[("tailscale-user-login", "skippy@tail.ts.net")],
+        )
+        .await;
+        assert_eq!(allowed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_is_reachable_but_path_free_when_unauthenticated() {
+        let (state, _, _) = test_state();
+        let app =
+            dashboard_router(state.with_auth(AuthConfig::from_parts(Some("t0ken".into()), [])));
+
+        // Unauthenticated: 200 liveness, but no filesystem paths leaked.
+        let (status, body) = get_api(&app, "/api/health", &[]).await;
+        assert_eq!(status, StatusCode::OK, "health stays reachable for probes");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string());
+        assert!(json["database_path"].is_null(), "must not leak db path");
+        assert!(json["binary_path"].is_null(), "must not leak binary path");
+
+        // Authorized: full drift-detection payload.
+        let (status, body) =
+            get_api(&app, "/api/health", &[("authorization", "Bearer t0ken")]).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["database_path"].is_string(), "authorized sees paths");
+    }
+
+    #[tokio::test]
+    async fn open_mode_health_returns_full_payload() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+        let (status, body) = get_api(&app, "/api/health", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["database_path"].is_string(),
+            "local doctor drift detection unchanged in open mode"
+        );
     }
 
     #[tokio::test]
