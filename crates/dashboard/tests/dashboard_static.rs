@@ -108,6 +108,74 @@ fn dashboard_message_deep_links_are_route_first_without_legacy_slug_gate() {
 }
 
 #[test]
+fn dashboard_draft_deep_links_load_the_specific_draft_detail() {
+    // Issue #71: a `/accounts/<id>/drafts/<draft-id>` deep link returned the
+    // SPA shell and scrolled the cockpit, but never loaded the target draft,
+    // so `state.currentDraft` stayed null and nothing reviewable rendered.
+    assert!(
+        DASHBOARD_JS
+            .contains("kind: 'draft', accountId: decode(match[1]), draftId: decode(match[2])"),
+        "draft deep links should parse `/accounts/<id>/drafts/<draft-id>` into a draft route with a draftId"
+    );
+
+    // The route applier must call the draft-specific loader with route.draftId
+    // so the detail card is fetched directly from the draft API record rather
+    // than depending on the cockpit aggregate/list being populated.
+    let draft_branch_start = DASHBOARD_JS
+        .find("} else if (route.kind === 'draft') {")
+        .expect("applyDashboardRoute should branch on the draft route kind");
+    let draft_branch_end = DASHBOARD_JS[draft_branch_start..]
+        .find("} else if (route.kind === 'cockpit') {")
+        .map(|offset| draft_branch_start + offset)
+        .expect("draft branch should precede the cockpit branch");
+    let draft_branch = &DASHBOARD_JS[draft_branch_start..draft_branch_end];
+    assert!(
+        draft_branch.contains("await openDraftDeepLink(route.draftId)"),
+        "draft route must load the specified draft via openDraftDeepLink(route.draftId)"
+    );
+    assert!(
+        DASHBOARD_JS.contains("loadCockpitPanel: route.kind !== 'draft'"),
+        "draft routes must suppress the aggregate cockpit refresh so it cannot race and overwrite the loaded draft detail"
+    );
+
+    // The draft-specific loader must set the detail state and render it, and
+    // must fall back to the clear not-found cockpit state for missing drafts.
+    let loader_start = DASHBOARD_JS
+        .find("async function openDraftDeepLink(draftId) {")
+        .expect("openDraftDeepLink loader should exist");
+    let loader_body = &DASHBOARD_JS[loader_start..];
+    assert!(
+        loader_body.contains("state.currentDraft = data.draft"),
+        "openDraftDeepLink must populate state.currentDraft from the draft API record"
+    );
+    assert!(
+        loader_body.contains("draft not found"),
+        "openDraftDeepLink must fall back to a clear not-found cockpit state for missing drafts"
+    );
+
+    // The detail card renders whenever a current draft exists, independent of
+    // whether the cockpit list has any other drafts loaded.
+    assert!(
+        DASHBOARD_JS.contains("if (state.currentDraft) {")
+            && DASHBOARD_JS.contains("renderDraftDetail(state.currentDraft, true)"),
+        "renderDrafts must render the draft detail card whenever state.currentDraft is set"
+    );
+    assert!(
+        DASHBOARD_JS.contains("if (!list) return;")
+            && DASHBOARD_JS.contains("if (status) status.textContent")
+            && DASHBOARD_JS.contains("if (message) {"),
+        "renderDrafts must not no-op just because legacy cockpit status/message nodes are absent from the current dashboard shell"
+    );
+
+    // The SPA route must be preserved: the deep-link boot path applies the
+    // parsed route rather than redirecting away from it.
+    assert!(
+        DASHBOARD_JS.contains("const routed = await applyDashboardRoute(route)"),
+        "draft deep-link boot must apply the parsed SPA route in place"
+    );
+}
+
+#[test]
 fn dashboard_phase1_shell_uses_three_pane_mail_layout() {
     assert!(
         DASHBOARD_HTML.contains("class=\"mail-shell\"")
