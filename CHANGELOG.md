@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7] — 2026-07-02
+
+### Fixed
+
+- Dashboard draft review deep links now open the exact linked local draft in Agent Cockpit, including the reviewable detail card, instead of only selecting the account and leaving operators with nothing to review.
+
 ## [0.11.6] — 2026-07-01
 
 ### Added

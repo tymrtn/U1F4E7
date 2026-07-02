@@ -2854,16 +2854,18 @@ function renderDrafts() {
   const status = $('cockpit-status');
   const message = $('cockpit-message');
   const list = $('cockpit-drafts');
-  if (!status || !message || !list) return;
+  if (!list) return;
 
-  status.textContent = state.cockpitStatus || '';
-  clear(message);
-  if (state.cockpitMessage && state.cockpitMessage.text) {
-    message.className = `cockpit-message ${state.cockpitMessage.kind || ''}`;
-    message.textContent = state.cockpitMessage.text;
-    message.classList.remove('hidden');
-  } else {
-    message.className = 'cockpit-message hidden';
+  if (status) status.textContent = state.cockpitStatus || '';
+  if (message) {
+    clear(message);
+    if (state.cockpitMessage && state.cockpitMessage.text) {
+      message.className = `cockpit-message ${state.cockpitMessage.kind || ''}`;
+      message.textContent = state.cockpitMessage.text;
+      message.classList.remove('hidden');
+    } else {
+      message.className = 'cockpit-message hidden';
+    }
   }
 
   clear(list);
@@ -3407,12 +3409,22 @@ async function applyDashboardRoute(route = parseDashboardRoute()) {
     return true;
   }
 
-  await selectAccount(account, 'INBOX', { loadFolderList: false, loadMessageList: false });
+  await selectAccount(account, 'INBOX', {
+    loadFolderList: false,
+    loadMessageList: false,
+    loadCockpitPanel: route.kind !== 'draft',
+  });
   if (route.kind === 'rules') {
     $('rules-summary').scrollIntoView({ block: 'start' });
   } else if (route.kind === 'draft') {
-    toast('Draft review opened in Agent Cockpit', 'success');
+    // Load and render the specific draft directly from its API record so the
+    // detail card appears even when the cockpit aggregate/list is empty,
+    // stale, or still loading. Missing drafts fall through to the existing
+    // not-found cockpit state inside openDraftDeepLink.
+    setCockpitExpanded(true);
     $('cockpit-drafts-count').scrollIntoView({ block: 'start' });
+    await openDraftDeepLink(route.draftId);
+    toast('Draft review opened in Agent Cockpit', 'success');
   } else if (route.kind === 'cockpit') {
     $('cockpit-account').scrollIntoView({ block: 'start' });
   }
