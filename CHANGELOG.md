@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-07-04
+
+### Fixed
+
+- Outbound SMTP From headers now fall back to the account name when `display_name` is unset or blank, so accounts such as `Tyler Martin <tyler@martin.fm>` no longer send as a bare email address. Envelope now builds the default From mailbox through lettre's mailbox builder so quoted display names are serialized safely.
+
 ## [0.12.0] — 2026-07-02
 
 ### Added

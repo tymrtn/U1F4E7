@@ -3,9 +3,9 @@
 
 use envelope_email_store::models::AccountWithCredentials;
 use lettre::message::header::{self, ContentType};
-use lettre::message::{Attachment as LettreAttachment, Mailboxes, MultiPart, SinglePart};
+use lettre::message::{Attachment as LettreAttachment, Mailbox, Mailboxes, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use tracing::info;
 use uuid::Uuid;
 
@@ -205,12 +205,11 @@ pub fn build_message(
     references: Option<&[String]>,
     attachments: &[Attachment],
 ) -> Result<(Message, String), SmtpError> {
-    let from_addr = if let Some(f) = from_override {
-        f.to_string()
-    } else if let Some(ref display) = account.account.display_name {
-        format!("{display} <{}>", account.account.username)
+    let from_mailbox = if let Some(f) = from_override {
+        f.parse::<Mailbox>()
+            .map_err(|e| SmtpError::Send(format!("invalid from address: {e}")))?
     } else {
-        account.account.username.clone()
+        account_from_mailbox(account)?
     };
 
     // Build the message headers.
@@ -219,11 +218,7 @@ pub fn build_message(
     // display names) by parsing into `Mailboxes`. Reply-To stays a single
     // mailbox to match the existing CLI/agent contract.
     let mut builder = Message::builder()
-        .from(
-            from_addr
-                .parse()
-                .map_err(|e| SmtpError::Send(format!("invalid from address: {e}")))?,
-        )
+        .from(from_mailbox)
         .mailbox(header::To::from(parse_mailboxes(to, "to")?))
         .subject(subject)
         // Set the Message-ID explicitly so it is always present and matches the
@@ -326,6 +321,44 @@ fn strip_brackets(id: &str) -> String {
         .to_string()
 }
 
+/// Build the account's default From mailbox without hand-concatenating an RFC5322
+/// header string. This lets lettre quote/encode display names correctly.
+fn account_from_mailbox(account: &AccountWithCredentials) -> Result<Mailbox, SmtpError> {
+    let address = account.account.username.trim();
+    let display = account
+        .account
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| account_name_fallback(account, address));
+
+    mailbox_for_address(address, display, "from")
+}
+
+fn account_name_fallback<'a>(
+    account: &'a AccountWithCredentials,
+    address: &str,
+) -> Option<&'a str> {
+    let name = account.account.name.trim();
+    if !name.is_empty() && !name.eq_ignore_ascii_case(address) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn mailbox_for_address(
+    address: &str,
+    display_name: Option<&str>,
+    field: &str,
+) -> Result<Mailbox, SmtpError> {
+    let email = address
+        .parse::<Address>()
+        .map_err(|e| SmtpError::Send(format!("invalid {field} address: {e}")))?;
+    Ok(Mailbox::new(display_name.map(str::to_string), email))
+}
+
 /// Parse a recipient header value into a list of mailboxes.
 ///
 /// Accepts a single address or an RFC5322 comma-separated list, with or without
@@ -387,9 +420,17 @@ mod tests {
     /// Minimal in-memory account for message-construction tests. No network,
     /// no credentials store — `build_message` never touches either.
     fn test_account(username: &str, display: Option<&str>) -> AccountWithCredentials {
+        test_account_with_name(username, display, None)
+    }
+
+    fn test_account_with_name(
+        username: &str,
+        display: Option<&str>,
+        name: Option<&str>,
+    ) -> AccountWithCredentials {
         let account = Account {
             id: "acct-test".to_string(),
-            name: "Test".to_string(),
+            name: name.unwrap_or("Test").to_string(),
             username: username.to_string(),
             domain: String::new(),
             smtp_host: "smtp.example.com".to_string(),
@@ -570,5 +611,96 @@ mod tests {
             .parse::<ContentType>()
             .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
         let _ = result; // just ensure the fallback path compiles
+    }
+
+    // --- From-display-name fallback regression tests ---
+
+    fn from_header(account: &AccountWithCredentials) -> String {
+        let bare = generate_message_id(account);
+        let (email, _) = build_message(
+            account,
+            &bare,
+            "recipient@example.com",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        email
+            .headers()
+            .get_raw("From")
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn from_display_name_wins_over_account_name() {
+        let acct = test_account_with_name(
+            "tyler@martin.fm",
+            Some("Display Name"),
+            Some("Account Name"),
+        );
+        let from = from_header(&acct);
+        assert!(
+            from.contains("Display Name"),
+            "display_name should win: {from}"
+        );
+        assert!(
+            !from.contains("Account Name"),
+            "account name must not appear when display_name is set: {from}"
+        );
+    }
+
+    #[test]
+    fn from_falls_back_to_account_name_when_display_name_absent() {
+        let acct = test_account_with_name("tyler@martin.fm", None, Some("Tyler Martin"));
+        let from = from_header(&acct);
+        assert!(
+            from.contains("Tyler Martin"),
+            "account name should appear as display name: {from}"
+        );
+        assert!(
+            from.contains("<tyler@martin.fm>"),
+            "address must still be present: {from}"
+        );
+    }
+
+    #[test]
+    fn from_omits_display_name_when_account_name_equals_email() {
+        let acct = test_account_with_name("tyler@martin.fm", None, Some("tyler@martin.fm"));
+        let from = from_header(&acct);
+        // Should be bare address, not "tyler@martin.fm <tyler@martin.fm>"
+        let double = "tyler@martin.fm <tyler@martin.fm>";
+        assert!(
+            !from.contains(double),
+            "redundant display name must not appear: {from}"
+        );
+    }
+
+    #[test]
+    fn from_blank_display_name_falls_back_to_account_name() {
+        let acct = test_account_with_name("tyler@martin.fm", Some("  "), Some("Tyler Martin"));
+        let from = from_header(&acct);
+        assert!(
+            from.contains("Tyler Martin"),
+            "blank display_name should not suppress account.name fallback: {from}"
+        );
+    }
+
+    #[test]
+    fn from_account_name_with_comma_is_quoted_by_mailbox_builder() {
+        let acct = test_account_with_name("tyler@martin.fm", None, Some("Martin, Tyler"));
+        let from = from_header(&acct);
+        assert!(
+            from.contains("\"Martin, Tyler\""),
+            "comma-bearing account name should be quoted safely: {from}"
+        );
     }
 }
