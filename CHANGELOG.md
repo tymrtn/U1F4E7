@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.5] — 2026-07-04
+
+### Fixed
+
+- **Malformed `From:` header on client-appended Sent archive copies (issue #81).** The Sent-copy MIME builder received an already-formatted mailbox string (e.g. `"Display Name" <user@example.test>`) and passed it to `MessageBuilder::from` as if it were a raw address, double-wrapping it into a nested `From: <Display Name <user@example.test>>`. The `from` value is now parsed into proper `(display_name, email)` mailbox parts before serialization, matching the RFC5322-safe `From` handling used by SMTP delivery. The same fix applies to the IMAP Drafts APPEND path. Account-name fallback, comma/quote-safe display names, explicit `--from` overrides, and attachment preservation all remain intact.
+
 ## [0.12.4] — 2026-07-04
 
 ### Fixed
