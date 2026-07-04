@@ -465,13 +465,9 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     // Append an exact Sent copy for providers that do not auto-save SMTP
     // submissions, so the message is durably visible and the proof lookup
     // resolves. Best-effort; never fails the send.
-    let from_for_sent = if let Some(f) = from {
-        f.to_string()
-    } else if let Some(ref display) = creds.account.display_name {
-        format!("{display} <{}>", creds.account.username)
-    } else {
-        creds.account.username.clone()
-    };
+    let from_for_sent = from
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::commands::drafts::account_from_header(&creds));
     let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
     let (sent_mail_appended, sent_mail_append_skipped_reason) =
         crate::commands::drafts::append_sent_copy_for_immediate_send(
@@ -826,11 +822,7 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     // Append an exact Sent copy for providers that do not auto-save SMTP
     // submissions, preserving threading headers and the same Message-ID so the
     // proof lookup resolves. Best-effort; never fails the send.
-    let from_for_sent = if let Some(ref display) = creds.account.display_name {
-        format!("{display} <{}>", creds.account.username)
-    } else {
-        creds.account.username.clone()
-    };
+    let from_for_sent = crate::commands::drafts::account_from_header(&creds);
     let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
     let (sent_mail_appended, sent_mail_append_skipped_reason) =
         crate::commands::drafts::append_sent_copy_for_immediate_send(

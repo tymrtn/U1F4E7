@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 authors = ["Tyler Martin"]
