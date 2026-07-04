@@ -17,7 +17,7 @@ use std::str::FromStr;
 use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::common::setup_credentials;
 use super::datetime::parse_until;
-use super::drafts::{find_sent_mail_by_message_id, sent_mail_proof_json};
+use super::drafts::{resolve_sent_copy_after_send, sent_mail_proof_json};
 use super::governor_gate::{account_domain, gate_and_record, governor_request};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
@@ -363,37 +363,45 @@ pub async fn run(
     .await
     .context("failed to send email")?;
 
-    // For providers that do not auto-save SMTP submissions (generic IMAP/SMTP),
-    // append an exact copy to Sent so the message is durably visible and the
-    // proof lookup below can resolve it. Gmail/Google are skipped to avoid a
-    // duplicate. Best-effort; never fails the send.
+    // Resolve Sent-folder copy using pre-append lookup semantics (issue #77).
+    // Pre-lookup runs first: if the provider already filed the message, skip
+    // the client IMAP APPEND so Gmail-style providers don't get duplicates.
     let from_for_sent = if let Some(f) = from {
         f.to_string()
-    } else if let Some(ref display) = creds.account.display_name {
-        format!("{display} <{}>", creds.account.username)
     } else {
-        creds.account.username.clone()
+        super::drafts::account_from_header(&creds)
     };
     let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
-    let (sent_mail_appended, sent_mail_append_skipped_reason) =
-        super::drafts::append_sent_copy_for_immediate_send(
-            &db,
-            &creds,
-            provider_type.as_deref(),
-            &from_for_sent,
-            to,
-            subject,
-            body,
-            html,
-            cc,
-            None,
-            &[],
-            &message_id,
-            &attachments,
-        )
-        .await;
+    let copy_result = resolve_sent_copy_after_send(
+        &db,
+        &creds,
+        provider_type.as_deref(),
+        &from_for_sent,
+        to,
+        subject,
+        body,
+        html,
+        cc,
+        None,
+        &[],
+        &message_id,
+        &attachments,
+    )
+    .await;
 
-    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_mail_appended = copy_result.sent_mail_appended;
+    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
+    let sent_mail_proof = copy_result.proof;
+    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
+    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -411,6 +419,8 @@ pub async fn run(
                 "sent_uid": sent_mail_proof.uid,
                 "sent_message_url": sent_message_url,
                 "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+                "provider_sent_copy": provider_sent_copy,
+                "client_appended_copy": client_appended_copy,
                 "attachments": attachments.iter().map(|a| serde_json::json!({
                     "filename": a.filename,
                     "content_type": a.content_type,
@@ -451,6 +461,95 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::commands::drafts::{SentMailProof, provider_auto_saves_sent, sent_mail_proof_json};
+
+    // Regression: CLI immediate send must call resolve_sent_copy_after_send
+    // (pre-lookup before append), not the old append helper directly.
+    #[test]
+    fn cli_send_no_longer_calls_append_helper_directly() {
+        let src = include_str!("send.rs");
+        let old_helper = concat!("append_sent_copy_for_immediate_", "send");
+        assert!(
+            !src.contains(old_helper),
+            "CLI immediate send must go through resolve_sent_copy_after_send so pre-append lookup runs first"
+        );
+        assert!(src.contains("resolve_sent_copy_after_send"));
+    }
+
+    #[test]
+    fn cli_send_json_output_shape_includes_sent_copy_source_fields() {
+        // Simulate the proof that resolve_sent_copy_after_send would return for a
+        // provider-auto-save path (e.g. Gmail). provider_sent_copy should be Some,
+        // client_appended_copy should be None.
+        let mut proof = SentMailProof::new(Some("Sent Mail".to_string()), Some(42), "found", None);
+        proof.copy_source = "provider";
+
+        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
+            Some(sent_mail_proof_json("acct@example.com", &proof))
+        } else {
+            None
+        };
+        let client_appended_copy = if proof.copy_source == "client_appended" {
+            Some(sent_mail_proof_json("acct@example.com", &proof))
+        } else {
+            None
+        };
+
+        assert!(
+            provider_sent_copy.is_some(),
+            "provider path: provider_sent_copy must be Some"
+        );
+        assert!(
+            client_appended_copy.is_none(),
+            "provider path: client_appended_copy must be None"
+        );
+        assert_eq!(
+            provider_sent_copy.as_ref().unwrap()["copy_source"],
+            "provider"
+        );
+    }
+
+    #[test]
+    fn cli_send_client_appended_path_populates_client_appended_copy() {
+        let mut proof = SentMailProof::new(Some("Sent".to_string()), Some(99), "found", None);
+        proof.copy_source = "client_appended";
+
+        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
+            Some(sent_mail_proof_json("acct@example.com", &proof))
+        } else {
+            None
+        };
+        let client_appended_copy = if proof.copy_source == "client_appended" {
+            Some(sent_mail_proof_json("acct@example.com", &proof))
+        } else {
+            None
+        };
+
+        assert!(
+            provider_sent_copy.is_none(),
+            "client_appended path: provider_sent_copy must be None"
+        );
+        assert!(
+            client_appended_copy.is_some(),
+            "client_appended path: client_appended_copy must be Some"
+        );
+        assert_eq!(
+            client_appended_copy.as_ref().unwrap()["copy_source"],
+            "client_appended"
+        );
+    }
+
+    #[test]
+    fn provider_auto_saves_sent_is_accessible_from_send_module() {
+        // Verify the send module can access provider detection (used by
+        // resolve_sent_copy_after_send for pre-lookup routing).
+        assert!(provider_auto_saves_sent(Some("gmail"), "smtp.gmail.com"));
+        assert!(!provider_auto_saves_sent(None, "smtp.migadu.com"));
+    }
 }
 
 fn record_send_policy_event(

@@ -1876,6 +1876,132 @@
       },
       "name": "reply",
       "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachments": {
+            "description": "Non-secret attachment summaries: filename, content_type, and size only",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "client_appended_copy": {
+            "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. Mailbox hygiene only — not independent delivery or legal proof.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "cooldown_seconds": {
+            "description": "Queued-send cooldown in seconds",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "draft_id": {
+            "description": "Local draft id when queued or draft-only",
+            "type": "string"
+          },
+          "draft_ui": {
+            "description": "Dashboard review links for the draft",
+            "type": "object"
+          },
+          "error": {
+            "description": "Stable denial/block object ({code, reason})",
+            "type": "object"
+          },
+          "imap_draft_deleted": {
+            "description": "Whether a synced IMAP Drafts copy was deleted after send",
+            "type": "boolean"
+          },
+          "in_reply_to": {
+            "description": "In-Reply-To header of the sent message when present",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "SMTP Message-ID when sent immediately",
+            "type": "string"
+          },
+          "parent_ui": {
+            "description": "Dashboard links for the parent message when replying",
+            "type": "object"
+          },
+          "provider_sent_copy": {
+            "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "queued_reason": {
+            "description": "Human-readable queued-send explanation",
+            "type": "string"
+          },
+          "queued_reason_code": {
+            "description": "Stable queued-send reason code",
+            "type": "string"
+          },
+          "send_after": {
+            "description": "ISO8601 time the queued send becomes due",
+            "type": "string"
+          },
+          "send_mode": {
+            "description": "Applied send safety mode when policy was evaluated",
+            "type": "string"
+          },
+          "sent": {
+            "description": "true when the message was transmitted immediately",
+            "type": "boolean"
+          },
+          "sent_folder": {
+            "description": "Sent folder containing the sent message when resolved",
+            "type": "string"
+          },
+          "sent_mail": {
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof.",
+            "type": "object"
+          },
+          "sent_mail_append_skipped_reason": {
+            "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sent_mail_appended": {
+            "description": "Whether Envelope appended a client-side Sent-folder archive copy",
+            "type": "boolean"
+          },
+          "sent_message_url": {
+            "description": "Dashboard URL for the sent message when resolved",
+            "type": "string"
+          },
+          "sent_uid": {
+            "description": "Sent-folder IMAP UID when resolved",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "queued, sent, scheduled, drafted, or denied",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject when sent",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient address when sent",
+            "type": "string"
+          },
+          "ui": {
+            "description": "Dashboard navigation links",
+            "type": "object"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "stability": "stable-v1"
@@ -2195,6 +2321,132 @@
       },
       "name": "send_draft",
       "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachments": {
+            "description": "Non-secret attachment summaries: filename, content_type, and size only",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "client_appended_copy": {
+            "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. Mailbox hygiene only — not independent delivery or legal proof.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "cooldown_seconds": {
+            "description": "Queued-send cooldown in seconds",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "draft_id": {
+            "description": "Local draft id when queued or draft-only",
+            "type": "string"
+          },
+          "draft_ui": {
+            "description": "Dashboard review links for the draft",
+            "type": "object"
+          },
+          "error": {
+            "description": "Stable denial/block object ({code, reason})",
+            "type": "object"
+          },
+          "imap_draft_deleted": {
+            "description": "Whether a synced IMAP Drafts copy was deleted after send",
+            "type": "boolean"
+          },
+          "in_reply_to": {
+            "description": "In-Reply-To header of the sent message when present",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "SMTP Message-ID when sent immediately",
+            "type": "string"
+          },
+          "parent_ui": {
+            "description": "Dashboard links for the parent message when replying",
+            "type": "object"
+          },
+          "provider_sent_copy": {
+            "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "queued_reason": {
+            "description": "Human-readable queued-send explanation",
+            "type": "string"
+          },
+          "queued_reason_code": {
+            "description": "Stable queued-send reason code",
+            "type": "string"
+          },
+          "send_after": {
+            "description": "ISO8601 time the queued send becomes due",
+            "type": "string"
+          },
+          "send_mode": {
+            "description": "Applied send safety mode when policy was evaluated",
+            "type": "string"
+          },
+          "sent": {
+            "description": "true when the message was transmitted immediately",
+            "type": "boolean"
+          },
+          "sent_folder": {
+            "description": "Sent folder containing the sent message when resolved",
+            "type": "string"
+          },
+          "sent_mail": {
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof.",
+            "type": "object"
+          },
+          "sent_mail_append_skipped_reason": {
+            "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sent_mail_appended": {
+            "description": "Whether Envelope appended a client-side Sent-folder archive copy",
+            "type": "boolean"
+          },
+          "sent_message_url": {
+            "description": "Dashboard URL for the sent message when resolved",
+            "type": "string"
+          },
+          "sent_uid": {
+            "description": "Sent-folder IMAP UID when resolved",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "queued, sent, scheduled, drafted, or denied",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Subject when sent",
+            "type": "string"
+          },
+          "to": {
+            "description": "Recipient address when sent",
+            "type": "string"
+          },
+          "ui": {
+            "description": "Dashboard navigation links",
+            "type": "object"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "stability": "stable-v1"
