@@ -1155,6 +1155,13 @@
             },
             "type": "array"
           },
+          "client_appended_copy": {
+            "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. This is mailbox hygiene only — not independent delivery or legal proof.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "cooldown_seconds": {
             "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)",
             "type": [
@@ -1173,6 +1180,13 @@
           "message_id": {
             "description": "SMTP Message-ID when sent immediately",
             "type": "string"
+          },
+          "provider_sent_copy": {
+            "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "queued_reason": {
             "description": "Human-readable explanation that the message is queued in the outbox for the safety cooldown so agents/operators can report and correct issues before SMTP transmission",
@@ -1199,7 +1213,7 @@
             "type": "string"
           },
           "sent_mail": {
-            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui",
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof.",
             "type": "object"
           },
           "sent_mail_append_skipped_reason": {
@@ -1210,7 +1224,7 @@
             ]
           },
           "sent_mail_appended": {
-            "description": "Whether Envelope appended a Sent-folder copy after SMTP because the provider does not auto-save submissions",
+            "description": "Whether Envelope appended a client-side Sent-folder archive copy after SMTP because the provider does not auto-save submissions. This is mailbox hygiene, not independent delivery proof.",
             "type": "boolean"
           },
           "sent_message_url": {
@@ -1384,6 +1398,13 @@
             },
             "type": "array"
           },
+          "client_appended_copy": {
+            "description": "Envelope-created client-side Sent archive copy when applicable; not independent delivery proof.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
@@ -1399,12 +1420,19 @@
             "description": "SMTP Message-ID for sent drafts",
             "type": "string"
           },
+          "provider_sent_copy": {
+            "description": "Provider-created/auto-filed Sent copy proof when applicable; null otherwise.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "sent_folder": {
             "description": "Sent folder containing the sent message when resolved",
             "type": "string"
           },
           "sent_mail": {
-            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui",
+            "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted.",
             "type": "object"
           },
           "sent_message_url": {
