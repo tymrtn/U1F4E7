@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] — 2026-07-04
+
+### Fixed
+
+- **Sent-copy source semantics (issue #77).** `sent_mail.copy_source` now carries a stable label — `provider`, `client_appended`, `unresolved`, or `not_attempted` — distinguishing a provider-created Sent copy (e.g. Gmail auto-files) from a client-side IMAP APPEND archive copy written by Envelope. A `client_appended` copy is mailbox hygiene only; it is **not** independent delivery or legal proof. Agents and operators must not treat a client-appended Sent entry as provider confirmation of delivery.
+- Added `provider_sent_copy` and `client_appended_copy` top-level fields to immediate-send JSON output for explicit source semantics. Existing backward-compatible fields (`sent_folder`, `sent_uid`, `sent_message_url`, `sent_mail`, `sent_mail_appended`, `sent_mail_append_skipped_reason`) are preserved unchanged.
+- Updated agent contract docs and JSON schema descriptions to reflect honest semantics: `sent_mail_appended` is described as a client-side archive, not a proof of delivery.
+
 ## [0.12.2] — 2026-07-04
 
 ### Fixed

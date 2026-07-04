@@ -167,9 +167,11 @@ fn surfaces() -> Value {
                 "sent_folder": string("Sent folder containing the sent message when resolved"),
                 "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
                 "sent_message_url": string("Dashboard URL for the sent message when resolved"),
-                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"}),
-                "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a Sent-folder copy after SMTP because the provider does not auto-save submissions"}),
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof."}),
+                "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a client-side Sent-folder archive copy after SMTP because the provider does not auto-save submissions. This is mailbox hygiene, not independent delivery proof."}),
                 "sent_mail_append_skipped_reason": json!({"type": ["string", "null"], "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed"}),
+                "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
+                "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. This is mailbox hygiene only — not independent delivery or legal proof."}),
                 "draft_id": string("Local draft id when scheduled or draft-only"),
                 "to": string("Recipient address"),
                 "subject": string("Subject")
@@ -231,7 +233,9 @@ fn surfaces() -> Value {
                 "sent_folder": string("Sent folder containing the sent message when resolved"),
                 "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
                 "sent_message_url": string("Dashboard URL for the sent message when resolved"),
-                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui"})
+                "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted."}),
+                "provider_sent_copy": json!({"type": ["object", "null"], "description": "Provider-created/auto-filed Sent copy proof when applicable; null otherwise."}),
+                "client_appended_copy": json!({"type": ["object", "null"], "description": "Envelope-created client-side Sent archive copy when applicable; not independent delivery proof."})
             }),
             json!([]),
         ),

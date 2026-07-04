@@ -10,7 +10,7 @@ use crate::commands::attachments::{
     attachment_summaries, decode_attachments, snapshot_attachments,
 };
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
-use crate::commands::drafts::{find_sent_mail_by_message_id, sent_mail_proof_json};
+use crate::commands::drafts::sent_mail_proof_json;
 use crate::commands::governor_gate::{account_domain, gate_and_record, governor_request};
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
@@ -462,32 +462,41 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     .await
     .map_err(|e| e.to_string())?;
 
-    // Append an exact Sent copy for providers that do not auto-save SMTP
-    // submissions, so the message is durably visible and the proof lookup
-    // resolves. Best-effort; never fails the send.
+    // Resolve Sent-folder copy using pre-append lookup semantics.
     let from_for_sent = from
         .map(str::to_string)
         .unwrap_or_else(|| crate::commands::drafts::account_from_header(&creds));
     let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
-    let (sent_mail_appended, sent_mail_append_skipped_reason) =
-        crate::commands::drafts::append_sent_copy_for_immediate_send(
-            &db,
-            &creds,
-            provider_type.as_deref(),
-            &from_for_sent,
-            to,
-            subject,
-            body,
-            html,
-            cc,
-            None,
-            &[],
-            &message_id,
-            &attachments,
-        )
-        .await;
+    let copy_result = crate::commands::drafts::resolve_sent_copy_after_send(
+        &db,
+        &creds,
+        provider_type.as_deref(),
+        &from_for_sent,
+        to,
+        subject,
+        body,
+        html,
+        cc,
+        None,
+        &[],
+        &message_id,
+        &attachments,
+    )
+    .await;
 
-    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_mail_appended = copy_result.sent_mail_appended;
+    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
+    let sent_mail_proof = copy_result.proof;
+    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
+    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -500,6 +509,9 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         "sent_uid": sent_mail_proof.uid,
         "sent_message_url": sent_message_url,
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+        "provider_sent_copy": provider_sent_copy,
+        "client_appended_copy": client_appended_copy,
+        "copy_source": sent_mail_proof.copy_source,
         "attachments": attachment_summaries(&attachment_snapshots),
         "ui": sent_ui,
     }))
@@ -819,30 +831,39 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
     .await
     .map_err(|e| e.to_string())?;
 
-    // Append an exact Sent copy for providers that do not auto-save SMTP
-    // submissions, preserving threading headers and the same Message-ID so the
-    // proof lookup resolves. Best-effort; never fails the send.
+    // Resolve Sent-folder copy using pre-append lookup semantics.
     let from_for_sent = crate::commands::drafts::account_from_header(&creds);
     let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
-    let (sent_mail_appended, sent_mail_append_skipped_reason) =
-        crate::commands::drafts::append_sent_copy_for_immediate_send(
-            &db,
-            &creds,
-            provider_type.as_deref(),
-            &from_for_sent,
-            &headers.to,
-            &headers.subject,
-            Some(body),
-            html,
-            cc_str.as_deref(),
-            headers.in_reply_to.as_deref(),
-            &headers.references,
-            &message_id,
-            &attachments,
-        )
-        .await;
+    let copy_result = crate::commands::drafts::resolve_sent_copy_after_send(
+        &db,
+        &creds,
+        provider_type.as_deref(),
+        &from_for_sent,
+        &headers.to,
+        &headers.subject,
+        Some(body),
+        html,
+        cc_str.as_deref(),
+        headers.in_reply_to.as_deref(),
+        &headers.references,
+        &message_id,
+        &attachments,
+    )
+    .await;
 
-    let sent_mail_proof = find_sent_mail_by_message_id(&db, &creds, &message_id).await;
+    let sent_mail_appended = copy_result.sent_mail_appended;
+    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
+    let sent_mail_proof = copy_result.proof;
+    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
+    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
+        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
+    } else {
+        None
+    };
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -855,6 +876,9 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         "sent_uid": sent_mail_proof.uid,
         "sent_message_url": sent_message_url,
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
+        "provider_sent_copy": provider_sent_copy,
+        "client_appended_copy": client_appended_copy,
+        "copy_source": sent_mail_proof.copy_source,
         "attachments": attachment_summaries(&attachment_snapshots),
         "in_reply_to": headers.in_reply_to,
         "ui": sent_ui,
