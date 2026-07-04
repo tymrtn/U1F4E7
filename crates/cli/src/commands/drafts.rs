@@ -308,7 +308,9 @@ pub(crate) fn build_rfc822_full(
     message_id: Option<&str>,
     attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
-    let mut builder = MessageBuilder::new().from(from).subject(subject);
+    let mut builder = MessageBuilder::new()
+        .from(builder_from_address(from)?)
+        .subject(subject);
     if !to.trim().is_empty() {
         builder = builder.to(builder_address_list(to, "to")?);
     }
@@ -555,7 +557,7 @@ fn build_rfc822_draft(
     attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
     let mut builder = MessageBuilder::new()
-        .from(from)
+        .from(builder_from_address(from)?)
         .subject(subject.unwrap_or(""));
 
     if !to.trim().is_empty() {
@@ -613,6 +615,29 @@ fn build_rfc822_draft(
 /// `"a@example.com, b@example.com"` directly produces an invalid single address.
 /// Parse with lettre's RFC5322 mailbox-list parser first, then hand
 /// mail-builder an explicit list so draft RFC822 matches SMTP send behavior.
+/// Parse a `From:` header value into a single mail-builder address.
+///
+/// The incoming `from` string is already a fully-formed RFC5322 mailbox — either
+/// the account default produced by [`account_from_header`] (e.g.
+/// `"Display Name" <user@example.test>`) or an explicit `--from` override. It must
+/// be parsed into `(display_name, email)` parts so mail-builder can re-serialize
+/// it safely; passing the preformatted string to `MessageBuilder::from` treats the
+/// whole thing as a bare address and double-wraps it into `<Display Name <addr>>`
+/// (issue #81).
+fn builder_from_address(from: &str) -> Result<BuilderAddress<'static>> {
+    let mailboxes = from
+        .parse::<Mailboxes>()
+        .with_context(|| "invalid from address")?;
+    let mailbox = mailboxes
+        .iter()
+        .next()
+        .with_context(|| "from address is empty")?;
+    Ok(BuilderAddress::new_address(
+        mailbox.name.clone(),
+        mailbox.email.to_string(),
+    ))
+}
+
 fn builder_address_list(value: &str, field: &str) -> Result<BuilderAddress<'static>> {
     let mailboxes = value
         .parse::<Mailboxes>()
@@ -2560,6 +2585,143 @@ mod tests {
         assert!(msg.contains("multipart/mixed"));
         assert!(msg.contains("hello.txt"));
         assert!(msg.contains("hello attachment") || msg.contains("aGVsbG8gYXR0YWNobWVudA"));
+    }
+
+    // ─── appended Sent copy From header (issue #81) ──────────────────────
+
+    /// Extract the raw `From:` header line from a built RFC822 message.
+    fn from_header_line(msg: &str) -> String {
+        msg.lines()
+            .find(|l| l.to_lowercase().starts_with("from:"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn appended_sent_from_uses_account_name_fallback_not_nested() {
+        // account_from_header produces the preformatted mailbox that the Sent
+        // copy is built from. It must not be double-wrapped into nested angle
+        // brackets when re-serialized by build_rfc822_full.
+        let creds = make_creds("user@example.test", None, "Display Name");
+        let from = account_from_header(&creds);
+
+        let (rfc822, _) = build_rfc822_full(
+            &from,
+            "recipient@example.test",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            None,
+            &[],
+            Some("<mid@example.test>"),
+            &[],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+        let from_line = from_header_line(&msg);
+
+        assert_eq!(
+            from_line, "From: \"Display Name\" <user@example.test>",
+            "account-name fallback must serialize as a proper mailbox, not nested: {from_line}"
+        );
+        assert!(
+            !from_line.contains("<Display Name <"),
+            "From must not be double-wrapped: {from_line}"
+        );
+    }
+
+    #[test]
+    fn appended_sent_from_quotes_comma_display_name() {
+        let creds = make_creds("user@example.test", Some("Doe, Jane \"JD\""), "Account");
+        let from = account_from_header(&creds);
+
+        let (rfc822, _) = build_rfc822_full(
+            &from,
+            "recipient@example.test",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            None,
+            &[],
+            Some("<mid@example.test>"),
+            &[],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+        let from_line = from_header_line(&msg);
+
+        assert!(
+            from_line.contains("user@example.test"),
+            "address must be present: {from_line}"
+        );
+        assert!(
+            !from_line.contains("<Doe,"),
+            "comma/quote display name must not leak into the address wrapper: {from_line}"
+        );
+        // Round-trips back into a single valid mailbox.
+        let parsed = from_line
+            .trim_start_matches("From:")
+            .trim()
+            .parse::<Mailboxes>()
+            .expect("From header must be a valid RFC5322 mailbox");
+        assert_eq!(parsed.iter().count(), 1);
+    }
+
+    #[test]
+    fn appended_sent_from_explicit_override_not_double_wrapped() {
+        let (rfc822, _) = build_rfc822_full(
+            "\"Override Name\" <override@example.test>",
+            "recipient@example.test",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            None,
+            &[],
+            Some("<mid@example.test>"),
+            &[],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+        let from_line = from_header_line(&msg);
+
+        assert_eq!(
+            from_line, "From: \"Override Name\" <override@example.test>",
+            "explicit --from override must not be double-wrapped: {from_line}"
+        );
+    }
+
+    #[test]
+    fn appended_sent_from_preserves_attachments() {
+        let attachment = Attachment {
+            filename: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: b"%PDF-1.4 fake".to_vec(),
+        };
+        let creds = make_creds("user@example.test", None, "Display Name");
+        let from = account_from_header(&creds);
+
+        let (rfc822, _) = build_rfc822_full(
+            &from,
+            "recipient@example.test",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            None,
+            &[],
+            Some("<mid@example.test>"),
+            &[attachment],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+        let from_line = from_header_line(&msg);
+
+        assert_eq!(from_line, "From: \"Display Name\" <user@example.test>");
+        assert!(msg.contains("multipart/mixed"));
+        assert!(msg.contains("report.pdf"));
     }
 
     // ─── account_from_header / From identity ─────────────────────────────
