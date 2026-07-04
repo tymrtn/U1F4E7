@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] — 2026-07-04
+
+### Fixed
+
+- **Sent-copy source semantics follow-up (issue #79).** CLI immediate send now uses the same pre-append Sent lookup resolver as draft/MCP send paths, so provider-created Sent copies are checked before Envelope considers a client-side IMAP APPEND archive copy.
+- MCP send/reply no longer emit an undocumented top-level `copy_source`; the canonical source label is `sent_mail.copy_source`. MCP `reply` and `send_draft` contract schemas now explicitly advertise `provider_sent_copy`, `client_appended_copy`, and Sent-copy source semantics.
+- Added wiring regressions so CLI immediate send cannot quietly fall back to the old append-before-lookup helper.
+
 ## [0.12.3] — 2026-07-04
 
 ### Fixed

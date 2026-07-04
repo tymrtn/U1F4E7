@@ -356,13 +356,13 @@ fn surfaces() -> Value {
         vec!["Collection and attachment export must use EXAMINE and BODY.PEEK[]; raw RFC822 .eml files and raw attachment bytes remain canonical evidence."],
     ));
 
-    for (name, schema) in mcp_only_inputs() {
+    for (name, input_schema, output_schema) in mcp_only_inputs() {
         items.push(surface_entry(
             name,
             "mcp-only",
             Some(name),
-            schema,
-            json!({"type": "object"}),
+            input_schema,
+            output_schema,
             vec![],
         ));
     }
@@ -461,7 +461,41 @@ fn mcp_tool_entries() -> Value {
     )
 }
 
-fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
+fn sent_copy_output_schema() -> Value {
+    object(
+        json!({
+            "sent": json!({"type": "boolean", "description": "true when the message was transmitted immediately"}),
+            "message_id": string("SMTP Message-ID when sent immediately"),
+            "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a client-side Sent-folder archive copy"}),
+            "sent_mail_append_skipped_reason": json!({"type": ["string", "null"], "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed"}),
+            "sent_folder": string("Sent folder containing the sent message when resolved"),
+            "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
+            "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+            "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof."}),
+            "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
+            "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. Mailbox hygiene only — not independent delivery or legal proof."}),
+            "status": string("queued, sent, scheduled, drafted, or denied"),
+            "draft_id": string("Local draft id when queued or draft-only"),
+            "to": string("Recipient address when sent"),
+            "subject": string("Subject when sent"),
+            "imap_draft_deleted": json!({"type": "boolean", "description": "Whether a synced IMAP Drafts copy was deleted after send"}),
+            "send_after": string("ISO8601 time the queued send becomes due"),
+            "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Queued-send cooldown in seconds"}),
+            "queued_reason": string("Human-readable queued-send explanation"),
+            "queued_reason_code": string("Stable queued-send reason code"),
+            "send_mode": string("Applied send safety mode when policy was evaluated"),
+            "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason})"}),
+            "in_reply_to": string("In-Reply-To header of the sent message when present"),
+            "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
+            "ui": json!({"type": "object", "description": "Dashboard navigation links"}),
+            "parent_ui": json!({"type": "object", "description": "Dashboard links for the parent message when replying"}),
+            "draft_ui": json!({"type": "object", "description": "Dashboard review links for the draft"})
+        }),
+        json!([]),
+    )
+}
+
+fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
     vec![
         (
             "reply",
@@ -481,6 +515,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid", "body"]),
             ),
+            sent_copy_output_schema(),
         ),
         (
             "create_reply_draft",
@@ -498,6 +533,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "create_forward_draft",
@@ -516,6 +552,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "modify_draft",
@@ -538,6 +575,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["draft_id"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "get_draft",
@@ -547,6 +585,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["draft_id"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "send_draft",
@@ -561,6 +600,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["draft_id"]),
             ),
+            sent_copy_output_schema(),
         ),
         (
             "move_message",
@@ -573,6 +613,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid", "to_folder"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "flag",
@@ -586,6 +627,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid", "action", "flag"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "folders",
@@ -593,6 +635,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 json!({"account": string("Account ID or email address")}),
                 json!([]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "tag",
@@ -606,6 +649,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["uid"]),
             ),
+            json!({"type": "object"}),
         ),
         (
             "contacts",
@@ -620,8 +664,13 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value)> {
                 }),
                 json!(["action"]),
             ),
+            json!({"type": "object"}),
         ),
-        ("accounts", object(json!({}), json!([]))),
+        (
+            "accounts",
+            object(json!({}), json!([])),
+            json!({"type": "object"}),
+        ),
     ]
 }
 

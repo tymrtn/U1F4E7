@@ -511,7 +511,6 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
         "provider_sent_copy": provider_sent_copy,
         "client_appended_copy": client_appended_copy,
-        "copy_source": sent_mail_proof.copy_source,
         "attachments": attachment_summaries(&attachment_snapshots),
         "ui": sent_ui,
     }))
@@ -878,7 +877,6 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
         "provider_sent_copy": provider_sent_copy,
         "client_appended_copy": client_appended_copy,
-        "copy_source": sent_mail_proof.copy_source,
         "attachments": attachment_summaries(&attachment_snapshots),
         "in_reply_to": headers.in_reply_to,
         "ui": sent_ui,
@@ -1607,6 +1605,109 @@ mod tests {
         assert!(
             err.contains("draft_id"),
             "expected draft_id error, got: {err}"
+        );
+    }
+
+    // Regression: MCP send and reply must NOT include a bare top-level
+    // copy_source field. The canonical location is sent_mail.copy_source.
+    // This test validates that the tool_list() contract schemas for reply and
+    // send_draft advertise provider_sent_copy and client_appended_copy.
+    #[test]
+    fn mcp_reply_schema_advertises_sent_copy_source_fields() {
+        let tools = tool_list();
+        let entries = tools["tools"].as_array().expect("tools must be array");
+        let reply = entries
+            .iter()
+            .find(|t| t["name"] == "reply")
+            .expect("reply tool must exist in tool_list");
+
+        // contractSchema must reference the surface which now has an explicit output_schema.
+        assert!(
+            reply.get("contractSchema").is_some(),
+            "reply must have contractSchema"
+        );
+
+        // Verify the contract surface for reply includes the new output fields.
+        let contract = crate::commands::contract::agent_contract();
+        let surfaces = contract["surfaces"].as_array().expect("surfaces");
+        let reply_surface = surfaces
+            .iter()
+            .find(|s| s["name"] == "reply")
+            .expect("reply surface");
+        let out_props = &reply_surface["output_schema"]["properties"];
+        assert!(
+            out_props.get("provider_sent_copy").is_some(),
+            "reply output_schema must advertise provider_sent_copy"
+        );
+        assert!(
+            out_props.get("client_appended_copy").is_some(),
+            "reply output_schema must advertise client_appended_copy"
+        );
+        assert!(
+            out_props.get("sent_mail").is_some(),
+            "reply output_schema must advertise sent_mail (contains copy_source)"
+        );
+        assert!(
+            out_props.get("parent_ui").is_some(),
+            "reply output_schema must allow parent_ui emitted by handle_reply"
+        );
+    }
+
+    #[test]
+    fn mcp_send_draft_schema_advertises_sent_copy_source_fields() {
+        let contract = crate::commands::contract::agent_contract();
+        let surfaces = contract["surfaces"].as_array().expect("surfaces");
+        let send_draft_surface = surfaces
+            .iter()
+            .find(|s| s["name"] == "send_draft")
+            .expect("send_draft surface");
+        let out_props = &send_draft_surface["output_schema"]["properties"];
+        assert!(
+            out_props.get("provider_sent_copy").is_some(),
+            "send_draft output_schema must advertise provider_sent_copy"
+        );
+        assert!(
+            out_props.get("client_appended_copy").is_some(),
+            "send_draft output_schema must advertise client_appended_copy"
+        );
+        assert!(
+            out_props.get("sent_mail").is_some(),
+            "send_draft output_schema must advertise sent_mail (contains copy_source)"
+        );
+        for key in [
+            "to",
+            "subject",
+            "imap_draft_deleted",
+            "draft_ui",
+            "error",
+            "cooldown_seconds",
+        ] {
+            assert!(
+                out_props.get(key).is_some(),
+                "send_draft output_schema must allow actual output key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_send_output_has_no_bare_top_level_copy_source() {
+        // Validate that the MCP send surface output_schema does NOT advertise a
+        // bare top-level copy_source field (it was removed as undocumented).
+        let contract = crate::commands::contract::agent_contract();
+        let surfaces = contract["surfaces"].as_array().expect("surfaces");
+        let send_surface = surfaces
+            .iter()
+            .find(|s| s["name"] == "send")
+            .expect("send surface");
+        let out_props = &send_surface["output_schema"]["properties"];
+        assert!(
+            out_props.get("copy_source").is_none(),
+            "send output_schema must not have bare top-level copy_source (use sent_mail.copy_source)"
+        );
+        // The canonical location must be present.
+        assert!(
+            out_props.get("sent_mail").is_some(),
+            "send output_schema must advertise sent_mail (contains copy_source)"
         );
     }
 }
