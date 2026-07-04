@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-07-04
+
+### Fixed
+
+- Draft and Sent-copy `From` headers now use the same account-name fallback and RFC5322-safe quoting as SMTP sends, so draft/reply/MCP proof copies no longer regress to bare addresses when `display_name` is unset.
+- Sent proof append for `draft send` now runs even when the local draft has no IMAP Drafts UID, so local-only drafts on generic IMAP/SMTP providers can still produce durable Sent-folder proof after SMTP acceptance.
+- Sent append failures now surface stable skipped reasons instead of silently reporting only SMTP success, and draft JSON includes a `sync_status_reason` when a draft is local-only.
+- Folder detection candidates now include lowercase slash layouts such as `INBOX/draft` and `INBOX/sent` used by inbox.eu/martin.fm-style accounts.
+
 ## [0.12.1] — 2026-07-04
 
 ### Fixed

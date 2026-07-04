@@ -237,6 +237,8 @@ pub fn all_candidates_for(canonical_type: &str) -> &'static [&'static str] {
             "Draft",
             "INBOX.Drafts",
             "INBOX/Drafts",
+            // Lowercase slash variants (martin.fm / inbox.eu style)
+            "INBOX/draft",
         ],
         "sent" => &[
             "Sent",
@@ -246,6 +248,11 @@ pub fn all_candidates_for(canonical_type: &str) -> &'static [&'static str] {
             "[Gmail]/Sent Mail",
             "INBOX.Sent",
             "INBOX.Sent Messages",
+            // Slash-hierarchy variants (martin.fm / inbox.eu)
+            "INBOX/Sent",
+            "INBOX/sent",
+            "INBOX/Sent Mail",
+            "INBOX/Sent Messages",
         ],
         "trash" => &[
             "Trash",
@@ -522,5 +529,46 @@ mod tests {
     #[test]
     fn candidates_unknown_type_returns_empty() {
         assert!(all_candidates_for("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn candidates_cover_inbox_slash_lowercase_folders() {
+        // martin.fm / inbox.eu use INBOX/sent, INBOX/draft (lowercase, slash-separated)
+        // These must appear in candidates so detect_sent_folder/detect_drafts_folder
+        // resolve them before the fuzzy fallback.
+        let drafts = all_candidates_for("drafts");
+        assert!(
+            drafts.contains(&"INBOX/draft"),
+            "INBOX/draft must be a drafts candidate; got {drafts:?}"
+        );
+        let sent = all_candidates_for("sent");
+        assert!(
+            sent.contains(&"INBOX/sent"),
+            "INBOX/sent must be a sent candidate; got {sent:?}"
+        );
+        assert!(
+            sent.contains(&"INBOX/Sent"),
+            "INBOX/Sent must be a sent candidate; got {sent:?}"
+        );
+    }
+
+    #[test]
+    fn detect_provider_for_inbox_slash_hierarchy_returns_standard() {
+        // Providers like inbox.eu use INBOX/sent, INBOX/draft (slash, not dot).
+        // detect_provider must return Standard (not Dovecot which uses INBOX. prefix)
+        // so that the candidate fallback path runs for these folders.
+        let folders = vec![
+            "INBOX".to_string(),
+            "INBOX/draft".to_string(),
+            "INBOX/sent".to_string(),
+            "INBOX/Trash".to_string(),
+        ];
+        // slash-hierarchy doesn't match INBOX. prefix → should NOT be Dovecot
+        let provider = detect_provider(&folders);
+        assert_ne!(
+            provider,
+            ProviderType::Dovecot,
+            "INBOX/x (slash) folders must not be mistaken for Dovecot INBOX.x (dot)"
+        );
     }
 }

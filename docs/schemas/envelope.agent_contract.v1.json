@@ -1202,6 +1202,17 @@
             "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, and ui",
             "type": "object"
           },
+          "sent_mail_append_skipped_reason": {
+            "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sent_mail_appended": {
+            "description": "Whether Envelope appended a Sent-folder copy after SMTP because the provider does not auto-save submissions",
+            "type": "boolean"
+          },
           "sent_message_url": {
             "description": "Dashboard URL for the sent message when resolved",
             "type": "string"

@@ -485,12 +485,40 @@ pub(crate) fn threading_from_metadata(
 
 // ─── contextual reply / forward drafts ───────────────────────────────────
 
-/// Build the `From:` header value for an account (display name + address).
-fn account_from_header(creds: &AccountWithCredentials) -> String {
-    if let Some(ref display) = creds.account.display_name {
-        format!("{display} <{}>", creds.account.username)
-    } else {
-        creds.account.username.clone()
+/// Build the `From:` header value using the same precedence as SMTP:
+/// explicit `display_name` → non-empty `account.name` (when not identical to the
+/// email address) → bare email address.
+///
+/// Uses `lettre::message::Mailbox` for RFC5322-safe quoting so names containing
+/// commas or other special characters are quoted correctly.
+pub(crate) fn account_from_header(creds: &AccountWithCredentials) -> String {
+    use lettre::{Address, message::Mailbox};
+
+    let address = creds.account.username.trim();
+    let display_name = creds
+        .account
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            let name = creds.account.name.trim();
+            if !name.is_empty() && !name.eq_ignore_ascii_case(address) {
+                Some(name)
+            } else {
+                None
+            }
+        });
+
+    if let Ok(email) = address.parse::<Address>() {
+        let mbox = Mailbox::new(display_name.map(str::to_string), email);
+        return mbox.to_string();
+    }
+
+    // Fallback for malformed addresses: use raw string concatenation.
+    match display_name {
+        Some(name) => format!("{name} <{address}>"),
+        None => address.to_string(),
     }
 }
 
@@ -1164,6 +1192,7 @@ pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
             "imap_folder": storage.and_then(|s| s.get("imap_folder")).cloned().unwrap_or(serde_json::Value::Null),
             "imap_uid": draft.imap_uid,
             "local_only": !imap_synced,
+            "sync_status_reason": storage.and_then(|s| s.get("sync_status_reason")).cloned().unwrap_or(serde_json::Value::Null),
         },
         "dashboard_path": dashboard_path,
         "dashboard_url": dashboard_url,
@@ -1487,13 +1516,9 @@ pub async fn run_create(
     let attachments = decode_attachments(&attachment_snapshots)?;
 
     // Build RFC822 message for IMAP APPEND
-    let from_addr = if let Some(f) = from {
-        f.to_string()
-    } else if let Some(ref display) = creds.account.display_name {
-        format!("{display} <{}>", creds.account.username)
-    } else {
-        creds.account.username.clone()
-    };
+    let from_addr = from
+        .map(str::to_string)
+        .unwrap_or_else(|| account_from_header(&creds));
 
     let (rfc822, message_id) = build_rfc822_draft(
         &from_addr,
@@ -1633,6 +1658,13 @@ pub async fn run_create(
                 "imap_uid": imap_uid,
                 "imap_folder": if imap_synced { Some(&drafts_folder_name) } else { None },
                 "local_only": !imap_synced,
+                "sync_status_reason": if !imap_synced && has_imap {
+                    Some("imap_sync_failed")
+                } else if !has_imap {
+                    Some("no_imap")
+                } else {
+                    None
+                },
                 "dashboard_path": dashboard_path,
                 "dashboard_url": dashboard_url,
                 "review_url": dashboard_url,
@@ -2025,7 +2057,8 @@ pub(crate) async fn send_existing_draft(
     let mut sent_mail_appended = false;
     let mut sent_mail_append_skipped_reason: Option<&'static str> = None;
 
-    // ── Delete from IMAP Drafts folder + Copy to Sent ──
+    // ── Delete from IMAP Drafts folder ──
+    // Only attempt when the draft had an IMAP UID (otherwise there's nothing to delete).
     if let Some(uid) = imap_uid {
         if !acct.imap_host.is_empty() {
             match imap::connect(&creds).await {
@@ -2041,53 +2074,74 @@ pub(crate) async fn send_existing_draft(
                             drafts_folder
                         );
                     }
-
-                    // Copy to Sent folder only for providers that do not do it
-                    // themselves. Gmail auto-saves SMTP submissions in
-                    // [Gmail]/Sent Mail; appending here creates a visible
-                    // duplicate sent message.
-                    if sent_mail_auto_saved {
-                        sent_mail_append_skipped_reason = Some("provider_auto_saves_sent");
-                    } else {
-                        let from = if let Some(ref display) = creds.account.display_name {
-                            format!("{display} <{}>", creds.account.username)
-                        } else {
-                            creds.account.username.clone()
-                        };
-                        if let Ok((rfc822_bytes, _)) = build_rfc822_full(
-                            &from,
-                            &to_addr,
-                            &subject,
-                            text_body.as_deref(),
-                            html_body.as_deref(),
-                            cc_addr.as_deref(),
-                            in_reply_to.as_deref(),
-                            &references,
-                            Some(&message_id),
-                            &attachments,
-                        ) {
-                            let sent_result = detect_sent_folder(&mut client, &db, &acct.id).await;
-                            if let Ok(Some(sent_folder)) = sent_result {
-                                if let Err(e) = imap::append_message(
-                                    &mut client,
-                                    &sent_folder,
-                                    "(\\Seen)",
-                                    &rfc822_bytes,
-                                )
-                                .await
-                                {
-                                    warn!("failed to copy sent message to {sent_folder}: {e}");
-                                } else {
-                                    sent_mail_appended = true;
-                                }
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     warn!("failed to connect to IMAP to clean up sent draft: {e}");
                 }
             }
+        }
+    }
+
+    // ── Copy to Sent folder ──
+    // Run regardless of whether the draft had an IMAP UID: local-only drafts
+    // (imap_uid = None) can still SMTP-send, and without an explicit Sent append
+    // the message is never visible in Sent on providers that do not auto-save.
+    if acct.imap_host.is_empty() {
+        sent_mail_append_skipped_reason = Some("no_imap");
+    } else if sent_mail_auto_saved {
+        sent_mail_append_skipped_reason = Some("provider_auto_saves_sent");
+    } else {
+        let from = account_from_header(&creds);
+        match build_rfc822_full(
+            &from,
+            &to_addr,
+            &subject,
+            text_body.as_deref(),
+            html_body.as_deref(),
+            cc_addr.as_deref(),
+            in_reply_to.as_deref(),
+            &references,
+            Some(&message_id),
+            &attachments,
+        ) {
+            Err(e) => {
+                warn!("failed to build RFC822 for Sent copy: {e}");
+                sent_mail_append_skipped_reason = Some("rfc822_build_failed");
+            }
+            Ok((rfc822_bytes, _)) => match imap::connect(&creds).await {
+                Err(e) => {
+                    warn!("failed to connect to IMAP for Sent copy: {e}");
+                    sent_mail_append_skipped_reason = Some("imap_connect_failed");
+                }
+                Ok(mut client) => match detect_sent_folder(&mut client, &db, &acct.id).await {
+                    Err(e) => {
+                        warn!("Sent folder detection failed for Sent copy: {e}");
+                        sent_mail_append_skipped_reason = Some("sent_folder_detection_failed");
+                    }
+                    Ok(None) => {
+                        warn!("no Sent folder found — Sent copy skipped");
+                        sent_mail_append_skipped_reason = Some("sent_folder_not_found");
+                    }
+                    Ok(Some(sent_folder)) => {
+                        match imap::append_message(
+                            &mut client,
+                            &sent_folder,
+                            "(\\Seen)",
+                            &rfc822_bytes,
+                        )
+                        .await
+                        {
+                            Err(e) => {
+                                warn!("failed to append Sent copy to {sent_folder}: {e}");
+                                sent_mail_append_skipped_reason = Some("append_failed");
+                            }
+                            Ok(_) => {
+                                sent_mail_appended = true;
+                            }
+                        }
+                    }
+                },
+            },
         }
     }
 
@@ -2365,6 +2419,143 @@ mod tests {
         assert!(msg.contains("multipart/mixed"));
         assert!(msg.contains("hello.txt"));
         assert!(msg.contains("hello attachment") || msg.contains("aGVsbG8gYXR0YWNobWVudA"));
+    }
+
+    // ─── account_from_header / From identity ─────────────────────────────
+
+    fn make_creds(
+        username: &str,
+        display_name: Option<&str>,
+        name: &str,
+    ) -> AccountWithCredentials {
+        use envelope_email_store::models::Account;
+        AccountWithCredentials {
+            account: Account {
+                id: "acct-test".to_string(),
+                name: name.to_string(),
+                username: username.to_string(),
+                domain: String::new(),
+                smtp_host: "smtp.example.com".to_string(),
+                smtp_port: 587,
+                imap_host: "imap.example.com".to_string(),
+                imap_port: 993,
+                smtp_username: None,
+                imap_username: None,
+                display_name: display_name.map(str::to_string),
+                signature_text: None,
+                signature_html: None,
+                created_at: String::new(),
+            },
+            password: "unused".to_string(),
+            smtp_password: None,
+            imap_password: None,
+        }
+    }
+
+    #[test]
+    fn from_header_display_name_wins_over_account_name() {
+        let creds = make_creds("tyler@martin.fm", Some("Display Name"), "Account Name");
+        let from = account_from_header(&creds);
+        assert!(
+            from.contains("Display Name"),
+            "display_name should win: {from}"
+        );
+        assert!(
+            !from.contains("Account Name"),
+            "account name must not appear: {from}"
+        );
+        assert!(
+            from.contains("tyler@martin.fm"),
+            "address must be present: {from}"
+        );
+    }
+
+    #[test]
+    fn from_header_falls_back_to_account_name_when_no_display_name() {
+        let creds = make_creds("tyler@martin.fm", None, "Tyler Martin");
+        let from = account_from_header(&creds);
+        assert!(
+            from.contains("Tyler Martin"),
+            "account name fallback required: {from}"
+        );
+        assert!(
+            from.contains("tyler@martin.fm"),
+            "address must be present: {from}"
+        );
+    }
+
+    #[test]
+    fn from_header_blank_display_name_uses_account_name_fallback() {
+        let creds = make_creds("tyler@martin.fm", Some("  "), "Tyler Martin");
+        let from = account_from_header(&creds);
+        assert!(
+            from.contains("Tyler Martin"),
+            "blank display_name must not suppress name: {from}"
+        );
+    }
+
+    #[test]
+    fn from_header_omits_name_when_account_name_equals_email() {
+        let creds = make_creds("tyler@martin.fm", None, "tyler@martin.fm");
+        let from = account_from_header(&creds);
+        assert!(
+            !from.contains("tyler@martin.fm <tyler@martin.fm>"),
+            "redundant name must not appear: {from}"
+        );
+    }
+
+    #[test]
+    fn from_header_quotes_account_name_with_comma() {
+        let creds = make_creds("tyler@martin.fm", None, "Martin, Tyler");
+        let from = account_from_header(&creds);
+        assert!(
+            from.contains("\"Martin, Tyler\""),
+            "comma in name must be quoted: {from}"
+        );
+    }
+
+    // ─── draft_envelope_json: sync_status_reason ─────────────────────────
+
+    #[test]
+    fn draft_envelope_json_exposes_sync_status_reason_when_local_only() {
+        let draft = envelope_email_store::models::Draft {
+            id: "d1".to_string(),
+            account_id: "acct@example.com".to_string(),
+            status: DraftStatus::Draft,
+            to_addr: "b@example.com".to_string(),
+            cc_addr: None,
+            bcc_addr: None,
+            reply_to: None,
+            subject: Some("Test".to_string()),
+            text_content: Some("hi".to_string()),
+            html_content: None,
+            in_reply_to: None,
+            metadata: Some(serde_json::json!({
+                "storage": {
+                    "imap_synced": false,
+                    "local_only": true,
+                    "sync_status_reason": "imap_sync_failed",
+                }
+            })),
+            attachments: vec![],
+            message_id: None,
+            send_after: None,
+            snoozed_until: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            sent_at: None,
+            created_by: Some("cli".to_string()),
+            imap_uid: None,
+        };
+        let value = draft_envelope_json(&draft);
+        assert_eq!(
+            value["storage"]["local_only"], true,
+            "local_only must be true"
+        );
+        assert_eq!(
+            value["storage"]["sync_status_reason"], "imap_sync_failed",
+            "sync_status_reason must be surfaced in storage block"
+        );
     }
 
     #[test]
