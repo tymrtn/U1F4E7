@@ -2368,6 +2368,13 @@ async function openMessage(uid, accountId = null, folder = null) {
   const effectiveAccountId = accountId || state.currentAccount?.id;
   const effectiveFolder = folder || state.currentFolder || 'INBOX';
   if (!effectiveAccountId) return;
+  // Drafts-folder links should not depend on the read-message endpoint. Local
+  // Envelope drafts may exist even when the backing IMAP message is not cached,
+  // and the desired destination is the editor, not the reader.
+  if (folderMatchesSmart(effectiveFolder, 'drafts')) {
+    await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, null);
+    return;
+  }
   // Show reader immediately with loading state
   $('reader-subject').textContent = 'Loading…';
   $('reader-from').textContent = '';
@@ -2396,13 +2403,6 @@ async function openMessage(uid, accountId = null, folder = null) {
       folder: effectiveFolder,
     });
     state.loadRemoteImages = false;
-    // Messages in a Drafts folder should open as editable drafts, not in the
-    // read-only reader.  Gmail itself does this — opening a draft opens the
-    // composer, not the message view.
-    if (folderMatchesSmart(effectiveFolder, 'drafts')) {
-      await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, state.currentMessage);
-      return;
-    }
     renderReader();
   } catch (e) {
     $('reader-subject').textContent = 'Error';
@@ -2817,9 +2817,6 @@ async function loadDrafts() {
 }
 
 async function openDraftDeepLink(draftId) {
-  state.cockpitStatus = 'loading draft...';
-  state.cockpitMessage = null;
-  renderDrafts();
   try {
     const data = await api(
       'GET',
@@ -2827,9 +2824,8 @@ async function openDraftDeepLink(draftId) {
     );
     state.currentDraft = data.draft;
     upsertDraft(data.draft);
-    state.cockpitStatus = 'draft opened';
     renderDrafts();
-    focusAgentCockpit();
+    openComposerFromDraft(data.draft);
   } catch (e) {
     state.currentDraft = null;
     state.cockpitStatus = 'draft not found';
@@ -2838,17 +2834,14 @@ async function openDraftDeepLink(draftId) {
       text: `Draft "${draftId}" was not found for ${state.currentAccount.username}.`,
     };
     renderDrafts();
-    focusAgentCockpit();
     toast('Draft deep link not found', 'error');
   }
 }
 
 async function openDraftFromMessageLink(accountId, uid, folder, msg) {
-  setCockpitExpanded(true);
-  state.cockpitStatus = 'loading draft...';
-  state.cockpitMessage = null;
-  renderDrafts();
-
+  // The message route briefly opens the reader while fetching; Drafts links
+  // should land in the editor, not leave a read-only message panel behind it.
+  $('reader').classList.remove('show');
   try {
     const data = await api(
       'GET',
@@ -2856,45 +2849,37 @@ async function openDraftFromMessageLink(accountId, uid, folder, msg) {
     );
     state.currentDraft = data.draft;
     upsertDraft(data.draft);
-    state.cockpitStatus = 'draft opened';
     renderDrafts();
-    focusAgentCockpit();
-    toast('Draft review opened in Agent Cockpit', 'success');
+    openComposerFromDraft(data.draft, { accountId, uid, folder });
     return;
   } catch (_) {
+    let draftMessage = msg;
+    if (!draftMessage) {
+      try {
+        const messageData = await api(
+          'GET',
+          `/accounts/${accountId}/messages/${uid}?folder=${encodeURIComponent(folder)}`
+        );
+        const account = accountById(accountId);
+        draftMessage = Object.assign({}, messageData.message, {
+          account_id: accountId,
+          account_username: account?.username || accountId || '',
+          account_display_name: account?.display_name || null,
+          folder,
+        });
+      } catch (messageError) {
+        $('reader-subject').textContent = 'Error';
+        clear($('reader-body'));
+        $('reader-body').appendChild(el('div', { class: 'text-center text-warn py-12', text: messageError.message }));
+        $('reader').classList.add('show');
+        return;
+      }
+    }
     // Some Drafts-folder messages are server-only IMAP drafts rather than
-    // Envelope-created local drafts. Still render a highlighted review card so
-    // a Drafts message link never dumps the operator into a raw message view.
-    state.currentDraft = imapMessageToDraftCard(accountId, uid, folder, msg);
-    upsertDraft(state.currentDraft);
-    state.cockpitStatus = 'IMAP draft opened';
-    state.cockpitMessage = {
-      kind: 'warn',
-      text: 'This draft exists in the mailbox but has no local Envelope draft row yet.',
-    };
-    renderDrafts();
-    focusAgentCockpit();
-    toast('IMAP draft opened in Agent Cockpit', '');
+    // Envelope-created local drafts. Gmail's behavior is still the right model:
+    // opening a Drafts message opens an editable draft composer.
+    openComposerFromImap(draftMessage);
   }
-}
-
-function imapMessageToDraftCard(accountId, uid, folder, msg) {
-  return {
-    id: `imap:${folder}:${uid}`,
-    account_id: accountId,
-    status: 'imap_draft',
-    to_addr: msg?.to_addr || '',
-    cc_addr: msg?.cc_addr || '',
-    bcc_addr: msg?.bcc_addr || '',
-    reply_to: msg?.reply_to || '',
-    subject: msg?.subject || '',
-    text_content: msg?.text_body || '',
-    html_content: msg?.html_body || '',
-    updated_at: msg?.date || '',
-    created_by: 'imap',
-    imap_uid: uid,
-    folder,
-  };
 }
 
 function upsertDraft(draft) {
@@ -3074,14 +3059,23 @@ function openComposer(mode = 'new', parent = null) {
   $('composer').classList.add('show');
 }
 
-function openComposerFromDraft(draft) {
+function openComposerFromDraft(draft, origin = null) {
   openComposer('new');
+  const source = origin || (
+    draft && draft.account_id && draft.imap_uid != null
+      ? { accountId: draft.account_id, uid: draft.imap_uid, folder: draft.folder || 'Drafts' }
+      : null
+  );
+  if (source) {
+    state.composeMode = 'imap-draft';
+    state.composeImapDraft = source;
+  }
   $('composer-to').value = draft.to_addr || '';
   $('composer-cc').value = draft.cc_addr || '';
   $('composer-subject').value = draft.subject || '';
   $('composer-body').value = draft.text_content || draft.html_content || '';
   setBodyFormat(draft.html_content && !draft.text_content ? 'html' : 'text');
-  toast('Draft loaded into composer', 'success');
+  $('composer-title').textContent = 'Edit Draft';
 }
 
 
@@ -3476,14 +3470,9 @@ async function applyDashboardRoute(route = parseDashboardRoute()) {
   if (route.kind === 'rules') {
     $('rules-summary').scrollIntoView({ block: 'start' });
   } else if (route.kind === 'draft') {
-    // Load and render the specific draft directly from its API record so the
-    // detail card appears even when the cockpit aggregate/list is empty,
-    // stale, or still loading. Missing drafts fall through to the existing
-    // not-found cockpit state inside openDraftDeepLink.
-    setCockpitExpanded(true);
-    $('cockpit-drafts-count').scrollIntoView({ block: 'start' });
+    // Draft links are editor links. Behave like Gmail: fetch the draft and open
+    // the composer directly, without steering the operator into Cockpit.
     await openDraftDeepLink(route.draftId);
-    toast('Draft review opened in Agent Cockpit', 'success');
   } else if (route.kind === 'cockpit') {
     $('cockpit-account').scrollIntoView({ block: 'start' });
   }

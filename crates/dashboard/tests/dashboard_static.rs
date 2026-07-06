@@ -108,19 +108,16 @@ fn dashboard_message_deep_links_are_route_first_without_legacy_slug_gate() {
 }
 
 #[test]
-fn dashboard_draft_deep_links_load_the_specific_draft_detail() {
+fn dashboard_draft_deep_links_open_the_editable_draft_composer() {
     // Issue #71: a `/accounts/<id>/drafts/<draft-id>` deep link returned the
-    // SPA shell and scrolled the cockpit, but never loaded the target draft,
-    // so `state.currentDraft` stayed null and nothing reviewable rendered.
+    // SPA shell but did not load the target draft. A draft link should behave
+    // like Gmail: open the actual editable draft composer.
     assert!(
         DASHBOARD_JS
             .contains("kind: 'draft', accountId: decode(match[1]), draftId: decode(match[2])"),
         "draft deep links should parse `/accounts/<id>/drafts/<draft-id>` into a draft route with a draftId"
     );
 
-    // The route applier must call the draft-specific loader with route.draftId
-    // so the detail card is fetched directly from the draft API record rather
-    // than depending on the cockpit aggregate/list being populated.
     let draft_branch_start = DASHBOARD_JS
         .find("} else if (route.kind === 'draft') {")
         .expect("applyDashboardRoute should branch on the draft route kind");
@@ -134,41 +131,30 @@ fn dashboard_draft_deep_links_load_the_specific_draft_detail() {
         "draft route must load the specified draft via openDraftDeepLink(route.draftId)"
     );
     assert!(
+        !draft_branch.contains("setCockpitExpanded")
+            && !draft_branch.contains("scrollIntoView")
+            && !draft_branch.contains("Agent Cockpit"),
+        "draft routes must not steer the operator into Cockpit; they are editor links"
+    );
+    assert!(
         DASHBOARD_JS.contains("loadCockpitPanel: route.kind !== 'draft'"),
-        "draft routes must suppress the aggregate cockpit refresh so it cannot race and overwrite the loaded draft detail"
+        "draft routes must suppress the aggregate cockpit refresh so it cannot race and overwrite the loaded draft"
     );
 
-    // The draft-specific loader must set the detail state and render it, and
-    // must fall back to the clear not-found cockpit state for missing drafts.
     let loader_start = DASHBOARD_JS
         .find("async function openDraftDeepLink(draftId) {")
         .expect("openDraftDeepLink loader should exist");
     let loader_body = &DASHBOARD_JS[loader_start..];
     assert!(
-        loader_body.contains("state.currentDraft = data.draft"),
-        "openDraftDeepLink must populate state.currentDraft from the draft API record"
+        loader_body.contains("state.currentDraft = data.draft")
+            && loader_body.contains("openComposerFromDraft(data.draft)"),
+        "openDraftDeepLink must fetch the draft record and open it in the editable composer"
     );
     assert!(
         loader_body.contains("draft not found"),
-        "openDraftDeepLink must fall back to a clear not-found cockpit state for missing drafts"
+        "openDraftDeepLink must fall back to a clear not-found state for missing drafts"
     );
 
-    // The detail card renders whenever a current draft exists, independent of
-    // whether the cockpit list has any other drafts loaded.
-    assert!(
-        DASHBOARD_JS.contains("if (state.currentDraft) {")
-            && DASHBOARD_JS.contains("renderDraftDetail(state.currentDraft, true)"),
-        "renderDrafts must render the draft detail card whenever state.currentDraft is set"
-    );
-    assert!(
-        DASHBOARD_JS.contains("if (!list) return;")
-            && DASHBOARD_JS.contains("if (status) status.textContent")
-            && DASHBOARD_JS.contains("if (message) {"),
-        "renderDrafts must not no-op just because legacy cockpit status/message nodes are absent from the current dashboard shell"
-    );
-
-    // The SPA route must be preserved: the deep-link boot path applies the
-    // parsed route rather than redirecting away from it.
     assert!(
         DASHBOARD_JS.contains("const routed = await applyDashboardRoute(route)"),
         "draft deep-link boot must apply the parsed SPA route in place"
@@ -176,26 +162,42 @@ fn dashboard_draft_deep_links_load_the_specific_draft_detail() {
 }
 
 #[test]
-fn dashboard_drafts_folder_message_links_prioritize_agent_cockpit_draft() {
+fn dashboard_drafts_folder_message_links_open_the_editable_draft_composer() {
     // Links like `/accounts/<id>/messages/<uid>?folder=[Gmail]/Drafts` are the
-    // shape users get from IMAP-backed Drafts folders. They must resolve to the
-    // reviewable Agent Cockpit draft card instead of opening a raw read-only
-    // message view or only a composer overlay.
+    // shape users get from IMAP-backed Drafts folders. They must open the draft
+    // composer, not a read-only message and not an Agent Cockpit card.
+    let open_message_start = DASHBOARD_JS
+        .find("async function openMessage(uid")
+        .expect("openMessage should exist");
+    let open_message = &DASHBOARD_JS[open_message_start..];
+    let draft_branch = open_message
+        .find("if (folderMatchesSmart(effectiveFolder, 'drafts'))")
+        .expect("openMessage should special-case Drafts folders");
+    let message_fetch = open_message
+        .find("`/accounts/${effectiveAccountId}/messages/${uid}")
+        .expect("openMessage should still fetch normal messages");
     assert!(
-        DASHBOARD_JS.contains("await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, state.currentMessage)"),
-        "message deep links whose folder is Drafts must use the draft-prioritizing loader"
+        draft_branch < message_fetch
+            && DASHBOARD_JS.contains(
+                "await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, null)"
+            ),
+        "Drafts-folder message links must resolve local drafts before trying the read-message endpoint"
     );
     assert!(
         DASHBOARD_JS.contains("/drafts/by-imap-uid/")
             && DASHBOARD_JS.contains("state.currentDraft = data.draft")
-            && DASHBOARD_JS.contains("renderDrafts()")
-            && DASHBOARD_JS.contains("focusAgentCockpit()"),
-        "Drafts-folder message links should map IMAP UID to a local draft, render it highlighted, and focus Agent Cockpit"
+            && DASHBOARD_JS
+                .contains("openComposerFromDraft(data.draft, { accountId, uid, folder })"),
+        "Drafts-folder message links should map IMAP UID to a local draft and open the editable composer"
     );
     assert!(
-        DASHBOARD_JS.contains("function imapMessageToDraftCard")
-            && DASHBOARD_JS.contains("status: 'imap_draft'"),
-        "server-only IMAP drafts should still render as a highlighted draft card fallback"
+        DASHBOARD_JS.contains("openComposerFromImap(draftMessage)"),
+        "server-only IMAP drafts should fall back to the same editable draft composer"
+    );
+    assert!(
+        DASHBOARD_JS.contains("const messageData = await api(")
+            && DASHBOARD_JS.contains("draftMessage = Object.assign({}, messageData.message"),
+        "server-only IMAP fallback may fetch the message only after local draft resolution misses"
     );
 }
 
