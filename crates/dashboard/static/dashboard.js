@@ -135,6 +135,9 @@ function resolveAccountSlug(slug) {
 
 function dashboardPathForDraft(draft) {
   const accountId = draft.account_id || (state.currentAccount && state.currentAccount.id);
+  if (draft && draft.imap_uid && draft.folder) {
+    return `/accounts/${encodeURIComponent(accountId)}/messages/${encodeURIComponent(draft.imap_uid)}?folder=${encodeURIComponent(draft.folder)}`;
+  }
   if (!accountId || !draft.id) return '#';
   return `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draft.id)}`;
 }
@@ -2397,7 +2400,7 @@ async function openMessage(uid, accountId = null, folder = null) {
     // read-only reader.  Gmail itself does this — opening a draft opens the
     // composer, not the message view.
     if (folderMatchesSmart(effectiveFolder, 'drafts')) {
-      openComposerFromImap(state.currentMessage);
+      await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, state.currentMessage);
       return;
     }
     renderReader();
@@ -2840,6 +2843,60 @@ async function openDraftDeepLink(draftId) {
   }
 }
 
+async function openDraftFromMessageLink(accountId, uid, folder, msg) {
+  setCockpitExpanded(true);
+  state.cockpitStatus = 'loading draft...';
+  state.cockpitMessage = null;
+  renderDrafts();
+
+  try {
+    const data = await api(
+      'GET',
+      `/accounts/${accountId}/drafts/by-imap-uid/${encodeURIComponent(uid)}`
+    );
+    state.currentDraft = data.draft;
+    upsertDraft(data.draft);
+    state.cockpitStatus = 'draft opened';
+    renderDrafts();
+    focusAgentCockpit();
+    toast('Draft review opened in Agent Cockpit', 'success');
+    return;
+  } catch (_) {
+    // Some Drafts-folder messages are server-only IMAP drafts rather than
+    // Envelope-created local drafts. Still render a highlighted review card so
+    // a Drafts message link never dumps the operator into a raw message view.
+    state.currentDraft = imapMessageToDraftCard(accountId, uid, folder, msg);
+    upsertDraft(state.currentDraft);
+    state.cockpitStatus = 'IMAP draft opened';
+    state.cockpitMessage = {
+      kind: 'warn',
+      text: 'This draft exists in the mailbox but has no local Envelope draft row yet.',
+    };
+    renderDrafts();
+    focusAgentCockpit();
+    toast('IMAP draft opened in Agent Cockpit', '');
+  }
+}
+
+function imapMessageToDraftCard(accountId, uid, folder, msg) {
+  return {
+    id: `imap:${folder}:${uid}`,
+    account_id: accountId,
+    status: 'imap_draft',
+    to_addr: msg?.to_addr || '',
+    cc_addr: msg?.cc_addr || '',
+    bcc_addr: msg?.bcc_addr || '',
+    reply_to: msg?.reply_to || '',
+    subject: msg?.subject || '',
+    text_content: msg?.text_body || '',
+    html_content: msg?.html_body || '',
+    updated_at: msg?.date || '',
+    created_by: 'imap',
+    imap_uid: uid,
+    folder,
+  };
+}
+
 function upsertDraft(draft) {
   if (!draft || !draft.id) return;
   const idx = state.drafts.findIndex(d => d.id === draft.id);
@@ -2926,6 +2983,8 @@ function renderDraftDetail(draft, highlighted = false) {
   addDraftMeta(meta, 'Cc', draft.cc_addr);
   addDraftMeta(meta, 'Bcc', draft.bcc_addr);
   addDraftMeta(meta, 'Reply-To', draft.reply_to);
+  addDraftMeta(meta, 'Folder', draft.folder);
+  addDraftMeta(meta, 'IMAP UID', draft.imap_uid);
   addDraftMeta(meta, 'Created by', draft.created_by);
   addDraftMeta(meta, 'Updated', draft.updated_at);
   addDraftMeta(meta, 'Send after', draft.send_after);

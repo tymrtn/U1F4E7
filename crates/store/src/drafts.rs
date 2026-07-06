@@ -88,6 +88,33 @@ impl Database {
         Ok(draft)
     }
 
+    /// Find the active local draft that corresponds to an IMAP Drafts-folder UID.
+    ///
+    /// Dashboard links often arrive as `/messages/<imap_uid>?folder=<Drafts>`
+    /// because IMAP clients identify the server-side draft by UID. Envelope's
+    /// review surface, however, is the local draft row. This lookup lets the
+    /// dashboard prioritize the reviewable local draft instead of showing a raw
+    /// read-only message/composer detour.
+    pub fn get_draft_by_imap_uid(&self, account_id: &str, imap_uid: u32) -> Result<Option<Draft>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to, subject,
+                    text_content, html_content, in_reply_to, metadata, attachments, message_id,
+                    send_after, snoozed_until, created_at, updated_at, sent_at, created_by,
+                    imap_uid
+             FROM drafts
+             WHERE account_id = ?1
+               AND imap_uid = ?2
+               AND status IN ('draft', 'pending_review', 'blocked')
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )?;
+
+        let draft = stmt
+            .query_row(params![account_id, imap_uid as i64], Self::map_draft)
+            .optional()?;
+        Ok(draft)
+    }
+
     pub fn list_drafts(
         &self,
         account_id: &str,
@@ -518,6 +545,46 @@ mod tests {
         db.update_draft_imap_uid(&draft.id, 42).unwrap();
         let fetched = db.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(fetched.imap_uid, Some(42));
+    }
+
+    #[test]
+    fn get_draft_by_imap_uid_prioritizes_active_local_draft() {
+        let db = setup();
+        let active = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Active"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&active.id, 38103).unwrap();
+
+        let discarded = db
+            .create_draft(
+                "acc1",
+                "old@test.com",
+                Some("Old"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&discarded.id, 38103).unwrap();
+        db.discard_draft(&discarded.id).unwrap();
+
+        let found = db.get_draft_by_imap_uid("acc1", 38103).unwrap().unwrap();
+        assert_eq!(found.id, active.id);
+        assert_eq!(found.imap_uid, Some(38103));
+        assert!(db.get_draft_by_imap_uid("acc1", 999).unwrap().is_none());
     }
 
     #[test]

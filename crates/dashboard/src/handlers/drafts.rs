@@ -132,6 +132,50 @@ pub async fn show(
     .into_response()
 }
 
+pub async fn show_by_imap_uid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, imap_uid)): Path<(String, u32)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    let account = match resolve_account(&db, &account_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => return (StatusCode::NOT_FOUND, "account not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+    };
+
+    let draft = match db.get_draft_by_imap_uid(&account.id, imap_uid) {
+        Ok(Some(draft)) => draft,
+        Ok(None) => return (StatusCode::NOT_FOUND, "draft not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+    };
+
+    let dashboard_path = draft_dashboard_path(&account.id, &draft.id);
+    let dashboard_url = draft_dashboard_url(&headers, &account.id, &draft.id);
+
+    Json(json!({
+        "draft": draft,
+        "account": account,
+        "dashboard_path": dashboard_path,
+        "dashboard_url": dashboard_url,
+        "review_url": dashboard_url,
+        "source": {
+            "kind": "imap_uid",
+            "imap_uid": imap_uid,
+        },
+        "metadata": {
+            "dashboard_path": dashboard_path,
+            "dashboard_url": dashboard_url,
+            "review_url": dashboard_url,
+        },
+    }))
+    .into_response()
+}
+
 fn resolve_account(db: &Database, account_id: &str) -> Result<Option<Account>, StoreError> {
     if let Some(account) = db.get_account(account_id)? {
         return Ok(Some(account));

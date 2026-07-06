@@ -176,6 +176,30 @@ fn dashboard_draft_deep_links_load_the_specific_draft_detail() {
 }
 
 #[test]
+fn dashboard_drafts_folder_message_links_prioritize_agent_cockpit_draft() {
+    // Links like `/accounts/<id>/messages/<uid>?folder=[Gmail]/Drafts` are the
+    // shape users get from IMAP-backed Drafts folders. They must resolve to the
+    // reviewable Agent Cockpit draft card instead of opening a raw read-only
+    // message view or only a composer overlay.
+    assert!(
+        DASHBOARD_JS.contains("await openDraftFromMessageLink(effectiveAccountId, uid, effectiveFolder, state.currentMessage)"),
+        "message deep links whose folder is Drafts must use the draft-prioritizing loader"
+    );
+    assert!(
+        DASHBOARD_JS.contains("/drafts/by-imap-uid/")
+            && DASHBOARD_JS.contains("state.currentDraft = data.draft")
+            && DASHBOARD_JS.contains("renderDrafts()")
+            && DASHBOARD_JS.contains("focusAgentCockpit()"),
+        "Drafts-folder message links should map IMAP UID to a local draft, render it highlighted, and focus Agent Cockpit"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function imapMessageToDraftCard")
+            && DASHBOARD_JS.contains("status: 'imap_draft'"),
+        "server-only IMAP drafts should still render as a highlighted draft card fallback"
+    );
+}
+
+#[test]
 fn dashboard_phase1_shell_uses_three_pane_mail_layout() {
     assert!(
         DASHBOARD_HTML.contains("class=\"mail-shell\"")

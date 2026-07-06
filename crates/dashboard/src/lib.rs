@@ -303,6 +303,10 @@ fn dashboard_router(state: AppState) -> Router {
         // Drafts
         .route("/accounts/{id}/drafts", get(handlers::drafts::list))
         .route(
+            "/accounts/{id}/drafts/by-imap-uid/{imap_uid}",
+            get(handlers::drafts::show_by_imap_uid),
+        )
+        .route(
             "/accounts/{id}/drafts/{draft_id}",
             get(handlers::drafts::show),
         )
@@ -845,6 +849,7 @@ mod tests {
                 Some("agent"),
             )
             .unwrap();
+        db.update_draft_imap_uid(&draft.id, 38103).unwrap();
         let other_draft = db
             .create_draft(
                 "acc2",
@@ -1099,6 +1104,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn drafts_by_imap_uid_endpoint_resolves_to_reviewable_local_draft() {
+        let (state, draft_id, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/accounts/editor@spainexpat.com/drafts/by-imap-uid/38103")
+                    .header("host", "localhost:1111")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["draft"]["id"], draft_id);
+        assert_eq!(json["draft"]["imap_uid"], 38103);
+        assert_eq!(json["source"]["kind"], "imap_uid");
+        assert_eq!(
+            json["dashboard_path"],
+            format!("/accounts/acc1/drafts/{draft_id}")
+        );
     }
 
     // ── Dashboard authentication (tailnet exposure guard) ────────────────
