@@ -149,12 +149,37 @@ function focusAgentCockpit() {
   panel.focus({ preventScroll: true });
 }
 
+// ── CSRF token (double-submit) ─────────────────────────────────────
+// Mutating /api requests that are NOT authenticated by a bearer token (open
+// loopback mode, or a tailnet identity behind `tailscale serve`) must echo a
+// CSRF token in the X-Envelope-CSRF header matching the cookie the server set.
+let csrfToken = null;
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH']);
+
+async function primeCsrf() {
+  try {
+    const res = await fetch('/api/csrf', { headers: { 'Accept': 'application/json' } });
+    if (res.ok) {
+      const data = await res.json();
+      csrfToken = data && data.token ? data.token : null;
+    }
+  } catch (e) {
+    // Non-fatal: mutating calls will retry priming on demand.
+    csrfToken = null;
+  }
+  return csrfToken;
+}
+
 // ── Fetch helper ───────────────────────────────────────────────────
 async function api(method, path, body) {
   const opts = { method, headers: { 'Accept': 'application/json' } };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
+  }
+  if (MUTATING_METHODS.has(method)) {
+    if (!csrfToken) await primeCsrf();
+    if (csrfToken) opts.headers['X-Envelope-CSRF'] = csrfToken;
   }
   const res = await fetch('/api' + path, opts);
   const text = await res.text();
@@ -3481,6 +3506,7 @@ async function applyDashboardRoute(route = parseDashboardRoute()) {
 
 // ── Boot ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+  await primeCsrf();
   state.route = parseDashboardRoute(window.location.pathname);
   wireEvents();
   setCockpitExpanded(false);

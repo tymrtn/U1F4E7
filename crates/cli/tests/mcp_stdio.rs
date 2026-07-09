@@ -122,6 +122,113 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
 }
 
 #[test]
+fn mcp_content_tools_advertise_untrusted_trust_boundary() {
+    // The content-returning MCP tools (read, inbox, search) must document that
+    // their results are wrapped in the untrusted-content trust envelope, and
+    // tools that do not return external email content must NOT. This asserts the
+    // advertised contract via tools/list without touching any mailbox.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    write_framed(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "envelope-test", "version": "0" }
+            }
+        }),
+    );
+    let _init = read_framed(&mut stdout);
+
+    write_framed(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+    let tools = read_framed(&mut stdout);
+    let entries = tools["result"]["tools"].as_array().expect("tools array");
+
+    let description_of = |name: &str| -> String {
+        entries
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} must exist"))["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    for wrapped in ["read", "inbox", "search"] {
+        let desc = description_of(wrapped);
+        assert!(
+            desc.contains("UNTRUSTED") && desc.contains("_envelope_trust"),
+            "wrapped tool {wrapped} description must document the untrusted trust envelope, got: {desc}"
+        );
+    }
+    for unwrapped in ["folders", "accounts"] {
+        let desc = description_of(unwrapped);
+        assert!(
+            !desc.contains("_envelope_trust"),
+            "unwrapped tool {unwrapped} description must not advertise the trust envelope, got: {desc}"
+        );
+    }
+
+    drop(stdin);
+    child.wait().expect("wait for mcp process");
+}
+
+#[test]
+fn contract_export_declares_untrusted_trust_model() {
+    // The additive trust_model block must describe the wrapper for MCP consumers.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let output = Command::new(envelope_bin())
+        .arg("contract")
+        .env("HOME", temp.path())
+        .output()
+        .expect("run contract");
+    assert!(output.status.success());
+    let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
+
+    // Contract stays v1 (additive change only).
+    assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+
+    let untrusted = &contract["trust_model"]["untrusted_content"];
+    assert_eq!(untrusted["marker_key"], "_envelope_trust");
+    assert_eq!(untrusted["marker_value"], "untrusted-content");
+    assert_eq!(untrusted["warning_key"], "_warning");
+    assert_eq!(untrusted["content_key"], "content");
+    let wrapped = untrusted["wrapped_tools"]
+        .as_array()
+        .expect("wrapped_tools array");
+    for name in ["inbox", "read", "search"] {
+        assert!(
+            wrapped.iter().any(|t| t == name),
+            "trust_model must list {name} as wrapped"
+        );
+    }
+    assert!(
+        untrusted["applies_to"]
+            .as_array()
+            .expect("applies_to array")
+            .iter()
+            .any(|c| c == "mcp"),
+        "trust_model must apply to mcp"
+    );
+}
+
+#[test]
 fn mcp_config_includes_runtime_snippets_and_draft_only_safety() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let output = Command::new(envelope_bin())

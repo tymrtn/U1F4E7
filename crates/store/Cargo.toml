@@ -29,10 +29,21 @@ argon2.workspace = true
 rand.workspace = true
 base64.workspace = true
 
-# OS keychain (optional — needed for --credential-store keychain)
-keyring = { workspace = true, optional = true }
+# OS keychain (optional — needed for --credential-store keychain).
+# Base declaration: optional, no platform features here.
+# Platform features are layered in via [target.'cfg(...)'.dependencies] below.
+keyring = { version = "3", optional = true }
 dirs-next.workspace = true
 
 # Machine identity for file-based credential store
 hostname = "0.4"
 whoami = "1"
+
+# macOS: use the native Keychain API
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"], optional = true }
+
+# Linux: async-secret-service uses zbus (pure-Rust D-Bus — no system libdbus link).
+# crypto-rust avoids OpenSSL. tokio feature matches our async runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "tokio"], optional = true }

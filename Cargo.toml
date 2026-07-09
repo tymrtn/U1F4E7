@@ -39,7 +39,7 @@ mail-parser = "0.9"
 mail-builder = "0.3"
 
 # Crypto & credentials
-keyring = { version = "3", features = ["apple-native"] }
+# keyring is declared per-crate with target-conditional features (see crates/store/Cargo.toml)
 aes-gcm = "0.10"
 argon2 = "0.5"
 sha2 = "0.10"

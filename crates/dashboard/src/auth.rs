@@ -143,22 +143,32 @@ impl AuthConfig {
             return true;
         }
 
-        let token_ok = match (&self.token, presented_token(headers)) {
+        self.bearer_authorized(headers) || self.identity_authorized(headers)
+    }
+
+    /// True when a *bearer token* (Authorization or X-Envelope-Token) matched.
+    ///
+    /// Used by CSRF enforcement: a browser cannot attach these headers
+    /// cross-site, so a valid bearer proves same-origin intent and exempts the
+    /// request from the double-submit check. Returns false in open mode — an
+    /// unenforced request never "authorized via bearer".
+    pub fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
+        match (&self.token, presented_token(headers)) {
             (Some(expected), Some(presented)) => {
                 constant_time_eq(expected.as_bytes(), presented.as_bytes())
             }
             _ => false,
-        };
+        }
+    }
 
-        let identity_ok = !self.tailscale_allow.is_empty()
+    fn identity_authorized(&self, headers: &HeaderMap) -> bool {
+        !self.tailscale_allow.is_empty()
             && header_str(headers, TAILSCALE_USER_LOGIN)
                 .map(|login| {
                     self.tailscale_allow
                         .contains(&login.trim().to_ascii_lowercase())
                 })
-                .unwrap_or(false);
-
-        token_ok || identity_ok
+                .unwrap_or(false)
     }
 }
 
@@ -198,7 +208,7 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
 /// Length-safe constant-time byte comparison. Folds the length difference into
 /// the accumulator and scans the longer input so timing does not reveal how many
 /// leading bytes matched.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u32;
     let n = a.len().max(b.len());
     for i in 0..n {
@@ -209,15 +219,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Request extension marker inserted by [`require_auth`] when the request was
+/// authorized by a valid *bearer token* (as opposed to Tailscale identity or
+/// open loopback mode). CSRF enforcement reads it to exempt bearer clients,
+/// which cannot be driven cross-site by a browser.
+#[derive(Clone, Copy, Debug)]
+pub struct BearerAuthenticated;
+
 /// Axum middleware enforcing [`AuthConfig`] on protected `/api` routes.
 ///
 /// Returns `401` with a stable JSON body + `WWW-Authenticate: Bearer` when the
-/// request is unauthorized. Passes through unchanged in open loopback mode.
-pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if state.auth.authorize(request.headers()) {
-        return next.run(request).await;
+/// request is unauthorized. Passes through unchanged in open loopback mode. When
+/// a valid bearer token authorized the request, inserts [`BearerAuthenticated`]
+/// into the request extensions so the downstream CSRF layer can exempt it.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !state.auth.authorize(request.headers()) {
+        return unauthorized().into_response();
     }
-    unauthorized().into_response()
+    if state.auth.bearer_authorized(request.headers()) {
+        request.extensions_mut().insert(BearerAuthenticated);
+    }
+    next.run(request).await
 }
 
 fn unauthorized() -> impl IntoResponse {

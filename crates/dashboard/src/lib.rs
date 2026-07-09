@@ -17,6 +17,7 @@
 
 pub mod assets;
 pub mod auth;
+pub mod csrf;
 pub mod handlers;
 pub mod state;
 mod ui_paths;
@@ -224,7 +225,11 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("server error: {e}"))
 }
 
-fn dashboard_router(state: AppState) -> Router {
+/// Build the dashboard router (HTML shell, static assets, and the `/api`
+/// surface) for a given [`AppState`]. Public for integration tests; production
+/// serving goes through [`serve_with_config`], which also attaches CORS.
+#[doc(hidden)]
+pub fn dashboard_router(state: AppState) -> Router {
     // Everything under here mutates or reads real mailbox data and is guarded by
     // the auth middleware when auth is enforced. `/api/health` is deliberately
     // kept OUT of this sub-router so an unauthenticated liveness probe still
@@ -344,6 +349,15 @@ fn dashboard_router(state: AppState) -> Router {
         )
         // Stats
         .route("/stats", get(handlers::stats::get))
+        // CSRF token mint. Inside the protected router so it shares the auth
+        // gate, but GET is never CSRF-checked so it is always reachable to the
+        // authorized frontend.
+        .route("/csrf", get(csrf::issue))
+        // CSRF enforcement on mutating methods. Layered BEFORE `require_auth`
+        // below so that, at request time, `require_auth` is the OUTER layer:
+        // it runs first, authorizes, and records `BearerAuthenticated`, then
+        // this inner CSRF layer reads that extension to exempt bearer clients.
+        .route_layer(axum::middleware::from_fn(csrf::require_csrf))
         // Enforce auth on every protected route (no-op in open loopback mode).
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
