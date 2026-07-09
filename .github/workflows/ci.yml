@@ -44,6 +44,45 @@ jobs:
       - name: Test all crates
         run: cargo test --all
 
+  linux-smoke:
+    name: Linux smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-smoke-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-smoke-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --bin envelope
+
+      - name: Smoke — version flag exits 0
+        run: ./target/release/envelope --version
+
+      - name: Smoke — quickstart --skip-network exits 2 (no account configured)
+        # Exit code 2 = PhaseName::Account failure — the expected outcome on a
+        # bare CI runner with no Envelope config directory or database.
+        # The paths phase (exit 1) runs first but succeeds because HOME is set.
+        # --skip-network suppresses the IMAP phases so we never reach exit 3/4.
+        run: |
+          ./target/release/envelope quickstart --skip-network --json; STATUS=$?
+          if [ "$STATUS" -ne 2 ]; then
+            echo "Expected exit code 2 (no_account_configured), got $STATUS" >&2
+            exit 1
+          fi
+          echo "Got expected exit code 2"
+
   security-grep:
     name: Governor architecture guard
     runs-on: ubuntu-latest

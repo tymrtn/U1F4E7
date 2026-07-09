@@ -1,0 +1,35 @@
+# Envelope IMAP IDLE watcher — one instance per account.
+# Install:  systemctl --user enable --now envelope-watch@you@example.com.service
+# (systemd escapes @ in instance names; see dist/systemd/README.md for details)
+#
+# Passphrase setup (once):
+#   install -m 600 /dev/null ~/.config/envelope-email/passphrase
+#   printf '%s' 'your-passphrase' > ~/.config/envelope-email/passphrase
+#
+[Unit]
+Description=Envelope mail watcher — account %i
+Documentation=https://github.com/tymrtn/U1F4E7
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/envelope watch --account %i --run-rules
+
+# Passphrase via systemd credentials (kernel-enforced 0600; trailing newline stripped).
+# The credential is exposed at ${CREDENTIALS_DIRECTORY}/envelope-passphrase.
+# envelope reads ENVELOPE_MASTER_PASSPHRASE_FILE and loads the file at that path.
+LoadCredential=envelope-passphrase:%h/.config/envelope-email/passphrase
+Environment=ENVELOPE_MASTER_PASSPHRASE_FILE=%d/envelope-passphrase
+
+Restart=on-failure
+RestartSec=30
+# Back off to 5 minutes over 5 steps after repeated failures (e.g. server-side IDLE ban)
+RestartSteps=5
+RestartMaxDelaySec=300
+
+# Resource limits: keep it lean — this is a long-running idle connection
+MemoryHigh=64M
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

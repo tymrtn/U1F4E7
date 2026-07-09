@@ -6,12 +6,15 @@
 //! Implements the MCP stdio transport: reads JSON-RPC requests from stdin,
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
+use crate::commands::agent_context::{self, AgentContext};
 use crate::commands::attachments::{
     attachment_summaries, decode_attachments, snapshot_attachments,
 };
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
 use crate::commands::drafts::sent_mail_proof_json;
-use crate::commands::governor_gate::{account_domain, gate_and_record, governor_request};
+use crate::commands::governor_gate::{
+    account_domain, gate_and_record_with_agent, governor_request,
+};
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::outbound::{
@@ -145,27 +148,78 @@ fn wrap_untrusted(value: Value) -> Value {
 
 // ── Tool dispatch ───────────────────────────────────────────────────
 
+/// The folder-selecting parameter for a tool call, used for policy folder checks.
+/// `move_message` names its target folder `to_folder`; the rest use `folder`.
+/// Tools without any folder concept return `None` (folder check skipped).
+fn tool_folder<'a>(tool_name: &str, params: &'a Value) -> Option<&'a str> {
+    match tool_name {
+        "move_message" => params.get("to_folder").and_then(|v| v.as_str()),
+        "accounts"
+        | "folders"
+        | "contacts"
+        | "get_draft"
+        | "modify_draft"
+        | "create_forward_draft"
+        | "send" => None,
+        _ => params.get("folder").and_then(|v| v.as_str()),
+    }
+}
+
+/// Resolve the account string a policy check should be evaluated against. Uses
+/// the tool's `account` param verbatim when supplied (case-sensitive, matching
+/// the transport allow-list); otherwise falls back to the configured default
+/// account id so the check runs against a concrete account rather than nothing.
+fn policy_account(params: &Value) -> String {
+    if let Some(account) = params.get("account").and_then(|v| v.as_str()) {
+        return account.to_string();
+    }
+    Database::open_default()
+        .ok()
+        .and_then(|db| db.default_account().ok().flatten())
+        .map(|a| a.id)
+        .unwrap_or_default()
+}
+
+/// Authorize a tool call against the agent policy when a context is present.
+/// Anonymous sessions (`None`) authorize everything, preserving today's behavior.
+/// Denials serialize the stable `{code, reason}` object as the tool error string.
+fn authorize_tool_call(
+    ctx: Option<&AgentContext>,
+    tool_name: &str,
+    params: &Value,
+) -> Result<(), String> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    let account = policy_account(params);
+    let folder = tool_folder(tool_name, params);
+    ctx.authorize_tool(tool_name, &account, folder)
+        .map_err(|denial| denial.to_json().to_string())
+}
+
 async fn handle_tool_call(
     tool_name: &str,
     params: &Value,
     backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
 ) -> Result<Value, String> {
+    authorize_tool_call(ctx, tool_name, params)?;
     match tool_name {
         "accounts" => handle_accounts(backend).await,
         "inbox" => handle_inbox(params, backend).await,
         "read" => handle_read(params, backend).await,
         "search" => handle_search(params, backend).await,
-        "send" => handle_send(params, backend).await,
-        "reply" => handle_reply(params, backend).await,
+        "send" => handle_send(params, backend, ctx).await,
+        "reply" => handle_reply(params, backend, ctx).await,
         "create_reply_draft" => handle_create_reply_draft(params, backend).await,
         "create_forward_draft" => handle_create_forward_draft(params, backend).await,
         "modify_draft" => handle_modify_draft(params, backend).await,
         "get_draft" => handle_get_draft(params, backend).await,
-        "send_draft" => handle_send_draft(params, backend).await,
-        "move_message" => handle_move(params, backend).await,
-        "flag" => handle_flag(params, backend).await,
+        "send_draft" => handle_send_draft(params, backend, ctx).await,
+        "move_message" => handle_move(params, backend, ctx).await,
+        "flag" => handle_flag(params, backend, ctx).await,
         "folders" => handle_folders(params, backend).await,
-        "tag" => handle_tag(params, backend).await,
+        "tag" => handle_tag(params, backend, ctx).await,
         "contacts" => handle_contacts(params, backend).await,
         _ => Err(format!("unknown tool: {tool_name}")),
     }
@@ -279,7 +333,11 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
     )))
 }
 
-async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_send(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let to = params
         .get("to")
         .and_then(|v| v.as_str())
@@ -303,6 +361,8 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
+    // Clamp the requested mode to the agent policy ceiling (never widens).
+    let send_mode = clamp_mode(ctx, send_mode);
     let confirm_send = params
         .get("confirm_send")
         .and_then(|v| v.as_bool())
@@ -338,7 +398,14 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
     };
 
     let decision = evaluate(send_mode, &policy_input);
-    record_send_policy_event(&db, &creds.account.id, send_mode, &decision, &policy_input);
+    record_send_policy_event(
+        &db,
+        &creds.account.id,
+        send_mode,
+        &decision,
+        &policy_input,
+        agent_context::agent_id_of(ctx),
+    );
 
     match decision {
         SendPolicyDecision::Allowed => {}
@@ -456,7 +523,12 @@ async fn handle_send(params: &Value, backend: CredentialBackend) -> Result<Value
         &attachments,
         false,
     );
-    let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
+    let gov_outcome = gate_and_record_with_agent(
+        &db,
+        &creds.account.id,
+        &gov_req,
+        agent_context::agent_id_of(ctx),
+    );
     if !gov_outcome.allowed {
         return Err(json!({
             "status": "blocked",
@@ -542,6 +614,7 @@ fn record_send_policy_event(
     mode: SendMode,
     decision: &SendPolicyDecision,
     input: &SendPolicyInput<'_>,
+    agent_id: Option<&str>,
 ) {
     let audit = audit_event_for(mode, decision, input);
     let now = chrono::Utc::now().to_rfc3339();
@@ -561,7 +634,16 @@ fn record_send_policy_event(
         acked_at: Some(now.clone()),
         created_at: now,
     };
-    let _ = db.insert_event(&event);
+    let _ = db.insert_event_with_agent(&event, agent_id);
+}
+
+/// Clamp a requested send mode to the agent policy ceiling. Anonymous sessions
+/// (`None`) return the requested mode unchanged.
+fn clamp_mode(ctx: Option<&AgentContext>, requested: SendMode) -> SendMode {
+    match ctx {
+        Some(ctx) => ctx.clamp_send_mode(requested),
+        None => requested,
+    }
 }
 
 fn required_str<'a>(params: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -602,7 +684,11 @@ fn required_uid(params: &Value) -> Result<u32, String> {
         .ok_or_else(|| "uid is required".to_string())
 }
 
-async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_reply(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let uid = params
         .get("uid")
         .and_then(|v| v.as_u64())
@@ -629,6 +715,8 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
+    // Clamp the requested mode to the agent policy ceiling (never widens).
+    let send_mode = clamp_mode(ctx, send_mode);
     let confirm_send = params
         .get("confirm_send")
         .and_then(|v| v.as_bool())
@@ -684,7 +772,14 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         allow_recipients: &allow_recipients,
     };
     let decision = evaluate(send_mode, &policy_input);
-    record_send_policy_event(&db, &creds.account.id, send_mode, &decision, &policy_input);
+    record_send_policy_event(
+        &db,
+        &creds.account.id,
+        send_mode,
+        &decision,
+        &policy_input,
+        agent_context::agent_id_of(ctx),
+    );
 
     match decision {
         SendPolicyDecision::Allowed => {}
@@ -824,7 +919,12 @@ async fn handle_reply(params: &Value, backend: CredentialBackend) -> Result<Valu
         &attachments,
         true,
     );
-    let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
+    let gov_outcome = gate_and_record_with_agent(
+        &db,
+        &creds.account.id,
+        &gov_req,
+        agent_context::agent_id_of(ctx),
+    );
     if !gov_outcome.allowed {
         return Err(json!({
             "status": "blocked",
@@ -1027,7 +1127,11 @@ async fn handle_get_draft(params: &Value, _backend: CredentialBackend) -> Result
     Ok(crate::commands::drafts::draft_envelope_json(&draft))
 }
 
-async fn handle_send_draft(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_send_draft(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let id = required_str(params, "draft_id")?;
     let account_arg = optional_str(params, "account");
     let confirm_send = params
@@ -1043,6 +1147,53 @@ async fn handle_send_draft(params: &Value, backend: CredentialBackend) -> Result
                 "reason": "send_draft requires confirm_send=true in MCP agent contexts"
             }
         }));
+    }
+
+    // ── Agent policy ceiling (never widens) ──
+    // send_draft dispatches to the shared send primitive, which runs only the
+    // Governor gate. Unlike `send`/`reply`, it never routed through the send-mode
+    // ceiling, so an agent whose ceiling is draft-only could send a pre-created
+    // draft with confirm flags set. Clamp the effective mode to the ceiling here,
+    // BEFORE any disposition/dispatch, so the ceiling wins over confirm_send,
+    // send_now, and confirm_send_now. This mirrors handle_send/handle_reply:
+    // a draft-only decision yields a non-sent status=drafted outcome referencing
+    // the already-existing draft (no new draft is created, no SMTP is reached).
+    if ctx.is_some() {
+        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let draft = db
+            .get_draft(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("draft not found: {id}"))?;
+        // send_draft's confirm flags express full send intent, so the requested
+        // mode is the maximal one; the ceiling clamps it down. A draft-only
+        // ceiling therefore blocks; any looser ceiling passes through to the
+        // normal Governor-gated dispatch below.
+        let send_mode = clamp_mode(ctx, SendMode::AutonomousSend);
+        let policy_input = SendPolicyInput {
+            to: &draft.to_addr,
+            cc: draft.cc_addr.as_deref(),
+            bcc: draft.bcc_addr.as_deref(),
+            confirm_send,
+            allow_recipients: &[],
+        };
+        let decision = evaluate(send_mode, &policy_input);
+        record_send_policy_event(
+            &db,
+            &draft.account_id,
+            send_mode,
+            &decision,
+            &policy_input,
+            agent_context::agent_id_of(ctx),
+        );
+        if matches!(decision, SendPolicyDecision::DraftOnly) {
+            return Ok(json!({
+                "sent": false,
+                "status": "drafted",
+                "send_mode": send_mode,
+                "draft_id": draft.id,
+                "ui": ui::draft_ui(&draft.account_id, &draft.id),
+            }));
+        }
     }
 
     let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
@@ -1107,7 +1258,36 @@ async fn handle_send_draft(params: &Value, backend: CredentialBackend) -> Result
     Ok(outcome.json)
 }
 
-async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+/// Record an agent-attributed audit row for a mutating MCP tool. No-op for
+/// anonymous sessions. Best-effort: audit failures never fail the tool call.
+fn log_agent_mutation(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    action_type: &str,
+    action_taken: &str,
+    message_id: Option<&str>,
+) {
+    let Some(agent_id) = agent_context::agent_id_of(ctx) else {
+        return;
+    };
+    let _ = db.log_action_with_agent(
+        account_id,
+        action_type,
+        1.0,
+        "mcp agent tool call",
+        action_taken,
+        message_id,
+        None,
+        Some(agent_id),
+    );
+}
+
+async fn handle_move(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let uid = params
         .get("uid")
         .and_then(|v| v.as_u64())
@@ -1122,7 +1302,7 @@ async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -1133,6 +1313,15 @@ async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value
         .await
         .map_err(|e| e.to_string())?;
 
+    log_agent_mutation(
+        &db,
+        ctx,
+        &creds.account.id,
+        "move",
+        &json!({"uid": uid, "from": from_folder, "to": to_folder}).to_string(),
+        None,
+    );
+
     Ok(json!({
         "moved": true,
         "uid": uid,
@@ -1142,7 +1331,11 @@ async fn handle_move(params: &Value, backend: CredentialBackend) -> Result<Value
     }))
 }
 
-async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_flag(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let uid = params
         .get("uid")
         .and_then(|v| v.as_u64())
@@ -1161,7 +1354,7 @@ async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -1181,6 +1374,15 @@ async fn handle_flag(params: &Value, backend: CredentialBackend) -> Result<Value
         }
         _ => return Err("action must be 'add' or 'remove'".to_string()),
     }
+
+    log_agent_mutation(
+        &db,
+        ctx,
+        &creds.account.id,
+        "flag",
+        &json!({"uid": uid, "action": action, "flag": flag, "folder": folder}).to_string(),
+        None,
+    );
 
     Ok(json!({
         "flagged": true,
@@ -1211,7 +1413,11 @@ async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Va
     }))
 }
 
-async fn handle_tag(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_tag(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let uid = params
         .get("uid")
         .and_then(|v| v.as_u64())
@@ -1278,6 +1484,15 @@ async fn handle_tag(params: &Value, backend: CredentialBackend) -> Result<Value,
     let current_scores = db
         .get_scores(&creds.account.id, message_id)
         .map_err(|e| e.to_string())?;
+
+    log_agent_mutation(
+        &db,
+        ctx,
+        &creds.account.id,
+        "tag",
+        &json!({"uid": uid, "tags": current_tags}).to_string(),
+        Some(message_id),
+    );
 
     Ok(json!({
         "uid": uid,
@@ -1630,7 +1845,7 @@ mod tests {
         // explicit confirm_send it returns a stable denial and never touches
         // SMTP/IMAP. This returns before any DB or network access.
         let params = serde_json::json!({ "draft_id": "abc-123" });
-        let out = handle_send_draft(&params, CredentialBackend::File)
+        let out = handle_send_draft(&params, CredentialBackend::File, None)
             .await
             .expect("denial path must not error");
         assert_eq!(out["status"], "denied");
@@ -1643,7 +1858,7 @@ mod tests {
     #[tokio::test]
     async fn send_draft_requires_draft_id() {
         let params = serde_json::json!({ "confirm_send": true });
-        let err = handle_send_draft(&params, CredentialBackend::File)
+        let err = handle_send_draft(&params, CredentialBackend::File, None)
             .await
             .expect_err("missing draft_id must error");
         assert!(
@@ -1757,6 +1972,21 @@ mod tests {
 }
 
 pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
+    // Resolve the per-agent context from ENVELOPE_AGENT_TOKEN once at startup.
+    // Unset → anonymous MCP (defaults unchanged). Set-but-invalid → fail loud;
+    // never silently fall back to anonymous.
+    let agent_ctx = {
+        let db = Database::open_default()?;
+        agent_context::resolve_from_env(&db)?
+    };
+    if let Some(ctx) = &agent_ctx {
+        // stderr only — stdout is the JSON-RPC channel and must stay clean.
+        eprintln!(
+            "envelope mcp: agent identity '{}' active; policy enforcement enabled",
+            ctx.agent_name
+        );
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -1796,7 +2026,9 @@ pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
                     .cloned()
                     .unwrap_or(json!({}));
 
-                match handle_tool_call(tool_name, &arguments, backend.clone()).await {
+                match handle_tool_call(tool_name, &arguments, backend.clone(), agent_ctx.as_ref())
+                    .await
+                {
                     Ok(result) => JsonRpcResponse::success(
                         request.id,
                         json!({

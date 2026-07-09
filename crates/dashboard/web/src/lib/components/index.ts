@@ -6,3 +6,5 @@ export { default as Modal } from './Modal.svelte';
 export { default as MonoTag } from './MonoTag.svelte';
 export { default as Spinner } from './Spinner.svelte';
 export { default as Toast } from './Toast.svelte';
+export { default as Rail } from './Rail.svelte';
+export { default as AccountDrawer } from './AccountDrawer.svelte';

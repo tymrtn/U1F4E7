@@ -33,6 +33,7 @@
       <span class="brand-tag">v2</span>
     </a>
     <nav class="app-nav">
+      <a href="{base}/mail/unified">Mail</a>
       <a href="{base}/kitchen-sink">Kitchen sink</a>
     </nav>
   </header>
@@ -85,6 +86,10 @@
     text-transform: uppercase;
     letter-spacing: 0.15em;
     color: var(--env-muted);
+  }
+  .app-nav {
+    display: inline-flex;
+    gap: 1rem;
   }
   .app-nav a {
     font-size: 0.8125rem;

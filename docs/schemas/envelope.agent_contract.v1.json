@@ -1,4 +1,57 @@
 {
+  "agent_identity": {
+    "cli_commands": [
+      "envelope agent create <name>",
+      "envelope agent list",
+      "envelope agent show <name>",
+      "envelope agent revoke <name>",
+      "envelope agent policy set <name> [--allow-accounts ...] [--allow-folders ...] [--allow-actions ...] [--send-mode-ceiling <mode>] [--allow-recipients ...]",
+      "envelope agent policy show <name>",
+      "envelope actions tail --agent <name-or-id>"
+    ],
+    "env": "ENVELOPE_AGENT_TOKEN",
+    "free_tier": {
+      "behavior": "Creating more than 2 active (non-revoked) agents requires an activated license (honor-system). `envelope agent create` beyond the limit returns agent_limit_license_required and points to `envelope license activate`.",
+      "max_active_agents": 2,
+      "over_limit_code": "agent_limit_license_required"
+    },
+    "policy_enforcement": {
+      "attribution": "Mutating tool calls (send/reply/send_draft, move_message, flag, tag) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision).",
+      "authorize": "Every MCP tool call is authorized before dispatch. The action is derived from the tool name (see tool_action_map); an unknown tool is denied. The account is the resolved `account` param (verbatim, case-sensitive; defaults to the configured default account id when omitted); the folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, a single \"*\" allows all.",
+      "denial_codes": [
+        "agent_policy_denied_action",
+        "agent_policy_denied_account",
+        "agent_policy_denied_folder"
+      ],
+      "denial_shape": "Denials return the stable {code, reason} object as a normal MCP tool error and never include recipient addresses, account secrets, or body content.",
+      "send_mode_clamp": "send/reply/send_draft requests are clamped down to the agent's send_mode_ceiling and never widened. Under a draft-only ceiling an autonomous request still produces only a draft."
+    },
+    "semantics": "When ENVELOPE_AGENT_TOKEN is set for an MCP server process, Envelope resolves it to a stored agent identity and enforces that agent's policy on every tool call. An unset token runs the MCP server anonymously with unchanged defaults; a set-but-unknown/revoked token fails MCP startup loud (never falls back to anonymous). The raw token is shown exactly once at `envelope agent create` and is never stored, logged, or recoverable.",
+    "send_mode_ceilings": [
+      "draft-only",
+      "confirm-send",
+      "allowlisted-send",
+      "autonomous-send"
+    ],
+    "tool_action_map": {
+      "accounts": "accounts.list",
+      "contacts": "contacts.read",
+      "create_forward_draft": "draft.create",
+      "create_reply_draft": "draft.create",
+      "flag": "flag",
+      "folders": "folders.list",
+      "get_draft": "draft.read",
+      "inbox": "inbox.read",
+      "modify_draft": "draft.modify",
+      "move_message": "move",
+      "read": "inbox.read",
+      "reply": "send",
+      "search": "inbox.read",
+      "send": "send",
+      "send_draft": "send",
+      "tag": "tag"
+    }
+  },
   "compatibility": {
     "breaking_change_policy": "Field removals, required-field additions, type changes, and semantic renames require a new schema id. New optional fields are backward-compatible.",
     "output_contract": "Existing CLI --json output is not changed by this contract export.",

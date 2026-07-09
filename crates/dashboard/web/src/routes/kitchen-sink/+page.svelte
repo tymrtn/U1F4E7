@@ -96,6 +96,7 @@
   .sink {
     padding: 1.5rem 2rem;
     max-width: 52rem;
+    margin: 0 auto;
     overflow-y: auto;
     width: 100%;
   }

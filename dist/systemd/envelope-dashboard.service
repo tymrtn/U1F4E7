@@ -1,0 +1,31 @@
+# Envelope local dashboard — persistent background server.
+# Install:  systemctl --user enable --now envelope-dashboard.service
+#
+# By default binds to 127.0.0.1:3141 (loopback only).
+# To expose over a Tailscale tailnet, set dashboard.auth_token or
+# dashboard.tailscale_allow first, then override --bind in ExecStart.
+#
+# Passphrase setup (once):
+#   install -m 600 /dev/null ~/.config/envelope-email/passphrase
+#   printf '%s' 'your-passphrase' > ~/.config/envelope-email/passphrase
+#
+[Unit]
+Description=Envelope dashboard (localhost:3141)
+Documentation=https://github.com/tymrtn/U1F4E7
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/envelope serve --port 3141
+
+# Passphrase via systemd credentials (kernel-enforced 0600; trailing newline stripped).
+LoadCredential=envelope-passphrase:%h/.config/envelope-email/passphrase
+Environment=ENVELOPE_MASTER_PASSPHRASE_FILE=%d/envelope-passphrase
+
+Restart=on-failure
+RestartSec=30
+
+MemoryHigh=128M
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

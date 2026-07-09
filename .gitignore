@@ -1,5 +1,9 @@
 /target
-/dist
+# dist/ holds generated release artifacts (ignored) — but dist/systemd/
+# unit templates are tracked source. Git needs the parent un-ignored for the
+# negation to work, hence the three-line pattern.
+/dist/*
+!/dist/systemd
 **/*.rs.bk
 *.swp
 *.swo

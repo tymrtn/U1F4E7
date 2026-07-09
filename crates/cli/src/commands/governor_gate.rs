@@ -68,9 +68,21 @@ pub(crate) fn gate_and_record(
     account_id: &str,
     req: &GovernorRequest,
 ) -> GovernorOutcome {
+    gate_and_record_with_agent(db, account_id, req, None)
+}
+
+/// Like [`gate_and_record`], but attributes the gate decision and its audit
+/// event to a specific agent (audit-only; the agent id never widens the gate).
+pub(crate) fn gate_and_record_with_agent(
+    db: &Database,
+    account_id: &str,
+    req: &GovernorRequest,
+    agent_id: Option<&str>,
+) -> GovernorOutcome {
     let config = GovernorConfig::from_env();
-    let outcome = gate(&config, req);
-    record_governor_event(db, account_id, req, &outcome);
+    let req = req.clone().with_agent_id(agent_id);
+    let outcome = gate(&config, &req);
+    record_governor_event(db, account_id, &req, &outcome, agent_id);
     outcome
 }
 
@@ -87,6 +99,7 @@ fn record_governor_event(
     account_id: &str,
     req: &GovernorRequest,
     outcome: &GovernorOutcome,
+    agent_id: Option<&str>,
 ) {
     let event_type = if outcome.allowed {
         "send_governor.allowed"
@@ -113,5 +126,5 @@ fn record_governor_event(
         acked_at: Some(chrono::Utc::now().to_rfc3339()),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let _ = db.insert_event(&event);
+    let _ = db.insert_event_with_agent(&event, agent_id);
 }

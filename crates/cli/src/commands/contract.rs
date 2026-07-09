@@ -71,6 +71,54 @@ pub fn agent_contract() -> Value {
                 "tools_not_wrapped": "Tools that do not return external email content (accounts, folders, move_message, flag, tag, contacts, send, send_draft) are not wrapped. Draft tools (create_reply_draft, create_forward_draft, modify_draft, get_draft, reply drafts) return agent-authored draft envelopes with abridged quoted previews and keep their existing shape."
             }
         },
+        "agent_identity": {
+            "env": "ENVELOPE_AGENT_TOKEN",
+            "semantics": "When ENVELOPE_AGENT_TOKEN is set for an MCP server process, Envelope resolves it to a stored agent identity and enforces that agent's policy on every tool call. An unset token runs the MCP server anonymously with unchanged defaults; a set-but-unknown/revoked token fails MCP startup loud (never falls back to anonymous). The raw token is shown exactly once at `envelope agent create` and is never stored, logged, or recoverable.",
+            "policy_enforcement": {
+                "authorize": "Every MCP tool call is authorized before dispatch. The action is derived from the tool name (see tool_action_map); an unknown tool is denied. The account is the resolved `account` param (verbatim, case-sensitive; defaults to the configured default account id when omitted); the folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, a single \"*\" allows all.",
+                "send_mode_clamp": "send/reply/send_draft requests are clamped down to the agent's send_mode_ceiling and never widened. Under a draft-only ceiling an autonomous request still produces only a draft.",
+                "attribution": "Mutating tool calls (send/reply/send_draft, move_message, flag, tag) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision).",
+                "denial_codes": [
+                    "agent_policy_denied_action",
+                    "agent_policy_denied_account",
+                    "agent_policy_denied_folder"
+                ],
+                "denial_shape": "Denials return the stable {code, reason} object as a normal MCP tool error and never include recipient addresses, account secrets, or body content."
+            },
+            "tool_action_map": {
+                "accounts": "accounts.list",
+                "inbox": "inbox.read",
+                "read": "inbox.read",
+                "search": "inbox.read",
+                "folders": "folders.list",
+                "contacts": "contacts.read",
+                "send": "send",
+                "reply": "send",
+                "send_draft": "send",
+                "create_reply_draft": "draft.create",
+                "create_forward_draft": "draft.create",
+                "modify_draft": "draft.modify",
+                "get_draft": "draft.read",
+                "move_message": "move",
+                "flag": "flag",
+                "tag": "tag"
+            },
+            "send_mode_ceilings": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"],
+            "free_tier": {
+                "max_active_agents": 2,
+                "over_limit_code": "agent_limit_license_required",
+                "behavior": "Creating more than 2 active (non-revoked) agents requires an activated license (honor-system). `envelope agent create` beyond the limit returns agent_limit_license_required and points to `envelope license activate`."
+            },
+            "cli_commands": [
+                "envelope agent create <name>",
+                "envelope agent list",
+                "envelope agent show <name>",
+                "envelope agent revoke <name>",
+                "envelope agent policy set <name> [--allow-accounts ...] [--allow-folders ...] [--allow-actions ...] [--send-mode-ceiling <mode>] [--allow-recipients ...]",
+                "envelope agent policy show <name>",
+                "envelope actions tail --agent <name-or-id>"
+            ]
+        },
         "surfaces": surfaces(),
         "mcp_tools": mcp_tool_entries(),
     })

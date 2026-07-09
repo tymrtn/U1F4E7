@@ -105,6 +105,31 @@ impl Database {
         Ok(actions)
     }
 
+    /// List recent actions for an account attributed to a specific `agent_id`,
+    /// newest first. Additive read (P1a writer freeze is over): mirrors
+    /// [`list_actions`] with an extra `agent_id` predicate on the same shape.
+    pub fn list_actions_for_agent(
+        &self,
+        account_id: &str,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ActionLog>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, action_type, confidence, justification, action_taken,
+                    message_id, draft_id, event_id, action_status, created_at
+             FROM action_log
+             WHERE account_id = ?1 AND agent_id = ?2
+             ORDER BY created_at DESC
+             LIMIT ?3",
+        )?;
+
+        let actions = stmt
+            .query_map(params![account_id, agent_id, limit], map_action_log)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(actions)
+    }
+
     fn insert_action_log(&self, input: ActionLogInsert<'_>) -> Result<ActionLog> {
         let id = Uuid::new_v4().to_string();
 
@@ -311,6 +336,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ev_agent.as_deref(), Some("agent-bravo"));
+    }
+
+    #[test]
+    fn list_actions_for_agent_filters_by_agent_id() {
+        let db = Database::open_memory().unwrap();
+        db.log_action_with_agent("acc-1", "move", 1.0, "j", "t", None, None, Some("agent-a"))
+            .unwrap();
+        db.log_action_with_agent("acc-1", "flag", 1.0, "j", "t", None, None, Some("agent-b"))
+            .unwrap();
+        // Legacy (no agent) row must not match any agent filter.
+        db.log_action("acc-1", "classify", 0.5, "j", "t", None, None)
+            .unwrap();
+
+        let a = db.list_actions_for_agent("acc-1", "agent-a", 10).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].action_type, "move");
+
+        let b = db.list_actions_for_agent("acc-1", "agent-b", 10).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].action_type, "flag");
+
+        // Unknown agent yields nothing.
+        assert!(
+            db.list_actions_for_agent("acc-1", "agent-z", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

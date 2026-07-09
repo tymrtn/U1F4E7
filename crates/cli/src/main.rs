@@ -328,6 +328,12 @@ enum Commands {
         subcommand: LicenseCmd,
     },
 
+    /// Manage per-agent identities and policies
+    Agent {
+        #[command(subcommand)]
+        subcommand: AgentCmd,
+    },
+
     /// Show account attributes
     Attributes {
         /// Account ID or email
@@ -918,6 +924,61 @@ enum LicenseCmd {
 }
 
 #[derive(Subcommand)]
+enum AgentCmd {
+    /// Create a new agent identity (prints its bearer token once)
+    Create {
+        /// Human-readable agent name (unique)
+        name: String,
+    },
+    /// List agent identities (names, prefixes, status; never token hashes)
+    List,
+    /// Show one agent identity
+    Show {
+        /// Agent name
+        name: String,
+    },
+    /// Revoke an agent identity (its token stops authorizing immediately)
+    Revoke {
+        /// Agent name
+        name: String,
+    },
+    /// Manage an agent's authorization policy
+    Policy {
+        #[command(subcommand)]
+        subcommand: AgentPolicyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentPolicyCmd {
+    /// Set (upsert) an agent's policy fields
+    Set {
+        /// Agent name
+        name: String,
+        /// Allowed accounts: '*' or comma-separated ids/emails
+        #[arg(long)]
+        allow_accounts: Option<String>,
+        /// Allowed folders: '*' or comma-separated names
+        #[arg(long)]
+        allow_folders: Option<String>,
+        /// Allowed actions: '*' or comma-separated action names
+        #[arg(long)]
+        allow_actions: Option<String>,
+        /// Send-mode ceiling: draft-only|confirm-send|allowlisted-send|autonomous-send
+        #[arg(long)]
+        send_mode_ceiling: Option<String>,
+        /// Allowed recipients: comma-separated email/@domain patterns
+        #[arg(long)]
+        allow_recipients: Option<String>,
+    },
+    /// Show an agent's policy
+    Show {
+        /// Agent name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ActionsCmd {
     /// Tail the action log
     Tail {
@@ -927,6 +988,9 @@ enum ActionsCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Filter to actions attributed to this agent (name or id)
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Execute a local audit action for an event
     Exec {
@@ -1931,14 +1995,50 @@ fn main() {
                 Ok(())
             }
         },
+        Commands::Agent { subcommand } => match subcommand {
+            AgentCmd::Create { name } => commands::agent::run_create(&name, cli.json, backend),
+            AgentCmd::List => commands::agent::run_list(cli.json, backend),
+            AgentCmd::Show { name } => commands::agent::run_show(&name, cli.json, backend),
+            AgentCmd::Revoke { name } => commands::agent::run_revoke(&name, cli.json, backend),
+            AgentCmd::Policy { subcommand } => match subcommand {
+                AgentPolicyCmd::Set {
+                    name,
+                    allow_accounts,
+                    allow_folders,
+                    allow_actions,
+                    send_mode_ceiling,
+                    allow_recipients,
+                } => commands::agent::run_policy_set(
+                    &name,
+                    allow_accounts.as_deref(),
+                    allow_folders.as_deref(),
+                    allow_actions.as_deref(),
+                    send_mode_ceiling.as_deref(),
+                    allow_recipients.as_deref(),
+                    cli.json,
+                    backend,
+                ),
+                AgentPolicyCmd::Show { name } => {
+                    commands::agent::run_policy_show(&name, cli.json, backend)
+                }
+            },
+        },
         Commands::Attributes { .. } => {
             eprintln!("Not yet implemented: attributes");
             std::process::exit(1);
         }
         Commands::Actions { subcommand } => match subcommand {
-            ActionsCmd::Tail { limit, account } => {
-                commands::actions::run_tail(limit, account.as_deref(), cli.json, backend)
-            }
+            ActionsCmd::Tail {
+                limit,
+                account,
+                agent,
+            } => commands::actions::run_tail(
+                limit,
+                account.as_deref(),
+                agent.as_deref(),
+                cli.json,
+                backend,
+            ),
             ActionsCmd::Exec {
                 event_id,
                 actor,

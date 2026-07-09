@@ -11,14 +11,22 @@ use super::common::resolve_account;
 pub fn run_tail(
     limit: u32,
     account: Option<&str>,
+    agent: Option<&str>,
     json: bool,
     _backend: CredentialBackend,
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
     let acct = resolve_account(&db, account)?;
-    let actions = db
-        .list_actions(&acct.id, limit)
-        .context("failed to list actions")?;
+    let actions = match agent {
+        Some(agent_ref) => {
+            let agent_id = resolve_agent_id(&db, agent_ref)?;
+            db.list_actions_for_agent(&acct.id, &agent_id, limit)
+                .context("failed to list actions")?
+        }
+        None => db
+            .list_actions(&acct.id, limit)
+            .context("failed to list actions")?,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&actions)?);
@@ -98,6 +106,25 @@ pub fn run_exec_mark_handled(
     }
 
     Ok(())
+}
+
+/// Resolve an `--agent` reference (name or id) to an agent id. Accepts the id
+/// directly when no name matches, so callers can filter by either.
+fn resolve_agent_id(db: &Database, agent_ref: &str) -> Result<String> {
+    if let Some(agent) = db
+        .get_agent_by_name(agent_ref)
+        .context("failed to resolve agent by name")?
+    {
+        return Ok(agent.id);
+    }
+    if db
+        .get_agent_by_id(agent_ref)
+        .context("failed to resolve agent by id")?
+        .is_some()
+    {
+        return Ok(agent_ref.to_string());
+    }
+    bail!("agent not found: {agent_ref}")
 }
 
 fn truncate(value: &str, max_len: usize) -> String {

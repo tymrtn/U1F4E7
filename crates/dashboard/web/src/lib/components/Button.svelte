@@ -58,7 +58,9 @@
   .env-btn-ghost {
     background: transparent;
     color: var(--env-ink);
-    border-color: var(--env-rule);
+    /* Mid-tone border (not the pale rule) so ghost reads as an actionable
+     * control, clearly distinct from the disabled state's faded look. */
+    border-color: var(--env-muted, #8a8780);
   }
   .env-btn-ghost:not(:disabled):hover {
     background: var(--env-accent-soft);

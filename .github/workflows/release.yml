@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # macOS: native builds for both Intel and Apple Silicon.
+  # macos-latest is Apple Silicon (M1/M2); cross-compiling x86_64 from arm64
+  # is fully supported by rustup (no emulation, Apple's linker handles it).
+  # We build both targets in a single job to share the Cargo registry cache.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --bin envelope --target ${{ matrix.target }}
+
+      - name: Package release
+        run: bash scripts/package-release.sh --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          # package-release.sh writes dist/<name>.tar.gz and .sha256
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux x86_64: native build on ubuntu-latest.
+  # The keychain feature resolves to async-secret-service+crypto-rust+tokio
+  # (pure-Rust D-Bus via zbus, no libdbus link required) per
+  # crates/store/Cargo.toml [target.'cfg(target_os = "linux")'].
+  # ---------------------------------------------------------------------------
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-x86_64-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --bin envelope
+
+      - name: Package release
+        run: bash scripts/package-release.sh --target x86_64-unknown-linux-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux aarch64: cross-compiled via cargo-zigbuild.
+  #
+  # Why cargo-zigbuild over `cross`:
+  #   - cross uses Docker-in-Docker (requires privileged runners or DIND setup).
+  #   - cargo-zigbuild uses Zig as a drop-in C cross-linker; no Docker needed.
+  #   - Zig ships a hermetic musl+glibc sysroot, so the binary links against
+  #     a known glibc floor (2.17) without needing a matching OS image.
+  #   - The keychain crate's async-secret-service feature is pure Rust (zbus),
+  #     so no native D-Bus headers are needed for the cross build.
+  # ---------------------------------------------------------------------------
+  build-linux-aarch64:
+    name: Build Linux aarch64
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-aarch64-cargo-
+
+      - name: Install cargo-zigbuild and Zig
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: Build release binary (cross)
+        run: cargo zigbuild --release --bin envelope --target aarch64-unknown-linux-gnu
+
+      - name: Package release
+        run: bash scripts/package-release.sh --target aarch64-unknown-linux-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64-unknown-linux-gnu
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Attach all artifacts to a GitHub release.
+  # On tag push: create a published release.
+  # On workflow_dispatch: create a draft release for human review.
+  # ---------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - build-macos
+      - build-linux-x86_64
+      - build-linux-aarch64
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find release-artifacts -type f | sort
+
+      - name: Create GitHub release and attach artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Bind context values to env vars — never interpolate github context
+          # expressions directly into shell strings (injection risk).
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          TAG="$GH_REF_NAME"
+          # workflow_dispatch sets ref_name to the branch; derive a pseudo-tag.
+          if [[ "$GH_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="dev-$(git rev-parse --short HEAD)"
+          fi
+
+          DRAFT_FLAG=""
+          if [[ "$GH_EVENT_NAME" == "workflow_dispatch" ]]; then
+            DRAFT_FLAG="--draft"
+          fi
+
+          gh release create "${TAG}" \
+            ${DRAFT_FLAG} \
+            --title "Envelope ${TAG}" \
+            --generate-notes \
+            release-artifacts/*

@@ -3,6 +3,8 @@
 
 pub mod accounts;
 pub mod actions;
+pub mod agent;
+pub mod agent_context;
 pub mod attachments;
 pub mod backup;
 pub mod clipboard;
