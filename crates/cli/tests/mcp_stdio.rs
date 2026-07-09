@@ -241,7 +241,20 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
     );
     let tools = read_framed(&mut stdout);
     let tool_entries = tools["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tool_entries.len(), 16);
+    assert_eq!(tool_entries.len(), 22);
+    for name in [
+        "bulk",
+        "thread",
+        "rules_preview",
+        "rules_run",
+        "watch_status",
+        "snooze",
+    ] {
+        assert!(
+            tool_entries.iter().any(|tool| tool["name"] == name),
+            "tool {name} must be advertised"
+        );
+    }
     assert!(tool_entries.iter().any(|tool| tool["name"] == "send"));
     assert!(
         tool_entries
@@ -660,4 +673,217 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
         payload["send_mode"], "draft-only",
         "confirm-send ceiling must not clamp to draft-only: {payload}"
     );
+}
+
+// ── Wave 3 tools: bulk / thread / rules / watch / snooze ────────────
+
+/// Set a policy with an explicit allow-actions list (comma-separated).
+fn set_policy_actions(home: &std::path::Path, name: &str, actions: &str) {
+    set_policy(home, name, actions, "draft-only");
+}
+
+#[test]
+fn mcp_bulk_denied_when_policy_lacks_underlying_action() {
+    // The bulk tool requires BOTH the coarse `bulk` action AND the underlying
+    // single action. An agent with `bulk` but not `delete` must be denied a bulk
+    // delete before any IMAP work, with a stable denial code.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "bulk"); // no `delete`
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "bulk",
+        json!({ "op": "delete", "uids": [1, 2], "folder": "INBOX", "confirm": true }),
+    );
+    assert!(is_error, "bulk missing underlying action must be denied");
+    assert_eq!(payload["code"], "agent_policy_denied_action");
+}
+
+#[test]
+fn mcp_bulk_allowed_with_both_actions_reaches_execution() {
+    // With both `bulk` and `delete` allowed, the two-action gate passes; the call
+    // proceeds past authorization (and then fails at the offline IMAP connect —
+    // proving it cleared policy rather than being denied).
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "bulk,delete");
+
+    let (payload, _is_error) = tool_call(
+        home,
+        Some(&token),
+        "bulk",
+        json!({ "op": "delete", "uids": [1], "folder": "INBOX", "confirm": true }),
+    );
+    // It must NOT be a policy denial (it cleared the two-action gate).
+    assert_ne!(
+        payload["code"], "agent_policy_denied_action",
+        "bulk with both actions must clear the gate: {payload}"
+    );
+}
+
+#[test]
+fn mcp_rules_run_default_dry_run_authorizes_under_rules_read() {
+    // rules_run defaults dry_run=true and must authorize under rules.read. An
+    // agent holding only rules.read must NOT be denied (it clears policy, then
+    // fails at the offline IMAP connect).
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "rules.read");
+
+    let (payload, _is_error) = tool_call(home, Some(&token), "rules_run", json!({}));
+    assert_ne!(
+        payload["code"], "agent_policy_denied_action",
+        "default dry-run rules_run must authorize under rules.read: {payload}"
+    );
+}
+
+#[test]
+fn mcp_rules_run_real_run_requires_rules_run_action() {
+    // A real run (dry_run:false) escalates to the rules.run action. An agent with
+    // only rules.read must be denied.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "rules.read");
+
+    let (payload, is_error) =
+        tool_call(home, Some(&token), "rules_run", json!({ "dry_run": false }));
+    assert!(is_error, "real rules_run without rules.run must be denied");
+    assert_eq!(payload["code"], "agent_policy_denied_action");
+}
+
+#[test]
+fn mcp_watch_status_happy_path_returns_delivery_counts() {
+    // watch_status is read-only (no IMAP): with the watch.read action it returns
+    // a structured summary with delivery counts even on an empty DB.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "watch.read");
+
+    let (payload, is_error) = tool_call(home, Some(&token), "watch_status", json!({}));
+    assert!(
+        !is_error,
+        "watch_status happy path must not error: {payload}"
+    );
+    assert!(payload["watches"].is_array(), "watches array: {payload}");
+    assert!(
+        payload["deliveries"]["delivered"].is_number(),
+        "delivery counts present: {payload}"
+    );
+    assert!(payload["deliveries"]["dead_letter"].is_number());
+}
+
+#[test]
+fn mcp_snooze_list_happy_path_returns_array() {
+    // snooze list is read-only (no IMAP): with the snooze action it returns the
+    // (empty) snoozed list without denial or error.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "snooze");
+
+    let (payload, is_error) = tool_call(home, Some(&token), "snooze", json!({ "action": "list" }));
+    assert!(
+        !is_error,
+        "snooze list happy path must not error: {payload}"
+    );
+    assert!(
+        payload.is_array(),
+        "snooze list must be an array: {payload}"
+    );
+}
+
+#[test]
+fn mcp_thread_list_happy_path_returns_wrapped_array() {
+    // thread list is DB-only (no IMAP). With inbox.read it returns the untrusted
+    // trust envelope wrapping a (possibly empty) thread array.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    set_policy_actions(home, "skippy", "inbox.read");
+
+    let (payload, is_error) = tool_call(home, Some(&token), "thread", json!({}));
+    assert!(
+        !is_error,
+        "thread list happy path must not error: {payload}"
+    );
+    assert_eq!(payload["_envelope_trust"], "untrusted-content");
+    assert!(
+        payload["content"].is_array(),
+        "wrapped thread list must be an array under content: {payload}"
+    );
+}
+
+#[test]
+fn contract_export_declares_wave3_tools_and_gates() {
+    // The contract export must additively declare the 5 new tools, the bulk
+    // two-action gate, the delete-confirm gate, and the revoked-token note (F4).
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let output = Command::new(envelope_bin())
+        .arg("contract")
+        .env("HOME", temp.path())
+        .output()
+        .expect("run contract");
+    assert!(output.status.success());
+    let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
+    assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+
+    let map = &contract["agent_identity"]["tool_action_map"];
+    assert_eq!(map["bulk"], "bulk");
+    assert_eq!(map["thread"], "inbox.read");
+    assert_eq!(map["rules_preview"], "rules.read");
+    assert_eq!(map["rules_run"], "rules.run");
+    assert_eq!(map["watch_status"], "watch.read");
+    assert_eq!(map["snooze"], "snooze");
+
+    let ai = &contract["agent_identity"];
+    assert!(ai["bulk_two_action_gate"].is_string());
+    assert!(
+        ai["bulk_delete_confirmation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("confirm")
+    );
+    assert!(
+        ai["rules_run_dry_run_default"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dry_run")
+    );
+    assert!(
+        ai["revoked_token_session_persistence"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("next session start"),
+        "F4 revoked-token note must document next-session-start semantics"
+    );
+
+    // All 5 new tools appear in the mcp_tools list too.
+    let tools = contract["mcp_tools"].as_array().expect("mcp_tools array");
+    for name in [
+        "bulk",
+        "thread",
+        "rules_preview",
+        "rules_run",
+        "watch_status",
+        "snooze",
+    ] {
+        assert!(
+            tools.iter().any(|t| t["name"] == name),
+            "mcp_tools must declare {name}"
+        );
+    }
 }

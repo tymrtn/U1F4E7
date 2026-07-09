@@ -355,6 +355,24 @@ pub async fn refresh_unified_inbox(
         }
     }
 
+    // Publish a metadata-level `new_mail` event per successfully-refreshed
+    // account. The unified refresh path has no server-side "new since last"
+    // delta, so this fires on every refresh that reached IMAP, carrying only
+    // post-refresh counts (no bodies/subjects/recipients). Clients treat it as
+    // "the inbox index for this account may have changed — reconcile counts".
+    // A dedicated IMAP IDLE push worker is intentionally out of scope this round.
+    for result in &account_results {
+        if result.ok {
+            state
+                .events
+                .publish(crate::events::DashboardEvent::NewMail {
+                    account_id: result.account_id.clone(),
+                    message_count: result.message_count,
+                    unread_count: result.unread_count,
+                });
+        }
+    }
+
     Json(build_unified_inbox_response(
         folder,
         q.limit,

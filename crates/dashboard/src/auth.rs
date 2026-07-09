@@ -161,6 +161,20 @@ impl AuthConfig {
         }
     }
 
+    /// True when `presented` matches the configured bearer token in constant
+    /// time. Used by the SSE handler for the `?access_token=` query path, which
+    /// exists because the browser `EventSource` API cannot set an `Authorization`
+    /// header. When no token is configured (open-loopback or identity-only) a
+    /// query token authorizes nothing — the SSE handler only consults this after
+    /// `authorize(headers)` has already failed, so this returns false there and
+    /// the request is rejected.
+    pub fn query_token_authorized(&self, presented: &str) -> bool {
+        match &self.token {
+            Some(expected) => constant_time_eq(expected.as_bytes(), presented.as_bytes()),
+            None => false,
+        }
+    }
+
     fn identity_authorized(&self, headers: &HeaderMap) -> bool {
         !self.tailscale_allow.is_empty()
             && header_str(headers, TAILSCALE_USER_LOGIN)
@@ -237,13 +251,45 @@ pub async fn require_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !state.auth.authorize(request.headers()) {
+    let header_ok = state.auth.authorize(request.headers());
+
+    // `EventSource` cannot set an `Authorization` header, so the SSE endpoint
+    // also accepts the token via `?access_token=`. Honor it here as an equivalent
+    // credential when the header path did not already authorize. It is checked
+    // with the same constant-time comparison as the header token.
+    //
+    // A query-token match deliberately does NOT set `BearerAuthenticated`: a
+    // query string can be carried by a browser cross-site (navigations, `<img>`,
+    // etc.), so unlike a real `Authorization` header it does not prove same-origin
+    // intent and must stay subject to CSRF on mutating methods. For the GET-only
+    // SSE stream that distinction is moot, but keeping it correct here prevents a
+    // query token from becoming a CSRF bypass on other routes.
+    let query_ok = !header_ok
+        && query_access_token(&request)
+            .map(|t| state.auth.query_token_authorized(&t))
+            .unwrap_or(false);
+
+    if !header_ok && !query_ok {
         return unauthorized().into_response();
     }
     if state.auth.bearer_authorized(request.headers()) {
         request.extensions_mut().insert(BearerAuthenticated);
     }
     next.run(request).await
+}
+
+/// Extract the `access_token` query parameter from the request URI, if present.
+fn query_access_token(request: &Request) -> Option<String> {
+    let query = request.uri().query()?;
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("access_token=") {
+            // Percent-decoding is unnecessary for our tokens (hex/base64url), and
+            // a decoding mismatch would only ever fail closed against the
+            // constant-time compare. Return the raw value.
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn unauthorized() -> impl IntoResponse {
@@ -363,6 +409,40 @@ mod tests {
         assert!(!AuthConfig::from_parts(Some("t".into()), ["a@b".to_string()]).is_identity_only());
         assert!(!AuthConfig::from_parts(Some("t".into()), []).is_identity_only());
         assert!(!AuthConfig::disabled().is_identity_only());
+    }
+
+    #[test]
+    fn query_access_token_parses_the_param_among_others() {
+        let req = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            query_access_token(&req("/api/events/stream?access_token=abc123")).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            query_access_token(&req("/api/events/stream?foo=1&access_token=xyz&bar=2")).as_deref(),
+            Some("xyz")
+        );
+        assert!(query_access_token(&req("/api/events/stream")).is_none());
+        assert!(query_access_token(&req("/api/events/stream?foo=1")).is_none());
+    }
+
+    #[test]
+    fn query_token_authorized_uses_constant_time_and_needs_configured_token() {
+        let cfg = AuthConfig::from_parts(Some("t0ken".into()), []);
+        assert!(cfg.query_token_authorized("t0ken"));
+        assert!(!cfg.query_token_authorized("nope"));
+        assert!(!cfg.query_token_authorized(""));
+        // No token configured: a query token authorizes nothing.
+        assert!(!AuthConfig::disabled().query_token_authorized("t0ken"));
+        assert!(
+            !AuthConfig::from_parts(None, ["a@b.ts.net".to_string()])
+                .query_token_authorized("t0ken")
+        );
     }
 
     #[test]

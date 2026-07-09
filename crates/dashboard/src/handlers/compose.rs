@@ -132,6 +132,14 @@ pub async fn send(
         draft
     };
 
+    state
+        .events
+        .publish(crate::events::DashboardEvent::DraftQueued {
+            account_id: creds.account.id.clone(),
+            draft_id: draft.id.clone(),
+            origin: "compose",
+        });
+
     Json(json!({
         "ok": true,
         "status": "queued",
@@ -263,6 +271,14 @@ pub async fn reply(
         }
         draft
     };
+
+    state
+        .events
+        .publish(crate::events::DashboardEvent::DraftQueued {
+            account_id: creds.account.id.clone(),
+            draft_id: draft.id.clone(),
+            origin: "reply",
+        });
 
     Json(json!({
         "ok": true,

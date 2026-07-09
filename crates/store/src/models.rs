@@ -476,6 +476,10 @@ pub struct EventRoute {
     pub delivery: String,
     pub enabled: bool,
     pub priority: i64,
+    /// Per-route HMAC-SHA256 signing key. Generated once at creation and
+    /// surfaced to the operator a single time; never re-emitted in list output.
+    /// `None` for legacy routes created before migration 10.
+    pub secret: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -490,6 +494,19 @@ pub struct EventDelivery {
     pub attempt_count: i64,
     pub last_attempt_at: Option<String>,
     pub error_summary: Option<String>,
+    /// ISO 8601 timestamp when this delivery is next eligible for an attempt.
+    pub next_attempt_at: Option<String>,
+    /// HTTP status code of the most recent attempt (None if never attempted or
+    /// the attempt failed before a response was received).
+    pub last_status_code: Option<i64>,
+    /// Response body of the most recent attempt, capped at 1 KiB.
+    pub last_response_snippet: Option<String>,
+    /// Transport-level error string of the most recent failed attempt.
+    pub last_error: Option<String>,
+    /// Set once retries are exhausted; the delivery is then terminal.
+    pub dead_lettered_at: Option<String>,
+    /// Set on the first 2xx response; the delivery is then terminal.
+    pub delivered_at: Option<String>,
     pub created_at: String,
 }
 

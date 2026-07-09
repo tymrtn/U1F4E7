@@ -1972,6 +1972,18 @@ pub async fn run_send(
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .context("failed to set send_after on draft")?;
+            // Catalog event: a send was queued into the outbox. Payload carries
+            // only the transition metadata — no recipients, no body.
+            let _ = db.emit_catalog_event(
+                &draft.account_id,
+                envelope_email_store::event_catalog::SEND_QUEUED,
+                Some(serde_json::json!({
+                    "draft_id": draft.id,
+                    "send_after": send_at,
+                    "cooldown_seconds": cd,
+                })),
+                None,
+            );
             if json {
                 println!(
                     "{}",
@@ -1992,6 +2004,19 @@ pub async fn run_send(
             return Ok(());
         }
         SendDisposition::Immediate => {}
+    }
+
+    // Catalog event: the operator approved this draft for immediate send. This
+    // is the human-confirmed transition (--send-now --confirm-send-now).
+    if let Ok(db) = Database::open_default()
+        && let Ok(Some(draft)) = db.get_draft(id)
+    {
+        let _ = db.emit_catalog_event(
+            &draft.account_id,
+            envelope_email_store::event_catalog::DRAFT_APPROVED,
+            Some(serde_json::json!({ "draft_id": id })),
+            None,
+        );
     }
 
     let outcome = send_existing_draft(id, account, backend).await?;
@@ -2281,6 +2306,17 @@ pub(crate) async fn send_existing_draft(
         db.mark_draft_sent(id, Some(&message_id))
             .context("failed to mark draft as sent")?;
     }
+    // Catalog event: the send completed. Payload carries only the draft id and
+    // message-id transition — never recipients or body.
+    let _ = db.emit_catalog_event(
+        &creds.account.id,
+        envelope_email_store::event_catalog::SEND_COMPLETED,
+        Some(serde_json::json!({
+            "draft_id": id,
+            "message_id": message_id,
+        })),
+        None,
+    );
 
     // ── Resolve Sent-folder copy (pre-lookup before any client append) ──
     let from = account_from_header(&creds);

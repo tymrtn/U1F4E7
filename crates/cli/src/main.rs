@@ -255,6 +255,12 @@ enum Commands {
         subcommand: FlagCmd,
     },
 
+    /// Bulk message operations (move/copy/flag/delete/tag) over many UIDs
+    Bulk {
+        #[command(subcommand)]
+        subcommand: BulkCmd,
+    },
+
     /// List IMAP folders
     Folders {
         /// Account ID or email
@@ -444,6 +450,11 @@ enum Commands {
         /// Run mail rules against new messages (not yet implemented)
         #[arg(long)]
         run_rules: bool,
+        /// Enqueue route-matched deliveries for each event and run the durable
+        /// delivery executor opportunistically (at-least-once webhook push with
+        /// HMAC signing, response capture, and exponential-backoff retries).
+        #[arg(long)]
+        deliver: bool,
     },
 
     /// Show resolved local state paths and HOME drift warnings
@@ -914,13 +925,20 @@ enum DraftCmd {
 
 #[derive(Subcommand)]
 enum LicenseCmd {
-    /// Activate a license key
+    /// Activate a license key.
+    ///
+    /// Key format: env-lic-<suffix> where <suffix> is at least 16 ASCII
+    /// alphanumeric or hyphen characters (total key length >= 24).
+    /// Stable error code for bad format: license_key_invalid_format.
+    /// The full key is never echoed after storage.
     Activate {
-        /// License key
+        /// License key (env-lic- prefix required, suffix >= 16 chars)
         key: String,
     },
     /// Show current license status
     Status,
+    /// Deactivate the current license (revert to free tier)
+    Deactivate,
 }
 
 #[derive(Subcommand)]
@@ -1029,6 +1047,66 @@ enum EventsCmd {
         /// Optional actor label for the CLI caller
         #[arg(long)]
         actor: Option<String>,
+    },
+    /// Manage event-delivery routes (durable webhook push)
+    Routes {
+        #[command(subcommand)]
+        subcommand: EventRoutesCmd,
+    },
+    /// Inspect and retry durable event deliveries
+    Deliveries {
+        #[command(subcommand)]
+        subcommand: EventDeliveriesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventRoutesCmd {
+    /// Add a webhook delivery route. Prints the signing secret ONCE — store it
+    /// now; it is never shown again.
+    Add {
+        /// Webhook URL to POST matching events to
+        #[arg(long)]
+        url: String,
+        /// Comma-separated event types to match (default: all)
+        #[arg(long)]
+        event_types: Option<String>,
+        /// Account ID or email to scope the route to (default: default account)
+        #[arg(long)]
+        account: Option<String>,
+        /// Priority (lower runs first)
+        #[arg(long, default_value = "100")]
+        priority: i64,
+    },
+    /// List event routes (secret is shown as a prefix only)
+    List {
+        /// Account ID or email (default: default account)
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Remove an event route by id
+    Remove {
+        /// Route ID
+        route_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventDeliveriesCmd {
+    /// List deliveries, optionally filtered by status
+    List {
+        /// Filter: pending | dead | delivered | all
+        #[arg(long, default_value = "all")]
+        status: String,
+        /// Number of entries
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Retry a delivery: clear its dead-letter and backoff so the next executor
+    /// pass attempts it again
+    Retry {
+        /// Delivery ID
+        delivery_id: String,
     },
 }
 
@@ -1662,6 +1740,163 @@ enum ContactsCmd {
     },
 }
 
+/// Common arguments shared across all `envelope bulk` subcommands.
+#[derive(clap::Args)]
+struct BulkCommonArgs {
+    /// Explicit UID list or range spec (e.g. `1,2,9:14`). Mutually exclusive with --query.
+    #[arg(long)]
+    uids: Option<String>,
+    /// IMAP search query to resolve UIDs. Mutually exclusive with --uids.
+    #[arg(long)]
+    query: Option<String>,
+    /// IMAP folder to operate on
+    #[arg(long, default_value = "INBOX")]
+    folder: String,
+    /// Plan only — do not mutate the mailbox
+    #[arg(long)]
+    dry_run: bool,
+    /// Account ID or email
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum BulkCmd {
+    /// Move matched messages to another folder
+    Move {
+        /// Destination folder
+        #[arg(long)]
+        to_folder: String,
+        #[command(flatten)]
+        common: BulkCommonArgs,
+    },
+    /// Copy matched messages to another folder
+    Copy {
+        /// Destination folder
+        #[arg(long)]
+        to_folder: String,
+        #[command(flatten)]
+        common: BulkCommonArgs,
+    },
+    /// Add or remove an IMAP flag on matched messages
+    Flag {
+        /// Flag name (e.g. \\Seen, \\Flagged)
+        #[arg(long)]
+        flag: String,
+        /// Action: add or remove
+        #[arg(long, default_value = "add")]
+        action: String,
+        #[command(flatten)]
+        common: BulkCommonArgs,
+    },
+    /// Delete matched messages (requires --confirm or falls back to --dry-run)
+    Delete {
+        /// Confirm the destructive delete (omit to run as dry-run)
+        #[arg(long)]
+        confirm: bool,
+        #[command(flatten)]
+        common: BulkCommonArgs,
+    },
+    /// Apply a tag to matched messages
+    Tag {
+        /// Tag name to apply
+        #[arg(long)]
+        tag: String,
+        #[command(flatten)]
+        common: BulkCommonArgs,
+    },
+}
+
+/// Dispatch a `bulk` subcommand: build the op + target, then run the engine.
+fn run_bulk(
+    subcommand: BulkCmd,
+    json: bool,
+    backend: envelope_email_store::CredentialBackend,
+) -> anyhow::Result<()> {
+    use commands::bulk;
+    use envelope_email_transport::bulk::BulkOp;
+
+    match subcommand {
+        BulkCmd::Move { to_folder, common } => {
+            let target = bulk::build_target(common.uids.as_deref(), common.query.as_deref())?;
+            bulk::run(
+                BulkOp::Move { to_folder },
+                target,
+                &common.folder,
+                common.dry_run,
+                common.account.as_deref(),
+                json,
+                backend,
+            )
+        }
+        BulkCmd::Copy { to_folder, common } => {
+            let target = bulk::build_target(common.uids.as_deref(), common.query.as_deref())?;
+            bulk::run(
+                BulkOp::Copy { to_folder },
+                target,
+                &common.folder,
+                common.dry_run,
+                common.account.as_deref(),
+                json,
+                backend,
+            )
+        }
+        BulkCmd::Flag {
+            flag,
+            action,
+            common,
+        } => {
+            let target = bulk::build_target(common.uids.as_deref(), common.query.as_deref())?;
+            let op = if action == "add" {
+                BulkOp::FlagAdd { flag }
+            } else {
+                BulkOp::FlagRemove { flag }
+            };
+            bulk::run(
+                op,
+                target,
+                &common.folder,
+                common.dry_run,
+                common.account.as_deref(),
+                json,
+                backend,
+            )
+        }
+        BulkCmd::Delete { confirm, common } => {
+            let target = bulk::build_target(common.uids.as_deref(), common.query.as_deref())?;
+            // Bulk delete requires --confirm; without it (and without --dry-run)
+            // fall back to a dry run so nothing is destroyed by accident.
+            let dry_run = bulk::delete_effective_dry_run(common.dry_run, confirm);
+            if dry_run && !common.dry_run {
+                eprintln!(
+                    "bulk delete: no --confirm given — running as DRY RUN. Re-run with --confirm to delete."
+                );
+            }
+            bulk::run(
+                BulkOp::Delete,
+                target,
+                &common.folder,
+                dry_run,
+                common.account.as_deref(),
+                json,
+                backend,
+            )
+        }
+        BulkCmd::Tag { tag, common } => {
+            let target = bulk::build_target(common.uids.as_deref(), common.query.as_deref())?;
+            bulk::run(
+                BulkOp::Tag { tag },
+                target,
+                &common.folder,
+                common.dry_run,
+                common.account.as_deref(),
+                json,
+                backend,
+            )
+        }
+    }
+}
+
 fn main() {
     // Install the rustls crypto provider before any TLS connections are made.
     // Without this, rustls panics with "Could not automatically determine
@@ -1974,26 +2209,9 @@ fn main() {
             std::process::exit(1);
         }
         Commands::License { subcommand } => match subcommand {
-            LicenseCmd::Activate { key: _ } => {
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "not_implemented",
-                            "command": "license activate",
-                            "message": "license activation is not yet implemented"
-                        }))
-                        .expect("serialize license activation status")
-                    );
-                } else {
-                    eprintln!("Not yet implemented: license activate");
-                }
-                std::process::exit(1);
-            }
-            LicenseCmd::Status => {
-                println!("License: unlicensed (free tier)");
-                Ok(())
-            }
+            LicenseCmd::Activate { key } => commands::license::run_activate(&key, cli.json),
+            LicenseCmd::Status => commands::license::run_status(cli.json),
+            LicenseCmd::Deactivate => commands::license::run_deactivate(cli.json),
         },
         Commands::Agent { subcommand } => match subcommand {
             AgentCmd::Create { name } => commands::agent::run_create(&name, cli.json, backend),
@@ -2056,6 +2274,35 @@ fn main() {
             EventsCmd::Ack { event_id, actor } => {
                 commands::events::run_ack(&event_id, actor.as_deref(), cli.json, backend)
             }
+            EventsCmd::Routes { subcommand } => match subcommand {
+                EventRoutesCmd::Add {
+                    url,
+                    event_types,
+                    account,
+                    priority,
+                } => commands::events::run_route_add(
+                    &url,
+                    event_types.as_deref(),
+                    account.as_deref(),
+                    priority,
+                    cli.json,
+                    backend,
+                ),
+                EventRoutesCmd::List { account } => {
+                    commands::events::run_route_list(account.as_deref(), cli.json, backend)
+                }
+                EventRoutesCmd::Remove { route_id } => {
+                    commands::events::run_route_remove(&route_id, cli.json, backend)
+                }
+            },
+            EventsCmd::Deliveries { subcommand } => match subcommand {
+                EventDeliveriesCmd::List { status, limit } => {
+                    commands::events::run_delivery_list(&status, limit, cli.json, backend)
+                }
+                EventDeliveriesCmd::Retry { delivery_id } => {
+                    commands::events::run_delivery_retry(&delivery_id, cli.json, backend)
+                }
+            },
         },
 
         Commands::Snooze { subcommand } => match subcommand {
@@ -2187,6 +2434,8 @@ fn main() {
             }
         },
 
+        Commands::Bulk { subcommand } => run_bulk(subcommand, cli.json, backend),
+
         Commands::Rule { subcommand } => match subcommand {
             RuleCmd::Create {
                 name,
@@ -2311,11 +2560,13 @@ fn main() {
             folder,
             webhook,
             run_rules,
+            deliver,
         } => commands::watch::run(
             &folder,
             account.as_deref(),
             webhook.as_deref(),
             run_rules,
+            deliver,
             cli.json,
             backend,
         ),

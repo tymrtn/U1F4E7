@@ -193,6 +193,21 @@ fn authorize_tool_call(
     };
     let account = policy_account(params);
     let folder = tool_folder(tool_name, params);
+
+    // rules_run authorizes under `rules.read` for its default dry-run preview and
+    // only escalates to `rules.run` when the caller explicitly opts into a real
+    // (mutating) run with dry_run:false. Preview-only agents can hold rules.read.
+    if tool_name == "rules_run" {
+        let dry_run = params
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let action = if dry_run { "rules.read" } else { "rules.run" };
+        return ctx
+            .authorize_action(action, &account, folder)
+            .map_err(|denial| denial.to_json().to_string());
+    }
+
     ctx.authorize_tool(tool_name, &account, folder)
         .map_err(|denial| denial.to_json().to_string())
 }
@@ -221,6 +236,12 @@ async fn handle_tool_call(
         "folders" => handle_folders(params, backend).await,
         "tag" => handle_tag(params, backend, ctx).await,
         "contacts" => handle_contacts(params, backend).await,
+        "bulk" => handle_bulk(params, backend, ctx).await,
+        "thread" => handle_thread(params, backend).await,
+        "rules_preview" => handle_rules_preview(params, backend).await,
+        "rules_run" => handle_rules_run(params, backend).await,
+        "watch_status" => handle_watch_status(params, backend).await,
+        "snooze" => handle_snooze(params, backend, ctx).await,
         _ => Err(format!("unknown tool: {tool_name}")),
     }
 }
@@ -1260,6 +1281,12 @@ async fn handle_send_draft(
 
 /// Record an agent-attributed audit row for a mutating MCP tool. No-op for
 /// anonymous sessions. Best-effort: audit failures never fail the tool call.
+///
+/// In addition to the action-log row, this emits the durable `agent_action`
+/// catalog event (attributed to the same agent id) so event routes can push
+/// agent activity to webhooks. The event payload carries only the action type
+/// and the (already non-secret) `action_taken` metadata the action log stores —
+/// no bodies, credentials, or full recipient addresses.
 fn log_agent_mutation(
     db: &Database,
     ctx: Option<&AgentContext>,
@@ -1279,6 +1306,17 @@ fn log_agent_mutation(
         action_taken,
         message_id,
         None,
+        Some(agent_id),
+    );
+    let payload = json!({
+        "action_type": action_type,
+        "action": action_taken,
+        "message_id": message_id,
+    });
+    let _ = db.emit_catalog_event(
+        account_id,
+        envelope_email_store::event_catalog::AGENT_ACTION,
+        Some(payload),
         Some(agent_id),
     );
 }
@@ -1604,6 +1642,483 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
             }))
         }
         _ => Err(format!("unknown contacts action: {action}")),
+    }
+}
+
+// ── Bulk / thread / rules / watch / snooze tools ────────────────────
+
+/// Parse the MCP `bulk` input into a transport [`BulkRequest`], returning the
+/// op string alongside it for the underlying-action policy check. Enforces the
+/// MCP send-safety rule: a `delete` op without `confirm: true` is coerced to a
+/// dry run so a destructive bulk delete can never fire on an unconfirmed call.
+fn parse_bulk_request(
+    params: &Value,
+) -> Result<(envelope_email_transport::bulk::BulkRequest, String, bool), String> {
+    use envelope_email_transport::bulk::{BulkOp, BulkRequest, BulkTarget};
+
+    let folder = params
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INBOX")
+        .to_string();
+
+    let target = if let Some(uids) = params.get("uids").and_then(|v| v.as_array()) {
+        let parsed: Vec<u32> = uids
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .map(|n| n as u32)
+                    .ok_or_else(|| "uids entries must be unsigned integers".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        BulkTarget::Uids(parsed)
+    } else if let Some(query) = params.get("search").and_then(|v| v.as_str()) {
+        BulkTarget::Search(query.to_string())
+    } else {
+        return Err("bulk requires either 'uids' (array) or 'search' (string)".to_string());
+    };
+
+    let op_str = params
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or("op is required (move, copy, flag_add, flag_remove, delete, tag)")?
+        .to_string();
+
+    let to_folder = || {
+        params
+            .get("to_folder")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("to_folder is required for op '{op_str}'"))
+    };
+    let flag = || {
+        params
+            .get("flag")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("flag is required for op '{op_str}'"))
+    };
+
+    let op = match op_str.as_str() {
+        "move" => BulkOp::Move {
+            to_folder: to_folder()?,
+        },
+        "copy" => BulkOp::Copy {
+            to_folder: to_folder()?,
+        },
+        "flag_add" => BulkOp::FlagAdd { flag: flag()? },
+        "flag_remove" => BulkOp::FlagRemove { flag: flag()? },
+        "delete" => BulkOp::Delete,
+        "tag" => {
+            let tag = params
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .ok_or("tag is required for op 'tag'")?;
+            BulkOp::Tag {
+                tag: tag.to_string(),
+            }
+        }
+        other => return Err(format!("unknown bulk op '{other}'")),
+    };
+
+    let requested_dry_run = params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Send-safety: a bulk delete must be explicitly confirmed. Without
+    // confirm:true it is forced to a dry run (mirrors the CLI --confirm gate).
+    let forced_dry_run = op_str == "delete" && !confirm;
+    let dry_run = requested_dry_run || forced_dry_run;
+
+    Ok((
+        BulkRequest {
+            target,
+            op,
+            folder,
+            dry_run,
+        },
+        op_str,
+        forced_dry_run,
+    ))
+}
+
+async fn handle_bulk(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
+    let (req, op_str, forced_dry_run) = parse_bulk_request(params)?;
+
+    // Two-action gate: `bulk` (already checked by authorize_tool_call) AND the
+    // underlying single action for this op must both be allowed. Deny with the
+    // standard denial codes when the underlying action is missing.
+    if let Some(ctx) = ctx {
+        let underlying = agent_context::bulk_underlying_action(&op_str)
+            .ok_or_else(|| format!("unknown bulk op '{op_str}'"))?;
+        let account = policy_account(params);
+        let folder = params.get("folder").and_then(|v| v.as_str());
+        ctx.authorize_action(underlying, &account, folder)
+            .map_err(|denial| denial.to_json().to_string())?;
+    }
+
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+
+    let mut client = envelope_email_transport::imap::connect(&creds)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let result = envelope_email_transport::bulk::execute(&mut client, &db, &creds.account.id, &req)
+        .await
+        .map_err(|e| json!({"code": e.code(), "reason": e.to_string()}).to_string())?;
+
+    // Attribute a mutation only when the bulk actually mutated (not a dry run).
+    if !result.dry_run {
+        log_agent_mutation(
+            &db,
+            ctx,
+            &creds.account.id,
+            req.op.action_type(),
+            &json!({
+                "op": op_str,
+                "folder": req.folder,
+                "succeeded": result.succeeded.len(),
+                "failed": result.failed.len(),
+            })
+            .to_string(),
+            None,
+        );
+    }
+
+    let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+    if let (true, Some(obj)) = (forced_dry_run, out.as_object_mut()) {
+        obj.insert(
+            "note".to_string(),
+            json!(
+                "bulk delete ran as a dry run: pass confirm:true to actually delete these messages"
+            ),
+        );
+    }
+    Ok(out)
+}
+
+async fn handle_thread(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+
+    // thread show: a uid selects a single conversation. Otherwise list recent
+    // threads (bounded by the same agent list-limit cap the CLI uses).
+    if let Some(uid) = params.get("uid").and_then(|v| v.as_u64()) {
+        let uid = uid as u32;
+        let folder = params
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("INBOX");
+        let thread_id = db
+            .find_thread_by_uid(uid, folder, &creds.account.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!("message UID {uid} in {folder} not found in any thread (run thread build)")
+            })?;
+        let thread = db
+            .get_thread(&thread_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("thread not found in database")?;
+        if thread.account_id != creds.account.id {
+            return Err("thread belongs to a different account".to_string());
+        }
+        let messages = db
+            .get_thread_messages(&thread_id)
+            .map_err(|e| e.to_string())?;
+        return Ok(wrap_untrusted(json!({
+            "thread_id": thread.thread_id,
+            "subject": thread.subject_normalized,
+            "message_count": thread.message_count,
+            "first_seen": thread.first_seen,
+            "last_activity": thread.last_activity,
+            "account_id": thread.account_id,
+            "messages": messages,
+        })));
+    }
+
+    let limit = validate_agent_list_limit(params.get("limit"))?;
+    let threads = db
+        .list_threads(Some(&creds.account.id), limit)
+        .map_err(|e| e.to_string())?;
+    Ok(wrap_untrusted(Value::Array(
+        threads
+            .iter()
+            .map(|thread| {
+                json!({
+                    "thread_id": thread.thread_id,
+                    "subject": thread.subject_normalized,
+                    "message_count": thread.message_count,
+                    "first_seen": thread.first_seen,
+                    "last_activity": thread.last_activity,
+                    "account_id": thread.account_id,
+                })
+            })
+            .collect(),
+    )))
+}
+
+async fn handle_rules_preview(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+    let folder = params
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INBOX");
+    let limit = validate_agent_list_limit(params.get("limit"))?;
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let mut client = envelope_email_transport::imap::connect(&creds)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    crate::commands::rule::preview_core(&mut client, &db, &creds.account.id, folder, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_rules_run(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+    let folder = params
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INBOX");
+    let limit = validate_agent_list_limit(params.get("limit"))?;
+    // Send-safety: rules_run defaults to a dry run. A real run requires an
+    // explicit dry_run:false (the policy `rules.run` action was already checked).
+    let dry_run = params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    let mut client = envelope_email_transport::imap::connect(&creds)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if dry_run {
+        let mut preview =
+            crate::commands::rule::preview_core(&mut client, &db, &creds.account.id, folder, limit)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some(obj) = preview.as_object_mut() {
+            obj.insert("dry_run".to_string(), json!(true));
+            obj.insert(
+                "note".to_string(),
+                json!("dry run: pass dry_run:false to apply these rules to the mailbox"),
+            );
+        }
+        return Ok(preview);
+    }
+
+    let mut result =
+        crate::commands::rule::apply_core(&mut client, &db, &creds.account.id, folder, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("dry_run".to_string(), json!(false));
+    }
+    Ok(result)
+}
+
+async fn handle_watch_status(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+    use envelope_email_store::DeliveryStatusFilter;
+
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+    // watch_status is read-only diagnostics; resolve the DB without opening IMAP.
+    let (db, account_id) = match account_arg {
+        Some(_) => {
+            let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+                .map_err(|e: anyhow::Error| e.to_string())?;
+            (db, Some(creds.account.id))
+        }
+        None => (Database::open_default().map_err(|e| e.to_string())?, None),
+    };
+
+    let watches = db
+        .list_watches(account_id.as_deref(), 100)
+        .map_err(|e| e.to_string())?;
+
+    // Delivery counts by high-level status (bounded reads).
+    let cap = 1000usize;
+    let count = |filter: DeliveryStatusFilter| -> Result<usize, String> {
+        db.list_deliveries(filter, cap)
+            .map(|v| v.len())
+            .map_err(|e| e.to_string())
+    };
+    let delivered = count(DeliveryStatusFilter::Delivered)?;
+    let dead = count(DeliveryStatusFilter::Dead)?;
+    let pending = count(DeliveryStatusFilter::Pending)?;
+
+    // Most recent successful delivery timestamp across the recent window.
+    let recent = db
+        .list_deliveries(DeliveryStatusFilter::Delivered, cap)
+        .map_err(|e| e.to_string())?;
+    let last_delivery = recent.iter().filter_map(|d| d.delivered_at.clone()).max();
+
+    Ok(json!({
+        "watches": watches.iter().map(|w| json!({
+            "account_id": w.account_id,
+            "folder": w.folder,
+            "status": w.status,
+            "last_heartbeat_at": w.last_heartbeat_at,
+            "last_event_at": w.last_event_at,
+            "failure_reason": w.failure_reason,
+            "updated_at": w.updated_at,
+        })).collect::<Vec<_>>(),
+        "deliveries": {
+            "delivered": delivered,
+            "pending": pending,
+            "dead_letter": dead,
+            "last_delivery_at": last_delivery,
+        },
+    }))
+}
+
+async fn handle_snooze(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
+    let account_arg = params.get("account").and_then(|v| v.as_str());
+
+    match action {
+        "list" => {
+            // Read-only: resolve account email filter without opening IMAP.
+            let (db, filter) = match account_arg {
+                Some(_) => {
+                    let (db, creds) =
+                        crate::commands::common::setup_credentials(account_arg, backend)
+                            .map_err(|e: anyhow::Error| e.to_string())?;
+                    (db, Some(creds.account.username))
+                }
+                None => (Database::open_default().map_err(|e| e.to_string())?, None),
+            };
+            let snoozed = db
+                .list_snoozed(filter.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_value(&snoozed).map_err(|e| e.to_string())?)
+        }
+        "set" => {
+            let uid = required_uid(params)?;
+            let until = required_str(params, "until")?;
+            let folder = params
+                .get("folder")
+                .and_then(|v| v.as_str())
+                .unwrap_or("INBOX");
+            let reason = params.get("reason").and_then(|v| v.as_str());
+            let note = params.get("note").and_then(|v| v.as_str());
+            let recipient = params.get("recipient").and_then(|v| v.as_str());
+            let return_at = crate::commands::datetime::parse_until(until)
+                .map_err(|e| format!("failed to parse until: {e}"))?;
+
+            let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+                .map_err(|e: anyhow::Error| e.to_string())?;
+            let account_email = creds.account.username.clone();
+
+            if db
+                .find_snoozed_by_uid(&account_email, uid)
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err(format!("UID {uid} is already snoozed; cancel it first"));
+            }
+
+            let mut client = envelope_email_transport::imap::connect(&creds)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = envelope_email_transport::imap::create_folder(&mut client, "Snoozed").await;
+            let msg = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (subject, message_id) = match &msg {
+                Some(m) => (Some(m.subject.as_str()), m.message_id.as_deref()),
+                None => (None, None),
+            };
+            envelope_email_transport::imap::move_message(&mut client, uid, folder, "Snoozed")
+                .await
+                .map_err(|e| e.to_string())?;
+            let snoozed = db
+                .create_snoozed(
+                    &account_email,
+                    uid,
+                    folder,
+                    "Snoozed",
+                    &return_at,
+                    message_id,
+                    subject,
+                    reason,
+                    note,
+                    recipient,
+                )
+                .map_err(|e| e.to_string())?;
+
+            log_agent_mutation(
+                &db,
+                ctx,
+                &creds.account.id,
+                "snooze",
+                &json!({"uid": uid, "until": return_at, "from": folder}).to_string(),
+                message_id,
+            );
+            Ok(serde_json::to_value(&snoozed).map_err(|e| e.to_string())?)
+        }
+        "cancel" => {
+            let uid = required_uid(params)?;
+            let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+                .map_err(|e: anyhow::Error| e.to_string())?;
+            let account_email = creds.account.username.clone();
+            let snoozed = db
+                .find_snoozed_by_uid(&account_email, uid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("no snoozed message found for UID {uid}"))?;
+
+            let mut client = envelope_email_transport::imap::connect(&creds)
+                .await
+                .map_err(|e| e.to_string())?;
+            envelope_email_transport::imap::move_message(
+                &mut client,
+                snoozed.uid,
+                &snoozed.snoozed_folder,
+                &snoozed.original_folder,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            db.delete_snoozed(&snoozed.id).map_err(|e| e.to_string())?;
+
+            log_agent_mutation(
+                &db,
+                ctx,
+                &creds.account.id,
+                "snooze",
+                &json!({"uid": uid, "cancelled": true, "to": snoozed.original_folder}).to_string(),
+                snoozed.message_id.as_deref(),
+            );
+            Ok(json!({
+                "cancelled": true,
+                "uid": uid,
+                "returned_to": snoozed.original_folder,
+            }))
+        }
+        other => Err(format!(
+            "unknown snooze action '{other}' (expected set, list, or cancel)"
+        )),
     }
 }
 
@@ -1968,6 +2483,93 @@ mod tests {
             out_props.get("sent_mail").is_some(),
             "send output_schema must advertise sent_mail (contains copy_source)"
         );
+    }
+
+    #[test]
+    fn parse_bulk_delete_without_confirm_forces_dry_run_with_note() {
+        // Send-safety: a bulk delete op with no confirm:true must be coerced to a
+        // dry run (no mutation), and the caller-facing forced_dry_run flag is set
+        // so the handler can attach the explanatory note.
+        let params = json!({ "op": "delete", "uids": [1, 2, 3], "folder": "INBOX" });
+        let (req, op_str, forced) = parse_bulk_request(&params).expect("parse");
+        assert_eq!(op_str, "delete");
+        assert!(req.dry_run, "unconfirmed delete must run as dry run");
+        assert!(forced, "forced_dry_run must be set so the note is attached");
+    }
+
+    #[test]
+    fn parse_bulk_delete_with_confirm_actually_deletes() {
+        let params = json!({ "op": "delete", "uids": [1], "folder": "INBOX", "confirm": true });
+        let (req, _op, forced) = parse_bulk_request(&params).expect("parse");
+        assert!(
+            !req.dry_run,
+            "confirmed delete must not be forced to dry run"
+        );
+        assert!(!forced);
+    }
+
+    #[test]
+    fn parse_bulk_non_delete_ops_do_not_require_confirm() {
+        let params = json!({ "op": "move", "uids": [1], "to_folder": "Archive" });
+        let (req, op_str, forced) = parse_bulk_request(&params).expect("parse");
+        assert_eq!(op_str, "move");
+        assert!(!req.dry_run);
+        assert!(!forced);
+    }
+
+    #[test]
+    fn log_agent_mutation_emits_agent_action_event_with_agent_id() {
+        use crate::commands::agent_context::AgentContext;
+        use envelope_email_transport::{AgentPolicy as TransportPolicy, SendMode};
+
+        let db = Database::open_memory().unwrap();
+        let ctx = AgentContext {
+            agent_id: "agent-42".to_string(),
+            agent_name: "skippy".to_string(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".to_string()],
+                allowed_folders: vec!["*".to_string()],
+                allowed_actions: vec!["*".to_string()],
+                send_mode_ceiling: SendMode::DraftOnly,
+                allow_recipients: Vec::new(),
+            },
+        };
+
+        log_agent_mutation(
+            &db,
+            Some(&ctx),
+            "acc-1",
+            "move",
+            &json!({"uid": 5, "to": "Archive"}).to_string(),
+            None,
+        );
+
+        // The durable agent_action catalog event landed, attributed to the agent.
+        let (event_type, agent_id): (String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT event_type, agent_id FROM events WHERE event_type = ?1",
+                [envelope_email_store::event_catalog::AGENT_ACTION],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("agent_action event must exist");
+        assert_eq!(event_type, "agent_action");
+        assert_eq!(agent_id.as_deref(), Some("agent-42"));
+    }
+
+    #[test]
+    fn log_agent_mutation_anonymous_emits_no_agent_action_event() {
+        let db = Database::open_memory().unwrap();
+        log_agent_mutation(&db, None, "acc-1", "move", "{}", None);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                [envelope_email_store::event_catalog::AGENT_ACTION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "anonymous sessions must not emit agent_action");
     }
 }
 

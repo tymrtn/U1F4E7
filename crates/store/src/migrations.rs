@@ -604,6 +604,83 @@ fn migrations() -> Migrations<'static> {
                 Ok(())
             },
         ),
+        // ── Migration 10: durable event push (v2 webhook delivery) ──────
+        // Turns the fire-and-forget webhook path into an at-least-once
+        // delivery pipeline. Additive only — new columns default to values
+        // that preserve the meaning of pre-existing rows:
+        //   * event_routes.secret        HMAC-SHA256 signing key per route,
+        //                                generated once at creation, shown once.
+        //   * event_deliveries.next_attempt_at  when the delivery is next due.
+        //   * event_deliveries.last_status_code HTTP status of last attempt.
+        //   * event_deliveries.last_response_snippet  response body, capped at
+        //                                RESPONSE_SNIPPET_CAP_BYTES (1 KiB) to
+        //                                bound storage and avoid logging secrets.
+        //   * event_deliveries.last_error        transport-level error string.
+        //   * event_deliveries.dead_lettered_at  set once retries are exhausted.
+        //   * event_deliveries.delivered_at      set on the first 2xx response.
+        // Every ALTER is guarded on column existence so a database that skipped
+        // the baseline still migrates cleanly (same pattern as migration 9).
+        M::up_with_hook("", |tx: &Transaction| {
+            let table_exists = |table: &str| -> bool {
+                tx.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .and_then(|mut s| s.query_row([table], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0
+            };
+            let has_col = |table: &str, col: &str| -> bool {
+                tx.prepare(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                    > 0
+            };
+
+            if table_exists("event_routes") && !has_col("event_routes", "secret") {
+                tx.execute_batch("ALTER TABLE event_routes ADD COLUMN secret TEXT;")?;
+            }
+
+            if table_exists("event_deliveries") {
+                for (col, ddl) in [
+                    (
+                        "next_attempt_at",
+                        "ALTER TABLE event_deliveries ADD COLUMN next_attempt_at TEXT;",
+                    ),
+                    (
+                        "last_status_code",
+                        "ALTER TABLE event_deliveries ADD COLUMN last_status_code INTEGER;",
+                    ),
+                    (
+                        "last_response_snippet",
+                        "ALTER TABLE event_deliveries ADD COLUMN last_response_snippet TEXT;",
+                    ),
+                    (
+                        "last_error",
+                        "ALTER TABLE event_deliveries ADD COLUMN last_error TEXT;",
+                    ),
+                    (
+                        "dead_lettered_at",
+                        "ALTER TABLE event_deliveries ADD COLUMN dead_lettered_at TEXT;",
+                    ),
+                    (
+                        "delivered_at",
+                        "ALTER TABLE event_deliveries ADD COLUMN delivered_at TEXT;",
+                    ),
+                ] {
+                    if !has_col("event_deliveries", col) {
+                        tx.execute_batch(ddl)?;
+                    }
+                }
+                // Due-work index: scan pending, not-yet-delivered, not
+                // dead-lettered deliveries whose next attempt is due.
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_event_deliveries_due
+                        ON event_deliveries(next_attempt_at)
+                        WHERE delivered_at IS NULL AND dead_lettered_at IS NULL;",
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -678,6 +755,52 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         run(&mut conn).unwrap();
         // Running again should be a no-op
+        run(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn migration_10_adds_delivery_result_and_retry_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let cols = |conn: &Connection, table: &str| -> Vec<String> {
+            conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let route_cols = cols(&conn, "event_routes");
+        assert!(
+            route_cols.contains(&"secret".to_string()),
+            "event_routes must carry a per-route HMAC secret column"
+        );
+
+        let delivery_cols = cols(&conn, "event_deliveries");
+        for required in [
+            "attempt_count",
+            "next_attempt_at",
+            "last_status_code",
+            "last_response_snippet",
+            "last_error",
+            "dead_lettered_at",
+            "delivered_at",
+        ] {
+            assert!(
+                delivery_cols.contains(&required.to_string()),
+                "event_deliveries missing column: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_10_guard_survives_rerun() {
+        // Re-running after every column already exists must be a no-op; the
+        // guard must not assume a fresh schema.
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
         run(&mut conn).unwrap();
     }
 

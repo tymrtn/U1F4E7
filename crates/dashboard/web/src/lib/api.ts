@@ -428,8 +428,209 @@ export const api = {
       ...o,
       method: 'DELETE'
     });
+  },
+
+  /** GET /api/accounts/{id}/folders — IMAP folder list with STATUS stats. */
+  folders(accountId: string, o?: RequestOptions): Promise<FoldersResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/folders`, o);
+  },
+
+  /** GET /api/accounts/{id}/snoozed — snoozed messages for an account. */
+  snoozed(accountId: string, o?: RequestOptions): Promise<SnoozedResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/snoozed`, o);
+  },
+
+  /**
+   * POST /api/accounts/{id}/messages/{uid}/flags
+   * Adds and/or removes IMAP flags on a single message.
+   */
+  messageFlags(
+    accountId: string,
+    uid: number,
+    opts: { folder?: string; add?: string[]; remove?: string[] },
+    o?: RequestOptions
+  ): Promise<{ ok: boolean; uid: number; added: string[]; removed: string[] }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/flags`,
+      {
+        ...o,
+        method: 'POST',
+        body: { folder: opts.folder ?? 'INBOX', add: opts.add ?? [], remove: opts.remove ?? [] }
+      }
+    );
+  },
+
+  /**
+   * POST /api/accounts/{id}/messages/{uid}/move
+   * Moves a message to a target folder.
+   */
+  messageMove(
+    accountId: string,
+    uid: number,
+    opts: { folder?: string; to_folder: string },
+    o?: RequestOptions
+  ): Promise<{ ok: boolean; uid: number; moved_to: string }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/move`,
+      { ...o, method: 'POST', body: { folder: opts.folder ?? 'INBOX', to_folder: opts.to_folder } }
+    );
+  },
+
+  /**
+   * DELETE /api/accounts/{id}/messages/{uid}?folder=X
+   * Permanently deletes a message.
+   */
+  messageDelete(
+    accountId: string,
+    uid: number,
+    folder = 'INBOX',
+    o?: RequestOptions
+  ): Promise<{ ok: boolean; uid: number; deleted_from: string }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/messages/${uid}`,
+      { ...o, method: 'DELETE', query: { folder } }
+    );
+  },
+
+  /**
+   * GET /api/accounts/{id}/search?q=...&folder=...
+   * Account-scoped IMAP search.
+   */
+  searchMessages(
+    accountId: string,
+    q: string,
+    folder = 'INBOX',
+    limit = 50,
+    o?: RequestOptions
+  ): Promise<SearchResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/search`, {
+      ...o,
+      query: { q, folder, limit }
+    });
   }
 };
+
+// ── Additional domain types ───────────────────────────────────────────
+
+export interface FolderStats {
+  folder: string;
+  exists: number;
+  recent: number;
+  unseen: number | null;
+  virtual?: boolean;
+}
+
+export interface FoldersResponse {
+  folders: FolderStats[];
+  snoozed_virtual: FolderStats & { virtual: true };
+  error?: string;
+}
+
+export interface SnoozedItem {
+  id: string;
+  account_id: string;
+  uid: number;
+  message_id: string | null;
+  subject: string | null;
+  from_addr: string | null;
+  snoozed_folder: string;
+  original_folder: string;
+  snooze_until: string;
+  created_at: string;
+}
+
+export interface SnoozedResponse {
+  snoozed: SnoozedItem[];
+}
+
+export interface SearchMessageSummary extends MessageSummary {
+  unread: boolean;
+}
+
+export interface SearchResponse {
+  messages: SearchMessageSummary[];
+  query: string;
+}
+
+// ── Bulk client ───────────────────────────────────────────────────────
+
+export type BulkOp =
+  | { type: 'flags'; add?: string[]; remove?: string[]; folder?: string }
+  | { type: 'move'; to_folder: string; folder?: string }
+  | { type: 'delete'; folder?: string };
+
+export interface BulkItem {
+  accountId: string;
+  uid: number;
+}
+
+export interface BulkProgress {
+  done: number;
+  total: number;
+  failed: Array<{ item: BulkItem; error: string }>;
+}
+
+/**
+ * Client-side bulk operation runner — the fallback until a server bulk endpoint
+ * ships (a Rust agent is building /messages/bulk separately; do NOT call it yet).
+ *
+ * - Runs `op` against each item, concurrency-capped at 4 in-flight at once.
+ * - Calls `onProgress` after each item completes (pass or fail).
+ * - Returns the final `BulkProgress` with `failed` entries for partial-failure UX.
+ * - Accepts injectable `fetchImpl` so tests can mock at the request level.
+ */
+export async function bulkClient(
+  op: BulkOp,
+  items: BulkItem[],
+  onProgress?: (progress: BulkProgress) => void,
+  fetchImpl?: typeof fetch
+): Promise<BulkProgress> {
+  const CONCURRENCY = 4;
+  const progress: BulkProgress = { done: 0, total: items.length, failed: [] };
+
+  async function runOne(item: BulkItem): Promise<void> {
+    try {
+      const o: RequestOptions = fetchImpl ? { fetchImpl } : {};
+      if (op.type === 'flags') {
+        await request(
+          `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/flags`,
+          { ...o, method: 'POST', body: { folder: op.folder ?? 'INBOX', add: op.add ?? [], remove: op.remove ?? [] } }
+        );
+      } else if (op.type === 'move') {
+        await request(
+          `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/move`,
+          { ...o, method: 'POST', body: { folder: op.folder ?? 'INBOX', to_folder: op.to_folder } }
+        );
+      } else if (op.type === 'delete') {
+        await request(
+          `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}`,
+          { ...o, method: 'DELETE', query: { folder: op.folder ?? 'INBOX' } }
+        );
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      progress.failed.push({ item, error: msg });
+    }
+    progress.done += 1;
+    onProgress?.({ ...progress, failed: [...progress.failed] });
+  }
+
+  // Concurrency-cap via a sliding pool.
+  const queue = [...items];
+  const inFlight = new Set<Promise<void>>();
+  while (queue.length > 0 || inFlight.size > 0) {
+    while (queue.length > 0 && inFlight.size < CONCURRENCY) {
+      const item = queue.shift()!;
+      const p = runOne(item).finally(() => inFlight.delete(p));
+      inFlight.add(p);
+    }
+    if (inFlight.size > 0) {
+      await Promise.race(inFlight);
+    }
+  }
+
+  return progress;
+}
 
 // ── Account-health derivation (shared by rail + drawer) ───────────────
 

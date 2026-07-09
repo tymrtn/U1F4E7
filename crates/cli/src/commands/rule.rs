@@ -427,31 +427,26 @@ pub async fn run_test(
     Ok(())
 }
 
-/// `envelope rule preview` — batch preview rules without mailbox mutation.
-#[allow(clippy::too_many_arguments)]
-#[tokio::main]
-pub async fn run_preview(
+/// Reusable rule-preview core: resolve rules against fetched summaries and
+/// return the structured `{mode, folder, processed, matches, mutated}` Value
+/// with no mailbox mutation. Shared by the CLI `run_preview` wrapper and the
+/// MCP `rules_preview` tool so both advertise identical semantics.
+pub async fn preview_core(
+    client: &mut imap::ImapClient,
+    db: &envelope_email_store::Database,
+    account_id: &str,
     folder: &str,
-    account: Option<&str>,
     limit: u32,
-    json: bool,
-    backend: CredentialBackend,
-) -> Result<()> {
-    let (db, creds) = setup_credentials(account, backend)?;
-    let account_id = creds.account.id.clone();
-
-    let mut client = imap::connect(&creds)
-        .await
-        .context("IMAP connection failed")?;
-    let summaries = imap::fetch_inbox(&mut client, folder, limit)
+) -> Result<serde_json::Value> {
+    let summaries = imap::fetch_inbox(client, folder, limit)
         .await
         .context("failed to fetch messages")?;
-    let preview_rules = db.list_rules(&account_id).context("failed to list rules")?;
+    let preview_rules = db.list_rules(account_id).context("failed to list rules")?;
 
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();
     for summary in &summaries {
-        let ctx = build_message_context_from_summary(summary, &db, &account_id)?;
+        let ctx = build_message_context_from_summary(summary, db, account_id)?;
         for rule in &preview_rules {
             let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
                 Ok(e) => e,
@@ -475,18 +470,127 @@ pub async fn run_preview(
         }
     }
 
+    Ok(serde_json::json!({
+        "mode": "preview",
+        "folder": folder,
+        "processed": total,
+        "matches": matches,
+        "mutated": false,
+        "ui": ui::rules_ui(account_id),
+    }))
+}
+
+/// Reusable rule-run core: apply enabled rules against fetched summaries,
+/// mutating the mailbox, and return the structured `{processed, actions, log}`
+/// Value. Shared by the CLI `run_apply` wrapper and the MCP `rules_run` tool.
+/// The caller is responsible for the confirm/dry-run gate — this always mutates.
+pub async fn apply_core(
+    client: &mut imap::ImapClient,
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    folder: &str,
+    limit: u32,
+) -> Result<serde_json::Value> {
+    let summaries = imap::fetch_inbox(client, folder, limit)
+        .await
+        .context("failed to fetch messages")?;
+
+    let enabled_rules = db
+        .list_enabled_rules(account_id)
+        .context("failed to list enabled rules")?;
+
+    if enabled_rules.is_empty() {
+        return Ok(serde_json::json!({
+            "processed": 0,
+            "actions": 0,
+            "log": [],
+            "message": "no enabled rules",
+            "ui": ui::rules_ui(account_id),
+        }));
+    }
+
+    let total = summaries.len();
+    let mut actions_taken = 0u32;
+    let mut action_log: Vec<serde_json::Value> = Vec::new();
+
+    for summary in summaries.iter() {
+        let uid = summary.uid;
+        let ctx = build_message_context_from_summary(summary, db, account_id)?;
+
+        for rule in &enabled_rules {
+            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !rules::evaluate(&match_expr, &ctx) {
+                continue;
+            }
+            let action: Action = match serde_json::from_str(&rule.action) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let action_result =
+                execute_action(client, &action, uid, folder, Some(&rule.name), Some(&ctx)).await;
+            match &action_result {
+                Ok(desc) => {
+                    info!("rule '{}' fired on UID {uid}: {desc}", rule.name);
+                    db.increment_rule_hit(&rule.id).ok();
+                    actions_taken += 1;
+                    action_log.push(serde_json::json!({
+                        "uid": uid,
+                        "rule": rule.name,
+                        "action": desc,
+                        "status": "ok",
+                    }));
+                }
+                Err(e) => {
+                    action_log.push(serde_json::json!({
+                        "uid": uid,
+                        "rule": rule.name,
+                        "error": format!("{e}"),
+                        "status": "error",
+                    }));
+                }
+            }
+            if matches!(action, Action::Move(_) | Action::Delete) {
+                break;
+            }
+            if rule.stop {
+                break;
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "processed": total,
+        "actions": actions_taken,
+        "log": action_log,
+        "ui": ui::rules_ui(account_id),
+    }))
+}
+
+/// `envelope rule preview` — batch preview rules without mailbox mutation.
+#[allow(clippy::too_many_arguments)]
+#[tokio::main]
+pub async fn run_preview(
+    folder: &str,
+    account: Option<&str>,
+    limit: u32,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    let (db, creds) = setup_credentials(account, backend)?;
+    let account_id = creds.account.id.clone();
+
+    let mut client = imap::connect(&creds)
+        .await
+        .context("IMAP connection failed")?;
+    let result = preview_core(&mut client, &db, &account_id, folder, limit).await?;
+    let matches = result["matches"].as_array().cloned().unwrap_or_default();
+    let total = result["processed"].as_u64().unwrap_or(0) as usize;
+
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mode": "preview",
-                "folder": folder,
-                "processed": total,
-                "matches": matches,
-                "mutated": false,
-                "ui": ui::rules_ui(&account_id),
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&result)?);
     } else if matches.is_empty() {
         println!(
             "Preview: no rules would touch {total} message(s) in {folder}; no mailbox changes made"
@@ -531,117 +635,15 @@ pub async fn run_apply(
         .await
         .context("IMAP connection failed")?;
 
-    // Fetch inbox messages
-    let summaries = imap::fetch_inbox(&mut client, folder, limit)
-        .await
-        .context("failed to fetch messages")?;
-
-    let enabled_rules = db
-        .list_enabled_rules(&account_id)
-        .context("failed to list enabled rules")?;
-
-    if enabled_rules.is_empty() {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "processed": 0,
-                    "actions": 0,
-                    "message": "no enabled rules",
-                    "ui": ui::rules_ui(&account_id),
-                })
-            );
-        } else {
-            println!("No enabled rules — nothing to do");
-        }
-        return Ok(());
-    }
-
-    let total = summaries.len();
-    let mut actions_taken = 0u32;
-    let mut action_log: Vec<serde_json::Value> = Vec::new();
-
-    for (i, summary) in summaries.iter().enumerate() {
-        let uid = summary.uid;
-        let ctx = build_message_context_from_summary(summary, &db, &account_id)?;
-
-        // Evaluate all enabled rules (in priority order, stop on first stop rule)
-        for rule in &enabled_rules {
-            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !rules::evaluate(&match_expr, &ctx) {
-                continue;
-            }
-
-            let action: Action = match serde_json::from_str(&rule.action) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-
-            // Execute the action
-            let action_result = execute_action(
-                &mut client,
-                &action,
-                uid,
-                folder,
-                Some(&rule.name),
-                Some(&ctx),
-            )
-            .await;
-
-            match &action_result {
-                Ok(desc) => {
-                    info!("rule '{}' fired on UID {uid}: {desc}", rule.name);
-                    db.increment_rule_hit(&rule.id).ok();
-                    actions_taken += 1;
-
-                    action_log.push(serde_json::json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "action": desc,
-                        "status": "ok",
-                    }));
-                }
-                Err(e) => {
-                    action_log.push(serde_json::json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "error": format!("{e}"),
-                        "status": "error",
-                    }));
-                }
-            }
-
-            // If the action moved/deleted the message, skip remaining rules
-            if matches!(action, Action::Move(_) | Action::Delete) {
-                break;
-            }
-
-            if rule.stop {
-                break;
-            }
-        }
-
-        // Progress output (non-JSON only, every 50 messages)
-        if !json && (i + 1) % 50 == 0 {
-            eprintln!("processed {}/{total}, {actions_taken} actions taken", i + 1,);
-        }
-    }
+    let result = apply_core(&mut client, &db, &account_id, folder, limit).await?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "processed": total,
-                "actions": actions_taken,
-                "log": action_log,
-                "ui": ui::rules_ui(&account_id),
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.get("message").and_then(|m| m.as_str()) == Some("no enabled rules") {
+        println!("No enabled rules — nothing to do");
     } else {
+        let total = result["processed"].as_u64().unwrap_or(0);
+        let actions_taken = result["actions"].as_u64().unwrap_or(0);
         println!("processed {total}/{total}, {actions_taken} action(s) taken");
     }
 

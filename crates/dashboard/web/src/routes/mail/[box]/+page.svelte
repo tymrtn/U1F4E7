@@ -6,5 +6,5 @@
 
 <EmptyState
   title="Open a message to read it"
-  hint="Select a message from the list. Reading never marks it read — Envelope peeks with BODY.PEEK."
+  hint="Select a message from the list. Reading here never marks messages as read."
 />

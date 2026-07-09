@@ -13,8 +13,8 @@ export interface Mailbox {
 export const MAILBOXES: Mailbox[] = [
   { slug: 'unified', label: 'Unified Inbox', wired: true },
   { slug: 'needs-attention', label: 'Needs Attention', wired: false },
-  { slug: 'snoozed', label: 'Snoozed', wired: false },
-  { slug: 'drafts', label: 'Drafts', wired: false },
+  { slug: 'snoozed', label: 'Snoozed', wired: true },
+  { slug: 'drafts', label: 'Drafts', wired: true },
   { slug: 'sent', label: 'Sent', wired: false }
 ];
 

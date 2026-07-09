@@ -6,10 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_imap::extensions::idle::IdleResponse;
 use envelope_email_store::CredentialBackend;
-use envelope_email_store::models::Event;
+use envelope_email_store::models::{Event, EventRoute};
 use envelope_email_transport::code_extractor::{
     OtpPatternId, extract_code_with_pattern, parse_expiry_hint, redact_codes,
 };
+use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
@@ -21,13 +22,18 @@ pub async fn run(
     account: Option<&str>,
     webhook: Option<&str>,
     _run_rules: bool,
+    deliver: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
 
-    let http_client = webhook.map(|_| reqwest::Client::new());
+    let http_client = if webhook.is_some() || deliver {
+        Some(reqwest::Client::new())
+    } else {
+        None
+    };
 
     if !json {
         eprintln!(
@@ -111,7 +117,12 @@ pub async fn run(
                     );
 
                     match db.insert_event_idempotent(&event) {
-                        Ok(true) => emit_event(&event, webhook, http_client.as_ref()),
+                        Ok(true) => {
+                            emit_event(&event, webhook, http_client.as_ref());
+                            if deliver {
+                                enqueue_deliveries_for_event(&db, &event);
+                            }
+                        }
                         Ok(false) => continue,
                         Err(e) => warn!("failed to persist event: {e}"),
                     }
@@ -136,10 +147,39 @@ pub async fn run(
                                 created_at,
                             );
                             match db.insert_event_idempotent(&otp_event) {
-                                Ok(true) => emit_event(&otp_event, webhook, http_client.as_ref()),
+                                Ok(true) => {
+                                    emit_event(&otp_event, webhook, http_client.as_ref());
+                                    if deliver {
+                                        enqueue_deliveries_for_event(&db, &otp_event);
+                                    }
+                                }
                                 Ok(false) => {}
                                 Err(e) => warn!("failed to persist OTP event: {e}"),
                             }
+                        }
+                    }
+                }
+
+                // Opportunistically drain any due deliveries after this batch.
+                if deliver {
+                    if let Some(client) = http_client.as_ref() {
+                        match deliver_due_events(
+                            &db,
+                            client,
+                            chrono::Utc::now(),
+                            DeliveryLimits::default(),
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                if report.examined > 0 {
+                                    info!(
+                                        "deliveries: {} delivered, {} retried, {} dead-lettered",
+                                        report.delivered, report.retried, report.dead_lettered
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("delivery executor error: {e}"),
                         }
                     }
                 }
@@ -276,6 +316,51 @@ fn confidence_for_pattern(pattern: OtpPatternId) -> f32 {
         OtpPatternId::OtpStyle => 0.9,
         OtpPatternId::HtmlProminent => 0.7,
         OtpPatternId::Fallback => 0.4,
+    }
+}
+
+/// Enqueue a pending delivery for every enabled route (in this event's account)
+/// whose match expression accepts the event type. Deterministic delivery ids
+/// keep enqueue idempotent so re-processing the same event never double-sends.
+fn enqueue_deliveries_for_event(db: &envelope_email_store::Database, event: &Event) {
+    let routes = match db.list_enabled_event_routes(Some(&event.account_id)) {
+        Ok(routes) => routes,
+        Err(e) => {
+            warn!("failed to load event routes: {e}");
+            return;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    for route in &routes {
+        if !route_matches(route, &event.event_type) {
+            continue;
+        }
+        let delivery_row_id = format!("{}:{}", event.id, route.id);
+        let delivery_marker = stable_hash(&delivery_row_id);
+        if let Err(e) = db.enqueue_delivery(
+            &delivery_row_id,
+            &event.id,
+            &route.id,
+            &delivery_marker,
+            &now,
+        ) {
+            warn!("failed to enqueue delivery: {e}");
+        }
+    }
+}
+
+/// Does a route's `match_expr` accept this event type? The expression is JSON:
+/// `{"event_types": ["new_message", ...]}` matches only the listed types; an
+/// empty object / missing `event_types` matches everything.
+fn route_matches(route: &EventRoute, event_type: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&route.match_expr) else {
+        // Unparseable match expression fails closed (no delivery) rather than
+        // spamming every route target.
+        return false;
+    };
+    match value.get("event_types").and_then(|v| v.as_array()) {
+        Some(types) => types.iter().any(|t| t.as_str() == Some(event_type)),
+        None => true,
     }
 }
 

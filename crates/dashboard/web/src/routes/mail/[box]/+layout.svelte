@@ -1,18 +1,24 @@
 <script lang="ts">
-  // A mailbox view: rail + message list + reader outlet. The list lives here so
-  // it stays mounted while the reader (a nested [account]/[uid] route) swaps in
-  // the third column. Only the Unified Inbox is wired to real data this wave;
-  // other boxes render an explicit "not yet wired" state — no fake rows.
+  // v2 mailbox layout: rail + message list (selection, search, bulk ops) + reader outlet.
+  // The list stays mounted while the reader (nested [account]/[uid] route) swaps the third column.
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import type { Snippet } from 'svelte';
   import { Rail, Spinner, EmptyState, MonoTag } from '$lib/components';
+  import MessageRow from '$lib/components/MessageRow.svelte';
+  import BulkToolbar from '$lib/components/BulkToolbar.svelte';
+  import SearchBar from '$lib/components/SearchBar.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
+  import { SelectionStore } from '$lib/selection.svelte';
   import {
     api,
     EnvelopeApiError,
     type UnifiedInboxMessage,
-    type UnifiedInboxError
+    type UnifiedInboxError,
+    type Draft,
+    type SnoozedItem,
+    type SearchMessageSummary,
+    type FolderStats,
   } from '$lib/api';
 
   let { children }: { children: Snippet } = $props();
@@ -21,18 +27,31 @@
   const selectedUid = $derived(page.params.uid ? Number(page.params.uid) : null);
   const selectedAccount = $derived(page.params.account ?? null);
 
-  let messages = $state<UnifiedInboxMessage[]>([]);
+  const selection = new SelectionStore();
+
+  let unifiedMessages = $state<UnifiedInboxMessage[]>([]);
+  let drafts = $state<Draft[]>([]);
+  let snoozed = $state<SnoozedItem[]>([]);
   let listErrors = $state<UnifiedInboxError[]>([]);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadedBox = $state<string | null>(null);
+  let folders = $state<FolderStats[]>([]);
+
+  const searchQuery = $derived(page.url.searchParams.get('q') ?? '');
+  let searchResults = $state<SearchMessageSummary[]>([]);
+  let searching = $state(false);
+  let searchError = $state<string | null>(null);
+  const isSearching = $derived(searchQuery.length > 0);
+
+  let starOverrides = $state<Map<string, boolean>>(new Map());
 
   async function loadUnified() {
     loading = true;
     error = null;
     try {
       const res = await api.unifiedInbox(50);
-      messages = res.messages;
+      unifiedMessages = res.messages;
       listErrors = res.errors ?? [];
     } catch (e) {
       const err = e as EnvelopeApiError;
@@ -42,41 +61,194 @@
     }
   }
 
-  // Load once per box entry into a wired mailbox.
+  async function loadDrafts() {
+    loading = true;
+    error = null;
+    try {
+      const { accounts } = await api.listAccounts();
+      const allDrafts: Draft[] = [];
+      await Promise.all(
+        accounts.map(async (acct) => {
+          try {
+            const res = await api.drafts(acct.id);
+            allDrafts.push(...res.drafts);
+          } catch {
+            // best-effort
+          }
+        })
+      );
+      drafts = allDrafts;
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load drafts.' };
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function loadSnoozed() {
+    loading = true;
+    error = null;
+    try {
+      const { accounts } = await api.listAccounts();
+      const allSnoozed: SnoozedItem[] = [];
+      await Promise.all(
+        accounts.map(async (acct) => {
+          try {
+            const res = await api.snoozed(acct.id);
+            allSnoozed.push(...res.snoozed);
+          } catch {
+            // best-effort
+          }
+        })
+      );
+      snoozed = allSnoozed;
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load snoozed.' };
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function loadFolders() {
+    try {
+      const { accounts } = await api.listAccounts();
+      if (accounts.length === 0) return;
+      const res = await api.folders(accounts[0].id);
+      folders = res.folders ?? [];
+    } catch {
+      // non-fatal
+    }
+  }
+
   $effect(() => {
     const slug = page.params.box ?? 'unified';
     if (box?.wired && loadedBox !== slug) {
       loadedBox = slug;
-      loadUnified();
+      selection.clear();
+      starOverrides = new Map();
+      if (slug === 'unified') {
+        loadUnified();
+        loadFolders();
+      } else if (slug === 'drafts') {
+        loadDrafts();
+      } else if (slug === 'snoozed') {
+        loadSnoozed();
+      }
     }
   });
 
-  function fmtDate(iso: string | null): string {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    const now = new Date();
-    const sameDay = d.toDateString() === now.toDateString();
-    return sameDay
-      ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-      : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  $effect(() => {
+    const q = searchQuery;
+    if (!q) {
+      searchResults = [];
+      searchError = null;
+      return;
+    }
+    runSearch(q);
+  });
+
+  async function runSearch(q: string) {
+    searching = true;
+    searchError = null;
+    try {
+      const { accounts } = await api.listAccounts();
+      const merged: SearchMessageSummary[] = [];
+      await Promise.all(
+        accounts.map(async (acct) => {
+          try {
+            const res = await api.searchMessages(acct.id, q);
+            merged.push(...res.messages);
+          } catch {
+            // partial ok
+          }
+        })
+      );
+      searchResults = merged;
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      searchError = err.message ?? 'Search failed.';
+    } finally {
+      searching = false;
+    }
+  }
+
+  async function handleStar(uid: number, accountId: string, star: boolean) {
+    const key = `${accountId}:${uid}`;
+    const prev = starOverrides.has(key)
+      ? starOverrides.get(key)!
+      : (unifiedMessages.find((m) => m.uid === uid && m.account_id === accountId)?.flags ?? [])
+          .some((f) => f.toLowerCase().includes('flagged'));
+    starOverrides = new Map(starOverrides).set(key, star);
+    try {
+      await api.messageFlags(accountId, uid, {
+        folder: 'INBOX',
+        add: star ? ['\\Flagged'] : [],
+        remove: star ? [] : ['\\Flagged'],
+      });
+    } catch {
+      starOverrides = new Map(starOverrides).set(key, prev);
+    }
+  }
+
+  function isStarred(uid: number, accountId: string, flags: string[]): boolean {
+    const key = `${accountId}:${uid}`;
+    if (starOverrides.has(key)) return starOverrides.get(key)!;
+    return flags.some((f) => f.toLowerCase().includes('flagged'));
   }
 
   function senderLabel(m: UnifiedInboxMessage): string {
     return m.from_addr || m.account_username;
+  }
+
+  const orderedUnifiedKeys = $derived(
+    unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
+  );
+  const orderedSearchKeys = $derived(
+    searchResults.map((m, i) => `search:${i}:${m.uid}`)
+  );
+
+  const currentFolder = $derived(
+    page.params.box === 'unified' ? 'INBOX' : 'INBOX'
+  );
+
+  async function handleOperated() {
+    const slug = page.params.box ?? 'unified';
+    if (slug === 'unified') await loadUnified();
+    else if (slug === 'drafts') await loadDrafts();
+    else if (slug === 'snoozed') await loadSnoozed();
   }
 </script>
 
 <div class="mail-shell">
   <Rail />
 
-  <section class="list" aria-label="Message list">
+  <section id="msg-list-pane" class="list" aria-label="Message list">
     <header class="pane-head">
       <span class="pane-title">{box?.label ?? 'Mailbox'}</span>
-      {#if box?.wired && messages.length > 0}
-        <span class="pane-count"><MonoTag>{messages.length}</MonoTag></span>
-      {/if}
+      <div class="pane-head-right">
+        {#if box?.wired}
+          <span class="pane-count">
+            <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+          </span>
+          <SearchBar
+            hint="Search {box.label}…"
+            onsubmit={(q) => runSearch(q)}
+            onreset={() => { searchResults = []; searchError = null; }}
+          />
+        {/if}
+      </div>
     </header>
+
+    {#if box?.wired && !loading}
+      <BulkToolbar
+        {selection}
+        folder={currentFolder}
+        {folders}
+        onoperated={handleOperated}
+      />
+    {/if}
 
     {#if !box}
       <EmptyState title="Unknown mailbox" hint="This mailbox slug isn't recognized." />
@@ -96,48 +268,164 @@
         <p class="list-error-msg">Couldn't load messages.</p>
         <p class="list-error-detail">{error.message}</p>
         <p><MonoTag>{error.code}</MonoTag></p>
-        <button class="list-retry" type="button" onclick={loadUnified}>Retry</button>
+        <button class="list-retry" type="button" onclick={() => {
+          const slug = page.params.box ?? 'unified';
+          if (slug === 'unified') loadUnified();
+          else if (slug === 'drafts') loadDrafts();
+          else if (slug === 'snoozed') loadSnoozed();
+        }}>Retry</button>
       </div>
-    {:else if messages.length === 0}
-      <EmptyState
-        title="Inbox is empty"
-        hint="No messages across your connected accounts. New mail appears here."
-      />
-    {:else}
+
+    {:else if isSearching}
+      {#if searching}
+        <div class="list-loading"><Spinner label="Searching" /> <span>Searching…</span></div>
+      {:else if searchError}
+        <div class="list-error" role="alert">
+          <p class="list-error-msg">Search failed.</p>
+          <p class="list-error-detail">{searchError}</p>
+        </div>
+      {:else if searchResults.length === 0}
+        <EmptyState title="No results" hint="No messages matched your search." />
+      {:else}
+        <ul id="search-results-list" class="msg-list">
+          {#each searchResults as m, i (`search:${i}:${m.uid}`)}
+            {@const key = `search:${i}:${m.uid}`}
+            <li>
+              <MessageRow
+                message={{
+                  key,
+                  uid: m.uid,
+                  accountId: '',
+                  subject: m.subject,
+                  from: m.from_addr,
+                  date: m.date,
+                  snippet: null,
+                  unread: m.unread,
+                  starred: isStarred(m.uid, '', m.flags),
+                  href: `${base}/mail/${page.params.box}/search/${m.uid}`,
+                }}
+                {selection}
+                orderedKeys={orderedSearchKeys}
+              />
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    {:else if box.slug === 'unified'}
       {#if listErrors.length > 0}
         <p class="list-partial" role="status">
           {listErrors.length} account(s) couldn't be reached; showing what loaded.
         </p>
       {/if}
-      <ul class="msg-list">
-        {#each messages as m (m.account_id + ':' + m.uid)}
-          {@const active = selectedUid === m.uid && selectedAccount === m.account_id}
-          <li>
-            <a
-              class="msg-row"
-              class:is-unread={m.unread}
-              class:is-active={active}
-              href="{base}/mail/unified/{encodeURIComponent(m.account_id)}/{m.uid}"
-            >
-              <div class="msg-line1">
-                <span class="msg-sender">{senderLabel(m)}</span>
-                <span class="msg-date">{fmtDate(m.date)}</span>
-              </div>
-              <div class="msg-line2">
-                <span class="msg-subject">{m.subject || '(no subject)'}</span>
-                <span class="msg-chip" title={m.account_username}>{m.account_display_name || m.account_username}</span>
-              </div>
-              {#if m.snippet}
-                <p class="msg-snippet">{m.snippet}</p>
-              {/if}
-            </a>
-          </li>
-        {/each}
-      </ul>
+      {#if unifiedMessages.length === 0}
+        <EmptyState
+          title="Inbox is empty"
+          hint="No messages across your connected accounts. New mail appears here."
+        />
+      {:else}
+        <ul id="unified-msg-list" class="msg-list">
+          {#each unifiedMessages as m (`${m.account_id}:${m.uid}`)}
+            {@const key = `${m.account_id}:${m.uid}`}
+            {@const active = selectedUid === m.uid && selectedAccount === m.account_id}
+            <li>
+              <MessageRow
+                message={{
+                  key,
+                  uid: m.uid,
+                  accountId: m.account_id,
+                  subject: m.subject,
+                  from: senderLabel(m),
+                  date: m.date,
+                  snippet: m.snippet,
+                  unread: m.unread,
+                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  accountChip: m.account_display_name || m.account_username,
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,
+                }}
+                {selection}
+                orderedKeys={orderedUnifiedKeys}
+                {active}
+                onstar={handleStar}
+              />
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    {:else if box.slug === 'drafts'}
+      {#if drafts.length === 0}
+        <EmptyState title="No drafts" hint="Drafts waiting to be sent appear here." />
+      {:else}
+        <ul id="drafts-msg-list" class="msg-list">
+          {#each drafts as d (d.id)}
+            {@const key = `draft:${d.account_id}:${d.id}`}
+            <li>
+              <MessageRow
+                message={{
+                  key,
+                  uid: d.imap_uid ?? 0,
+                  accountId: d.account_id,
+                  subject: d.subject ?? '(no subject)',
+                  from: d.to_addr,
+                  date: d.created_at,
+                  snippet: d.text_content ? d.text_content.slice(0, 80) : null,
+                  unread: false,
+                  starred: false,
+                  accountChip: d.account_id,
+                  href: `${base}/mail/drafts/${encodeURIComponent(d.account_id)}/${d.id}`,
+                }}
+                {selection}
+                orderedKeys={drafts.map((x) => `draft:${x.account_id}:${x.id}`)}
+              />
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    {:else if box.slug === 'snoozed'}
+      {#if snoozed.length === 0}
+        <EmptyState title="Nothing snoozed" hint="Messages you snooze reappear here until their wake time." />
+      {:else}
+        <ul id="snoozed-msg-list" class="msg-list">
+          {#each snoozed as s (s.id)}
+            {@const key = `snoozed:${s.account_id}:${s.uid}`}
+            <li>
+              <MessageRow
+                message={{
+                  key,
+                  uid: s.uid,
+                  accountId: s.account_id,
+                  subject: s.subject ?? '(no subject)',
+                  from: s.from_addr ?? s.account_id,
+                  date: s.snooze_until,
+                  snippet: null,
+                  unread: false,
+                  starred: false,
+                  accountChip: s.account_id,
+                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}`,
+                }}
+                {selection}
+                orderedKeys={snoozed.map((x) => `snoozed:${x.account_id}:${x.uid}`)}
+              />
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    {:else}
+      <EmptyState
+        title="{box.label} has no messages to show here"
+        hint="This smart mailbox doesn't load its own list yet. Unified Inbox has your mail."
+      >
+        {#snippet action()}
+          <a class="empty-link" href="{base}/mail/unified">Go to Unified Inbox</a>
+        {/snippet}
+      </EmptyState>
     {/if}
   </section>
 
-  <section class="reader" aria-label="Reader">
+  <section id="reader-pane" class="reader" aria-label="Reader">
     {@render children()}
   </section>
 </div>
@@ -167,11 +455,13 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.75rem 1rem 0.5rem;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
     position: sticky;
     top: 0;
     background: var(--env-paper);
-    z-index: 1;
+    z-index: 2;
+    border-bottom: 1px solid var(--env-rule);
   }
   .pane-title {
     font-family: var(--font-mono);
@@ -179,6 +469,18 @@
     text-transform: uppercase;
     letter-spacing: 0.12em;
     color: var(--env-muted);
+    flex-shrink: 0;
+  }
+  .pane-head-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 0;
+    justify-content: flex-end;
+  }
+  .pane-count {
+    flex-shrink: 0;
   }
   .list-loading {
     display: flex;
@@ -229,78 +531,9 @@
     list-style: none;
     margin: 0;
     padding: 0;
+    flex: 1;
   }
-  .msg-row {
+  .msg-list li {
     display: block;
-    min-height: 44px;
-    padding: 0.5rem 1rem;
-    border-bottom: 1px solid var(--env-rule);
-    text-decoration: none;
-    color: var(--env-ink);
-  }
-  .msg-row:hover {
-    background: var(--env-accent-soft);
-  }
-  .msg-row.is-active {
-    background: var(--env-accent-soft);
-    box-shadow: inset 3px 0 0 var(--env-accent);
-  }
-  .msg-line1 {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.5rem;
-  }
-  .msg-sender {
-    font-size: 0.8125rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .is-unread .msg-sender,
-  .is-unread .msg-subject {
-    font-weight: 700;
-  }
-  .msg-date {
-    font-size: 0.6875rem;
-    color: var(--env-muted);
-    flex-shrink: 0;
-    font-family: var(--font-mono);
-  }
-  .msg-line2 {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.5rem;
-    margin-top: 0.1rem;
-  }
-  .msg-subject {
-    font-size: 0.8125rem;
-    color: var(--env-ink);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .msg-chip {
-    font-family: var(--font-mono);
-    font-size: 0.625rem;
-    color: var(--env-muted);
-    background: var(--env-surface);
-    border: 1px solid var(--env-rule);
-    border-radius: var(--radius-xs, 2px);
-    padding: 0 0.3rem;
-    flex-shrink: 0;
-    max-width: 40%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .msg-snippet {
-    margin: 0.2rem 0 0;
-    font-size: 0.75rem;
-    color: var(--env-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 </style>

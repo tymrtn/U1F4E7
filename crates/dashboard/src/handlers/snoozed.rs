@@ -78,8 +78,17 @@ pub async fn unsnooze(
     }
 
     drop(client);
-    let db = state.db.lock().await;
-    let _ = db.delete_snoozed(&snoozed.id);
+    {
+        let db = state.db.lock().await;
+        let _ = db.delete_snoozed(&snoozed.id);
+    }
+
+    state
+        .events
+        .publish(crate::events::DashboardEvent::Unsnoozed {
+            account_id: snoozed.account.clone(),
+            original_folder: snoozed.original_folder.clone(),
+        });
 
     Json(json!({
         "ok": true,

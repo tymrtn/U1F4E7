@@ -192,7 +192,16 @@ pub async fn approve(
         .and_then(|_| db.update_draft_status(&draft_id, DraftStatus::Draft))
         .and_then(|_| db.get_draft(&draft_id))
     {
-        Ok(Some(draft)) => Json(json!({ "draft": draft, "status": "approved" })).into_response(),
+        Ok(Some(draft)) => {
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftStatusChanged {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    status: DraftStatus::Draft.as_str().to_string(),
+                });
+            Json(json!({ "draft": draft, "status": "approved" })).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "draft not found").into_response(),
         Err(e) => draft_error(e),
     }
@@ -225,10 +234,24 @@ pub async fn discard(
     Path((account_id, draft_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let db = state.db.lock().await;
+    // Resolve the canonical account id up front so the emitted event carries the
+    // account id, not a caller-supplied email alias.
+    let resolved_account = ensure_draft_account(&db, &account_id, &draft_id)
+        .map(|draft| draft.account_id)
+        .unwrap_or_else(|_| account_id.clone());
     match ensure_draft_account(&db, &account_id, &draft_id)
         .and_then(|_| db.discard_draft(&draft_id))
     {
-        Ok(true) => Json(json!({ "draft_id": draft_id, "status": "discarded" })).into_response(),
+        Ok(true) => {
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftStatusChanged {
+                    account_id: resolved_account,
+                    draft_id: draft_id.clone(),
+                    status: DraftStatus::Discarded.as_str().to_string(),
+                });
+            Json(json!({ "draft_id": draft_id, "status": "discarded" })).into_response()
+        }
         Ok(false) => (StatusCode::CONFLICT, "draft is not discardable").into_response(),
         Err(e) => draft_error(e),
     }
@@ -244,12 +267,21 @@ pub async fn block(
         .and_then(|_| db.update_draft_status(&draft_id, DraftStatus::Blocked))
         .and_then(|_| db.get_draft(&draft_id))
     {
-        Ok(Some(draft)) => Json(json!({
-            "draft": draft,
-            "status": "blocked",
-            "reason": req.reason.unwrap_or_else(|| "changes requested".to_string())
-        }))
-        .into_response(),
+        Ok(Some(draft)) => {
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftStatusChanged {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    status: DraftStatus::Blocked.as_str().to_string(),
+                });
+            Json(json!({
+                "draft": draft,
+                "status": "blocked",
+                "reason": req.reason.unwrap_or_else(|| "changes requested".to_string())
+            }))
+            .into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "draft not found").into_response(),
         Err(e) => draft_error(e),
     }
@@ -324,16 +356,25 @@ pub async fn send(
     // dashboard SMTP bypass.
     let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
     match queue_draft_for_outbox(&db, &draft, cooldown) {
-        Ok(send_after) => Json(json!({
-            "draft_id": draft.id,
-            "sent": false,
-            "status": "queued",
-            "send_after": send_after,
-            "cooldown_seconds": cooldown,
-            "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
-            "queued_reason": OUTBOX_COOLDOWN_REASON,
-        }))
-        .into_response(),
+        Ok(send_after) => {
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftQueued {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    origin: "queue",
+                });
+            Json(json!({
+                "draft_id": draft.id,
+                "sent": false,
+                "status": "queued",
+                "send_after": send_after,
+                "cooldown_seconds": cooldown,
+                "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
+                "queued_reason": OUTBOX_COOLDOWN_REASON,
+            }))
+            .into_response()
+        }
         Err(e) => draft_error(e),
     }
 }

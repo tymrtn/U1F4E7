@@ -9,7 +9,7 @@ import { accountHealthFromCockpit, type Account, type CockpitResponse } from '$l
 import { page as pageState } from '$app/state';
 
 // vi.mock is hoisted above imports; the api spy set lives in vi.hoisted().
-const { apiMock } = vi.hoisted(() => ({
+const { apiMock, readerApiMock } = vi.hoisted(() => ({
   apiMock: {
     listAccounts: vi.fn(),
     cockpit: vi.fn(),
@@ -18,6 +18,11 @@ const { apiMock } = vi.hoisted(() => ({
     message: vi.fn(),
     verifyAccount: vi.fn(),
     deleteAccount: vi.fn()
+  },
+  readerApiMock: {
+    fetchMessageDetail: vi.fn(),
+    fetchThread: vi.fn(),
+    postFlags: vi.fn()
   }
 }));
 
@@ -26,6 +31,17 @@ const { apiMock } = vi.hoisted(() => ({
 vi.mock('$lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/api')>();
   return { ...actual, api: apiMock };
+});
+
+// ReaderPane uses reader-api helpers rather than api.message directly.
+vi.mock('$lib/reader-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/reader-api')>();
+  return {
+    ...actual,
+    fetchMessageDetail: readerApiMock.fetchMessageDetail,
+    fetchThread: readerApiMock.fetchThread,
+    postFlags: readerApiMock.postFlags
+  };
 });
 
 import Rail from './Rail.svelte';
@@ -65,6 +81,9 @@ beforeEach(() => {
     actions: { failed: [] }
   } as CockpitResponse);
   apiMock.stats.mockResolvedValue({ accounts: 2, snoozed: 3, drafts: 1 });
+  // ReaderPane uses reader-api helpers; wire a default no-thread response.
+  readerApiMock.fetchThread.mockResolvedValue(null);
+  readerApiMock.postFlags.mockResolvedValue({ ok: true, uid: 0, added: [], removed: [] });
 });
 
 afterEach(() => {
@@ -267,7 +286,8 @@ describe('Reader pane', () => {
   it('loads the selected message on navigation and shows the text body', async () => {
     pageState.params = { box: 'unified', account: 'acct-ok', uid: '101' };
     pageState.url = new URL('http://localhost/v2/mail/unified/acct-ok/101') as typeof pageState.url;
-    apiMock.message.mockResolvedValue({
+    // ReaderPane calls reader-api.fetchMessageDetail, not api.message.
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
       message: {
         uid: 101,
         message_id: '<a@x>',
@@ -280,14 +300,15 @@ describe('Reader pane', () => {
         flags: [],
         text_body: 'The full plain-text body.',
         html_body: null,
-        unread: true
+        unread: true,
+        attachments: []
       }
     });
 
     render(ReaderPage);
     await waitFor(() => expect(screen.getByText('Reader subject')).toBeInTheDocument());
     // Loaded from INBOX with the account + uid from the route.
-    expect(apiMock.message).toHaveBeenCalledWith('acct-ok', 101, 'INBOX');
+    expect(readerApiMock.fetchMessageDetail).toHaveBeenCalledWith('acct-ok', 101, 'INBOX');
     expect(screen.getByText('The full plain-text body.')).toBeInTheDocument();
     expect(screen.getByText('alice@example.com')).toBeInTheDocument();
   });
@@ -296,7 +317,7 @@ describe('Reader pane', () => {
     pageState.params = { box: 'unified', account: 'acct-ok', uid: '999' };
     pageState.url = new URL('http://localhost/v2/mail/unified/acct-ok/999') as typeof pageState.url;
     const { EnvelopeApiError } = await import('$lib/api');
-    apiMock.message.mockRejectedValue(new EnvelopeApiError(502, 'imap_unavailable', 'IMAP down', null));
+    readerApiMock.fetchMessageDetail.mockRejectedValueOnce(new EnvelopeApiError(502, 'imap_unavailable', 'IMAP down', null));
     render(ReaderPage);
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText('imap_unavailable')).toBeInTheDocument();

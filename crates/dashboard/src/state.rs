@@ -15,6 +15,7 @@ use envelope_email_transport::ImapClient;
 use envelope_email_transport::imap;
 
 use crate::auth::AuthConfig;
+use crate::events::EventBus;
 
 /// Shared application state injected into every handler.
 #[derive(Clone)]
@@ -26,6 +27,9 @@ pub struct AppState {
     /// disabled (open loopback mode); the serve entrypoint injects the resolved
     /// policy via [`AppState::with_auth`].
     pub auth: AuthConfig,
+    /// Real-time event bus fanned out to `GET /api/events/stream` subscribers.
+    /// Cloneable and cheap; publishing when there are no subscribers is a no-op.
+    pub events: EventBus,
 }
 
 impl AppState {
@@ -35,6 +39,7 @@ impl AppState {
             imap_pool: Arc::new(Mutex::new(HashMap::new())),
             backend,
             auth: AuthConfig::disabled(),
+            events: EventBus::new(),
         }
     }
 

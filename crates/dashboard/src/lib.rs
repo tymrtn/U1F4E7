@@ -18,6 +18,7 @@
 pub mod assets;
 pub mod auth;
 pub mod csrf;
+pub mod events;
 pub mod handlers;
 pub mod state;
 mod ui_paths;
@@ -202,7 +203,7 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
         );
     }
     if options.background_sweeps {
-        println!("Background unsnooze + scheduled-send sweep running every 60s");
+        println!("Background unsnooze + scheduled-send + event-delivery sweep running every 60s");
         let ticker_state = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -216,6 +217,14 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
                 }
             }
         });
+
+        // The durable webhook delivery executor interleaves DB reads/writes with
+        // HTTP awaits and holds a non-Send rusqlite handle across those awaits,
+        // so it cannot run on the multi-threaded runtime's `tokio::spawn` (which
+        // requires Send). Give it its own OS thread with a current-thread runtime
+        // and its own DB connection (WAL makes the second connection safe against
+        // the shared state DB). This keeps the existing sweeps untouched.
+        spawn_event_delivery_sweeper();
     } else {
         println!("Background unsnooze + scheduled-send sweeps disabled for diagnostic mode");
     }
@@ -349,6 +358,10 @@ pub fn dashboard_router(state: AppState) -> Router {
         )
         // Stats
         .route("/stats", get(handlers::stats::get))
+        // Real-time event stream (SSE). GET → CSRF-exempt; auth applies. The
+        // browser `EventSource` rides the cookie/identity credential; bearer-only
+        // clients pass `?access_token=`.
+        .route("/events/stream", get(handlers::events_stream::stream))
         // CSRF token mint. Inside the protected router so it shares the auth
         // gate, but GET is never CSRF-checked so it is always reachable to the
         // authorized frontend.
@@ -449,12 +462,20 @@ async fn run_unsnooze_sweep(state: &AppState) -> anyhow::Result<()> {
         .await
         {
             Ok(()) => {
-                let db = state.db.lock().await;
-                let _ = db.delete_snoozed(&msg.id);
+                {
+                    let db = state.db.lock().await;
+                    let _ = db.delete_snoozed(&msg.id);
+                }
                 info!(
                     "unsnoozed UID {} back to {} ({})",
                     msg.uid, msg.original_folder, msg.account
                 );
+                state
+                    .events
+                    .publish(crate::events::DashboardEvent::Unsnoozed {
+                        account_id: msg.account.clone(),
+                        original_folder: msg.original_folder.clone(),
+                    });
             }
             Err(e) => {
                 tracing::warn!(
@@ -568,6 +589,21 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     envelope_email_store::DraftStatus::PendingReview,
                 );
             }
+            // Metadata-level send status: decision + optional block code only.
+            // No recipients, subject, or body ever cross this channel.
+            state
+                .events
+                .publish(crate::events::DashboardEvent::SendStatus {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    outcome: if pause_for_review {
+                        "blocked"
+                    } else {
+                        "deferred"
+                    },
+                    governor_decision: Some(gov_outcome.decision.clone()),
+                    governor_block_code: gov_outcome.block_code.clone(),
+                });
             continue;
         }
 
@@ -588,8 +624,10 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
         .await
         {
             Ok(message_id) => {
-                let db = state.db.lock().await;
-                let _ = db.mark_draft_sent(&draft.id, Some(&message_id));
+                {
+                    let db = state.db.lock().await;
+                    let _ = db.mark_draft_sent(&draft.id, Some(&message_id));
+                }
                 info!(
                     "scheduled send: sent draft {} (recipient_count={}, message_id={})",
                     draft.id,
@@ -600,6 +638,15 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     ),
                     message_id
                 );
+                state
+                    .events
+                    .publish(crate::events::DashboardEvent::SendStatus {
+                        account_id: draft.account_id.clone(),
+                        draft_id: draft.id.clone(),
+                        outcome: "sent",
+                        governor_decision: Some(gov_outcome.decision.clone()),
+                        governor_block_code: None,
+                    });
             }
             Err(e) => {
                 tracing::warn!(
@@ -611,8 +658,84 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                         draft.bcc_addr.as_deref()
                     )
                 );
+                state
+                    .events
+                    .publish(crate::events::DashboardEvent::SendStatus {
+                        account_id: draft.account_id.clone(),
+                        draft_id: draft.id.clone(),
+                        outcome: "failed",
+                        governor_decision: Some(gov_outcome.decision.clone()),
+                        governor_block_code: None,
+                    });
             }
         }
+    }
+
+    Ok(())
+}
+
+// ── Background event-delivery sweep ─────────────────────────────────
+
+/// Spawn the dedicated OS thread that runs the durable webhook delivery executor
+/// every 60s on its own current-thread runtime with its own DB connection.
+fn spawn_event_delivery_sweeper() {
+    std::thread::Builder::new()
+        .name("envelope-event-delivery".to_string())
+        .spawn(|| {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!("event delivery sweeper: runtime build failed: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async {
+                let db = match Database::open_default() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::warn!("event delivery sweeper: db open failed: {e}");
+                        return;
+                    }
+                };
+                let http = reqwest::Client::new();
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = run_event_delivery_sweep(&db, &http).await {
+                        tracing::warn!("event delivery sweep error: {e}");
+                    }
+                }
+            });
+        })
+        .ok();
+}
+
+/// Drive the durable webhook delivery executor once. Picks due, not-yet-delivered,
+/// not-dead-lettered delivery rows and POSTs each event to its route's signed
+/// webhook, advancing the retry schedule.
+///
+/// Logs a one-line summary only when deliveries were actually attempted
+/// (`examined > 0`), keeping quiet sweeps silent. The summary carries counts
+/// only — never URLs, bodies, signatures, or secrets.
+async fn run_event_delivery_sweep(db: &Database, http: &reqwest::Client) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    let report = envelope_email_transport::event_delivery::deliver_due_events(
+        db,
+        http,
+        now,
+        envelope_email_transport::event_delivery::DeliveryLimits::default(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("delivery executor error: {e}"))?;
+
+    if report.examined > 0 {
+        info!(
+            "event delivery sweep: examined {} delivered {} retried {} dead_lettered {} skipped {}",
+            report.examined, report.delivered, report.retried, report.dead_lettered, report.skipped
+        );
     }
 
     Ok(())
@@ -922,6 +1045,69 @@ mod tests {
             draft.id,
             other_draft.id,
         )
+    }
+
+    #[tokio::test]
+    async fn event_delivery_sweep_invokes_executor_on_due_delivery() {
+        // Wiring test: a due delivery pointed at an unreachable loopback URL must
+        // be picked up by run_event_delivery_sweep and advanced by the executor
+        // (connection failure -> attempt recorded + rescheduled), proving the
+        // sweep actually drives deliver_due_events. No real webhook is required.
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+
+        let route = db
+            .create_event_route(
+                "acc1",
+                r#"{"event_types":["agent_action"]}"#,
+                // Port 1 is reserved/unbindable: guarantees a fast connect failure.
+                r#"{"type":"webhook","url":"http://127.0.0.1:1/hook"}"#,
+                true,
+                100,
+            )
+            .unwrap();
+        let event = db
+            .emit_catalog_event(
+                "acc1",
+                envelope_email_store::event_catalog::AGENT_ACTION,
+                Some(serde_json::json!({"action_type": "move"})),
+                Some("agent-1"),
+            )
+            .unwrap();
+        db.enqueue_delivery(
+            "del-1",
+            &event.id,
+            &route.id,
+            "dk-1",
+            "2000-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        // Before the sweep the delivery is pending with zero attempts.
+        let before = db.get_delivery("del-1").unwrap().unwrap();
+        assert_eq!(before.attempt_count, 0);
+
+        let http = reqwest::Client::new();
+        run_event_delivery_sweep(&db, &http).await.unwrap();
+
+        // After the sweep the executor attempted (and rescheduled) the delivery.
+        let after = db.get_delivery("del-1").unwrap().unwrap();
+        assert_eq!(
+            after.attempt_count, 1,
+            "the sweep must drive the delivery executor over the due row"
+        );
+        assert!(
+            after.delivered_at.is_none(),
+            "an unreachable webhook must not be marked delivered"
+        );
     }
 
     #[test]

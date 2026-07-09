@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::errors::ImapError;
 
 /// Reject strings containing characters that could be used for IMAP command injection.
-fn validate_imap_input(s: &str) -> Result<(), ImapError> {
+pub fn validate_imap_input(s: &str) -> Result<(), ImapError> {
     if s.contains('\r')
         || s.contains('\n')
         || s.contains('\0')
@@ -42,7 +42,7 @@ fn validate_imap_input(s: &str) -> Result<(), ImapError> {
 /// first atom and fail with "folder not found". Quoting is valid for ordinary
 /// mailbox names too and preserves literal names while escaping quoted-string
 /// metacharacters.
-fn imap_mailbox_arg(mailbox: &str) -> String {
+pub fn imap_mailbox_arg(mailbox: &str) -> String {
     format!("\"{}\"", mailbox.replace('\\', r"\\").replace('"', "\\\""))
 }
 
@@ -179,12 +179,94 @@ impl SelectedMailbox {
 /// IMAP client wrapping an authenticated async-imap session.
 pub struct ImapClient {
     session: ImapSession,
+    /// True once this session has already emitted the "bare EXPUNGE fallback"
+    /// warning, so [`expunge_uids`] warns at most once per connection.
+    warned_bare_expunge: bool,
 }
 
 impl ImapClient {
     pub fn session_mut(&mut self) -> &mut ImapSession {
         &mut self.session
     }
+}
+
+/// How [`expunge_uids`] will remove `\Deleted` messages, chosen from the
+/// server's advertised capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpungeStrategy {
+    /// Server advertises `UIDPLUS`: scope the expunge to exactly `seq_set`.
+    UidScoped(String),
+    /// Server lacks `UIDPLUS`: bare `EXPUNGE` (removes ALL `\Deleted` messages).
+    BareAll,
+}
+
+/// Pure decision + command-string formatter, split out so both the capability
+/// choice and the exact `UID EXPUNGE <seq_set>` wire form are unit-testable
+/// without a live session. `has_uidplus` comes from
+/// `Capabilities::has_str("UIDPLUS")` at the call site.
+fn choose_expunge_strategy(has_uidplus: bool, seq_set: &str) -> ExpungeStrategy {
+    if has_uidplus {
+        ExpungeStrategy::UidScoped(format!("UID EXPUNGE {seq_set}"))
+    } else {
+        ExpungeStrategy::BareAll
+    }
+}
+
+/// Expunge exactly the messages named by `seq_set`, never other sessions'
+/// `\Deleted` messages.
+///
+/// The currently selected mailbox must already have `\Deleted` set on the
+/// target UIDs. If the server advertises `UIDPLUS` (RFC 4315) we issue
+/// `UID EXPUNGE <seq_set>`, which removes only messages that are both
+/// `\Deleted` AND in `seq_set` — so a `\Deleted` message flagged by a
+/// concurrent client survives.
+///
+/// If the server lacks `UIDPLUS` we fall back to a bare `EXPUNGE`, which
+/// removes EVERY `\Deleted` message in the mailbox. That is the RFC 3501
+/// behavior and can collaterally delete messages another session flagged;
+/// there is no safe alternative on such servers, so we accept the residual
+/// risk and emit a one-time warning per connection.
+///
+/// `seq_set` is validated to contain no injection characters before use.
+pub async fn expunge_uids(client: &mut ImapClient, seq_set: &str) -> Result<(), ImapError> {
+    validate_imap_input(seq_set)?;
+
+    let has_uidplus = client
+        .session
+        .capabilities()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("CAPABILITY: {e}")))?
+        .has_str("UIDPLUS");
+
+    match choose_expunge_strategy(has_uidplus, seq_set) {
+        ExpungeStrategy::UidScoped(_) => {
+            let stream = client
+                .session
+                .uid_expunge(seq_set)
+                .await
+                .map_err(|e| ImapError::Protocol(format!("UID EXPUNGE {seq_set}: {e}")))?;
+            let mut stream = pin!(stream);
+            while let Some(_item) = stream.next().await {}
+        }
+        ExpungeStrategy::BareAll => {
+            if !client.warned_bare_expunge {
+                client.warned_bare_expunge = true;
+                warn!(
+                    "server lacks UIDPLUS; falling back to bare EXPUNGE, which removes \
+                     ALL \\Deleted messages in the mailbox and may collaterally delete \
+                     messages flagged by other sessions"
+                );
+            }
+            let expunge_stream = client
+                .session
+                .expunge()
+                .await
+                .map_err(|e| ImapError::Protocol(format!("EXPUNGE: {e}")))?;
+            let mut stream = pin!(expunge_stream);
+            while let Some(_item) = stream.next().await {}
+        }
+    }
+    Ok(())
 }
 
 /// Connect to an IMAP server over TLS and authenticate.
@@ -231,7 +313,10 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
         .map_err(|(e, _)| ImapError::Auth(format!("login failed for {username}@{host}: {e}")))?;
 
     debug!("IMAP session established for {username}@{host}");
-    Ok(ImapClient { session })
+    Ok(ImapClient {
+        session,
+        warned_bare_expunge: false,
+    })
 }
 
 /// Read and discard the untagged `* OK ...` greeting from a freshly constructed
@@ -1154,7 +1239,7 @@ pub async fn fetch_list_unsubscribe_headers(
 }
 
 /// Map human-readable flag names to IMAP flag format.
-fn map_flag_name(flag: &str) -> String {
+pub fn map_flag_name(flag: &str) -> String {
     match flag.to_lowercase().as_str() {
         "seen" => "\\Seen".to_string(),
         "flagged" => "\\Flagged".to_string(),
@@ -1301,17 +1386,9 @@ pub async fn move_message(
         while let Some(_item) = store_stream.next().await {}
     }
 
-    {
-        let expunge_stream = client
-            .session
-            .expunge()
-            .await
-            .map_err(|e| ImapError::Protocol(format!("EXPUNGE: {e}")))?;
-
-        // Consume the expunge stream (needs pinning)
-        let mut stream = pin!(expunge_stream);
-        while let Some(_item) = stream.next().await {}
-    }
+    // Scope the expunge to exactly this UID so we never remove another
+    // session's \Deleted messages (see expunge_uids).
+    expunge_uids(client, &uid_str).await?;
 
     debug!("moved UID {uid} from {from} to {to}");
     Ok(())
@@ -1372,16 +1449,9 @@ pub async fn delete_message(
         while let Some(_item) = store_stream.next().await {}
     }
 
-    {
-        let expunge_stream = client
-            .session
-            .expunge()
-            .await
-            .map_err(|e| ImapError::Protocol(format!("EXPUNGE: {e}")))?;
-
-        let mut stream = pin!(expunge_stream);
-        while let Some(_item) = stream.next().await {}
-    }
+    // Scope the expunge to exactly this UID so we never remove another
+    // session's \Deleted messages (see expunge_uids).
+    expunge_uids(client, &uid_str).await?;
 
     debug!("deleted UID {uid} from {folder}");
     Ok(())
@@ -1621,6 +1691,22 @@ mod tests {
     #[test]
     fn test_imap_mailbox_arg_escapes_quoted_string_metacharacters() {
         assert_eq!(imap_mailbox_arg(r#"Foo\"Bar"#), r#""Foo\\\"Bar""#);
+    }
+
+    #[test]
+    fn expunge_strategy_uses_uid_expunge_when_uidplus_present() {
+        assert_eq!(
+            choose_expunge_strategy(true, "1:5,9"),
+            ExpungeStrategy::UidScoped("UID EXPUNGE 1:5,9".to_string())
+        );
+    }
+
+    #[test]
+    fn expunge_strategy_falls_back_to_bare_when_uidplus_absent() {
+        assert_eq!(
+            choose_expunge_strategy(false, "1:5,9"),
+            ExpungeStrategy::BareAll
+        );
     }
 
     #[test]

@@ -127,4 +127,17 @@ fn record_governor_event(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let _ = db.insert_event_with_agent(&event, agent_id);
+
+    // Also emit the canonical catalog `governor_blocked` event so durable
+    // delivery routes can subscribe to blocks by their stable wire name. The
+    // legacy `send_governor.blocked` audit event above is preserved for
+    // existing consumers.
+    if !outcome.allowed {
+        let _ = db.emit_catalog_event(
+            account_id,
+            envelope_email_store::event_catalog::GOVERNOR_BLOCKED,
+            Some(serde_json::json!({ "outcome": outcome.audit_json() })),
+            agent_id,
+        );
+    }
 }

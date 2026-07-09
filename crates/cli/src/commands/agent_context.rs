@@ -59,6 +59,18 @@ impl AgentContext {
         self.policy.authorize(action, account, folder)
     }
 
+    /// Authorize a bare policy action (already resolved, not a tool name)
+    /// against `account`/`folder`. Used for the bulk two-action gate, where the
+    /// coarse `bulk` action and the underlying operation action must both pass.
+    pub fn authorize_action(
+        &self,
+        action: &str,
+        account: &str,
+        folder: Option<&str>,
+    ) -> Result<(), PolicyDenial> {
+        self.policy.authorize(action, account, folder)
+    }
+
     /// Clamp a requested send mode down to this agent's policy ceiling.
     pub fn clamp_send_mode(&self, requested: SendMode) -> SendMode {
         self.policy.clamp_send_mode(requested)
@@ -182,6 +194,27 @@ pub fn tool_action(tool_name: &str) -> Option<&'static str> {
         "move_message" => "move",
         "flag" => "flag",
         "tag" => "tag",
+        "bulk" => "bulk",
+        "thread" => "inbox.read",
+        "rules_preview" => "rules.read",
+        "rules_run" => "rules.run",
+        "watch_status" => "watch.read",
+        "snooze" => "snooze",
+        _ => return None,
+    })
+}
+
+/// Map a bulk operation name to the single-message policy action it must ALSO be
+/// authorized under, in addition to the coarse `bulk` action. A bulk delete is
+/// gated behind the same `delete` action a single delete would need. Returns
+/// `None` for an unknown op string (caller denies).
+pub fn bulk_underlying_action(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "move" => "move",
+        "copy" => "move",
+        "flag_add" | "flag_remove" => "flag",
+        "delete" => "delete",
+        "tag" => "tag",
         _ => return None,
     })
 }
@@ -264,7 +297,24 @@ mod tests {
         assert_eq!(tool_action("search"), Some("inbox.read"));
         assert_eq!(tool_action("move_message"), Some("move"));
         assert_eq!(tool_action("tag"), Some("tag"));
+        assert_eq!(tool_action("bulk"), Some("bulk"));
+        assert_eq!(tool_action("thread"), Some("inbox.read"));
+        assert_eq!(tool_action("rules_preview"), Some("rules.read"));
+        assert_eq!(tool_action("rules_run"), Some("rules.run"));
+        assert_eq!(tool_action("watch_status"), Some("watch.read"));
+        assert_eq!(tool_action("snooze"), Some("snooze"));
         assert_eq!(tool_action("nonexistent_tool"), None);
+    }
+
+    #[test]
+    fn bulk_underlying_action_maps_ops_and_denies_unknown() {
+        assert_eq!(bulk_underlying_action("move"), Some("move"));
+        assert_eq!(bulk_underlying_action("copy"), Some("move"));
+        assert_eq!(bulk_underlying_action("flag_add"), Some("flag"));
+        assert_eq!(bulk_underlying_action("flag_remove"), Some("flag"));
+        assert_eq!(bulk_underlying_action("delete"), Some("delete"));
+        assert_eq!(bulk_underlying_action("tag"), Some("tag"));
+        assert_eq!(bulk_underlying_action("nope"), None);
     }
 
     #[test]

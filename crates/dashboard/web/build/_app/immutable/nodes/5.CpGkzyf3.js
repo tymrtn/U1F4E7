@@ -1,1 +1,0 @@
-import"../chunks/B32Ffbs5.js";import"../chunks/xihTtKlq.js";import{c as e}from"../chunks/BMvUc439.js";import"../chunks/UJ-thqQd.js";function t(t){e(t,{title:`Open a message to read it`,hint:`Select a message from the list. Reading never marks it read — Envelope peeks with BODY.PEEK.`})}export{t as component};
