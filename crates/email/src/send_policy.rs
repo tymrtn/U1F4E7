@@ -110,6 +110,23 @@ pub struct SendPolicyAuditEvent {
     pub payload: Value,
 }
 
+impl SendPolicyAuditEvent {
+    /// Attach an agent identity to this audit event as **metadata only**.
+    ///
+    /// The `agent_id` is threaded into the audit payload for provenance so a
+    /// human can later see which agent identity attempted a send. It is never an
+    /// input to the send-policy decision (`evaluate` never sees it) and is
+    /// omitted entirely when `None`, keeping today's payload byte-identical.
+    pub fn with_agent_id(mut self, agent_id: Option<&str>) -> Self {
+        if let Some(id) = agent_id
+            && let Value::Object(map) = &mut self.payload
+        {
+            map.insert("agent_id".to_string(), Value::String(id.to_string()));
+        }
+        self
+    }
+}
+
 pub fn default_mode_for_runtime(runtime: SendRuntime) -> SendMode {
     match runtime {
         SendRuntime::HumanCli => SendMode::AutonomousSend,
@@ -164,26 +181,60 @@ fn evaluate_allowlisted(input: &SendPolicyInput<'_>) -> SendPolicyDecision {
         Err(denial) => return SendPolicyDecision::Denied(denial),
     };
 
-    let mut allowed_emails = Vec::new();
-    let mut allowed_domains = Vec::new();
-    for entry in input.allow_recipients {
-        let normalized = entry.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            continue;
-        }
-        if normalized.contains('@') {
-            allowed_emails.push(normalized);
-        } else {
-            allowed_domains.push(normalized);
-        }
-    }
+    let allowlist = RecipientAllowlist::from_patterns(input.allow_recipients);
 
-    if recipients.iter().all(|recipient| {
-        allowed_emails.contains(&recipient.email) || allowed_domains.contains(&recipient.domain)
-    }) {
+    if recipients
+        .iter()
+        .all(|recipient| allowlist.matches(&recipient.email, &recipient.domain))
+    {
         SendPolicyDecision::Allowed
     } else {
         SendPolicyDecision::Denied(SendPolicyDenial::recipient_not_allowlisted())
+    }
+}
+
+/// Canonical allowlist matcher shared by `allowlisted-send` evaluation and any
+/// other layer (e.g. agent policy) that must reuse the *same* recipient-matching
+/// semantics rather than reimplement a second matcher.
+///
+/// Patterns are exact email addresses or bare/`@`-prefixed domains:
+/// - `ops@corp.test` — exact email match (case-insensitive).
+/// - `corp.test` or `@corp.test` — domain suffix match (any local part).
+///
+/// Empty entries are ignored. An empty pattern set matches nothing.
+#[derive(Debug, Clone, Default)]
+pub struct RecipientAllowlist {
+    emails: Vec<String>,
+    domains: Vec<String>,
+}
+
+impl RecipientAllowlist {
+    /// Split allow patterns into exact-email and domain buckets (normalized to
+    /// lowercase, `@` domain prefixes stripped).
+    pub fn from_patterns(patterns: &[String]) -> Self {
+        let mut emails = Vec::new();
+        let mut domains = Vec::new();
+        for entry in patterns {
+            let normalized = entry.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+            if let Some(domain) = normalized.strip_prefix('@') {
+                if !domain.is_empty() {
+                    domains.push(domain.to_string());
+                }
+            } else if normalized.contains('@') {
+                emails.push(normalized);
+            } else {
+                domains.push(normalized);
+            }
+        }
+        Self { emails, domains }
+    }
+
+    /// True when a recipient (its lowercased email + domain) is permitted.
+    pub fn matches(&self, email: &str, domain: &str) -> bool {
+        self.emails.iter().any(|e| e == email) || self.domains.iter().any(|d| d == domain)
     }
 }
 
@@ -247,6 +298,14 @@ fn parse_recipient(token: &str) -> Result<ParsedRecipient, SendPolicyDenial> {
 struct ParsedRecipient {
     email: String,
     domain: String,
+}
+
+/// Parse a single recipient token (`Name <a@b>` or bare `a@b`) into its
+/// lowercased email and domain. Shared so other layers reuse the same parser
+/// rather than writing a second address splitter. Returns `None` when the token
+/// does not contain a single well-formed address.
+pub fn parse_recipient_email_domain(token: &str) -> Option<(String, String)> {
+    parse_recipient(token).ok().map(|r| (r.email, r.domain))
 }
 
 #[cfg(test)]
@@ -385,5 +444,52 @@ mod tests {
         assert!(!payload.values().any(|value| value == "taylor@example.com"));
         assert_eq!(payload.get("mode"), Some(&json!("confirm-send")));
         assert_eq!(payload.get("allow_recipient_count"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn audit_event_agent_id_defaults_none_and_only_serializes_when_some() {
+        let input = SendPolicyInput {
+            to: "Taylor <taylor@example.com>",
+            cc: None,
+            bcc: None,
+            confirm_send: true,
+            allow_recipients: &[],
+        };
+
+        // Default: agent_id is absent (byte-identical to today's payload).
+        let base = audit_event_for(SendMode::ConfirmSend, &SendPolicyDecision::Allowed, &input);
+        assert!(!base.payload.as_object().unwrap().contains_key("agent_id"));
+
+        // with_agent_id(None) is a no-op.
+        let none = base.clone().with_agent_id(None);
+        assert_eq!(none.payload, base.payload);
+
+        // with_agent_id(Some) adds metadata only, without leaking recipients.
+        let tagged = base.clone().with_agent_id(Some("skippy-agent-42"));
+        assert_eq!(
+            tagged.payload.get("agent_id"),
+            Some(&json!("skippy-agent-42"))
+        );
+        assert!(!tagged.payload.to_string().contains("taylor@example.com"));
+
+        // Removing agent_id recovers the original payload exactly.
+        let mut stripped = tagged.payload.as_object().unwrap().clone();
+        stripped.remove("agent_id");
+        assert_eq!(Value::Object(stripped), base.payload);
+    }
+
+    #[test]
+    fn recipient_allowlist_reuses_matcher_for_exact_domain_and_at_prefix() {
+        let allowlist = RecipientAllowlist::from_patterns(&[
+            "ops@corp.test".to_string(),
+            "@allowed.test".to_string(),
+            "bare.test".to_string(),
+        ]);
+        assert!(allowlist.matches("ops@corp.test", "corp.test"));
+        assert!(allowlist.matches("anyone@allowed.test", "allowed.test"));
+        assert!(allowlist.matches("someone@bare.test", "bare.test"));
+        assert!(!allowlist.matches("stranger@unknown.test", "unknown.test"));
+        // Empty patterns match nothing (deny by default).
+        assert!(!RecipientAllowlist::from_patterns(&[]).matches("a@b.test", "b.test"));
     }
 }

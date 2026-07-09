@@ -1,0 +1,70 @@
+/* Envelope v2 webmail — design system foundation.
+ *
+ * Ported from the v1 dashboard theme (crates/dashboard/static/dashboard.css +
+ * index.html): technical-but-warm — ink on paper, mono accents, one green
+ * accent. Fonts are self-hosted via @fontsource (no Google CDN). */
+
+@import '@fontsource/instrument-sans/400.css';
+@import '@fontsource/instrument-sans/500.css';
+@import '@fontsource/instrument-sans/600.css';
+@import '@fontsource/instrument-sans/700.css';
+@import '@fontsource/dm-mono/300.css';
+@import '@fontsource/dm-mono/400.css';
+@import '@fontsource/dm-mono/500.css';
+
+@import 'tailwindcss';
+
+/* Map the v1 token palette into Tailwind v4's theme so utilities like
+ * `bg-paper`, `text-ink`, `text-accent`, `border-rule` resolve to the brand
+ * colors, and `font-sans` / `font-mono` resolve to the self-hosted faces. */
+@theme {
+  --color-ink: #0a0a0a;
+  --color-paper: #f7f6f3;
+  --color-surface: #ffffff;
+  --color-mid: #8a8780;
+  --color-rule: #d9d7d1;
+  --color-accent: #1a6b4a;
+  --color-accent-soft: #e8f5ee;
+  --color-warn: #c4421a;
+  --color-warn-soft: #fdf0ec;
+  --color-pending: #9a7b1a;
+  --color-pending-soft: #fdf8e8;
+
+  --font-sans: 'Instrument Sans', system-ui, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, monospace;
+
+  /* Restrained radii — intentional, never Bootstrap-round. */
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 5px;
+}
+
+/* Also expose the tokens as plain custom properties so non-Tailwind CSS and
+ * component styles can reference them directly (mirrors v1's --env-* vars). */
+:root {
+  --env-ink: #0a0a0a;
+  --env-paper: #f7f6f3;
+  --env-surface: #ffffff;
+  --env-muted: #8a8780;
+  --env-rule: #d9d7d1;
+  --env-accent: #1a6b4a;
+  --env-accent-soft: #e8f5ee;
+  --env-warn: #c4421a;
+  --env-warn-soft: #fdf0ec;
+  --env-pending: #9a7b1a;
+  --env-pending-soft: #fdf8e8;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--env-paper);
+  color: var(--env-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}

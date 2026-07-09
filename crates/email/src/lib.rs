@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+pub mod agent_policy;
 pub mod attribution;
 pub mod backup;
 pub mod code_extractor;
@@ -25,6 +26,7 @@ pub mod smtp;
 pub mod threading;
 pub mod unsubscribe;
 
+pub use agent_policy::{AgentPolicy, PolicyDenial};
 pub use attribution::{
     AttributedSendContext, RecipientSummary, classify_sensitive_attachment,
     collect_recipient_domains, is_disposable_domain, is_freemail_domain, is_gov_domain,
@@ -44,8 +46,9 @@ pub use outbound::{
 pub use provider::{ProviderType, detect_provider, resolve_folder};
 pub use reply::{ReplyHeaders, build_reply_all_headers, build_reply_headers};
 pub use send_policy::{
-    SendMode, SendPolicyAuditEvent, SendPolicyDecision, SendPolicyDenial, SendPolicyInput,
-    SendRuntime, audit_event_for, default_mode_for_runtime, evaluate,
+    RecipientAllowlist, SendMode, SendPolicyAuditEvent, SendPolicyDecision, SendPolicyDenial,
+    SendPolicyInput, SendRuntime, audit_event_for, default_mode_for_runtime, evaluate,
+    parse_recipient_email_domain,
 };
 pub use smtp::SmtpSender;
 pub use threading::{ThreadBuildResult, build_threads, normalize_subject};

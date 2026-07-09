@@ -29,11 +29,50 @@ impl Database {
             draft_id,
             event_id: None,
             action_status: "completed",
+            agent_id: None,
+        })
+    }
+
+    /// Log an action attributed to a specific agent. `agent_id` is `None` for
+    /// human/legacy actions (stored as NULL); `Some` records the acting agent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_action_with_agent(
+        &self,
+        account_id: &str,
+        action_type: &str,
+        confidence: f64,
+        justification: &str,
+        action_taken: &str,
+        message_id: Option<&str>,
+        draft_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<ActionLog> {
+        self.insert_action_log(ActionLogInsert {
+            account_id,
+            action_type,
+            confidence,
+            justification,
+            action_taken,
+            message_id,
+            draft_id,
+            event_id: None,
+            action_status: "completed",
+            agent_id,
         })
     }
 
     /// Log an action linked to an event, returning the existing record on duplicate.
     pub fn log_action_for_event(&self, input: EventActionLogInput<'_>) -> Result<ActionLog> {
+        self.log_action_for_event_with_agent(input, None)
+    }
+
+    /// Log an event-linked action attributed to a specific agent. `agent_id` is
+    /// `None` for human/legacy actions (stored as NULL).
+    pub fn log_action_for_event_with_agent(
+        &self,
+        input: EventActionLogInput<'_>,
+        agent_id: Option<&str>,
+    ) -> Result<ActionLog> {
         self.insert_action_log(ActionLogInsert {
             account_id: input.account_id,
             action_type: input.action_type,
@@ -44,6 +83,7 @@ impl Database {
             draft_id: input.draft_id,
             event_id: Some(input.event_id),
             action_status: input.action_status,
+            agent_id,
         })
     }
 
@@ -71,8 +111,8 @@ impl Database {
         self.conn().execute(
             "INSERT OR IGNORE INTO action_log (
                 id, account_id, action_type, confidence, justification, action_taken,
-                message_id, draft_id, event_id, action_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                message_id, draft_id, event_id, action_status, agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 input.account_id,
@@ -84,6 +124,7 @@ impl Database {
                 input.draft_id,
                 input.event_id,
                 input.action_status,
+                input.agent_id,
             ],
         )?;
 
@@ -139,6 +180,7 @@ struct ActionLogInsert<'a> {
     draft_id: Option<&'a str>,
     event_id: Option<&'a str>,
     action_status: &'a str,
+    agent_id: Option<&'a str>,
 }
 
 fn map_action_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLog> {
@@ -200,6 +242,75 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[0].action_type, "classify");
         assert_eq!(actions[1].action_type, "auto_reply");
+    }
+
+    #[test]
+    fn agent_id_lands_and_legacy_writers_insert_null() {
+        let db = Database::open_memory().unwrap();
+
+        // Legacy writer: agent_id must be NULL.
+        let legacy = db
+            .log_action("acc-1", "classify", 0.5, "j", "t", None, None)
+            .unwrap();
+        let legacy_agent: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM action_log WHERE id = ?1",
+                super::params![legacy.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_agent, None);
+
+        // Agent-attributed writer stores the id.
+        let attributed = db
+            .log_action_with_agent(
+                "acc-1",
+                "auto_reply",
+                0.9,
+                "j",
+                "t",
+                None,
+                None,
+                Some("agent-skippy"),
+            )
+            .unwrap();
+        let stored: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM action_log WHERE id = ?1",
+                super::params![attributed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("agent-skippy"));
+
+        // Event-linked attributed writer.
+        let ev = db
+            .log_action_for_event_with_agent(
+                super::EventActionLogInput {
+                    account_id: "acc-1",
+                    event_id: "evt-77",
+                    action_type: "mark_handled",
+                    confidence: 1.0,
+                    justification: "j",
+                    action_taken: "t",
+                    action_status: "completed",
+                    message_id: None,
+                    draft_id: None,
+                },
+                Some("agent-bravo"),
+            )
+            .unwrap();
+        let ev_agent: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM action_log WHERE id = ?1",
+                super::params![ev.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ev_agent.as_deref(), Some("agent-bravo"));
     }
 
     #[test]

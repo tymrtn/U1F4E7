@@ -1,0 +1,7 @@
+node_modules/
+.svelte-kit/
+.DS_Store
+*.log
+vite.config.ts.timestamp-*
+# build/ is intentionally NOT ignored — the compiled SPA is committed so
+# `cargo install` never needs Node.

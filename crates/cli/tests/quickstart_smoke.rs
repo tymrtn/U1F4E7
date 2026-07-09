@@ -14,6 +14,9 @@ fn envelope_bin() -> &'static str {
 fn run_envelope(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(envelope_bin())
         .args(args)
+        // Explicit master key: `accounts add` no longer silently derives a
+        // machine key, so automation must supply a key source. Fake material.
+        .env("ENVELOPE_MASTER_KEY", "test-master-key-quickstart-smoke")
         .env("HOME", home)
         .output()
         .expect("run envelope")

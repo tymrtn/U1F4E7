@@ -7,13 +7,21 @@ use crate::models::Event;
 use rusqlite::{OptionalExtension, params};
 
 impl Database {
-    /// Insert an event into the events table.
+    /// Insert an event into the events table. Attribution is human/legacy
+    /// (agent_id stored as NULL); use [`Database::insert_event_with_agent`] to
+    /// attribute the event to an agent.
     pub fn insert_event(&self, event: &Event) -> Result<()> {
+        self.insert_event_with_agent(event, None)
+    }
+
+    /// Insert an event attributed to a specific agent. `agent_id` is `None` for
+    /// human/legacy events (stored as NULL).
+    pub fn insert_event_with_agent(&self, event: &Event, agent_id: Option<&str>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO events (
                 id, account_id, event_type, folder, uid, message_id, from_addr, subject, snippet,
-                payload, idempotency_key, secure_pending, acked_at, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                payload, idempotency_key, secure_pending, acked_at, created_at, agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 event.id,
                 event.account_id,
@@ -29,18 +37,30 @@ impl Database {
                 event.secure_pending,
                 event.acked_at,
                 event.created_at,
+                agent_id,
             ],
         )?;
         Ok(())
     }
 
     /// Insert an event, ignoring duplicates guarded by the idempotency key.
+    /// Attribution is human/legacy (agent_id NULL).
     pub fn insert_event_idempotent(&self, event: &Event) -> Result<bool> {
+        self.insert_event_idempotent_with_agent(event, None)
+    }
+
+    /// Idempotent insert attributed to a specific agent. `agent_id` is `None`
+    /// for human/legacy events (stored as NULL).
+    pub fn insert_event_idempotent_with_agent(
+        &self,
+        event: &Event,
+        agent_id: Option<&str>,
+    ) -> Result<bool> {
         let inserted = self.conn().execute(
             "INSERT OR IGNORE INTO events (
                 id, account_id, event_type, folder, uid, message_id, from_addr, subject, snippet,
-                payload, idempotency_key, secure_pending, acked_at, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                payload, idempotency_key, secure_pending, acked_at, created_at, agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 event.id,
                 event.account_id,
@@ -56,6 +76,7 @@ impl Database {
                 event.secure_pending,
                 event.acked_at,
                 event.created_at,
+                agent_id,
             ],
         )?;
         Ok(inserted > 0)
@@ -209,6 +230,78 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "new_message");
         assert_eq!(events[0].uid, Some(42));
+    }
+
+    #[test]
+    fn agent_id_lands_and_legacy_insert_is_null() {
+        let db = test_db();
+        let base = Event {
+            id: "evt-legacy".to_string(),
+            account_id: "acc-1".to_string(),
+            event_type: "new_message".to_string(),
+            folder: "INBOX".to_string(),
+            uid: None,
+            message_id: None,
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: None,
+            idempotency_key: Some("k-legacy".to_string()),
+            secure_pending: false,
+            acked_at: None,
+            created_at: "2026-04-19T12:00:00".to_string(),
+        };
+
+        db.insert_event(&base).unwrap();
+        let legacy_agent: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM events WHERE id = 'evt-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_agent, None);
+
+        db.insert_event_with_agent(
+            &Event {
+                id: "evt-agent".to_string(),
+                idempotency_key: Some("k-agent".to_string()),
+                ..base.clone()
+            },
+            Some("agent-skippy"),
+        )
+        .unwrap();
+        let attributed: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM events WHERE id = 'evt-agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attributed.as_deref(), Some("agent-skippy"));
+
+        assert!(
+            db.insert_event_idempotent_with_agent(
+                &Event {
+                    id: "evt-idem".to_string(),
+                    idempotency_key: Some("k-idem".to_string()),
+                    ..base.clone()
+                },
+                Some("agent-bravo"),
+            )
+            .unwrap()
+        );
+        let idem_agent: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT agent_id FROM events WHERE id = 'evt-idem'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idem_agent.as_deref(), Some("agent-bravo"));
     }
 
     #[test]

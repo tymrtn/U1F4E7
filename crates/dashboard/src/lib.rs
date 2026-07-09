@@ -32,7 +32,7 @@ use envelope_email_store::{CredentialBackend, Database};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
-use crate::assets::Assets;
+use crate::assets::{Assets, WebAssets};
 use crate::auth::AuthConfig;
 use crate::state::AppState;
 
@@ -383,6 +383,14 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route("/accounts/{id}/rules", get(index_page))
         .route("/accounts/{id}/messages/{uid}", get(index_page))
         .route("/static/{*path}", get(static_asset))
+        // ── Envelope v2 webmail (SvelteKit SPA, adapter-static) ──
+        // The v1 dashboard above stays at `/`. v2 mounts under `/v2` and serves
+        // its own committed `web/build/` bundle with SPA fallback: any `/v2/...`
+        // path that isn't a real embedded asset returns the SPA `index.html` so
+        // the client-side router (built with `paths.base = '/v2'`) can take over.
+        .route("/v2", get(v2_index))
+        .route("/v2/", get(v2_index))
+        .route("/v2/{*path}", get(v2_asset))
         .nest("/api", api)
         .with_state(state)
 }
@@ -825,6 +833,37 @@ async fn static_asset(axum::extract::Path(path): axum::extract::Path<String>) ->
         }
         None => (StatusCode::NOT_FOUND, format!("asset not found: {path}")).into_response(),
     }
+}
+
+// ── Envelope v2 webmail SPA serving ──────────────────────────────────
+
+/// Serve the v2 SPA shell (`web/build/index.html`).
+async fn v2_index() -> Response {
+    match WebAssets::get_file("index.html") {
+        Some(bytes) => Html(String::from_utf8_lossy(&bytes).into_owned()).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "v2 webmail bundle missing from embedded assets (run ci/build-frontend.sh)",
+        )
+            .into_response(),
+    }
+}
+
+/// Serve a `/v2/*` asset. Real embedded assets are returned with their guessed
+/// content type; anything else falls back to the SPA `index.html` so
+/// client-side routes (e.g. `/v2/kitchen-sink`) resolve instead of 404ing.
+async fn v2_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    if let Some(bytes) = WebAssets::get_file(&path) {
+        let content_type = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string();
+        return Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from(bytes))
+            .unwrap();
+    }
+    // SPA fallback: unknown path under /v2 → serve the shell.
+    v2_index().await
 }
 
 #[cfg(test)]

@@ -19,6 +19,20 @@ impl Assets {
     }
 }
 
+/// The Envelope v2 webmail SPA, compiled from `web/` by SvelteKit +
+/// adapter-static and committed under `web/build/`. Embedded the same way as
+/// [`Assets`] so `cargo install` never needs Node — the built bundle ships
+/// inside the binary and is served by the axum `/v2` mount (see `lib.rs`).
+#[derive(RustEmbed)]
+#[folder = "web/build/"]
+pub struct WebAssets;
+
+impl WebAssets {
+    pub fn get_file(path: &str) -> Option<Vec<u8>> {
+        Self::get(path).map(|f| f.data.into_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

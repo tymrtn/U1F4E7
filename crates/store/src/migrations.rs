@@ -543,6 +543,67 @@ fn migrations() -> Migrations<'static> {
             );
             ",
         ),
+        // ── Migration 9: agent identities (v2 multi-agent attribution) ──
+        // Per-agent identity + policy for a shared inbox. Every action is
+        // attributed via the additive agent_id columns on action_log/events
+        // (NULL = human/legacy; existing rows are never rewritten). Only a
+        // SHA-256 hash of each bearer token is stored — never the raw token.
+        M::up_with_hook(
+            "
+            CREATE TABLE IF NOT EXISTS agent_identities (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                revoked_at TEXT,
+                last_used_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_identities_active
+                ON agent_identities(revoked_at);
+
+            CREATE TABLE IF NOT EXISTS agent_policies (
+                agent_id TEXT PRIMARY KEY REFERENCES agent_identities(id) ON DELETE CASCADE,
+                allowed_accounts TEXT NOT NULL DEFAULT '*',
+                allowed_folders TEXT NOT NULL DEFAULT '*',
+                allowed_actions TEXT NOT NULL DEFAULT '*',
+                send_mode_ceiling TEXT NOT NULL DEFAULT 'draft-only',
+                allow_recipients TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            ",
+            // Additive agent_id columns on the audit tables. NULL means the
+            // action was taken by a human or predates multi-agent attribution;
+            // existing rows are left untouched. Guarded on table existence so a
+            // database that skipped the baseline (e.g. a partial fixture) still
+            // migrates cleanly.
+            |tx: &Transaction| {
+                let table_exists = |table: &str| -> bool {
+                    tx.prepare(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    )
+                    .and_then(|mut s| s.query_row([table], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                        > 0
+                };
+                let has_col = |table: &str, col: &str| -> bool {
+                    tx.prepare(&format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                    ))
+                    .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                        > 0
+                };
+                if table_exists("action_log") && !has_col("action_log", "agent_id") {
+                    tx.execute_batch("ALTER TABLE action_log ADD COLUMN agent_id TEXT;")?;
+                }
+                if table_exists("events") && !has_col("events", "agent_id") {
+                    tx.execute_batch("ALTER TABLE events ADD COLUMN agent_id TEXT;")?;
+                }
+                Ok(())
+            },
+        ),
     ])
 }
 
@@ -667,6 +728,93 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn agent_identity_tables_and_columns_exist() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"agent_identities".to_string()));
+        assert!(tables.contains(&"agent_policies".to_string()));
+
+        let has_col = |table: &str, col: &str| -> bool {
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            n > 0
+        };
+        assert!(has_col("action_log", "agent_id"));
+        assert!(has_col("events", "agent_id"));
+    }
+
+    #[test]
+    fn agent_id_columns_apply_to_pre_migration_database() {
+        // Simulate a database created before migration 9: build the v0.6 audit
+        // tables by hand, seed a legacy row, then run migrations to latest.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE action_log (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                justification TEXT NOT NULL DEFAULT '',
+                action_taken TEXT NOT NULL DEFAULT '',
+                message_id TEXT,
+                draft_id TEXT,
+                event_id TEXT,
+                action_status TEXT NOT NULL DEFAULT 'completed',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO action_log (id, account_id, action_type) VALUES ('a-legacy', 'acc', 'x');
+            INSERT INTO events (id, account_id, event_type, folder)
+                VALUES ('e-legacy', 'acc', 'new_message', 'INBOX');
+            PRAGMA user_version = 8;
+            ",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        // Legacy rows survive and their new agent_id column is NULL.
+        let action_agent: Option<String> = conn
+            .query_row(
+                "SELECT agent_id FROM action_log WHERE id = 'a-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(action_agent, None);
+        let event_agent: Option<String> = conn
+            .query_row(
+                "SELECT agent_id FROM events WHERE id = 'e-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_agent, None);
     }
 
     #[test]

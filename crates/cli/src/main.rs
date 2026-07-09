@@ -536,7 +536,15 @@ enum AccountsCmd {
         /// IMAP port
         #[arg(long)]
         imap_port: Option<u16>,
+        /// Establish the credential store under the INSECURE machine-derived
+        /// key (hostname+username) instead of a passphrase. Breaks if the
+        /// hostname/username change; only for non-interactive environments
+        /// where no passphrase can be provided. Prefer a passphrase.
+        #[arg(long)]
+        insecure_machine_key: bool,
     },
+    /// Re-encrypt the file credential store under a new passphrase
+    Rekey,
     /// Discover/import matching macOS Mail.app/Keychain internet-password entries
     ImportKeychain {
         /// Email address to match in Keychain internet-password entries

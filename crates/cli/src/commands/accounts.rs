@@ -5,9 +5,12 @@ use crate::commands::clipboard;
 use crate::commands::ui;
 use crate::{AccountsCmd, SignatureCmd};
 use anyhow::{Context, Result, bail};
-use envelope_email_store::credential_store::{self, CredentialBackend};
+use envelope_email_store::credential_store::{
+    self, CredentialBackend, PassphrasePrompter, RekeyOutcome,
+};
+use envelope_email_store::errors::StoreError;
 use envelope_email_store::{Account, Database, Event};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<()> {
     match cmd {
@@ -19,9 +22,20 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             imap_host,
             smtp_port,
             imap_port,
+            insecure_machine_key,
         } => add(
-            &email, password, name, smtp_host, smtp_port, imap_host, imap_port, json, backend,
+            &email,
+            password,
+            name,
+            smtp_host,
+            smtp_port,
+            imap_host,
+            imap_port,
+            insecure_machine_key,
+            json,
+            backend,
         ),
+        AccountsCmd::Rekey => rekey(json, backend),
         AccountsCmd::List => list(json),
         AccountsCmd::SetupInstructions {
             account,
@@ -174,6 +188,7 @@ fn emit_signature(account: &Account, json: bool, status: &str) -> Result<()> {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_arguments)]
 async fn add(
     email: &str,
     password: Option<String>,
@@ -182,6 +197,7 @@ async fn add(
     smtp_port: Option<u16>,
     imap_host: Option<String>,
     imap_port: Option<u16>,
+    insecure_machine_key: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -233,8 +249,13 @@ async fn add(
         }
     };
 
-    let passphrase = credential_store::get_or_create_passphrase(backend)
-        .context("failed to access credential store for encryption")?;
+    let passphrase = if insecure_machine_key {
+        credential_store::get_or_create_passphrase_insecure_machine(backend)
+            .context("failed to access credential store for encryption")?
+    } else {
+        credential_store::get_or_create_passphrase_with(backend, &StdinPrompter)
+            .context("failed to access credential store for encryption")?
+    };
 
     let db = Database::open_default().context("failed to open database")?;
 
@@ -611,6 +632,85 @@ fn prompt_password(prompt: &str) -> Result<String> {
     }
 
     Ok(password)
+}
+
+/// Read a single passphrase line from stdin with a stderr prompt.
+/// Mirrors `prompt_password`'s stdin idiom (the codebase does not yet do
+/// no-echo input); the value is never printed or logged.
+fn read_passphrase_line(prompt: &str) -> std::result::Result<String, StoreError> {
+    eprint!("{prompt}");
+    io::stderr()
+        .flush()
+        .map_err(|e| StoreError::Config(format!("stderr flush failed: {e}")))?;
+    let mut buf = String::new();
+    io::stdin()
+        .read_line(&mut buf)
+        .map_err(|e| StoreError::Config(format!("failed to read passphrase: {e}")))?;
+    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Terminal-backed passphrase prompter for the file credential store.
+///
+/// `is_interactive` is gated on stdin being a TTY so non-interactive runs fail
+/// loud in the store layer instead of blocking on a read.
+struct StdinPrompter;
+
+impl PassphrasePrompter for StdinPrompter {
+    fn is_interactive(&self) -> bool {
+        io::stdin().is_terminal()
+    }
+
+    fn prompt_unlock(&self) -> std::result::Result<String, StoreError> {
+        let pass = read_passphrase_line("Envelope master passphrase: ")?;
+        if pass.is_empty() {
+            return Err(StoreError::Config("passphrase cannot be empty".into()));
+        }
+        Ok(pass)
+    }
+
+    fn prompt_new(&self) -> std::result::Result<String, StoreError> {
+        let first = read_passphrase_line("Set a new Envelope master passphrase: ")?;
+        if first.is_empty() {
+            return Err(StoreError::Config("passphrase cannot be empty".into()));
+        }
+        let second = read_passphrase_line("Confirm passphrase: ")?;
+        if first != second {
+            return Err(StoreError::Config("passphrases did not match".into()));
+        }
+        Ok(first)
+    }
+}
+
+/// Rekey status for JSON output. Stable snake_case codes mirror the
+/// import-keychain contract style (`rekeyed`, `nothing_to_rekey`).
+#[derive(serde::Serialize)]
+struct RekeyStatus {
+    status: &'static str,
+    message: &'static str,
+}
+
+/// Re-encrypt the file credential store under a new passphrase.
+fn rekey(json: bool, backend: CredentialBackend) -> Result<()> {
+    let outcome = credential_store::rekey(backend, &StdinPrompter, &StdinPrompter)
+        .context("failed to rekey credential store")?;
+
+    let status = match outcome {
+        RekeyOutcome::Rekeyed => RekeyStatus {
+            status: "rekeyed",
+            message: "credential store re-encrypted under the new passphrase",
+        },
+        RekeyOutcome::Nothing => RekeyStatus {
+            status: "nothing_to_rekey",
+            message: "no credential store exists yet; add an account first",
+        },
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("status: {}\n{}", status.status, status.message);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

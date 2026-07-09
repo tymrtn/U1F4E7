@@ -215,6 +215,11 @@ pub struct GovernorRequest {
     pub is_reply: bool,
     /// Canonical Governor envelope-catalog attribute keys this send exhibits.
     pub attributes: Vec<String>,
+    /// Optional per-agent identity, carried as **audit metadata only**. This is
+    /// never added to [`Self::attributes`] and never influences Governor scoring
+    /// or any allow/deny decision. Defaults to `None` on every construction path
+    /// so behavior is byte-identical until a caller explicitly threads it in.
+    pub agent_id: Option<String>,
 }
 
 impl GovernorRequest {
@@ -311,13 +316,25 @@ impl GovernorRequest {
             attachment_types: types,
             is_reply: ctx.is_reply,
             attributes,
+            agent_id: None,
         }
+    }
+
+    /// Attach a per-agent identity as **audit metadata only**.
+    ///
+    /// The `agent_id` appears in [`Self::audit_payload`] for provenance but is
+    /// never pushed into [`Self::attributes`], so it cannot reach Governor's
+    /// scoring inputs or change any verdict. Omitting the call (or passing
+    /// `None`) leaves the request identical to today.
+    pub fn with_agent_id(mut self, agent_id: Option<&str>) -> Self {
+        self.agent_id = agent_id.map(str::to_string);
+        self
     }
 
     /// Sanitized JSON payload safe to persist in audit/event rows. Records the
     /// declared attribute **keys** (what Governor scored) — never the content.
     pub fn audit_payload(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "surface": self.surface.as_str(),
             "catalog": GOVERNOR_CATALOG,
             "attributes": self.attributes,
@@ -330,7 +347,16 @@ impl GovernorRequest {
             "attachment_types": self.attachment_types,
             "is_reply": self.is_reply,
             "draft_id": self.draft_id,
-        })
+        });
+        // Audit metadata only, and omitted when absent so today's payload is
+        // byte-identical. Deliberately not part of `attributes`: Governor never
+        // scores the agent id.
+        if let Some(agent_id) = &self.agent_id
+            && let Value::Object(map) = &mut payload
+        {
+            map.insert("agent_id".to_string(), Value::String(agent_id.clone()));
+        }
+        payload
     }
 
     /// Content-free justification passed to Governor for its own audit trail:
@@ -655,6 +681,54 @@ mod tests {
         // attributes are declared, and every one is a canonical envelope key.
         assert!(req.attributes.contains(&"has_attachment".to_string()));
         assert!(!req.attributes.contains(&"internal_domain".to_string()));
+    }
+
+    #[test]
+    fn agent_id_defaults_none_and_is_omitted_from_audit_payload() {
+        let req = sample_request();
+        assert_eq!(req.agent_id, None);
+        let payload = req.audit_payload();
+        let obj = payload.as_object().unwrap();
+        assert!(
+            !obj.contains_key("agent_id"),
+            "agent_id must be absent when None: {payload}"
+        );
+    }
+
+    #[test]
+    fn agent_id_is_audit_metadata_only_never_a_scoring_input() {
+        let base = sample_request();
+        let attributed = sample_request().with_agent_id(Some("skippy-agent-42"));
+
+        // Threading agent_id must not touch the scored attribute keys.
+        assert_eq!(base.attributes, attributed.attributes);
+        assert!(
+            !attributed
+                .attributes
+                .iter()
+                .any(|a| a.contains("skippy-agent-42")),
+            "agent_id must never enter Governor scoring attributes"
+        );
+
+        // It appears only in the audit payload, and only when Some.
+        let payload = attributed.audit_payload();
+        assert_eq!(
+            payload.get("agent_id"),
+            Some(&json!("skippy-agent-42")),
+            "agent_id should serialize into the audit payload when set"
+        );
+
+        // Redaction of recipients/subject still holds with agent_id present.
+        let audit = payload.to_string();
+        for needle in ["alice@example.com", "bob@example.com", "Quarterly numbers"] {
+            assert!(!audit.contains(needle), "audit leaked {needle}: {audit}");
+        }
+        assert!(audit.contains("sha256:"));
+
+        // Every field except agent_id is byte-identical to the un-threaded payload.
+        let mut with_id = payload.as_object().unwrap().clone();
+        with_id.remove("agent_id");
+        assert_eq!(Value::Object(with_id), base.audit_payload());
     }
 
     #[test]
