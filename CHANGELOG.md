@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-07-11
+
+First public release. Envelope is a bring-your-own-mailbox email client with
+agent-native primitives: it runs a fleet of AI agents on one shared inbox with
+per-agent identity, per-action attribution, and a fail-closed send gate, plus a
+full webmail dashboard for the humans in the loop.
+
+### Added
+
+- **Multi-agent identity on a shared inbox.** Named agent identities
+  (`envelope agent create|list|show|revoke`, `envtok_` tokens shown once and
+  stored as a SHA-256 hash + display prefix). Per-agent policy
+  (`envelope agent policy set`) clamps allowed accounts, folders, actions, a
+  send-mode ceiling, and recipient allowlists — a clamp never widens what a
+  policy permits. Every mutation and send-policy/Governor event carries
+  `agent_id` attribution; `envelope actions tail --agent <id>` shows the
+  per-agent trail. MCP contexts resolve `ENVELOPE_AGENT_TOKEN` at startup and
+  authorize every tool call pre-dispatch (unknown/revoked token fails loud).
+- **License gate.** Free tier runs up to 2 active agent identities; a 3rd
+  requires `envelope license activate` (stable `agent_limit_license_required`
+  denial). `license activate|status|deactivate` persist locally, prefix-only
+  display.
+- **Full webmail dashboard (v2).** SvelteKit (Svelte 5) SPA embedded in the
+  binary — accounts rail with health badges, unified/smart mailboxes, message
+  list with range-selection and contextual bulk toolbar, sandboxed reader that
+  never marks messages read, composer (reply/forward, send-later, undo-send),
+  and the Agent Cockpit: per-account draft-approval queue, per-agent
+  attribution feed, scheduled sends with persisted Governor verdict badges, and
+  rules-first authoring with live blast-radius preview.
+- **Bulk operations** (`envelope bulk`, MCP `bulk` tool): move/copy/flag/delete/
+  tag over UID or search targets (500 cap), partial-failure isolation, dry-run
+  default for destructive ops, UID-range coalescing.
+- **Durable event push / webhooks.** HMAC-SHA256 signed deliveries with
+  exponential backoff and dead-lettering, per-route secrets minted once,
+  delivery-result capture. `envelope watch --deliver`,
+  `envelope events routes …`, catalog: `send_queued`, `draft_approved`,
+  `send_completed`, `governor_blocked`, `agent_action`.
+- **Server-sent events** at `/api/events/stream` (metadata-only, heartbeat,
+  reconnecting client with polling fallback).
+- **Linux support.** Target-conditional keyring backends (macOS `apple-native`,
+  Linux secret-service + file/passphrase default), systemd `--user` units with
+  `LoadCredential`, `dist/install.sh` (OS/arch detect + sha256 verify), and a
+  4-target tag-triggered release pipeline.
+- **Passphrase-first credential store.** Interactive passphrase on first
+  account add (Argon2), `ENVELOPE_MASTER_PASSPHRASE_FILE` for systemd,
+  `envelope accounts rekey`; machine-key storage is now an explicit
+  `--insecure-machine-key` opt-in.
+- **Onboarding.** Provider app-password guidance on quickstart auth failure,
+  and docs: install-linux, credential-backends, agent-fleet-shared-inbox,
+  quickstart, webhooks.
+
+### Security
+
+- **MCP trust boundary.** Hostile message fields (body/subject/from/snippet)
+  returned to agents are wrapped in an `_envelope_trust: "untrusted-content"`
+  envelope so prompt-injection payloads are labelled, not silently trusted.
+- **Dashboard CSRF.** Double-submit `__Host-` cookie + `X-Envelope-CSRF` header
+  with Origin/Sec-Fetch-Site checks on all state-changing endpoints; valid
+  bearer requests are exempt. Stable `dashboard_csrf_required` code.
+- **SSRF guard on webhook URLs.** Every sink (CLI rule create/edit, CLI event
+  routes, dashboard rule create and update) rejects loopback/link-local/
+  private/reserved/documentation targets — including cloud metadata
+  `169.254.169.254` — before the URL is persisted.
+
+### Notes
+
+- Send-mode names (`draft-only`, `confirm-send`, `allowlisted-send`,
+  `autonomous-send`) are stable. MCP/agent contexts default to `draft-only`.
+- All outbound mail remains gated through Governor attribution; there is no
+  send bypass. Mailbox reads use `EXAMINE` + `BODY.PEEK[]` only.
+- Agent contract `envelope.agent_contract.v1` grew additively across this
+  release; no `--json` output shapes were removed or retyped.
+
 ## [0.12.5] — 2026-07-04
 
 ### Fixed
