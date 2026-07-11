@@ -9,6 +9,7 @@
 //! connection pool.
 
 pub mod accounts;
+pub mod agents;
 pub mod attachments;
 pub mod cockpit;
 pub mod compose;
@@ -18,6 +19,8 @@ pub mod folders;
 pub mod health;
 pub mod messages;
 pub mod rules;
+pub mod scheduled;
 pub mod snoozed;
 pub mod stats;
 pub mod threads;
+pub mod watches;

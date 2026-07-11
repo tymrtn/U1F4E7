@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::common::setup_credentials;
-use super::datetime::parse_until;
+use super::datetime::parse_send_at;
 use super::drafts::{resolve_sent_copy_after_send, sent_mail_proof_json};
 use super::governor_gate::{account_domain, gate_and_record, governor_request};
 use super::re_subject_guard::check_new_re_subject_guard;
@@ -139,7 +139,7 @@ pub async fn run(
                 "--from is not supported with --at (scheduled send does not persist sender override yet)"
             );
         }
-        let send_at = parse_until(at_str).context("failed to parse --at value")?;
+        let send_at = parse_send_at(at_str).context("failed to parse --at value")?;
 
         // Snapshot attachment bytes at schedule time so delivery does not depend
         // on the original files surviving. Bytes are base64-encoded into the
@@ -251,7 +251,7 @@ pub async fn run(
                     .context("failed to persist queued attachments")?;
             }
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
-                .format("%Y-%m-%dT%H:%M:%S")
+                .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .context("failed to set send_after on queued draft")?;

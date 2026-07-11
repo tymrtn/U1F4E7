@@ -8,6 +8,7 @@ pub mod bulk;
 pub mod code_extractor;
 pub mod compose;
 pub mod discovery;
+pub mod draft_cleanup;
 pub mod errors;
 pub mod event_delivery;
 pub mod event_pipeline;
@@ -27,6 +28,7 @@ pub mod sieve;
 pub mod smtp;
 pub mod threading;
 pub mod unsubscribe;
+pub mod url_guard;
 
 pub use agent_policy::{AgentPolicy, PolicyDenial};
 pub use attribution::{
@@ -62,3 +64,4 @@ pub use send_policy::{
 };
 pub use smtp::SmtpSender;
 pub use threading::{ThreadBuildResult, build_threads, normalize_subject};
+pub use url_guard::{UrlGuardError, check_public_url};

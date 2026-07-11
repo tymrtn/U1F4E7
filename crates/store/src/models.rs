@@ -78,6 +78,43 @@ pub struct Draft {
     /// IMAP UID of the draft in the server's Drafts folder (if synced).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imap_uid: Option<u32>,
+    /// Monotonic revision counter, bumped atomically by every
+    /// content-relevant mutation. Human approval is bound to this value.
+    #[serde(default)]
+    pub revision: i64,
+}
+
+impl Draft {
+    /// True when the draft carries a durable human-approval attestation
+    /// (written by `Database::record_draft_human_approval` from a human
+    /// surface such as the dashboard approve/send actions).
+    ///
+    /// Fail-closed derivation: a missing, malformed, or non-`human:`-prefixed
+    /// attestation is not approved; `approved_at` must parse as strict
+    /// RFC 3339 (a bare/naive timestamp or arbitrary string fails closed);
+    /// and the attestation's recorded `revision` must equal the draft's
+    /// current revision — an approval never outlives the exact revision the
+    /// human acted on. Agent-created state alone (a `created_by` of
+    /// `agent`/`mcp`, agent-written threading metadata, etc.) never satisfies
+    /// this — approval requires the explicit attestation object.
+    pub fn human_approved(&self) -> bool {
+        let Some(attestation) = self.metadata.as_ref().and_then(|m| m.get("human_approval")) else {
+            return false;
+        };
+        let by_human = attestation
+            .get("approved_by")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("human:"));
+        let valid_timestamp = attestation
+            .get("approved_at")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok());
+        let bound_to_current_revision = attestation
+            .get("revision")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|approved_revision| approved_revision == self.revision);
+        by_human && valid_timestamp && bound_to_current_revision
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,7 +122,31 @@ pub struct Draft {
 pub enum DraftStatus {
     Draft,
     PendingReview,
+    /// Durable transmission claim held by the scheduled-send sweep. Entered
+    /// only via the atomic id+revision+status claim
+    /// (`Database::claim_draft_for_sending`), which removes the row from the
+    /// due query before any network I/O. Not editable, not discardable — the
+    /// content is being transmitted. Left by `mark_draft_sent` (→ `sent`) or
+    /// `release_sending_draft` (→ retry/park). A crash mid-send strands the
+    /// row here: visible, inert, and never re-sent.
+    Sending,
+    /// Durable provider-sync claim held by `modify_draft` while it replaces
+    /// the server-side draft copy (delete old + APPEND new). Entered only via
+    /// the atomic `Database::claim_draft_for_sync` after the local content
+    /// update landed, and left via `release_syncing_draft` back to the prior
+    /// status. Not claimable by the send sweep, not editable by other actors;
+    /// only IMAP bookkeeping (`imap_uid`, `message_id`, storage metadata) may
+    /// be written while held. A crash mid-sync strands the row here: inert.
+    Syncing,
     Blocked,
+    /// Terminal-recovery state: SMTP ACCEPTED the message but the local
+    /// sent-state persistence failed, so delivery happened (or very likely
+    /// happened) without a durable record. Non-editable, non-approvable,
+    /// never due, never claimable — nothing may ever turn this row back into
+    /// a sendable draft. `send_after` is cleared atomically when parking
+    /// here. Recovery is an explicit operator reconciliation: verify
+    /// delivery (Sent folder / recipient), then discard the draft.
+    DeliveryUncertain,
     Sent,
     Discarded,
 }
@@ -95,7 +156,10 @@ impl DraftStatus {
         match self {
             Self::Draft => "draft",
             Self::PendingReview => "pending_review",
+            Self::Sending => "sending",
+            Self::Syncing => "syncing",
             Self::Blocked => "blocked",
+            Self::DeliveryUncertain => "delivery_uncertain",
             Self::Sent => "sent",
             Self::Discarded => "discarded",
         }
@@ -112,7 +176,10 @@ impl std::str::FromStr for DraftStatus {
         match s {
             "draft" => Ok(Self::Draft),
             "pending_review" => Ok(Self::PendingReview),
+            "sending" => Ok(Self::Sending),
+            "syncing" => Ok(Self::Syncing),
             "blocked" => Ok(Self::Blocked),
+            "delivery_uncertain" => Ok(Self::DeliveryUncertain),
             "sent" => Ok(Self::Sent),
             "discarded" => Ok(Self::Discarded),
             _ => Err(format!("unknown draft status: {s}")),
@@ -236,6 +303,7 @@ pub struct MessageIndexAccountFreshness {
     pub message_count: usize,
     pub indexed_at: Option<String>,
     pub freshness: String,
+    pub last_error: Option<String>,
 }
 
 /// Full IMAP message with body.

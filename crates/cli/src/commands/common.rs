@@ -28,7 +28,7 @@ pub fn resolve_account(db: &Database, account_arg: Option<&str>) -> Result<Accou
             match account {
                 Some(a) => Ok(a),
                 None => bail!(
-                    "no accounts configured. Add one with: envelope-email accounts add --email you@example.com"
+                    "no accounts configured. Add one with: envelope accounts add --email you@example.com"
                 ),
             }
         }

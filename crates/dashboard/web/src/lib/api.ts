@@ -349,6 +349,52 @@ export interface CockpitResponse {
   [key: string]: unknown;
 }
 
+// ── Compose / reply request + response types ──────────────────────────
+
+/** Body for POST /api/accounts/{id}/compose. Mirrors ComposeRequest in compose.rs. */
+export interface ComposeBody {
+  to: string;
+  subject: string;
+  text?: string | null;
+  html?: string | null;
+  cc?: string | null;
+  bcc?: string | null;
+  reply_to?: string | null;
+  attachments?: ComposeAttachment[];
+}
+
+export interface ComposeAttachment {
+  filename: string;
+  content_type: string;
+  data_b64: string;
+}
+
+/** Body for POST /api/accounts/{id}/compose/reply. Mirrors ReplyRequest in compose.rs. */
+export interface ReplyBody {
+  parent_uid: number;
+  parent_folder?: string;
+  reply_all?: boolean;
+  text?: string | null;
+  html?: string | null;
+  attachments?: ComposeAttachment[];
+}
+
+/**
+ * Response from compose / compose/reply endpoints. The backend queues with an
+ * outbox cooldown; `cooldown_seconds` tells the UI how long the undo window is.
+ * When `cooldown_seconds` is 0 the draft may have been swept immediately — show
+ * no undo toast in that case.
+ */
+export interface ComposeResponse {
+  ok: boolean;
+  status: 'queued' | string;
+  draft_id: string;
+  send_after: string;
+  cooldown_seconds: number;
+  in_reply_to?: string | null;
+  references?: string[] | null;
+}
+
 // ── Typed endpoint helpers ────────────────────────────────────────────
 
 export const api = {
@@ -507,6 +553,53 @@ export const api = {
       ...o,
       query: { q, folder, limit }
     });
+  },
+
+  /**
+   * POST /api/accounts/{id}/compose
+   * Queue a new outbound message. Returns ComposeResponse with cooldown info.
+   */
+  compose(
+    accountId: string,
+    body: ComposeBody,
+    o?: RequestOptions
+  ): Promise<ComposeResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/compose`, {
+      ...o,
+      method: 'POST',
+      body
+    });
+  },
+
+  /**
+   * POST /api/accounts/{id}/compose/reply
+   * Queue a reply or reply-all. Returns ComposeResponse with cooldown info.
+   */
+  composeReply(
+    accountId: string,
+    body: ReplyBody,
+    o?: RequestOptions
+  ): Promise<ComposeResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/compose/reply`, {
+      ...o,
+      method: 'POST',
+      body
+    });
+  },
+
+  /**
+   * POST /api/accounts/{id}/drafts/{draftId}/discard
+   * Discard a queued draft (undo send).
+   */
+  discardDraft(
+    accountId: string,
+    draftId: string,
+    o?: RequestOptions
+  ): Promise<{ draft_id: string; status: string }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/discard`,
+      { ...o, method: 'POST', body: {} }
+    );
   }
 };
 

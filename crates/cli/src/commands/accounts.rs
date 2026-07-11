@@ -297,7 +297,7 @@ fn list(json: bool) -> Result<()> {
 
     if accounts.is_empty() {
         println!(
-            "No accounts configured. Add one with: envelope-email accounts add --email you@example.com"
+            "No accounts configured. Add one with: envelope accounts add --email you@example.com"
         );
         return Ok(());
     }

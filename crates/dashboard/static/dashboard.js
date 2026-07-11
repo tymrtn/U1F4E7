@@ -31,7 +31,8 @@ const state = {
   snoozed: [],
   composeMode: 'new',
   composeParent: null,
-  composeImapDraft: null,
+  composeDraft: null,
+  composerSending: false,
   pendingAttachments: [],
   bodyFormat: 'text',
   showAllAccounts: false,
@@ -2875,7 +2876,7 @@ async function openDraftFromMessageLink(accountId, uid, folder, msg) {
     state.currentDraft = data.draft;
     upsertDraft(data.draft);
     renderDrafts();
-    openComposerFromDraft(data.draft, { accountId, uid, folder });
+    openComposerFromDraft(data.draft);
     return;
   } catch (_) {
     let draftMessage = msg;
@@ -2900,10 +2901,10 @@ async function openDraftFromMessageLink(accountId, uid, folder, msg) {
         return;
       }
     }
-    // Some Drafts-folder messages are server-only IMAP drafts rather than
-    // Envelope-created local drafts. Gmail's behavior is still the right model:
-    // opening a Drafts message opens an editable draft composer.
-    openComposerFromImap(draftMessage);
+    // Some Drafts-folder messages are server-only IMAP drafts with no local
+    // Envelope draft record. There is no revision-safe way to edit them here,
+    // so refuse with a review path rather than compose-copy-and-delete.
+    refuseRawImapDraftEdit(draftMessage);
   }
 }
 
@@ -3042,12 +3043,138 @@ function currentDraftCli(action, draft) {
 // ── Composer ───────────────────────────────────────────────────────
 function setBodyFormat(format) {
   state.bodyFormat = format === 'html' ? 'html' : 'text';
-  $('format-text').className = state.bodyFormat === 'text'
-    ? 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper'
-    : 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
-  $('format-html').className = state.bodyFormat === 'html'
-    ? 'px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper'
-    : 'px-2 py-0.5 text-xs font-mono border border-rule text-mid';
+  const textButton = $('format-text');
+  const htmlButton = $('format-html');
+  textButton.classList.toggle('is-active', state.bodyFormat === 'text');
+  htmlButton.classList.toggle('is-active', state.bodyFormat === 'html');
+  textButton.setAttribute('aria-pressed', state.bodyFormat === 'text' ? 'true' : 'false');
+  htmlButton.setAttribute('aria-pressed', state.bodyFormat === 'html' ? 'true' : 'false');
+}
+
+function composerAccount() {
+  const accountId = $('composer-from')?.value || '';
+  return state.accounts.find(account => account.id === accountId) || null;
+}
+
+function composerAccountLabel(account) {
+  if (!account) return 'Choose an account before sending.';
+  const name = account.display_name || account.name || '';
+  const address = account.username || '';
+  return name && address && name !== address
+    ? `Sending from ${name} <${address}>`
+    : `Sending from ${address || name}`;
+}
+
+function populateComposerAccounts(preferredAccountId = '') {
+  const select = $('composer-from');
+  clear(select);
+  if (state.accounts.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No accounts available';
+    select.appendChild(option);
+    select.disabled = true;
+    return;
+  }
+
+  select.disabled = false;
+  for (const account of state.accounts) {
+    const option = document.createElement('option');
+    option.value = account.id;
+    const name = account.display_name || account.name || account.username;
+    option.textContent = name === account.username ? name : `${name} <${account.username}>`;
+    select.appendChild(option);
+  }
+  const preferred = state.accounts.some(account => account.id === preferredAccountId)
+    ? preferredAccountId
+    : (state.currentAccount?.id || state.accounts[0].id);
+  select.value = preferred;
+}
+
+function validComposerAddresses(raw) {
+  const addresses = String(raw || '').split(',').map(value => value.trim()).filter(Boolean);
+  return addresses.length > 0
+    && addresses.every(address => {
+      const angleAddress = address.match(/<([^>]+)>/);
+      const normalized = (angleAddress?.[1] || address).trim();
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+    });
+}
+
+function setComposerCheck(id, text, kind = '') {
+  const check = $(id);
+  check.textContent = text;
+  check.classList.toggle('is-ready', kind === 'ready');
+  check.classList.toggle('is-error', kind === 'error');
+}
+
+function updateComposerReview({ preserveStatus = false } = {}) {
+  const to = $('composer-to').value.trim();
+  const subject = $('composer-subject').value.trim();
+  const account = composerAccount();
+  const recipientReady = validComposerAddresses(to);
+  const subjectReady = subject.length > 0;
+  const deliveryReady = Boolean(account);
+
+  setComposerCheck(
+    'composer-recipient-check',
+    recipientReady ? 'Ready' : (to ? 'Check address' : 'Required'),
+    recipientReady ? 'ready' : (to ? 'error' : '')
+  );
+  setComposerCheck(
+    'composer-subject-check',
+    subjectReady ? 'Ready' : 'Required',
+    subjectReady ? 'ready' : ''
+  );
+  setComposerCheck(
+    'composer-delivery-check',
+    deliveryReady ? 'Account ready' : 'Select account',
+    deliveryReady ? 'ready' : 'error'
+  );
+
+  $('composer-account-context').textContent = composerAccountLabel(account);
+  const canSend = recipientReady && subjectReady && deliveryReady && !state.composerSending;
+  $('btn-composer-send').disabled = !canSend;
+
+  if (!preserveStatus && !state.composerSending) {
+    const status = $('composer-status');
+    status.classList.remove('is-error');
+    status.textContent = canSend ? 'Ready to send.' : 'Complete the required fields before sending.';
+  }
+  return canSend;
+}
+
+function renderComposerAttachments() {
+  const list = $('attach-list');
+  const empty = $('composer-attachments-empty');
+  const count = $('composer-attachment-count');
+  clear(list);
+
+  const total = state.pendingAttachments.length;
+  count.textContent = total === 0 ? 'None' : `${total} file${total === 1 ? '' : 's'}`;
+  empty.hidden = total > 0;
+
+  state.pendingAttachments.forEach((attachment, index) => {
+    const item = el('li', { class: 'composer-attachment-item' });
+    item.appendChild(el('span', {
+      class: 'composer-attachment-name',
+      text: attachment.filename,
+      title: attachment.filename,
+    }));
+    item.appendChild(el('span', { text: formatSize(attachment.size || 0) }));
+    const remove = el('button', {
+      class: 'composer-attachment-remove',
+      type: 'button',
+      text: 'Remove',
+      aria: { label: `Remove ${attachment.filename}` },
+    });
+    remove.onclick = () => {
+      state.pendingAttachments.splice(index, 1);
+      renderComposerAttachments();
+    };
+    item.appendChild(remove);
+    list.appendChild(item);
+  });
 }
 
 function openComposer(mode = 'new', parent = null) {
@@ -3060,11 +3187,16 @@ function openComposer(mode = 'new', parent = null) {
   }
   state.composeMode = mode;
   state.composeParent = parent;
-  state.composeImapDraft = null;
+  state.composeDraft = null;
+  state.composerSending = false;
   state.pendingAttachments = [];
 
-  const title = mode === 'reply' ? 'Reply' : mode === 'reply-all' ? 'Reply All' : 'New Message';
+  const title = mode === 'reply' ? 'Reply' : mode === 'reply-all' ? 'Reply all' : 'New message';
   $('composer-title').textContent = title;
+  $('composer-mode').textContent = mode === 'new' ? 'New' : mode.replace('-', ' ');
+
+  const preferredAccountId = parent?.account_id || state.currentAccount?.id || '';
+  populateComposerAccounts(preferredAccountId);
 
   if (mode === 'new') {
     $('composer-to').value = '';
@@ -3079,53 +3211,58 @@ function openComposer(mode = 'new', parent = null) {
     $('composer-body').value = '\n\n--- On ' + (parent.date || '?') + ', ' + (parent.from_addr || '?') + ' wrote: ---\n' + quoted;
   }
 
-  clear($('attach-list'));
-  $('composer-status').textContent = '';
+  setBodyFormat('text');
+  renderComposerAttachments();
+  updateComposerReview();
+  $('composer-backdrop').classList.add('show');
+  $('composer-backdrop').setAttribute('aria-hidden', 'false');
   $('composer').classList.add('show');
+  $('composer').setAttribute('aria-hidden', 'false');
+  requestAnimationFrame(() => {
+    (mode === 'new' ? $('composer-to') : $('composer-body')).focus();
+  });
 }
 
-function openComposerFromDraft(draft, origin = null) {
+function openComposerFromDraft(draft) {
   openComposer('new');
-  const source = origin || (
-    draft && draft.account_id && draft.imap_uid != null
-      ? { accountId: draft.account_id, uid: draft.imap_uid, folder: draft.folder || 'Drafts' }
-      : null
-  );
-  if (source) {
-    state.composeMode = 'imap-draft';
-    state.composeImapDraft = source;
-  }
+  // Editing an existing local draft edits and queues the SAME draft through
+  // the revision-bound /edit + /send endpoints (expected_revision comes from
+  // this viewed draft; the send uses the fresh revision returned by /edit).
+  // The composer never composes a copy and never deletes mailbox messages:
+  // provider Drafts cleanup is owned exclusively by the scheduled-send sweep,
+  // after SMTP acceptance and durable sent state.
+  state.composeMode = 'draft';
+  state.composeDraft = {
+    accountId: draft.account_id,
+    draftId: draft.id,
+    expectedRevision: typeof draft.revision === 'number' ? draft.revision : 0,
+  };
   $('composer-to').value = draft.to_addr || '';
   $('composer-cc').value = draft.cc_addr || '';
   $('composer-subject').value = draft.subject || '';
   $('composer-body').value = draft.text_content || draft.html_content || '';
   setBodyFormat(draft.html_content && !draft.text_content ? 'html' : 'text');
   $('composer-title').textContent = 'Edit Draft';
+  $('composer-mode').textContent = 'Draft';
+  populateComposerAccounts(draft.account_id || source?.accountId || '');
+  updateComposerReview();
 }
 
 
-// Open a raw IMAP message (fetched from a Drafts folder) in the composer so the
-// user can edit and resend it.  We remember the original {accountId, uid, folder}
-// so that, after a successful send, sendComposer() can auto-delete the original
-// IMAP draft from the Drafts folder (issue #61).
-function openComposerFromImap(msg) {
-  openComposer('new');
-  // Mark this composition as originating from an IMAP draft so sendComposer()
-  // cleans up the original on success.  openComposer('new') reset composeMode to
-  // 'new'; override it here after the reset.
-  state.composeMode = 'imap-draft';
-  state.composeImapDraft = (msg && msg.account_id && msg.uid != null)
-    ? { accountId: msg.account_id, uid: msg.uid, folder: msg.folder || 'INBOX' }
-    : null;
-  $('composer-to').value = msg.to_addr || '';
-  $('composer-cc').value = msg.cc_addr || '';
-  $('composer-subject').value = msg.subject || '';
-  // Prefer plain text; fall back to stripping HTML if only html_body is present.
-  $('composer-body').value = msg.text_body
-    || (msg.html_body ? msg.html_body.replace(/<[^>]+>/g, '') : '');
-  setBodyFormat(msg.html_body && !msg.text_body ? 'html' : 'text');
-  $('composer-title').textContent = 'Edit Draft';
-  toast('IMAP draft loaded — edit and send. The original draft will be removed after sending.', '');
+// A Drafts-folder message with no corresponding local Envelope draft cannot be
+// edited here safely: composing a copy and then deleting the original by
+// guessed folder+UID risks removing the wrong message and double-sending.
+// Fail closed with a clear review path instead — the CLI owns draft identity
+// (it can import/modify the server-side draft with exact provenance).
+function refuseRawImapDraftEdit(msg) {
+  const uidLabel = msg && msg.uid != null ? ` (UID ${msg.uid})` : '';
+  const account = msg?.account_username || msg?.account_id || '<account>';
+  $('reader').classList.remove('show');
+  toast(
+    `This server-side draft${uidLabel} has no local Envelope draft record, so it cannot be edited safely from the dashboard. ` +
+    `Review it with the CLI instead: envelope draft list --account ${account}`,
+    'error'
+  );
 }
 
 function prefixRe(subject) {
@@ -3133,21 +3270,23 @@ function prefixRe(subject) {
 }
 
 function closeComposer() {
+  $('composer-backdrop').classList.remove('show');
+  $('composer-backdrop').setAttribute('aria-hidden', 'true');
   $('composer').classList.remove('show');
+  $('composer').setAttribute('aria-hidden', 'true');
   state.composeMode = 'new';
   state.composeParent = null;
-  state.composeImapDraft = null;
+  state.composeDraft = null;
+  state.composerSending = false;
   state.pendingAttachments = [];
+  $('composer-attach').value = '';
 }
 
 async function sendComposer() {
-  const sendAccountId = state.composeMode === 'new'
-    ? state.currentAccount?.id
-    : state.composeMode === 'imap-draft'
-      ? (state.composeImapDraft?.accountId || state.currentAccount?.id)
-      : (state.composeParent?.account_id || state.currentAccount?.id);
+  const sendAccountId = $('composer-from').value;
   if (!sendAccountId) {
-    toast('No account selected', 'error');
+    $('composer-status').textContent = 'Select a sending account.';
+    $('composer-status').classList.add('is-error');
     return;
   }
   const to = $('composer-to').value.trim();
@@ -3156,15 +3295,42 @@ async function sendComposer() {
   const body = $('composer-body').value;
   const isHtml = state.bodyFormat === 'html';
 
-  if (!to || !subject) {
-    toast('Recipient and subject required', 'error');
+  if (!updateComposerReview()) {
+    $('composer-status').textContent = 'Check the recipient, subject, and sending account.';
+    $('composer-status').classList.add('is-error');
     return;
   }
 
-  $('composer-status').textContent = 'Sending…';
+  state.composerSending = true;
+  $('btn-composer-send').disabled = true;
+  $('btn-composer-send').textContent = 'Queueing…';
+  $('composer-status').classList.remove('is-error');
+  $('composer-status').textContent = 'Queueing through Envelope…';
 
   try {
-    if (state.composeMode === 'reply' || state.composeMode === 'reply-all') {
+    if (state.composeMode === 'draft' && state.composeDraft) {
+      // Edit and queue the SAME local draft, revision-bound end to end: the
+      // edit carries the revision the human viewed; the send carries the new
+      // revision returned by the edit. A 409 means the draft changed under
+      // us — surface it, never overwrite or fall back to a copy.
+      if (state.pendingAttachments.length) {
+        throw new Error('Attachments cannot be added while editing an existing draft here; use `envelope draft modify --attach` instead.');
+      }
+      const d = state.composeDraft;
+      const edited = await api('POST', `/accounts/${d.accountId}/drafts/${d.draftId}/edit`, {
+        expected_revision: d.expectedRevision,
+        to_addr: to,
+        cc_addr: cc || null,
+        subject,
+        text_content: isHtml ? null : body,
+        html_content: isHtml ? body : null,
+      });
+      await api('POST', `/accounts/${d.accountId}/drafts/${d.draftId}/send`, {
+        confirm: true,
+        expected_revision: edited.draft.revision,
+      });
+      toast('Draft queued for send', 'success');
+    } else if (state.composeMode === 'reply' || state.composeMode === 'reply-all') {
       await api('POST', `/accounts/${sendAccountId}/compose/reply`, {
         parent_uid: state.composeParent.uid,
         parent_folder: state.composeParent?.folder || state.currentFolder,
@@ -3173,7 +3339,7 @@ async function sendComposer() {
         html: isHtml ? body : null,
         attachments: state.pendingAttachments,
       });
-      toast('Reply sent', 'success');
+      toast('Reply queued for send', 'success');
     } else {
       await api('POST', `/accounts/${sendAccountId}/compose`, {
         to,
@@ -3183,34 +3349,22 @@ async function sendComposer() {
         cc: cc || null,
         attachments: state.pendingAttachments,
       });
-      toast('Sent', 'success');
-      // Issue #61: a composition opened from an IMAP draft leaves the original
-      // message in the Drafts folder. The SMTP send fully succeeded above, so
-      // now remove the original draft. Only attempt when we know the source
-      // {accountId, uid, folder}; a delete failure must not look like a send
-      // failure, so it is reported separately and does not throw.
-      const origin = state.composeMode === 'imap-draft' ? state.composeImapDraft : null;
-      if (origin && origin.uid != null && origin.accountId) {
-        try {
-          await api(
-            'DELETE',
-            `/accounts/${origin.accountId}/messages/${origin.uid}?folder=${encodeURIComponent(origin.folder || 'INBOX')}`
-          );
-        } catch (delErr) {
-          toast('Sent, but the original draft could not be removed: ' + delErr.message, '');
-        }
-      }
+      toast('Message queued for send', 'success');
     }
     closeComposer();
   } catch (e) {
-    $('composer-status').textContent = '';
-    toast('Send failed: ' + e.message, 'error');
+    $('composer-status').textContent = 'Could not queue: ' + e.message;
+    $('composer-status').classList.add('is-error');
+    toast('Could not queue message: ' + e.message, 'error');
+  } finally {
+    state.composerSending = false;
+    $('btn-composer-send').textContent = 'Send';
+    if ($('composer').classList.contains('show')) updateComposerReview({ preserveStatus: true });
   }
 }
 
 async function handleAttachmentChange(e) {
   const files = Array.from(e.target.files || []);
-  const list = $('attach-list');
   for (const f of files) {
     const buf = await f.arrayBuffer();
     const bytes = new Uint8Array(buf);
@@ -3223,9 +3377,11 @@ async function handleAttachmentChange(e) {
       filename: f.name,
       content_type: f.type || 'application/octet-stream',
       data_b64: btoa(binary),
+      size: f.size,
     });
-    list.appendChild(el('li', { text: `${f.name} (${formatSize(f.size)})` }));
   }
+  e.target.value = '';
+  renderComposerAttachments();
 }
 
 // ── Add account modal ──────────────────────────────────────────────
@@ -3396,6 +3552,18 @@ function wireEvents() {
   $('btn-composer-close').onclick = closeComposer;
   $('btn-composer-send').onclick = sendComposer;
   $('composer-attach').onchange = handleAttachmentChange;
+  $('composer-from').onchange = () => updateComposerReview();
+  $('composer-to').oninput = () => updateComposerReview();
+  $('composer-subject').oninput = () => updateComposerReview();
+  $('composer-body').onkeydown = (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      event.preventDefault();
+      sendComposer();
+    }
+  };
+  $('composer-backdrop').onclick = (event) => {
+    if (event.target === $('composer-backdrop') && !state.composerSending) closeComposer();
+  };
 
   $('format-text').onclick = () => setBodyFormat('text');
   $('format-html').onclick = () => setBodyFormat('html');

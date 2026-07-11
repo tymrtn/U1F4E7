@@ -53,6 +53,15 @@
   --env-warn-soft: #fdf0ec;
   --env-pending: #9a7b1a;
   --env-pending-soft: #fdf8e8;
+  --env-page: #f3f1ec;
+  --env-soft: #fbfaf8;
+  --env-rule-soft: #ebe8e1;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 html,
@@ -62,9 +71,25 @@ body {
 
 body {
   margin: 0;
-  background: var(--env-paper);
+  background: var(--env-page);
   color: var(--env-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--env-accent) 62%, white);
+  outline-offset: 2px;
 }

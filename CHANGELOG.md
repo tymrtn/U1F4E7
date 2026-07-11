@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-07-10 (release candidate)
+
+Coherent v2 release candidate: the four committed v2 waves plus the uncommitted
+v2 continuation and the outbound-send-safety work (task t_bb6f8ff1). Covers all
+changes since 0.12.5; interim versions 0.12.6–0.12.8 were internal bumps that
+never received changelog entries or tagged releases.
+
+### Added — v2 platform
+
+- **Agent identities and per-agent policy.** Named agent tokens, MCP agent
+  identity enforcement, per-agent send ceilings, and passphrase-encrypted
+  credential store; Linux keyring backend.
+- **Agent Cockpit.** Read-only dashboard aggregates for agent roster and
+  activity (`/api/agents`), scheduled sends with Governor verdicts
+  (`/api/scheduled`), and watch/event-route delivery health (`/api/watches`),
+  plus the SvelteKit cockpit page (approval queue, scheduled panel, watch
+  panel). Aggregate loads perform no live auth probes, IMAP mutations, or
+  sends.
+- **Webmail.** SvelteKit shell with unified/per-account mail list and reader,
+  SSE live updates, compose/reply/forward composer drawer with review
+  checklist, undo-window toast, bulk operations, and refresh-error freshness
+  surfacing (`unavailable` state instead of silently stale rows).
+- **Rules Control Plane write endpoints.** Dashboard rule create/update/
+  delete/enable/disable with `MatchExpr` validation and sieve-exportability
+  re-derivation, plus the rules management page.
+- **Durable event push.** Webhook event delivery with HMAC signing, retries,
+  dead-letter visibility, and a warning when a route is configured without a
+  signing secret.
+- **Webhook SSRF guard.** `events routes add`, rule `webhook=` actions, and
+  dashboard rule endpoints now reject non-public webhook URLs (loopback,
+  private, link-local, metadata ranges).
+- **Docs.** New `docs/quickstart.md`, `docs/webhooks.md`,
+  `docs/credential-backends.md`, `docs/install-linux.md`,
+  `docs/agent-fleet-shared-inbox.md`; README quickstart/install hardening and
+  full MCP tool listing.
+- **CI.** SvelteKit bundle drift check (committed `web/build` must match
+  sources) and `actionlint` job. New `contract_drift` test pins the exported
+  agent contract to `docs/schemas/envelope.agent_contract.v1.json`.
+
+### Fixed — outbound send safety (t_bb6f8ff1)
+
+- **UTC/RFC3339 scheduled-queue timestamps.** `send --at` parses through a
+  canonical UTC parser that rejects ambiguous/nonexistent DST local times;
+  all `send_after` values serialize with an explicit `Z` suffix, and dashboard
+  time surfaces (scheduled countdowns, snooze sweeps, cockpit) compare against
+  UTC instead of local wall-clock. A structural regression test forbids local
+  wall-clock reads in dashboard time surfaces.
+- **Revision-bound human approval.** Drafts carry a monotonic `revision`;
+  human approval is recorded as a durable attestation bound to the approved
+  revision, and any content/metadata/attachment edit strips the attestation
+  and bumps the revision. Dashboard edit/approve/send take
+  `expected_revision` and answer `409` (`DraftModifiedConcurrently`) on a
+  stale revision. Approved scheduled sends declare the `tyler_approved`
+  Governor attribute from the durable attestation.
+- **Sending/syncing owner leases.** Scheduled and immediate sends must first
+  win an atomic CAS claim (`sending` status plus an opaque operation token);
+  `mark_draft_sent` is token-gated, sweeps reload the claimed row before
+  sending, and Governor blocks release the claim instead of leaking it.
+  Draft sync/edit uses an equivalent `syncing` lease so concurrent editors
+  cannot interleave.
+- **`delivery_uncertain` anti-resend.** If local sent-state persistence fails
+  after SMTP acceptance, the draft parks in `delivery_uncertain` (with a
+  `sent_unrecorded` event outcome) instead of returning to a resendable
+  state; exit is explicit operator discard only.
+- **Exact Message-ID / provider-folder draft cleanup.** Post-send provider
+  draft deletion resolves the target by exact, unique Message-ID match in the
+  detected drafts folder (fail-closed on zero or multiple matches) and only
+  runs after sent state is durably recorded. Header fetches use
+  `BODY.PEEK[HEADER.FIELDS]`.
+- **Same-draft browser flow.** The dashboard composer reuses one local draft
+  per session (revision-bound edit → send); raw IMAP-only drafts refuse
+  in-browser editing instead of copy-and-delete duplication, and the old
+  delete-original-after-send path is gone.
+- **Governor invocation hardening.** Nonzero Governor exit status now fails
+  closed even if stdout parses as an allow verdict.
+- **Contract docs.** `docs/agent-contract.md` documents the send-claim
+  lifecycle, `syncing` lease semantics, sweep atomicity, `delivery_uncertain`,
+  and the revision-bound human-approval/409 contract.
+
 ## [0.12.5] — 2026-07-04
 
 ### Fixed

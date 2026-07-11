@@ -226,32 +226,93 @@
 </div>
 
 <!-- Compose / Reply drawer -->
-<aside id="composer" class="fixed inset-y-0 right-0 w-full md:w-[640px] bg-paper border-l border-rule shadow-xl z-50 hidden flex-col">
-  <header class="border-b border-rule px-5 py-3 flex items-center justify-between">
-    <p id="composer-title" class="text-sm font-semibold">New Message</p>
-    <div class="flex items-center gap-1">
-      <button id="btn-composer-send" type="button" class="btn-primary text-xs">Send</button>
-      <button id="btn-composer-close" type="button" class="btn-ghost text-xs">Close</button>
+<div id="composer-backdrop" class="composer-backdrop" aria-hidden="true">
+  <aside
+    id="composer"
+    class="composer-drawer"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="composer-title"
+    aria-hidden="true"
+  >
+    <header class="composer-header">
+      <div class="composer-heading">
+        <p class="section-label">Draft window</p>
+        <div class="composer-title-row">
+          <h2 id="composer-title">New message</h2>
+          <span id="composer-mode" class="composer-mode">New</span>
+        </div>
+        <p id="composer-account-context" class="composer-context">Choose an account before sending.</p>
+      </div>
+      <div class="composer-header-actions">
+        <button id="btn-composer-send" type="button" class="btn-primary text-xs">Send</button>
+        <button id="btn-composer-close" type="button" class="btn-ghost text-xs" aria-label="Close draft window">Close</button>
+      </div>
+    </header>
+
+    <div class="composer-scroll">
+      <section class="composer-card composer-addresses" aria-label="Message addressing">
+        <div class="composer-field-row">
+          <label for="composer-from">From</label>
+          <select id="composer-from" aria-describedby="composer-account-context"></select>
+        </div>
+        <div class="composer-field-row">
+          <label for="composer-to">To</label>
+          <input type="text" inputmode="email" id="composer-to" placeholder="recipient@example.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="composer-field-row">
+          <label for="composer-cc">Cc</label>
+          <input type="text" inputmode="email" id="composer-cc" placeholder="Optional" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="composer-field-row">
+          <label for="composer-subject">Subject</label>
+          <input type="text" id="composer-subject" placeholder="Subject">
+        </div>
+      </section>
+
+      <section class="composer-review" aria-label="Pre-send review">
+        <div class="composer-check">
+          <span>Recipient</span>
+          <strong id="composer-recipient-check">Required</strong>
+        </div>
+        <div class="composer-check">
+          <span>Subject</span>
+          <strong id="composer-subject-check">Required</strong>
+        </div>
+        <div class="composer-check">
+          <span>Delivery</span>
+          <strong id="composer-delivery-check">Review</strong>
+        </div>
+      </section>
+
+      <section class="composer-editor" aria-label="Message editor">
+        <div class="composer-editor-toolbar">
+          <div class="composer-format" role="group" aria-label="Message format">
+            <button id="format-text" type="button" class="is-active" aria-pressed="true">Text</button>
+            <button id="format-html" type="button" aria-pressed="false">HTML</button>
+          </div>
+          <label class="composer-attach-button" for="composer-attach">Add attachment</label>
+          <input type="file" id="composer-attach" multiple hidden>
+        </div>
+        <label class="sr-only" for="composer-body">Message</label>
+        <textarea id="composer-body" rows="16" placeholder="Write your message"></textarea>
+      </section>
+
+      <section class="composer-card composer-attachments" aria-labelledby="composer-attachments-label">
+        <div class="composer-attachments-head">
+          <p id="composer-attachments-label" class="section-label">Attachments</p>
+          <span id="composer-attachment-count">None</span>
+        </div>
+        <ul id="attach-list" aria-live="polite"></ul>
+        <p id="composer-attachments-empty" class="composer-empty-note">No files attached.</p>
+      </section>
     </div>
-  </header>
-  <div class="flex-1 overflow-auto p-5 space-y-3">
-    <input type="email" id="composer-to" placeholder="To" class="input-field">
-    <input type="email" id="composer-cc" placeholder="Cc (optional)" class="input-field">
-    <input type="text" id="composer-subject" placeholder="Subject" class="input-field">
-    <div class="flex items-center gap-2">
-      <span class="text-xs text-mid font-mono">Format:</span>
-      <button id="format-text" type="button" class="px-2 py-0.5 text-xs font-mono border border-ink bg-ink text-paper">Text</button>
-      <button id="format-html" type="button" class="px-2 py-0.5 text-xs font-mono border border-rule text-mid">HTML</button>
-    </div>
-    <textarea id="composer-body" rows="16" placeholder="Message" class="input-field font-mono text-xs leading-relaxed resize-none"></textarea>
-    <div>
-      <label for="composer-attach" class="text-xs font-mono text-mid">Attachments:</label>
-      <input type="file" id="composer-attach" multiple class="block text-xs mt-1">
-      <ul id="attach-list" class="mt-1 text-xs text-mid font-mono space-y-0.5"></ul>
-    </div>
-    <div id="composer-status" class="text-xs font-mono text-mid"></div>
-  </div>
-</aside>
+
+    <footer class="composer-footer">
+      <div id="composer-status" aria-live="polite">Ready for review.</div>
+    </footer>
+  </aside>
+</div>
 
 <!-- Add account modal -->
 <div id="add-account-modal" class="fixed inset-0 bg-ink/40 z-50 hidden items-center justify-center">

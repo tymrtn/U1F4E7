@@ -121,22 +121,32 @@ impl UnifiedInboxAccountResult {
         latest_message_date: Option<String>,
         indexed_at: Option<String>,
         freshness: &str,
+        last_error: Option<String>,
     ) -> Self {
-        let (ok, freshness, error) = match freshness {
-            "fresh" if message_count == 0 => (true, UnifiedAccountFreshness::Empty, None),
-            "fresh" => (true, UnifiedAccountFreshness::Fresh, None),
-            "stale" | "expired" => (true, UnifiedAccountFreshness::Stale, None),
-            "missing" => (
-                false,
-                UnifiedAccountFreshness::Unavailable,
-                Some("cache missing; refresh required".to_string()),
-            ),
-            "empty" => (true, UnifiedAccountFreshness::Empty, None),
-            _ => (
-                false,
-                UnifiedAccountFreshness::Unavailable,
-                Some("cache freshness unknown; refresh required".to_string()),
-            ),
+        let (ok, freshness, error) = if let Some(error) = last_error {
+            (false, UnifiedAccountFreshness::Unavailable, Some(error))
+        } else {
+            match freshness {
+                "fresh" if message_count == 0 => (true, UnifiedAccountFreshness::Empty, None),
+                "fresh" => (true, UnifiedAccountFreshness::Fresh, None),
+                "stale" | "expired" => (true, UnifiedAccountFreshness::Stale, None),
+                "unavailable" => (
+                    false,
+                    UnifiedAccountFreshness::Unavailable,
+                    Some("cache unavailable; refresh required".to_string()),
+                ),
+                "missing" => (
+                    false,
+                    UnifiedAccountFreshness::Unavailable,
+                    Some("cache missing; refresh required".to_string()),
+                ),
+                "empty" => (true, UnifiedAccountFreshness::Empty, None),
+                _ => (
+                    false,
+                    UnifiedAccountFreshness::Unavailable,
+                    Some("cache freshness unknown; refresh required".to_string()),
+                ),
+            }
         };
         Self {
             account_id: account.id.clone(),
@@ -269,11 +279,9 @@ pub async fn refresh_unified_inbox(
         let (client_arc, _creds) = match state.get_or_create_imap(&account.id).await {
             Ok(c) => c,
             Err(e) => {
-                refresh_failures.push(UnifiedInboxAccountResult::err(
-                    account,
-                    &folder,
-                    format!("IMAP: {e}"),
-                ));
+                let error = format!("IMAP: {e}");
+                persist_refresh_error(&state, &account.id, &folder, &error).await;
+                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
                 continue;
             }
         };
@@ -283,11 +291,9 @@ pub async fn refresh_unified_inbox(
                 Ok(info) => info.uid_validity.unwrap_or(0) as u64,
                 Err(e) => {
                     state.evict_imap(&account.id).await;
-                    refresh_failures.push(UnifiedInboxAccountResult::err(
-                        account,
-                        &folder,
-                        format!("EXAMINE {folder}: {e}"),
-                    ));
+                    let error = format!("EXAMINE {folder}: {e}");
+                    persist_refresh_error(&state, &account.id, &folder, &error).await;
+                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
                     continue;
                 }
             };
@@ -320,40 +326,27 @@ pub async fn refresh_unified_inbox(
                     db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
                 };
                 if let Err(e) = write_result {
-                    refresh_failures.push(UnifiedInboxAccountResult::err(
-                        account,
-                        &folder,
-                        format!("index {folder}: {e}"),
-                    ));
+                    let error = format!("index {folder}: {e}");
+                    persist_refresh_error(&state, &account.id, &folder, &error).await;
+                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
                 }
             }
             Err(e) => {
                 state.evict_imap(&account.id).await;
-                refresh_failures.push(UnifiedInboxAccountResult::err(
-                    account,
-                    &folder,
-                    format!("fetch {folder}: {e}"),
-                ));
+                let error = format!("fetch {folder}: {e}");
+                persist_refresh_error(&state, &account.id, &folder, &error).await;
+                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
             }
         }
     }
 
-    let (messages, mut account_results) =
+    let (mut messages, mut account_results) =
         match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit).await {
             Ok(indexed) => indexed,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
 
-    for failure in refresh_failures {
-        if let Some(account_result) = account_results
-            .iter_mut()
-            .find(|result| result.account_id == failure.account_id)
-        {
-            account_result.ok = false;
-            account_result.freshness = UnifiedAccountFreshness::Unavailable;
-            account_result.error = failure.error;
-        }
-    }
+    apply_refresh_failures(&mut messages, &mut account_results, refresh_failures);
 
     // Publish a metadata-level `new_mail` event per successfully-refreshed
     // account. The unified refresh path has no server-side "new since last"
@@ -380,6 +373,50 @@ pub async fn refresh_unified_inbox(
         account_results,
     ))
     .into_response()
+}
+
+/// Persist a per-account/folder refresh-error marker. Persistence failure must
+/// not be silent (it would let a stale phantom row survive), but it also must
+/// not abort the response: the caller has already recorded the failure
+/// in-memory and [`apply_refresh_failures`] fails closed regardless of whether
+/// this write lands. We surface the persistence error to the log; the SQLite
+/// error string carries no mailbox secrets.
+async fn persist_refresh_error(state: &AppState, account_id: &str, folder: &str, error: &str) {
+    let result = {
+        let db = state.db.lock().await;
+        db.record_message_index_error(account_id, folder, error)
+    };
+    if let Err(persist_err) = result {
+        tracing::warn!(
+            "unified refresh: failed to persist index error for account {account_id} folder {folder}: {persist_err}"
+        );
+    }
+}
+
+/// Fail closed for the current refresh response: drop every cached message
+/// belonging to an account whose in-memory refresh failed, and overwrite its
+/// account result with the failure result. This is independent of whether the
+/// SQLite error marker persisted — if the marker write was rejected while reads
+/// still work, the DB query would otherwise leak the account's stale rows.
+fn apply_refresh_failures(
+    messages: &mut Vec<UnifiedInboxMessage>,
+    account_results: &mut [UnifiedInboxAccountResult],
+    failures: Vec<UnifiedInboxAccountResult>,
+) {
+    let failed_account_ids: std::collections::HashSet<String> = failures
+        .iter()
+        .map(|failure| failure.account_id.clone())
+        .collect();
+    messages.retain(|message| !failed_account_ids.contains(&message.account_id));
+
+    for failure in failures {
+        if let Some(slot) = account_results
+            .iter_mut()
+            .find(|result| result.account_id == failure.account_id)
+        {
+            *slot = failure;
+        }
+    }
 }
 
 async fn load_indexed_unified_inbox(
@@ -438,6 +475,7 @@ async fn load_indexed_unified_inbox(
                 account_freshness
                     .map(|row| row.freshness.as_str())
                     .unwrap_or("missing"),
+                account_freshness.and_then(|row| row.last_error.clone()),
             )
         })
         .collect();
@@ -1024,6 +1062,54 @@ mod tests {
                 ("acct-b", 40),
             ]
         );
+    }
+
+    #[test]
+    fn apply_refresh_failures_fails_closed_even_without_persisted_marker() {
+        // Simulate a refresh whose DB error-marker write was rejected: the DB
+        // query still returns the failed account's stale phantom row and still
+        // reports it as ok/fresh. The in-memory failure must nonetheless drop
+        // the row from the response and mark the account unavailable.
+        let mut messages = vec![
+            unified("acct-ok", 10, Some("Tue, 12 May 2026 10:00:00 +0000"), 0),
+            unified(
+                "acct-failed",
+                20,
+                Some("Thu, 09 Jul 2026 08:42:00 +0000"),
+                1,
+            ),
+        ];
+        let mut account_results = vec![
+            account_result("acct-ok", true, None),
+            // Stale success: as if last_error never persisted.
+            account_result("acct-failed", true, None),
+        ];
+        let failures = vec![account_result(
+            "acct-failed",
+            false,
+            Some("IMAP: auth failed"),
+        )];
+
+        apply_refresh_failures(&mut messages, &mut account_results, failures);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].account_id, "acct-ok");
+        assert!(messages.iter().all(|m| m.account_id != "acct-failed"));
+
+        let failed = account_results
+            .iter()
+            .find(|result| result.account_id == "acct-failed")
+            .expect("failed account result");
+        assert!(!failed.ok);
+        assert_eq!(failed.freshness, UnifiedAccountFreshness::Unavailable);
+        assert_eq!(failed.message_count, 0);
+        assert_eq!(failed.error.as_deref(), Some("IMAP: auth failed"));
+
+        let healthy = account_results
+            .iter()
+            .find(|result| result.account_id == "acct-ok")
+            .expect("healthy account result");
+        assert!(healthy.ok);
     }
 
     #[tokio::test]

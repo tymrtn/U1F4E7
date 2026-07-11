@@ -44,6 +44,11 @@ fn draft_dashboard_url(headers: &HeaderMap, account_id: &str, draft_id: &str) ->
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftEditRequest {
+    /// The [`Draft::revision`] the client was viewing when it composed this
+    /// edit. Required: the server never re-reads-and-blesses the latest row —
+    /// a concurrent change returns 409 instead of overwriting content the
+    /// human never saw.
+    pub expected_revision: i64,
     pub to_addr: Option<String>,
     pub cc_addr: Option<String>,
     pub bcc_addr: Option<String>,
@@ -60,9 +65,21 @@ pub struct DraftBlockRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DraftApproveRequest {
+    /// The [`Draft::revision`] the human reviewed. Required — approval is
+    /// bound to the viewed revision; a concurrent edit returns 409.
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DraftSendRequest {
     #[serde(default)]
     pub confirm: bool,
+    /// The [`Draft::revision`] the human reviewed before clicking send.
+    /// Required — the approval attestation is bound to this exact revision;
+    /// a concurrent edit returns 409 and nothing is queued.
+    pub expected_revision: i64,
     /// Optional override for the outbox cooldown (seconds). Omitted → the shared
     /// default cooldown. Negative values clamp to zero. There is intentionally no
     /// immediate-SMTP dashboard bypass: the queued draft is transmitted later by
@@ -186,13 +203,24 @@ fn resolve_account(db: &Database, account_id: &str) -> Result<Option<Account>, S
 pub async fn approve(
     State(state): State<AppState>,
     Path((account_id, draft_id)): Path<(String, String)>,
+    Json(req): Json<DraftApproveRequest>,
 ) -> impl IntoResponse {
     let db = state.db.lock().await;
-    match ensure_draft_account(&db, &account_id, &draft_id)
-        .and_then(|_| db.update_draft_status(&draft_id, DraftStatus::Draft))
-        .and_then(|_| db.get_draft(&draft_id))
-    {
-        Ok(Some(draft)) => {
+    // The dashboard approve action is an explicit human decision: the status
+    // flip and the durable attestation land in one store transaction,
+    // compare-and-set against the revision the human VIEWED (carried on the
+    // request — never a server-side re-read of the latest row). A concurrent
+    // content edit rolls the whole approval back (409) — the edited draft
+    // never inherits `tyler_approved`.
+    match ensure_draft_account(&db, &account_id, &draft_id).and_then(|draft| {
+        db.approve_draft_revision(
+            &draft.id,
+            req.expected_revision,
+            "human:dashboard",
+            &crate::timefmt::utc_now_string(),
+        )
+    }) {
+        Ok(draft) => {
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftStatusChanged {
@@ -202,7 +230,6 @@ pub async fn approve(
                 });
             Json(json!({ "draft": draft, "status": "approved" })).into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "draft not found").into_response(),
         Err(e) => draft_error(e),
     }
 }
@@ -214,8 +241,9 @@ pub async fn edit(
 ) -> impl IntoResponse {
     let db = state.db.lock().await;
     match ensure_draft_account(&db, &account_id, &draft_id).and_then(|draft| {
-        db.update_draft_content(
+        db.update_draft_content_for_revision(
             &draft.id,
+            req.expected_revision,
             req.to_addr.as_deref(),
             req.cc_addr.as_deref().or(draft.cc_addr.as_deref()),
             req.bcc_addr.as_deref().or(draft.bcc_addr.as_deref()),
@@ -298,31 +326,31 @@ pub async fn block(
 /// never marked sent here (that would drop it from the sweep and could strand it
 /// unsent) and never discarded.
 ///
+/// Promotion, `send_after`, and the human-approval attestation are one atomic
+/// store transaction (`queue_draft_with_human_approval`), compare-and-set
+/// against `expected_revision` — the revision the human VIEWED, carried on the
+/// request rather than re-read server-side. A concurrent content edit rolls
+/// everything back: no partially queued, unapproved state, and the edited
+/// content never inherits `tyler_approved` (an input attribute for Governor's
+/// blind scoring, never a gate bypass).
+///
 /// Returns the resolved `send_after` timestamp.
 fn queue_draft_for_outbox(
     db: &Database,
-    draft: &envelope_email_store::Draft,
+    draft_id: &str,
+    expected_revision: i64,
     cooldown_seconds: i64,
 ) -> envelope_email_store::errors::Result<String> {
-    // `list_drafts_due_for_send` only selects `status='draft'`; a
-    // pending-review draft approved by a human must be promoted so the sweep can
-    // pick it up. Do not silently override blocked/discarded/sent states: those
-    // represent explicit operator decisions or terminal states.
-    match draft.status {
-        DraftStatus::Draft => {}
-        DraftStatus::PendingReview => {
-            db.update_draft_status(&draft.id, DraftStatus::Draft)?;
-        }
-        DraftStatus::Blocked | DraftStatus::Discarded | DraftStatus::Sent => {
-            return Err(envelope_email_store::StoreError::DraftNotEditable(
-                draft.status.as_str().to_string(),
-            ));
-        }
-    }
     let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_seconds))
-        .format("%Y-%m-%dT%H:%M:%S")
+        .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    db.update_draft_send_after(&draft.id, &send_at)?;
+    db.queue_draft_with_human_approval(
+        draft_id,
+        expected_revision,
+        &send_at,
+        "human:dashboard",
+        &crate::timefmt::utc_now_string(),
+    )?;
     Ok(send_at)
 }
 
@@ -355,7 +383,7 @@ pub async fn send(
     // aligned with CLI/MCP/scheduled outbound semantics; there is no immediate
     // dashboard SMTP bypass.
     let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
-    match queue_draft_for_outbox(&db, &draft, cooldown) {
+    match queue_draft_for_outbox(&db, &draft.id, req.expected_revision, cooldown) {
         Ok(send_after) => {
             state
                 .events
@@ -405,6 +433,9 @@ fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response 
             (StatusCode::NOT_FOUND, format!("{e}")).into_response()
         }
         envelope_email_store::StoreError::DraftNotEditable(_) => {
+            (StatusCode::CONFLICT, format!("{e}")).into_response()
+        }
+        envelope_email_store::StoreError::DraftModifiedConcurrently(_) => {
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
@@ -505,7 +536,7 @@ mod tests {
         .unwrap();
         let draft = db.get_draft(&draft.id).unwrap().unwrap();
 
-        let send_at = super::queue_draft_for_outbox(&db, &draft, 120).unwrap();
+        let send_at = super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
 
         let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
         // Queued, not sent: sweep-eligible status and a future send_after, with no
@@ -584,10 +615,105 @@ mod tests {
             .unwrap();
         let draft = db.get_draft(&draft.id).unwrap().unwrap();
 
-        super::queue_draft_for_outbox(&db, &draft, 0).unwrap();
+        super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 0).unwrap();
         let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(reloaded.status, DraftStatus::Draft);
         assert!(reloaded.sent_at.is_none());
+    }
+
+    /// The dashboard queue/send action is an explicit human decision: it must
+    /// durably record the sanitized approval attestation so the scheduled
+    /// sweep re-scores with `tyler_approved`. Agent-created state alone (the
+    /// draft was created_by=agent) must not derive as approved before the
+    /// human action.
+    #[test]
+    fn dashboard_send_records_durable_human_approval_attestation() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            !draft.human_approved(),
+            "agent-created state alone must not self-approve"
+        );
+
+        super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(reloaded.human_approved());
+        let attestation = &reloaded.metadata.as_ref().unwrap()["human_approval"];
+        assert_eq!(attestation["approved_by"], "human:dashboard");
+        let approved_at = attestation["approved_at"].as_str().unwrap();
+        assert!(
+            approved_at.ends_with('Z'),
+            "attestation timestamp is canonical RFC 3339 UTC, got {approved_at}"
+        );
+        // Sanitized: no recipient address anywhere in the attestation.
+        assert!(!attestation.to_string().contains("buyer@example.com"));
+        // Canonical UTC queue timestamp.
+        assert!(reloaded.send_after.unwrap().ends_with('Z'));
+    }
+
+    /// Handler-boundary regression for revision binding: an edit through the
+    /// dashboard edit primitive after a human queue/approval must invalidate
+    /// the attestation, so the changed content cannot ride the earlier
+    /// `tyler_approved`. A fresh human send re-stamps the new revision.
+    #[test]
+    fn edit_after_dashboard_send_invalidates_the_approval() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+
+        super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+        assert!(db.get_draft(&draft.id).unwrap().unwrap().human_approved());
+
+        // The same store call the dashboard edit handler makes.
+        db.update_draft_content(
+            &draft.id,
+            Some("someone-else@example.net"),
+            None,
+            None,
+            None,
+            Some("changed body"),
+            None,
+        )
+        .unwrap();
+        let edited = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            !edited.human_approved(),
+            "post-approval edit must clear the human-approval attestation"
+        );
+
+        // Re-queueing (a fresh human send) approves the new revision.
+        super::queue_draft_for_outbox(&db, &edited.id, edited.revision, 120).unwrap();
+        assert!(db.get_draft(&draft.id).unwrap().unwrap().human_approved());
     }
 
     /// Queueing must not override explicit blocked/discarded terminal operator
@@ -614,7 +740,7 @@ mod tests {
         db.update_draft_status(&draft.id, DraftStatus::Blocked)
             .unwrap();
         let blocked = db.get_draft(&draft.id).unwrap().unwrap();
-        assert!(super::queue_draft_for_outbox(&db, &blocked, 0).is_err());
+        assert!(super::queue_draft_for_outbox(&db, &blocked.id, blocked.revision, 0).is_err());
         assert_eq!(
             db.get_draft(&draft.id).unwrap().unwrap().status,
             DraftStatus::Blocked
@@ -623,7 +749,7 @@ mod tests {
         db.update_draft_status(&draft.id, DraftStatus::Discarded)
             .unwrap();
         let discarded = db.get_draft(&draft.id).unwrap().unwrap();
-        assert!(super::queue_draft_for_outbox(&db, &discarded, 0).is_err());
+        assert!(super::queue_draft_for_outbox(&db, &discarded.id, discarded.revision, 0).is_err());
         assert_eq!(
             db.get_draft(&draft.id).unwrap().unwrap().status,
             DraftStatus::Discarded

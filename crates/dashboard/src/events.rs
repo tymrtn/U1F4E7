@@ -75,7 +75,9 @@ pub enum DashboardEvent {
     SendStatus {
         account_id: String,
         draft_id: String,
-        /// `"sent"`, `"blocked"`, `"deferred"`, or `"failed"`.
+        /// `"sent"`, `"sent_unrecorded"` (SMTP accepted but local sent-state
+        /// persistence failed — not durable success), `"blocked"`,
+        /// `"deferred"`, or `"failed"`.
         outcome: &'static str,
         /// Governor decision (`"allow"`/`"review"`/`"deny"`/…) when the gate ran.
         governor_decision: Option<String>,

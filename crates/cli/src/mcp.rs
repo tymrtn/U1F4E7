@@ -509,7 +509,7 @@ async fn handle_send(
                     .map_err(|e| e.to_string())?;
             }
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
-                .format("%Y-%m-%dT%H:%M:%S")
+                .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .map_err(|e| e.to_string())?;
@@ -904,7 +904,7 @@ async fn handle_reply(
             )
             .map_err(|e| e.to_string())?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
-                .format("%Y-%m-%dT%H:%M:%S")
+                .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .map_err(|e| e.to_string())?;
@@ -1253,7 +1253,7 @@ async fn handle_send_draft(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("draft not found: {id}"))?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
-                .format("%Y-%m-%dT%H:%M:%S")
+                .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .map_err(|e| e.to_string())?;

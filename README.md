@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.12.5-green.svg" alt="v0.12.5">
+  <img src="https://img.shields.io/badge/version-0.13.0-green.svg" alt="v0.13.0">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -36,21 +36,35 @@ envelope inbox --json
 ## Install
 
 ```bash
-# Homebrew
+# Homebrew (macOS) — installs the binary named `envelope`
 brew install tymrtn/u1f4e7/u1f4e7
 
-# From source
+# From source (Linux or macOS)
+# 1. Install Rust if not already present:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && source "$HOME/.cargo/env"
+
+# 2. Clone and build:
 git clone https://github.com/tymrtn/U1F4E7
 cd U1F4E7
 cargo build --release
 # binary: target/release/envelope
+
+# 3. Install the binary somewhere on PATH:
+cp target/release/envelope ~/.local/bin/envelope
 ```
 
 ## Quick start
 
+> **Provider prerequisite:** Gmail, Fastmail, iCloud, and Outlook all require an *app password* — not your login password — before adding an account. Generate one in your provider's security settings first. If you skip this and get an auth error, run `envelope quickstart` and check the `remediation` field for provider-specific URLs.
+
 ```bash
-# Add an account — Envelope auto-discovers IMAP/SMTP from the email domain
+# Add an account — Envelope auto-discovers IMAP/SMTP from the email domain.
+# --password is optional; omit it and Envelope prompts interactively.
+# Non-interactive contexts (CI, scripts) must pass --password explicitly.
 envelope accounts add --email you@gmail.com --password <app-password>
+
+# Verify setup end-to-end (paths → account → IMAP auth → inbox peek)
+envelope quickstart
 
 # See folders with unread counts
 envelope folders
@@ -240,9 +254,11 @@ envelope mcp --config
 # }
 ```
 
-11 tools: `inbox`, `read`, `search`, `send`, `reply`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`. Envelope is the only MCP email server that works against any IMAP provider.
+22 tools: `inbox`, `read`, `search`, `send`, `reply`, `create_reply_draft`, `create_forward_draft`, `modify_draft`, `get_draft`, `send_draft`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`, `bulk`, `thread`, `rules_preview`, `rules_run`, `watch_status`, `snooze`. Envelope is the only MCP email server that works against any IMAP provider.
 
 For a single, distribution-ready operating guide to hand a fresh agent, see [the Envelope agent skill](docs/agents/envelope-skill.md).
+
+For a walkthrough of running multiple agents from one shared inbox with scoped policies, see [Agents at a glance](docs/agent-fleet-shared-inbox.md).
 
 ## Rules engine
 

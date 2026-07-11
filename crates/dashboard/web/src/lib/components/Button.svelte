@@ -8,19 +8,21 @@
   let {
     variant = 'primary',
     type = 'button',
+    form,
     disabled = false,
     onclick,
     children
   }: {
     variant?: Variant;
     type?: 'button' | 'submit' | 'reset';
+    form?: string;
     disabled?: boolean;
     onclick?: (e: MouseEvent) => void;
     children: Snippet;
   } = $props();
 </script>
 
-<button class="env-btn env-btn-{variant}" {type} {disabled} {onclick}>
+<button class="env-btn env-btn-{variant}" {type} {form} {disabled} {onclick}>
   {@render children()}
 </button>
 

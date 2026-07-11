@@ -11,7 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use envelope_email_store::{Database, Message, MessageSummary, Rule};
-use envelope_email_transport::rules::{self, Action, MessageContext};
+use envelope_email_transport::rules::{self, Action, MatchExpr, MessageContext};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
@@ -468,6 +468,307 @@ pub async fn run_enabled(
     .into_response()
 }
 
+// ── Write endpoints ────────────────────────────────────────────────────────
+
+/// Shared body for create and update — carries the rule definition fields.
+///
+/// `match_expr` must be valid JSON that deserialises into a `MatchExpr`.
+/// `action` must be valid JSON that deserialises into an `Action`. Both are
+/// validated server-side before the store write so malformed JSON is rejected
+/// with 400 rather than persisted as dead weight.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleWriteRequest {
+    pub name: String,
+    pub match_expr: serde_json::Value,
+    pub action: serde_json::Value,
+    #[serde(default = "default_priority")]
+    pub priority: i64,
+    #[serde(default)]
+    pub stop: bool,
+    /// Only respected during create. Enable/disable after creation uses the
+    /// dedicated endpoints so the intent is always explicit.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_priority() -> i64 {
+    100
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// A rejected write request, carrying an HTTP status, a stable machine-readable
+/// `code`, and a human-readable message. Rendered as a JSON body so clients can
+/// branch on `code` without string-matching the message.
+#[derive(Debug)]
+pub(crate) struct WriteError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl WriteError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        WriteError {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for WriteError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            Json(json!({ "code": self.code, "error": self.message })),
+        )
+            .into_response()
+    }
+}
+
+fn validate_write_request(req: &RuleWriteRequest) -> Result<(String, String), WriteError> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "name_required",
+            "name is required",
+        ));
+    }
+    if name.len() > 200 {
+        return Err(WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "name_too_long",
+            "name too long (max 200 chars)",
+        ));
+    }
+
+    // Validate match_expr round-trips through MatchExpr.
+    let match_expr_json = serde_json::to_string(&req.match_expr).map_err(|e| {
+        WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_match_expr",
+            format!("invalid match_expr JSON: {e}"),
+        )
+    })?;
+    if let Err(e) = serde_json::from_str::<MatchExpr>(&match_expr_json) {
+        return Err(WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_match_expr",
+            format!("invalid match expression: {e}"),
+        ));
+    }
+
+    // Validate action round-trips through Action.
+    let action_json = serde_json::to_string(&req.action).map_err(|e| {
+        WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_action",
+            format!("invalid action JSON: {e}"),
+        )
+    })?;
+    let action: Action = serde_json::from_str(&action_json).map_err(|e| {
+        WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_action",
+            format!("invalid action: {e}"),
+        )
+    })?;
+
+    // SSRF guard: a webhook action's URL must resolve to a public target.
+    // Rejects loopback, link-local (incl. cloud metadata), private (RFC 1918),
+    // documentation, and non-http(s) schemes before the rule is persisted.
+    if let Action::Webhook(url) = &action {
+        if let Err(e) = envelope_email_transport::url_guard::check_public_url(url) {
+            return Err(WriteError::new(
+                StatusCode::BAD_REQUEST,
+                "webhook_url_rejected",
+                e.to_string(),
+            ));
+        }
+    }
+
+    Ok((match_expr_json, action_json))
+}
+
+/// POST /api/accounts/{id}/rules — create a new rule.
+pub async fn create(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(req): Json<RuleWriteRequest>,
+) -> impl IntoResponse {
+    let (match_expr_json, action_json) = match validate_write_request(&req) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let db = state.db.lock().await;
+
+    // Duplicate-name guard (mirrors CLI behaviour).
+    match db.find_rule_by_name(&account_id, req.name.trim()) {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "a rule named '{}' already exists for this account",
+                    req.name.trim()
+                ),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+    }
+
+    match db.create_rule_with_enabled(
+        &account_id,
+        req.name.trim(),
+        &match_expr_json,
+        &action_json,
+        req.priority,
+        req.stop,
+        req.enabled,
+    ) {
+        Ok(rule) => Json(json!({ "rule": dashboard_rule_json(&rule) })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create rule: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/accounts/{id}/rules/{rule_id} — update an existing rule's definition.
+///
+/// Does not alter the `enabled` flag; use the enable/disable endpoints for
+/// that so the intent is explicit and auditable.
+pub async fn update(
+    State(state): State<AppState>,
+    Path((account_id, rule_id)): Path<(String, String)>,
+    Json(req): Json<RuleWriteRequest>,
+) -> impl IntoResponse {
+    let (match_expr_json, action_json) = match validate_write_request(&req) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let db = state.db.lock().await;
+
+    match db.update_rule(
+        &rule_id,
+        &account_id,
+        req.name.trim(),
+        &match_expr_json,
+        &action_json,
+        req.priority,
+        req.stop,
+    ) {
+        Ok(Some(rule)) => Json(json!({ "rule": dashboard_rule_json(&rule) })).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("update rule: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/accounts/{id}/rules/{rule_id} — delete a rule permanently.
+pub async fn destroy(
+    State(state): State<AppState>,
+    Path((account_id, rule_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+
+    // Scope-check: verify the rule belongs to this account before deleting.
+    match db.get_rule(&rule_id) {
+        Ok(Some(rule)) if rule.account_id != account_id => {
+            return (StatusCode::NOT_FOUND, "rule not found").into_response();
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    match db.delete_rule(&rule_id) {
+        Ok(true) => Json(json!({ "deleted": rule_id })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete rule: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/accounts/{id}/rules/{rule_id}/enable — enable a disabled rule.
+pub async fn enable(
+    State(state): State<AppState>,
+    Path((account_id, rule_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+
+    // Scope-check.
+    match db.get_rule(&rule_id) {
+        Ok(Some(rule)) if rule.account_id != account_id => {
+            return (StatusCode::NOT_FOUND, "rule not found").into_response();
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    match db.enable_rule(&rule_id) {
+        Ok(true) => Json(json!({ "enabled": true, "rule_id": rule_id })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("enable rule: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/accounts/{id}/rules/{rule_id}/disable — disable a rule without deleting it.
+pub async fn disable(
+    State(state): State<AppState>,
+    Path((account_id, rule_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+
+    // Scope-check.
+    match db.get_rule(&rule_id) {
+        Ok(Some(rule)) if rule.account_id != account_id => {
+            return (StatusCode::NOT_FOUND, "rule not found").into_response();
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    match db.disable_rule(&rule_id) {
+        Ok(true) => Json(json!({ "enabled": false, "rule_id": rule_id })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("disable rule: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn execute_action(
     client: &mut envelope_email_transport::ImapClient,
     action: &Action,
@@ -620,7 +921,8 @@ fn build_summary_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuleRunRequest, sanitized_action_json};
+    use super::{RuleRunRequest, RuleWriteRequest, sanitized_action_json, validate_write_request};
+    use axum::http::StatusCode;
 
     #[test]
     fn rule_run_request_requires_explicit_confirmation_by_default() {
@@ -656,5 +958,143 @@ mod tests {
             r#"{"move":"Junk"}"#
         );
         assert_eq!(sanitized_action_json(r#""delete""#), r#""delete""#);
+    }
+
+    #[test]
+    fn rule_write_request_rejects_empty_name() {
+        let req = RuleWriteRequest {
+            name: "  ".to_string(),
+            match_expr: serde_json::json!({ "from": "*@x.com" }),
+            action: serde_json::json!({ "move": "Archive" }),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let result = validate_write_request(&req);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("name"));
+    }
+
+    #[test]
+    fn rule_write_request_rejects_invalid_match_expr() {
+        let req = RuleWriteRequest {
+            name: "test".to_string(),
+            // "unknown_field" is not a valid MatchExpr variant.
+            match_expr: serde_json::json!({ "unknown_field": "value" }),
+            action: serde_json::json!({ "move": "Archive" }),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let result = validate_write_request(&req);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rule_write_request_rejects_invalid_action() {
+        let req = RuleWriteRequest {
+            name: "test".to_string(),
+            match_expr: serde_json::json!({ "from": "*@x.com" }),
+            // "explode" is not a valid Action variant.
+            action: serde_json::json!({ "explode": "everything" }),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let result = validate_write_request(&req);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rule_write_request_accepts_valid_from_move_rule() {
+        let req = RuleWriteRequest {
+            name: "GitHub noise".to_string(),
+            match_expr: serde_json::json!({ "from": "*@notifications.github.com" }),
+            action: serde_json::json!({ "move": "Archive" }),
+            priority: 50,
+            stop: true,
+            enabled: false,
+        };
+        let result = validate_write_request(&req);
+        assert!(result.is_ok());
+        let (match_json, action_json) = result.unwrap();
+        assert!(match_json.contains("notifications.github.com"));
+        assert!(action_json.contains("Archive"));
+    }
+
+    #[test]
+    fn rule_write_request_rejects_link_local_webhook() {
+        // Cloud instance-metadata SSRF target — create path must reject it.
+        let req = RuleWriteRequest {
+            name: "exfil".to_string(),
+            match_expr: serde_json::json!({ "from": "*@x.com" }),
+            action: serde_json::json!({ "webhook": "http://169.254.169.254/latest/meta-data/" }),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let err = validate_write_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "webhook_url_rejected");
+    }
+
+    #[test]
+    fn rule_write_request_rejects_private_webhook() {
+        // Same validate_write_request feeds both create and update, so this
+        // covers the update path too.
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://10.0.0.1/hook",
+            "http://localhost:8080/hook",
+            "http://[::1]/hook",
+        ] {
+            let req = RuleWriteRequest {
+                name: "exfil".to_string(),
+                match_expr: serde_json::json!({ "from": "*@x.com" }),
+                action: serde_json::json!({ "webhook": url }),
+                priority: 100,
+                stop: false,
+                enabled: true,
+            };
+            let err = validate_write_request(&req).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "url {url}");
+            assert_eq!(err.code, "webhook_url_rejected", "url {url}");
+        }
+    }
+
+    #[test]
+    fn rule_write_request_accepts_public_https_webhook() {
+        let req = RuleWriteRequest {
+            name: "notify".to_string(),
+            match_expr: serde_json::json!({ "from": "*@x.com" }),
+            action: serde_json::json!({ "webhook": "https://hooks.example.com/envelope" }),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let (_, action_json) = validate_write_request(&req).unwrap();
+        assert!(action_json.contains("hooks.example.com"));
+    }
+
+    #[test]
+    fn rule_write_request_accepts_delete_and_unsubscribe_actions() {
+        for action_json in [r#""delete""#, r#""unsubscribe""#] {
+            let req = RuleWriteRequest {
+                name: "test".to_string(),
+                match_expr: serde_json::json!({ "from": "*@x.com" }),
+                action: serde_json::from_str(action_json).unwrap(),
+                priority: 100,
+                stop: false,
+                enabled: true,
+            };
+            assert!(
+                validate_write_request(&req).is_ok(),
+                "action {action_json} should be valid"
+            );
+        }
     }
 }

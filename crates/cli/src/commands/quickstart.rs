@@ -427,23 +427,62 @@ fn classify_imap_error(
     err: envelope_email_transport::errors::ImapError,
 ) -> QuickstartPhase {
     let text = sanitize_error(err.to_string());
-    let code = match err {
-        envelope_email_transport::errors::ImapError::Auth(_) => "imap_auth_failed",
+    let (code, remediation) = match &err {
+        envelope_email_transport::errors::ImapError::Auth(_) => (
+            "imap_auth_failed",
+            auth_remediation_for_account_domain(None),
+        ),
         envelope_email_transport::errors::ImapError::Connection(_)
             if text.to_lowercase().contains("tls") =>
         {
-            "imap_tls_failed"
+            ("imap_tls_failed", vec![])
         }
         envelope_email_transport::errors::ImapError::Connection(_)
             if text.to_lowercase().contains("dns") =>
         {
-            "imap_dns_failed"
+            ("imap_dns_failed", vec![])
         }
-        envelope_email_transport::errors::ImapError::Connection(_) => "imap_dns_failed",
+        envelope_email_transport::errors::ImapError::Connection(_) => ("imap_dns_failed", vec![]),
         envelope_email_transport::errors::ImapError::Protocol(_)
-        | envelope_email_transport::errors::ImapError::NotFound(_) => "inbox_peek_failed",
+        | envelope_email_transport::errors::ImapError::NotFound(_) => ("inbox_peek_failed", vec![]),
     };
-    error_phase(name, started, code, text, vec![])
+    error_phase(name, started, code, text, remediation)
+}
+
+/// Return static app-password guidance keyed off a known provider domain.
+/// `domain` is the host portion of the account email (e.g. "gmail.com").
+/// When None or unrecognized, returns generic guidance.
+pub fn auth_remediation_for_account_domain(domain: Option<&str>) -> Vec<String> {
+    match domain.unwrap_or("").to_lowercase().as_str() {
+        d if d == "gmail.com" || d.ends_with("@gmail.com") => vec![
+            "Gmail requires an app password, not your Google account password.".to_string(),
+            "1. Enable 2-Step Verification: https://myaccount.google.com/security".to_string(),
+            "2. Create an app password: https://myaccount.google.com/apppasswords".to_string(),
+            "3. Re-run: envelope accounts add --email you@gmail.com --password <app-password>".to_string(),
+        ],
+        d if d == "fastmail.com" || d.ends_with(".fastmail.com") => vec![
+            "Fastmail requires an app password, not your Fastmail login password.".to_string(),
+            "Create one at: https://app.fastmail.com/settings/security/devicekeys".to_string(),
+            "Re-run: envelope accounts add --email you@fastmail.com --password <app-password>".to_string(),
+        ],
+        d if d == "icloud.com" || d == "me.com" || d == "mac.com" => vec![
+            "iCloud Mail requires an app-specific password, not your Apple ID password.".to_string(),
+            "Create one at: https://appleid.apple.com (Sign-In and Security → App-Specific Passwords).".to_string(),
+            "2FA must be enabled on your Apple ID first.".to_string(),
+            "Re-run: envelope accounts add --email you@icloud.com --password <app-specific-password>".to_string(),
+        ],
+        d if d == "outlook.com" || d == "hotmail.com" || d == "live.com" || d.ends_with(".outlook.com") => vec![
+            "Outlook/Hotmail requires an app password when 2FA is enabled.".to_string(),
+            "Create one at: https://account.microsoft.com/security (Advanced security → App passwords).".to_string(),
+            "Re-run: envelope accounts add --email you@outlook.com --password <app-password>".to_string(),
+        ],
+        _ => vec![
+            "Use an app password, not your email login password.".to_string(),
+            "Most providers (Gmail, Fastmail, iCloud, Outlook) require an app password when 2FA is enabled.".to_string(),
+            "Check your provider's security settings to generate an app password, then re-run:".to_string(),
+            "  envelope accounts add --email you@example.com --password <app-password>".to_string(),
+        ],
+    }
 }
 
 pub fn exit_code(report: &QuickstartReport) -> i32 {
@@ -675,6 +714,61 @@ mod tests {
             };
             assert_eq!(exit_code(&report), code);
         }
+    }
+
+    #[test]
+    fn auth_remediation_gmail_domain_present() {
+        let rem = auth_remediation_for_account_domain(Some("gmail.com"));
+        assert!(!rem.is_empty(), "gmail should produce remediation");
+        let joined = rem.join(" ");
+        assert!(
+            joined.contains("myaccount.google.com/apppasswords"),
+            "gmail remediation should include app passwords URL"
+        );
+    }
+
+    #[test]
+    fn auth_remediation_unknown_domain_generic() {
+        let rem = auth_remediation_for_account_domain(Some("example.com"));
+        assert!(
+            !rem.is_empty(),
+            "unknown domain should still produce generic guidance"
+        );
+        let joined = rem.join(" ");
+        assert!(
+            joined.contains("app password"),
+            "generic guidance should mention app password"
+        );
+    }
+
+    #[test]
+    fn auth_remediation_none_domain_generic() {
+        let rem = auth_remediation_for_account_domain(None);
+        assert!(
+            !rem.is_empty(),
+            "None domain should produce generic guidance"
+        );
+    }
+
+    #[test]
+    fn auth_remediation_fastmail() {
+        let rem = auth_remediation_for_account_domain(Some("fastmail.com"));
+        let joined = rem.join(" ");
+        assert!(joined.contains("fastmail.com/settings/security"));
+    }
+
+    #[test]
+    fn auth_remediation_icloud() {
+        let rem = auth_remediation_for_account_domain(Some("icloud.com"));
+        let joined = rem.join(" ");
+        assert!(joined.contains("appleid.apple.com"));
+    }
+
+    #[test]
+    fn auth_remediation_outlook() {
+        let rem = auth_remediation_for_account_domain(Some("outlook.com"));
+        let joined = rem.join(" ");
+        assert!(joined.contains("account.microsoft.com"));
     }
 
     #[test]

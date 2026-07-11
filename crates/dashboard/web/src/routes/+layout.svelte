@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { base } from '$app/paths';
+  import { page } from '$app/state';
   import type { Snippet } from 'svelte';
 
   let { children }: { children: Snippet } = $props();
@@ -30,11 +31,12 @@
         </svg>
       </span>
       <span class="brand-name">Envelope</span>
-      <span class="brand-tag">v2</span>
+      <span class="brand-tag">v0.13.0</span>
     </a>
-    <nav class="app-nav">
-      <a href="{base}/mail/unified">Mail</a>
-      <a href="{base}/kitchen-sink">Kitchen sink</a>
+    <nav class="app-nav" aria-label="Primary navigation">
+      <a class:is-active={page.url.pathname.startsWith(`${base}/mail`)} href="{base}/mail/unified">Mail</a>
+      <a class:is-active={page.url.pathname.startsWith(`${base}/cockpit`)} href="{base}/cockpit">Cockpit</a>
+      <a class:is-active={page.url.pathname.startsWith(`${base}/rules`)} href="{base}/rules">Rules</a>
     </nav>
   </header>
 
@@ -54,10 +56,10 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    height: 56px;
-    padding: 0 1rem;
+    height: 68px;
+    padding: 0 1.125rem;
     border-bottom: 1px solid var(--env-rule);
-    background: var(--env-paper);
+    background: #fbfaf8;
     flex-shrink: 0;
   }
   .brand {
@@ -71,14 +73,14 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 32px;
+    height: 32px;
     border: 2px solid var(--env-ink);
   }
   .brand-name {
     font-weight: 600;
     font-size: 1.05rem;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
   }
   .brand-tag {
     font-family: var(--font-mono);
@@ -89,19 +91,52 @@
   }
   .app-nav {
     display: inline-flex;
-    gap: 1rem;
+    gap: 0.35rem;
   }
   .app-nav a {
+    min-height: 2rem;
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid transparent;
+    padding: 0 0.75rem;
     font-size: 0.8125rem;
     color: var(--env-muted);
     text-decoration: none;
   }
   .app-nav a:hover {
     color: var(--env-accent);
+    border-color: var(--env-rule);
+    background: var(--env-surface);
+  }
+  .app-nav a.is-active {
+    border-color: var(--env-ink);
+    background: var(--env-ink);
+    color: var(--env-surface);
   }
   .app-main {
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+  @media (max-width: 640px) {
+    .app-shell {
+      height: auto;
+      min-height: 100vh;
+    }
+    .app-header {
+      height: auto;
+      min-height: 68px;
+      align-items: stretch;
+      flex-direction: column;
+      gap: 0.625rem;
+      padding: 0.75rem;
+    }
+    .app-nav {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .app-nav a {
+      justify-content: center;
+    }
   }
 </style>

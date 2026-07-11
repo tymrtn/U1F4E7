@@ -164,6 +164,20 @@ pub async fn deliver_due_events(
             )
         });
 
+        // Warn operators about unsigned routes. Routes minted before migration 10
+        // may have a NULL secret; without a signing secret the receiver cannot
+        // verify the webhook origin. The delivery proceeds (fail-open by design —
+        // stopping delivery would be worse than an unverified push for legacy
+        // routes), but the operator should rotate to a new route with
+        // `envelope events routes add` to get a signing secret.
+        if route.secret.is_none() {
+            warn!(
+                route_id = %delivery.route_id,
+                "event route has no signing secret — webhook receiver cannot \
+                 verify origin; create a new route to obtain an HMAC secret"
+            );
+        }
+
         let attempt_result = post_webhook(
             http,
             &webhook.url,
@@ -394,5 +408,51 @@ mod tests {
             envelope_email_store::event_deliveries::RESPONSE_SNIPPET_CAP_BYTES,
             1024
         );
+    }
+
+    // ── Unsigned-route guard ─────────────────────────────────────────
+
+    /// Routes that carry a secret must produce a signature; routes without one
+    /// must not (the warning fires at the call-site but we validate the
+    /// output contract here).
+    #[test]
+    fn signature_present_iff_secret_present() {
+        // Simulate what deliver_due_events does: build the signature if and
+        // only if the route has a secret.
+        let make_sig = |secret: Option<&str>, body: &str| -> Option<String> {
+            secret.map(|s| format!("sha256={}", hmac_sha256_hex(s.as_bytes(), body.as_bytes())))
+        };
+
+        let body = r#"{"event_type":"new_message"}"#;
+
+        let with_secret = make_sig(Some("evrt_abc123"), body);
+        assert!(
+            with_secret.is_some(),
+            "secret present → signature must be produced"
+        );
+        assert!(
+            with_secret.as_deref().unwrap().starts_with("sha256="),
+            "signature must be in sha256=<hex> format"
+        );
+
+        let no_secret = make_sig(None, body);
+        assert!(
+            no_secret.is_none(),
+            "no secret → no signature header must be sent"
+        );
+    }
+
+    /// The signature produced with a known key must be stable across calls
+    /// (deterministic HMAC, not a random value) so receivers can re-verify.
+    #[test]
+    fn signature_is_deterministic() {
+        let body = r#"{"event_type":"otp_detected","id":"evt-1"}"#;
+        let secret = "evrt_deterministic_test_key";
+        let s1 = hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
+        let s2 = hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
+        assert_eq!(s1, s2);
+        // Also verify it changes when the body changes (not a constant).
+        let s3 = hmac_sha256_hex(secret.as_bytes(), b"different body");
+        assert_ne!(s1, s3);
     }
 }

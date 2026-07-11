@@ -20,6 +20,9 @@ pub enum StoreError {
     #[error("draft not editable (status: {0})")]
     DraftNotEditable(String),
 
+    #[error("draft modified concurrently, approval not recorded: {0}")]
+    DraftModifiedConcurrently(String),
+
     #[error("encryption error: {0}")]
     Encryption(String),
 

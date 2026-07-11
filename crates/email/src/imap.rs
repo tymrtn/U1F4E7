@@ -1073,11 +1073,13 @@ pub async fn fetch_message_headers_selected_uid_set(
         let uid = fetch
             .uid
             .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
-        let message_id = fetch.body().and_then(|body| {
-            mail_parser::MessageParser::default()
-                .parse(body)
-                .and_then(|m| m.message_id().map(|s| s.to_string()))
-        });
+        // `BODY.PEEK[HEADER.FIELDS (…)]` responses parse to
+        // `SectionPath::Full(MessageSection::Header)`, which async-imap
+        // surfaces via `Fetch::header()` — `Fetch::body()` only matches the
+        // section-less `BODY[]`/`RFC822` and returns None for these fetches.
+        let message_id = fetch
+            .header()
+            .and_then(parse_message_id_from_header_section);
         out.push(MessageHeader {
             uid,
             message_id,
@@ -1085,6 +1087,17 @@ pub async fn fetch_message_headers_selected_uid_set(
         });
     }
     Ok(out)
+}
+
+/// Parse the Message-ID from the raw bytes of a
+/// `BODY[HEADER.FIELDS (MESSAGE-ID)]` FETCH section (header lines terminated
+/// by an empty line). Returns the id as mail_parser normalizes it (angle
+/// brackets stripped), or `None` when the section carries no parseable
+/// Message-ID.
+pub fn parse_message_id_from_header_section(section: &[u8]) -> Option<String> {
+    mail_parser::MessageParser::default()
+        .parse(section)
+        .and_then(|m| m.message_id().map(str::to_string))
 }
 
 fn validate_uid_set(uid_set: &str) -> Result<(), ImapError> {
@@ -1123,6 +1136,89 @@ pub async fn find_uid_by_message_id(
 
     let uid = uid_set.into_iter().next();
     Ok(uid)
+}
+
+/// Find the single message whose Message-ID header equals `message_id`
+/// exactly, or `None` when identity cannot be established unambiguously.
+///
+/// [`find_uid_by_message_id`] is best-effort: IMAP `SEARCH HEADER` is a
+/// substring match and it returns an arbitrary first hit, so it must never be
+/// treated as identity verification for destructive actions. This primitive
+/// instead treats the search hits as *candidates*, fetches every candidate's
+/// actual Message-ID header (`BODY.PEEK`, no flag changes), normalizes both
+/// sides (whitespace, angle brackets), and requires exact equality. It returns
+/// `Ok(Some(uid))` only when **exactly one** candidate matches exactly; zero
+/// or multiple exact matches (duplicate Message-IDs) return `Ok(None)` so
+/// callers with destructive intent skip instead of acting on an ambiguous
+/// identity.
+pub async fn find_unique_uid_by_exact_message_id(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+) -> Result<Option<u32>, ImapError> {
+    validate_imap_input(folder)?;
+
+    client
+        .session
+        .select(folder)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
+
+    let search_query = message_id_search_query(message_id)?;
+    let uid_set = client
+        .session
+        .uid_search(&search_query)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {search_query}: {e}")))?;
+
+    let mut candidate_uids: Vec<u32> = uid_set.into_iter().collect();
+    if candidate_uids.is_empty() {
+        return Ok(None);
+    }
+    candidate_uids.sort_unstable();
+    let uid_set_arg = candidate_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let headers = fetch_message_headers_selected_uid_set(client, folder, &uid_set_arg).await?;
+    let candidates: Vec<(u32, Option<String>)> =
+        headers.into_iter().map(|h| (h.uid, h.message_id)).collect();
+    Ok(select_unique_exact_message_id(&candidates, message_id))
+}
+
+/// Pure candidate selection for [`find_unique_uid_by_exact_message_id`]:
+/// among `(uid, Message-ID header)` candidates produced by a substring-based
+/// search, return the UID whose Message-ID equals `wanted` exactly after
+/// normalization — and only when exactly one such candidate exists. Zero or
+/// multiple exact matches return `None` (fail closed on ambiguity).
+pub fn select_unique_exact_message_id(
+    candidates: &[(u32, Option<String>)],
+    wanted: &str,
+) -> Option<u32> {
+    let wanted = normalize_message_id(wanted)?;
+    let mut exact = candidates.iter().filter_map(|(uid, header)| {
+        let candidate = normalize_message_id(header.as_deref()?)?;
+        (candidate == wanted).then_some(*uid)
+    });
+    let unique = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    Some(unique)
+}
+
+/// Normalize a Message-ID for exact comparison: trim surrounding whitespace
+/// and strip the angle brackets. Returns `None` when nothing remains. No
+/// case folding — a case mismatch stays a mismatch (fail closed).
+pub fn normalize_message_id(raw: &str) -> Option<String> {
+    let bare = raw.trim().trim_matches(['<', '>']).trim();
+    if bare.is_empty() {
+        None
+    } else {
+        Some(bare.to_string())
+    }
 }
 
 /// Search the currently selected/examined mailbox for evidence collection.
@@ -1686,6 +1782,117 @@ mod tests {
     #[test]
     fn test_imap_mailbox_arg_quotes_workmail_junk_folder() {
         assert_eq!(imap_mailbox_arg("Junk E-mail"), "\"Junk E-mail\"");
+    }
+
+    // ── select_unique_exact_message_id (identity verification) ──────────
+    // IMAP `SEARCH HEADER` is substring-based, so its hits are only
+    // candidates; destructive callers need exact, unique verification.
+
+    #[test]
+    fn exact_message_id_match_excludes_substring_collisions() {
+        // Both candidates contain the wanted id as a substring (both would be
+        // SEARCH hits); only UID 7 is an exact match.
+        let candidates = vec![
+            (7, Some("<queued-1@martin.fm>".to_string())),
+            (9, Some("<zzz-queued-1@martin.fm.evil.example>".to_string())),
+            (11, Some("<queued-1@martin.fm.suffix>".to_string())),
+        ];
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "queued-1@martin.fm"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn ambiguous_exact_matches_return_none() {
+        // Duplicate Message-IDs (e.g. an appended copy): identity is
+        // ambiguous, so no UID may be returned for destructive use.
+        let candidates = vec![
+            (7, Some("<dup@martin.fm>".to_string())),
+            (9, Some("<dup@martin.fm>".to_string())),
+        ];
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "dup@martin.fm"),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_exact_matches_return_none() {
+        let candidates = vec![(7, Some("<other@martin.fm>".to_string())), (9, None)];
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "queued-1@martin.fm"),
+            None
+        );
+        assert_eq!(
+            select_unique_exact_message_id(&[], "queued-1@martin.fm"),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_match_normalizes_brackets_and_whitespace_on_both_sides() {
+        let candidates = vec![(7, Some("  <a@b.example>  ".to_string()))];
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "a@b.example"),
+            Some(7)
+        );
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "<a@b.example>"),
+            Some(7)
+        );
+        // Case differences are NOT folded away — fail closed.
+        assert_eq!(
+            select_unique_exact_message_id(&candidates, "A@B.EXAMPLE"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_or_bracket_only_wanted_id_matches_nothing() {
+        let candidates = vec![(7, Some("<a@b.example>".to_string()))];
+        assert_eq!(select_unique_exact_message_id(&candidates, ""), None);
+        assert_eq!(select_unique_exact_message_id(&candidates, "<>"), None);
+        assert_eq!(select_unique_exact_message_id(&candidates, "   "), None);
+    }
+
+    // ── parse_message_id_from_header_section (FETCH section boundary) ───
+    // Representative `BODY[HEADER.FIELDS (MESSAGE-ID)]` section payloads:
+    // header lines, CRLF-terminated, ending with an empty line.
+
+    #[test]
+    fn header_section_parses_message_id_from_representative_fetch_data() {
+        let section = b"Message-ID: <queued-1@martin.fm>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_from_header_section(section).as_deref(),
+            Some("queued-1@martin.fm")
+        );
+        // Case-insensitive header name, as servers commonly emit it.
+        let lower = b"Message-Id: <queued-2@martin.fm>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_from_header_section(lower).as_deref(),
+            Some("queued-2@martin.fm")
+        );
+    }
+
+    #[test]
+    fn header_section_parses_folded_message_id_header() {
+        // RFC 5322 folding: continuation line starts with whitespace.
+        let folded = b"Message-ID:\r\n <folded-3@martin.fm>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_from_header_section(folded).as_deref(),
+            Some("folded-3@martin.fm")
+        );
+    }
+
+    #[test]
+    fn header_section_without_message_id_yields_none() {
+        assert_eq!(
+            parse_message_id_from_header_section(b"Subject: hi\r\n\r\n"),
+            None
+        );
+        assert_eq!(parse_message_id_from_header_section(b"\r\n"), None);
+        assert_eq!(parse_message_id_from_header_section(b""), None);
     }
 
     #[test]

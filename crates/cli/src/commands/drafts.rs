@@ -17,7 +17,7 @@ use envelope_email_transport::{detect_drafts_folder, detect_sent_folder};
 use lettre::message::Mailboxes;
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::attachments::{attachment_summaries, decode_attachments, snapshot_attachments};
 use super::common::{resolve_account, setup_credentials};
@@ -800,28 +800,6 @@ async fn append_draft_best_effort(
     (true, folder, uid)
 }
 
-/// Delete a stale IMAP draft after a modify replaces it. Best-effort.
-async fn delete_draft_best_effort(db: &Database, creds: &AccountWithCredentials, uid: u32) {
-    if creds.account.imap_host.is_empty() {
-        return;
-    }
-    let mut client = match imap::connect(creds).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("IMAP connect failed while replacing draft (old UID {uid} left in place): {e}");
-            return;
-        }
-    };
-    let folder = detect_drafts_folder(&mut client, db, &creds.account.id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "Drafts".to_string());
-    if let Err(e) = imap::delete_message(&mut client, &folder, uid).await {
-        warn!("failed to delete replaced draft from IMAP {folder} (UID {uid}): {e}");
-    }
-}
-
 /// All the resolved fields needed to instantiate a contextual draft.
 ///
 /// Built once by [`run_reply`]/[`run_forward`] and consumed by
@@ -1145,6 +1123,14 @@ pub(crate) async fn modify_draft(
             draft.status.as_str()
         );
     }
+    // Bind the credential context to the draft's account before any local or
+    // provider mutation.
+    ensure_draft_account_binding(
+        &draft.id,
+        &draft.account_id,
+        &creds.account.id,
+        &creds.account.username,
+    )?;
 
     let meta = draft
         .metadata
@@ -1232,59 +1218,207 @@ pub(crate) async fn modify_draft(
         &attachments,
     )?;
 
-    // Replace the IMAP draft: append the new RFC822, delete the stale copy.
-    let old_uid = draft.imap_uid;
-    let (imap_synced, imap_folder, new_uid) =
-        append_draft_best_effort(db, creds, &rfc822, &message_id_hdr).await;
-    if imap_synced && new_uid != old_uid {
-        if let Some(stale) = old_uid {
-            delete_draft_best_effort(db, creds, stale).await;
-        }
-    }
+    // ── Exclusive sync lease BEFORE any mutation (local or provider) ──
+    // The `syncing` claim (owner-token lease) is acquired first: the send
+    // sweep cannot claim the row for the whole modify, no other actor can
+    // mutate it, no partially-updated draft is ever claimable, and a crash
+    // leaves the row inert as `syncing`.
+    let claim = db
+        .claim_draft_for_sync(id, draft.revision)
+        .context("failed to claim draft for modify")?;
+    let Some(claim) = claim else {
+        bail!(
+            "draft {id} was modified, claimed for sending, or changed state concurrently — \
+             re-check with `envelope draft show {id}` and retry"
+        );
+    };
 
-    db.update_draft_content(
+    // Everything below runs under the lease; on any failure release it back
+    // to the prior status so the draft is never stranded by a soft error.
+    let result = modify_claimed_draft(
+        db,
+        creds,
         id,
-        Some(&new_to),
+        &draft,
+        &claim.token,
+        &meta,
+        &new_to,
         new_cc.as_deref(),
         bcc.or(draft.bcc_addr.as_deref()),
-        Some(&new_subject),
-        Some(&assembled.text),
-        assembled.html.as_deref(),
+        &new_subject,
+        &assembled,
+        &agent_text,
+        agent_html.as_deref(),
+        &attachment_snapshots,
+        &rfc822,
+        &message_id_hdr,
     )
-    .context("failed to update draft content")?;
-    if let Some(uid) = new_uid {
-        let _ = db.update_draft_imap_uid(id, uid);
+    .await;
+    match db.release_syncing_draft(id, &claim.token, claim.prior_status.clone()) {
+        Ok(true) => {}
+        Ok(false) => warn!("draft {id}: sync lease release matched no owned `syncing` row"),
+        Err(e) => {
+            warn!("draft {id}: sync lease release failed: {e} — draft stays inert as `syncing`")
+        }
     }
-    db.update_draft_attachments(id, &attachment_snapshots)
-        .context("failed to update draft attachments")?;
-
-    // Update metadata: authored body + signature state + storage. Preserve
-    // source/context/preview/references unchanged.
-    let mut new_meta = meta.clone();
-    if let Some(obj) = new_meta.as_object_mut() {
-        obj.insert("agent_body_text".into(), serde_json::json!(agent_text));
-        obj.insert("agent_body_html".into(), serde_json::json!(agent_html));
-        obj.insert(
-            "signature_applied".into(),
-            serde_json::json!(assembled.signature_applied),
-        );
-        obj.insert(
-            "storage".into(),
-            serde_json::json!({
-                "imap_synced": imap_synced,
-                "imap_folder": if imap_synced { Some(imap_folder) } else { None },
-                "local_only": !imap_synced,
-            }),
-        );
-    }
-    db.set_draft_metadata(id, &new_meta)
-        .context("failed to update draft metadata")?;
+    result?;
 
     db.get_draft(id)
         .context("failed to reload draft")?
         .ok_or_else(|| anyhow::anyhow!("draft vanished after edit: {id}"))
 }
 
+/// The leased section of [`modify_draft`]: one atomic local edit, then the
+/// provider replace with the owner token rechecked before each side effect.
+#[allow(clippy::too_many_arguments)]
+async fn modify_claimed_draft(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    id: &str,
+    pre_edit: &Draft,
+    token: &str,
+    meta: &serde_json::Value,
+    new_to: &str,
+    new_cc: Option<&str>,
+    new_bcc: Option<&str>,
+    new_subject: &str,
+    assembled: &compose::AssembledBody,
+    agent_text: &str,
+    agent_html: Option<&str>,
+    attachment_snapshots: &[serde_json::Value],
+    rfc822: &[u8],
+    message_id_hdr: &str,
+) -> Result<()> {
+    // ── One atomic local edit under the lease ──
+    // Content + recipients + attachments + metadata land in a single UPDATE
+    // statement conditioned on the owner token: either the whole edit is
+    // visible or none of it, and only to us — the row stays `syncing`.
+    let mut edited_meta = meta.clone();
+    if let Some(obj) = edited_meta.as_object_mut() {
+        obj.insert("agent_body_text".into(), serde_json::json!(agent_text));
+        obj.insert("agent_body_html".into(), serde_json::json!(agent_html));
+        obj.insert(
+            "signature_applied".into(),
+            serde_json::json!(assembled.signature_applied),
+        );
+    }
+    db.apply_synced_draft_edit(
+        id,
+        token,
+        new_to,
+        new_cc,
+        new_bcc,
+        new_subject,
+        &assembled.text,
+        assembled.html.as_deref(),
+        attachment_snapshots,
+        &edited_meta,
+    )
+    .context("failed to apply draft edit")?;
+
+    if creds.account.imap_host.is_empty() {
+        db.finalize_synced_draft_bookkeeping(
+            id,
+            token,
+            None,
+            &serde_json::json!({
+                "imap_synced": false,
+                "imap_folder": null,
+                "local_only": true,
+            }),
+        )
+        .context("failed to record storage state")?;
+        return Ok(());
+    }
+
+    // ── Provider replace: delete old copy FIRST, exact + unique ──
+    // The replacement APPEND reuses the same Message-ID, so before-the-append
+    // is the only unambiguous window. If the old copy exists but cannot be
+    // confirmably removed (unresolvable identity, ambiguous match, or delete
+    // failure), the APPEND is SKIPPED — never a duplicate provider copy with
+    // the same Message-ID. The local edit stands; the stale provider copy is
+    // removed later by post-send exact cleanup, and storage metadata records
+    // the actionable state.
+    let provider_copy_expected = provider_copy_may_exist(pre_edit);
+    let mut old_copy_cleared = !provider_copy_expected;
+    if provider_copy_expected {
+        use envelope_email_transport::draft_cleanup::{
+            ProviderDraftCleanup, delete_provider_draft_exact, resolve_draft_cleanup_target,
+        };
+        // Recheck lease ownership immediately before the destructive delete.
+        if !db.holds_sync_claim(id, token).unwrap_or(false) {
+            bail!("draft {id}: sync lease lost before provider replace — aborting");
+        }
+        match resolve_draft_cleanup_target(db, pre_edit) {
+            Ok(target) => match imap::connect(creds).await {
+                Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
+                    Ok(ProviderDraftCleanup::Deleted { uid }) => {
+                        old_copy_cleared = true;
+                        info!(
+                            "draft {id}: removed stale provider copy (UID {uid} in {})",
+                            target.folder
+                        );
+                    }
+                    Ok(ProviderDraftCleanup::Skipped(reason)) => {
+                        warn!(
+                            "draft {id}: stale provider copy in {} not removed ({reason}) — \
+                             replacement APPEND skipped to avoid a duplicate Message-ID",
+                            target.folder
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "draft {id}: stale provider copy removal failed ({e}) — \
+                             replacement APPEND skipped to avoid a duplicate Message-ID"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "draft {id}: IMAP connect for provider re-sync failed ({e}) — \
+                         replacement APPEND skipped"
+                    );
+                }
+            },
+            Err(reason) => {
+                warn!(
+                    "draft {id}: stale provider copy identity unresolvable ({reason}) — \
+                     replacement APPEND skipped to avoid a duplicate Message-ID"
+                );
+            }
+        }
+    }
+
+    let (imap_synced, imap_folder, new_uid) = if old_copy_cleared {
+        // Recheck lease ownership immediately before the APPEND side effect.
+        if !db.holds_sync_claim(id, token).unwrap_or(false) {
+            bail!("draft {id}: sync lease lost before provider APPEND — aborting");
+        }
+        append_draft_best_effort(db, creds, rfc822, message_id_hdr).await
+    } else {
+        (false, String::new(), None)
+    };
+
+    let storage = if old_copy_cleared {
+        serde_json::json!({
+            "imap_synced": imap_synced,
+            "imap_folder": if imap_synced { Some(imap_folder.clone()) } else { None },
+            "local_only": !imap_synced,
+        })
+    } else {
+        serde_json::json!({
+            "imap_synced": false,
+            "imap_folder": null,
+            "local_only": true,
+            "sync_status_reason": "stale_provider_copy_not_replaced",
+        })
+    };
+    db.finalize_synced_draft_bookkeeping(id, token, new_uid, &storage)
+        .context("failed to record storage state")?;
+    Ok(())
+}
+
+/// Build and print (or pretty-print) the consistent contextual-draft envelope.
 /// Build and print (or pretty-print) the consistent contextual-draft envelope.
 fn emit_draft_envelope(draft: &Draft, json: bool) {
     if json {
@@ -1968,7 +2102,7 @@ pub async fn run_send(
                 .context("failed to get draft")?
                 .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
-                .format("%Y-%m-%dT%H:%M:%S")
+                .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             db.update_draft_send_after(&draft.id, &send_at)
                 .context("failed to set send_after on draft")?;
@@ -2048,6 +2182,95 @@ pub async fn run_send(
 /// contract payload and the discrete fields the human CLI output needs, so the
 /// silent send primitive can serve the CLI, MCP, and any other surface without
 /// printing to stdout (which would corrupt the MCP stdio transport).
+/// True when a provider draft copy may exist for this draft — from durable
+/// storage provenance OR a recorded UID, never UID alone: APPEND can succeed
+/// while the post-APPEND UID lookup returns `None`, leaving `imap_uid` NULL
+/// with a real copy on the server (`metadata.storage.imap_synced == true`).
+/// Only genuinely local-only drafts (`imap_synced` false/absent, no UID) may
+/// APPEND a fresh copy without clearing an old one first.
+fn provider_copy_may_exist(draft: &Draft) -> bool {
+    if draft.imap_uid.is_some() {
+        return true;
+    }
+    draft
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("storage"))
+        .and_then(|s| s.get("imap_synced"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Refuse any modify/send when the resolved credential context does not
+/// belong to the draft's account. Checked BEFORE any claim, local mutation,
+/// or provider/network side effect — a mismatched `--account` must never
+/// touch another account's mailbox with the wrong credentials.
+fn ensure_draft_account_binding(
+    draft_id: &str,
+    draft_account_id: &str,
+    creds_account_id: &str,
+    creds_username: &str,
+) -> Result<()> {
+    if draft_account_id != creds_account_id {
+        bail!(
+            "draft {draft_id} belongs to account {draft_account_id}, but the resolved \
+             credentials are for {creds_username} ({creds_account_id}) — refusing before \
+             any mailbox or network side effect. Drop --account or pass the draft's own account."
+        );
+    }
+    Ok(())
+}
+
+/// Releases an immediate-send `sending` claim back to `draft` on early exit
+/// (any pre-SMTP failure, including panics). Disarmed after SMTP acceptance —
+/// from that point the claim may only be left via `mark_draft_sent` or an
+/// explicit anti-duplicate park.
+struct SendClaimGuard<'a> {
+    db: &'a Database,
+    draft_id: String,
+    /// Opaque owner lease token from the claim; release requires it.
+    lease: String,
+    armed: bool,
+}
+
+impl<'a> SendClaimGuard<'a> {
+    fn new(db: &'a Database, draft_id: &str, lease: String) -> Self {
+        Self {
+            db,
+            draft_id: draft_id.to_string(),
+            lease,
+            armed: true,
+        }
+    }
+
+    /// SMTP was accepted: the claim must no longer be released to `draft`.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SendClaimGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            match self.db.release_sending_draft(
+                &self.draft_id,
+                &self.lease,
+                envelope_email_store::DraftStatus::Draft,
+            ) {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    "draft {}: send-claim release matched no `sending` row",
+                    self.draft_id
+                ),
+                Err(e) => warn!(
+                    "draft {}: send-claim release failed: {e} — draft stays inert as `sending`",
+                    self.draft_id
+                ),
+            }
+        }
+    }
+}
+
 pub(crate) struct SentDraftOutcome {
     pub json: serde_json::Value,
     pub to_addr: String,
@@ -2112,6 +2335,82 @@ pub(crate) async fn send_existing_draft(
         Some(id.parse::<u32>().unwrap())
     } else {
         None
+    };
+
+    // ── Resolve raw numeric IMAP ids to the local draft record (fail closed) ──
+    // Every send rides the durable claim of a LOCAL draft. A bare IMAP UID is
+    // resolved through the existing account+imap_uid mapping; if no local
+    // record exists there is no revision to claim and no persisted cleanup
+    // identity, so the send is refused with an import/review path instead of
+    // an unclaimed compose-and-guess flow.
+    let local_draft = match local_draft {
+        Some(d) => Some(d),
+        None if is_imap_uid => {
+            let uid: u32 = id.parse().unwrap();
+            match db
+                .get_draft_by_imap_uid(&acct.id, uid)
+                .context("failed to resolve IMAP draft to a local record")?
+            {
+                Some(d) => Some(d),
+                None => bail!(
+                    "IMAP draft UID {uid} in account {} has no local Envelope draft record \
+                     and cannot be sent safely. Review it first (dashboard Drafts view or \
+                     `envelope draft list --account {}`) or recreate it as an Envelope draft.",
+                    acct.username,
+                    acct.username
+                ),
+            }
+        }
+        None => None,
+    };
+
+    // ── Bind credentials to the draft's account (before any network work) ──
+    if let Some(d) = &local_draft {
+        ensure_draft_account_binding(&d.id, &d.account_id, &acct.id, &acct.username)?;
+    }
+
+    // ── Exclusive durable send claim ──
+    // The same `sending` claim the scheduled sweep uses, acquired before any
+    // Governor/SMTP work: an in-flight sweep claim, a provider sync, a
+    // concurrent edit (stale revision), or any non-`draft` status loses here
+    // instead of double-sending or transmitting a stale snapshot. The claim
+    // returns an owner lease token: only its holder can mark-sent, park, or
+    // release. The guard releases the claim back to `draft` on every pre-SMTP
+    // failure; after SMTP acceptance the claim is left only via
+    // `mark_draft_sent`.
+    let mut claim_guard: Option<SendClaimGuard<'_>> = None;
+    let local_draft = match local_draft {
+        Some(d) => {
+            let lease = match db
+                .claim_draft_for_immediate_send(&d.id, d.revision)
+                .context("failed to claim draft for sending")?
+            {
+                Some(lease) => lease,
+                None => {
+                    let status = db
+                        .get_draft(&d.id)
+                        .ok()
+                        .flatten()
+                        .map(|cur| cur.status.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    bail!(
+                        "draft {} is not sendable right now (status '{status}'): it may be \
+                         mid-send, mid-sync, awaiting review, or just modified — re-check \
+                         with `envelope draft show {}`",
+                        d.id,
+                        d.id
+                    );
+                }
+            };
+            claim_guard = Some(SendClaimGuard::new(&db, &d.id, lease));
+            // Reload the claimed row: the authoritative send snapshot.
+            let claimed = db
+                .get_draft(&d.id)
+                .context("failed to reload claimed draft")?
+                .ok_or_else(|| anyhow::anyhow!("draft vanished after claim: {}", d.id))?;
+            Some(claimed)
+        }
+        None => None,
     };
 
     // Threading (In-Reply-To / References) + preserved Message-ID from the
@@ -2276,35 +2575,96 @@ pub(crate) async fn send_existing_draft(
 
     let provider_type = db.get_provider_type(&acct.id).ok().flatten();
 
-    // ── Delete from IMAP Drafts folder ──
-    // Only attempt when the draft had an IMAP UID (otherwise there's nothing to delete).
-    if let Some(uid) = imap_uid {
-        if !acct.imap_host.is_empty() {
-            match imap::connect(&creds).await {
-                Ok(mut client) => {
-                    let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
-                        .unwrap_or_else(|| "Drafts".to_string());
-
-                    if let Err(e) = imap::delete_message(&mut client, &drafts_folder, uid).await {
-                        warn!(
-                            "failed to delete draft from IMAP {} (UID {uid}): {e}",
-                            drafts_folder
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to connect to IMAP to clean up sent draft: {e}");
-                }
+    // ── Durable sent state FIRST (same post-SMTP discipline as the sweep) ──
+    // SMTP was accepted: disarm the claim guard (the claim must never return
+    // to `draft`) and persist the sent state via `mark_draft_sent`, which
+    // transitions only our held `sending` claim. If persistence fails, park
+    // the claim as `blocked` (or leave it inert as `sending`) and SKIP
+    // provider cleanup — never report durable success, never leave a
+    // retransmit path.
+    let lease = claim_guard.as_mut().map(|guard| {
+        guard.disarm();
+        guard.lease.clone()
+    });
+    let mut sent_recorded = local_draft.is_none();
+    if let (Some(d), Some(lease)) = (&local_draft, &lease) {
+        match db.mark_draft_sent(&d.id, lease, Some(&message_id)) {
+            Ok(()) => sent_recorded = true,
+            Err(e) => {
+                let parked = db.park_delivery_uncertain(&d.id, lease).unwrap_or(false);
+                warn!(
+                    "draft {} was transmitted (message_id={message_id}) but sent-state \
+                     persistence failed: {e} — parked as delivery_uncertain={parked}; \
+                     provider cleanup skipped. Reconcile explicitly: verify delivery \
+                     (Sent folder / recipient), then `envelope draft discard {}`. It \
+                     will never be re-sent automatically.",
+                    d.id, d.id
+                );
             }
         }
     }
 
-    // ── Update local SQLite record ──
-    if local_draft.is_some() {
-        db.mark_draft_sent(id, Some(&message_id))
-            .context("failed to mark draft as sent")?;
+    // ── Provider draft cleanup (exact + unique, only after durable state) ──
+    // Local drafts resolve identity from the detected-folder cache + the
+    // persisted pre-send Message-ID; raw IMAP sends use the folder the content
+    // was actually fetched from + the fetched Message-ID. In both cases only
+    // the single exact Message-ID match is deleted — never a raw UID in a
+    // guessed folder. Skips and failures are logged, never claimed as done.
+    let cleanup_target = if !sent_recorded {
+        None
+    } else if let Some(d) = &local_draft {
+        // Identity needs only the exact detected folder + persisted
+        // Message-ID; a stored UID is neither required nor trusted.
+        match envelope_email_transport::draft_cleanup::resolve_draft_cleanup_target(&db, d) {
+            Ok(target) => Some(target),
+            Err(reason) => {
+                if d.imap_uid.is_some() {
+                    warn!("draft {}: provider draft cleanup skipped: {reason}", d.id);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Reported from the ACTUAL cleanup outcome — never inferred from UID
+    // presence or from the absence of local state.
+    let mut imap_draft_deleted = false;
+    if let Some(target) = cleanup_target
+        && !acct.imap_host.is_empty()
+    {
+        use envelope_email_transport::draft_cleanup::{
+            ProviderDraftCleanup, delete_provider_draft_exact,
+        };
+        match imap::connect(&creds).await {
+            Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
+                Ok(ProviderDraftCleanup::Deleted { uid }) => {
+                    imap_draft_deleted = true;
+                    info!(
+                        "removed provider draft copy (UID {uid} in {})",
+                        target.folder
+                    );
+                }
+                Ok(ProviderDraftCleanup::Skipped(reason)) => {
+                    warn!(
+                        "provider draft cleanup skipped in {}: {reason}",
+                        target.folder
+                    );
+                }
+                Err(e) => warn!("provider draft cleanup failed in {}: {e}", target.folder),
+            },
+            Err(e) => {
+                warn!("failed to connect to IMAP to clean up sent draft: {e}");
+            }
+        }
+    }
+    if local_draft.is_some() && !sent_recorded {
+        bail!(
+            "draft {id} was transmitted (message_id={message_id}) but the sent state could \
+             not be recorded; the draft is parked as delivery_uncertain and will never be \
+             re-sent. Reconcile explicitly: verify delivery (Sent folder / recipient), \
+             then `envelope draft discard {id}`."
+        );
     }
     // Catalog event: the send completed. Payload carries only the draft id and
     // message-id transition — never recipients or body.
@@ -2361,7 +2721,7 @@ pub(crate) async fn send_existing_draft(
         "to": to_addr.clone(),
         "subject": subject.clone(),
         "message_id": message_id.clone(),
-        "imap_draft_deleted": imap_uid.is_some(),
+        "imap_draft_deleted": imap_draft_deleted,
         "sent_mail_appended": sent_mail_appended,
         "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
         "sent_folder": sent_mail_proof.folder.clone(),
@@ -2855,6 +3215,92 @@ mod tests {
 
     // ─── draft_envelope_json: sync_status_reason ─────────────────────────
 
+    /// APPEND-succeeded/UID-missing provenance: a successful APPEND whose
+    /// post-APPEND UID lookup returned None leaves `imap_uid` NULL while
+    /// `storage.imap_synced=true` records that a provider copy exists. The
+    /// modify replace decision must treat that as "copy may exist" (old-copy
+    /// cleanup required before APPEND); only genuinely local-only drafts may
+    /// APPEND without it. Pure store rows — no mailbox or network.
+    #[test]
+    fn provider_copy_presence_uses_storage_provenance_not_uid_alone() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'T', 't@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("S"),
+                Some("b"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        // Fresh draft: no UID, no storage provenance → genuinely local-only.
+        let fresh = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(!provider_copy_may_exist(&fresh));
+
+        // APPEND succeeded but the UID lookup missed: imap_uid stays NULL,
+        // storage provenance records the sync. A copy MAY exist.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                "storage": {"imap_synced": true, "imap_folder": "[Gmail]/Drafts", "local_only": false}
+            }),
+        )
+        .unwrap();
+        let appended_no_uid = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            appended_no_uid.imap_uid.is_none(),
+            "precondition: UID lookup missed"
+        );
+        assert!(
+            provider_copy_may_exist(&appended_no_uid),
+            "imap_synced provenance must imply a possible provider copy despite a NULL UID"
+        );
+
+        // Explicit local-only provenance: append is allowed without cleanup.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({"storage": {"imap_synced": false, "local_only": true}}),
+        )
+        .unwrap();
+        let local_only = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(!provider_copy_may_exist(&local_only));
+
+        // A recorded UID always implies a possible copy, regardless of metadata.
+        db.update_draft_imap_uid(&draft.id, 77).unwrap();
+        let with_uid = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(provider_copy_may_exist(&with_uid));
+    }
+
+    /// A mismatched --account/credential context must refuse before any
+    /// provider or network side effect. Pure — no DB, no IMAP, no SMTP.
+    #[test]
+    fn account_binding_refuses_mismatched_credentials() {
+        assert!(ensure_draft_account_binding("d1", "acc1", "acc1", "a@x.com").is_ok());
+        let err = ensure_draft_account_binding("d1", "acc1", "acc2", "b@y.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to account acc1"), "{err}");
+        assert!(err.contains("b@y.com"), "{err}");
+        assert!(
+            err.contains("refusing before"),
+            "refusal must be explicit about ordering: {err}"
+        );
+    }
+
     #[test]
     fn draft_envelope_json_exposes_sync_status_reason_when_local_only() {
         let draft = envelope_email_store::models::Draft {
@@ -2885,6 +3331,7 @@ mod tests {
             sent_at: None,
             created_by: Some("cli".to_string()),
             imap_uid: None,
+            revision: 0,
         };
         let value = draft_envelope_json(&draft);
         assert_eq!(
@@ -2926,6 +3373,7 @@ mod tests {
             sent_at: None,
             created_by: Some("test".to_string()),
             imap_uid: None,
+            revision: 0,
         };
 
         let value = draft_envelope_json(&draft);

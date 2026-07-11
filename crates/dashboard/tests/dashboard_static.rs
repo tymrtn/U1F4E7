@@ -6,6 +6,51 @@ const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 const DASHBOARD_HTML: &str = include_str!("../static/index.html");
 
 #[test]
+fn dashboard_draft_window_has_reviewable_composer_structure() {
+    for marker in [
+        "id=\"composer-backdrop\"",
+        "id=\"composer-from\"",
+        "id=\"composer-recipient-check\"",
+        "id=\"composer-subject-check\"",
+        "id=\"composer-delivery-check\"",
+        "class=\"composer-editor\"",
+        "id=\"composer-attachment-count\"",
+    ] {
+        assert!(
+            DASHBOARD_HTML.contains(marker),
+            "draft window should expose the reviewed composer marker: {marker}"
+        );
+    }
+
+    for marker in [
+        "function populateComposerAccounts",
+        "function updateComposerReview",
+        "function renderComposerAttachments",
+        "Message queued for send",
+        "Reply queued for send",
+        "event.metaKey || event.ctrlKey",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(marker),
+            "draft window should preserve the reviewed interaction marker: {marker}"
+        );
+    }
+
+    for marker in [
+        ".composer-drawer",
+        "width: min(760px, 100vw)",
+        ".composer-review",
+        ".composer-editor-toolbar",
+        "grid-template-columns: repeat(3, minmax(0, 1fr))",
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(marker),
+            "draft window should preserve the approved visual-system marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn dashboard_rewrites_cid_images_and_blocks_remote_images_by_default() {
     assert!(
         DASHBOARD_JS.contains("function sanitizeEmailHtml"),
@@ -186,13 +231,15 @@ fn dashboard_drafts_folder_message_links_open_the_editable_draft_composer() {
     assert!(
         DASHBOARD_JS.contains("/drafts/by-imap-uid/")
             && DASHBOARD_JS.contains("state.currentDraft = data.draft")
-            && DASHBOARD_JS
-                .contains("openComposerFromDraft(data.draft, { accountId, uid, folder })"),
+            && DASHBOARD_JS.contains("openComposerFromDraft(data.draft)"),
         "Drafts-folder message links should map IMAP UID to a local draft and open the editable composer"
     );
+    // Server-only IMAP drafts (no local record) must NOT fall back to a
+    // compose-copy: there is no revision-safe way to queue them, so the flow
+    // fails closed with a CLI review path.
     assert!(
-        DASHBOARD_JS.contains("openComposerFromImap(draftMessage)"),
-        "server-only IMAP drafts should fall back to the same editable draft composer"
+        DASHBOARD_JS.contains("refuseRawImapDraftEdit(draftMessage)"),
+        "server-only IMAP drafts must refuse dashboard editing, not compose a copy"
     );
     assert!(
         DASHBOARD_JS.contains("const messageData = await api(")
@@ -544,34 +591,74 @@ fn dashboard_bulk_status_auto_clears_terminal_results() {
 }
 
 #[test]
-fn dashboard_sending_from_imap_draft_deletes_original_draft() {
-    // Issue #61: composing from an IMAP Drafts message must clean up the
-    // original draft after a successful send.
+fn dashboard_draft_edit_is_revision_bound_and_never_deletes_mailbox_messages() {
+    // Supersedes the issue #61 compose-copy-and-delete flow, which deleted the
+    // original message by guessed folder+UID after only a *queued* response
+    // (before SMTP) and bypassed revision safety. Editing an existing draft
+    // must now edit and queue the SAME local draft through the revision-bound
+    // endpoints; provider-side Drafts cleanup is owned exclusively by the
+    // scheduled-send sweep after SMTP acceptance and durable sent state.
+
+    // The composer edits the same draft: dedicated 'draft' compose mode
+    // carrying {accountId, draftId, expectedRevision} from the viewed draft.
     assert!(
-        DASHBOARD_JS.contains("composeImapDraft"),
-        "composer state should track the originating IMAP draft {{accountId, uid, folder}}"
+        DASHBOARD_JS.contains("state.composeMode = 'draft'")
+            && DASHBOARD_JS.contains("state.composeDraft = {"),
+        "openComposerFromDraft should enter the same-draft edit mode"
     );
     assert!(
-        DASHBOARD_JS.contains("'imap-draft'"),
-        "composing from an IMAP draft should use a dedicated compose mode"
+        DASHBOARD_JS.contains("expectedRevision: typeof draft.revision === 'number'"),
+        "the composer must capture the revision the human is viewing"
+    );
+
+    // Revision-bound request bodies through the shared CSRF-aware api()
+    // helper: the edit carries the viewed revision, the send carries the
+    // fresh revision returned by the edit, plus the explicit confirm.
+    assert!(
+        DASHBOARD_JS
+            .contains("await api('POST', `/accounts/${d.accountId}/drafts/${d.draftId}/edit`")
+            && DASHBOARD_JS.contains("expected_revision: d.expectedRevision,"),
+        "draft edit must POST /edit with the viewed expected_revision via api()"
     );
     assert!(
-        DASHBOARD_JS.contains("state.composeMode = 'imap-draft'"),
-        "openComposerFromImap should mark the composition as imap-draft"
+        DASHBOARD_JS
+            .contains("await api('POST', `/accounts/${d.accountId}/drafts/${d.draftId}/send`")
+            && DASHBOARD_JS.contains("expected_revision: edited.draft.revision,")
+            && DASHBOARD_JS.contains("confirm: true,"),
+        "draft send must POST /send with confirm and the post-edit revision via api()"
     );
-    // The cleanup DELETE must run on the send path, scoped to the original
-    // draft's uid/folder, and must not be conflated with the send itself.
+    // api() is the CSRF carrier for every mutating method.
     assert!(
-        DASHBOARD_JS.contains("state.composeMode === 'imap-draft' ? state.composeImapDraft : null"),
-        "send path should only delete when the composition came from an IMAP draft"
+        DASHBOARD_JS.contains("if (MUTATING_METHODS.has(method))")
+            && DASHBOARD_JS.contains("opts.headers['X-Envelope-CSRF'] = csrfToken"),
+        "the shared api() helper must attach the CSRF token to mutating requests"
+    );
+
+    // The unsafe flow is gone: no imap-draft compose mode, no direct DELETE of
+    // the original message, no guessed Drafts folder cleanup in the composer.
+    assert!(
+        !DASHBOARD_JS.contains("'imap-draft'") && !DASHBOARD_JS.contains("composeImapDraft"),
+        "the compose-copy imap-draft mode must not exist"
     );
     assert!(
-        DASHBOARD_JS.contains("`/accounts/${origin.accountId}/messages/${origin.uid}?folder=")
-            && DASHBOARD_JS.contains("'DELETE'"),
-        "successful send from an IMAP draft should DELETE the original draft uid in its folder"
+        !DASHBOARD_JS.contains("api(\n            'DELETE'")
+            && !DASHBOARD_JS.contains("`/accounts/${origin.accountId}/messages/${origin.uid}"),
+        "the composer must never DELETE the original mailbox message"
     );
     assert!(
-        DASHBOARD_JS.contains("could not be removed"),
-        "a draft-delete failure must be surfaced separately and not reported as a send failure"
+        !DASHBOARD_JS.contains("folder: draft.folder || 'Drafts'"),
+        "the composer must never guess a Drafts folder for cleanup"
+    );
+
+    // Raw server-side IMAP drafts without a local record fail closed with a
+    // review path instead of compose-copy + delete.
+    assert!(
+        DASHBOARD_JS.contains("function refuseRawImapDraftEdit")
+            && DASHBOARD_JS.contains("refuseRawImapDraftEdit(draftMessage)"),
+        "raw IMAP drafts with no local record must refuse dashboard editing"
+    );
+    assert!(
+        DASHBOARD_JS.contains("envelope draft list --account"),
+        "the refusal must point at a concrete CLI review path"
     );
 }

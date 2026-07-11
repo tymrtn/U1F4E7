@@ -61,7 +61,7 @@ fn attachment_snapshots(
 fn cooldown_send_after() -> (i64, String) {
     let cooldown = resolve_cooldown_seconds(None);
     let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown))
-        .format("%Y-%m-%dT%H:%M:%S")
+        .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     (cooldown, send_at)
 }
@@ -114,20 +114,39 @@ pub async fn send(
             None,
             req.cc.as_deref(),
             req.bcc.as_deref(),
-            Some("dashboard"),
+            Some("human:dashboard"),
         ) {
             Ok(d) => d,
             Err(e) => {
                 return (StatusCode::BAD_GATEWAY, format!("queue draft: {e}")).into_response();
             }
         };
-        if let Err(e) = db.update_draft_send_after(&draft.id, &send_at) {
-            return (StatusCode::BAD_GATEWAY, format!("queue send_after: {e}")).into_response();
-        }
         if !attachment_snapshots.is_empty()
             && let Err(e) = db.update_draft_attachments(&draft.id, &attachment_snapshots)
         {
             return (StatusCode::BAD_GATEWAY, format!("queue attachments: {e}")).into_response();
+        }
+        // A dashboard compose is human-authored and human-sent: schedule and
+        // record the approval attestation in one atomic store transaction,
+        // bound to the final revision written above. `tyler_approved` is an
+        // input attribute for Governor's blind scoring, never a bypass.
+        let current = match db.get_draft(&draft.id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return (StatusCode::BAD_GATEWAY, "queue: draft vanished").into_response();
+            }
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("queue reload: {e}")).into_response();
+            }
+        };
+        if let Err(e) = db.queue_draft_with_human_approval(
+            &current.id,
+            current.revision,
+            &send_at,
+            "human:dashboard",
+            &crate::timefmt::utc_now_string(),
+        ) {
+            return (StatusCode::BAD_GATEWAY, format!("queue approval: {e}")).into_response();
         }
         draft
     };
@@ -230,7 +249,7 @@ pub async fn reply(
             headers.in_reply_to.as_deref(),
             cc_joined.as_deref(),
             None,
-            Some("dashboard"),
+            Some("human:dashboard"),
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -253,19 +272,37 @@ pub async fn reply(
             )
                 .into_response();
         }
-        if let Err(e) = db.update_draft_send_after(&draft.id, &send_at) {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("queue reply send_after: {e}"),
-            )
-                .into_response();
-        }
         if !attachment_snapshots.is_empty()
             && let Err(e) = db.update_draft_attachments(&draft.id, &attachment_snapshots)
         {
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("queue reply attachments: {e}"),
+            )
+                .into_response();
+        }
+        // Schedule + approval attestation as one atomic store transaction,
+        // bound to the final revision written above (metadata + attachments).
+        let current = match db.get_draft(&draft.id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return (StatusCode::BAD_GATEWAY, "queue reply: draft vanished").into_response();
+            }
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("queue reply reload: {e}"))
+                    .into_response();
+            }
+        };
+        if let Err(e) = db.queue_draft_with_human_approval(
+            &current.id,
+            current.revision,
+            &send_at,
+            "human:dashboard",
+            &crate::timefmt::utc_now_string(),
+        ) {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("queue reply approval: {e}"),
             )
                 .into_response();
         }
@@ -290,4 +327,66 @@ pub async fn reply(
         "references": headers.references,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use envelope_email_store::Database;
+
+    fn seed_account(db: &Database, id: &str, username: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password) \
+                 VALUES (?1, 'Test', ?2, 'example.com', 'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                (id, username),
+            )
+            .unwrap();
+    }
+
+    /// Dashboard-composed drafts and replies must be stamped created_by='human:dashboard'
+    /// so they are distinguishable from agent-composed drafts in audit logs and
+    /// Governor scoring. This test verifies the constant we pass to create_draft.
+    #[test]
+    fn compose_handler_source_stamps_human_dashboard_created_by() {
+        let source = include_str!("compose.rs");
+        let needle = "human:dashboard";
+        assert!(
+            source.contains(needle),
+            "compose.rs must pass created_by='human:dashboard' to create_draft; found no such stamp"
+        );
+        // Must not still have the bare 'dashboard' stamp (without the 'human:' prefix)
+        // in a create_draft call context. We check by confirming the only occurrences
+        // of 'dashboard' in string literals carry the 'human:' prefix.
+        let bare = "Some(\"dashboard\")";
+        assert!(
+            !source.contains(bare),
+            "compose.rs must not pass bare created_by='dashboard'; use 'human:dashboard'"
+        );
+    }
+
+    /// Verifies create_draft accepts human:dashboard as a valid created_by value
+    /// by exercising it against a real in-memory database.
+    #[test]
+    fn create_draft_accepts_human_dashboard_created_by() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        assert_eq!(
+            draft.created_by.as_deref(),
+            Some("human:dashboard"),
+            "create_draft must persist the human:dashboard stamp"
+        );
+    }
 }

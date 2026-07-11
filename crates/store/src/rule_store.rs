@@ -138,6 +138,44 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Update a rule's name, match expression, action, priority, and stop flag.
+    ///
+    /// `sieve_exportable` is re-derived from the new match/action pair; the
+    /// caller must not pass it explicitly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_rule(
+        &self,
+        id: &str,
+        account_id: &str,
+        name: &str,
+        match_expr: &str,
+        action: &str,
+        priority: i64,
+        stop: bool,
+    ) -> Result<Option<Rule>> {
+        let sieve_exportable = is_sieve_exportable(match_expr, action);
+        let rows = self.conn().execute(
+            "UPDATE rules
+             SET name = ?1, match_expr = ?2, action = ?3, priority = ?4,
+                 stop = ?5, sieve_exportable = ?6, updated_at = datetime('now')
+             WHERE id = ?7 AND account_id = ?8",
+            params![
+                name,
+                match_expr,
+                action,
+                priority,
+                stop as i32,
+                sieve_exportable as i32,
+                id,
+                account_id,
+            ],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        self.get_rule(id)
+    }
+
     pub fn increment_rule_hit(&self, id: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE rules SET hit_count = hit_count + 1, last_hit_at = datetime('now') WHERE id = ?1",
@@ -254,6 +292,54 @@ mod tests {
 
         let not_found = db.find_rule_by_name("acct1", "nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn update_rule_modifies_fields_and_re_derives_sieve_exportable() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "Old name",
+                r#"{"from":"*@x.com"}"#,
+                r#"{"move":"Archive"}"#,
+                100,
+                false,
+            )
+            .unwrap();
+
+        // Update to a local-only action — sieve_exportable must become false.
+        let updated = db
+            .update_rule(
+                &rule.id,
+                "acct1",
+                "New name",
+                r#"{"from":"*@y.com"}"#,
+                r#"{"webhook":"https://example.com"}"#,
+                50,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.name, "New name");
+        assert_eq!(updated.priority, 50);
+        assert!(updated.stop);
+        assert!(!updated.sieve_exportable, "webhook makes rule local-only");
+
+        // Cross-account update returns None (scoped to account_id).
+        let cross = db
+            .update_rule(
+                &rule.id,
+                "other-account",
+                "X",
+                r#"{"from":"a"}"#,
+                r#"{"move":"B"}"#,
+                1,
+                false,
+            )
+            .unwrap();
+        assert!(cross.is_none());
     }
 
     #[test]
