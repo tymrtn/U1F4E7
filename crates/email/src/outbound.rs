@@ -544,19 +544,36 @@ pub fn gate(config: &GovernorConfig, req: &GovernorRequest) -> GovernorOutcome {
     match command.output() {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            match parse_governor_verdict(&stdout) {
-                Some(verdict) => decide_from_verdict(config.mode, verdict),
-                None => fail_outcome(
-                    config.mode,
-                    "unparseable",
-                    "governor produced no parseable decision",
-                ),
-            }
+            interpret_governor_invocation(config.mode, out.status.success(), &stdout)
         }
         Err(_) => fail_outcome(
             config.mode,
             "unavailable",
             "governor binary could not be executed",
+        ),
+    }
+}
+
+/// Interpret a completed `governor score` invocation.
+///
+/// The process exit status is authoritative and is checked BEFORE stdout: a
+/// nonzero exit fails closed (per mode) even when stdout happens to contain a
+/// parseable `allow` — a crashed, partially-executed, or tampered Governor
+/// must never grant a send on the strength of whatever it printed first.
+pub fn interpret_governor_invocation(
+    mode: GovernorMode,
+    exited_successfully: bool,
+    stdout: &str,
+) -> GovernorOutcome {
+    if !exited_successfully {
+        return fail_outcome(mode, "unavailable", "governor exited with a failure status");
+    }
+    match parse_governor_verdict(stdout) {
+        Some(verdict) => decide_from_verdict(mode, verdict),
+        None => fail_outcome(
+            mode,
+            "unparseable",
+            "governor produced no parseable decision",
         ),
     }
 }
@@ -573,6 +590,82 @@ pub fn hash_subject(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Governor invocation interpretation (exit status before stdout) ──
+
+    #[test]
+    fn nonzero_exit_fails_closed_even_with_parseable_allow_stdout() {
+        let allow_json = r#"{"decision": "allow", "state": "green", "score": 0.1}"#;
+        // Sanity: with a successful exit this stdout would allow.
+        assert!(interpret_governor_invocation(GovernorMode::Required, true, allow_json).allowed);
+
+        // A failure exit must override the parseable allow.
+        let outcome = interpret_governor_invocation(GovernorMode::Required, false, allow_json);
+        assert!(!outcome.allowed, "failed exit must never grant a send");
+        assert_eq!(outcome.decision, "unavailable");
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+
+        // Warn mode records the failure but does not block (existing warn
+        // semantics preserved).
+        let warn = interpret_governor_invocation(GovernorMode::Warn, false, allow_json);
+        assert!(warn.allowed);
+        assert_eq!(warn.decision, "unavailable");
+    }
+
+    #[test]
+    fn successful_exit_with_unparseable_stdout_still_fails_closed() {
+        let outcome = interpret_governor_invocation(GovernorMode::Required, true, "not json");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.decision, "unparseable");
+    }
+
+    /// End-to-end fixture: a local throwaway executable that prints a valid
+    /// `allow` verdict but exits nonzero must be refused by the real gate in
+    /// required mode. No secrets, no network — the fixture is a two-line shell
+    /// script in the test temp dir.
+    #[cfg(unix)]
+    #[test]
+    fn gate_refuses_allow_stdout_from_failing_governor_process() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "envelope-governor-exit-fixture-{}.sh",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "echo '{{\"decision\": \"allow\"}}'").unwrap();
+            writeln!(f, "exit 3").unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = GovernorConfig {
+            mode: GovernorMode::Required,
+            bin: path.to_string_lossy().into_owned(),
+        };
+        let req = GovernorRequest::build(
+            "acc1",
+            Some("example.com"),
+            "subject",
+            "to@example.net",
+            None,
+            None,
+            SendSurface::Scheduled,
+            Some("draft-1"),
+            &[],
+            false,
+        );
+        let outcome = gate(&config, &req);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !outcome.allowed,
+            "required mode must fail closed on nonzero exit despite allow stdout"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+    }
 
     #[test]
     fn default_cooldown_is_120_seconds() {

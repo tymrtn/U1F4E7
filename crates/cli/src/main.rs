@@ -78,7 +78,7 @@ PROVIDERS
 MORE HELP
   envelope <command> --help    Show help for a specific command
   envelope serve               Open the web dashboard at http://localhost:3141
-  https://github.com/tymrtn/envelope-email"#
+  https://github.com/tymrtn/U1F4E7"#
 )]
 struct Cli {
     #[command(subcommand)]

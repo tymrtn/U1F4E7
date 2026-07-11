@@ -39,7 +39,14 @@ fn parse_action(s: &str) -> Result<Action> {
             "unflag" => Ok(Action::Unflag(arg.to_string())),
             "snooze" => Ok(Action::Snooze(arg.to_string())),
             "add_tag" | "addtag" | "tag" => Ok(Action::AddTag(arg.to_string())),
-            "webhook" => Ok(Action::Webhook(arg.to_string())),
+            "webhook" => {
+                // SSRF guard: reject private/reserved/loopback/link-local
+                // webhook targets before the URL is ever persisted.
+                envelope_email_transport::url_guard::check_public_url(arg)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("webhook action URL rejected")?;
+                Ok(Action::Webhook(arg.to_string()))
+            }
             "reject" => Ok(Action::Reject(arg.to_string())),
             "ereject" => Ok(Action::Ereject(arg.to_string())),
             _ => bail!(
@@ -883,6 +890,36 @@ mod tests {
     fn parse_action_unknown() {
         assert!(parse_action("banana=split").is_err());
         assert!(parse_action("banana").is_err());
+    }
+
+    #[test]
+    fn parse_action_webhook_accepts_public_https() {
+        let a = parse_action("webhook=https://hooks.example.com/rule").unwrap();
+        assert_eq!(
+            a,
+            Action::Webhook("https://hooks.example.com/rule".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_action_webhook_rejects_link_local_metadata() {
+        // AWS/GCP/Azure instance-metadata endpoint must be rejected.
+        // `{:#}` renders the full anyhow chain inline (outer context + source),
+        // matching what the CLI's error printer shows the user.
+        let err = format!(
+            "{:#}",
+            parse_action("webhook=http://169.254.169.254/latest/meta-data/").unwrap_err()
+        );
+        assert!(
+            err.contains("rejected") && err.contains("private/reserved"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_action_webhook_rejects_localhost_and_private() {
+        assert!(parse_action("webhook=http://localhost:8080/hook").is_err());
+        assert!(parse_action("webhook=http://10.0.0.5/hook").is_err());
     }
 
     #[test]

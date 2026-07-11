@@ -7,6 +7,7 @@ use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_store::event_deliveries::DeliveryStatusFilter;
 use envelope_email_store::models::{Event, EventDelivery, EventRoute};
 use envelope_email_transport::code_extractor::redact_codes;
+use envelope_email_transport::url_guard::check_public_url;
 
 use super::common::resolve_account;
 
@@ -169,6 +170,11 @@ pub fn run_route_add(
     json: bool,
     _backend: CredentialBackend,
 ) -> Result<()> {
+    // Guard against SSRF before touching the database.
+    check_public_url(url)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("webhook URL rejected")?;
+
     let db = Database::open_default().context("failed to open database")?;
     let account_id = resolve_account(&db, account)?.id;
 

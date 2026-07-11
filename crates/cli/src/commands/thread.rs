@@ -40,7 +40,7 @@ pub async fn run_show(
                 Some(tid) => tid,
                 None => bail!(
                     "message UID {uid} in {folder} not found in any thread. \
-                     Try building threads with: envelope-email thread build"
+                     Try building threads with: envelope thread build"
                 ),
             }
         }
@@ -159,7 +159,7 @@ pub async fn run_list(
         println!("{}", serde_json::to_string_pretty(&enriched)?);
     } else {
         if threads.is_empty() {
-            println!("No threads found. Build threads with: envelope-email thread build");
+            println!("No threads found. Build threads with: envelope thread build");
             return Ok(());
         }
 

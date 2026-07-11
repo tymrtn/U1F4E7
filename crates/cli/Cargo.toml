@@ -29,6 +29,7 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
+url.workspace = true
 futures-util.workspace = true
 async-imap.workspace = true
 hickory-resolver.workspace = true

@@ -3,6 +3,7 @@
 
 pub mod accounts;
 pub mod action_log;
+pub mod agent_cockpit;
 pub mod agent_identity;
 pub mod build_info;
 pub mod contacts;
@@ -27,12 +28,14 @@ pub mod snoozed;
 pub mod tag_store;
 pub mod threads;
 
+pub use agent_cockpit::{AgentActivityCounts, GovernorVerdict};
 pub use agent_identity::{
     AgentIdentity, AgentPolicy, DEFAULT_SEND_MODE_CEILING, NewAgentToken, SendModeCeiling,
 };
 pub use build_info::{BuildInfo, VERSION};
 pub use credential_store::CredentialBackend;
 pub use db::Database;
+pub use drafts::SyncClaim;
 pub use errors::StoreError;
 pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use models::*;

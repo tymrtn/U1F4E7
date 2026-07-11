@@ -21,6 +21,7 @@ pub mod csrf;
 pub mod events;
 pub mod handlers;
 pub mod state;
+pub mod timefmt;
 mod ui_paths;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -28,7 +29,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use axum::Router;
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use envelope_email_store::{CredentialBackend, Database};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
@@ -263,6 +264,16 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/cockpit",
             get(handlers::cockpit::get_for_account),
         )
+        // Per-agent attribution feed + approval queue (read-only aggregate).
+        .route("/agents", get(handlers::agents::get))
+        // Scheduled sends + Governor verdict visibility (read-only aggregate).
+        .route("/scheduled", get(handlers::scheduled::get))
+        .route(
+            "/accounts/{id}/scheduled",
+            get(handlers::scheduled::get_for_account),
+        )
+        // Watch + delivery health browser (read-only aggregate).
+        .route("/watches", get(handlers::watches::get))
         // Folders
         .route("/accounts/{id}/folders", get(handlers::folders::list))
         // Messages
@@ -289,8 +300,11 @@ pub fn dashboard_router(state: AppState) -> Router {
             delete(handlers::messages::delete),
         )
         .route("/accounts/{id}/search", get(handlers::messages::search))
-        // Rules
-        .route("/accounts/{id}/rules", get(handlers::rules::list))
+        // Rules — read
+        .route(
+            "/accounts/{id}/rules",
+            get(handlers::rules::list).post(handlers::rules::create),
+        )
         .route(
             "/accounts/{id}/rules/run",
             post(handlers::rules::run_enabled),
@@ -302,6 +316,19 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route(
             "/accounts/{id}/rules/test/{uid}",
             get(handlers::rules::test_message),
+        )
+        // Rules — write
+        .route(
+            "/accounts/{id}/rules/{rule_id}",
+            put(handlers::rules::update).delete(handlers::rules::destroy),
+        )
+        .route(
+            "/accounts/{id}/rules/{rule_id}/enable",
+            post(handlers::rules::enable),
+        )
+        .route(
+            "/accounts/{id}/rules/{rule_id}/disable",
+            post(handlers::rules::disable),
         )
         // Attachments
         .route(
@@ -411,7 +438,9 @@ pub fn dashboard_router(state: AppState) -> Router {
 // ── Background unsnooze sweep ────────────────────────────────────────
 
 async fn run_unsnooze_sweep(state: &AppState) -> anyhow::Result<()> {
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    // Snooze `return_at` rows are stored in UTC (naive or `Z`); comparing them
+    // against local wall-clock time skews every unsnooze by the UTC offset.
+    let now = timefmt::utc_now_string();
     let due = {
         let db = state.db.lock().await;
         db.list_snoozed_due(&now, None)
@@ -506,15 +535,77 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
 
     info!("scheduled send sweep: {} draft(s) due", due.len());
 
-    for draft in &due {
-        // Resolve credentials for the draft's account
+    for scanned in &due {
+        // ── Atomic claim (id + revision + status) BEFORE any await ──
+        //
+        // A single CAS UPDATE moves the row `draft` → `sending`. Losing the
+        // claim means another sweeper took it, a concurrent edit bumped the
+        // revision, or an operator blocked/discarded it after the due scan —
+        // in every case this sweeper must not transmit its (stale) snapshot.
+        // While claimed the row is out of the due query, so a crash or later
+        // DB failure can strand it as `sending` but never re-send it.
+        let claimed = {
+            let db = state.db.lock().await;
+            db.claim_draft_for_sending(&scanned.id, scanned.revision)
+        };
+        let lease = match claimed {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                info!(
+                    "scheduled send: draft {} not claimed (concurrent claim, edit, or \
+                     state change) — skipping this sweep",
+                    scanned.id
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("scheduled send: claim failed for draft {}: {e}", scanned.id);
+                continue;
+            }
+        };
+
+        // Reload the claimed row: the authoritative snapshot for attribution
+        // and SMTP is what was claimed, not the pre-claim scan.
+        let draft = {
+            let db = state.db.lock().await;
+            db.get_draft(&scanned.id)
+        };
+        let draft = match draft {
+            Ok(Some(d)) => d,
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    "scheduled send: claimed draft {} could not be reloaded — releasing \
+                     claim for retry",
+                    scanned.id
+                );
+                release_claim(
+                    state,
+                    &scanned.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Draft,
+                )
+                .await;
+                continue;
+            }
+        };
+        let draft = &draft;
+
+        // Resolve credentials for the draft's account.
         let (client_arc, creds) = match state.get_or_create_imap(&draft.account_id).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
-                    "scheduled send: failed to get credentials for {}: {e}",
+                    "scheduled send: failed to get credentials for {}: {e} — releasing \
+                     claim for retry",
                     draft.account_id
                 );
+                release_claim(
+                    state,
+                    &draft.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Draft,
+                )
+                .await;
                 continue;
             }
         };
@@ -523,7 +614,7 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
 
         // Rehydrate any attachment bytes snapshotted at schedule time. If the
         // stored payload is corrupt/undecodable, refuse to send (do not silently
-        // deliver without the attachment); mark the draft blocked so the sweep
+        // deliver without the attachment); park the draft blocked so the sweep
         // stops retrying and the failure is visible in scheduled-send status.
         let attachments = match decode_scheduled_attachments(&draft.attachments) {
             Ok(a) => a,
@@ -532,9 +623,13 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     "scheduled send: skipping draft {} — attachment decode failed: {e}",
                     draft.id
                 );
-                let db = state.db.lock().await;
-                let _ =
-                    db.update_draft_status(&draft.id, envelope_email_store::DraftStatus::Blocked);
+                release_claim(
+                    state,
+                    &draft.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Blocked,
+                )
+                .await;
                 continue;
             }
         };
@@ -553,21 +648,17 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
         // ── Governor gate (fail-closed before any real SMTP) ──
         //
         // The scheduled-send sweep is the one place that actually transmits
-        // queued mail, so it must run the Governor gate. When Governor is
-        // required and missing/errors/denies/reviews, the send is refused and
-        // the draft stays queued (the sweep retries next cycle).
+        // queued mail, so it must run the Governor gate against the reloaded,
+        // claimed row. When Governor is required and missing/errors/denies/
+        // reviews, the send is refused and the claim is released per reason.
         let gov_outcome = run_governor_gate(state, draft, &creds, subject, &attachments).await;
         if !gov_outcome.allowed {
             // A durable Governor verdict (review/deny/block) must not be retried
-            // on every sweep. Leaving the draft in `draft` status with a past
-            // `send_after` would re-select it via `list_drafts_due_for_send` each
-            // cycle, re-running the gate and emitting a fresh
-            // `send_governor.blocked` event forever. Instead, transition the
-            // draft to `pending_review`: the due query only selects
-            // `status = 'draft'`, so the draft durably drops out of the sweep
-            // while remaining preserved, editable, and re-sendable by explicit
-            // human action. Transient gate failures (Governor unavailable) are
-            // left queued so a later sweep can retry once Governor is reachable.
+            // on every sweep: release the claim into `pending_review`, dropping
+            // the draft out of the due query while it stays preserved, editable,
+            // and re-sendable by explicit human action. Transient gate failures
+            // (Governor unavailable) release back to `draft` so a later sweep
+            // retries once Governor is reachable.
             let pause_for_review = should_pause_for_review(&gov_outcome);
             tracing::warn!(
                 "scheduled send: governor blocked draft {} ({}){}",
@@ -579,16 +670,20 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                 if pause_for_review {
                     " — moving to pending_review"
                 } else {
-                    " — leaving queued for retry"
+                    " — releasing claim for retry"
                 }
             );
-            if pause_for_review {
-                let db = state.db.lock().await;
-                let _ = db.update_draft_status(
-                    &draft.id,
-                    envelope_email_store::DraftStatus::PendingReview,
-                );
-            }
+            release_claim(
+                state,
+                &draft.id,
+                &lease,
+                if pause_for_review {
+                    envelope_email_store::DraftStatus::PendingReview
+                } else {
+                    envelope_email_store::DraftStatus::Draft
+                },
+            )
+            .await;
             // Metadata-level send status: decision + optional block code only.
             // No recipients, subject, or body ever cross this channel.
             state
@@ -624,33 +719,62 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
         .await
         {
             Ok(message_id) => {
-                {
+                let persistence = {
                     let db = state.db.lock().await;
-                    let _ = db.mark_draft_sent(&draft.id, Some(&message_id));
-                }
-                info!(
-                    "scheduled send: sent draft {} (recipient_count={}, message_id={})",
-                    draft.id,
-                    recipient_count_for_log(
-                        &draft.to_addr,
-                        draft.cc_addr.as_deref(),
-                        draft.bcc_addr.as_deref()
+                    persist_sent_state(&db, &draft.id, &lease, &message_id)
+                };
+                // Honest logging: an unrecorded persistence outcome is not a
+                // durable success and must not read like one (the persistence
+                // failure itself was already logged at error level).
+                match persistence {
+                    SentPersistence::Recorded => info!(
+                        "scheduled send: sent draft {} (recipient_count={}, message_id={})",
+                        draft.id,
+                        recipient_count_for_log(
+                            &draft.to_addr,
+                            draft.cc_addr.as_deref(),
+                            draft.bcc_addr.as_deref()
+                        ),
+                        message_id
                     ),
-                    message_id
-                );
+                    SentPersistence::Unrecorded { parked } => tracing::warn!(
+                        "scheduled send: draft {} transmitted (message_id={}) but sent \
+                         state is UNRECORDED (parked={parked}) — not a durable success",
+                        draft.id,
+                        message_id
+                    ),
+                }
+                // The original server-side draft copy is now stale. Clean it up
+                // strictly AFTER SMTP acceptance AND durable sent-state
+                // persistence — if the sent state did not persist, the local
+                // draft is the only record of what happened and the provider
+                // copy must be left alone. Identity needs only the exact
+                // detected folder + persisted Message-ID (a stored UID is not
+                // required and never trusted).
+                if persistence == SentPersistence::Recorded {
+                    cleanup_provider_draft_after_send(state, draft).await;
+                }
                 state
                     .events
                     .publish(crate::events::DashboardEvent::SendStatus {
                         account_id: draft.account_id.clone(),
                         draft_id: draft.id.clone(),
-                        outcome: "sent",
+                        // Never report durable success when the sent state did
+                        // not persist — the SMTP transmission happened, but
+                        // Envelope's record of it is incomplete.
+                        outcome: if persistence == SentPersistence::Recorded {
+                            "sent"
+                        } else {
+                            "sent_unrecorded"
+                        },
                         governor_decision: Some(gov_outcome.decision.clone()),
                         governor_block_code: None,
                     });
             }
             Err(e) => {
                 tracing::warn!(
-                    "scheduled send: SMTP failed for draft {} (recipient_count={}): {e}",
+                    "scheduled send: SMTP failed for draft {} (recipient_count={}): {e} — \
+                     releasing claim for retry",
                     draft.id,
                     recipient_count_for_log(
                         &draft.to_addr,
@@ -658,6 +782,15 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                         draft.bcc_addr.as_deref()
                     )
                 );
+                // SMTP was NOT accepted: releasing back to `draft` (due again)
+                // is safe and preserves the pre-claim retry behavior.
+                release_claim(
+                    state,
+                    &draft.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Draft,
+                )
+                .await;
                 state
                     .events
                     .publish(crate::events::DashboardEvent::SendStatus {
@@ -672,6 +805,32 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Release a sweep claim into `to`, logging (but never panicking on) failure.
+/// Only ever called BEFORE SMTP acceptance or for the anti-duplicate park — a
+/// transmitted draft leaves the claim exclusively via `mark_draft_sent`. If
+/// the release itself fails, the row stays `sending`: stranded but inert, and
+/// never re-selected for a duplicate transmission.
+async fn release_claim(
+    state: &AppState,
+    draft_id: &str,
+    lease: &str,
+    to: envelope_email_store::DraftStatus,
+) {
+    let db = state.db.lock().await;
+    match db.release_sending_draft(draft_id, lease, to.clone()) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            "scheduled send: claim release for draft {draft_id} matched no `sending` row \
+             (already transitioned?)"
+        ),
+        Err(e) => tracing::error!(
+            "scheduled send: claim release for draft {draft_id} → {} failed: {e} — the \
+             draft stays parked in `sending` (inert, never re-sent) until repaired",
+            to.as_str()
+        ),
+    }
 }
 
 // ── Background event-delivery sweep ─────────────────────────────────
@@ -768,6 +927,140 @@ fn scheduled_threading(draft: &envelope_email_store::Draft) -> (Option<String>, 
     (draft.in_reply_to.clone().or(meta_in_reply_to), references)
 }
 
+/// Outcome of persisting the local sent state after SMTP acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentPersistence {
+    /// `status='sent'` was durably recorded: safe to clean up the provider
+    /// draft copy and report success.
+    Recorded,
+    /// Persistence failed after a real transmission. `parked` reports whether
+    /// the anti-duplicate fallback (moving the draft out of the sweep's due
+    /// query) succeeded.
+    Unrecorded { parked: bool },
+}
+
+/// Persist the sent state for a draft whose SMTP transmission was accepted.
+///
+/// A `mark_draft_sent` failure is dangerous in both directions: reporting
+/// success would lie about durability, and returning the draft to due would
+/// resend delivered mail. On failure this parks the claim as the terminal
+/// `delivery_uncertain` state — atomically clearing `send_after` under the
+/// owner lease — which is non-editable, non-approvable, non-queueable, and
+/// never due, so no approval or sweep can ever promote it back into a send.
+/// If the park ALSO fails, the row simply remains in its durable `sending`
+/// claim — which the due query never selects. Both failures are loud, with
+/// the operator reconciliation path (verify delivery, then discard) spelled
+/// out.
+fn persist_sent_state(
+    db: &Database,
+    draft_id: &str,
+    lease: &str,
+    message_id: &str,
+) -> SentPersistence {
+    match db.mark_draft_sent(draft_id, lease, Some(message_id)) {
+        Ok(()) => SentPersistence::Recorded,
+        Err(e) => {
+            tracing::error!(
+                "scheduled send: draft {draft_id} was transmitted but sent-state \
+                 persistence failed: {e}"
+            );
+            let parked = match db.park_delivery_uncertain(draft_id, lease) {
+                Ok(true) => {
+                    tracing::error!(
+                        "scheduled send: draft {draft_id} parked as delivery_uncertain — \
+                         the message WAS transmitted but its sent state is unrecorded. \
+                         Reconcile explicitly: verify delivery (Sent folder / recipient), \
+                         then discard the draft. It will never be re-sent automatically."
+                    );
+                    true
+                }
+                Ok(false) => {
+                    tracing::error!(
+                        "scheduled send: draft {draft_id} park after unrecorded send \
+                         matched no owned `sending` row"
+                    );
+                    false
+                }
+                Err(park_err) => {
+                    tracing::error!(
+                        "scheduled send: draft {draft_id} could not be parked after \
+                         unrecorded send: {park_err} — it remains claimed as `sending` \
+                         (never due, never re-sent) until repaired"
+                    );
+                    false
+                }
+            };
+            SentPersistence::Unrecorded { parked }
+        }
+    }
+}
+
+/// Best-effort deletion of the original server-side draft copy after a
+/// successful, durably recorded scheduled SMTP send.
+///
+/// Delegates to the shared identity-safe primitives
+/// (`envelope_email_transport::draft_cleanup`): the folder comes only from
+/// the detected-folder cache, and only the single exact Message-ID match is
+/// deleted — zero/ambiguous matches skip. Every skip/failure is logged
+/// (draft id, UID, folder only — never addresses or content) and never
+/// claimed as done; send success stays authoritative regardless.
+async fn cleanup_provider_draft_after_send(state: &AppState, draft: &envelope_email_store::Draft) {
+    use envelope_email_transport::draft_cleanup::{
+        ProviderDraftCleanup, delete_provider_draft_exact, resolve_draft_cleanup_target,
+    };
+
+    let target = {
+        let db = state.db.lock().await;
+        resolve_draft_cleanup_target(&db, draft)
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(reason) => {
+            tracing::warn!(
+                "scheduled send: draft {} sent; skipping provider draft cleanup \
+                 (provider copy left in place): {reason}",
+                draft.id
+            );
+            return;
+        }
+    };
+    let folder = &target.folder;
+
+    let (client_arc, _creds) = match state.get_or_create_imap(&draft.account_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "scheduled send: draft {} sent, but IMAP connect for draft cleanup \
+                 failed (provider copy left in {folder}): {e}",
+                draft.id
+            );
+            return;
+        }
+    };
+    let mut client = client_arc.lock().await;
+
+    match delete_provider_draft_exact(&mut client, &target).await {
+        Ok(ProviderDraftCleanup::Deleted { uid: deleted_uid }) => info!(
+            "scheduled send: removed provider draft copy for draft {} \
+             (UID {deleted_uid} in {folder})",
+            draft.id
+        ),
+        Ok(ProviderDraftCleanup::Skipped(reason)) => tracing::warn!(
+            "scheduled send: draft {} sent; {reason} in {folder} — skipping cleanup",
+            draft.id
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "scheduled send: draft {} sent, but provider draft cleanup failed \
+                 in {folder} (provider copy left in place): {e}",
+                draft.id
+            );
+            drop(client);
+            state.evict_imap(&draft.account_id).await;
+        }
+    }
+}
+
 /// Decide whether a blocked scheduled draft should be durably paused into
 /// `pending_review` versus left queued for a later retry.
 ///
@@ -786,6 +1079,12 @@ fn should_pause_for_review(outcome: &envelope_email_transport::outbound::Governo
 /// come from the persisted draft, attachment sensitivity is classified from the
 /// rehydrated snapshot's filenames (class only — bytes are never inspected for
 /// scoring). This is the authoritative context the sweep gates on.
+///
+/// `human_approved` is read from the draft's durable attestation
+/// ([`envelope_email_store::Draft::human_approved`], written only by human
+/// surfaces such as the dashboard approve/send actions) and declares the
+/// `tyler_approved` attribute to Governor's blind scoring. It is an input
+/// attribute, never a bypass: the fail-closed gate still runs in full.
 fn scheduled_send_context(
     draft: &envelope_email_store::Draft,
     account_domain: Option<String>,
@@ -810,6 +1109,7 @@ fn scheduled_send_context(
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        human_approved: draft.human_approved(),
         ..Default::default()
     }
 }
@@ -1291,6 +1591,281 @@ mod tests {
         assert!(attrs.contains(&"sensitive_attachment"), "{attrs:?}");
         // External recipient — never internal.
         assert!(!attrs.contains(&"internal_domain"), "{attrs:?}");
+    }
+
+    /// Scheduled attribution must declare `tyler_approved` only from the
+    /// durable human attestation — never from agent-created state alone — so a
+    /// human-approved send does not come back from Governor as review_required
+    /// while agents can never self-approve. Pure: no Governor, no network.
+    #[test]
+    fn scheduled_send_context_declares_tyler_approved_only_with_human_attestation() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "recipient@example.net",
+                Some("Queued"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // Agent-written contextual metadata is not an approval.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({"in_reply_to": "parent@example.net"}),
+        )
+        .unwrap();
+
+        let unapproved = db.get_draft(&draft.id).unwrap().unwrap();
+        let attrs = scheduled_send_context(&unapproved, Some("example.com".to_string()), &[])
+            .to_governor_attrs();
+        assert!(
+            !attrs.contains(&"tyler_approved"),
+            "agent state alone must not declare tyler_approved: {attrs:?}"
+        );
+
+        // The dashboard approve/send action records the durable attestation
+        // (revision-bound CAS); the next sweep's re-derivation declares
+        // tyler_approved.
+        let human_view = db.get_draft(&draft.id).unwrap().unwrap();
+        db.record_draft_human_approval(
+            &draft.id,
+            human_view.revision,
+            "human:dashboard",
+            "2026-07-10T09:00:00Z",
+        )
+        .unwrap();
+        let approved = db.get_draft(&draft.id).unwrap().unwrap();
+        let attrs = scheduled_send_context(&approved, Some("example.com".to_string()), &[])
+            .to_governor_attrs();
+        assert!(attrs.contains(&"tyler_approved"), "{attrs:?}");
+        // Threading survived the attestation merge and still attributes.
+        assert!(attrs.contains(&"reply_to_thread"), "{attrs:?}");
+
+        // Revision binding at the attribution boundary: a content edit after
+        // approval (e.g. an agent modifying the queued draft) clears the
+        // attestation, so the sweep re-scores WITHOUT tyler_approved.
+        db.update_draft_content(
+            &draft.id,
+            Some("other@example.net"),
+            None,
+            None,
+            None,
+            Some("changed after approval"),
+            None,
+        )
+        .unwrap();
+        let edited = db.get_draft(&draft.id).unwrap().unwrap();
+        let attrs = scheduled_send_context(&edited, Some("example.com".to_string()), &[])
+            .to_governor_attrs();
+        assert!(
+            !attrs.contains(&"tyler_approved"),
+            "an edited revision must not ride the earlier approval: {attrs:?}"
+        );
+    }
+
+    /// After SMTP acceptance, a sent-state persistence failure must never look
+    /// like durable success and must not leave the draft re-sendable by the
+    /// next sweep (duplicate transmission). No SMTP or mailbox involved — this
+    /// exercises only the local persistence decision.
+    #[test]
+    fn unrecorded_sent_state_parks_draft_out_of_sweep_instead_of_resending() {
+        use envelope_email_store::DraftStatus;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Queued"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let revision = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let lease = db
+            .claim_draft_for_sending(&draft.id, revision)
+            .unwrap()
+            .expect("precondition: sweep claims the due draft before SMTP");
+
+        // Simulate a persistence failure for exactly the sent-state write:
+        // `mark_draft_sent` is the only path that touches `sent_at`.
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_sent_write BEFORE UPDATE OF sent_at ON drafts
+                 BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END",
+                [],
+            )
+            .unwrap();
+
+        let outcome = persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>");
+        assert_eq!(outcome, SentPersistence::Unrecorded { parked: true });
+
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(parked.status, DraftStatus::DeliveryUncertain);
+        assert!(
+            parked.sent_at.is_none(),
+            "sent state really did not persist"
+        );
+        assert!(
+            parked.send_after.is_none(),
+            "the park must clear send_after atomically"
+        );
+        assert!(
+            !db.list_drafts_due_for_send()
+                .unwrap()
+                .iter()
+                .any(|d| d.id == draft.id),
+            "an unrecorded send must not be re-selected and resent by the sweep"
+        );
+        // Approval/queue must reject the terminal-recovery state outright.
+        assert!(
+            db.approve_draft_revision(
+                &draft.id,
+                parked.revision,
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .is_err()
+        );
+        assert!(
+            db.queue_draft_with_human_approval(
+                &draft.id,
+                parked.revision,
+                "2026-07-10T09:02:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .is_err()
+        );
+
+        // Explicit operator reconciliation is the only exit: discard works.
+        assert!(db.discard_draft(&draft.id).unwrap());
+
+        // Happy path: with persistence working, the state is durably `sent`.
+        db.conn()
+            .execute("DROP TRIGGER fail_sent_write", [])
+            .unwrap();
+        let fresh = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Queued again"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&fresh.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let lease2 = db
+            .claim_draft_for_sending(&fresh.id, fresh.revision)
+            .unwrap()
+            .expect("re-claim");
+        assert_eq!(
+            persist_sent_state(&db, &fresh.id, &lease2, "<mid@example.com>"),
+            SentPersistence::Recorded
+        );
+        let sent = db.get_draft(&fresh.id).unwrap().unwrap();
+        assert_eq!(sent.status, DraftStatus::Sent);
+        assert!(sent.sent_at.is_some());
+    }
+
+    /// When even the anti-duplicate park fails, the outcome must say so —
+    /// callers never treat it as recorded, and both failures are loud.
+    #[test]
+    fn unrecorded_sent_state_reports_failed_park() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Queued"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        // The sweep claims before transmitting; both post-send updates then
+        // fail: a status-write failure breaks mark_draft_sent (which sets
+        // status='sent') AND the blocked-park fallback.
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let revision = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let lease = db
+            .claim_draft_for_sending(&draft.id, revision)
+            .unwrap()
+            .expect("claim");
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_status_write BEFORE UPDATE OF status ON drafts
+                 BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>"),
+            SentPersistence::Unrecorded { parked: false }
+        );
+
+        // Even with BOTH post-send updates failing, the durable `sending`
+        // claim keeps the transmitted draft out of the due query — the failed
+        // park can never become a duplicate retransmission.
+        let stranded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(stranded.status, envelope_email_store::DraftStatus::Sending);
+        assert!(
+            !db.list_drafts_due_for_send()
+                .unwrap()
+                .iter()
+                .any(|d| d.id == draft.id),
+            "a transmitted draft must never be re-selected, even when both \
+             mark-sent and the park fallback fail"
+        );
     }
 
     #[tokio::test]

@@ -1,15 +1,22 @@
 <script lang="ts">
   // v2 mailbox layout: rail + message list (selection, search, bulk ops) + reader outlet.
   // The list stays mounted while the reader (nested [account]/[uid] route) swaps the third column.
+  // This layout also owns: SSE live-update wiring, Composer drawer launch points (header button
+  // + keyboard 'c'), UndoToast for queued sends, and the rail-footer connection indicator.
   import { base } from '$app/paths';
   import { page } from '$app/state';
+  import { onMount } from 'svelte';
   import type { Snippet } from 'svelte';
   import { Rail, Spinner, EmptyState, MonoTag } from '$lib/components';
   import MessageRow from '$lib/components/MessageRow.svelte';
   import BulkToolbar from '$lib/components/BulkToolbar.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
+  import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
+  import UndoToast from '$lib/components/UndoToast.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
   import { SelectionStore } from '$lib/selection.svelte';
+  import { getLiveStore } from '$lib/live.svelte';
+  import { getComposerStore } from '$lib/composer.svelte';
   import {
     api,
     EnvelopeApiError,
@@ -19,6 +26,8 @@
     type SnoozedItem,
     type SearchMessageSummary,
     type FolderStats,
+    type ComposeResponse,
+    type Account,
   } from '$lib/api';
 
   let { children }: { children: Snippet } = $props();
@@ -28,6 +37,22 @@
   const selectedAccount = $derived(page.params.account ?? null);
 
   const selection = new SelectionStore();
+
+  // ── SSE live store ────────────────────────────────────────────────
+  // Started once on mount (onMount guard prevents SSR). When the stream is
+  // open, the live ticks replace the polling timer. When degraded, polling
+  // continues as before (all existing fetch paths stay intact).
+  let live = $state<ReturnType<typeof getLiveStore> | null>(null);
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  // ── Accounts cache (for composer from-select) ─────────────────────
+  let allAccounts = $state<Account[]>([]);
+
+  // ── Composer store ────────────────────────────────────────────────
+  const composer = getComposerStore();
+
+  // ── Undo toast ────────────────────────────────────────────────────
+  let undoToast = $state<{ res: ComposeResponse; accountId: string } | null>(null);
 
   let unifiedMessages = $state<UnifiedInboxMessage[]>([]);
   let drafts = $state<Draft[]>([]);
@@ -219,9 +244,104 @@
     else if (slug === 'drafts') await loadDrafts();
     else if (slug === 'snoozed') await loadSnoozed();
   }
+
+  // ── Accounts load (for composer from-select) ──────────────────────
+  async function loadAccounts() {
+    try {
+      const res = await api.listAccounts();
+      allAccounts = res.accounts;
+    } catch {
+      // non-fatal; composer gracefully shows empty select
+    }
+  }
+
+  // ── Composer helpers ──────────────────────────────────────────────
+  function openCompose() {
+    // Open with first account as default; user can change via the select.
+    composer.open('compose', { accountId: allAccounts[0]?.id ?? '' });
+  }
+
+  function handleGlobalKey(e: KeyboardEvent) {
+    // 'c' opens compose unless an input/textarea/select is focused.
+    if (e.key === 'c' || e.key === 'C') {
+      const tag = (document.activeElement?.tagName ?? '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      e.preventDefault();
+      openCompose();
+    }
+  }
+
+  // ── Send / undo toast ─────────────────────────────────────────────
+  function handleSent(res: ComposeResponse, fromAccountId: string) {
+    // Only show undo if the cooldown is meaningful (> 0 seconds).
+    if (res.cooldown_seconds > 0) {
+      undoToast = { res, accountId: fromAccountId };
+    }
+    // Refresh the list so a queued draft appears in /drafts.
+    const slug = page.params.box ?? 'unified';
+    if (slug === 'drafts') loadDrafts();
+  }
+
+  // ── SSE wiring ────────────────────────────────────────────────────
+  // Guards with onMount so the SSE client never opens during SSR or unit tests
+  // that do not call onMount.
+  onMount(() => {
+    // Load accounts for the composer from-select.
+    loadAccounts();
+
+    // Start the shared live store (idempotent). Guard against jsdom / SSR
+    // environments where EventSource is not defined.
+    let offNewMail: (() => void) | null = null;
+    let offLagged: (() => void) | null = null;
+
+    if (typeof EventSource !== 'undefined') {
+      live = getLiveStore();
+
+      // When the stream is live and a new_mail event arrives, refresh the
+      // current box. When degraded, the existing polling paths take over.
+      offNewMail = live.on(['new_mail'], () => {
+        if (!live?.degraded) {
+          const slug = page.params.box ?? 'unified';
+          if (slug === 'unified') loadUnified();
+        }
+      });
+
+      // Server said we fell behind the event stream: re-poll for exactness.
+      offLagged = live.onLagged(() => {
+        const slug = page.params.box ?? 'unified';
+        if (slug === 'unified') loadUnified();
+        else if (slug === 'drafts') loadDrafts();
+        else if (slug === 'snoozed') loadSnoozed();
+      });
+    }
+
+    return () => {
+      offNewMail?.();
+      offLagged?.();
+      if (pollTimer !== null) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+  });
+
+  // Reactive effect: when laggedTicks increments (lagged control frame
+  // arrived), refresh unified inbox for exactness.
+  $effect(() => {
+    if (live && live.laggedTicks > 0) {
+      const slug = page.params.box ?? 'unified';
+      if (slug === 'unified') loadUnified();
+    }
+  });
+
+  // Connection state for the rail footer indicator.
+  const connectionState = $derived(live?.connection ?? 'closed');
+  const isDegraded = $derived(live?.degraded ?? false);
 </script>
 
-<div class="mail-shell">
+<svelte:window onkeydown={handleGlobalKey} />
+
+<div class="mail-shell" class:is-reading={selectedUid !== null}>
   <Rail />
 
   <section id="msg-list-pane" class="list" aria-label="Message list">
@@ -238,8 +358,30 @@
             onreset={() => { searchResults = []; searchError = null; }}
           />
         {/if}
+        <button
+          id="compose-btn"
+          class="compose-btn"
+          type="button"
+          aria-label="Compose new message"
+          title="Compose (c)"
+          onclick={openCompose}
+        >Compose</button>
       </div>
     </header>
+
+    <!-- Connection indicator (rail footer) -->
+    <div id="live-indicator" class="live-indicator" aria-label="Connection status">
+      {#if connectionState === 'open' && !isDegraded}
+        <span class="live-dot live-dot-ok" aria-hidden="true"></span>
+        <span class="live-label">Live</span>
+      {:else if isDegraded}
+        <span class="live-dot live-dot-degraded" aria-hidden="true"></span>
+        <span class="live-label">Polling</span>
+      {:else if connectionState === 'connecting' || connectionState === 'reconnecting'}
+        <span class="live-dot live-dot-pending" aria-hidden="true"></span>
+        <span class="live-label">Connecting</span>
+      {/if}
+    </div>
 
     {#if box?.wired && !loading}
       <BulkToolbar
@@ -430,19 +572,38 @@
   </section>
 </div>
 
+<!-- Composer drawer: mounts globally for keyboard 'c' and rail button. -->
+<ComposerDrawer
+  accounts={allAccounts}
+  onsent={(res, accountId) => handleSent(res, accountId)}
+/>
+
+<!-- Undo toast: shown only when a compose queued with cooldown. -->
+{#if undoToast && undoToast.res.cooldown_seconds > 0}
+  <UndoToast
+    draftId={undoToast.res.draft_id}
+    accountId={undoToast.accountId}
+    seconds={undoToast.res.cooldown_seconds}
+    ondismiss={() => (undoToast = null)}
+  />
+{/if}
+
 <style>
   .mail-shell {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 240px minmax(320px, 1fr) minmax(360px, 1.4fr);
+    grid-template-columns: 240px minmax(360px, 1fr) minmax(360px, 42vw);
+    gap: 1px;
+    background: var(--env-rule);
+    overflow: hidden;
   }
   .list {
-    border-right: 1px solid var(--env-rule);
     display: flex;
     flex-direction: column;
     min-height: 0;
     overflow-y: auto;
+    background: var(--env-surface);
   }
   .reader {
     display: flex;
@@ -459,7 +620,8 @@
     padding: 0.5rem 0.75rem;
     position: sticky;
     top: 0;
-    background: var(--env-paper);
+    min-height: 3.25rem;
+    background: var(--env-soft);
     z-index: 2;
     border-bottom: 1px solid var(--env-rule);
   }
@@ -535,5 +697,80 @@
   }
   .msg-list li {
     display: block;
+  }
+  .compose-btn {
+    flex-shrink: 0;
+    font-family: var(--font-sans);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    padding: 0.3rem 0.65rem;
+    background: var(--env-ink);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-sm, 3px);
+    cursor: pointer;
+    line-height: 1.2;
+  }
+  .compose-btn:hover {
+    background: #262626;
+  }
+  .live-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.75rem;
+    border-bottom: 1px solid var(--env-rule);
+    background: var(--env-paper);
+  }
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .live-dot-ok {
+    background: var(--env-accent);
+  }
+  .live-dot-degraded {
+    background: var(--env-pending, #c98a00);
+  }
+  .live-dot-pending {
+    background: var(--env-muted);
+  }
+  .live-label {
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--env-muted);
+  }
+  @media (max-width: 1100px) {
+    .mail-shell {
+      grid-template-columns: 220px minmax(340px, 1fr) minmax(340px, 38vw);
+    }
+  }
+  @media (max-width: 760px) {
+    .mail-shell {
+      grid-template-columns: minmax(0, 1fr);
+      min-height: calc(100vh - 126px);
+      overflow: visible;
+    }
+    .mail-shell :global(.rail),
+    .reader {
+      display: none;
+    }
+    .mail-shell.is-reading .list {
+      display: none;
+    }
+    .mail-shell.is-reading .reader {
+      display: flex;
+    }
+    .pane-head {
+      align-items: stretch;
+      flex-direction: column;
+    }
+    .pane-head-right {
+      justify-content: stretch;
+    }
   }
 </style>

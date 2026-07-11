@@ -24,3 +24,4 @@ apps/
 
 # Stray scratch files
 *.tif
+.worktrees/

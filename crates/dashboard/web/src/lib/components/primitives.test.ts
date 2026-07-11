@@ -43,12 +43,16 @@ describe('primitive tripwire — no status leaks as labels', () => {
     expect(entries.length).toBeGreaterThan(0);
     for (const [path, src] of entries) {
       // Strip HTML/line/block comments so an explanatory code comment (e.g. the
-      // reader's "lands next wave" safety note) doesn't trip the guard —
-      // only user-visible markup is under test.
+      // reader's "lands next wave" safety note) doesn't trip the guard, and
+      // strip `placeholder=` input attributes (legitimate form UX, not the v1
+      // stub-copy bug class we're guarding against) — only user-visible prose
+      // is under test.
       const stripped = src
         .replace(/<!--[\s\S]*?-->/g, '')
         .replace(/\/\/.*$/gm, '')
-        .replace(/\/\*[\s\S]*?\*\//g, '');
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/placeholder=(["'])[\s\S]*?\1/g, '')
+        .replace(/placeholder=\{[^}]*\}/g, '');
       expect(stripped, `${path} leaks placeholder copy`).not.toMatch(STATUS_LEAK);
     }
   });

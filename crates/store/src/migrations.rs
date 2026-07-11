@@ -681,6 +681,64 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // ── Migration 11: draft revision counter (approval binding) ─────
+        // Monotonic per-draft revision, bumped in the same UPDATE statement
+        // as every content-relevant mutation (content/recipients,
+        // attachments, metadata). The human-approval attestation records the
+        // revision it approved; approval derives valid only while the
+        // draft's revision still matches, and the approval write is
+        // compare-and-set on this column so a concurrent edit can never
+        // inherit an approval. Additive; existing rows start at revision 0.
+        M::up_with_hook("", |tx: &Transaction| {
+            let table_exists = |table: &str| -> bool {
+                tx.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .and_then(|mut s| s.query_row([table], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0
+            };
+            let has_col = |table: &str, col: &str| -> bool {
+                tx.prepare(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                    > 0
+            };
+            if table_exists("drafts") && !has_col("drafts", "revision") {
+                tx.execute_batch(
+                    "ALTER TABLE drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            Ok(())
+        }),
+        // ── Migration 12: draft operation lease token ────────────────────
+        // Opaque owner token for the durable `sending`/`syncing` claims.
+        // Claim primitives generate it; mark-sent/release/finalize require
+        // id + token, so a non-owner can neither finalize nor release another
+        // actor's claim. NULL means no active lease (the token is cleared on
+        // every terminal/released transition). Additive; existing rows —
+        // including any legacy stranded `sending` rows — start with NULL and
+        // stay inert until repaired.
+        M::up_with_hook("", |tx: &Transaction| {
+            let table_exists = |table: &str| -> bool {
+                tx.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .and_then(|mut s| s.query_row([table], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0
+            };
+            let has_col = |table: &str, col: &str| -> bool {
+                tx.prepare(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                    > 0
+            };
+            if table_exists("drafts") && !has_col("drafts", "operation_token") {
+                tx.execute_batch("ALTER TABLE drafts ADD COLUMN operation_token TEXT;")?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -692,6 +750,93 @@ mod tests {
     fn migrations_are_valid() {
         // rusqlite_migration validates that migrations are well-formed
         migrations().validate().unwrap();
+    }
+
+    /// Regression for migration 11: a pre-revision draft row (database created
+    /// before the revision column existed) upgrades in place and reads back as
+    /// revision 0 — the value the approval CAS and claim primitives treat as
+    /// the row's first revision.
+    #[test]
+    fn pre_revision_draft_rows_upgrade_to_revision_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE drafts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                to_addr TEXT NOT NULL,
+                cc_addr TEXT,
+                bcc_addr TEXT,
+                reply_to TEXT,
+                subject TEXT,
+                text_content TEXT,
+                html_content TEXT,
+                in_reply_to TEXT,
+                metadata TEXT,
+                attachments TEXT NOT NULL DEFAULT '[]',
+                message_id TEXT,
+                send_after TEXT,
+                snoozed_until TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                sent_at TEXT,
+                created_by TEXT,
+                imap_uid INTEGER
+            );
+            INSERT INTO drafts (id, account_id, to_addr, subject)
+                VALUES ('d-legacy', 'acc', 'to@example.net', 'Pre-revision draft');
+            PRAGMA user_version = 11;
+            ",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM drafts WHERE id = 'd-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 0, "legacy rows start at revision 0");
+    }
+
+    /// Regression for migration 12: pre-lease rows upgrade in place with a
+    /// NULL operation token — no active lease, inert until claimed anew.
+    #[test]
+    fn pre_lease_draft_rows_upgrade_with_null_operation_token() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE drafts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                to_addr TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO drafts (id, account_id, to_addr, status)
+                VALUES ('d-legacy', 'acc', 'to@example.net', 'sending');
+            PRAGMA user_version = 12;
+            ",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let token: Option<String> = conn
+            .query_row(
+                "SELECT operation_token FROM drafts WHERE id = 'd-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            token.is_none(),
+            "legacy rows (even stranded `sending` ones) carry no lease"
+        );
     }
 
     #[test]

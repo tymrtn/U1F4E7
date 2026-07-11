@@ -42,6 +42,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # HTTP client (List-Unsubscribe)
 reqwest.workspace = true
 
+# URL parsing (SSRF guard for webhook targets)
+url.workspace = true
+
 # DNS discovery
 hickory-resolver.workspace = true
 

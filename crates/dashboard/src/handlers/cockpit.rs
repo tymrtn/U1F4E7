@@ -23,7 +23,8 @@ pub async fn get(
     State(state): State<AppState>,
     Query(query): Query<CockpitQuery>,
 ) -> impl IntoResponse {
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    // Snooze/schedule rows are stored in UTC; `now` must share that frame.
+    let now = crate::timefmt::utc_now_string();
     let db = state.db.lock().await;
     match build_cockpit_json(&db, query.account_id.as_deref(), &now) {
         Ok(payload) => Json(payload).into_response(),
@@ -39,7 +40,7 @@ pub async fn get_for_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = crate::timefmt::utc_now_string();
     let db = state.db.lock().await;
     match build_cockpit_json(&db, Some(&account_id), &now) {
         Ok(payload) => Json(payload).into_response(),
@@ -131,9 +132,15 @@ fn build_cockpit_json(db: &Database, account_id: Option<&str>, now: &str) -> Sto
         (_, Some(id)) => db.list_snoozed(Some(id))?,
         (_, None) => db.list_snoozed(None)?,
     };
+    let now_utc = crate::timefmt::parse_utc(now);
     let due_snoozes: Vec<_> = all_snoozes
         .iter()
-        .filter(|item| item.return_at.as_str() <= now)
+        .filter(|item| {
+            matches!(
+                (crate::timefmt::parse_utc(&item.return_at), now_utc),
+                (Some(r), Some(n)) if r <= n
+            )
+        })
         .cloned()
         .collect();
 

@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email"
-version = "0.12.7"
+version = "0.12.8"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -920,12 +920,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "envelope-email-dashboard"
-version = "0.12.7"
+version = "0.12.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -949,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-store"
-version = "0.12.7"
+version = "0.12.8"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -974,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-transport"
-version = "0.12.7"
+version = "0.12.8"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -998,6 +999,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "url",
  "uuid",
  "webpki-roots 0.26.11",
  "zip",

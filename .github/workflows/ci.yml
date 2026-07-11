@@ -83,6 +83,61 @@ jobs:
           fi
           echo "Got expected exit code 2"
 
+  web:
+    name: Web frontend (SPA bundle drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: crates/dashboard/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: crates/dashboard/web
+        run: npm ci
+
+      - name: Run tests
+        working-directory: crates/dashboard/web
+        run: npm test
+
+      - name: Build SPA bundle
+        working-directory: crates/dashboard/web
+        run: npm run build
+
+      - name: Verify committed bundle matches sources
+        # The bundle is embedded via rust-embed and must be committed.
+        # A dirty tree here means someone rebuilt without committing the output.
+        # We check both modified tracked files and new untracked files under build/.
+        run: |
+          if ! git diff --quiet -- crates/dashboard/web/build \
+             || [[ -n "$(git ls-files --others --exclude-standard -- crates/dashboard/web/build)" ]]; then
+            echo "ERROR: crates/dashboard/web/build/ is out of date after building." >&2
+            echo "       The committed SPA bundle does not match the sources." >&2
+            echo "       Rebuild and commit:" >&2
+            echo "         cd crates/dashboard/web && npm run build" >&2
+            echo "         git add crates/dashboard/web/build && git commit" >&2
+            echo "" >&2
+            echo "Changed/new files:" >&2
+            git status --porcelain -- crates/dashboard/web/build >&2
+            exit 1
+          fi
+          echo "OK: committed bundle matches sources."
+
+  actionlint:
+    name: Lint GitHub Actions workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color /github/workspace/.github/workflows/ci.yml /github/workspace/.github/workflows/release.yml
+
   security-grep:
     name: Governor architecture guard
     runs-on: ubuntu-latest
