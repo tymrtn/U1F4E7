@@ -56,8 +56,8 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 # Interactive (prompts for password on stderr — do not pipe when using this form)
 envelope accounts add --email you@gmail.com
 
-# Non-interactive (CI, scripts, headless VPS — --password required)
-envelope accounts add --email you@gmail.com --password <app-password>
+# Non-interactive (CI, scripts, headless VPS — opt into stdin explicitly)
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@gmail.com --password-stdin
 ```
 
 Envelope auto-discovers IMAP and SMTP servers from the email domain via DNS.

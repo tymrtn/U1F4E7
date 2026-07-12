@@ -50,9 +50,9 @@ fn seeded_state() -> AppState {
     let pending = db
         .create_draft(
             "acc1",
-            "buyer@example.com",
+            "approval-private@example.test",
             Some("Review me"),
-            Some("body"),
+            Some("approval-private-body"),
             None,
             None,
             None,
@@ -170,8 +170,11 @@ async fn agents_endpoint_returns_roster_and_approval_queue_without_imap() {
     assert_eq!(json["agents"][0]["activity"]["event_count"], 1);
     assert_eq!(json["summary"]["awaiting_approval"], 1);
     assert_eq!(json["approval_queue"][0]["source"], "mcp");
-    // Never leak the token hash across the wire.
-    assert!(!serde_json::to_string(&json).unwrap().contains("token_hash"));
+    // Aggregate queues expose workflow metadata only, never secrets or email content.
+    let serialized = serde_json::to_string(&json).unwrap();
+    assert!(!serialized.contains("token_hash"));
+    assert!(!serialized.contains("approval-private@example.test"));
+    assert!(!serialized.contains("approval-private-body"));
 }
 
 #[tokio::test]

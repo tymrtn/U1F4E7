@@ -88,6 +88,13 @@ impl AuthConfig {
         self.token.is_none() && !self.tailscale_allow.is_empty()
     }
 
+    /// True when authorization can succeed from a Tailscale identity header.
+    /// Such headers are only trustworthy when `tailscale serve` injects them
+    /// onto a loopback listener.
+    pub fn has_tailscale_identity_allowlist(&self) -> bool {
+        !self.tailscale_allow.is_empty()
+    }
+
     /// Build from explicit parts. Empty/whitespace token is treated as unset;
     /// allowlist entries are trimmed and lowercased for case-insensitive match.
     pub fn from_parts(
@@ -409,6 +416,14 @@ mod tests {
         assert!(!AuthConfig::from_parts(Some("t".into()), ["a@b".to_string()]).is_identity_only());
         assert!(!AuthConfig::from_parts(Some("t".into()), []).is_identity_only());
         assert!(!AuthConfig::disabled().is_identity_only());
+        assert!(
+            AuthConfig::from_parts(None, ["a@b".to_string()]).has_tailscale_identity_allowlist()
+        );
+        assert!(
+            AuthConfig::from_parts(Some("t".into()), ["a@b".to_string()])
+                .has_tailscale_identity_allowlist()
+        );
+        assert!(!AuthConfig::from_parts(Some("t".into()), []).has_tailscale_identity_allowlist());
     }
 
     #[test]

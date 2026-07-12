@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-07-11
+
+### Security
+
+- **No automatic retry after an inconclusive SMTP failure.** Scheduled sends
+  now park in `delivery_uncertain` when SMTP returns any error, because a
+  dropped final acknowledgement cannot prove that the remote server rejected
+  the message. An operator must reconcile delivery before discarding the draft.
+- **Bearer token required for broad dashboard binds.** A Tailscale identity
+  allowlist is accepted only on a loopback listener behind `tailscale serve`;
+  non-loopback binds now require a dashboard bearer token.
+- **Secrets no longer accepted as CLI arguments.** Account passwords and
+  license keys use a hidden terminal prompt or explicit `--password-stdin` /
+  `--key-stdin` input, keeping them out of process listings and shell history.
+
 ## [0.13.0] — 2026-07-10 (release candidate)
 
 Coherent v2 release candidate: the four committed v2 waves plus the uncommitted

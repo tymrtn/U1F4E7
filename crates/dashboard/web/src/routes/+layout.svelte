@@ -31,7 +31,7 @@
         </svg>
       </span>
       <span class="brand-name">Envelope</span>
-      <span class="brand-tag">v0.13.0</span>
+      <span class="brand-tag">v0.13.1</span>
     </a>
     <nav class="app-nav" aria-label="Primary navigation">
       <a class:is-active={page.url.pathname.startsWith(`${base}/mail`)} href="{base}/mail/unified">Mail</a>

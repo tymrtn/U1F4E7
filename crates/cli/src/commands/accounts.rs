@@ -16,7 +16,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
     match cmd {
         AccountsCmd::Add {
             email,
-            password,
+            password_stdin,
             name,
             smtp_host,
             imap_host,
@@ -25,7 +25,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             insecure_machine_key,
         } => add(
             &email,
-            password,
+            password_stdin,
             name,
             smtp_host,
             smtp_port,
@@ -191,7 +191,7 @@ fn emit_signature(account: &Account, json: bool, status: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn add(
     email: &str,
-    password: Option<String>,
+    password_stdin: bool,
     name: Option<String>,
     smtp_host: Option<String>,
     smtp_port: Option<u16>,
@@ -201,10 +201,7 @@ async fn add(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let password = match password {
-        Some(pw) => pw,
-        None => prompt_password("Password: ")?,
-    };
+    let password = crate::commands::secret_input::read_secret("Mailbox password", password_stdin)?;
 
     let display_name = name.unwrap_or_else(|| email.to_string());
 
@@ -615,23 +612,6 @@ fn remove(id_or_email: &str, json: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn prompt_password(prompt: &str) -> Result<String> {
-    eprint!("{prompt}");
-    io::stderr().flush()?;
-
-    let mut password = String::new();
-    io::stdin()
-        .read_line(&mut password)
-        .context("failed to read password")?;
-
-    let password = password.trim_end().to_string();
-    if password.is_empty() {
-        bail!("password cannot be empty");
-    }
-
-    Ok(password)
 }
 
 /// Read a single passphrase line from stdin with a stderr prompt.

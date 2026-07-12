@@ -458,29 +458,29 @@ pub fn auth_remediation_for_account_domain(domain: Option<&str>) -> Vec<String> 
             "Gmail requires an app password, not your Google account password.".to_string(),
             "1. Enable 2-Step Verification: https://myaccount.google.com/security".to_string(),
             "2. Create an app password: https://myaccount.google.com/apppasswords".to_string(),
-            "3. Re-run: envelope accounts add --email you@gmail.com --password <app-password>".to_string(),
+            "3. Re-run: envelope accounts add --email you@gmail.com".to_string(),
         ],
         d if d == "fastmail.com" || d.ends_with(".fastmail.com") => vec![
             "Fastmail requires an app password, not your Fastmail login password.".to_string(),
             "Create one at: https://app.fastmail.com/settings/security/devicekeys".to_string(),
-            "Re-run: envelope accounts add --email you@fastmail.com --password <app-password>".to_string(),
+            "Re-run: envelope accounts add --email you@fastmail.com".to_string(),
         ],
         d if d == "icloud.com" || d == "me.com" || d == "mac.com" => vec![
             "iCloud Mail requires an app-specific password, not your Apple ID password.".to_string(),
             "Create one at: https://appleid.apple.com (Sign-In and Security → App-Specific Passwords).".to_string(),
             "2FA must be enabled on your Apple ID first.".to_string(),
-            "Re-run: envelope accounts add --email you@icloud.com --password <app-specific-password>".to_string(),
+            "Re-run: envelope accounts add --email you@icloud.com".to_string(),
         ],
         d if d == "outlook.com" || d == "hotmail.com" || d == "live.com" || d.ends_with(".outlook.com") => vec![
             "Outlook/Hotmail requires an app password when 2FA is enabled.".to_string(),
             "Create one at: https://account.microsoft.com/security (Advanced security → App passwords).".to_string(),
-            "Re-run: envelope accounts add --email you@outlook.com --password <app-password>".to_string(),
+            "Re-run: envelope accounts add --email you@outlook.com".to_string(),
         ],
         _ => vec![
             "Use an app password, not your email login password.".to_string(),
             "Most providers (Gmail, Fastmail, iCloud, Outlook) require an app password when 2FA is enabled.".to_string(),
             "Check your provider's security settings to generate an app password, then re-run:".to_string(),
-            "  envelope accounts add --email you@example.com --password <app-password>".to_string(),
+            "  envelope accounts add --email you@example.com".to_string(),
         ],
     }
 }

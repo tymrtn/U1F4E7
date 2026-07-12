@@ -5,10 +5,12 @@
 //! per-agent identity contract. Each test runs the built binary against an
 //! isolated `HOME` so no real mailbox or DB is touched.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn envelope_bin() -> &'static str {
     env!("CARGO_BIN_EXE_envelope")
@@ -31,15 +33,87 @@ fn json_stdout(out: &std::process::Output) -> Value {
     })
 }
 
+fn write_framed(stdin: &mut ChildStdin, value: &Value) {
+    let body = serde_json::to_vec(value).expect("serialize request");
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame header");
+    stdin.write_all(&body).expect("write frame body");
+    stdin.flush().expect("flush frame");
+}
+
+fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Value {
+    let started = Instant::now();
+    let mut content_length = None;
+    loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for MCP response headers"
+        );
+        let mut line = String::new();
+        let bytes = stdout.read_line(&mut line).expect("read response header");
+        assert_ne!(bytes, 0, "EOF while reading response headers");
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
+            }
+        }
+    }
+    let mut body = vec![0; content_length.expect("Content-Length header")];
+    stdout.read_exact(&mut body).expect("read response body");
+    serde_json::from_slice(&body).expect("parse response JSON")
+}
+
+fn mcp_tool_call(home: &Path, token: &str, name: &str, arguments: Value) -> (Value, bool) {
+    let mut child = Command::new(envelope_bin())
+        .arg("mcp")
+        .env("HOME", home)
+        .env("ENVELOPE_AGENT_TOKEN", token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn MCP server");
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let stdout = child.stdout.take().expect("MCP stdout");
+    let mut stdout = BufReader::new(stdout);
+    write_framed(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }),
+    );
+    let response = read_framed(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait for MCP server");
+
+    let result = &response["result"];
+    let is_error = result["isError"].as_bool().unwrap_or(false);
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let json_text = text.strip_prefix("Error: ").unwrap_or(text);
+    (
+        serde_json::from_str(json_text).unwrap_or_else(|_| json!({ "_raw": text })),
+        is_error,
+    )
+}
+
 #[test]
 fn agent_create_list_revoke_roundtrip_via_json() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
 
     // create prints the raw token exactly once.
-    let created = run(home, &["--json", "agent", "create", "skippy"]);
-    assert!(created.status.success());
-    let created = json_stdout(&created);
+    let created_output = run(home, &["--json", "agent", "create", "skippy"]);
+    assert!(created_output.status.success());
+    let created_raw = String::from_utf8_lossy(&created_output.stdout);
+    let created = json_stdout(&created_output);
     assert_eq!(created["status"], "created");
     assert_eq!(created["name"], "skippy");
     let token = created["token"].as_str().expect("token string");
@@ -48,6 +122,11 @@ fn agent_create_list_revoke_roundtrip_via_json() {
         created["token_prefix"].as_str().unwrap(),
         &token[..15],
         "token_prefix must be the first 15 chars of the token"
+    );
+    assert_eq!(
+        created_raw.matches(token).count(),
+        1,
+        "the raw agent token must appear exactly once in its creation response"
     );
 
     // list shows the agent, active, and NEVER a token or hash.
@@ -74,6 +153,66 @@ fn agent_create_list_revoke_roundtrip_via_json() {
     assert_eq!(json_stdout(&revoked)["status"], "revoked");
     let after = json_stdout(&run(home, &["--json", "agent", "show", "skippy"]));
     assert_eq!(after["status"], "revoked");
+}
+
+#[test]
+fn agent_token_enforces_policy_and_revocation_at_mcp_startup() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+
+    let created = json_stdout(&run(home, &["--json", "agent", "create", "policy-agent"]));
+    let token = created["token"].as_str().expect("agent token");
+
+    let configured = run(
+        home,
+        &[
+            "agent",
+            "policy",
+            "set",
+            "policy-agent",
+            "--allow-accounts",
+            "*",
+            "--allow-folders",
+            "*",
+            "--allow-actions",
+            "accounts.list",
+            "--send-mode-ceiling",
+            "draft-only",
+        ],
+    );
+    assert!(configured.status.success(), "policy setup failed");
+
+    let (allowed, is_error) = mcp_tool_call(home, token, "accounts", json!({}));
+    assert!(!is_error, "allowed MCP tool must succeed: {allowed}");
+    assert!(
+        allowed.is_array(),
+        "accounts tool returns an array: {allowed}"
+    );
+
+    let (denied, is_error) = mcp_tool_call(home, token, "inbox", json!({ "account": "any" }));
+    assert!(is_error, "disallowed MCP tool must be rejected: {denied}");
+    assert_eq!(denied["code"], "agent_policy_denied_action");
+
+    assert!(
+        run(home, &["agent", "revoke", "policy-agent"])
+            .status
+            .success()
+    );
+    let revoked = Command::new(envelope_bin())
+        .arg("mcp")
+        .env("HOME", home)
+        .env("ENVELOPE_AGENT_TOKEN", token)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run revoked MCP server");
+    assert!(
+        !revoked.status.success(),
+        "revoked token must fail MCP startup"
+    );
+    assert!(
+        !String::from_utf8_lossy(&revoked.stderr).contains(token),
+        "revocation failure must not echo the token"
+    );
 }
 
 #[test]

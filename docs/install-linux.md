@@ -62,8 +62,8 @@ printf '%s' 'your-long-random-passphrase' > ~/.config/envelope-email/passphrase
 # 2. Point Envelope at it
 export ENVELOPE_MASTER_PASSPHRASE_FILE="$HOME/.config/envelope-email/passphrase"
 
-# 3. Add an account (non-interactive — --password required when stdin is not a TTY)
-envelope accounts add --email you@example.com --password <app-password>
+# 3. Add an account (non-interactive — opt into stdin explicitly)
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@example.com --password-stdin
 
 # 4. Verify
 envelope quickstart

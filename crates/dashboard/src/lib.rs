@@ -122,8 +122,8 @@ pub async fn serve_with_backend_and_options(
 }
 
 /// Start the dashboard server with full configuration, including bind address
-/// and authentication policy. Fails closed: a non-loopback bind with no auth
-/// method configured is rejected before the listener opens.
+/// and authentication policy. Fails closed: a non-loopback bind without a
+/// bearer token is rejected before the listener opens.
 pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
     let ServeConfig {
         port,
@@ -133,34 +133,7 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
         auth,
     } = cfg;
 
-    // `is_loopback()` returns false for IPv4-mapped IPv6 loopback
-    // (`::ffff:127.0.0.1`), so such a bind is intentionally treated as
-    // non-loopback and requires auth — the safe direction. Do not "fix" this to
-    // treat mapped loopback as loopback; it would loosen the guard.
-    if !bind.is_loopback() && !auth.is_enforced() {
-        anyhow::bail!(
-            "refusing to bind {bind}:{port} with no authentication. The dashboard \
-             mutates real mailboxes; exposing it beyond loopback without a credential \
-             would let any reachable host read and send mail. Set a token \
-             (ENVELOPE_DASHBOARD_TOKEN or `envelope config set dashboard.auth_token <token>`), \
-             or a Tailscale identity allowlist (dashboard.tailscale_allow), before \
-             binding a non-loopback address. To keep it local, drop --bind (defaults to 127.0.0.1)."
-        );
-    }
-
-    // Identity-only auth trusts the `Tailscale-User-Login` header, which any
-    // process that can reach the bound port could forge. That is safe only when
-    // the port is fronted by `tailscale serve` (loopback bind). On a broad bind
-    // the header is forgeable by any reachable host — warn and recommend a token.
-    if !bind.is_loopback() && auth.is_identity_only() {
-        eprintln!(
-            "warning: identity-only auth on a non-loopback bind ({bind}). The \
-             Tailscale-User-Login header is forgeable by anything that can reach \
-             this port. Prefer a bearer token (dashboard.auth_token) for broad \
-             binds, and reserve the identity allowlist for a loopback bind fronted \
-             by `tailscale serve`."
-        );
-    }
+    validate_dashboard_bind(bind, port, &auth)?;
 
     let db = Database::open_default().map_err(|e| anyhow::anyhow!("{e}"))?;
     let state = AppState::new(db, backend).with_auth(auth);
@@ -233,6 +206,43 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("server error: {e}"))
+}
+
+/// Validate the dashboard exposure boundary before opening a listener.
+///
+/// `is_loopback()` returns false for IPv4-mapped IPv6 loopback
+/// (`::ffff:127.0.0.1`), so such a bind is intentionally treated as
+/// non-loopback and requires a bearer token. Do not loosen this guard: a
+/// Tailscale identity header is only trustworthy when `tailscale serve` adds
+/// it to a loopback listener.
+fn validate_dashboard_bind(bind: IpAddr, port: u16, auth: &AuthConfig) -> anyhow::Result<()> {
+    if bind.is_loopback() {
+        return Ok(());
+    }
+
+    if !auth.is_enforced() {
+        anyhow::bail!(
+            "refusing to bind {bind}:{port} with no authentication. The dashboard \
+             mutates real mailboxes; exposing it beyond loopback without a credential \
+             would let any reachable host read and send mail. Set a bearer token \
+             (ENVELOPE_DASHBOARD_TOKEN or `envelope config set dashboard.auth_token <token>`) \
+             before binding a non-loopback address. To keep it local, drop --bind \
+             (defaults to 127.0.0.1)."
+        );
+    }
+
+    if auth.has_tailscale_identity_allowlist() {
+        anyhow::bail!(
+            "refusing to bind {bind}:{port} with a Tailscale identity allowlist. The \
+             Tailscale-User-Login header is forgeable by anything that can reach a broad \
+             listener, even when a bearer token is also configured. Keep the dashboard on \
+             loopback behind `tailscale serve`, or remove dashboard.tailscale_allow and use \
+             a bearer token (ENVELOPE_DASHBOARD_TOKEN or `envelope config set \
+             dashboard.auth_token <token>`) for a non-loopback bind."
+        );
+    }
+
+    Ok(())
 }
 
 /// Build the dashboard router (HTML shell, static assets, and the `/api`
@@ -773,8 +783,9 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(
-                    "scheduled send: SMTP failed for draft {} (recipient_count={}): {e} — \
-                     releasing claim for retry",
+                    "scheduled send: SMTP result is inconclusive for draft {} \
+                     (recipient_count={}): {e} — parking as delivery_uncertain to \
+                     prevent an automatic duplicate",
                     draft.id,
                     recipient_count_for_log(
                         &draft.to_addr,
@@ -782,21 +793,18 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                         draft.bcc_addr.as_deref()
                     )
                 );
-                // SMTP was NOT accepted: releasing back to `draft` (due again)
-                // is safe and preserves the pre-claim retry behavior.
-                release_claim(
-                    state,
-                    &draft.id,
-                    &lease,
-                    envelope_email_store::DraftStatus::Draft,
-                )
-                .await;
+                // SMTP errors can occur after the server accepts DATA but before
+                // the client receives its final acknowledgement. No error variant
+                // proves non-delivery, so retries would risk a duplicate message.
+                // Keep the draft terminal until an operator reconciles delivery.
+                let db = state.db.lock().await;
+                park_delivery_uncertain(&db, &draft.id, &lease, "an inconclusive SMTP result");
                 state
                     .events
                     .publish(crate::events::DashboardEvent::SendStatus {
                         account_id: draft.account_id.clone(),
                         draft_id: draft.id.clone(),
-                        outcome: "failed",
+                        outcome: "delivery_uncertain",
                         governor_decision: Some(gov_outcome.decision.clone()),
                         governor_block_code: None,
                     });
@@ -808,10 +816,10 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
 }
 
 /// Release a sweep claim into `to`, logging (but never panicking on) failure.
-/// Only ever called BEFORE SMTP acceptance or for the anti-duplicate park — a
-/// transmitted draft leaves the claim exclusively via `mark_draft_sent`. If
-/// the release itself fails, the row stays `sending`: stranded but inert, and
-/// never re-selected for a duplicate transmission.
+/// Only ever called before SMTP acceptance. A transmitted or inconclusive
+/// delivery leaves the claim through `park_delivery_uncertain` or
+/// `mark_draft_sent`. If the release fails, the row stays `sending`: stranded
+/// but inert, and never re-selected for a duplicate transmission.
 async fn release_claim(
     state: &AppState,
     draft_id: &str,
@@ -939,6 +947,39 @@ enum SentPersistence {
     Unrecorded { parked: bool },
 }
 
+/// Terminally park a claimed draft when delivery may have occurred.
+///
+/// This is intentionally distinct from `release_claim`: `park_delivery_uncertain`
+/// atomically clears both the lease and `send_after`, ensuring an inconclusive
+/// SMTP attempt cannot remain presented as scheduled or become resendable.
+fn park_delivery_uncertain(db: &Database, draft_id: &str, lease: &str, cause: &str) -> bool {
+    match db.park_delivery_uncertain(draft_id, lease) {
+        Ok(true) => {
+            tracing::error!(
+                "scheduled send: draft {draft_id} parked as delivery_uncertain after {cause}. \
+                 Reconcile explicitly: verify delivery (Sent folder / recipient), then discard \
+                 the draft. It will never be re-sent automatically."
+            );
+            true
+        }
+        Ok(false) => {
+            tracing::error!(
+                "scheduled send: draft {draft_id} park after {cause} matched no owned \
+                 `sending` row"
+            );
+            false
+        }
+        Err(park_err) => {
+            tracing::error!(
+                "scheduled send: draft {draft_id} could not be parked after {cause}: \
+                 {park_err} — it remains claimed as `sending` (never due, never re-sent) \
+                 until repaired"
+            );
+            false
+        }
+    }
+}
+
 /// Persist the sent state for a draft whose SMTP transmission was accepted.
 ///
 /// A `mark_draft_sent` failure is dangerous in both directions: reporting
@@ -964,32 +1005,8 @@ fn persist_sent_state(
                 "scheduled send: draft {draft_id} was transmitted but sent-state \
                  persistence failed: {e}"
             );
-            let parked = match db.park_delivery_uncertain(draft_id, lease) {
-                Ok(true) => {
-                    tracing::error!(
-                        "scheduled send: draft {draft_id} parked as delivery_uncertain — \
-                         the message WAS transmitted but its sent state is unrecorded. \
-                         Reconcile explicitly: verify delivery (Sent folder / recipient), \
-                         then discard the draft. It will never be re-sent automatically."
-                    );
-                    true
-                }
-                Ok(false) => {
-                    tracing::error!(
-                        "scheduled send: draft {draft_id} park after unrecorded send \
-                         matched no owned `sending` row"
-                    );
-                    false
-                }
-                Err(park_err) => {
-                    tracing::error!(
-                        "scheduled send: draft {draft_id} could not be parked after \
-                         unrecorded send: {park_err} — it remains claimed as `sending` \
-                         (never due, never re-sent) until repaired"
-                    );
-                    false
-                }
-            };
+            let parked =
+                park_delivery_uncertain(db, draft_id, lease, "sent-state persistence failure");
             SentPersistence::Unrecorded { parked }
         }
     }
@@ -1297,6 +1314,25 @@ mod tests {
     use axum::http::Request;
     use envelope_email_store::{CredentialBackend, Database};
     use tower::ServiceExt;
+
+    #[test]
+    fn broad_bind_requires_a_bearer_token() {
+        let broad = "0.0.0.0".parse().unwrap();
+        let identity_only = AuthConfig::from_parts(None, ["operator@tailnet.ts.net".to_string()]);
+        let token_and_identity = AuthConfig::from_parts(
+            Some("dashboard-token".to_string()),
+            ["operator@tailnet.ts.net".to_string()],
+        );
+        let token = AuthConfig::from_parts(Some("dashboard-token".to_string()), []);
+
+        assert!(validate_dashboard_bind(broad, 3141, &AuthConfig::disabled()).is_err());
+        assert!(validate_dashboard_bind(broad, 3141, &identity_only).is_err());
+        assert!(validate_dashboard_bind(broad, 3141, &token_and_identity).is_err());
+        assert!(validate_dashboard_bind(broad, 3141, &token).is_ok());
+        assert!(
+            validate_dashboard_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), 3141, &identity_only).is_ok()
+        );
+    }
 
     fn test_state() -> (AppState, String, String) {
         let db = Database::open_memory().unwrap();
@@ -1800,6 +1836,68 @@ mod tests {
         let sent = db.get_draft(&fresh.id).unwrap().unwrap();
         assert_eq!(sent.status, DraftStatus::Sent);
         assert!(sent.sent_at.is_some());
+    }
+
+    #[test]
+    fn inconclusive_smtp_result_clears_the_scheduled_delivery_state() {
+        use envelope_email_store::DraftStatus;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, \
+                 imap_host, imap_port, encrypted_password) \
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com', \
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Queued"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let lease = db
+            .claim_draft_for_sending(&draft.id, draft.revision)
+            .unwrap()
+            .expect("due draft is claimed before SMTP");
+
+        assert!(park_delivery_uncertain(
+            &db,
+            &draft.id,
+            &lease,
+            "a simulated SMTP error"
+        ));
+
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(parked.status, DraftStatus::DeliveryUncertain);
+        assert!(parked.send_after.is_none(), "terminal park clears schedule");
+        let operation_token: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT operation_token FROM drafts WHERE id = ?1",
+                [&draft.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(operation_token.is_none(), "terminal park clears lease");
+        assert!(
+            !db.list_drafts_due_for_send()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.id == draft.id),
+            "an inconclusive SMTP attempt must not remain visible as due"
+        );
     }
 
     /// When even the anti-duplicate park fails, the outcome must say so —

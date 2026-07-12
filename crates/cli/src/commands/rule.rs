@@ -43,8 +43,7 @@ fn parse_action(s: &str) -> Result<Action> {
                 // SSRF guard: reject private/reserved/loopback/link-local
                 // webhook targets before the URL is ever persisted.
                 envelope_email_transport::url_guard::check_public_url(arg)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .context("webhook action URL rejected")?;
+                    .map_err(|e| anyhow::anyhow!("webhook action URL rejected: {e}"))?;
                 Ok(Action::Webhook(arg.to_string()))
             }
             "reject" => Ok(Action::Reject(arg.to_string())),

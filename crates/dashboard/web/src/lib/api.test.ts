@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EnvelopeApiError, request, resetCsrf } from './api';
 
+type FetchCall = [RequestInfo | URL, RequestInit?];
+
+function fetchCalls(fetchImpl: { mock: { calls: unknown[][] } }): FetchCall[] {
+  return fetchImpl.mock.calls as unknown as FetchCall[];
+}
+
 /** Build a minimal Response-like object for a mocked fetch. */
 function jsonResponse(body: unknown, init: { status?: number } = {}): Response {
   const status = init.status ?? 200;
@@ -27,10 +33,10 @@ describe('request() CSRF handling', () => {
     await request('/accounts', { fetchImpl });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-    const [url] = fetchImpl.mock.calls[0];
+    const [url] = fetchCalls(fetchImpl)[0]!;
     expect(url).toBe('/api/accounts');
     // No /api/csrf call for a read.
-    expect(fetchImpl.mock.calls.some(([u]) => String(u).includes('/api/csrf'))).toBe(false);
+    expect(fetchCalls(fetchImpl).some(([u]) => String(u).includes('/api/csrf'))).toBe(false);
   });
 
   it('primes the token and attaches X-Envelope-CSRF on POST', async () => {
@@ -43,14 +49,14 @@ describe('request() CSRF handling', () => {
 
     await request('/messages/unified/refresh', { method: 'POST', fetchImpl });
 
-    const csrfCall = fetchImpl.mock.calls.find(([u]) => String(u).includes('/api/csrf'));
+    const csrfCall = fetchCalls(fetchImpl).find(([u]) => String(u).includes('/api/csrf'));
     expect(csrfCall).toBeTruthy();
 
-    const mutatingCall = fetchImpl.mock.calls.find(([u]) =>
+    const mutatingCall = fetchCalls(fetchImpl).find(([u]) =>
       String(u).includes('/messages/unified/refresh')
     );
     expect(mutatingCall).toBeTruthy();
-    const init = mutatingCall![1] as RequestInit;
+    const init = mutatingCall![1]!;
     const headers = init.headers as Record<string, string>;
     expect(headers['X-Envelope-CSRF']).toBe('tok-abc');
     expect(init.method).toBe('POST');
@@ -65,7 +71,7 @@ describe('request() CSRF handling', () => {
     await request('/a', { method: 'POST', fetchImpl });
     await request('/b', { method: 'POST', fetchImpl });
 
-    const csrfCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes('/api/csrf'));
+    const csrfCalls = fetchCalls(fetchImpl).filter(([u]) => String(u).includes('/api/csrf'));
     expect(csrfCalls.length).toBe(1);
   });
 
@@ -90,9 +96,9 @@ describe('request() CSRF handling', () => {
     // Minted twice: initial prime + re-prime after the 403.
     expect(mintCount).toBe(2);
     // The POST was retried, and the retry carried the fresh token.
-    const postCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes('/send'));
+    const postCalls = fetchCalls(fetchImpl).filter(([u]) => String(u).includes('/send'));
     expect(postCalls.length).toBe(2);
-    const retryHeaders = (postCalls[1][1] as RequestInit).headers as Record<string, string>;
+    const retryHeaders = postCalls[1]![1]!.headers as Record<string, string>;
     expect(retryHeaders['X-Envelope-CSRF']).toBe('tok-2');
   });
 
@@ -106,7 +112,7 @@ describe('request() CSRF handling', () => {
       code: 'forbidden_other',
       status: 403
     });
-    const postCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes('/x'));
+    const postCalls = fetchCalls(fetchImpl).filter(([u]) => String(u).includes('/x'));
     expect(postCalls.length).toBe(1);
   });
 
@@ -115,8 +121,14 @@ describe('request() CSRF handling', () => {
       jsonResponse({ code: 'dashboard_auth_required', error: 'unauthorized' }, { status: 401 })
     );
 
-    const err = await request('/accounts', { fetchImpl }).catch((e) => e);
+    const err = await request('/accounts', { fetchImpl }).then(
+      () => {
+        throw new Error('expected request to fail');
+      },
+      (error: unknown) => error
+    );
     expect(err).toBeInstanceOf(EnvelopeApiError);
+    if (!(err instanceof EnvelopeApiError)) throw new Error('expected EnvelopeApiError');
     expect(err.code).toBe('dashboard_auth_required');
     expect(err.status).toBe(401);
   });

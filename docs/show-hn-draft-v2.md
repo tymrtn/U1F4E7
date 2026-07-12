@@ -18,7 +18,7 @@ https://github.com/tymrtn/envelope-email-rs
 
 I built Envelope because I wanted an email client that treated the terminal as a first-class interface — not a TUI you navigate with arrow keys, but a CLI you pipe through `jq`.
 
-**What it does:** Envelope turns any IMAP/SMTP mailbox into a programmable interface. Add an account with `envelope-email accounts add --email you@gmail.com --password <app-password>` and it auto-discovers your IMAP/SMTP servers via DNS (SRV records → MX lookup → common patterns). No config file. No TOML. Just email and password.
+**What it does:** Envelope turns any IMAP/SMTP mailbox into a programmable interface. Add an account with `envelope-email accounts add --email you@gmail.com` and it auto-discovers your IMAP/SMTP servers via DNS (SRV records → MX lookup → common patterns). No config file. No TOML. Just email and password.
 
 Every command supports `--json`:
 

@@ -19,7 +19,7 @@ So I built **Envelope** — a Rust CLI email client where your mailbox IS the ba
 brew install tymrtn/tap/envelope-email
 
 # Add your mailbox (auto-discovers IMAP/SMTP via DNS)
-envelope-email accounts add --email you@yourdomain.com --password <password>
+envelope-email accounts add --email you@yourdomain.com
 
 # Done. Read your mail.
 envelope-email inbox

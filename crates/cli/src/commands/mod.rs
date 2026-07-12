@@ -35,6 +35,7 @@ pub mod read;
 pub mod rule;
 pub mod scheduled;
 pub mod search;
+pub mod secret_input;
 pub mod send;
 pub mod serve;
 pub mod snooze;

@@ -2,8 +2,9 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
@@ -22,8 +23,27 @@ fn run_envelope(home: &Path, args: &[&str]) -> std::process::Output {
         .expect("run envelope")
 }
 
+fn run_envelope_with_stdin(home: &Path, args: &[&str], input: &str) -> std::process::Output {
+    let mut child = Command::new(envelope_bin())
+        .args(args)
+        .env("ENVELOPE_MASTER_KEY", "test-master-key-quickstart-smoke")
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn envelope");
+    child
+        .stdin
+        .as_mut()
+        .expect("envelope stdin")
+        .write_all(format!("{input}\n").as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for envelope")
+}
+
 fn seed_account(home: &Path) {
-    let output = run_envelope(
+    let output = run_envelope_with_stdin(
         home,
         &[
             "--json",
@@ -31,8 +51,7 @@ fn seed_account(home: &Path) {
             "add",
             "--email",
             "agent@example.test",
-            "--password",
-            "test-password",
+            "--password-stdin",
             "--name",
             "Agent Test",
             "--smtp-host",
@@ -44,6 +63,7 @@ fn seed_account(home: &Path) {
             "--imap-port",
             "993",
         ],
+        "test-password",
     );
     assert!(
         output.status.success(),
