@@ -6,15 +6,16 @@ const config = {
   preprocess: vitePreprocess(),
   kit: {
     // SPA mode: no server, every route falls back to index.html so the axum
-    // /v2 mount can serve one shell and let the client router take over.
+    // dashboard can serve one shell and let the client router take over.
     adapter: adapter({
       fallback: 'index.html',
       precompress: false
     }),
-    // Mounted under /v2 by the dashboard. All asset URLs and links are
-    // rewritten with this prefix at build time.
+    // Served at the site root by the dashboard (v2 is the dashboard as of
+    // 1.0.0 — the old /v2 mount and the v1 static dashboard are gone). Empty
+    // base keeps every asset URL and link root-relative.
     paths: {
-      base: '/v2',
+      base: '',
       relative: false
     }
   }

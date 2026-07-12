@@ -26,15 +26,15 @@ mod ui_paths;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use axum::Router;
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
 use envelope_email_store::{CredentialBackend, Database};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
-use crate::assets::{Assets, WebAssets};
+use crate::assets::WebAssets;
 use crate::auth::AuthConfig;
 use crate::state::AppState;
 
@@ -408,30 +408,21 @@ pub fn dashboard_router(state: AppState) -> Router {
         // Health / build identity (drift detection, issue #46). Unauthenticated
         // callers get a minimal liveness payload; authorized callers get paths.
         .route("/health", get(handlers::health::get))
-        .merge(protected);
+        .merge(protected)
+        // Unmatched `/api/*` paths return JSON 404, not the SPA shell — the
+        // root fallback below would otherwise serve HTML for a bad API call.
+        .fallback(api_not_found);
 
+    // ── Envelope v2 webmail (SvelteKit SPA, adapter-static) ──
+    // As of 1.0.0 the v2 webmail IS the dashboard: it serves at `/`, and the
+    // root fallback returns embedded `web/build/` assets or the SPA shell for
+    // client-side routes (`/cockpit`, `/rules`, `/mail/...`) built with
+    // `paths.base = ''`. The old v1 static dashboard and its `/v2` mount are
+    // gone. CLI/MCP `ui` deep links resolve through the same SPA shell.
     Router::new()
-        .route("/", get(index_page))
-        // Frontend deep links emitted by CLI/MCP `ui` metadata. These must
-        // serve the SPA shell, not 404, so links like
-        // `/accounts/<id>/messages/<uid>?folder=INBOX` open cleanly. Legacy
-        // back-compat paths without the `/accounts/` prefix are kept too.
-        .route("/{account}/drafts/{draft_id}", get(index_page))
-        .route("/accounts/{account}/drafts/{draft_id}", get(index_page))
-        .route("/{account}/cockpit", get(index_page))
-        .route("/accounts/{id}/cockpit", get(index_page))
-        .route("/accounts/{id}/rules", get(index_page))
-        .route("/accounts/{id}/messages/{uid}", get(index_page))
-        .route("/static/{*path}", get(static_asset))
-        // ── Envelope v2 webmail (SvelteKit SPA, adapter-static) ──
-        // The v1 dashboard above stays at `/`. v2 mounts under `/v2` and serves
-        // its own committed `web/build/` bundle with SPA fallback: any `/v2/...`
-        // path that isn't a real embedded asset returns the SPA `index.html` so
-        // the client-side router (built with `paths.base = '/v2'`) can take over.
-        .route("/v2", get(v2_index))
-        .route("/v2/", get(v2_index))
-        .route("/v2/{*path}", get(v2_asset))
+        .route("/", get(spa_shell))
         .nest("/api", api)
+        .fallback(spa_fallback)
         .with_state(state)
 }
 
@@ -1226,42 +1217,10 @@ fn decode_scheduled_attachments(
     Ok(out)
 }
 
-// ── Static asset serving ─────────────────────────────────────────────
-
-async fn index_page() -> Response {
-    match Assets::get_file("index.html") {
-        Some(bytes) => {
-            let html = String::from_utf8_lossy(&bytes)
-                .replace("__ENVELOPE_VERSION__", env!("CARGO_PKG_VERSION"));
-            Html(html).into_response()
-        }
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "index.html missing from embedded assets",
-        )
-            .into_response(),
-    }
-}
-
-async fn static_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    match Assets::get_file(&path) {
-        Some(bytes) => {
-            let content_type = mime_guess::from_path(&path)
-                .first_or_octet_stream()
-                .to_string();
-            Response::builder()
-                .header(header::CONTENT_TYPE, content_type)
-                .body(axum::body::Body::from(bytes))
-                .unwrap()
-        }
-        None => (StatusCode::NOT_FOUND, format!("asset not found: {path}")).into_response(),
-    }
-}
-
 // ── Envelope v2 webmail SPA serving ──────────────────────────────────
 
-/// Serve the v2 SPA shell (`web/build/index.html`).
-async fn v2_index() -> Response {
+/// Serve the v2 SPA shell (`web/build/index.html`) — the dashboard entry point.
+async fn spa_shell() -> Response {
     match WebAssets::get_file("index.html") {
         Some(bytes) => Html(String::from_utf8_lossy(&bytes).into_owned()).into_response(),
         None => (
@@ -1272,12 +1231,15 @@ async fn v2_index() -> Response {
     }
 }
 
-/// Serve a `/v2/*` asset. Real embedded assets are returned with their guessed
-/// content type; anything else falls back to the SPA `index.html` so
-/// client-side routes (e.g. `/v2/kitchen-sink`) resolve instead of 404ing.
-async fn v2_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    if let Some(bytes) = WebAssets::get_file(&path) {
-        let content_type = mime_guess::from_path(&path)
+/// Root fallback: return a real embedded `web/build/` asset by request path
+/// (e.g. `/_app/immutable/...`, `/favicon.svg`) with its guessed content type,
+/// or the SPA shell for any client-side route (`/cockpit`, `/mail/...`) so the
+/// SvelteKit router — built with `paths.base = ''` — resolves it instead of
+/// 404ing.
+async fn spa_fallback(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if let Some(bytes) = WebAssets::get_file(path) {
+        let content_type = mime_guess::from_path(path)
             .first_or_octet_stream()
             .to_string();
         return Response::builder()
@@ -1285,8 +1247,17 @@ async fn v2_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Res
             .body(axum::body::Body::from(bytes))
             .unwrap();
     }
-    // SPA fallback: unknown path under /v2 → serve the shell.
-    v2_index().await
+    spa_shell().await
+}
+
+/// JSON 404 for unmatched `/api/*` paths (keeps API errors machine-readable
+/// instead of returning the SPA shell HTML via the root fallback).
+async fn api_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not_found" })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -2113,7 +2084,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("<title>Envelope</title>"));
-        assert!(html.contains("/static/dashboard.js"));
+        assert!(html.contains("/_app/"));
     }
 
     #[tokio::test]
@@ -2143,8 +2114,8 @@ mod tests {
                 .unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(
-                html.contains("<title>Envelope</title>") && html.contains("/static/dashboard.js"),
-                "deep link {uri} should return the dashboard SPA index"
+                html.contains("<title>Envelope</title>") && html.contains("/_app/"),
+                "deep link {uri} should return the v2 SPA shell"
             );
         }
     }
