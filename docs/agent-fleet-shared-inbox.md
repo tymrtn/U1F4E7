@@ -122,12 +122,12 @@ envelope actions tail --account you@example.com
 ## 6. License tiers and free usage
 
 - Free tier: up to 2 agent identities per account.
-- Beyond 2: `envelope license activate env-lic-<your-key>` (see commercial licensing
+- Beyond 2: `envelope license activate` (see commercial licensing
   in the README).
 
 ```bash
 envelope license status
-envelope license activate env-lic-<your-key>
+envelope license activate
 ```
 
 ---

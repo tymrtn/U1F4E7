@@ -6,7 +6,7 @@ Pre-built tarballs land with each release. On a fresh VPS:
 
 ```bash
 # Download the latest release tarball (replace VERSION and ARCH as needed)
-VERSION=0.12.7
+VERSION=1.0.0
 ARCH=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu on ARM
 curl -LO "https://github.com/tymrtn/U1F4E7/releases/download/v${VERSION}/envelope-${VERSION}-${ARCH}.tar.gz"
 tar -xzf "envelope-${VERSION}-${ARCH}.tar.gz"
@@ -62,8 +62,8 @@ printf '%s' 'your-long-random-passphrase' > ~/.config/envelope-email/passphrase
 # 2. Point Envelope at it
 export ENVELOPE_MASTER_PASSPHRASE_FILE="$HOME/.config/envelope-email/passphrase"
 
-# 3. Add an account (non-interactive — --password required when stdin is not a TTY)
-envelope accounts add --email you@example.com --password <app-password>
+# 3. Add an account (non-interactive — opt into stdin explicitly)
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@example.com --password-stdin
 
 # 4. Verify
 envelope quickstart

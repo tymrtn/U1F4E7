@@ -5,8 +5,9 @@
 //! agent-limit unlock flow. Tests run the built binary against isolated HOME
 //! directories so no real mailbox or DB is touched.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
@@ -20,6 +21,30 @@ fn run(home: &Path, args: &[&str]) -> std::process::Output {
         .env("HOME", home)
         .output()
         .expect("run envelope")
+}
+
+fn run_activate(home: &Path, json: bool, key: &str) -> std::process::Output {
+    let mut command = Command::new(envelope_bin());
+    if json {
+        command.arg("--json");
+    }
+    let mut child = command
+        .args(["license", "activate", "--key-stdin"])
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn envelope license activate");
+    child
+        .stdin
+        .as_mut()
+        .expect("license stdin")
+        .write_all(format!("{key}\n").as_bytes())
+        .expect("write license key");
+    child
+        .wait_with_output()
+        .expect("wait for license activation")
 }
 
 fn json_stdout(out: &std::process::Output) -> Value {
@@ -39,7 +64,7 @@ const VALID_KEY: &str = "env-lic-testkey1234567890";
 #[test]
 fn activate_bad_format_exits_nonzero_with_stable_code_json() {
     let temp = tempfile::tempdir().expect("temp HOME");
-    let out = run(temp.path(), &["--json", "license", "activate", "bad-key"]);
+    let out = run_activate(temp.path(), true, "bad-key");
     assert!(
         !out.status.success(),
         "bad-format key must be rejected (non-zero exit)"
@@ -62,10 +87,7 @@ fn activate_bad_format_exits_nonzero_with_stable_code_json() {
 #[test]
 fn activate_bad_format_exits_nonzero_human_output() {
     let temp = tempfile::tempdir().expect("temp HOME");
-    let out = run(
-        temp.path(),
-        &["license", "activate", "no-prefix-here-at-all!!!"],
-    );
+    let out = run_activate(temp.path(), false, "no-prefix-here-at-all!!!");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -88,7 +110,7 @@ fn activate_then_status_roundtrip_json() {
     assert_eq!(pre["activated_at"], Value::Null);
 
     // Activate with a valid key.
-    let act = run(home, &["--json", "license", "activate", VALID_KEY]);
+    let act = run_activate(home, true, VALID_KEY);
     assert!(
         act.status.success(),
         "valid key must activate successfully; stderr: {}",
@@ -139,13 +161,13 @@ fn activate_same_key_twice_is_idempotent() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
 
-    let first = run(home, &["--json", "license", "activate", VALID_KEY]);
+    let first = run_activate(home, true, VALID_KEY);
     assert!(first.status.success());
     let first_payload = json_stdout(&first);
     let first_activated_at = first_payload["activated_at"].as_str().unwrap().to_string();
 
     // Second activate with the same key must succeed and report "already_active".
-    let second = run(home, &["--json", "license", "activate", VALID_KEY]);
+    let second = run_activate(home, true, VALID_KEY);
     assert!(
         second.status.success(),
         "re-activating same key must succeed; stderr: {}",
@@ -171,11 +193,7 @@ fn deactivate_clears_license_and_reverts_to_unlicensed() {
     let home = temp.path();
 
     // Activate first.
-    assert!(
-        run(home, &["license", "activate", VALID_KEY])
-            .status
-            .success()
-    );
+    assert!(run_activate(home, false, VALID_KEY).status.success());
     assert_eq!(
         json_stdout(&run(home, &["--json", "license", "status"]))["licensed"],
         true
@@ -219,11 +237,8 @@ fn activate_never_echoes_full_key_in_output() {
 
     let secret_key = "env-lic-supersecretkey12345678";
 
-    for args in [
-        vec!["license", "activate", secret_key],
-        vec!["--json", "license", "activate", secret_key],
-    ] {
-        let out = run(home, &args);
+    for json in [false, true] {
+        let out = run_activate(home, json, secret_key);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -262,7 +277,7 @@ fn license_activate_unlocks_third_agent_create() {
     );
 
     // Activate a valid license.
-    let activated = run(home, &["--json", "license", "activate", VALID_KEY]);
+    let activated = run_activate(home, true, VALID_KEY);
     assert!(
         activated.status.success(),
         "license activate must succeed; stderr: {}",

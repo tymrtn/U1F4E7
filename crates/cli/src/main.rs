@@ -13,7 +13,7 @@ use clap::{ArgGroup, Parser, Subcommand};
     about = "Email mastery for agents. BYO mailbox — give it an email and password, it does the rest.",
     after_help = r#"GETTING STARTED
   Add an account (auto-discovers IMAP/SMTP from the domain):
-    envelope accounts add --email you@gmail.com --password <app-password>
+    envelope accounts add --email you@gmail.com
 
   Browse your inbox:
     envelope inbox
@@ -535,9 +535,10 @@ enum AccountsCmd {
         /// Email address
         #[arg(long)]
         email: String,
-        /// Password (will prompt if not given)
+        /// Read the mailbox password from stdin. Without this flag, prompts
+        /// securely on an interactive terminal.
         #[arg(long)]
-        password: Option<String>,
+        password_stdin: bool,
         /// Account display name
         #[arg(long)]
         name: Option<String>,
@@ -932,8 +933,14 @@ enum LicenseCmd {
     /// Stable error code for bad format: license_key_invalid_format.
     /// The full key is never echoed after storage.
     Activate {
-        /// License key (env-lic- prefix required, suffix >= 16 chars)
-        key: String,
+        /// Read the license key from stdin. Without this flag, prompts
+        /// securely on an interactive terminal.
+        #[arg(long)]
+        key_stdin: bool,
+        /// Legacy positional key input is accepted only to return a redacted
+        /// migration error. Never pass a secret on the command line.
+        #[arg(hide = true)]
+        legacy_key: Option<String>,
     },
     /// Show current license status
     Status,
@@ -2209,7 +2216,21 @@ fn main() {
             std::process::exit(1);
         }
         Commands::License { subcommand } => match subcommand {
-            LicenseCmd::Activate { key } => commands::license::run_activate(&key, cli.json),
+            LicenseCmd::Activate {
+                key_stdin,
+                legacy_key,
+            } => {
+                if legacy_key.is_some() {
+                    Err(anyhow::anyhow!(
+                        "license keys must not be passed on the command line; use \
+                         `envelope license activate --key-stdin` or run the command \
+                         interactively for a hidden prompt"
+                    ))
+                } else {
+                    commands::secret_input::read_secret("License key", key_stdin)
+                        .and_then(|key| commands::license::run_activate(&key, cli.json))
+                }
+            }
             LicenseCmd::Status => commands::license::run_status(cli.json),
             LicenseCmd::Deactivate => commands::license::run_deactivate(cli.json),
         },

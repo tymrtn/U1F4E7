@@ -22,18 +22,38 @@ fn run_cli(home: &std::path::Path, args: &[&str], token: Option<&str>) -> std::p
     cmd.output().expect("run envelope cli")
 }
 
+fn run_cli_with_stdin(
+    home: &std::path::Path,
+    args: &[&str],
+    token: Option<&str>,
+    input: &str,
+) -> std::process::Output {
+    let mut cmd = Command::new(envelope_bin());
+    cmd.args(args).env("HOME", home).stdin(Stdio::piped());
+    if let Some(t) = token {
+        cmd.env("ENVELOPE_AGENT_TOKEN", t);
+    }
+    let mut child = cmd.spawn().expect("spawn envelope cli");
+    child
+        .stdin
+        .as_mut()
+        .expect("envelope stdin")
+        .write_all(format!("{input}\n").as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for envelope cli")
+}
+
 /// Seed one offline account so send/reply draft paths can resolve credentials
 /// without any network. Uses the insecure machine key (test-only).
 fn seed_account(home: &std::path::Path) {
-    let out = run_cli(
+    let out = run_cli_with_stdin(
         home,
         &[
             "accounts",
             "add",
             "--email",
             "test@example.test",
-            "--password",
-            "pw",
+            "--password-stdin",
             "--smtp-host",
             "smtp.example.test",
             "--smtp-port",
@@ -46,6 +66,7 @@ fn seed_account(home: &std::path::Path) {
             "--json",
         ],
         None,
+        "pw",
     );
     assert!(out.status.success(), "seed account failed");
 }

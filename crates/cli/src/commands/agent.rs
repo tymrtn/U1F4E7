@@ -42,7 +42,7 @@ pub fn run_create(name: &str, json: bool, _backend: CredentialBackend) -> Result
                     "code": AGENT_LIMIT_CODE,
                     "reason": format!(
                         "the free tier allows up to {FREE_TIER_AGENT_LIMIT} active agents; \
-                         run `envelope license activate <key>` to add more"
+                         run `envelope license activate` to add more"
                     ),
                 },
                 "active_agents": active,
@@ -53,7 +53,7 @@ pub fn run_create(name: &str, json: bool, _backend: CredentialBackend) -> Result
             } else {
                 eprintln!(
                     "Free tier allows up to {FREE_TIER_AGENT_LIMIT} active agents \
-                     ({active} active). Run `envelope license activate <key>` to add more."
+                     ({active} active). Run `envelope license activate` to add more."
                 );
             }
             std::process::exit(1);

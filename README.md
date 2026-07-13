@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-0.12.5-green.svg" alt="v0.12.5">
+  <img src="https://img.shields.io/badge/version-1.0.0-green.svg" alt="v1.0.0">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -29,7 +29,7 @@ Your agent needs to manage email. You shouldn't need to configure DNS records, s
 **Envelope: add your email address and password. That's it. Your agent reads, sends, replies, snoozes, tags, and filters email — from your existing mailbox.**
 
 ```bash
-envelope accounts add --email you@gmail.com --password <app-password>
+envelope accounts add --email you@gmail.com
 envelope inbox --json
 ```
 
@@ -59,9 +59,8 @@ cp target/release/envelope ~/.local/bin/envelope
 
 ```bash
 # Add an account — Envelope auto-discovers IMAP/SMTP from the email domain.
-# --password is optional; omit it and Envelope prompts interactively.
-# Non-interactive contexts (CI, scripts) must pass --password explicitly.
-envelope accounts add --email you@gmail.com --password <app-password>
+# Interactive input is hidden. For non-interactive use, opt into stdin.
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@gmail.com --password-stdin
 
 # Verify setup end-to-end (paths → account → IMAP auth → inbox peek)
 envelope quickstart

@@ -25,6 +25,14 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./vitest-setup.ts'],
-    include: ['src/**/*.{test,spec}.{js,ts}']
+    include: ['src/**/*.{test,spec}.{js,ts}'],
+    // Vite's current rolldown runtime is already loaded by the test runner;
+    // optimizing it again under the browser condition tries to bundle Node's
+    // `node:module` built-in as client code.
+    deps: {
+      optimizer: {
+        client: { enabled: false }
+      }
+    }
   }
 });

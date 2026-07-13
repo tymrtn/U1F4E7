@@ -76,7 +76,7 @@ Never hard-code accounts. Discover them.
 
 ```bash
 envelope accounts list --json
-envelope accounts add --email you@example.com --password <app-password>
+envelope accounts add --email you@example.com
 envelope accounts setup-instructions --account you@example.com --client mailapp --json
 ```
 

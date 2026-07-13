@@ -202,7 +202,7 @@ pub fn run_status(json_mode: bool) -> Result<()> {
                 );
             } else {
                 println!("License: unlicensed (free tier — up to 2 active agents)");
-                println!("  Run `envelope license activate <key>` to unlock.");
+                println!("  Run `envelope license activate` to unlock.");
             }
         }
     }

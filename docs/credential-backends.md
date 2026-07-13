@@ -40,8 +40,8 @@ Prompts for the current passphrase, then a new one, and re-encrypts in place.
 ### Insecure machine key (legacy / automation fallback)
 
 ```bash
-envelope accounts add --email you@example.com \
-  --password <app-password> \
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@example.com \
+  --password-stdin \
   --insecure-machine-key
 ```
 
@@ -57,7 +57,7 @@ On macOS, pass `--credential-store keychain` to store and retrieve the master
 passphrase through the system Keychain instead of the passphrase file.
 
 ```bash
-envelope --credential-store keychain accounts add --email you@example.com --password <app-password>
+printf '%s\n' "$APP_PASSWORD" | envelope --credential-store keychain accounts add --email you@example.com --password-stdin
 envelope --credential-store keychain quickstart
 ```
 
@@ -73,7 +73,7 @@ On Linux desktop systems with GNOME Keyring or KWallet running, pass
 time (it is in release builds).
 
 ```bash
-envelope --credential-store keychain accounts add --email you@example.com --password <app-password>
+printf '%s\n' "$APP_PASSWORD" | envelope --credential-store keychain accounts add --email you@example.com --password-stdin
 ```
 
 Secret Service access requires a running D-Bus session bus. On a headless VPS with no

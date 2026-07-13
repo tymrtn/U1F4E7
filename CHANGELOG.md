@@ -69,7 +69,19 @@ full webmail dashboard for the humans in the loop.
 - **SSRF guard on webhook URLs.** Every sink (CLI rule create/edit, CLI event
   routes, dashboard rule create and update) rejects loopback/link-local/
   private/reserved/documentation targets — including cloud metadata
-  `169.254.169.254` — before the URL is persisted.
+  `169.254.169.254`, and IPv4-mapped/compatible IPv6 forms of them — before the
+  URL is persisted.
+- **No automatic retry after an inconclusive SMTP failure.** A scheduled send
+  whose SMTP attempt errors parks in `delivery_uncertain` rather than releasing
+  for retry: a dropped final acknowledgement cannot prove non-delivery, so an
+  operator must reconcile before the draft is discarded — never a silent
+  duplicate send.
+- **Secrets are never accepted as CLI arguments.** Account passwords and license
+  keys use a hidden terminal prompt or explicit `--password-stdin` / `--key-stdin`,
+  keeping them out of process listings and shell history.
+- **Bearer token required for broad dashboard binds.** A Tailscale identity
+  allowlist is honored only on a loopback listener behind `tailscale serve`;
+  any non-loopback bind requires a dashboard bearer token.
 
 ### Notes
 

@@ -117,7 +117,7 @@ pub fn agent_contract() -> Value {
             "free_tier": {
                 "max_active_agents": 2,
                 "over_limit_code": "agent_limit_license_required",
-                "behavior": "Creating more than 2 active (non-revoked) agents requires an activated license (honor-system). `envelope agent create` beyond the limit returns agent_limit_license_required and points to `envelope license activate`."
+                "behavior": "Creating more than 2 active (non-revoked) agents requires an activated license (honor-system). `envelope agent create` beyond the limit returns agent_limit_license_required and points to `envelope license activate` (hidden prompt or --key-stdin)."
             },
             "cli_commands": [
                 "envelope agent create <name>",
