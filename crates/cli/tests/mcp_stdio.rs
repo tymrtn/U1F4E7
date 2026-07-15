@@ -104,27 +104,31 @@ fn set_policy(home: &std::path::Path, name: &str, actions: &str, ceiling: &str) 
     assert!(out.status.success(), "policy set failed");
 }
 
-/// Create a local draft via the CLI (offline: IMAP sync fails, draft is saved
-/// locally) and return its id. Used to feed send_draft without any network.
+/// Seed a draft record directly in the store and return its id, feeding
+/// send_draft without any network. `draft create` now requires a live IMAP
+/// APPEND (drafts must land in the real Drafts folder), and the seed account
+/// points at an unreachable host — but the send-ceiling behavior under test is
+/// independent of the IMAP transport, so we insert the draft row directly.
 fn create_local_draft(home: &std::path::Path, to: &str) -> String {
-    let out = run_cli(
-        home,
-        &[
-            "draft",
-            "create",
-            "--to",
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let account_id: String = db
+        .conn()
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .expect("seed account id");
+    let draft = db
+        .create_draft(
+            &account_id,
             to,
-            "--subject",
-            "hi",
-            "--body",
-            "x",
-            "--json",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "draft create failed");
-    let v: Value = serde_json::from_slice(&out.stdout).expect("draft create JSON");
-    v["id"].as_str().expect("draft id").to_string()
+            Some("hi"),
+            Some("x"),
+            None,
+            None,
+            None,
+            None,
+            Some("cli"),
+        )
+        .expect("create draft record");
+    draft.id
 }
 
 /// Send one framed tools/call and return the parsed tool-result text as JSON,

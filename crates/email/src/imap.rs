@@ -360,6 +360,40 @@ pub async fn list_folders(client: &mut ImapClient) -> Result<Vec<String>, ImapEr
     Ok(folders)
 }
 
+/// Return the mailbox the server flags with the RFC 6154 SPECIAL-USE `\Drafts`
+/// attribute, if any.
+///
+/// This is the most reliable, name- and language-agnostic way to locate the
+/// Drafts folder: the server names the role directly, so a mailbox called
+/// `Brouillons`, `Entwürfe`, `[Gmail]/Drafts`, or `INBOX.Drafts` all resolve
+/// the same way without guessing. Returns `Ok(None)` on servers that don't
+/// advertise SPECIAL-USE, so callers fall back to name-based detection.
+pub async fn drafts_special_use_folder(
+    client: &mut ImapClient,
+) -> Result<Option<String>, ImapError> {
+    use async_imap::types::NameAttribute;
+    let mailboxes = client
+        .session
+        .list(Some(""), Some("*"))
+        .await
+        .map_err(|e| ImapError::Protocol(format!("LIST (special-use) failed: {e}")))?;
+
+    let mut stream = mailboxes;
+    while let Some(item) = stream.next().await {
+        let mailbox = item.map_err(|e| ImapError::Protocol(format!("LIST parse error: {e}")))?;
+        if mailbox
+            .attributes()
+            .iter()
+            .any(|attr| matches!(attr, NameAttribute::Drafts))
+        {
+            let name = mailbox.name().to_string();
+            debug!("SPECIAL-USE \\Drafts folder: {name}");
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch stats for a single folder via IMAP `STATUS (MESSAGES RECENT UNSEEN)`.
 ///
 /// Unlike `fetch_inbox`, this does NOT `SELECT` the folder (which would cause
