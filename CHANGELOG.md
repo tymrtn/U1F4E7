@@ -83,6 +83,17 @@ full webmail dashboard for the humans in the loop.
   allowlist is honored only on a loopback listener behind `tailscale serve`;
   any non-loopback bind requires a dashboard bearer token.
 
+### Fixed
+
+- **Drafts always land in the real IMAP Drafts folder.** Draft create/reply/
+  forward previously appended to IMAP only best-effort and silently fell back to
+  a local-only record (invisible to Mail.app and other clients) on any failure.
+  The append is now mandatory and fail-loud, and Envelope resolves the Drafts
+  folder itself via the RFC 6154 SPECIAL-USE `\Drafts` attribute (plus provider
+  and localized-name detection), so a folder named `Brouillons`, `INBOX/draft`,
+  or `[Gmail]/Drafts` all resolve without the agent naming it. Send-only accounts
+  with no IMAP host now error instead of creating an invisible draft.
+
 ### Notes
 
 - Send-mode names (`draft-only`, `confirm-send`, `allowlisted-send`,
