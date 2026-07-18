@@ -26,12 +26,15 @@ export default defineConfig({
     globals: true,
     setupFiles: ['./vitest-setup.ts'],
     include: ['src/**/*.{test,spec}.{js,ts}'],
-    // Vite's current rolldown runtime is already loaded by the test runner;
-    // optimizing it again under the browser condition tries to bundle Node's
-    // `node:module` built-in as client code.
+    // Vite's rolldown runtime is already loaded by the test runner; optimizing
+    // it again under the browser resolve condition tries to bundle Node's
+    // `node:module` built-in as client code, which fails on Linux CI. Disable
+    // dependency optimization for the test run entirely. (Vitest 4 renamed the
+    // `client` optimizer key to `web`; the old key was silently a no-op.)
     deps: {
       optimizer: {
-        client: { enabled: false }
+        web: { enabled: false },
+        ssr: { enabled: false }
       }
     }
   }
