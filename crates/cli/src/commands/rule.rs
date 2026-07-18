@@ -43,7 +43,8 @@ fn parse_action(s: &str) -> Result<Action> {
                 // SSRF guard: reject private/reserved/loopback/link-local
                 // webhook targets before the URL is ever persisted.
                 envelope_email_transport::url_guard::check_public_url(arg)
-                    .map_err(|e| anyhow::anyhow!("webhook action URL rejected: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("webhook action URL rejected")?;
                 Ok(Action::Webhook(arg.to_string()))
             }
             "reject" => Ok(Action::Reject(arg.to_string())),
@@ -903,9 +904,12 @@ mod tests {
     #[test]
     fn parse_action_webhook_rejects_link_local_metadata() {
         // AWS/GCP/Azure instance-metadata endpoint must be rejected.
-        let err = parse_action("webhook=http://169.254.169.254/latest/meta-data/")
-            .unwrap_err()
-            .to_string();
+        // `{:#}` renders the full anyhow chain inline (outer context + source),
+        // matching what the CLI's error printer shows the user.
+        let err = format!(
+            "{:#}",
+            parse_action("webhook=http://169.254.169.254/latest/meta-data/").unwrap_err()
+        );
         assert!(
             err.contains("rejected") && err.contains("private/reserved"),
             "unexpected error: {err}"

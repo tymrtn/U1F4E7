@@ -96,6 +96,22 @@ pub async fn detect_drafts_folder(
         return Ok(Some(cached));
     }
 
+    // SPECIAL-USE (RFC 6154): ask the server which mailbox is Drafts. Most
+    // reliable and language-agnostic — a folder named `Brouillons` or
+    // `Entwürfe` resolves the same as `Drafts`. Only servers without the
+    // extension fall through to name-based detection below.
+    match imap::drafts_special_use_folder(client).await {
+        Ok(Some(folder)) => {
+            info!("resolved drafts folder via SPECIAL-USE \\Drafts: {folder}");
+            if let Err(e) = db.set_detected_folder(account_id, "drafts", &folder) {
+                warn!("failed to cache drafts folder: {e}");
+            }
+            return Ok(Some(folder));
+        }
+        Ok(None) => {}
+        Err(e) => warn!("SPECIAL-USE drafts lookup failed: {e}; trying name-based detection"),
+    }
+
     // Try provider-aware resolution
     let provider = get_or_detect_provider(client, db, account_id).await?;
     if provider != ProviderType::Unknown {
@@ -130,10 +146,11 @@ pub async fn detect_drafts_folder(
         }
     }
 
-    // Case-insensitive fuzzy fallback
+    // Case-insensitive fuzzy fallback, including common localized names — the
+    // last net for servers that neither advertise SPECIAL-USE nor use an
+    // English folder name.
     for folder in &folders {
-        let lower = folder.to_lowercase();
-        if lower.contains("draft") {
+        if looks_like_drafts_folder(folder) {
             info!("detected drafts folder (fuzzy): {folder}");
             if let Err(e) = db.set_detected_folder(account_id, "drafts", folder) {
                 warn!("failed to cache drafts folder: {e}");
@@ -144,6 +161,42 @@ pub async fn detect_drafts_folder(
 
     warn!("no drafts folder detected for account {account_id}");
     Ok(None)
+}
+
+/// Heuristic name match for a Drafts folder on servers that don't advertise
+/// SPECIAL-USE and don't use an English name. Matches the English root plus
+/// common localizations; compares the leaf (last hierarchy segment) so a
+/// prefix like `INBOX.` or `[Gmail]/` doesn't defeat the check.
+pub fn looks_like_drafts_folder(folder: &str) -> bool {
+    let leaf = folder
+        .rsplit(['/', '.'])
+        .next()
+        .unwrap_or(folder)
+        .trim()
+        .to_lowercase();
+    if leaf.contains("draft") {
+        return true;
+    }
+    // Localized "Drafts" (leaf-exact to avoid false positives).
+    const LOCALIZED: &[&str] = &[
+        "brouillons",     // French
+        "entwürfe",       // German
+        "entwurfe",       // German (no umlaut)
+        "borradores",     // Spanish
+        "bozze",          // Italian
+        "concepten",      // Dutch
+        "rascunhos",      // Portuguese
+        "utkast",         // Swedish/Norwegian
+        "kladde",         // Danish
+        "черновики",      // Russian
+        "下書き",         // Japanese
+        "草稿",           // Chinese
+        "임시보관함",     // Korean
+        "taslaklar",      // Turkish
+        "robógiltúr",     // (defensive; rare)
+        "wersje robocze", // Polish
+    ];
+    LOCALIZED.iter().any(|name| leaf == *name)
 }
 
 /// Detect the sent folder for an account.
@@ -311,6 +364,26 @@ pub struct FolderInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_drafts_matches_english_localized_and_prefixed() {
+        // English, case-insensitive, and hierarchy-prefixed.
+        assert!(looks_like_drafts_folder("Drafts"));
+        assert!(looks_like_drafts_folder("drafts"));
+        assert!(looks_like_drafts_folder("Draft"));
+        assert!(looks_like_drafts_folder("INBOX.Drafts"));
+        assert!(looks_like_drafts_folder("[Gmail]/Drafts"));
+        // Localized leaf names.
+        assert!(looks_like_drafts_folder("Brouillons"));
+        assert!(looks_like_drafts_folder("Entwürfe"));
+        assert!(looks_like_drafts_folder("Borradores"));
+        assert!(looks_like_drafts_folder("INBOX.Bozze"));
+        // Non-drafts folders must not match.
+        assert!(!looks_like_drafts_folder("INBOX"));
+        assert!(!looks_like_drafts_folder("Sent"));
+        assert!(!looks_like_drafts_folder("Archive"));
+        assert!(!looks_like_drafts_folder("Trash"));
+    }
 
     #[test]
     fn test_drafts_folder_db_cache() {

@@ -19,6 +19,7 @@ fn run_envelope(home: &Path, args: &[&str]) -> std::process::Output {
         // machine key, so automation must supply a key source. Fake material.
         .env("ENVELOPE_MASTER_KEY", "test-master-key-quickstart-smoke")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .output()
         .expect("run envelope")
 }
@@ -28,6 +29,7 @@ fn run_envelope_with_stdin(home: &Path, args: &[&str], input: &str) -> std::proc
         .args(args)
         .env("ENVELOPE_MASTER_KEY", "test-master-key-quickstart-smoke")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -7,99 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.13.1] — 2026-07-11
+## [1.0.0] — 2026-07-11
+
+First public release. Envelope is a bring-your-own-mailbox email client with
+agent-native primitives: it runs a fleet of AI agents on one shared inbox with
+per-agent identity, per-action attribution, and a fail-closed send gate, plus a
+full webmail dashboard for the humans in the loop.
+
+### Added
+
+- **Multi-agent identity on a shared inbox.** Named agent identities
+  (`envelope agent create|list|show|revoke`, `envtok_` tokens shown once and
+  stored as a SHA-256 hash + display prefix). Per-agent policy
+  (`envelope agent policy set`) clamps allowed accounts, folders, actions, a
+  send-mode ceiling, and recipient allowlists — a clamp never widens what a
+  policy permits. Every mutation and send-policy/Governor event carries
+  `agent_id` attribution; `envelope actions tail --agent <id>` shows the
+  per-agent trail. MCP contexts resolve `ENVELOPE_AGENT_TOKEN` at startup and
+  authorize every tool call pre-dispatch (unknown/revoked token fails loud).
+- **License gate.** Free tier runs up to 2 active agent identities; a 3rd
+  requires `envelope license activate` (stable `agent_limit_license_required`
+  denial). `license activate|status|deactivate` persist locally, prefix-only
+  display.
+- **Full webmail dashboard (v2).** SvelteKit (Svelte 5) SPA embedded in the
+  binary — accounts rail with health badges, unified/smart mailboxes, message
+  list with range-selection and contextual bulk toolbar, sandboxed reader that
+  never marks messages read, composer (reply/forward, send-later, undo-send),
+  and the Agent Cockpit: per-account draft-approval queue, per-agent
+  attribution feed, scheduled sends with persisted Governor verdict badges, and
+  rules-first authoring with live blast-radius preview.
+- **Bulk operations** (`envelope bulk`, MCP `bulk` tool): move/copy/flag/delete/
+  tag over UID or search targets (500 cap), partial-failure isolation, dry-run
+  default for destructive ops, UID-range coalescing.
+- **Durable event push / webhooks.** HMAC-SHA256 signed deliveries with
+  exponential backoff and dead-lettering, per-route secrets minted once,
+  delivery-result capture. `envelope watch --deliver`,
+  `envelope events routes …`, catalog: `send_queued`, `draft_approved`,
+  `send_completed`, `governor_blocked`, `agent_action`.
+- **Server-sent events** at `/api/events/stream` (metadata-only, heartbeat,
+  reconnecting client with polling fallback).
+- **Linux support.** Target-conditional keyring backends (macOS `apple-native`,
+  Linux secret-service + file/passphrase default), systemd `--user` units with
+  `LoadCredential`, `dist/install.sh` (OS/arch detect + sha256 verify), and a
+  4-target tag-triggered release pipeline.
+- **Passphrase-first credential store.** Interactive passphrase on first
+  account add (Argon2), `ENVELOPE_MASTER_PASSPHRASE_FILE` for systemd,
+  `envelope accounts rekey`; machine-key storage is now an explicit
+  `--insecure-machine-key` opt-in.
+- **Onboarding.** Provider app-password guidance on quickstart auth failure,
+  and docs: install-linux, credential-backends, agent-fleet-shared-inbox,
+  quickstart, webhooks.
 
 ### Security
 
-- **No automatic retry after an inconclusive SMTP failure.** Scheduled sends
-  now park in `delivery_uncertain` when SMTP returns any error, because a
-  dropped final acknowledgement cannot prove that the remote server rejected
-  the message. An operator must reconcile delivery before discarding the draft.
+- **MCP trust boundary.** Hostile message fields (body/subject/from/snippet)
+  returned to agents are wrapped in an `_envelope_trust: "untrusted-content"`
+  envelope so prompt-injection payloads are labelled, not silently trusted.
+- **Dashboard CSRF.** Double-submit `__Host-` cookie + `X-Envelope-CSRF` header
+  with Origin/Sec-Fetch-Site checks on all state-changing endpoints; valid
+  bearer requests are exempt. Stable `dashboard_csrf_required` code.
+- **SSRF guard on webhook URLs.** Every sink (CLI rule create/edit, CLI event
+  routes, dashboard rule create and update) rejects loopback/link-local/
+  private/reserved/documentation targets — including cloud metadata
+  `169.254.169.254`, and IPv4-mapped/compatible IPv6 forms of them — before the
+  URL is persisted.
+- **No automatic retry after an inconclusive SMTP failure.** A scheduled send
+  whose SMTP attempt errors parks in `delivery_uncertain` rather than releasing
+  for retry: a dropped final acknowledgement cannot prove non-delivery, so an
+  operator must reconcile before the draft is discarded — never a silent
+  duplicate send.
+- **Secrets are never accepted as CLI arguments.** Account passwords and license
+  keys use a hidden terminal prompt or explicit `--password-stdin` / `--key-stdin`,
+  keeping them out of process listings and shell history.
 - **Bearer token required for broad dashboard binds.** A Tailscale identity
-  allowlist is accepted only on a loopback listener behind `tailscale serve`;
-  non-loopback binds now require a dashboard bearer token.
-- **Secrets no longer accepted as CLI arguments.** Account passwords and
-  license keys use a hidden terminal prompt or explicit `--password-stdin` /
-  `--key-stdin` input, keeping them out of process listings and shell history.
+  allowlist is honored only on a loopback listener behind `tailscale serve`;
+  any non-loopback bind requires a dashboard bearer token.
 
-## [0.13.0] — 2026-07-10 (release candidate)
+### Fixed
 
-Coherent v2 release candidate: the four committed v2 waves plus the uncommitted
-v2 continuation and the outbound-send-safety work (task t_bb6f8ff1). Covers all
-changes since 0.12.5; interim versions 0.12.6–0.12.8 were internal bumps that
-never received changelog entries or tagged releases.
+- **Drafts always land in the real IMAP Drafts folder.** Draft create/reply/
+  forward previously appended to IMAP only best-effort and silently fell back to
+  a local-only record (invisible to Mail.app and other clients) on any failure.
+  The append is now mandatory and fail-loud, and Envelope resolves the Drafts
+  folder itself via the RFC 6154 SPECIAL-USE `\Drafts` attribute (plus provider
+  and localized-name detection), so a folder named `Brouillons`, `INBOX/draft`,
+  or `[Gmail]/Drafts` all resolve without the agent naming it. Send-only accounts
+  with no IMAP host now error instead of creating an invisible draft.
 
-### Added — v2 platform
+### Notes
 
-- **Agent identities and per-agent policy.** Named agent tokens, MCP agent
-  identity enforcement, per-agent send ceilings, and passphrase-encrypted
-  credential store; Linux keyring backend.
-- **Agent Cockpit.** Read-only dashboard aggregates for agent roster and
-  activity (`/api/agents`), scheduled sends with Governor verdicts
-  (`/api/scheduled`), and watch/event-route delivery health (`/api/watches`),
-  plus the SvelteKit cockpit page (approval queue, scheduled panel, watch
-  panel). Aggregate loads perform no live auth probes, IMAP mutations, or
-  sends.
-- **Webmail.** SvelteKit shell with unified/per-account mail list and reader,
-  SSE live updates, compose/reply/forward composer drawer with review
-  checklist, undo-window toast, bulk operations, and refresh-error freshness
-  surfacing (`unavailable` state instead of silently stale rows).
-- **Rules Control Plane write endpoints.** Dashboard rule create/update/
-  delete/enable/disable with `MatchExpr` validation and sieve-exportability
-  re-derivation, plus the rules management page.
-- **Durable event push.** Webhook event delivery with HMAC signing, retries,
-  dead-letter visibility, and a warning when a route is configured without a
-  signing secret.
-- **Webhook SSRF guard.** `events routes add`, rule `webhook=` actions, and
-  dashboard rule endpoints now reject non-public webhook URLs (loopback,
-  private, link-local, metadata ranges).
-- **Docs.** New `docs/quickstart.md`, `docs/webhooks.md`,
-  `docs/credential-backends.md`, `docs/install-linux.md`,
-  `docs/agent-fleet-shared-inbox.md`; README quickstart/install hardening and
-  full MCP tool listing.
-- **CI.** SvelteKit bundle drift check (committed `web/build` must match
-  sources) and `actionlint` job. New `contract_drift` test pins the exported
-  agent contract to `docs/schemas/envelope.agent_contract.v1.json`.
-
-### Fixed — outbound send safety (t_bb6f8ff1)
-
-- **UTC/RFC3339 scheduled-queue timestamps.** `send --at` parses through a
-  canonical UTC parser that rejects ambiguous/nonexistent DST local times;
-  all `send_after` values serialize with an explicit `Z` suffix, and dashboard
-  time surfaces (scheduled countdowns, snooze sweeps, cockpit) compare against
-  UTC instead of local wall-clock. A structural regression test forbids local
-  wall-clock reads in dashboard time surfaces.
-- **Revision-bound human approval.** Drafts carry a monotonic `revision`;
-  human approval is recorded as a durable attestation bound to the approved
-  revision, and any content/metadata/attachment edit strips the attestation
-  and bumps the revision. Dashboard edit/approve/send take
-  `expected_revision` and answer `409` (`DraftModifiedConcurrently`) on a
-  stale revision. Approved scheduled sends declare the `tyler_approved`
-  Governor attribute from the durable attestation.
-- **Sending/syncing owner leases.** Scheduled and immediate sends must first
-  win an atomic CAS claim (`sending` status plus an opaque operation token);
-  `mark_draft_sent` is token-gated, sweeps reload the claimed row before
-  sending, and Governor blocks release the claim instead of leaking it.
-  Draft sync/edit uses an equivalent `syncing` lease so concurrent editors
-  cannot interleave.
-- **`delivery_uncertain` anti-resend.** If local sent-state persistence fails
-  after SMTP acceptance, the draft parks in `delivery_uncertain` (with a
-  `sent_unrecorded` event outcome) instead of returning to a resendable
-  state; exit is explicit operator discard only.
-- **Exact Message-ID / provider-folder draft cleanup.** Post-send provider
-  draft deletion resolves the target by exact, unique Message-ID match in the
-  detected drafts folder (fail-closed on zero or multiple matches) and only
-  runs after sent state is durably recorded. Header fetches use
-  `BODY.PEEK[HEADER.FIELDS]`.
-- **Same-draft browser flow.** The dashboard composer reuses one local draft
-  per session (revision-bound edit → send); raw IMAP-only drafts refuse
-  in-browser editing instead of copy-and-delete duplication, and the old
-  delete-original-after-send path is gone.
-- **Governor invocation hardening.** Nonzero Governor exit status now fails
-  closed even if stdout parses as an allow verdict.
-- **Contract docs.** `docs/agent-contract.md` documents the send-claim
-  lifecycle, `syncing` lease semantics, sweep atomicity, `delivery_uncertain`,
-  and the revision-bound human-approval/409 contract.
+- Send-mode names (`draft-only`, `confirm-send`, `allowlisted-send`,
+  `autonomous-send`) are stable. MCP/agent contexts default to `draft-only`.
+- All outbound mail remains gated through Governor attribution; there is no
+  send bypass. Mailbox reads use `EXAMINE` + `BODY.PEEK[]` only.
+- Agent contract `envelope.agent_contract.v1` grew additively across this
+  release; no `--json` output shapes were removed or retyped.
 
 ## [0.12.5] — 2026-07-04
 

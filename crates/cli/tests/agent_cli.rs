@@ -20,6 +20,7 @@ fn run(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(envelope_bin())
         .args(args)
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .output()
         .expect("run envelope")
 }
@@ -70,6 +71,7 @@ fn mcp_tool_call(home: &Path, token: &str, name: &str, arguments: Value) -> (Val
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .env("ENVELOPE_AGENT_TOKEN", token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -201,6 +203,7 @@ fn agent_token_enforces_policy_and_revocation_at_mcp_startup() {
     let revoked = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .env("ENVELOPE_AGENT_TOKEN", token)
         .stdin(Stdio::null())
         .output()

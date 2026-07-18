@@ -109,7 +109,18 @@ fn check_ipv4_ssrf(v4: std::net::Ipv4Addr) -> Result<(), UrlGuardError> {
 /// Return `Err` for IPv6 addresses in loopback (::1), unspecified (::),
 /// unique-local (fc00::/7, which includes fd00::/8 per RFC 4193), and
 /// link-local (fe80::/10).
+///
+/// IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) literals are
+/// held to the IPv4 rules first: otherwise a blocked v4 target — e.g. the cloud
+/// instance-metadata endpoint `169.254.169.254` — could be smuggled through an
+/// IPv6 literal and, on a dual-stack host that routes mapped v6 to v4, reach the
+/// address the guard claims to reject. The delegation only *adds* rejections; the
+/// native v6 checks below still own `::1`/`::` (which `to_ipv4()` renders as
+/// `0.0.0.1`/`0.0.0.0`, not caught by the v4 rules).
 fn check_ipv6_ssrf(v6: std::net::Ipv6Addr) -> Result<(), UrlGuardError> {
+    if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+        check_ipv4_ssrf(v4)?;
+    }
     let blocked = v6.is_loopback()
         || v6.is_unspecified()
         || (v6.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
@@ -182,5 +193,23 @@ mod tests {
     fn ssrf_guard_rejects_unique_local_ipv6() {
         // fc00::/7 (unique-local, includes fd00::/8 used by RFC 4193).
         assert!(check_public_url("http://[fd12:3456:789a::1]/hook").is_err());
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_ipv4_mapped_and_compatible_ipv6() {
+        // IPv4-mapped (::ffff:a.b.c.d): a blocked v4 target must not be
+        // smuggled through an IPv6 literal. Cloud metadata + loopback + RFC1918.
+        assert!(check_public_url("http://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
+        assert!(check_public_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(check_public_url("http://[::ffff:10.0.0.1]/hook").is_err());
+        // IPv4-compatible (::a.b.c.d, deprecated but still routable on some hosts).
+        assert!(check_public_url("http://[::169.254.169.254]/latest/meta-data/").is_err());
+    }
+
+    #[test]
+    fn ssrf_guard_allows_public_ipv4_mapped_ipv6() {
+        // A public address in IPv4-mapped form stays permitted; the delegation
+        // only adds rejections, it must not block legitimate targets.
+        assert!(check_public_url("http://[::ffff:93.184.216.34]/hook").is_ok());
     }
 }

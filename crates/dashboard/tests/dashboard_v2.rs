@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2
 //
-// Integration tests for the Envelope v2 webmail mount (`/v2`). These build the
-// real dashboard router via `dashboard_router` and assert the committed
-// `web/build/` SPA bundle is served correctly: the shell at `/v2`, SPA fallback
-// for client-side routes, a hashed asset with the right content type, and the
-// invariant that the bundle carries no `cdn.tailwindcss` reference.
+// Integration tests for the Envelope v2 webmail — the dashboard as of 1.0.0,
+// served at the site root. These build the real dashboard router via
+// `dashboard_router` and assert the committed `web/build/` SPA bundle is served
+// correctly: the shell at `/`, SPA fallback for client-side routes, a hashed
+// asset with the right content type, and the invariant that the bundle carries
+// no `cdn.tailwindcss` reference.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -53,8 +54,8 @@ fn committed_v2_bundle_has_no_tailwind_cdn_reference() {
 
 #[tokio::test]
 async fn v2_root_serves_the_spa_index() {
-    let (status, body, content_type) = get("/v2").await;
-    assert_eq!(status, StatusCode::OK, "/v2 should serve the SPA shell");
+    let (status, body, content_type) = get("/").await;
+    assert_eq!(status, StatusCode::OK, "/ should serve the SPA shell");
     let html = String::from_utf8(body).unwrap();
     assert!(html.contains("<title>Envelope</title>"));
     assert!(
@@ -62,8 +63,8 @@ async fn v2_root_serves_the_spa_index() {
         "shell should carry the SvelteKit bootstrap"
     );
     assert!(
-        html.contains(r#"base: "/v2""#),
-        "shell should carry the /v2 base path"
+        html.contains(r#"base: """#),
+        "shell should carry the empty (root) base path"
     );
     assert!(
         !html.contains("cdn.tailwindcss"),
@@ -75,14 +76,14 @@ async fn v2_root_serves_the_spa_index() {
 
 #[tokio::test]
 async fn v2_unknown_client_route_falls_back_to_index() {
-    // `/v2/kitchen-sink` is a client-side route with no matching embedded file;
+    // `/kitchen-sink` is a client-side route with no matching embedded file;
     // the SPA fallback must return the shell so the router can resolve it.
-    let (status, body, _) = get("/v2/kitchen-sink").await;
+    let (status, body, _) = get("/kitchen-sink").await;
     assert_eq!(status, StatusCode::OK);
     let html = String::from_utf8(body).unwrap();
     assert!(
         html.contains("<title>Envelope</title>") && html.contains("__sveltekit"),
-        "unknown /v2 route should fall back to the SPA shell"
+        "unknown client route should fall back to the SPA shell"
     );
 }
 
@@ -90,11 +91,11 @@ async fn v2_unknown_client_route_falls_back_to_index() {
 async fn v2_hashed_asset_serves_with_correct_content_type() {
     // Discover a real hashed CSS asset path from the served shell so this test
     // is robust to content-hash changes across rebuilds.
-    let (_, index_body, _) = get("/v2").await;
+    let (_, index_body, _) = get("/").await;
     let html = String::from_utf8(index_body).unwrap();
     let css_path = html
         .split('"')
-        .find(|token| token.starts_with("/v2/_app/") && token.ends_with(".css"))
+        .find(|token| token.starts_with("/_app/") && token.ends_with(".css"))
         .expect("built shell should reference at least one hashed CSS asset");
 
     let (status, body, content_type) = get(css_path).await;

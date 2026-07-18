@@ -6,7 +6,7 @@ Pre-built tarballs land with each release. On a fresh VPS:
 
 ```bash
 # Download the latest release tarball (replace VERSION and ARCH as needed)
-VERSION=0.13.0
+VERSION=1.0.0
 ARCH=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu on ARM
 curl -LO "https://github.com/tymrtn/U1F4E7/releases/download/v${VERSION}/envelope-${VERSION}-${ARCH}.tar.gz"
 tar -xzf "envelope-${VERSION}-${ARCH}.tar.gz"

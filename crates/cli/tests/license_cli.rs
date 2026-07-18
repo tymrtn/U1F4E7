@@ -19,6 +19,7 @@ fn run(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(envelope_bin())
         .args(args)
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .output()
         .expect("run envelope")
 }
@@ -31,6 +32,7 @@ fn run_activate(home: &Path, json: bool, key: &str) -> std::process::Output {
     let mut child = command
         .args(["license", "activate", "--key-stdin"])
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

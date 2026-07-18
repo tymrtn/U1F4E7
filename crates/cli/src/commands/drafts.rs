@@ -800,6 +800,69 @@ async fn append_draft_best_effort(
     (true, folder, uid)
 }
 
+/// APPEND a draft to the account's IMAP Drafts folder, or fail loud.
+///
+/// A draft's real home is the account's Drafts folder — the store Mail.app and
+/// every other IMAP client display. Envelope's local SQLite record is a
+/// secondary index, invisible to those clients, so we never silently downgrade
+/// to a local-only draft: any failure (no IMAP host, connect, folder
+/// detection, or the APPEND itself) returns an error so the caller aborts
+/// before creating a phantom local record. The Drafts folder is resolved by
+/// Envelope (SPECIAL-USE `\Drafts`, then provider/name detection); the caller
+/// never names it.
+///
+/// Returns `(drafts_folder, appended_uid)`. A missing UID (post-APPEND search
+/// miss) is non-fatal — the draft is on the server regardless.
+async fn append_draft_required(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    rfc822: &[u8],
+    message_id: &str,
+) -> Result<(String, Option<u32>)> {
+    if creds.account.imap_host.is_empty() {
+        bail!(
+            "account {} has no IMAP mailbox, so a draft has nowhere to land where your \
+             mail client can see it. Drafts require an IMAP account.",
+            creds.account.username
+        );
+    }
+    let mut client = imap::connect(creds)
+        .await
+        .context("connecting to IMAP to save the draft")?;
+    let folder = match detect_drafts_folder(&mut client, db, &creds.account.id).await? {
+        Some(folder) => folder,
+        None => {
+            // Every real mailbox has a Drafts folder, and detection now covers
+            // SPECIAL-USE + provider + localized names. If we still find none,
+            // create the canonical one as a last resort so the draft lands.
+            let target = String::from("Drafts");
+            imap::create_folder_if_missing(&mut client, &target)
+                .await
+                .context("no Drafts folder found and creating one failed")?;
+            if let Err(e) = db.set_detected_folder(&creds.account.id, "drafts", &target) {
+                warn!("failed to cache drafts folder: {e}");
+            }
+            info!(
+                "no Drafts folder detected for {}; created '{target}'",
+                creds.account.username
+            );
+            target
+        }
+    };
+    imap::append_message(&mut client, &folder, "(\\Draft \\Seen)", rfc822)
+        .await
+        .with_context(|| format!("appending the draft to your '{folder}' folder"))?;
+    let uid = if message_id.is_empty() {
+        None
+    } else {
+        let mid_clean = message_id.trim_matches(|c| c == '<' || c == '>');
+        imap::find_uid_by_message_id(&mut client, &folder, mid_clean)
+            .await
+            .unwrap_or(None)
+    };
+    Ok((folder, uid))
+}
+
 /// All the resolved fields needed to instantiate a contextual draft.
 ///
 /// Built once by [`run_reply`]/[`run_forward`] and consumed by
@@ -866,8 +929,11 @@ async fn create_contextual_draft(
         &spec.attachments,
     )?;
 
-    let (imap_synced, imap_folder, imap_uid) =
-        append_draft_best_effort(db, creds, &rfc822, &message_id_hdr).await;
+    // Mandatory IMAP APPEND: the reply/forward draft must land in the account's
+    // real Drafts folder (visible in Mail.app and every IMAP client). On any
+    // failure this bails before the local record is created — no phantom.
+    let (imap_folder, imap_uid) =
+        append_draft_required(db, creds, &rfc822, &message_id_hdr).await?;
 
     // Local record (full assembled body is the source of truth for the quote).
     let draft = db
@@ -927,9 +993,9 @@ async fn create_contextual_draft(
         "attachments_forwarded": spec.attachments_forwarded,
         "full_content_preserved": true,
         "storage": {
-            "imap_synced": imap_synced,
-            "imap_folder": if imap_synced { Some(imap_folder.clone()) } else { None },
-            "local_only": !imap_synced,
+            "imap_synced": true,
+            "imap_folder": imap_folder,
+            "local_only": false,
         },
     });
     db.set_draft_metadata(&draft.id, &metadata)
@@ -1863,78 +1929,12 @@ pub async fn run_create(
     )?;
 
     // Check if this is a send-only account (no IMAP)
-    let has_imap = !creds.account.imap_host.is_empty();
-
-    let mut imap_uid: Option<u32> = None;
-    let mut imap_synced = false;
-    let mut drafts_folder_name = String::from("Drafts");
-
-    if has_imap {
-        // ── IMAP-first: APPEND to the Drafts folder ──
-        match imap::connect(&creds).await {
-            Ok(mut client) => {
-                // Detect the correct Drafts folder for this account
-                let detected = detect_drafts_folder(&mut client, &db, &creds.account.id).await;
-                match detected {
-                    Ok(Some(folder)) => {
-                        drafts_folder_name = folder.clone();
-                        match imap::append_message(
-                            &mut client,
-                            &folder,
-                            "(\\Draft \\Seen)",
-                            &rfc822,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                imap_synced = true;
-                                // Try to find the UID of the appended message
-                                if !message_id.is_empty() {
-                                    let mid_clean =
-                                        message_id.trim_matches(|c| c == '<' || c == '>');
-                                    match imap::find_uid_by_message_id(
-                                        &mut client,
-                                        &folder,
-                                        mid_clean,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(uid)) => imap_uid = Some(uid),
-                                        Ok(None) => warn!(
-                                            "IMAP APPEND succeeded but could not find UID by Message-ID"
-                                        ),
-                                        Err(e) => {
-                                            warn!("failed to search for appended draft UID: {e}")
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("IMAP APPEND to {folder} failed: {e}");
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "no drafts folder detected for {}; saving locally only",
-                            creds.account.username
-                        );
-                    }
-                    Err(e) => {
-                        warn!("drafts folder detection failed: {e}; saving locally only");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("IMAP connect failed: {e}; saving draft locally only");
-            }
-        }
-    } else {
-        warn!(
-            "account {} has no IMAP — draft saved locally only (send-only account)",
-            creds.account.username
-        );
-    }
+    // IMAP-first and mandatory: a draft's real home is the account's Drafts
+    // folder — what Mail.app and every other IMAP client display. A local-only
+    // SQLite record is invisible to those clients, so we never silently fall
+    // back to it; append_draft_required fails loud on any IMAP/folder error.
+    let (drafts_folder_name, imap_uid) =
+        append_draft_required(&db, &creds, &rfc822, &message_id).await?;
 
     // ── Local SQLite record: secondary cache/reference ──
     let draft = db
@@ -1985,17 +1985,11 @@ pub async fn run_create(
                 "bcc": bcc,
                 "in_reply_to": in_reply_to,
                 "attachments": attachment_summary,
-                "imap_synced": imap_synced,
+                "imap_synced": true,
                 "imap_uid": imap_uid,
-                "imap_folder": if imap_synced { Some(&drafts_folder_name) } else { None },
-                "local_only": !imap_synced,
-                "sync_status_reason": if !imap_synced && has_imap {
-                    Some("imap_sync_failed")
-                } else if !has_imap {
-                    Some("no_imap")
-                } else {
-                    None
-                },
+                "imap_folder": drafts_folder_name,
+                "local_only": false,
+                "sync_status_reason": serde_json::Value::Null,
                 "dashboard_path": dashboard_path,
                 "dashboard_url": dashboard_url,
                 "review_url": dashboard_url,
@@ -2004,13 +1998,7 @@ pub async fn run_create(
                     "dashboard_url": dashboard_url,
                     "review_url": dashboard_url,
                 },
-                "warning": if !imap_synced && has_imap {
-                    Some("IMAP sync failed — draft saved locally only. Retry with draft create or check IMAP connectivity.")
-                } else if !has_imap {
-                    Some("Send-only account (no IMAP) — draft is local only.")
-                } else {
-                    None
-                },
+                "warning": serde_json::Value::Null,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             })
         );
@@ -2037,16 +2025,10 @@ pub async fn run_create(
             }
         }
         println!("  Review:  {dashboard_url}");
-        if imap_synced {
-            if let Some(uid) = imap_uid {
-                println!("  IMAP:    synced to {} (UID {})", drafts_folder_name, uid);
-            } else {
-                println!("  IMAP:    synced to {} (UID pending)", drafts_folder_name);
-            }
-        } else if has_imap {
-            println!("  ⚠ IMAP:  sync failed — saved locally only");
+        if let Some(uid) = imap_uid {
+            println!("  IMAP:    saved to {drafts_folder_name} (UID {uid})");
         } else {
-            println!("  ⚠ IMAP:  send-only account — saved locally only");
+            println!("  IMAP:    saved to {drafts_folder_name} (UID pending)");
         }
     }
 
@@ -3166,6 +3148,30 @@ mod tests {
         assert!(
             from.contains("tyler@martin.fm"),
             "address must be present: {from}"
+        );
+    }
+
+    #[test]
+    fn append_draft_required_fails_loud_for_send_only_account() {
+        // A send-only account (no IMAP host) has nowhere for a draft to land
+        // where a mail client can see it. Rather than silently create a
+        // local-only phantom, the append must fail loud.
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let mut creds = make_creds("send-only@example.com", None, "Send Only");
+        creds.account.imap_host = String::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(append_draft_required(
+                &db,
+                &creds,
+                b"raw message",
+                "<mid@example.com>",
+            ))
+            .expect_err("send-only account must not yield a silent local-only draft");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no IMAP mailbox"),
+            "expected fail-loud IMAP message, got: {msg}"
         );
     }
 

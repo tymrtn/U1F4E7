@@ -15,7 +15,7 @@ fn envelope_bin() -> &'static str {
 
 fn run_cli(home: &std::path::Path, args: &[&str], token: Option<&str>) -> std::process::Output {
     let mut cmd = Command::new(envelope_bin());
-    cmd.args(args).env("HOME", home);
+    cmd.args(args).env("HOME", home).env("ENVELOPE_HOME", home);
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -29,7 +29,10 @@ fn run_cli_with_stdin(
     input: &str,
 ) -> std::process::Output {
     let mut cmd = Command::new(envelope_bin());
-    cmd.args(args).env("HOME", home).stdin(Stdio::piped());
+    cmd.args(args)
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .stdin(Stdio::piped());
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -104,27 +107,31 @@ fn set_policy(home: &std::path::Path, name: &str, actions: &str, ceiling: &str) 
     assert!(out.status.success(), "policy set failed");
 }
 
-/// Create a local draft via the CLI (offline: IMAP sync fails, draft is saved
-/// locally) and return its id. Used to feed send_draft without any network.
+/// Seed a draft record directly in the store and return its id, feeding
+/// send_draft without any network. `draft create` now requires a live IMAP
+/// APPEND (drafts must land in the real Drafts folder), and the seed account
+/// points at an unreachable host — but the send-ceiling behavior under test is
+/// independent of the IMAP transport, so we insert the draft row directly.
 fn create_local_draft(home: &std::path::Path, to: &str) -> String {
-    let out = run_cli(
-        home,
-        &[
-            "draft",
-            "create",
-            "--to",
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let account_id: String = db
+        .conn()
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .expect("seed account id");
+    let draft = db
+        .create_draft(
+            &account_id,
             to,
-            "--subject",
-            "hi",
-            "--body",
-            "x",
-            "--json",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "draft create failed");
-    let v: Value = serde_json::from_slice(&out.stdout).expect("draft create JSON");
-    v["id"].as_str().expect("draft id").to_string()
+            Some("hi"),
+            Some("x"),
+            None,
+            None,
+            None,
+            None,
+            Some("cli"),
+        )
+        .expect("create draft record");
+    draft.id
 }
 
 /// Send one framed tools/call and return the parsed tool-result text as JSON,
@@ -136,7 +143,7 @@ fn tool_call(
     arguments: Value,
 ) -> (Value, bool) {
     let mut cmd = Command::new(envelope_bin());
-    cmd.arg("mcp").env("HOME", home);
+    cmd.arg("mcp").env("HOME", home).env("ENVELOPE_HOME", home);
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -175,13 +182,14 @@ fn tool_call(
 }
 
 fn db_path(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library/Application Support/envelope-email/envelope.db")
+    home.join("envelope-email/envelope.db")
 }
 
 fn spawn_mcp(home: &std::path::Path) -> Child {
     Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -376,6 +384,7 @@ fn contract_export_declares_untrusted_trust_model() {
     let output = Command::new(envelope_bin())
         .arg("contract")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run contract");
     assert!(output.status.success());
@@ -415,6 +424,7 @@ fn mcp_config_includes_runtime_snippets_and_draft_only_safety() {
         .arg("mcp")
         .arg("--config")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run mcp --config");
 
@@ -470,6 +480,7 @@ fn mcp_startup_fails_loud_on_unknown_token() {
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .env(
             "ENVELOPE_AGENT_TOKEN",
             "envtok_deadbeefdeadbeefdeadbeefdeadbeef",
@@ -504,6 +515,7 @@ fn mcp_startup_fails_loud_on_revoked_token() {
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .env("ENVELOPE_AGENT_TOKEN", &token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -856,6 +868,7 @@ fn contract_export_declares_wave3_tools_and_gates() {
     let output = Command::new(envelope_bin())
         .arg("contract")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run contract");
     assert!(output.status.success());

@@ -76,7 +76,10 @@ jobs:
         # The paths phase (exit 1) runs first but succeeds because HOME is set.
         # --skip-network suppresses the IMAP phases so we never reach exit 3/4.
         run: |
-          ./target/release/envelope quickstart --skip-network --json; STATUS=$?
+          # `|| STATUS=$?` exempts the command from `set -e` so the expected
+          # non-zero exit is captured instead of aborting the step.
+          STATUS=0
+          ./target/release/envelope quickstart --skip-network --json || STATUS=$?
           if [ "$STATUS" -ne 2 ]; then
             echo "Expected exit code 2 (no_account_configured), got $STATUS" >&2
             exit 1
@@ -89,10 +92,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: crates/dashboard/web/package-lock.json
 
