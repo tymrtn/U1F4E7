@@ -15,7 +15,7 @@ fn envelope_bin() -> &'static str {
 
 fn run_cli(home: &std::path::Path, args: &[&str], token: Option<&str>) -> std::process::Output {
     let mut cmd = Command::new(envelope_bin());
-    cmd.args(args).env("HOME", home);
+    cmd.args(args).env("HOME", home).env("ENVELOPE_HOME", home);
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -29,7 +29,10 @@ fn run_cli_with_stdin(
     input: &str,
 ) -> std::process::Output {
     let mut cmd = Command::new(envelope_bin());
-    cmd.args(args).env("HOME", home).stdin(Stdio::piped());
+    cmd.args(args)
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .stdin(Stdio::piped());
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -140,7 +143,7 @@ fn tool_call(
     arguments: Value,
 ) -> (Value, bool) {
     let mut cmd = Command::new(envelope_bin());
-    cmd.arg("mcp").env("HOME", home);
+    cmd.arg("mcp").env("HOME", home).env("ENVELOPE_HOME", home);
     if let Some(t) = token {
         cmd.env("ENVELOPE_AGENT_TOKEN", t);
     }
@@ -179,13 +182,14 @@ fn tool_call(
 }
 
 fn db_path(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library/Application Support/envelope-email/envelope.db")
+    home.join("envelope-email/envelope.db")
 }
 
 fn spawn_mcp(home: &std::path::Path) -> Child {
     Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -380,6 +384,7 @@ fn contract_export_declares_untrusted_trust_model() {
     let output = Command::new(envelope_bin())
         .arg("contract")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run contract");
     assert!(output.status.success());
@@ -419,6 +424,7 @@ fn mcp_config_includes_runtime_snippets_and_draft_only_safety() {
         .arg("mcp")
         .arg("--config")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run mcp --config");
 
@@ -474,6 +480,7 @@ fn mcp_startup_fails_loud_on_unknown_token() {
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .env(
             "ENVELOPE_AGENT_TOKEN",
             "envtok_deadbeefdeadbeefdeadbeefdeadbeef",
@@ -508,6 +515,7 @@ fn mcp_startup_fails_loud_on_revoked_token() {
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .env("ENVELOPE_AGENT_TOKEN", &token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -860,6 +868,7 @@ fn contract_export_declares_wave3_tools_and_gates() {
     let output = Command::new(envelope_bin())
         .arg("contract")
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run contract");
     assert!(output.status.success());

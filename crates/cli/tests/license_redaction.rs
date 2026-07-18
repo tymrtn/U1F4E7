@@ -17,6 +17,7 @@ fn run_activate(home: &Path, json: bool, key: &str) -> std::process::Output {
     let mut child = command
         .args(["license", "activate", "--key-stdin"])
         .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -63,6 +64,7 @@ fn legacy_positional_license_key_is_rejected_without_echoing_it() {
     let output = Command::new(envelope_bin())
         .args(["license", "activate", secret])
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run envelope");
 

@@ -8,7 +8,17 @@ const DATABASE_FILE_NAME: &str = "envelope.db";
 const CREDENTIAL_FILE_NAME: &str = "credentials.json";
 
 /// Platform-resolved config directory, or `.config` as a local fallback.
+///
+/// `ENVELOPE_HOME`, when set to a non-empty value, overrides the resolved
+/// location entirely: Envelope keeps its config, database, and credentials
+/// under `$ENVELOPE_HOME/envelope-email`. This is a single, platform-independent
+/// way to isolate an Envelope instance — used by tests and throwaway/dev setups
+/// — without depending on OS-specific `HOME`/`XDG_CONFIG_HOME` semantics (macOS
+/// ignores `XDG_CONFIG_HOME`; Linux honors it, so `HOME` alone does not isolate).
 pub fn config_root_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ENVELOPE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs_next::config_dir().unwrap_or_else(|| PathBuf::from(".config"))
 }
 

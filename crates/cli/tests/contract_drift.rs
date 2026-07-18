@@ -38,6 +38,7 @@ fn contract_output_matches_committed_schema() {
     let output = Command::new(envelope_bin())
         .args(["contract"])
         .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
         .output()
         .expect("run envelope contract");
 
