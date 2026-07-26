@@ -37,3 +37,64 @@
 - Account discovery for quickstart uses read-only existing database access; do not replace it with `Database::open_default()`.
 - Network quickstart may read an existing credential-store passphrase but must never create one; use non-mutating credential-store access.
 - Inbox peek remains `EXAMINE` + `BODY.PEEK[HEADER.FIELDS (...)]`; never `SELECT` or `BODY[]`.
+
+## Writing rules (docs, README, marketing, commit messages, PR bodies)
+
+Applies to prose written for humans. Code comments follow the surrounding code
+instead. The failure mode these rules target is writing that reads as
+machine-generated: abstract, evenly-cadenced, confident about nothing in
+particular.
+
+### Banned constructions
+
+- **Antithesis as a crutch.** "It's not X, it's Y." "X isn't just Y — it's Z."
+  Occasionally earns its place; as a default sentence shape it's the single
+  loudest tell. One per document, maximum.
+- **Aphoristic taglines.** "An inbox is not a permission." If a line sounds
+  like it belongs on a conference slide, cut it or replace it with the concrete
+  claim underneath.
+- **Compulsive triads.** Three parallel items because three feels complete, not
+  because there are three things. Use two. Use four. Use one.
+- **The restating summary sentence.** A paragraph ends, then a sentence
+  explains what the paragraph meant. Delete it; the reader was there.
+- **Bolding the punchline of every paragraph.** Bold is for scanning tables and
+  genuine warnings. When everything is emphasized, nothing is.
+- **Balanced sentence rhythm.** Three medium sentences in a row is a tell. Vary
+  length hard — a nine-word sentence next to a forty-word one.
+- **Abstract category nouns for concrete things.** "Governed mailbox runtime,"
+  "control plane," "the layer above." Say what it does: "it holds the agent's
+  drafts until you approve them."
+
+### Banned vocabulary
+
+`delve`, `leverage` (as a verb), `robust`, `seamless`, `elevate`, `landscape`,
+`realm`, `testament to`, `tapestry`, `in today's fast-paced`, `it's worth
+noting`, `at its core`, `unlock` (metaphorical), `journey`, `empower`,
+`game-changing`, `best-in-class`, `crucially`, `notably`.
+
+Words that are fine in moderation and slop in bulk — cap each at roughly once
+per document: `genuinely`, `structurally`, `durable`, `load-bearing`, `table
+stakes`, `wedge`, `moat`, `surface` (as a noun), `posture`, `primitive`.
+
+### Positive rules
+
+- **Concrete over abstract.** A number, a command, a filename, a dollar figure.
+  "Cheaper" is slop; "$0.35 per 1,000" is writing.
+- **Every claim checkable.** If a reader can't verify it with a command, a
+  citation, or a file path, either add the source or delete the claim.
+- **Say the uncertainty.** "~70% likely," "I checked, this doesn't hold," "we
+  haven't tested this on Outlook." False confidence is the most damaging kind
+  of slop because it's the kind that gets published.
+- **Concede first.** Where a competitor or alternative wins, say so plainly and
+  early. It's true, and it's what makes the rest credible.
+- **Short words.** "Use," not "utilize." "Stops," not "mitigates."
+- **Cut the preamble.** Start at the finding, not at the context for the
+  finding.
+
+### Before shipping any document
+
+1. Reread the first sentence of every paragraph. If they'd read as a coherent
+   list of claims on their own, good. If they read as throat-clearing, rewrite.
+2. Search for `—` and `isn't just`. Cut most of them.
+3. Find the three most abstract nouns and replace each with a thing.
+4. Check every number and quoted price against a source, with a date.
