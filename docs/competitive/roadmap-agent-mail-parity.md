@@ -67,6 +67,7 @@ new vendor.
 
 | # | Deliverable | Detail |
 |---|---|---|
+| 1.0 | **Cloudflare Email Routing recipe** | Documentation, not code: `*@agents.yourdomain.com` catch-all routed free into your existing mailbox, Envelope splitting inbound by `Delivered-To`. Unlimited per-agent addresses at $0 with no new vendor. Ships ahead of 1.1 because it needs nothing built. Caveat per provider: outbound send-as requires aligned DKIM |
 | 1.1 | `envelope identity mint --agent <name>` | Mints a plus-address (default) or catch-all-subdomain address; persists to a new `agent_identities`-linked `agent_addresses` table; prints once |
 | 1.2 | `envelope identity list / show / rotate / revoke` | Rotate issues a fresh token-suffixed address and retires the old; revoke stops outbound use and installs a rule that files inbound to a quarantine folder |
 | 1.3 | Outbound binding | Sends from an agent bind `From`/`Reply-To` to that agent's address. The address must be inside the agent's policy allowlist — the clamp still governs, minting never widens authority |
@@ -99,6 +100,7 @@ product API wearing a UI's clothes.
 | 2.4 | TS + Python SDKs | Generated from the contract schema, published to npm/PyPI, CI-regenerated so drift is impossible. Table stakes for developer adoption |
 | 2.5 | Container + deploy recipes | Multi-arch image, `docker compose` with a passphrase file via secrets, Fly/Railway one-click, systemd already **exists** |
 | 2.6 | OAuth / XOAUTH2 | Gmail + Microsoft device-code flow. App-password-only is a hard blocker wherever an org disables them, and Microsoft keeps tightening. This is the highest-severity onboarding gap we have |
+| 2.7 | Inbound HTTP ingestion adapter | Authenticated endpoint accepting an RFC822 message from a Cloudflare Worker or any webhook source, landing it in the local index with the same rules/tagging/audit path as IMAP-sourced mail. Makes "govern any supply" literally true for non-IMAP providers. Added after the Cloudflare analysis — see `feature-matrix-and-forecast.md` §7.2 |
 
 **Exit criteria:** a cloud agent with only an `envtok_` and a URL can run the
 full read/draft/approve loop, and hits the identical denial codes a local MCP
@@ -130,6 +132,13 @@ that wasn't already open.
 ## Phase 4 — The trust moat (ongoing, v1.4+)
 
 Where we go somewhere they can't follow. This is the durable differentiation.
+
+> **Reprioritized 2026-07-26.** Items 4.1 and 4.5 move ahead of 4.3/4.4.
+> Cloudflare owns Area 1 email security and has ~45% odds of pointing it at
+> agent traffic within the year (`feature-matrix-and-forecast.md` §5). If they
+> ship injection defense before we do, we lose the safety narrative and become
+> "the local version." Conversely, 3.3 (semantic search) drops in priority —
+> both competitors have it and neither wins deals with it.
 
 | # | Deliverable | Detail |
 |---|---|---|
