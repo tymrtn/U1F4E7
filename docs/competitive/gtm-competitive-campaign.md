@@ -46,6 +46,8 @@ Lead with the first two. Kill "governed mailbox runtime," "control plane," and
 1. **Oops protection for agents with email access.**
 2. **Your agent has email. Now give it brakes.**
 3. They raised $6M to run mail servers. You already have one.
+3b. Giving an agent an inbox is the easy half. We built the other one.
+3c. Bootstrapped. No $6M, no board, no per-message fee.
 4. Everyone's handing agents inboxes. Nobody's handing them brakes.
 5. Draft-only by default. Your agent is new here.
 6. Built on the assumption that your agent will screw up. Because it will.
@@ -180,10 +182,19 @@ launch the product into a conversation we already shaped.
 Snark is approved. It works here because the product's whole personality is
 "we assume this will go wrong." But it has a shape:
 
-1. **Punch at the category and at ourselves, never at their team.** "Everyone's
-   handing agents inboxes" — good. "They raised $6M to run mail servers" —
-   good, it's a fact about capital structure. Anything implying they're bad at
-   their jobs — no. They're not, and it reads as insecurity.
+1. **The funding contrast is approved and on-strategy.** "They raised $6M to
+   wrap SES; we're self-funded and built the hard half" is fair game — it's a
+   fact about capital structure paired with a fact about scope, and
+   bootstrapped-vs-funded is a positioning a lot of buyers actively prefer.
+   Say it. The line to hold is *easy problem, not bad team*: the inbox layer
+   genuinely is the easy half, and running abuse ops at scale genuinely is
+   hard. Mock the funding-to-difficulty ratio, never their competence.
+   - Good: "Giving an agent an inbox is the easy half. We built the other one."
+   - Good: "Self-funded, and we didn't need $6M to wrap SES."
+   - Good: "Our roadmap answers to users instead of a term sheet."
+   - Bad: anything implying they're incompetent, fraudulent, or coasting.
+   - Note the expiry: this line stops being ours the day we take money. Use it
+     hard while it's true.
 2. **Every jab must survive one command.** If a line can't be checked by a
    reader in ten seconds (`curl`, `dig`, a published pricing page), cut it.
    The disposable-domain line qualifies. Guesses about their internals don't.

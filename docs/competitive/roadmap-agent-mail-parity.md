@@ -150,6 +150,14 @@ Where we go somewhere they can't follow. This is the durable differentiation.
 
 ---
 
+## Phase 5 — Enterprise self-serve (Q2, v1.5)
+
+SSO/OIDC, org roles, audit-log export to SIEM, secrets-manager backends, policy
+as code, Helm/Terraform, offline license activation, `license quote` with
+PO/ACH, and the trust page. Each item exists to remove a conversation that would
+otherwise require a salesperson we don't have. Full reasoning, pricing ladder,
+and sequencing in [`enterprise-self-serve.md`](enterprise-self-serve.md).
+
 ## Sequencing and dependencies
 
 ```
