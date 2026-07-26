@@ -68,6 +68,50 @@ Custom domains are paid-tier only.
    production.
 5. **Capital.** $6M buys abuse ops, IP reputation management, and a docs team.
 
+## 2.5 Is this just hosted email?
+
+Mostly, yes — and it's worth being precise about which parts are new, because
+that determines where they're actually hard to displace.
+
+What we can observe from outside:
+
+```
+$ curl -s https://api.usercheck.com/domain/agentmail.to
+{"domain":"agentmail.to","domain_age_in_days":577,"mx":true,
+ "mx_records":[{"hostname":"inbound-smtp.us-east-1.amazonaws.com","priority":10}],
+ "mx_providers":[{"slug":"amazon","type":"email_api","grade":"professional"}],
+ "spf":"missing","dmarc":"reject","disposable":true, ...}
+```
+
+Inbound is **AWS SES**. Outbound is SES too (`mail.agentmail.to` publishes
+`v=spf1 include:amazonses.com -all`). Add object storage, a Postgres-shaped
+message model, a REST API, and an IMAP/SMTP front door, and you have the
+product. That is hosted email with an API-first face — which is exactly why
+"I could build this in a weekend" keeps surfacing in their threads.
+
+The three things that are genuinely not commodity:
+
+1. **Provisioning without a human.** No OAuth consent screen, no signup form, no
+   password reset flow. An API call yields a working address. That sounds small
+   and isn't — every incumbent mailbox provider assumes a person.
+2. **API key as the auth primitive.** Machine-shaped credentials instead of
+   per-seat passwords, which is what makes fleet provisioning tractable.
+3. **Metered multi-tenant billing** on a resource everyone else sells per-seat.
+
+Everything else — threading, search, labeling, attachment parsing, webhooks —
+is table stakes any competent team ships in a quarter.
+
+**So the moat isn't the tech, it's the operations.** IP warmup, blocklist
+relationships, abuse response, a trust-and-safety function. That's what the $6M
+buys and it's the part that's genuinely hard. It's also a cost structure we
+never have to carry, because we don't send from our own infrastructure.
+
+Caution for anyone using this section externally: "it's just SES with a REST
+API" is a fair read of the architecture and a bad argument to lead with,
+because "Envelope is just IMAP with a SQLite file" is an equally fair read of
+ours. Neither product's value is in the protocol layer. Use this to understand
+their cost structure, not as a talking point.
+
 ## 3. Where they're structurally exposed
 
 These are not potshots — each one is a load-bearing constraint of the hosted
@@ -104,6 +148,67 @@ neutralize.
    means **an AgentMail inbox is an Envelope account today.** Their growth is
    addressable surface for us, not lost ground. See the interop wedge in the
    roadmap.
+
+8. **`agentmail.to` is already classified as a disposable domain.** UserCheck's
+   public API returns `"disposable": true` for it — the same verdict it returns
+   for `mailinator.com`. Their headline use case is agents doing signups and
+   collecting OTPs; signup forms are precisely where disposable-domain detection
+   APIs get called. This is a self-limiting loop: the more agents use their
+   default domain to register for services, the faster that domain gets treated
+   as throwaway, and the less it can do the one job the ad promises.
+   Verify in one command: `curl -s https://api.usercheck.com/domain/agentmail.to`.
+   _(Not yet present in the two largest open blocklists — checked
+   `disposable-email-domains` and `eramitgupta/disposable-email` on 2026-07-26.
+   The commercial detectors are ahead of the open lists here.)_
+
+9. **The custom-domain paradox.** The fix for #8 is to bring your own verified
+   domain — available on paid tiers only, and it requires DNS work. At that
+   point the customer is doing the DNS setup that was the stated reason to use
+   a hosted inbox instead of their own mailbox, *and* paying per message, *and*
+   warming a brand-new sending domain from zero reputation. The escape hatch
+   costs more than the thing it's escaping.
+
+10. **Address portability is the lock-in.** The agent's identity *is*
+    `something@agentmail.to`. Leaving means changing an address that
+    counterparties, signup records, OAuth grants, and password-reset flows have
+    already recorded. Mailbox exports don't help; the address is the asset. On
+    your own domain you can swap every layer underneath and keep the address.
+
+11. **No oops protection.** There is no published approval queue, send-mode
+    ceiling, recipient allowlist, per-agent policy, or undo window. The design
+    intent is agents operating independently, which means the failure mode —
+    an agent that emails 400 real people at 3am — has no built-in brake. Their
+    own Launch HN answer on prompt injection was "allowlists and permissions,"
+    which is a plan, not a shipped feature.
+
+12. **Metered billing has no visible spend ceiling.** An agent stuck in a reply
+    loop is a billing incident. No published overage cap, alert, or hard stop.
+
+13. **The disposable-inbox pitch fights the inbox-capped pricing.** "An inbox
+    per agent, per task" runs out at 150 inboxes on the $200/mo tier. Either
+    inboxes are precious (and the provisioning story is oversold) or they're
+    disposable (and the pricing model is wrong).
+
+14. **Semantic search means your mail is indexed on their infrastructure.**
+    Embeddings of message bodies on a third party is a sub-processor and DPA
+    question, not just a preference. Anyone with a data-residency clause has to
+    ask it.
+
+15. **Commoditization pressure from above.** Cloudflare shipped Email Service
+    for agents in April 2026. SES + S3 + a webhook is a weekend for a competent
+    team. If a model provider ships agent identity primitives with an inbox
+    attached, hosted agent mail becomes a feature of someone else's platform.
+
+### Checked and *not* a finding
+
+Recording these so nobody rediscovers them and publishes something wrong:
+
+- **"Their apex domain has no SPF record."** True (`agentmail.to` publishes no
+  `v=spf1`), but not a misconfiguration. They send from `mail.agentmail.to`,
+  which publishes `v=spf1 include:amazonses.com -all`, and the apex carries
+  `v=DMARC1; p=reject`. That's a normal, correct SES setup. Do not use this.
+- **"They're on the public disposable blocklists."** Not yet — only the
+  commercial detectors, as of 2026-07-26. State it precisely or not at all.
 
 ## 4. Honest scorecard
 

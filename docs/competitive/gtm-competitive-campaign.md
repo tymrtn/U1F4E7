@@ -5,194 +5,227 @@ Campaign window: 6 weeks, aligned to v1.1 → v1.2._
 
 ---
 
-## 1. The strategic frame
+## 1. The frame
 
-AgentMail asked and answered: **"how does an agent get an inbox?"**
+AgentMail answered "how does an agent get an inbox?" Fine. That question has a
+ceiling, and we shouldn't spend a dollar arguing about it.
 
-That question has a ceiling. Once every agent has an address, the question that
-replaces it is: **"how do you let an agent touch the inbox your business
-already runs on — and prove afterwards what it did?"**
+The question nobody has answered: **what happens the first time the agent gets
+it wrong?** Not in the demo. In week three, at 3am, against your actual
+customers, from the address your invoices come from.
 
-Nobody owns that question. We already ship the answer: per-agent identities,
-policy clamps, send-mode ceilings, a fail-closed Governor gate, a
-human-in-the-loop approval queue, and an attributed audit trail. The campaign's
-job is to make that question the one the market is asking.
+We ship the answer already — draft-only defaults, send cooldowns, recipient
+allowlists, an approval queue, revocable per-agent tokens, a fail-closed send
+gate, and a receipt for every action. What we've been doing is describing it in
+language nobody says out loud.
 
-**We are not the cheap alternative to AgentMail. We are the layer above it.**
+### Call it what it is: oops protection
 
-### Positioning statement
+`send-mode ceiling`, `policy clamp`, `Governor verdict`, `agent identity
+attribution` — accurate, unreadable. From now on the external name for the
+whole cluster is **oops protection**, and the individual pieces get plain
+descriptions:
 
-> Envelope is the governed mailbox runtime for AI agents. It gives agents
-> scoped, attributed, revocable authority over mailboxes you already own — any
-> IMAP provider, self-hosted, $0 per message — so a fleet of agents can run your
-> real email without you losing control of it.
+| Internal term | What we say publicly |
+|---|---|
+| Send-mode ceiling (`draft-only`) | Your agent can write email. It can't send it. |
+| Recipient allowlist | It can only email people you've named. |
+| Send cooldown + undo | There's a window to catch it before it goes out. |
+| Governor gate | Every send gets checked, and a failed check means no send. |
+| `actions tail --agent` | You can see exactly which agent did what, after the fact. |
+| Per-agent token + revoke | Kill one agent's access without touching the others. |
 
-### Category we're naming
+Ship a `docs/oops-protection.md` and a README section under that name. It's the
+most important copy change in this document.
 
-**Agent mail governance.** Hosted inboxes are *supply*. Governance is *control*.
-Every asset should reinforce that these are different layers, not competing
-products — because the moment a buyer accepts that framing, we stop being
-compared on inbox provisioning and start being compared on a dimension where
-nobody else has an entry.
+### Taglines
 
-### Taglines (lead with the first)
+Lead with the first two. Kill "governed mailbox runtime," "control plane," and
+"an inbox is not a permission" — that's conference-panel language.
 
-1. **"An inbox is not a permission."**
-2. "They give your agent an inbox. We give you control of the one you already have."
-3. "Your domain. Your reputation. Your rules. Your audit trail."
-4. "The agent didn't get an email address. It got a delegation."
+1. **Oops protection for agents with email access.**
+2. **Your agent has email. Now give it brakes.**
+3. They raised $6M to run mail servers. You already have one.
+4. Everyone's handing agents inboxes. Nobody's handing them brakes.
+5. Draft-only by default. Your agent is new here.
+6. Built on the assumption that your agent will screw up. Because it will.
+7. $0 per message. It's your mailbox. You already paid for it.
 
----
+### The weekend line
+
+The top comment on every launch in this category is "I could build this in a
+weekend with Claude." Don't fight it — take it, because for us it's true:
+
+> You could build this in a weekend with Claude. I did. Then I spent six months
+> on the part where it doesn't email your entire contact list at 3am.
+
+That one line does three jobs: it disarms the dismissal, it's honest, and it
+relocates the argument onto the ground where we win. Use it in the HN comment,
+the README intro, and the demo voiceover.
+
+### Positioning statement (internal)
+
+> Envelope runs AI agents on mailboxes you already own — any IMAP provider,
+> self-hosted, $0 per message — with the brakes, the approval queue, and the
+> audit trail that keep a bad prompt from becoming an apology email.
 
 ## 2. Messaging pillars
 
-| Pillar | Claim | Proof |
+| Pillar | What we say | Proof |
 |---|---|---|
-| **Authority, not access** | Agents get clamped, revocable delegations — not a shared credential | `envelope agent policy set`, send-mode ceiling ladder, `agent_policy_denied_action` |
-| **Attribution** | Every action, every send decision, traced to a named agent | `envelope actions tail --agent`, Governor verdict badges, HMAC-signed event stream |
-| **Your identity** | Send from the address counterparties already trust | Any IMAP provider, no DNS setup, no new domain |
-| **$0 per message** | Flat annual license; marginal cost of a message is zero | Licensing table + cost calculator |
-| **Custody** | Bodies, attachments, and threads never leave your infrastructure | Self-hosted, offline-capable, evidence bundles |
-| **Interop, not lock-in** | We govern *any* mailbox — including theirs | v1.1 AgentMail provider profile |
+| **Brakes** | Your agent drafts; you approve. Or clamp it tighter. | Draft-only ceiling, allowlists, cooldown, Governor gate |
+| **Receipts** | Every action traced to a named agent, after the fact | `actions tail --agent`, signed event stream |
+| **Your address** | Send from the address people already recognize | Any IMAP provider, no DNS setup, no new domain |
+| **$0 a message** | Flat annual license. Your agent looping isn't a billing event. | Licensing table + calculator |
+| **It stays on your box** | Bodies and attachments never leave your infrastructure | Self-hosted, works offline, evidence bundles |
+| **Works with theirs** | We govern any mailbox, including AgentMail's | v1.1 provider profile |
 
-## 3. ICP segments and the message each one gets
+## 3. ICP segments
 
-| Segment | Pain | Lead message | Entry product |
+| Segment | Pain | Lead message | Entry |
 |---|---|---|---|
-| **Solo builders / indie agent devs** | Want an agent on their own Gmail without wiring OAuth | "Add your email and password. Your agent has a mailbox in 60 seconds." | Free personal tier |
-| **Agent-platform teams already on AgentMail** | Provisioning is solved; governance isn't. Nobody can answer "which agent sent that?" | "Keep your inboxes. Add the control plane." | v1.1 interop path → Team |
-| **SMB ops teams (10–25 mailboxes)** | Want triage/scheduling/follow-up automation on their real support and sales mail | "Automate the inbox you already run, with a human approving every send." | Team / Growth |
-| **Regulated + legal** | Cannot put message bodies on a third party's infrastructure | "Custody stays with you. Evidence bundles are read-only and verifiable." | Growth / Enterprise |
-| **Self-hosters / homelab** | Ideological and practical: own the stack | "Runs offline. Any IMAP. FSL source-available." | Free → Team |
+| **Solo builders** | Want an agent on their Gmail without wiring OAuth | "Your email and password. Sixty seconds." | Free personal |
+| **Teams already on AgentMail** | Provisioning solved, nobody can answer "which agent sent that?" | "Keep your inboxes. Add the brakes." | v1.1 interop → Team |
+| **SMB ops (10–25 mailboxes)** | Triage and follow-up on real support/sales mail | "Automate the inbox you already run, with a human approving every send." | Team / Growth |
+| **Regulated + legal** | Can't put message bodies on someone else's servers | "Your mail stays yours. Evidence bundles are read-only and verifiable." | Growth / Enterprise |
+| **Self-hosters** | Own the stack | "One binary. Any IMAP. Runs offline." | Free → Team |
 
-## 4. The cost argument (state the assumption honestly)
+## 4. The cost argument
 
-Assumption, said out loud in every asset: **you already pay for email.** If you
-don't have a mailbox, a hosted inbox API is genuinely the faster start — say so.
-For everyone else, the math:
+Say the assumption out loud in every asset: **you already pay for email.** If
+you don't have a mailbox, a hosted inbox API is the faster start — say so and
+move on. For everyone else:
 
-| Agent email volume | Hosted inbox API (published rates) | Envelope |
+| Agent volume | Hosted inbox API (published rates) | Envelope |
 |---|---:|---:|
 | 3k msgs/mo | $0 (free tier) | $0 personal / $240 yr commercial |
-| 10k msgs/mo | $240/yr | $240/yr Team, flat |
+| 10k msgs/mo | $240/yr | $240/yr, flat |
 | 50k msgs/mo | $2,400/yr (Startup tier required) | $240–960/yr, flat |
 | 150k msgs/mo | $2,400/yr | $240–960/yr, flat |
 | 500k msgs/mo | Enterprise, negotiated | $960/yr, flat |
 
-The line to hold: **their cost scales with how much your agent talks; ours
-doesn't.** An agent in a reply loop is a billing incident on a metered plan and
-a no-op on ours.
+The line: **their price goes up when your agent talks more. Ours doesn't.** A
+runaway loop is a billing incident over there and a no-op here.
 
-Ship this as an interactive calculator on the comparison page. Pull competitor
-numbers from published pricing only, date-stamp them, and fix them within a week
-of any change — a stale competitor price is the fastest way to lose the
-credibility this whole campaign runs on.
+Ship it as a calculator. Pull competitor numbers from published pricing only,
+date-stamp them, fix them within a week of any change. A stale competitor price
+is the fastest way to lose the credibility this whole thing runs on.
 
-## 5. Asset list
+## 5. Assets
 
-**Tier 1 — must ship before Week 1**
+**Before Week 1**
 
-1. **Comparison page** — `envelope vs. hosted agent inboxes`. Includes an honest
-   "when to use them instead" section: no mailbox yet, need hundreds of
-   throwaway inboxes, want managed deliverability, don't want to run anything.
-   The concession is what makes the rest believable.
-2. **90-second demo video** — the fleet-on-shared-inbox story from
-   `docs/launch-assets.md`: two agents, one mailbox, one clamped to draft-only,
-   a denial with a stable code, then `actions tail` showing who did what.
-3. **Cost calculator** — volume slider, flat line vs. metered line.
-4. **"An inbox is not a permission" essay** — the category-defining piece.
-   Argues that provisioning is solved and authority isn't, with the Launch HN
-   prompt-injection thread as evidence that the category knows it.
+1. **Comparison page** — with an honest "use them instead if…" block: no mailbox
+   yet, need hundreds of throwaway addresses, want someone else managing
+   deliverability, don't want to run anything. The concession is what makes the
+   rest believable.
+2. **90-second demo** — two agents, one mailbox, one clamped to draft-only, the
+   denial fires with a real error code, then `actions tail` shows who did what.
+   The denial is the money shot. Lead with it, don't bury it at 0:70.
+3. **Cost calculator** — flat line vs. metered line, one slider.
+4. **The essay** — *"Everyone's handing agents inboxes. Nobody's handing them
+   brakes."* The weekend line goes in the first three paragraphs.
+5. **`docs/oops-protection.md`** — the plain-language safety page.
 
-**Tier 2 — Weeks 2–4**
+**Weeks 2–4**
 
-5. **`docs/providers/agentmail.md`** + companion post: *"Govern your AgentMail
-   inboxes with Envelope"* — five commands, real output, zero snark. Genuinely
-   useful to their users; that's the point.
-6. **Prompt-injection field guide** — how a malicious email escalates through an
-   agent's mail tool, and what a send-mode ceiling actually stops. Positions us
-   as the safety-serious vendor before Phase 4 ships the tooling.
-7. **Migration guide** — from metered API to BYO mailbox, including the
-   deliverability checklist (`envelope deliverability` output as the artifact).
-8. **`envelope-skill.md` distribution** — Claude Code plugin marketplace, MCP
-   registries, awesome-mcp lists, Cursor/Zed docs. Distribution beats messaging.
+6. **`docs/providers/agentmail.md`** + post: *"Govern your AgentMail inboxes
+   with Envelope"* — five commands, real output, zero snark. It has to be
+   genuinely useful to their customers; that's the entire point.
+7. **Prompt-injection field guide** — how a malicious email walks an agent into
+   sending something, and what a draft-only ceiling actually stops.
+8. **Migration guide** — metered API → your own mailbox, with the
+   `envelope deliverability` output as the artifact.
+9. **Skill distribution** — `envelope-skill.md` into the Claude Code plugin
+   marketplace, MCP registries, awesome-mcp lists, Cursor/Zed docs.
+   Distribution beats messaging.
 
-**Tier 3 — Weeks 5–6**
+**Weeks 5–6**
 
-9. **Case study** — one real fleet-on-shared-inbox deployment with numbers.
-10. **Conformance benchmark teaser** — announce the public agent-mail governance
-    test corpus (Phase 4.5). Owning the benchmark is owning the vocabulary.
+10. **Case study** with real numbers.
+11. **Conformance benchmark teaser** — a public test corpus for agent-mail
+    safety. Owning the benchmark is owning the vocabulary.
 
 ## 6. Six-week calendar
 
-| Week | Ship | Publish | Channel focus |
+| Week | Ship | Publish | Where |
 |---|---|---|---|
-| **0** | v1.1 (Phase 0 interop) | Comparison page, calculator, demo video | Assets staged, nothing announced |
-| **1** | — | **"An inbox is not a permission"** | HN, Lobsters, r/selfhosted, X, LinkedIn. The essay leads, not the product |
-| **2** | — | Comparison page + calculator push | SEO ("email api for ai agents", "agent inbox alternative"), roundup-site outreach with corrected/added Envelope rows |
-| **3** | — | **"Govern your AgentMail inboxes"** | Their audience, in their subreddits and Discords, gracious tone. Also: MCP registry + plugin marketplace listings |
-| **4** | v1.2 (per-agent identity, OAuth, HTTP API) | **Show HN #2: inbox-per-agent on the domain you already own** | HN front page attempt, YC-adjacent networks, X |
-| **5** | — | Prompt-injection field guide + migration guide | Security newsletters, agent-dev communities |
-| **6** | — | Case study + benchmark teaser | Podcasts, newsletters, sales follow-up on Week-4 inbound |
+| **0** | v1.1 (interop) | Assets staged | Nothing announced |
+| **1** | — | **The brakes essay** | HN, Lobsters, r/selfhosted, X, LinkedIn. Essay leads, product follows |
+| **2** | — | Comparison page + calculator | SEO ("email api for ai agents", "agentmail alternative"), roundup-site outreach |
+| **3** | — | **"Govern your AgentMail inboxes"** | Their communities, gracious tone. Plus MCP registry + marketplace listings |
+| **4** | v1.2 (per-agent addresses, OAuth, HTTP API) | **Show HN #2** | HN front page attempt, X, YC-adjacent networks |
+| **5** | — | Injection field guide + migration guide | Security newsletters, agent-dev communities |
+| **6** | — | Case study + benchmark teaser | Podcasts, newsletters, Week-4 inbound follow-up |
 
-**Why the essay leads:** launching product-first invites a feature comparison we
-partially lose today (Phase 0/1 aren't fully landed until Week 4). Launching
-frame-first means the Week-4 product launch arrives into a conversation we
-defined.
+Why the essay leads: a feature-by-feature comparison today partially loses on
+provisioning, and Phases 0/1 don't fully land until Week 4. Set the frame first,
+launch the product into a conversation we already shaped.
 
 ## 7. Objection handling
 
 | Objection | Response |
 |---|---|
-| "AgentMail sets up in one API call, you need an app password." | True today, and it's the top item on our roadmap — OAuth device flow in v1.2. The 90 seconds buys you an address your customers already recognize and $0 per message forever. |
-| "Doesn't self-hosting mean I run infrastructure?" | One binary, SQLite, systemd unit or container. No DNS, no MX, no IP warmup — that's the infrastructure we're saving you from. |
-| "What about deliverability?" | You inherit your existing domain's reputation instead of sharing a pool with every other tenant. `envelope deliverability` audits SPF/DKIM/DMARC; v1.4 adds continuous DMARC report monitoring. |
-| "We need hundreds of disposable inboxes." | Then use a hosted provider for supply — and put Envelope on top for governance. That's a supported configuration as of v1.1, not a concession. |
-| "Is this just Himalaya with extra steps?" | Himalaya is a CLI mail client. Envelope is a multi-agent runtime with identity, policy, audit, and a fail-closed send gate. See the README comparison. |
-| "Source-available isn't open source." | Correct, and we don't claim otherwise. FSL-1.1-ALv2: free for personal use, converts to Apache 2.0, flat annual commercial license — no per-seat, no per-message. |
-| "Why should I trust an agent with my real mailbox?" | You shouldn't trust it — you should clamp it. Draft-only ceiling, recipient allowlists, human approval queue, revocable per-agent tokens, and an audit trail of every action. That's the entire product thesis. |
+| "They set up in one API call, you need an app password." | True today. OAuth device flow lands in v1.2. Those ninety seconds buy an address your customers recognize and $0 per message forever. |
+| "Isn't self-hosting infrastructure?" | One binary and a SQLite file. No DNS, no MX, no IP warmup — that's the infrastructure we're saving you. |
+| "What about deliverability?" | You inherit your own domain's reputation instead of sharing a pool with every other tenant's agent. `envelope deliverability` audits SPF/DKIM/DMARC; continuous DMARC monitoring lands in v1.4. |
+| "We need hundreds of disposable inboxes." | Then buy those from a hosted provider and put Envelope on top. Supported configuration as of v1.1, not a concession. |
+| "Just Himalaya with extra steps?" | Himalaya is a mail client. This is a multi-agent runtime with identity, policy, audit, and a send gate that fails closed. |
+| "Source-available isn't open source." | Correct, and we don't pretend otherwise. FSL-1.1-ALv2, converts to Apache 2.0, flat annual commercial license, no per-seat, no per-message. |
+| "Why would I trust an agent with my real mailbox?" | Don't trust it. Clamp it. Draft-only, allowlisted recipients, a human approving sends, revocable tokens, and a log of everything it did. That's the product. |
+| "Their inboxes are fine for signups and OTPs." | `curl -s https://api.usercheck.com/domain/agentmail.to` returns `"disposable": true` — same bucket as mailinator. Signup forms call those APIs. Your own domain doesn't have that problem. |
 
-## 8. Rules of engagement
+## 8. How to be snarky without being a jerk
 
-Non-negotiable. A competitive campaign that gets caught embellishing loses more
-than it wins, and our whole pitch is trustworthiness.
+Snark is approved. It works here because the product's whole personality is
+"we assume this will go wrong." But it has a shape:
 
-1. **No astroturfing.** No sock puppets, no fake reviews, no seeded comments.
-2. **No disparagement.** AgentMail built something good and we say so. We
-   compete on a different axis; that reads as confidence, and it's also true.
-3. **Cite only published material,** date-stamped, corrected within a week of any
-   change.
-4. **Never claim capabilities we don't ship.** If Phase 1 slips, the per-agent
-   identity messaging slips with it. Roadmap items are labeled as roadmap.
-5. **Never claim managed deliverability.** We audit DNS; we do not warm IPs.
-6. **Concede the honest wins.** Every comparison asset carries a "when to use
-   them instead" section.
-7. **Their users are guests.** The Week-3 interop post is genuinely useful to
-   AgentMail customers or it doesn't ship.
+1. **Punch at the category and at ourselves, never at their team.** "Everyone's
+   handing agents inboxes" — good. "They raised $6M to run mail servers" —
+   good, it's a fact about capital structure. Anything implying they're bad at
+   their jobs — no. They're not, and it reads as insecurity.
+2. **Every jab must survive one command.** If a line can't be checked by a
+   reader in ten seconds (`curl`, `dig`, a published pricing page), cut it.
+   The disposable-domain line qualifies. Guesses about their internals don't.
+3. **Self-deprecate first.** The weekend line concedes more about us than any
+   line concedes about them. That's what earns the rest.
+4. **No astroturfing.** No sock puppets, no seeded comments, no fake reviews.
+   Not a tone question — a hard rule.
+5. **Don't run the deliverability-audit hit piece.** We could publish
+   `envelope deliverability --domain agentmail.to` output. It would go mildly
+   viral and it would make us the vendor that audits competitors' DNS for
+   content. Use the general argument — shared domain vs. yours — instead.
+   _(Also: I checked. Their setup is correct. The apex has no SPF but they send
+   from `mail.agentmail.to` with `include:amazonses.com -all` and `p=reject` at
+   the apex. Anyone who "finds" this and publishes it will be wrong in public.)_
+6. **Never claim what we don't ship.** If Phase 1 slips, the per-agent-address
+   messaging slips with it. Roadmap gets labeled roadmap.
+7. **Never claim managed deliverability.** We audit DNS. We don't warm IPs.
+8. **Their users are guests.** The Week-3 interop post is useful to AgentMail
+   customers or it doesn't ship.
 
 ## 9. Metrics
 
 | Metric | Baseline | 90-day target |
 |---|---|---|
 | Comparison-page sessions | 0 | 5,000 |
-| Calculator → license-inquiry conversion | — | 3% |
+| Calculator → license inquiry | — | 3% |
 | GitHub stars | current | +2,000 |
-| `envelope quickstart` completions (opt-in telemetry or self-reported) | current | 3× |
-| Commercial licenses issued | current | 3× |
-| Inbound mentioning "governance" / "audit" / "attribution" | ~0 | 25% of inbound |
+| `quickstart` completions | current | 3× |
+| Commercial licenses | current | 3× |
+| Inbound mentioning brakes / approval / audit | ~0 | 25% |
 | Third-party roundups listing Envelope | 0 | 5 |
-| Share of voice on "agent email governance" | 0 | #1 |
 
-The pillar metric is the second-to-last one. If a quarter from now buyers are
-asking about attribution and clamps instead of inbox provisioning, the campaign
-worked regardless of what the other numbers did.
+The one that matters is the second-to-last. If buyers are asking "what stops it
+from sending the wrong thing" instead of "how many inboxes do I get," the
+campaign worked regardless of the other numbers.
 
-## 10. Immediate next actions
+## 10. Next actions
 
 1. Land Phase 0 (AgentMail provider profile + docs + tests) — unblocks Week 3.
-2. Draft "An inbox is not a permission" — the long pole; start now.
-3. Build the comparison page and calculator from the teardown's scorecard tables.
-4. Re-cut the `docs/launch-assets.md` demo to 90 seconds, denial-code moment
-   front and center.
-5. Prioritize OAuth device flow (Phase 2.6) — the objection that kills deals.
-6. Set a weekly competitor-pricing check so the calculator never goes stale.
+2. Write `docs/oops-protection.md` and re-cut the README around that language.
+3. Draft the brakes essay. Long pole; start now.
+4. Build the comparison page and calculator off the teardown scorecard.
+5. Re-cut the demo to 90 seconds with the denial in the first 20.
+6. Prioritize OAuth device flow — the objection that ends deals.
+7. Weekly competitor-pricing check so the calculator never goes stale.

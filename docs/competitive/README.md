@@ -10,9 +10,10 @@ category (AgentMail and peers). Research current as of 2026-07-26.
 | [`gtm-competitive-campaign.md`](gtm-competitive-campaign.md) | Positioning, messaging pillars, ICP segments, cost argument, asset list, six-week calendar, objection handling, rules of engagement, metrics |
 
 **The one-line thesis:** hosted inbox APIs answered "how does an agent get an
-inbox." Envelope answers "how do you let an agent touch the inbox your business
-already runs on, and prove afterwards what it did." We don't compete on inbox
-supply — we govern any mailbox, including theirs.
+inbox." Nobody answered "what happens the first time it gets it wrong?" We ship
+the brakes — draft-only defaults, approval queue, revocable per-agent tokens,
+audit trail — for mailboxes you already own, including inboxes rented from
+someone else. Externally we call that **oops protection**, not "governance."
 
 Claims about Envelope in these documents are verified against the repo; claims
 about competitors come from published material only and are date-stamped. See
