@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-07-30
+
+### Fixed
+
+- **Draft review URLs honor the configured dashboard host consistently.** CLI
+  draft output now uses the canonical dashboard base URL resolver for top-level
+  `dashboard_url` and `review_url` fields, matching nested `ui` metadata instead
+  of falling back to `http://localhost:3141` when only persistent
+  `dashboard.base_url` is configured.
+
 ## [1.0.0] — 2026-07-11
 
 First public release. Envelope is a bring-your-own-mailbox email client with

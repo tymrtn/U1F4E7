@@ -24,16 +24,6 @@ use super::common::{resolve_account, setup_credentials};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
 
-const DEFAULT_DASHBOARD_BASE_URL: &str = "http://localhost:3141";
-
-fn dashboard_base_url() -> String {
-    std::env::var("ENVELOPE_DASHBOARD_URL")
-        .ok()
-        .map(|url| url.trim().trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| DEFAULT_DASHBOARD_BASE_URL.to_string())
-}
-
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -64,7 +54,10 @@ fn draft_dashboard_url_with_base(base_url: &str, account_id: &str, draft_id: &st
 }
 
 pub(crate) fn draft_dashboard_url(account_id: &str, draft_id: &str) -> String {
-    draft_dashboard_url_with_base(&dashboard_base_url(), account_id, draft_id)
+    // Resolve through the canonical dashboard base URL precedence
+    // (ENVELOPE_DASHBOARD_BASE_URL → legacy alias → persisted dashboard.base_url
+    // → localhost) so top-level draft URLs match the nested `ui` review URLs.
+    draft_dashboard_url_with_base(&ui::dashboard_base(), account_id, draft_id)
 }
 
 /// Strip surrounding angle brackets from a Message-ID (`<id>` → `id`).
@@ -2859,6 +2852,61 @@ mod tests {
             ),
             "http://localhost:1111/accounts/editor%40spainexpat.com/drafts/draft-123"
         );
+    }
+
+    fn drafts_test_config_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "envelope-drafts-dashboard-test-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn draft_urls_use_persisted_dashboard_base_url() {
+        let path = drafts_test_config_path("persisted-base");
+        let _ = std::fs::remove_file(&path);
+        let _guard = crate::commands::config::isolated_dashboard_config(path.clone());
+        std::fs::write(
+            &path,
+            r#"{"dashboard":{"base_url":"https://macbook-pro.tail87a011.ts.net"}}"#,
+        )
+        .unwrap();
+
+        let account = "editor@spainexpat.com";
+        let draft = "draft-123";
+        let top_level = draft_dashboard_url(account, draft);
+        let ui = ui::draft_ui(account, draft);
+
+        let expected = "https://macbook-pro.tail87a011.ts.net/accounts/editor%40spainexpat.com/drafts/draft-123";
+        assert_eq!(top_level, expected);
+        assert_eq!(ui["review_url"], expected);
+        assert_eq!(ui["dashboard_url"], "https://macbook-pro.tail87a011.ts.net");
+        // Top-level draft URL must agree with the nested UI review URL.
+        assert_eq!(top_level, ui["review_url"].as_str().unwrap());
+    }
+
+    #[test]
+    fn draft_urls_prefer_env_over_persisted_dashboard_base_url() {
+        let path = drafts_test_config_path("env-precedence");
+        let _ = std::fs::remove_file(&path);
+        let guard = crate::commands::config::isolated_dashboard_config(path.clone());
+        std::fs::write(
+            &path,
+            r#"{"dashboard":{"base_url":"https://config.example"}}"#,
+        )
+        .unwrap();
+        guard.set_primary_env("https://env.example/");
+
+        let account = "a@b.com";
+        let draft = "d1";
+        let top_level = draft_dashboard_url(account, draft);
+        let ui = ui::draft_ui(account, draft);
+
+        assert_eq!(
+            top_level,
+            "https://env.example/accounts/a%40b.com/drafts/d1"
+        );
+        assert_eq!(top_level, ui["review_url"].as_str().unwrap());
     }
 
     #[test]
