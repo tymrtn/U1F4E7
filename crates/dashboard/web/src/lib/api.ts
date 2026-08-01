@@ -298,7 +298,44 @@ export interface FailedActionItem {
   [key: string]: unknown;
 }
 
-export type DraftStatus = 'draft' | 'pending_review' | 'blocked' | 'sent' | 'discarded';
+/**
+ * Mirrors `store::DraftStatus` (serde snake_case). `sending`/`syncing` are
+ * durable claims held by the send sweep and the IMAP sync, and
+ * `delivery_uncertain` is the terminal-recovery park — none of the three are
+ * editable, so surfaces must render them read-only rather than assume a draft
+ * is always open for editing.
+ */
+export type DraftStatus =
+  | 'draft'
+  | 'pending_review'
+  | 'sending'
+  | 'syncing'
+  | 'blocked'
+  | 'delivery_uncertain'
+  | 'sent'
+  | 'discarded';
+
+/** Statuses the store's content-edit guard accepts (`update_draft_content_inner`). */
+export const EDITABLE_DRAFT_STATUSES: readonly DraftStatus[] = [
+  'draft',
+  'pending_review',
+  'blocked'
+];
+
+/**
+ * Statuses `queue_draft_with_human_approval` will promote into the outbox.
+ * `blocked` is deliberately excluded: it means changes were requested, and it
+ * has to be approved back into `draft` before it can be queued.
+ */
+export const SENDABLE_DRAFT_STATUSES: readonly DraftStatus[] = ['draft', 'pending_review'];
+
+export function isEditableDraftStatus(status: DraftStatus): boolean {
+  return EDITABLE_DRAFT_STATUSES.includes(status);
+}
+
+export function isSendableDraftStatus(status: DraftStatus): boolean {
+  return SENDABLE_DRAFT_STATUSES.includes(status);
+}
 
 export interface Draft {
   id: string;
@@ -322,6 +359,13 @@ export interface Draft {
   sent_at: string | null;
   created_by: string | null;
   imap_uid?: number;
+  /**
+   * Monotonic revision counter bumped by every content-relevant mutation.
+   * Edit/approve/send must echo the revision they were shown back as
+   * `expected_revision`; the server returns 409 instead of overwriting content
+   * the operator never saw.
+   */
+  revision: number;
 }
 
 export interface DraftsResponse {
@@ -330,8 +374,59 @@ export interface DraftsResponse {
 
 export interface DraftResponse {
   draft: Draft;
+  account?: Account;
   dashboard_path?: string;
   dashboard_url?: string;
+  review_url?: string | null;
+}
+
+/**
+ * Body for POST /api/accounts/{id}/drafts/{draftId}/edit. Mirrors
+ * `DraftEditRequest`, which is `deny_unknown_fields` — send these keys only.
+ *
+ * `text_content` and `html_content` are one unit: supplying either replaces the
+ * body pair and CLEARS the omitted alternate, so a single-format editor cannot
+ * leave a stale alternate behind for `multipart/alternative` delivery to
+ * surface instead of the edit. Supplying neither leaves both bodies untouched.
+ */
+export interface DraftEditBody {
+  expected_revision: number;
+  to_addr?: string;
+  cc_addr?: string;
+  bcc_addr?: string;
+  subject?: string;
+  text_content?: string;
+  html_content?: string;
+}
+
+export interface DraftEditResponse {
+  draft: Draft;
+  status: string;
+}
+
+/**
+ * Body for POST /api/accounts/{id}/drafts/{draftId}/send. Mirrors
+ * `DraftSendRequest` (`deny_unknown_fields`).
+ *
+ * `confirm` must be an explicit human decision — the backend rejects the call
+ * with 400 otherwise. There is no immediate-SMTP path here: the endpoint queues
+ * the draft into the outbox cooldown and the shared scheduled-send sweep
+ * performs the real send behind the Governor gate.
+ */
+export interface DraftSendBody {
+  confirm: boolean;
+  expected_revision: number;
+  cooldown_seconds?: number;
+}
+
+export interface DraftQueuedResponse {
+  draft_id: string;
+  sent: boolean;
+  status: string;
+  send_after: string;
+  cooldown_seconds: number;
+  queued_reason_code: string;
+  queued_reason: string;
 }
 
 /**
@@ -585,6 +680,43 @@ export const api = {
       method: 'POST',
       body
     });
+  },
+
+  /**
+   * POST /api/accounts/{id}/drafts/{draftId}/edit
+   * Save operator edits. `expected_revision` is the revision the operator was
+   * shown — a concurrent change returns 409 rather than clobbering it. Editing
+   * clears any existing human-approval attestation server-side, so an edited
+   * draft can never ride an earlier approval.
+   */
+  editDraft(
+    accountId: string,
+    draftId: string,
+    body: DraftEditBody,
+    o?: RequestOptions
+  ): Promise<DraftEditResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/edit`,
+      { ...o, method: 'POST', body }
+    );
+  },
+
+  /**
+   * POST /api/accounts/{id}/drafts/{draftId}/send
+   * Queue an approved draft into the outbox cooldown. Requires an explicit
+   * `confirm: true` and the reviewed `expected_revision`; the approval
+   * attestation is bound to that exact revision.
+   */
+  sendDraft(
+    accountId: string,
+    draftId: string,
+    body: DraftSendBody,
+    o?: RequestOptions
+  ): Promise<DraftQueuedResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/send`,
+      { ...o, method: 'POST', body }
+    );
   },
 
   /**

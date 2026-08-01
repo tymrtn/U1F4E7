@@ -10,6 +10,7 @@
     type ComposeResponse
   } from '$lib/api';
   import { getComposerStore, type ComposerMode } from '$lib/composer.svelte';
+  import { optionalAddrsValid, validateAddrs } from '$lib/addresses';
 
   type PendingAttachment = ComposeAttachment & { size: number };
 
@@ -37,27 +38,16 @@
   let sendError = $state<{ code: string; message: string } | null>(null);
   let openSession = $state('');
 
-  function normalizedAddress(addr: string): string {
-    const angle = addr.match(/<([^>]+)>/);
-    return (angle?.[1] ?? addr).trim();
-  }
-
-  function isValidEmail(addr: string): boolean {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedAddress(addr));
-  }
-
-  function parseAddrs(raw: string): string[] {
-    return raw.split(',').map((value) => value.trim()).filter(Boolean);
-  }
-
-  function validateAddrs(raw: string): boolean {
-    const addrs = parseAddrs(raw);
-    return addrs.length > 0 && addrs.every(isValidEmail);
-  }
-
   const isFreshMessage = $derived(composer.mode === 'compose' || composer.mode === 'forward');
-  const toValid = $derived(toRaw.trim() === '' ? true : validateAddrs(toRaw));
+  const toValid = $derived(optionalAddrsValid(toRaw));
   const recipientReady = $derived(isFreshMessage ? validateAddrs(toRaw) : true);
+  // Cc/Bcc are optional, but anything actually typed has to be a usable
+  // address — otherwise a malformed Cc rides along on an otherwise valid send
+  // and only fails at SMTP time. Only shown (and only populated) on fresh
+  // messages; reply mode clears them.
+  const ccValid = $derived(optionalAddrsValid(ccRaw));
+  const bccValid = $derived(optionalAddrsValid(bccRaw));
+  const optionalRecipientsReady = $derived(!isFreshMessage || (ccValid && bccValid));
   const subjectReady = $derived(isFreshMessage ? subject.trim().length > 0 : true);
   const deliveryReady = $derived(fromAccountId.length > 0);
 
@@ -84,6 +74,7 @@
       !readingAttachments &&
       deliveryReady &&
       recipientReady &&
+      optionalRecipientsReady &&
       subjectReady
   );
 
@@ -256,7 +247,7 @@
           {#if !toValid && toRaw.trim() !== ''}
             <p class="composer-validation-note">Enter valid email addresses separated by commas.</p>
           {/if}
-          <div class="composer-field-row">
+          <div class="composer-field-row" class:is-invalid={!ccValid}>
             <label for="composer-cc">Cc</label>
             <input
               id="composer-cc"
@@ -267,10 +258,14 @@
               spellcheck="false"
               bind:value={ccRaw}
               disabled={sending}
+              aria-invalid={!ccValid}
             />
           </div>
+          {#if !ccValid}
+            <p class="composer-validation-note">Enter valid Cc addresses separated by commas.</p>
+          {/if}
           {#if showBcc}
-            <div class="composer-field-row">
+            <div class="composer-field-row" class:is-invalid={!bccValid}>
               <label for="composer-bcc">Bcc</label>
               <input
                 id="composer-bcc"
@@ -281,8 +276,12 @@
                 spellcheck="false"
                 bind:value={bccRaw}
                 disabled={sending}
+                aria-invalid={!bccValid}
               />
             </div>
+            {#if !bccValid}
+              <p class="composer-validation-note">Enter valid Bcc addresses separated by commas.</p>
+            {/if}
           {/if}
           <div class="composer-field-row">
             <label for="composer-subject">Subject</label>

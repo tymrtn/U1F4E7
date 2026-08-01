@@ -2348,6 +2348,80 @@ mod tests {
         }
     }
 
+    /// Client route id of the draft review composer, as SvelteKit compiles it
+    /// into the embedded bundle's route table.
+    const DRAFT_REVIEW_ROUTE_ID: &str = "/accounts/[account]/drafts/[draft]";
+
+    /// A route id that has shipped since the v2 cutover. Used as a control so a
+    /// SvelteKit/Vite change to the route-table encoding fails this test loudly
+    /// instead of silently making the draft assertion vacuous.
+    const CONTROL_ROUTE_ID: &str = "/mail/[box]/[account]/[uid]";
+
+    /// Source of the SvelteKit client entry chunk inside the embedded
+    /// `web/build/` bundle. It carries the client route table, e.g.
+    /// `{"/":[3],"/cockpit":[4],"/mail/[box]":[6,[2]], …}`.
+    fn embedded_spa_entry_chunk() -> String {
+        let path = WebAssets::iter()
+            .map(|file| file.to_string())
+            .find(|path| path.starts_with("_app/immutable/entry/app.") && path.ends_with(".js"))
+            .expect("embedded SPA bundle must contain a SvelteKit client entry chunk");
+        String::from_utf8(WebAssets::get_file(&path).expect("entry chunk readable"))
+            .expect("entry chunk is utf-8")
+    }
+
+    /// True when a concrete path is matched by a SvelteKit route id: same
+    /// segment count, literal segments equal, `[param]` segments absorb any
+    /// non-empty segment.
+    fn route_id_matches(route_id: &str, path: &str) -> bool {
+        let pattern: Vec<&str> = route_id.split('/').collect();
+        let actual: Vec<&str> = path.split('/').collect();
+        pattern.len() == actual.len()
+            && pattern.iter().zip(&actual).all(|(expected, segment)| {
+                if expected.starts_with('[') && expected.ends_with(']') {
+                    !segment.is_empty()
+                } else {
+                    expected == segment
+                }
+            })
+    }
+
+    /// Regression for the generated draft review link 404: the axum SPA
+    /// fallback already served the shell for `/accounts/<id>/drafts/<id>`
+    /// (see the deep-link tests above), but the SvelteKit bundle had no
+    /// matching client route, so the router rendered its own 404 page. Serving
+    /// the shell is necessary and not sufficient — this asserts the embedded
+    /// bundle can actually route the path the CLI and API hand to humans.
+    #[test]
+    fn embedded_spa_bundle_routes_the_generated_draft_review_link() {
+        let entry = embedded_spa_entry_chunk();
+
+        assert!(
+            entry.contains(&format!("\"{CONTROL_ROUTE_ID}\"")),
+            "control route {CONTROL_ROUTE_ID} missing from the embedded route table — the \
+             SvelteKit route-table encoding changed and this assertion needs updating"
+        );
+        assert!(
+            entry.contains(&format!("\"{DRAFT_REVIEW_ROUTE_ID}\"")),
+            "embedded SPA bundle has no {DRAFT_REVIEW_ROUTE_ID} client route, so generated \
+             draft links render the SvelteKit 404 page — rebuild with ci/build-frontend.sh"
+        );
+
+        // The exact link shape the CLI (`draft_dashboard_url`) and the drafts
+        // API (`dashboard_url` / `review_url`) emit must match that route.
+        let generated = crate::ui_paths::draft_dashboard_path(
+            "31f5fddf-04f9-4978-aea5-29aa9af12bb0",
+            "365d958c-6666-4872-898e-cb8a60f21aca",
+        );
+        assert_eq!(
+            generated,
+            "/accounts/31f5fddf-04f9-4978-aea5-29aa9af12bb0/drafts/365d958c-6666-4872-898e-cb8a60f21aca"
+        );
+        assert!(
+            route_id_matches(DRAFT_REVIEW_ROUTE_ID, &generated),
+            "generated draft link {generated} is not matched by client route {DRAFT_REVIEW_ROUTE_ID}"
+        );
+    }
+
     #[test]
     fn decode_scheduled_attachments_round_trips_bytes() {
         let attachments = vec![

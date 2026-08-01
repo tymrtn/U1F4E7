@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-08-01
+
+### Added
+
+- Generated draft review links now open a first-class dashboard composer for editing recipients, subject, and body, with revision-conflict protection, explicit human send confirmation, cooldown queueing, persisted queued/read-only states, and safe route-change handling.
+
+### Fixed
+
+- The Svelte dashboard now recognizes `/accounts/{account}/drafts/{draft}` instead of rendering its own 404 for valid draft URLs.
+- Draft review preserves both body alternatives for recipient- or subject-only edits, validates To/Cc/Bcc before send, and prevents in-flight edits or route changes from acting on the wrong draft.
+
 ## [1.0.2] — 2026-07-31
 
 ### Fixed
