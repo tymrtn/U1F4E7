@@ -53,6 +53,11 @@ pub struct DraftEditRequest {
     pub cc_addr: Option<String>,
     pub bcc_addr: Option<String>,
     pub subject: Option<String>,
+    /// The two body fields are one unit — the draft's body representation set.
+    /// Sending either one replaces the body with exactly that pair and CLEARS
+    /// the omitted alternate; sending neither leaves both bodies untouched. A
+    /// single-format editor therefore cannot leave a stale alternate behind for
+    /// `multipart/alternative` delivery to surface instead of the edit.
     pub text_content: Option<String>,
     pub html_content: Option<String>,
 }

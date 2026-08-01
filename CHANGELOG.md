@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-07-31
+
+### Fixed
+
+- Existing drafts edited in the dashboard now replace the stored body representation set atomically. Editing the plain-text form clears a stale HTML alternate (and vice versa), preventing `multipart/alternative` delivery from showing recipients the pre-edit draft; recipient- or subject-only edits still preserve both body forms.
+
 ## [1.0.1] — 2026-07-30
 
 ### Fixed

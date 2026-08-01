@@ -191,6 +191,19 @@ impl Database {
         }
     }
 
+    /// Edit a draft's recipients, subject, and body.
+    ///
+    /// `to_addr`/`subject` are per-field: `None` keeps the stored value.
+    /// `cc_addr`/`bcc_addr` are written as given (pass the existing value to
+    /// keep it).
+    ///
+    /// The two body fields move together as the draft's body representation
+    /// set. Supplying either `text_content` or `html_content` writes the
+    /// supplied pair exactly and CLEARS the omitted alternate; supplying
+    /// neither preserves both. A draft holding an edited text body beside a
+    /// pre-edit HTML body is transmitted as `multipart/alternative`, where
+    /// receiving clients prefer the HTML — so preserving the bodies per-field
+    /// would deliver the content the editor was used to change.
     pub fn update_draft_content(
         &self,
         id: &str,
@@ -254,6 +267,15 @@ impl Database {
         text_content: Option<&str>,
         html_content: Option<&str>,
     ) -> Result<Draft> {
+        // `?9` gates BOTH body columns as one unit: a supplied body replaces
+        // the pair exactly, and a recipient/subject-only edit (neither
+        // supplied) leaves the pair alone. Coalescing the columns
+        // independently left a text-only edit sitting beside the old HTML, and
+        // that dual-body row goes out as `multipart/alternative` — receiving
+        // clients prefer the HTML alternative, so the recipient read the
+        // pre-edit draft. Matches `apply_synced_draft_edit`, where the CLI
+        // edit path already writes the body pair as a replacement.
+        let body_edit = text_content.is_some() || html_content.is_some();
         // One atomic statement: the content change, the revision bump, the
         // approval invalidation, the editable-status guard, and (when bound,
         // ?8) the stale-view revision guard all land together or not at all —
@@ -266,8 +288,8 @@ impl Database {
                 cc_addr = ?2,
                 bcc_addr = ?3,
                 subject = COALESCE(?4, subject),
-                text_content = COALESCE(?5, text_content),
-                html_content = COALESCE(?6, html_content),
+                text_content = CASE WHEN ?9 THEN ?5 ELSE text_content END,
+                html_content = CASE WHEN ?9 THEN ?6 ELSE html_content END,
                 metadata = json_remove(metadata, '$.human_approval'),
                 revision = revision + 1,
                 updated_at = datetime('now')
@@ -282,7 +304,8 @@ impl Database {
                 text_content,
                 html_content,
                 id,
-                expected_revision
+                expected_revision,
+                body_edit
             ],
         )?;
         if rows == 0 {
@@ -1187,6 +1210,140 @@ mod tests {
                 .map(|m| m.get("human_approval").is_none())
                 .unwrap_or(true),
             "set_draft_metadata must never persist an injected attestation"
+        );
+    }
+
+    /// Create a draft carrying BOTH body forms, as an agent-composed reply
+    /// with an HTML alternative does.
+    fn dual_body_draft(db: &Database) -> Draft {
+        db.create_draft(
+            "acc1",
+            "to@test.com",
+            Some("Subject"),
+            Some("OLD text body"),
+            Some("<p>OLD html body</p>"),
+            None,
+            None,
+            None,
+            Some("agent"),
+        )
+        .unwrap()
+    }
+
+    /// Regression: a body edit replaces the draft's body representation SET.
+    ///
+    /// The dashboard's plain-text editor POSTs `text_content` alone for a
+    /// draft that carries both a text and an HTML body. Coalescing each body
+    /// column independently kept the omitted HTML, so the row stayed dual-body
+    /// and the send snapshot went out as `multipart/alternative` — where
+    /// receiving clients prefer the HTML alternative and render the UNEDITED
+    /// draft. The edited body must be the only body that persists, and the only
+    /// body the due-send snapshot carries.
+    #[test]
+    fn text_edit_clears_the_stale_html_alternative() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(viewed.text_content.as_deref(), Some("OLD text body"));
+        assert_eq!(viewed.html_content.as_deref(), Some("<p>OLD html body</p>"));
+
+        // Exactly the edit the dashboard text editor performs: the edited text,
+        // no HTML field, guarded on the revision the human viewed.
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                None,
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                None,
+                Some("NEW text body"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(edited.text_content.as_deref(), Some("NEW text body"));
+        assert_eq!(
+            edited.html_content, None,
+            "the omitted HTML alternative must not survive a text-body edit — a \
+             dual-body row sends multipart/alternative and clients render the \
+             stale HTML"
+        );
+        assert_eq!(edited.revision, viewed.revision + 1);
+
+        // The due-send snapshot — the row the scheduled sweep reloads and hands
+        // to SMTP — carries the edited body only.
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let due = db.list_drafts_due_for_send().unwrap();
+        let queued = due
+            .iter()
+            .find(|d| d.id == draft.id)
+            .expect("edited draft should be due");
+        assert_eq!(queued.text_content.as_deref(), Some("NEW text body"));
+        assert_eq!(
+            queued.html_content, None,
+            "the transmission snapshot must not be dual-body after a text edit"
+        );
+    }
+
+    /// The mirror case: an HTML-body edit clears the omitted text alternative,
+    /// so the recipient's plain-text client cannot render the pre-edit body.
+    #[test]
+    fn html_edit_clears_the_stale_text_alternative() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                None,
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                None,
+                None,
+                Some("<p>NEW html body</p>"),
+            )
+            .unwrap();
+
+        assert_eq!(edited.html_content.as_deref(), Some("<p>NEW html body</p>"));
+        assert_eq!(
+            edited.text_content, None,
+            "the omitted text alternative must not survive an HTML-body edit"
+        );
+    }
+
+    /// A recipient- or subject-only edit supplies NO body: both existing body
+    /// forms are preserved untouched. Clearing a body the editor never showed
+    /// the human would silently drop content.
+    #[test]
+    fn recipient_or_subject_only_edit_preserves_both_body_forms() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                Some("someone-else@test.com"),
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                Some("New subject"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(edited.to_addr, "someone-else@test.com");
+        assert_eq!(edited.subject.as_deref(), Some("New subject"));
+        assert_eq!(edited.text_content.as_deref(), Some("OLD text body"));
+        assert_eq!(
+            edited.html_content.as_deref(),
+            Some("<p>OLD html body</p>"),
+            "an edit that supplies no body must preserve both existing bodies"
         );
     }
 

@@ -1684,6 +1684,136 @@ mod tests {
         );
     }
 
+    /// End-to-end regression for the stale-alternative bug: a dashboard
+    /// text-body edit must be what actually goes on the wire.
+    ///
+    /// The dashboard editor POSTs `text_content` alone for a draft that carries
+    /// both a text and an HTML body. When the omitted HTML survived the edit,
+    /// the due-send snapshot stayed dual-body and the sweep handed both forms to
+    /// `build_message`, producing `multipart/alternative` — receiving clients
+    /// prefer the HTML alternative, so the recipient read the UNEDITED draft.
+    ///
+    /// This runs the real edit handler, takes the row the sweep's due scan
+    /// returns, and builds the message from the same body arguments the sweep
+    /// hands to `SmtpSender::send`. No socket is opened — `build_message` only
+    /// constructs MIME.
+    #[tokio::test]
+    async fn dashboard_text_edit_is_what_the_due_send_snapshot_transmits() {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use envelope_email_store::models::{Account, AccountWithCredentials};
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "recipient@example.net",
+                Some("Quote request"),
+                Some("OLD text body"),
+                Some("<p>OLD html body</p>"),
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+        let state = AppState::new(db, CredentialBackend::File);
+
+        // The dashboard editor's POST: edited text, no HTML field.
+        let response = handlers::drafts::edit(
+            AxumState(state.clone()),
+            AxumPath(("acc1".to_string(), draft.id.clone())),
+            axum::Json(handlers::drafts::DraftEditRequest {
+                expected_revision: viewed.revision,
+                to_addr: None,
+                cc_addr: None,
+                bcc_addr: None,
+                subject: None,
+                text_content: Some("NEW text body".to_string()),
+                html_content: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Queue it, then take the row the sweep's due scan returns.
+        let queued = {
+            let db = state.db.lock().await;
+            db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+                .unwrap();
+            db.list_drafts_due_for_send()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.id == draft.id)
+                .expect("edited draft should be due for send")
+        };
+
+        let account = Account {
+            id: "acc1".to_string(),
+            name: "Agent".to_string(),
+            username: "agent@example.com".to_string(),
+            domain: "example.com".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            smtp_username: None,
+            imap_username: None,
+            display_name: None,
+            signature_text: None,
+            signature_html: None,
+            created_at: String::new(),
+        };
+        let creds = AccountWithCredentials {
+            account,
+            password: "unused".to_string(),
+            smtp_password: None,
+            imap_password: None,
+        };
+        // Same body arguments the sweep passes to `SmtpSender::send`.
+        let (message, _) = envelope_email_transport::smtp::build_message(
+            &creds,
+            "regression@example.com",
+            &queued.to_addr,
+            queued.subject.as_deref().unwrap_or(""),
+            queued.text_content.as_deref(),
+            queued.html_content.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let wire = String::from_utf8_lossy(&message.formatted()).to_string();
+
+        assert!(
+            wire.contains("NEW text body"),
+            "the edited body must be on the wire"
+        );
+        assert!(
+            !wire.contains("OLD html body"),
+            "the pre-edit HTML alternative must not be transmitted — clients \
+             prefer it over the edited text and would render the unedited draft"
+        );
+        assert!(
+            !wire.contains("multipart/alternative"),
+            "a single-body draft must not be sent as multipart/alternative"
+        );
+    }
+
     /// After SMTP acceptance, a sent-state persistence failure must never look
     /// like durable success and must not leave the draft re-sendable by the
     /// next sweep (duplicate transmission). No SMTP or mailbox involved — this
