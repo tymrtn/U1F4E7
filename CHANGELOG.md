@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-08-01
+
+### Fixed
+
+- The dashboard header now reports the running backend version from `/api/health` instead of displaying a hard-coded `v1.0.0`; if health is unavailable, the version badge is omitted rather than showing a false release.
+
 ## [1.0.3] — 2026-08-01
 
 ### Added

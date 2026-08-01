@@ -266,6 +266,25 @@ export interface MessageDetailResponse {
   message: MessageDetail;
 }
 
+/**
+ * GET /api/health — identity of the *running* dashboard process.
+ *
+ * `version` is the live binary's version (handlers/health.rs reads
+ * `BuildInfo::current()`), which is exactly why the UI must render it rather
+ * than a compiled-in string: a stale launchd service has to visibly report its
+ * own version. The path/backend fields are only returned to authorized callers,
+ * so they are optional here.
+ */
+export interface HealthResponse {
+  status: string;
+  service: string;
+  version: string;
+  binary_path?: string;
+  credential_backend?: string;
+  database_path?: string;
+  app_data_dir?: string;
+}
+
 /** GET /api/stats aggregate counts (folder-agnostic, whole-install). */
 export interface StatsResponse {
   accounts: number;
@@ -553,6 +572,11 @@ export const api = {
 
   stats(o?: RequestOptions): Promise<StatsResponse> {
     return request('/stats', o);
+  },
+
+  /** GET /api/health — running-service identity (version, and paths if authorized). */
+  health(o?: RequestOptions): Promise<HealthResponse> {
+    return request('/health', o);
   },
 
   /** POST /api/accounts/{id}/verify — reconnect probe (IMAP auth check). */

@@ -2,9 +2,28 @@
   import '../app.css';
   import { base } from '$app/paths';
   import { page } from '$app/state';
-  import type { Snippet } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
+  import { api } from '$lib/api';
 
   let { children }: { children: Snippet } = $props();
+
+  // The brand tag reports the version of the *running* backend, read from
+  // /api/health. A compiled-in string would keep claiming the release the
+  // bundle was built from even when a stale launchd service is serving it —
+  // exactly the drift /api/health exists to expose. Until health answers (or
+  // if it fails) the tag is omitted: no number is honest, a wrong one is not.
+  let version = $state<string | null>(null);
+
+  onMount(async () => {
+    try {
+      const health = await api.health();
+      if (health.version) version = health.version;
+    } catch {
+      // Left null on purpose — the missing tag IS the signal. This probe is
+      // decorative; failing the whole shell over it would be worse.
+      version = null;
+    }
+  });
 </script>
 
 <div class="app-shell">
@@ -31,7 +50,9 @@
         </svg>
       </span>
       <span class="brand-name">Envelope</span>
-      <span class="brand-tag">v1.0.0</span>
+      {#if version}
+        <span class="brand-tag">v{version}</span>
+      {/if}
     </a>
     <nav class="app-nav" aria-label="Primary navigation">
       <a class:is-active={page.url.pathname.startsWith(`${base}/mail`)} href="{base}/mail/unified">Mail</a>

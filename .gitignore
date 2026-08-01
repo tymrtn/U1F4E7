@@ -18,6 +18,7 @@
 _internal/
 worktrees/
 .hermes/
+/node_modules/
 
 # Out-of-scope subprojects (tracked separately or deferred)
 apps/

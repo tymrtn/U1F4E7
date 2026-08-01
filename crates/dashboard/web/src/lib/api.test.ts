@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EnvelopeApiError, request, resetCsrf } from './api';
+import { EnvelopeApiError, api, request, resetCsrf } from './api';
 
 type FetchCall = [RequestInfo | URL, RequestInit?];
 
@@ -131,5 +131,27 @@ describe('request() CSRF handling', () => {
     if (!(err instanceof EnvelopeApiError)) throw new Error('expected EnvelopeApiError');
     expect(err.code).toBe('dashboard_auth_required');
     expect(err.status).toBe(401);
+  });
+});
+
+describe('api.health()', () => {
+  it('GETs /api/health and returns the running version', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ status: 'ok', service: 'envelope-dashboard', version: '1.0.3' })
+    );
+
+    const health = await api.health({ fetchImpl });
+
+    expect(health.version).toBe('1.0.3');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchCalls(fetchImpl)[0]!;
+    expect(url).toBe('/api/health');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('propagates a failed health probe as EnvelopeApiError', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ code: 'boom' }, { status: 500 }));
+
+    await expect(api.health({ fetchImpl })).rejects.toBeInstanceOf(EnvelopeApiError);
   });
 });
