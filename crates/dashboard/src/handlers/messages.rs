@@ -966,6 +966,7 @@ mod tests {
             date: date.map(str::to_string),
             flags: Vec::new(),
             size: 100,
+            provider_spam: None,
         }
     }
 

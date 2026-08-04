@@ -251,6 +251,22 @@ pub struct StoredLicense {
     pub activated_at: String,
 }
 
+/// Canonical form of a Message-ID for use as a tag/score lookup key.
+///
+/// IMAP `ENVELOPE` returns the Message-ID wrapped in angle brackets
+/// (`<id@host>`), while the full-message path (`mail_parser`) and the persisted
+/// `message_scores` / `tags` rows store the bare id. Strip one surrounding pair
+/// of angle brackets and trim so summary, full-message, and persistence keys
+/// all agree. A value with no surrounding brackets is returned trimmed and
+/// unchanged.
+pub fn canonical_message_id(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    match trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        Some(inner) => inner.trim(),
+        None => trimmed,
+    }
+}
+
 /// Summary of an IMAP message (envelope data, no body).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSummary {
@@ -262,6 +278,12 @@ pub struct MessageSummary {
     pub date: Option<String>,
     pub flags: Vec<String>,
     pub size: u32,
+    /// Provider spam score derived from the summary FETCH's header fields
+    /// (`X-Migadu-Spam-Score` / `X-Spam-Score`). Internal rule-engine signal
+    /// only: `#[serde(skip)]` keeps it out of `envelope search` / `inbox`
+    /// JSON and the flattened dashboard read model.
+    #[serde(skip)]
+    pub provider_spam: Option<f64>,
 }
 
 /// Input for updating the local dashboard message-summary read model.
@@ -330,6 +352,12 @@ pub struct Message {
     pub references: Option<String>,
     pub flags: Vec<String>,
     pub attachments: Vec<AttachmentMeta>,
+    /// Provider spam score derived from the fetched message headers
+    /// (`X-Migadu-Spam-Score` / `X-Spam-Score`). Internal rule-engine signal
+    /// only: `#[serde(skip)]` keeps it out of the message JSON emitted by
+    /// `envelope read` and dashboard message views.
+    #[serde(skip)]
+    pub provider_spam: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +652,7 @@ mod tests {
             references: None,
             flags: vec!["Seen".to_string()],
             attachments: vec![],
+            provider_spam: None,
         };
 
         let serialized = serde_json::to_string(&msg).expect("serialize");
@@ -631,5 +660,65 @@ mod tests {
         let reparsed: Message = serde_json::from_str(&serialized).expect("strict parse");
         assert_eq!(reparsed.text_body, msg.text_body);
         assert_eq!(reparsed.to_addrs, msg.to_addrs);
+    }
+
+    #[test]
+    fn canonical_message_id_strips_surrounding_brackets() {
+        // Bracketed IMAP ENVELOPE form normalizes to the bare persisted form.
+        assert_eq!(canonical_message_id("<id@host>"), "id@host");
+        assert_eq!(canonical_message_id("  <id@host>  "), "id@host");
+        assert_eq!(canonical_message_id("< id@host >"), "id@host");
+        // Already-bare id is unchanged (mail_parser / persistence form).
+        assert_eq!(canonical_message_id("id@host"), "id@host");
+        // Malformed / one-sided brackets are left as-is (still won't match, but
+        // never silently mangled).
+        assert_eq!(canonical_message_id("<id@host"), "<id@host");
+        assert_eq!(canonical_message_id(""), "");
+    }
+
+    /// The internal `provider_spam` rule-engine signal must never leak into the
+    /// public JSON emitted by `envelope search` / `inbox` / `read`.
+    #[test]
+    fn provider_spam_is_never_serialized() {
+        let summary = MessageSummary {
+            uid: 1,
+            message_id: Some("<m@example.com>".to_string()),
+            from_addr: "a@example.com".to_string(),
+            to_addr: "b@example.com".to_string(),
+            subject: "hi".to_string(),
+            date: None,
+            flags: vec![],
+            size: 10,
+            provider_spam: Some(7.5),
+        };
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(
+            !json.contains("provider_spam"),
+            "MessageSummary JSON must not expose provider_spam: {json}"
+        );
+
+        let msg = Message {
+            uid: 1,
+            message_id: None,
+            from_addr: "a@example.com".to_string(),
+            to_addr: "b@example.com".to_string(),
+            cc_addr: None,
+            to_addrs: vec![],
+            cc_addrs: vec![],
+            subject: "hi".to_string(),
+            date: None,
+            text_body: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            flags: vec![],
+            attachments: vec![],
+            provider_spam: Some(7.5),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize message");
+        assert!(
+            !json.contains("provider_spam"),
+            "Message JSON must not expose provider_spam: {json}"
+        );
     }
 }

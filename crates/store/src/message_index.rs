@@ -203,6 +203,8 @@ fn map_indexed_message_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inde
             date: row.get(10)?,
             flags,
             size: row.get::<_, i64>(12)? as u32,
+            // Not persisted (derived per-fetch from headers); absent on rebuild.
+            provider_spam: None,
         },
         snippet: row.get(13)?,
         thread_id: row.get(14)?,

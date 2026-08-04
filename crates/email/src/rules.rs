@@ -98,6 +98,44 @@ impl Action {
     }
 }
 
+/// Stable score dimension derived from a provider's spam-scoring headers.
+///
+/// Seeded from `X-Migadu-Spam-Score` (preferred) or `X-Spam-Score` (fallback)
+/// during rule test/preview/run. Existing rules match it via `score_above` /
+/// `score_below` like any other dimension. The name is part of the rule
+/// contract — keep it stable.
+pub const PROVIDER_SPAM_DIMENSION: &str = "provider_spam";
+
+/// Derive the `provider_spam` score from raw provider header values.
+///
+/// Prefers `X-Migadu-Spam-Score`, falling back to `X-Spam-Score`. Each value
+/// is parsed as a finite `f64`; a malformed, empty, or non-finite value
+/// (`NaN`, `±inf`) is ignored so a garbage header never fabricates a score. A
+/// present-but-malformed Migadu header still falls back to a valid generic
+/// value.
+pub fn provider_spam_from_headers(migadu: Option<&str>, generic: Option<&str>) -> Option<f64> {
+    parse_finite_score(migadu).or_else(|| parse_finite_score(generic))
+}
+
+fn parse_finite_score(raw: Option<&str>) -> Option<f64> {
+    let value: f64 = raw?.trim().parse().ok()?;
+    value.is_finite().then_some(value)
+}
+
+/// Merge a header-derived `provider_spam` score into a scores map without
+/// clobbering an explicitly persisted value.
+///
+/// An operator-set `provider_spam` score (from `message_scores`) always wins
+/// over the derived header signal; the derived value only fills the gap when
+/// no persisted score exists for the dimension.
+pub fn merge_provider_spam(scores: &mut HashMap<String, f64>, derived: Option<f64>) {
+    if let Some(value) = derived {
+        scores
+            .entry(PROVIDER_SPAM_DIMENSION.to_string())
+            .or_insert(value);
+    }
+}
+
 /// Context about a message for rule evaluation.
 ///
 /// Callers populate this from a `MessageSummary` + the tag/score store.
@@ -466,6 +504,88 @@ mod tests {
                 .is_none()
         );
         assert!(Action::Delete.local_execution_skip_reason().is_none());
+    }
+
+    // ── provider_spam score derivation ──────────────────────────────
+
+    #[test]
+    fn provider_spam_prefers_migadu_header() {
+        assert_eq!(
+            provider_spam_from_headers(Some("3.5"), None),
+            Some(3.5),
+            "Migadu header alone should seed the score"
+        );
+    }
+
+    #[test]
+    fn provider_spam_falls_back_to_generic_header() {
+        assert_eq!(
+            provider_spam_from_headers(None, Some("5.1")),
+            Some(5.1),
+            "generic X-Spam-Score should be used when Migadu is absent"
+        );
+    }
+
+    #[test]
+    fn provider_spam_migadu_wins_over_generic() {
+        assert_eq!(
+            provider_spam_from_headers(Some("2.0"), Some("9.9")),
+            Some(2.0),
+            "Migadu must take precedence when both headers are present"
+        );
+    }
+
+    #[test]
+    fn provider_spam_malformed_migadu_falls_back_to_generic() {
+        assert_eq!(
+            provider_spam_from_headers(Some("not-a-number"), Some("4.2")),
+            Some(4.2),
+            "a malformed Migadu value must not block the generic fallback"
+        );
+    }
+
+    #[test]
+    fn provider_spam_ignores_malformed_and_non_finite() {
+        assert_eq!(
+            provider_spam_from_headers(Some("bogus"), Some("junk")),
+            None
+        );
+        assert_eq!(provider_spam_from_headers(Some("NaN"), None), None);
+        assert_eq!(provider_spam_from_headers(Some("inf"), None), None);
+        assert_eq!(provider_spam_from_headers(Some("-inf"), None), None);
+        assert_eq!(provider_spam_from_headers(None, None), None);
+        assert_eq!(provider_spam_from_headers(Some("  "), None), None);
+    }
+
+    #[test]
+    fn provider_spam_parses_negative_and_padded_values() {
+        assert_eq!(provider_spam_from_headers(Some(" -2.6 "), None), Some(-2.6));
+    }
+
+    #[test]
+    fn merge_provider_spam_seeds_when_absent() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        merge_provider_spam(&mut scores, Some(3.5));
+        assert_eq!(scores.get(PROVIDER_SPAM_DIMENSION), Some(&3.5));
+    }
+
+    #[test]
+    fn merge_provider_spam_does_not_clobber_persisted() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        scores.insert(PROVIDER_SPAM_DIMENSION.to_string(), 8.0);
+        merge_provider_spam(&mut scores, Some(3.5));
+        assert_eq!(
+            scores.get(PROVIDER_SPAM_DIMENSION),
+            Some(&8.0),
+            "an explicitly persisted provider_spam score must win"
+        );
+    }
+
+    #[test]
+    fn merge_provider_spam_none_is_noop() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        merge_provider_spam(&mut scores, None);
+        assert!(scores.is_empty());
     }
 
     // ── build_match_expr helper ─────────────────────────────────────

@@ -382,6 +382,7 @@ mod tests {
             references: None,
             flags: vec![],
             attachments: Vec::<AttachmentMeta>::new(),
+            provider_spam: None,
         }
     }
 

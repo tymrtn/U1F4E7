@@ -86,7 +86,10 @@ fn build_message_context(
     db: &envelope_email_store::Database,
     account_id: &str,
 ) -> Result<MessageContext> {
-    let message_id = msg.message_id.as_deref().unwrap_or("");
+    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
+    // arrive bracketed; persisted scores/tags use the bare id).
+    let message_id =
+        envelope_email_store::canonical_message_id(msg.message_id.as_deref().unwrap_or(""));
 
     let tags: Vec<String> = if !message_id.is_empty() {
         db.get_tags(account_id, message_id)
@@ -98,7 +101,7 @@ fn build_message_context(
         vec![]
     };
 
-    let scores: HashMap<String, f64> = if !message_id.is_empty() {
+    let mut scores: HashMap<String, f64> = if !message_id.is_empty() {
         db.get_scores(account_id, message_id)
             .context("failed to get scores")?
             .into_iter()
@@ -107,6 +110,8 @@ fn build_message_context(
     } else {
         HashMap::new()
     };
+    // Seed the header-derived provider_spam signal; a persisted score wins.
+    rules::merge_provider_spam(&mut scores, msg.provider_spam);
 
     let contact_tags = db
         .get_contact_tags(account_id, &msg.from_addr)
@@ -131,7 +136,10 @@ fn build_message_context_from_summary(
     db: &envelope_email_store::Database,
     account_id: &str,
 ) -> Result<MessageContext> {
-    let message_id = summary.message_id.as_deref().unwrap_or("");
+    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
+    // arrive bracketed; persisted scores/tags use the bare id).
+    let message_id =
+        envelope_email_store::canonical_message_id(summary.message_id.as_deref().unwrap_or(""));
 
     let tags: Vec<String> = if !message_id.is_empty() {
         db.get_tags(account_id, message_id)
@@ -143,7 +151,7 @@ fn build_message_context_from_summary(
         vec![]
     };
 
-    let scores: HashMap<String, f64> = if !message_id.is_empty() {
+    let mut scores: HashMap<String, f64> = if !message_id.is_empty() {
         db.get_scores(account_id, message_id)
             .context("failed to get scores")?
             .into_iter()
@@ -152,6 +160,8 @@ fn build_message_context_from_summary(
     } else {
         HashMap::new()
     };
+    // Seed the header-derived provider_spam signal; a persisted score wins.
+    rules::merge_provider_spam(&mut scores, summary.provider_spam);
 
     let contact_tags = db
         .get_contact_tags(account_id, &summary.from_addr)
@@ -979,6 +989,7 @@ mod tests {
             date: None,
             flags: vec![],
             size: 1024,
+            provider_spam: None,
         };
 
         let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
@@ -1003,6 +1014,7 @@ mod tests {
             date: None,
             flags: vec![],
             size: 512,
+            provider_spam: None,
         };
 
         let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
@@ -1023,12 +1035,80 @@ mod tests {
             date: None,
             flags: vec![],
             size: 256,
+            provider_spam: None,
         };
 
         let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
         let expr = rules::MatchExpr::From("*@spam.com".to_string());
 
         assert!(rules::evaluate(&expr, &ctx));
+    }
+
+    #[test]
+    fn summary_provider_spam_seeds_context_score() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let summary = envelope_email_store::MessageSummary {
+            uid: 7,
+            message_id: Some("<spammy@example.com>".to_string()),
+            from_addr: "noreply@promo.example".to_string(),
+            to_addr: "me@example.com".to_string(),
+            subject: "Deal!".to_string(),
+            date: None,
+            flags: vec![],
+            size: 128,
+            provider_spam: Some(6.5),
+        };
+
+        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+
+        assert_eq!(
+            ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
+            Some(&6.5),
+            "derived provider_spam must seed the batch summary context"
+        );
+        // A score_above rule can now match the header signal.
+        let expr = rules::MatchExpr::ScoreAbove {
+            dimension: rules::PROVIDER_SPAM_DIMENSION.to_string(),
+            threshold: 5.0,
+        };
+        assert!(rules::evaluate(&expr, &ctx));
+    }
+
+    #[test]
+    fn persisted_provider_spam_wins_over_derived_across_bracketed_summary_id() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        // Scores are persisted under the bare Message-ID (mail_parser / tag-cmd
+        // form)...
+        db.set_score(
+            "test-account",
+            "pinned@example.com",
+            rules::PROVIDER_SPAM_DIMENSION,
+            2.0,
+            None,
+            None,
+        )
+        .unwrap();
+        // ...while the IMAP ENVELOPE summary hands us the bracketed id.
+        let summary = envelope_email_store::MessageSummary {
+            uid: 8,
+            message_id: Some("<pinned@example.com>".to_string()),
+            from_addr: "sender@example.com".to_string(),
+            to_addr: "me@example.com".to_string(),
+            subject: "Pinned".to_string(),
+            date: None,
+            flags: vec![],
+            size: 128,
+            provider_spam: Some(9.9),
+        };
+
+        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+
+        assert_eq!(
+            ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
+            Some(&2.0),
+            "persisted score keyed on the bare id must be found for a bracketed \
+             summary id and win over the derived header value"
+        );
     }
 }
 

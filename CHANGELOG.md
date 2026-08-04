@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] — 2026-08-04
+
+### Added
+
+- Envelope rules now derive a `provider_spam` score from `X-Migadu-Spam-Score` or `X-Spam-Score` during read-only header fetches, allowing sender-independent composite junk rules without downloading message bodies. Explicitly persisted scores retain precedence over provider headers.
+
+### Fixed
+
+- Rule test, preview, and run now canonicalize Message-ID keys consistently across CLI and dashboard paths, so persisted tag/score overrides are honored for both full-message and summary evaluation.
+- Dashboard rule execution now evaluates the same header-only summaries used by preview instead of re-fetching each full RFC822 message.
+
 ## [1.0.4] — 2026-08-01
 
 ### Fixed

@@ -157,7 +157,15 @@ pub struct PeekHeaderSummary {
 
 pub const QUICKSTART_PEEK_FETCH_DESCRIPTOR: &str =
     "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])";
-pub const FETCH_SUMMARY_DESCRIPTOR: &str = "(UID FLAGS ENVELOPE RFC822.SIZE)";
+/// Batch summary FETCH: envelope metadata plus the provider spam-scoring
+/// headers, requested via `BODY.PEEK[HEADER.FIELDS (...)]`.
+///
+/// `BODY.PEEK` (not `BODY[]`) means the fetch never sets `\Seen`, and only the
+/// two named header fields are transferred — no message bodies. This keeps
+/// rule preview/run header-only and read-only. `message_summary_from_fetch`
+/// derives `provider_spam` from these fields.
+pub const FETCH_SUMMARY_DESCRIPTOR: &str =
+    "(UID FLAGS ENVELOPE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)])";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectedMailbox {
@@ -555,6 +563,11 @@ fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummar
         (String::new(), String::new(), String::new(), None, None)
     };
 
+    // Derive the provider spam score from the peeked header fields requested by
+    // `FETCH_SUMMARY_DESCRIPTOR`. `Fetch::header()` carries the
+    // `BODY[HEADER.FIELDS (...)]` section bytes.
+    let provider_spam = fetch.header().and_then(provider_spam_from_header_bytes);
+
     MessageSummary {
         uid,
         message_id,
@@ -564,6 +577,7 @@ fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummar
         date,
         flags,
         size,
+        provider_spam,
     }
 }
 
@@ -790,6 +804,9 @@ pub async fn fetch_message(
     let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
     let references = parsed.references().as_text().map(|s| s.to_string());
     let message_id = parsed.message_id().map(|s| s.to_string());
+    // Read the provider spam-scoring headers straight from the raw RFC822 so a
+    // single code path handles both this full fetch and the summary FETCH.
+    let provider_spam = provider_spam_from_header_bytes(body);
 
     let attachments: Vec<AttachmentMeta> = parsed
         .attachments()
@@ -825,6 +842,7 @@ pub async fn fetch_message(
         references,
         flags,
         attachments,
+        provider_spam,
     }))
 }
 
@@ -1132,6 +1150,59 @@ pub fn parse_message_id_from_header_section(section: &[u8]) -> Option<String> {
     mail_parser::MessageParser::default()
         .parse(section)
         .and_then(|m| m.message_id().map(str::to_string))
+}
+
+/// Extract the first value of header `name` from a raw RFC822 header block,
+/// unfolding folded continuation lines. Case-insensitive on the field name;
+/// scanning stops at the blank line that ends the header block, so passing a
+/// full message body only reads its top-level headers.
+///
+/// Central helper so the full-message and summary FETCH paths read the same
+/// headers the same way.
+pub fn header_value_from_bytes(section: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(section);
+    // `Some(value)` while accumulating the target header's (possibly folded)
+    // value; stays `None` until the first matching header line is seen.
+    let mut capturing: Option<String> = None;
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            break; // end of the header block
+        }
+        if line.starts_with([' ', '\t']) {
+            // Folded continuation — only meaningful while reading the target.
+            if let Some(value) = capturing.as_mut() {
+                if !value.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        // A new header line begins. If we were already reading the target, its
+        // folded value is now complete — first match wins.
+        if capturing.is_some() {
+            break;
+        }
+        match line.split_once(':') {
+            Some((field, value)) if field.trim().eq_ignore_ascii_case(name) => {
+                capturing = Some(value.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    capturing.map(|value| value.trim().to_string())
+}
+
+/// Derive the `provider_spam` score from a raw header block (a
+/// `BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)]` section or a
+/// full RFC822 message). Prefers `X-Migadu-Spam-Score`, falling back to
+/// `X-Spam-Score`; returns `None` when neither carries a finite number.
+pub fn provider_spam_from_header_bytes(section: &[u8]) -> Option<f64> {
+    let migadu = header_value_from_bytes(section, "X-Migadu-Spam-Score");
+    let generic = header_value_from_bytes(section, "X-Spam-Score");
+    crate::rules::provider_spam_from_headers(migadu.as_deref(), generic.as_deref())
 }
 
 fn validate_uid_set(uid_set: &str) -> Result<(), ImapError> {
@@ -1470,6 +1541,9 @@ pub async fn search(
                     date,
                     flags,
                     size,
+                    // Search does not fetch spam-score headers; rules never run
+                    // against search results, so leave the signal absent.
+                    provider_spam: None,
                 });
             }
             Err(e) => return Err(ImapError::Protocol(format!("UID FETCH parse error: {e}"))),
@@ -2115,10 +2189,49 @@ Subject: hi\r\n\r\nbody\r\n";
     }
 
     #[test]
-    fn summary_fetch_descriptor_is_envelope_only() {
-        assert_eq!(FETCH_SUMMARY_DESCRIPTOR, "(UID FLAGS ENVELOPE RFC822.SIZE)");
-        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY["));
+    fn summary_fetch_descriptor_is_header_only_and_read_only() {
+        assert_eq!(
+            FETCH_SUMMARY_DESCRIPTOR,
+            "(UID FLAGS ENVELOPE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)])"
+        );
+        // Header fields only, fetched via PEEK — never a full/partial body, so
+        // the summary FETCH stays read-only (no `\Seen`) and body-free.
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("BODY.PEEK[HEADER.FIELDS ("));
+        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY[]"));
         assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY.PEEK[]"));
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("X-MIGADU-SPAM-SCORE"));
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("X-SPAM-SCORE"));
+    }
+
+    #[test]
+    fn provider_spam_from_migadu_header_section() {
+        let section = b"X-Migadu-Spam-Score: 3.5\r\nX-Spam-Score: 9.9\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), Some(3.5));
+    }
+
+    #[test]
+    fn provider_spam_falls_back_to_generic_header_section() {
+        let section = b"Subject: hi\r\nX-Spam-Score: 5.1\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), Some(5.1));
+    }
+
+    #[test]
+    fn provider_spam_header_section_ignores_malformed() {
+        let section = b"X-Migadu-Spam-Score: not-a-number\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), None);
+    }
+
+    #[test]
+    fn header_value_from_bytes_is_case_insensitive_and_unfolds() {
+        let section = b"x-migadu-spam-score: 2.0\r\nSubject: a\r\n  folded\r\n\r\n";
+        assert_eq!(
+            header_value_from_bytes(section, "X-Migadu-Spam-Score"),
+            Some("2.0".to_string())
+        );
+        assert_eq!(
+            header_value_from_bytes(section, "Subject"),
+            Some("a folded".to_string())
+        );
     }
 
     #[test]

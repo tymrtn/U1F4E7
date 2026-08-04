@@ -198,6 +198,7 @@ mod tests {
             references: references.map(|s| s.to_string()),
             flags: vec![],
             attachments: Vec::<AttachmentMeta>::new(),
+            provider_spam: None,
         }
     }
 
