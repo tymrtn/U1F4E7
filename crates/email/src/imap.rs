@@ -802,7 +802,7 @@ pub async fn fetch_message(
     let text_body = parsed.body_text(0).map(|t| t.to_string());
     let html_body = parsed.body_html(0).map(|h| h.to_string());
     let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-    let references = parsed.references().as_text().map(|s| s.to_string());
+    let references = crate::threading::references_header(&parsed);
     let message_id = parsed.message_id().map(|s| s.to_string());
     // Read the provider spam-scoring headers straight from the raw RFC822 so a
     // single code path handles both this full fetch and the summary FETCH.

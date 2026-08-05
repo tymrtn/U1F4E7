@@ -15,6 +15,19 @@ const THREAD_COLS: &str =
 const THREAD_MSG_COLS: &str = "id, thread_id, uid, message_id, in_reply_to, reference_ids, folder, \
      from_address, to_addresses, date, subject, is_outbound, snippet";
 
+/// Reduce a Message-ID to its bare `local@domain` form for comparison.
+///
+/// Ingestion writes bracket-free ids (`mail_parser` strips them) while drafts
+/// and RFC 5322 headers carry `<...>`. Both forms must resolve to the same
+/// thread, so every lookup normalizes instead of matching the stored bytes.
+pub fn normalize_message_id(message_id: &str) -> String {
+    message_id
+        .trim()
+        .trim_matches(['<', '>'])
+        .trim()
+        .to_string()
+}
+
 impl Database {
     // ── Thread CRUD ──────────────────────────────────────────────────
 
@@ -231,13 +244,17 @@ impl Database {
         message_id: &str,
         account_id: &str,
     ) -> Result<Option<String>> {
+        let needle = normalize_message_id(message_id);
+        if needle.is_empty() {
+            return Ok(None);
+        }
         let thread_id: Option<String> = self
             .conn()
             .query_row(
                 "SELECT tm.thread_id FROM thread_messages tm \
                  INNER JOIN threads t ON t.thread_id = tm.thread_id \
-                 WHERE tm.message_id = ?1 AND t.account_id = ?2 LIMIT 1",
-                params![message_id, account_id],
+                 WHERE trim(trim(tm.message_id), '<>') = ?1 AND t.account_id = ?2 LIMIT 1",
+                params![needle, account_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -273,21 +290,29 @@ impl Database {
         references: &[&str],
         account_id: &str,
     ) -> Result<Option<String>> {
-        if references.is_empty() {
+        // Normalize both sides: stored ids are bracket-free, header-derived
+        // references arrive wrapped in `<...>`.
+        let needles: Vec<String> = references
+            .iter()
+            .map(|r| normalize_message_id(r))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if needles.is_empty() {
             return Ok(None);
         }
         // Build a placeholder list: (?1, ?2, ..., ?N) for references,
         // then ?N+1 for account_id
-        let placeholders: Vec<String> = (1..=references.len()).map(|i| format!("?{i}")).collect();
-        let account_param_idx = references.len() + 1;
+        let placeholders: Vec<String> = (1..=needles.len()).map(|i| format!("?{i}")).collect();
+        let account_param_idx = needles.len() + 1;
         let sql = format!(
             "SELECT tm.thread_id FROM thread_messages tm \
              INNER JOIN threads t ON t.thread_id = tm.thread_id \
-             WHERE tm.message_id IN ({}) AND t.account_id = ?{account_param_idx} LIMIT 1",
+             WHERE trim(trim(tm.message_id), '<>') IN ({}) \
+               AND t.account_id = ?{account_param_idx} LIMIT 1",
             placeholders.join(", ")
         );
         let mut stmt = self.conn().prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = references
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = needles
             .iter()
             .map(|r| r as &dyn rusqlite::types::ToSql)
             .collect();
@@ -631,6 +656,88 @@ mod tests {
             .find_thread_by_message_id("<nonexistent@example.com>", "acct1")
             .unwrap();
         assert!(not_found.is_none());
+    }
+
+    /// Thread ingestion stores bracket-free Message-IDs (`mail_parser` strips
+    /// them), while drafts persist the RFC 5322 bracketed form. Lookup must
+    /// bridge the two: feeding a draft's `in_reply_to` straight in used to miss
+    /// the thread it plainly belongs to.
+    #[test]
+    fn find_thread_by_message_id_ignores_angle_brackets() {
+        let db = Database::open_memory().unwrap();
+        let thread = db
+            .create_thread(
+                "test",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "acct1",
+            )
+            .unwrap();
+
+        // Stored the way ingestion writes it: no brackets.
+        db.upsert_thread_message(
+            &thread.thread_id,
+            100,
+            Some("bare@example.com"),
+            None,
+            None,
+            "INBOX",
+            "a@b.com",
+            "c@d.com",
+            "2026-03-28T10:00:00",
+            "Test",
+            false,
+            None,
+        )
+        .unwrap();
+
+        for query in [
+            "bare@example.com",
+            "<bare@example.com>",
+            " <bare@example.com> ",
+        ] {
+            assert_eq!(
+                db.find_thread_by_message_id(query, "acct1").unwrap(),
+                Some(thread.thread_id.clone()),
+                "lookup of {query:?} must resolve to the thread"
+            );
+        }
+
+        // The reverse skew: bracketed on disk, bare in hand.
+        let other = db
+            .create_thread(
+                "other",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "acct1",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &other.thread_id,
+            101,
+            Some("<wrapped@example.com>"),
+            None,
+            None,
+            "INBOX",
+            "a@b.com",
+            "c@d.com",
+            "2026-03-28T10:00:00",
+            "Test",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.find_thread_by_message_id("wrapped@example.com", "acct1")
+                .unwrap(),
+            Some(other.thread_id.clone())
+        );
+
+        assert!(
+            db.find_thread_by_message_id("<nope@example.com>", "acct1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -673,6 +673,22 @@ pub(crate) fn threading_from_metadata(
     (in_reply_to, references, message_id)
 }
 
+/// Threading for a stored draft, reconciling the two places it can live.
+///
+/// The contextual reply/forward builders write a metadata blob; every other
+/// path that creates a reply (IMAP-synced drafts, plain `draft create`) sets
+/// only the `in_reply_to` column. Reading metadata alone made column-only
+/// replies look like fresh messages, so metadata wins where present and the
+/// columns are the fallback.
+pub(crate) fn threading_for_draft(draft: &Draft) -> (Option<String>, Vec<String>, Option<String>) {
+    let (in_reply_to, references, message_id) = threading_from_metadata(draft.metadata.as_ref());
+    (
+        in_reply_to.or_else(|| draft.in_reply_to.clone()),
+        references,
+        message_id.or_else(|| draft.message_id.clone()),
+    )
+}
+
 // ─── contextual reply / forward drafts ───────────────────────────────────
 
 /// Build the `From:` header value using the same precedence as SMTP:
@@ -1549,19 +1565,30 @@ pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
     let dashboard_path = draft_dashboard_path(&draft.account_id, &draft.id);
     let dashboard_url = draft_dashboard_url(&draft.account_id, &draft.id);
 
+    // Threading comes from metadata-or-column, so a reply that only ever set
+    // the column still reports its parent instead of posing as a new message.
+    let (resolved_in_reply_to, resolved_references, _) = threading_for_draft(draft);
+    let draft_kind = meta.get("draft_kind").and_then(|v| v.as_str()).unwrap_or(
+        if resolved_in_reply_to.is_some() {
+            "reply"
+        } else {
+            "new"
+        },
+    );
+
     serde_json::json!({
         "status": "drafted",
         "draft_id": draft.id,
         "account_id": draft.account_id,
-        "draft_kind": meta.get("draft_kind").and_then(|v| v.as_str()).unwrap_or("new"),
+        "draft_kind": draft_kind,
         "source": get("source"),
         "fields": {
             "to": draft.to_addr,
             "cc": draft.cc_addr,
             "bcc": draft.bcc_addr,
             "subject": draft.subject,
-            "in_reply_to": get("in_reply_to"),
-            "references": meta.get("references").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "in_reply_to": resolved_in_reply_to,
+            "references": serde_json::json!(resolved_references),
             "message_id": draft.message_id,
         },
         "content": {
@@ -2392,7 +2419,7 @@ pub(crate) async fn send_existing_draft(
     // local draft metadata — preferred so reply headers survive the send.
     let (meta_in_reply_to, meta_references, _meta_message_id) = local_draft
         .as_ref()
-        .map(|d| threading_from_metadata(d.metadata.as_ref()))
+        .map(threading_for_draft)
         .unwrap_or((None, Vec::new(), None));
 
     // ── Fetch draft content from IMAP (source of truth) ──
@@ -2526,6 +2553,12 @@ pub(crate) async fn send_existing_draft(
     }
 
     // ── Send via SMTP (full path so In-Reply-To / References survive) ──
+    // A reply must carry its parent in References even when neither the draft
+    // metadata nor the parent's own headers supplied a chain.
+    let references = envelope_email_transport::reply::ensure_references_chain(
+        &references,
+        in_reply_to.as_deref(),
+    );
     let references_opt = if references.is_empty() {
         None
     } else {
@@ -3396,6 +3429,68 @@ mod tests {
             value["storage"]["sync_status_reason"], "imap_sync_failed",
             "sync_status_reason must be surfaced in storage block"
         );
+    }
+
+    /// A reply whose parent lives only in the `in_reply_to` column (no
+    /// contextual-reply metadata blob) is still a reply. Reading threading
+    /// from metadata alone reported it as `draft_kind: "new"` with
+    /// `in_reply_to: null`, so the agent contract disowned the thread and the
+    /// send path had nothing to re-emit.
+    #[test]
+    fn draft_threading_falls_back_to_the_in_reply_to_column() {
+        let mut draft = Draft {
+            id: "draft-1".to_string(),
+            account_id: "acct@example.com".to_string(),
+            status: DraftStatus::Draft,
+            to_addr: "a@example.com".to_string(),
+            cc_addr: None,
+            bcc_addr: None,
+            reply_to: None,
+            subject: Some("RE: thread".to_string()),
+            text_content: Some("body".to_string()),
+            html_content: None,
+            in_reply_to: Some("<parent@example.net>".to_string()),
+            metadata: None,
+            attachments: vec![],
+            message_id: Some("<mine@example.net>".to_string()),
+            send_after: None,
+            snoozed_until: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            sent_at: None,
+            created_by: Some("cli".to_string()),
+            imap_uid: Some(2084),
+            revision: 0,
+        };
+
+        let (irt, refs, mid) = threading_for_draft(&draft);
+        assert_eq!(irt.as_deref(), Some("<parent@example.net>"));
+        assert_eq!(mid.as_deref(), Some("<mine@example.net>"));
+        assert!(refs.is_empty());
+
+        let value = draft_envelope_json(&draft);
+        assert_eq!(value["fields"]["in_reply_to"], "<parent@example.net>");
+        assert_eq!(
+            value["draft_kind"], "reply",
+            "a draft with a parent must not report itself as a new message"
+        );
+
+        // Metadata still wins when it carries the richer contextual state.
+        draft.metadata = Some(serde_json::json!({
+            "draft_kind": "forward",
+            "in_reply_to": "<meta-parent@example.net>",
+            "references": ["<root@example.net>", "<meta-parent@example.net>"],
+        }));
+        let (irt, refs, _) = threading_for_draft(&draft);
+        assert_eq!(irt.as_deref(), Some("<meta-parent@example.net>"));
+        assert_eq!(refs.len(), 2);
+        assert_eq!(draft_envelope_json(&draft)["draft_kind"], "forward");
+
+        // A genuine fresh draft keeps reporting itself as new.
+        draft.in_reply_to = None;
+        draft.metadata = None;
+        assert_eq!(draft_envelope_json(&draft)["draft_kind"], "new");
+        assert!(threading_for_draft(&draft).0.is_none());
     }
 
     #[test]

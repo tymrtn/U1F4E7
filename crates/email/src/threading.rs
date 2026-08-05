@@ -102,6 +102,27 @@ pub fn parse_references(refs: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract the full `References` chain from a parsed message as a
+/// space-separated string of bracket-free Message-IDs.
+///
+/// `mail_parser` models a lone reference as `Text` but a real chain as
+/// `TextList`, and `as_text()` collapses the list to its *last* element.
+/// Reading the header that way silently truncated every multi-hop thread to a
+/// single id, so this matches on both shapes.
+pub fn references_header(msg: &mail_parser::Message<'_>) -> Option<String> {
+    let joined = match msg.references() {
+        mail_parser::HeaderValue::Text(id) => id.trim().to_string(),
+        mail_parser::HeaderValue::TextList(ids) => ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// Extract a snippet (first ~200 chars) from message body text.
 pub fn extract_snippet(text: &str, max_len: usize) -> String {
     // Remove quoted lines (starting with >)
@@ -339,7 +360,7 @@ where
                 // Extract threading headers
                 let message_id = parsed.message_id().map(|s| s.to_string());
                 let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-                let references_raw = parsed.references().as_text().map(|s| s.to_string());
+                let references_raw = references_header(&parsed);
                 let subject = parsed.subject().unwrap_or_default().to_string();
                 let date = parsed
                     .date()
@@ -586,6 +607,39 @@ mod tests {
         assert_eq!(
             parse_references("<single@host.com>"),
             vec!["<single@host.com>"]
+        );
+    }
+
+    /// A References header carrying more than one Message-ID must survive
+    /// extraction. `mail_parser` reports a single id as `Text` but a chain as
+    /// `TextList`, so reading it with `as_text()` silently dropped every real
+    /// reply chain — the exact case threading depends on.
+    #[test]
+    fn references_header_survives_multiple_ids() {
+        let single = b"Message-ID: <c@host>\r\nReferences: <a@host>\r\n\r\nBody\r\n";
+        let chain =
+            b"Message-ID: <c@host>\r\nReferences: <a@host> <b@host>\r\n\r\nBody\r\n" as &[u8];
+
+        // `mail_parser` yields bracket-free ids, matching `message_id()` and
+        // `in_reply_to()`. Bare ids are the stored form across the workspace.
+        let parsed = mail_parser::MessageParser::default()
+            .parse(single as &[u8])
+            .unwrap();
+        assert_eq!(
+            references_header(&parsed),
+            Some("a@host".to_string()),
+            "single-id References must be extracted"
+        );
+
+        let parsed = mail_parser::MessageParser::default().parse(chain).unwrap();
+        assert_eq!(
+            references_header(&parsed),
+            Some("a@host b@host".to_string()),
+            "multi-id References must be extracted, not dropped"
+        );
+        assert_eq!(
+            parse_references(&references_header(&parsed).unwrap()),
+            vec!["a@host", "b@host"]
         );
     }
 

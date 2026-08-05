@@ -21,6 +21,7 @@
   import { optionalAddrsValid, validateAddrs } from '$lib/addresses';
   import Badge from './Badge.svelte';
   import Button from './Button.svelte';
+  import DraftThread from './DraftThread.svelte';
   import Modal from './Modal.svelte';
   import MonoTag from './MonoTag.svelte';
   import Spinner from './Spinner.svelte';
@@ -524,6 +525,11 @@
           <MonoTag>{queued.queued_reason_code}</MonoTag>
         {/if}
       </div>
+    {/if}
+
+    <!-- ── Conversation this draft answers ─────────────────────────── -->
+    {#if draft?.in_reply_to}
+      <DraftThread {accountId} inReplyTo={draft.in_reply_to} />
     {/if}
 
     <div class="draft-card draft-addresses">

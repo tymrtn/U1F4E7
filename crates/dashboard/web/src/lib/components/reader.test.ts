@@ -34,7 +34,12 @@ vi.mock('$lib/reader-api', async (importOriginal) => {
 import BodyFrame from './BodyFrame.svelte';
 import ThreadStrip from './ThreadStrip.svelte';
 import ReaderPane from './ReaderPane.svelte';
-import { isSeen, formatBytes, attachmentDownloadUrl } from '$lib/reader-api';
+import {
+  isSeen,
+  formatBytes,
+  attachmentDownloadUrl,
+  type ThreadMessage
+} from '$lib/reader-api';
 import { EnvelopeApiError } from '$lib/api';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -170,10 +175,29 @@ describe('BodyFrame', () => {
 // ── ThreadStrip ───────────────────────────────────────────────────────
 
 describe('ThreadStrip', () => {
+  // Field-for-field the server's ThreadMessage (crates/store/src/models.rs).
+  // The previous fixture invented `from_addr`/`flags`/`size`, which the
+  // endpoint never returns — so these tests passed while the strip threw on
+  // real data.
+  const threadMsg = (over: Partial<ThreadMessage> & { id: number; uid: number }): ThreadMessage => ({
+    thread_id: 't1',
+    message_id: null,
+    in_reply_to: null,
+    references: null,
+    folder: 'INBOX',
+    from_address: null,
+    to_addresses: 'me@x',
+    date: null,
+    subject: null,
+    is_outbound: false,
+    snippet: null,
+    ...over
+  });
+
   const msgs = [
-    { uid: 10, message_id: '<a@x>', from_addr: 'alice@example.com', to_addr: 'me@x', subject: 'First', date: '2026-07-01T10:00:00Z', flags: [], size: 100 },
-    { uid: 11, message_id: '<b@x>', from_addr: 'bob@example.com', to_addr: 'me@x', subject: 'Reply', date: '2026-07-02T10:00:00Z', flags: ['\\Seen'], size: 100 },
-    { uid: 12, message_id: '<c@x>', from_addr: 'carol@example.com', to_addr: 'me@x', subject: 'Re: Reply', date: '2026-07-03T10:00:00Z', flags: [], size: 100 }
+    threadMsg({ id: 1, uid: 10, message_id: 'a@x', from_address: 'alice@example.com', subject: 'First', date: '2026-07-01T10:00:00Z' }),
+    threadMsg({ id: 2, uid: 11, message_id: 'b@x', from_address: 'bob@example.com', subject: 'Reply', date: '2026-07-02T10:00:00Z' }),
+    threadMsg({ id: 3, uid: 12, message_id: 'c@x', from_address: 'carol@example.com', subject: 'Re: Reply', date: '2026-07-03T10:00:00Z' })
   ];
 
   it('renders all thread messages when count <= display limit', () => {
@@ -212,20 +236,13 @@ describe('ThreadStrip', () => {
       accountId: 'acct-a'
     });
     const links = document.querySelectorAll('a.thread-msg');
-    expect(links[0].getAttribute('href')).toBe('/v2/mail/unified/acct-a/10');
+    expect(links[0].getAttribute('href')).toBe('/mail/unified/acct-a/10');
   });
 
   it('shows +N more label when totalCount exceeds display limit', () => {
-    const many = Array.from({ length: 8 }, (_, i) => ({
-      uid: i + 1,
-      message_id: `<${i}@x>`,
-      from_addr: `user${i}@example.com`,
-      to_addr: 'me@x',
-      subject: `Msg ${i}`,
-      date: null,
-      flags: [],
-      size: 0
-    }));
+    const many = Array.from({ length: 8 }, (_, i) =>
+      threadMsg({ id: i + 1, uid: i + 1, message_id: `${i}@x`, from_address: `user${i}@example.com`, subject: `Msg ${i}` })
+    );
     render(ThreadStrip, {
       messages: many,
       currentUid: 1,
@@ -377,8 +394,8 @@ describe('ReaderPane', () => {
     readerApiMock.fetchThread.mockResolvedValueOnce({
       thread_id: 'thread-1',
       messages: [
-        { uid: 40, message_id: '<prev@x>', from_addr: 'alice@x', to_addr: 'me@x', subject: 'Prev', date: null, flags: [], size: 0 },
-        { uid: 42, message_id: '<test@x>', from_addr: 'sender@example.com', to_addr: 'me@x', subject: 'Test subject', date: null, flags: [], size: 0 }
+        { id: 1, thread_id: 'thread-1', uid: 40, message_id: 'prev@x', in_reply_to: null, references: null, folder: 'INBOX', from_address: 'alice@x', to_addresses: 'me@x', subject: 'Prev', date: null, is_outbound: false, snippet: null },
+        { id: 2, thread_id: 'thread-1', uid: 42, message_id: 'test@x', in_reply_to: null, references: null, folder: 'INBOX', from_address: 'sender@example.com', to_addresses: 'me@x', subject: 'Test subject', date: null, is_outbound: false, snippet: null }
       ]
     });
 
