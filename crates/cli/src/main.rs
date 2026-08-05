@@ -1213,6 +1213,11 @@ enum ThreadCmd {
         /// Maximum messages to scan
         #[arg(long, default_value = "200")]
         limit: u32,
+        /// Re-read each folder from the start instead of resuming after the
+        /// last build. Repairs threading headers on already-indexed messages;
+        /// slower, since it refetches up to --limit messages per folder.
+        #[arg(long)]
+        rebuild: bool,
     },
 }
 
@@ -2379,9 +2384,11 @@ fn main() {
             ThreadCmd::List { account, limit } => {
                 commands::thread::run_list(account.as_deref(), limit, cli.json, backend)
             }
-            ThreadCmd::Build { account, limit } => {
-                commands::thread::run_build(account.as_deref(), limit, cli.json, backend)
-            }
+            ThreadCmd::Build {
+                account,
+                limit,
+                rebuild,
+            } => commands::thread::run_build(account.as_deref(), limit, rebuild, cli.json, backend),
         },
 
         Commands::Tag { subcommand } => match subcommand {

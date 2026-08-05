@@ -394,6 +394,20 @@ impl Database {
         Ok(())
     }
 
+    /// Drop the incremental-sync watermark for every folder of an account,
+    /// so the next thread scan re-reads from the beginning of each mailbox.
+    ///
+    /// Thread rows are upserted by `message_id` + folder, so a rescan corrects
+    /// existing rows in place rather than duplicating them — this is how
+    /// headers captured by an earlier, buggy parse get repaired.
+    pub fn clear_last_synced_uid(&self, account_id: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM thread_sync_state WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
     /// Get the stored UIDVALIDITY for a folder/account pair.
     pub fn get_uidvalidity(&self, account_id: &str, folder: &str) -> Result<Option<u32>> {
         let val: Option<i64> = self
@@ -849,6 +863,36 @@ mod tests {
         // Update
         db.set_last_synced_uid("acct1", "INBOX", 600).unwrap();
         assert_eq!(db.get_last_synced_uid("acct1", "INBOX").unwrap(), Some(600));
+    }
+
+    /// Clearing the watermark is what makes a rebuild possible: the scan
+    /// resumes from `last_uid`, so rows written by an earlier (buggy) parse are
+    /// otherwise never revisited.
+    #[test]
+    fn clearing_sync_state_is_scoped_and_repeatable() {
+        let db = Database::open_memory().unwrap();
+        db.set_last_synced_uid("acct1", "INBOX", 600).unwrap();
+        db.set_last_synced_uid("acct1", "INBOX/sent", 90).unwrap();
+        db.set_last_synced_uid("acct2", "INBOX", 42).unwrap();
+
+        db.clear_last_synced_uid("acct1").unwrap();
+
+        assert!(db.get_last_synced_uid("acct1", "INBOX").unwrap().is_none());
+        assert!(
+            db.get_last_synced_uid("acct1", "INBOX/sent")
+                .unwrap()
+                .is_none(),
+            "every folder for the account must be cleared, not just INBOX"
+        );
+        assert_eq!(
+            db.get_last_synced_uid("acct2", "INBOX").unwrap(),
+            Some(42),
+            "another account's sync state must be untouched"
+        );
+
+        // Idempotent: clearing an already-clear account is not an error.
+        db.clear_last_synced_uid("acct1").unwrap();
+        assert!(db.get_last_synced_uid("acct1", "INBOX").unwrap().is_none());
     }
 
     #[test]

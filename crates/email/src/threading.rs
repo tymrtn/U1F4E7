@@ -161,13 +161,26 @@ pub fn classify_folder_type(name: &str) -> Option<String> {
 ///
 /// This is incremental: it tracks the last-synced UID per folder and only
 /// fetches new messages since the last sync.
+///
+/// `rebuild` drops that watermark first, so the scan re-reads the most recent
+/// `max_messages` of each folder instead of only what arrived since last time.
+/// Rows are upserted by `message_id` + folder, so this repairs headers stored
+/// by an earlier parse rather than duplicating messages.
 pub async fn build_threads(
     account: &AccountWithCredentials,
     db: &Database,
     max_messages: u32,
+    rebuild: bool,
 ) -> Result<ThreadBuildResult, ImapError> {
     let account_id = &account.account.id;
     let account_email = &account.account.username;
+
+    if rebuild {
+        info!("rebuild requested — clearing thread sync watermark for {account_email}");
+        if let Err(e) = db.clear_last_synced_uid(account_id) {
+            warn!("failed to clear thread sync state: {e}");
+        }
+    }
 
     let mut client = imap::connect(account).await?;
 
