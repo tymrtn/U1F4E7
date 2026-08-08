@@ -3,6 +3,9 @@
 
 pub mod agent_policy;
 pub mod attribution;
+pub mod attribution_persist;
+pub mod attribution_provenance;
+pub mod attribution_suggest;
 pub mod backup;
 pub mod bulk;
 pub mod code_extractor;
@@ -15,6 +18,7 @@ pub mod event_pipeline;
 pub mod event_types;
 pub mod evidence;
 pub mod folders;
+pub mod governor_catalog;
 pub mod idle;
 pub mod imap;
 pub mod managesieve;
@@ -32,8 +36,15 @@ pub mod url_guard;
 
 pub use agent_policy::{AgentPolicy, PolicyDenial};
 pub use attribution::{
-    AttributedSendContext, RecipientSummary, classify_sensitive_attachment,
-    collect_recipient_domains, is_disposable_domain, is_freemail_domain, is_gov_domain,
+    AttributedSendContext, AttributionResolution, AttributionState, RecipientSummary, RejectedAttr,
+    classify_sensitive_attachment, collect_recipient_domains, is_disposable_domain,
+    is_freemail_domain, is_gov_domain, resolve as resolve_attribution,
+};
+pub use attribution_persist::{
+    ATTRIBUTION_METADATA_KEY, AttemptOutcome, DeclarationOrigin, MAX_ATTRIBUTION_ATTEMPTS,
+    PARK_REASON_ATTRIBUTION_EXHAUSTED, PersistedDeclaration, ScheduledOrigin, advance_attempt,
+    failed_attempt_value, scheduled_attribution_inputs, scheduled_origin,
+    success_attribution_block,
 };
 pub use bulk::{
     BULK_UID_LIMIT, BulkError, BulkFailure, BulkOp, BulkRequest, BulkResult, BulkTarget,
@@ -53,7 +64,7 @@ pub use folders::{detect_drafts_folder, detect_sent_folder};
 pub use imap::ImapClient;
 pub use outbound::{
     GovernorConfig, GovernorMode, GovernorOutcome, GovernorRequest, SendDisposition, SendSurface,
-    gate as governor_gate, resolve_cooldown_seconds, resolve_disposition,
+    gate as governor_gate, gate_with_attribution, resolve_cooldown_seconds, resolve_disposition,
 };
 pub use provider::{ProviderType, detect_provider, resolve_folder};
 pub use reply::{ReplyHeaders, build_reply_all_headers, build_reply_headers};

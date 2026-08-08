@@ -22,6 +22,7 @@ pub mod events;
 pub mod evidence;
 pub mod flags;
 pub mod folders;
+pub mod governor;
 pub mod governor_gate;
 pub mod inbox;
 pub mod keychain_import;

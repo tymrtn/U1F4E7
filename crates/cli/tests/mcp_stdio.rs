@@ -181,6 +181,70 @@ fn tool_call(
     (parsed, is_error)
 }
 
+/// Like [`tool_call`] but injects extra environment variables on the MCP server
+/// process (e.g. a mock `ENVELOPE_GOVERNOR_BIN` / `ENVELOPE_GOVERNOR_MODE`).
+fn tool_call_env(
+    home: &std::path::Path,
+    token: Option<&str>,
+    name: &str,
+    arguments: Value,
+    extra_env: &[(&str, &str)],
+) -> (Value, bool) {
+    let mut cmd = Command::new(envelope_bin());
+    cmd.arg("mcp").env("HOME", home).env("ENVELOPE_HOME", home);
+    if let Some(t) = token {
+        cmd.env("ENVELOPE_AGENT_TOKEN", t);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    write_framed(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }),
+    );
+    let resp = read_framed(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait mcp");
+
+    let result = &resp["result"];
+    let is_error = result["isError"].as_bool().unwrap_or(false);
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let json_text = text.strip_prefix("Error: ").unwrap_or(text);
+    let parsed = serde_json::from_str(json_text).unwrap_or_else(|_| json!({ "_raw": text }));
+    (parsed, is_error)
+}
+
+/// Write an executable mock Governor binary that prints a fixed verdict and exits
+/// 0. Returns its path. Unix-only (the dev/CI target).
+#[cfg(unix)]
+fn write_mock_governor(dir: &std::path::Path, decision: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("mock-governor.sh");
+    let script = format!(
+        "#!/bin/sh\nprintf '{{\"decision\": \"{decision}\", \"state\": \"review_required\"}}'\nexit 0\n"
+    );
+    std::fs::write(&path, script).expect("write mock governor");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
 fn db_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join("envelope-email/envelope.db")
 }
@@ -270,7 +334,8 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
     );
     let tools = read_framed(&mut stdout);
     let tool_entries = tools["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tool_entries.len(), 22);
+    // 22 mailbox tools + the read-only governor_catalog discovery tool (v2).
+    assert_eq!(tool_entries.len(), 23);
     for name in [
         "bulk",
         "thread",
@@ -278,6 +343,7 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
         "rules_run",
         "watch_status",
         "snooze",
+        "governor_catalog",
     ] {
         assert!(
             tool_entries.iter().any(|tool| tool["name"] == name),
@@ -391,7 +457,7 @@ fn contract_export_declares_untrusted_trust_model() {
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
 
     // Contract stays v1 (additive change only).
-    assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+    assert_eq!(contract["schema"], "envelope.agent_contract.v2");
 
     let untrusted = &contract["trust_model"]["untrusted_content"];
     assert_eq!(untrusted["marker_key"], "_envelope_trust");
@@ -568,6 +634,7 @@ fn mcp_allowed_send_clamps_to_ceiling_and_attributes_agent() {
             "to": "a@b.test",
             "subject": "hi",
             "body": "x",
+            "attributes": ["informational"],
             "send_mode": "autonomous-send"
         }),
     );
@@ -594,9 +661,30 @@ fn mcp_allowed_send_clamps_to_ceiling_and_attributes_agent() {
 }
 
 #[test]
-fn mcp_anonymous_send_defaults_unchanged() {
-    // With no ENVELOPE_AGENT_TOKEN the MCP send tool behaves exactly as before:
-    // agent default is draft-only, so the result is a draft and no policy applies.
+fn mcp_anonymous_send_default_mode_is_draft_only() {
+    // With no ENVELOPE_AGENT_TOKEN the MCP send tool defaults send_mode to
+    // draft-only. A valid `attributes` declaration is required (v2), and the
+    // outcome is a draft — no policy applies.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "send",
+        json!({ "to": "a@b.test", "subject": "hi", "body": "x", "attributes": ["informational"] }),
+    );
+    assert!(!is_error, "anonymous send must not be denied: {payload}");
+    assert_eq!(payload["status"], "drafted");
+    assert_eq!(payload["send_mode"], "draft-only");
+}
+
+#[test]
+fn mcp_draft_only_send_without_attributes_is_attributes_required() {
+    // v2: the mandatory-attributes rule is enforced at the handler boundary even
+    // when the policy outcome would be draft-only — a missing declaration returns
+    // structured attributes_required, not a silently-created draft.
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
@@ -607,9 +695,15 @@ fn mcp_anonymous_send_defaults_unchanged() {
         "send",
         json!({ "to": "a@b.test", "subject": "hi", "body": "x" }),
     );
-    assert!(!is_error, "anonymous send must not be denied: {payload}");
-    assert_eq!(payload["status"], "drafted");
-    assert_eq!(payload["send_mode"], "draft-only");
+    assert!(is_error, "missing attributes must be refused: {payload}");
+    assert_eq!(payload["error"]["code"], "attributes_required");
+    // Nothing was created — the draft-only path never ran.
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts");
+    assert_eq!(count, 0, "no draft created when attributes are missing");
 }
 
 #[test]
@@ -632,6 +726,7 @@ fn mcp_send_draft_under_draft_only_ceiling_never_sends() {
         "send_draft",
         json!({
             "draft_id": draft_id,
+            "attributes": ["informational"],
             "confirm_send": true,
             "send_now": true,
             "confirm_send_now": true
@@ -675,8 +770,10 @@ fn mcp_send_draft_under_draft_only_ceiling_never_sends() {
 fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
     // A confirm-send ceiling (with confirm_send=true) must NOT be blocked by the
     // ceiling logic itself: the send clears the ceiling and proceeds to the
-    // normal Governor-gated dispatch. It may still be gated downstream, but it
-    // must not return the ceiling-denial (status=drafted / send_mode=draft-only).
+    // normal dispatch (here it queues into the outbox). It must not return the
+    // ceiling-denial (status=drafted / send_mode=draft-only). A valid `attributes`
+    // declaration is supplied (v2 requires it) and the default cooldown queue path
+    // keeps this deterministic — no Governor spawn, no SMTP.
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
@@ -691,9 +788,8 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
         "send_draft",
         json!({
             "draft_id": draft_id,
-            "confirm_send": true,
-            "send_now": true,
-            "confirm_send_now": true
+            "attributes": ["informational"],
+            "confirm_send": true
         }),
     );
 
@@ -873,7 +969,7 @@ fn contract_export_declares_wave3_tools_and_gates() {
         .expect("run contract");
     assert!(output.status.success());
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
-    assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+    assert_eq!(contract["schema"], "envelope.agent_contract.v2");
 
     let map = &contract["agent_identity"]["tool_action_map"];
     assert_eq!(map["bulk"], "bulk");
@@ -920,4 +1016,717 @@ fn contract_export_declares_wave3_tools_and_gates() {
             "mcp_tools must declare {name}"
         );
     }
+}
+
+// ── Attribution protocol journeys (envelope.attribution.v1) ──────────────
+//
+// These never send real email or spawn Governor: an unattributed/invalid
+// request is refused before any side effect, and an attributed request reaches
+// the local outbox queue (no SMTP). Anonymous MCP authorizes every tool; an
+// autonomous-send request reaches the actual-send attribution precheck.
+
+const RISK_KEYS: [&str; 5] = [
+    "financial_content",
+    "legal_content",
+    "commitment_language",
+    "has_pii",
+    "uncited_claims",
+];
+
+#[test]
+fn mcp_send_without_attributes_is_attributes_required_then_recovers() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    // Attempt 1: autonomous send, no attributes -> attributes_required.
+    let (resp, is_error) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(is_error, "unattributed send must be an error: {resp}");
+    assert_eq!(resp["status"], "invalid");
+    assert_eq!(resp["error"]["code"], "attributes_required");
+
+    // Governor was never spawned (this is not governor_unavailable).
+    let reason = resp["error"]["reason"].as_str().expect("reason string");
+    assert!(
+        reason.contains("attributes"),
+        "names the parameter: {reason}"
+    );
+    assert!(
+        reason.contains("governor_catalog"),
+        "names the catalog: {reason}"
+    );
+    assert!(
+        reason.contains("financial_content") || reason.contains("informational"),
+        "names a concrete key: {reason}"
+    );
+
+    // The error carries a self-contained `--help`-quality `help` object across the
+    // real MCP boundary: definition, both declaration syntaxes, contextual
+    // examples, and every catalog-discovery pointer.
+    let help = &resp["error"]["help"];
+    assert!(
+        help["what_are_attributes"].as_str().unwrap_or("").len() > 60,
+        "plain-language definition of attributes"
+    );
+    assert!(
+        help["syntax"]["cli"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--attr"),
+        "CLI declaration syntax"
+    );
+    assert_eq!(
+        help["syntax"]["mcp"]["field"], "attributes",
+        "MCP field name"
+    );
+    assert_eq!(help["list_attributes"]["mcp_tool"], "governor_catalog");
+    assert_eq!(
+        help["list_attributes"]["cli"],
+        "envelope governor catalog --json"
+    );
+    assert_eq!(
+        help["list_attributes"]["skill"],
+        "envelope-governor-attribution"
+    );
+    assert!(
+        help["rules"]
+            .as_array()
+            .map(|r| r.len() >= 3)
+            .unwrap_or(false)
+    );
+
+    // Examples: >=3 contextual suggestions, each with key/description/when, and at
+    // least one risk key.
+    let examples = help["examples"].as_array().expect("help.examples");
+    assert!(examples.len() >= 3, "at least three contextual examples");
+    for ex in examples {
+        assert!(ex["key"].is_string());
+        assert!(ex["description"].is_string());
+        assert!(ex["when"].is_string());
+    }
+    assert!(
+        examples
+            .iter()
+            .any(|s| RISK_KEYS.contains(&s["key"].as_str().unwrap_or(""))),
+        "at least one risk key"
+    );
+
+    // The declared/rejected INPUT sets are echoed under error.attributes.
+    assert!(resp["error"]["attributes"]["declared"].is_array());
+    assert!(resp["error"]["attributes"]["rejected"].is_array());
+
+    // No score/weight/threshold leaks anywhere in the payload.
+    let whole = serde_json::to_string(&resp).unwrap();
+    for banned in ["\"score\"", "weight", "threshold"] {
+        assert!(!whole.contains(banned), "payload leaked {banned}");
+    }
+
+    // Attempt 2: declare a true fact -> reaches the outbox queue (no SMTP).
+    let (resp2, is_error2) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "attributes": ["informational"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(!is_error2, "attributed send should proceed: {resp2}");
+    assert_eq!(resp2["status"], "queued");
+    assert!(resp2["draft_id"].is_string());
+
+    // Gap 3: a SUCCESSFUL (queued) result carries the additive `attribution`
+    // block. The real Governor decision runs later at the sweep, so governor is
+    // null and governor_decision_pending marks the deferral. No score ever.
+    let attribution = &resp2["attribution"];
+    assert_eq!(attribution["attribution_state"], "attributed");
+    assert_eq!(attribution["protocol"], "envelope.attribution.v1");
+    assert_eq!(attribution["catalog"], "envelope");
+    assert!(
+        attribution["declared_attrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "informational")
+    );
+    assert!(attribution["governor_attrs"].is_array());
+    assert!(attribution.get("accepted_redundant").is_some());
+    assert!(attribution.get("rejected_attrs").is_some());
+    assert_eq!(
+        attribution["governor"],
+        Value::Null,
+        "verdict deferred to sweep"
+    );
+    assert!(attribution.get("governor_decision_pending").is_some());
+    assert!(
+        !serde_json::to_string(attribution)
+            .unwrap()
+            .contains("\"score\"")
+    );
+}
+
+#[test]
+fn mcp_stateless_attribution_failure_never_claims_a_draft_was_parked() {
+    // Gap 2: a direct/stateless send that fails attribution created no draft, so
+    // its response must be idempotent to retry and must NOT claim any parking.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    let (resp, is_error) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(is_error);
+    assert_eq!(resp["error"]["code"], "attributes_required");
+    // Idempotent, and honest: no draft, nothing sent, nothing parked.
+    assert_eq!(resp["error"]["recovery"]["retry"]["idempotent"], true);
+    let note = resp["error"]["recovery"]["retry"]["note"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        note.contains("nothing was sent or created"),
+        "note must affirm nothing was created: {note}"
+    );
+    let whole = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !whole.contains("attribution_exhausted") && !whole.contains("pending_review"),
+        "a stateless failure must not claim a draft was parked: {whole}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_stateless_immediate_review_never_claims_a_draft_was_parked() {
+    // Block 4: a direct/stateless immediate send (send_now + confirm_send_now,
+    // no draft) that Governor routes to REVIEW created and parked nothing. Its
+    // recovery must say so and must NOT link a nonexistent pending_review draft.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+    let gov = write_mock_governor(temp.path(), "review");
+
+    let (resp, is_error) = tool_call_env(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "attributes": ["informational"],
+            "send_mode": "autonomous-send",
+            "send_now": true,
+            "confirm_send_now": true
+        }),
+        &[
+            ("ENVELOPE_GOVERNOR_MODE", "required"),
+            ("ENVELOPE_GOVERNOR_BIN", gov.to_str().unwrap()),
+        ],
+    );
+    assert!(is_error, "a review verdict blocks the send: {resp}");
+    assert_eq!(resp["status"], "blocked");
+    assert_eq!(resp["error"]["route"], "review");
+    let reason = resp["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("Nothing was sent, created, or parked"),
+        "stateless review must be honest about parking: {reason}"
+    );
+    let whole = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !whole.contains("pending_review"),
+        "must not link a nonexistent parked draft: {whole}"
+    );
+    // Nothing was created: no draft rows exist.
+    let db = envelope_email_store::Database::open(&db_path(temp.path())).expect("open db");
+    let draft_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts");
+    assert_eq!(draft_count, 0, "a stateless review must create no draft");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_draft_backed_immediate_review_does_not_falsely_park() {
+    // Block 4: a draft-backed immediate send (send_draft) that Governor reviews
+    // releases the draft back to `draft` (the claim guard), it is NOT parked. The
+    // recovery must not falsely claim a pending_review park.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_policy(home, "skippy", "send", "autonomous-send");
+    let draft_id = create_local_draft(home, "stranger@acme.example");
+    let gov = write_mock_governor(home, "review");
+
+    let (resp, is_error) = tool_call_env(
+        home,
+        Some(&token),
+        "send_draft",
+        json!({
+            "draft_id": draft_id,
+            "confirm_send": true,
+            "send_now": true,
+            "confirm_send_now": true,
+            "attributes": ["informational"]
+        }),
+        &[
+            ("ENVELOPE_GOVERNOR_MODE", "required"),
+            ("ENVELOPE_GOVERNOR_BIN", gov.to_str().unwrap()),
+        ],
+    );
+    assert!(is_error, "review blocks the send: {resp}");
+    assert_eq!(resp["error"]["route"], "review");
+    let whole = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !whole.contains("pending_review"),
+        "an unparked draft-backed review must not claim a pending_review park: {whole}"
+    );
+    // The draft is back at `draft` status (released, not parked/consumed).
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let status: String = db
+        .conn()
+        .query_row(
+            "SELECT status FROM drafts WHERE id = ?1",
+            [&draft_id],
+            |r| r.get(0),
+        )
+        .expect("draft status");
+    assert_eq!(
+        status, "draft",
+        "reviewed draft returns to draft, not parked"
+    );
+}
+
+#[test]
+fn mcp_send_typo_is_attributes_invalid_then_corrected() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    let (resp, is_error) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi",
+            "attributes": ["informationl"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(is_error);
+    assert_eq!(resp["error"]["code"], "attributes_invalid");
+    // Rejected keys + per-key reason + nearest suggestion live in the obvious
+    // error.attributes.rejected structure.
+    let rejected = resp["error"]["attributes"]["rejected"]
+        .as_array()
+        .expect("attributes.rejected");
+    assert!(rejected.iter().any(|r| {
+        r["key"] == "informationl"
+            && r["code"] == "unknown_attribute"
+            && r["did_you_mean"]
+                .as_array()
+                .map(|d| d.iter().any(|k| k == "informational"))
+                .unwrap_or(false)
+    }));
+    // The caller's declared input is echoed, and the same help affordances apply.
+    assert!(
+        resp["error"]["attributes"]["declared"]
+            .as_array()
+            .map(|d| d.iter().any(|k| k == "informationl"))
+            .unwrap_or(false)
+    );
+    assert!(
+        !resp["error"]["help"]["examples"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Corrected retry queues.
+    let (resp2, is_error2) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi",
+            "attributes": ["informational"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(!is_error2, "corrected retry should queue: {resp2}");
+    assert_eq!(resp2["status"], "queued");
+}
+
+#[test]
+fn mcp_self_asserted_tyler_approved_is_attestation_required() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    let (resp, is_error) = tool_call(
+        temp.path(),
+        None,
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi",
+            "attributes": ["tyler_approved", "informational"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(is_error);
+    assert_eq!(resp["error"]["code"], "attributes_invalid");
+    let rejected = resp["error"]["attributes"]["rejected"].as_array().unwrap();
+    assert!(
+        rejected
+            .iter()
+            .any(|r| r["key"] == "tyler_approved" && r["code"] == "attestation_required"),
+        "self-asserted attestation must be rejected: {resp}"
+    );
+    // The attestation key never reaches Governor: the whole request is invalid and
+    // Governor is never spawned, so no Governor decision block is emitted.
+    assert_eq!(resp["status"], "invalid");
+    assert!(
+        resp["error"].get("governor").is_none(),
+        "attestation must never reach Governor: {resp}"
+    );
+}
+
+#[test]
+fn mcp_governor_catalog_is_always_allowed_and_weight_free() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    // A restricted agent (no send, read-only) can still discover the catalog.
+    let (token, _id) = create_agent(temp.path(), "reader");
+    set_policy(temp.path(), "reader", "inbox.read", "draft-only");
+
+    let (resp, is_error) = tool_call(temp.path(), Some(&token), "governor_catalog", json!({}));
+    assert!(!is_error, "governor_catalog must be always allowed: {resp}");
+    assert_eq!(resp["protocol"], "envelope.attribution.v1");
+    assert_eq!(resp["catalog_version"], 1);
+    assert_eq!(resp["attributes"].as_array().unwrap().len(), 30);
+
+    // No weights/scores anywhere; provenance present; tyler_approved is attestation.
+    let text = serde_json::to_string(&resp).unwrap();
+    assert!(!text.contains("weight"));
+    assert!(!text.contains("\"score\""));
+    assert!(!text.contains("threshold"));
+    let attrs = resp["attributes"].as_array().unwrap();
+    assert!(attrs.iter().any(|a| a["provenance"] == "declarable"));
+    assert!(
+        attrs
+            .iter()
+            .any(|a| a["key"] == "tyler_approved" && a["provenance"] == "requires_attestation")
+    );
+}
+
+#[test]
+fn mcp_send_schema_attributes_enum_excludes_attestation_keys() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    write_framed(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+    );
+    let _ = read_framed(&mut stdout);
+    write_framed(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    );
+    let tools = read_framed(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait mcp");
+
+    let entries = tools["result"]["tools"].as_array().unwrap();
+    let send = entries.iter().find(|t| t["name"] == "send").unwrap();
+    let enum_vals = send["inputSchema"]["properties"]["attributes"]["items"]["enum"]
+        .as_array()
+        .expect("attributes enum");
+    assert!(
+        enum_vals.iter().any(|k| k == "financial_content"),
+        "declarable keys present"
+    );
+    assert!(
+        !enum_vals.iter().any(|k| k == "tyler_approved"),
+        "attestation keys must be unrepresentable in the schema enum"
+    );
+    // The attributes schema itself carries no weight/score data.
+    let attrs_schema =
+        serde_json::to_string(&send["inputSchema"]["properties"]["attributes"]).unwrap();
+    assert!(!attrs_schema.contains("\"score\""));
+    assert!(!attrs_schema.contains("weight"));
+}
+
+#[test]
+fn cli_send_without_attr_is_canonical_error_with_no_side_effect() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    // No --attr: attributes_required, nonzero exit, NO draft/SMTP/Governor side effect.
+    let out = run_cli(
+        temp.path(),
+        &[
+            "--json",
+            "send",
+            "--to",
+            "stranger@acme.example",
+            "--subject",
+            "Hi",
+            "--body",
+            "hi",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "unattributed CLI send must exit nonzero"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json on stdout");
+    assert_eq!(v["status"], "invalid");
+    assert_eq!(v["error"]["code"], "attributes_required");
+    assert!(!serde_json::to_string(&v).unwrap().contains("\"score\""));
+
+    // No draft row was created (no side effect before the refusal).
+    let db = envelope_email_store::Database::open(&db_path(temp.path())).expect("open db");
+    let count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts");
+    assert_eq!(
+        count, 0,
+        "no draft may be created on an attribution refusal"
+    );
+
+    // Retry with --attr: queues into the outbox (creates a draft, no SMTP).
+    let out2 = run_cli(
+        temp.path(),
+        &[
+            "--json",
+            "send",
+            "--to",
+            "stranger@acme.example",
+            "--subject",
+            "Hi",
+            "--body",
+            "hi",
+            "--attr",
+            "informational",
+        ],
+        None,
+    );
+    assert!(
+        out2.status.success(),
+        "attributed CLI send should queue: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    let v2: Value = serde_json::from_slice(&out2.stdout).expect("json");
+    assert_eq!(v2["status"], "queued");
+}
+
+#[test]
+fn cli_send_without_attr_fails_closed_in_warn_mode_too() {
+    // Warn mode softens only a Governor VERDICT; it never waives the attribution
+    // precondition. An unattributed CLI send under ENVELOPE_GOVERNOR_MODE=warn
+    // must still be refused with attributes_required and create no draft — the
+    // exact "warn must not send unattributed bot mail" invariant.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    seed_account(temp.path());
+
+    let out = Command::new(envelope_bin())
+        .args([
+            "--json",
+            "send",
+            "--to",
+            "stranger@acme.example",
+            "--subject",
+            "Hi",
+            "--body",
+            "hi",
+        ])
+        .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
+        .env("ENVELOPE_GOVERNOR_MODE", "warn")
+        .output()
+        .expect("run envelope cli");
+
+    assert!(
+        !out.status.success(),
+        "warn mode must still fail closed on a missing declaration: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json on stdout");
+    assert_eq!(v["status"], "invalid");
+    assert_eq!(v["error"]["code"], "attributes_required");
+
+    // No draft may be created — warn must not silently queue an unattributed send.
+    let db = envelope_email_store::Database::open(&db_path(temp.path())).expect("open db");
+    let count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts");
+    assert_eq!(
+        count, 0,
+        "warn must not create a draft for an unattributed send"
+    );
+}
+
+#[test]
+fn cli_governor_catalog_prints_weight_free_projection() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let out = run_cli(temp.path(), &["--json", "governor", "catalog"], None);
+    assert!(out.status.success(), "governor catalog --json must succeed");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["protocol"], "envelope.attribution.v1");
+    assert_eq!(v["attributes"].as_array().unwrap().len(), 30);
+    let text = serde_json::to_string(&v).unwrap();
+    assert!(!text.contains("weight"));
+    assert!(!text.contains("\"score\""));
+}
+
+// ── Contract parity: REAL handler output vs the PUBLISHED output schema ──
+//
+// The strongest anti-drift check: capture a real MCP `send` response and
+// validate it against the output schema the running binary publishes via
+// `envelope contract send`. Both sides are the real binary, so the schema can
+// never silently diverge from what the handler actually emits.
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn schema_type_admits(schema_type: &Value, actual: &str) -> bool {
+    match schema_type {
+        Value::String(s) => s == actual || (s == "number" && actual == "integer"),
+        Value::Array(types) => types.iter().any(|t| schema_type_admits(t, actual)),
+        _ => true,
+    }
+}
+
+/// Every key of `value` must be declared in the schema (contract objects are
+/// additionalProperties:false), and each present value's JSON type admitted by
+/// the property `type`. Returns violations (empty = conforms).
+fn schema_conformance_violations(schema: &Value, value: &Value) -> Vec<String> {
+    let props = &schema["properties"];
+    let mut errs = Vec::new();
+    for (k, v) in value.as_object().expect("response must be a JSON object") {
+        match props.get(k) {
+            None => errs.push(format!("undeclared key `{k}`")),
+            Some(prop) => {
+                let actual = json_type_name(v);
+                if prop.get("type").is_some() && !schema_type_admits(&prop["type"], actual) {
+                    errs.push(format!(
+                        "key `{k}` is {actual} but schema type is {}",
+                        prop["type"]
+                    ));
+                }
+            }
+        }
+    }
+    errs
+}
+
+fn published_output_schema(home: &std::path::Path, surface: &str) -> Value {
+    let out = run_cli(home, &["contract", "--surface", surface], None);
+    assert!(
+        out.status.success(),
+        "envelope contract --surface {surface} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("contract surface JSON");
+    v["output_schema"].clone()
+}
+
+#[test]
+fn real_send_responses_conform_to_published_contract_schema() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    // Autonomous ceiling so an attributed autonomous send reaches the outbox
+    // queue (rather than being clamped to a draft).
+    set_policy(home, "skippy", "send", "autonomous-send");
+
+    let send_schema = published_output_schema(home, "send");
+
+    // Real queued acceptance — the full success envelope, straight from the handler.
+    let (queued, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "attributes": ["informational"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert!(!is_error, "attributed send should proceed: {queued}");
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let errs = schema_conformance_violations(&send_schema, &queued);
+    assert!(
+        errs.is_empty(),
+        "real queued `send` response drifted from the published schema: {errs:?}\n{queued}"
+    );
+
+    // Real attribution refusal — the `{status, error}` envelope, straight from
+    // the handler (unknown key → attributes_invalid).
+    let (refusal, _is_error) = tool_call(
+        home,
+        Some(&token),
+        "send",
+        json!({
+            "to": "stranger@acme.example",
+            "subject": "Hello",
+            "body": "hi there",
+            "attributes": ["not_a_real_key"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+    assert_eq!(refusal["status"], "invalid", "{refusal}");
+    let errs = schema_conformance_violations(&send_schema, &refusal);
+    assert!(
+        errs.is_empty(),
+        "real refusal `send` response drifted from the published schema: {errs:?}\n{refusal}"
+    );
 }

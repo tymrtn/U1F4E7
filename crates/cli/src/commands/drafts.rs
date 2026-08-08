@@ -2061,6 +2061,7 @@ pub async fn run_create(
 pub async fn run_send(
     id: &str,
     account: Option<&str>,
+    attr: &[String],
     json: bool,
     backend: CredentialBackend,
     cooldown_seconds: Option<i64>,
@@ -2069,6 +2070,32 @@ pub async fn run_send(
 ) -> Result<()> {
     use envelope_email_transport::outbound::{
         IMMEDIATE_SEND_CONFIRM_CODE, SendDisposition, resolve_cooldown_seconds, resolve_disposition,
+    };
+
+    // ── Attribution precheck (before ANY side effect, incl. queueing) ──
+    //
+    // Capture the EXACT validated revision + resolution here so the queue CAS
+    // binds to the revision the declaration was validated against — never a
+    // reloaded, possibly concurrently-edited newer revision. The db is scoped so
+    // no connection is held across the later async send.
+    let declared: Vec<String> = attr.to_vec();
+    let precheck = {
+        let db = Database::open_default().context("failed to open database")?;
+        let precheck = precheck_draft(&db, id, SendSurface::Cli, &declared, None)?;
+        if let Some(outcome) = &precheck.refusal {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": outcome.status_str(),
+                        "draft_id": id,
+                        "error": outcome.error_json(),
+                    })
+                );
+            }
+            anyhow::bail!("{}", outcome.reason_string());
+        }
+        precheck
     };
 
     // ── Default actual-send cooldown (outbox queueing) ──
@@ -2099,22 +2126,31 @@ pub async fn run_send(
             cooldown_seconds: cd,
         } => {
             let db = Database::open_default().context("failed to open database")?;
-            let draft = db
-                .get_draft(id)
-                .context("failed to get draft")?
-                .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            db.update_draft_send_after(&draft.id, &send_at)
-                .context("failed to set send_after on draft")?;
+            // One atomic CAS bound to the EXACT revision the declaration was
+            // validated against at precheck (never a reloaded revision): a
+            // concurrent material edit conflicts rather than binding a stale
+            // declaration or leaving a partial schedule; a re-queued
+            // pending_review draft transitions to the due `draft` status.
+            queue_bot_draft_for_send(&db, id, precheck.revision, &send_at, &declared)?;
+            // The additive success block is built from the SAME validated
+            // resolution — no re-resolve that could observe edited content.
+            let queued_attribution =
+                envelope_email_transport::attribution_persist::success_attribution_block(
+                    &precheck.resolution,
+                    None,
+                    None,
+                    true,
+                );
             // Catalog event: a send was queued into the outbox. Payload carries
             // only the transition metadata — no recipients, no body.
             let _ = db.emit_catalog_event(
-                &draft.account_id,
+                &precheck.account_id,
                 envelope_email_store::event_catalog::SEND_QUEUED,
                 Some(serde_json::json!({
-                    "draft_id": draft.id,
+                    "draft_id": id,
                     "send_after": send_at,
                     "cooldown_seconds": cd,
                 })),
@@ -2123,13 +2159,14 @@ pub async fn run_send(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "status": "scheduled",
-                        "draft_id": draft.id,
-                        "send_after": send_at,
-                        "cooldown_seconds": cd,
-                        "ui": ui::draft_ui(&draft.account_id, &draft.id),
-                    })
+                    crate::commands::contract::send_body::draft_scheduled(
+                        false,
+                        id,
+                        &send_at,
+                        cd,
+                        queued_attribution,
+                        ui::draft_ui(&precheck.account_id, id),
+                    )
                 );
             } else {
                 println!(
@@ -2155,7 +2192,7 @@ pub async fn run_send(
         );
     }
 
-    let outcome = send_existing_draft(id, account, backend).await?;
+    let outcome = send_existing_draft(id, account, backend, SendSurface::Cli, &declared).await?;
     if json {
         println!("{}", outcome.json);
     } else {
@@ -2284,6 +2321,140 @@ pub(crate) struct SentDraftOutcome {
     pub lookup_status: &'static str,
 }
 
+/// Attribution precheck for a draft-send **before any side effect** (queueing or
+/// SMTP). Loads the draft, derives its sanitized send context, and returns the
+/// canonical refusal outcome for an unattributed/invalid request; `None` to
+/// proceed. No Governor spawn on refusal.
+/// The validated attribution precheck for a draft-send, produced BEFORE any
+/// side effect (queueing or SMTP). It captures the exact state the queue CAS
+/// must bind to, so a concurrent material edit conflicts instead of inheriting a
+/// stale declaration.
+pub(crate) struct DraftSendPrecheck {
+    /// The row `revision` at validation time. The atomic queue CAS
+    /// ([`queue_bot_draft_for_send`]) binds to exactly this value; a concurrent
+    /// edit (revision moved) then conflicts rather than binding the validated
+    /// declaration to newer, unvalidated content.
+    pub revision: i64,
+    /// The draft's account id, captured at validation so the queue path can emit
+    /// its catalog/UI metadata without a second load.
+    pub account_id: String,
+    /// The resolved attribution (declared ∪ host-derived), for the additive
+    /// success `attribution` block. Never a score/weight/threshold.
+    pub resolution: envelope_email_transport::attribution::AttributionResolution,
+    /// `Some` when the attribution precondition refuses the send before any side
+    /// effect (unattributed/invalid on a bot surface); the refusal is already
+    /// recorded in the audit log. `None` when the send may proceed.
+    pub refusal: Option<envelope_email_transport::outbound::GovernorOutcome>,
+}
+
+/// Resolve and validate a draft-send's attribution BEFORE any side effect, and
+/// return the exact revision + resolution the queue CAS must bind to.
+///
+/// This is a `Result`, not an `Option`: a load failure (missing draft/account,
+/// DB error) is a real error propagated to the caller, never silently swallowed
+/// into a "proceed" outcome. The returned `revision` is the row revision the
+/// declaration was validated against; callers MUST pass it back into
+/// [`queue_bot_draft_for_send`] rather than reloading — a reload could pick up a
+/// concurrently-edited newer revision and bind the stale declaration to it.
+pub(crate) fn precheck_draft(
+    db: &Database,
+    draft_id: &str,
+    surface: SendSurface,
+    declared: &[String],
+    agent_id: Option<&str>,
+) -> Result<DraftSendPrecheck> {
+    let draft = db
+        .get_draft(draft_id)
+        .context("failed to load draft for attribution precheck")?
+        .ok_or_else(|| anyhow::anyhow!("draft not found: {draft_id}"))?;
+    let acct = db
+        .get_account(&draft.account_id)
+        .context("failed to load account for attribution precheck")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "account not found for draft {draft_id}: {}",
+                draft.account_id
+            )
+        })?;
+    let attachments = draft_attachment_stubs(&draft);
+    let gov_req = super::governor_gate::governor_request(
+        &draft.account_id,
+        super::governor_gate::account_domain(&acct.username),
+        draft.subject.as_deref().unwrap_or(""),
+        &draft.to_addr,
+        draft.cc_addr.as_deref(),
+        draft.bcc_addr.as_deref(),
+        surface,
+        Some(draft_id),
+        &attachments,
+        draft.in_reply_to.is_some(),
+        declared,
+    );
+    // `governor_request` always resolves attribution, so this is present; treat a
+    // missing resolution as a hard error rather than silently proceeding.
+    let resolution = gov_req.resolution.clone().ok_or_else(|| {
+        anyhow::anyhow!("attribution resolution unavailable for draft {draft_id}")
+    })?;
+    let refusal =
+        super::governor_gate::precheck_attribution(db, &draft.account_id, &gov_req, agent_id);
+    Ok(DraftSendPrecheck {
+        revision: draft.revision,
+        account_id: draft.account_id.clone(),
+        resolution,
+        refusal,
+    })
+}
+
+/// Body-free attachment stubs (filename + content_type only) for deriving
+/// host attribution facts (`has_attachment`, `sensitive_attachment`, count)
+/// without rehydrating the snapshotted bytes.
+fn draft_attachment_stubs(
+    draft: &envelope_email_store::Draft,
+) -> Vec<envelope_email_transport::smtp::Attachment> {
+    draft
+        .attachments
+        .iter()
+        .map(|s| envelope_email_transport::smtp::Attachment {
+            filename: s
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("attachment")
+                .to_string(),
+            content_type: s
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            data: Vec::new(),
+        })
+        .collect()
+}
+
+/// Atomically queue a bot draft for scheduled sending: bind the bot's validated
+/// declaration to `expected_revision`, set `send_after`, and transition the row
+/// to the due `draft` status in ONE store compare-and-set (see
+/// [`Database::queue_draft_for_send`]).
+///
+/// `expected_revision` is the revision the declaration was validated against. A
+/// concurrent material edit (revision moved) fails with a conflict and leaves
+/// nothing scheduled or persisted — a stale declaration is never bound to newer
+/// content, and no partial schedule survives.
+pub(crate) fn queue_bot_draft_for_send(
+    db: &Database,
+    draft_id: &str,
+    expected_revision: i64,
+    send_after: &str,
+    declared: &[String],
+) -> Result<()> {
+    let attribution = envelope_email_transport::attribution_persist::PersistedDeclaration::new_bot(
+        declared,
+        expected_revision,
+    )
+    .to_value();
+    db.queue_draft_for_send(draft_id, expected_revision, send_after, &attribution)
+        .context("failed to atomically queue draft (declaration + schedule + due status)")
+}
+
 /// Send an already-created draft (by local UUID or IMAP UID) without printing
 /// anything. This is the single source of truth for "send this draft": it sends
 /// over SMTP, cleans up the IMAP Drafts copy, optionally appends to Sent, and —
@@ -2293,6 +2464,8 @@ pub(crate) async fn send_existing_draft(
     id: &str,
     account: Option<&str>,
     backend: CredentialBackend,
+    surface: SendSurface,
+    declared: &[String],
 ) -> Result<SentDraftOutcome> {
     let db = Database::open_default().context("failed to open database")?;
     let passphrase =
@@ -2523,7 +2696,7 @@ pub(crate) async fn send_existing_draft(
     // surfaces, so both converge on identical blind-attribution semantics. The
     // draft is a persisted, contextual send: threading and attachments are
     // re-derived from what will actually be transmitted.
-    {
+    let gov_attribution = {
         let gov_req = super::governor_gate::governor_request(
             &acct.id,
             super::governor_gate::account_domain(&creds.account.username),
@@ -2531,26 +2704,22 @@ pub(crate) async fn send_existing_draft(
             &to_addr,
             cc_addr.as_deref(),
             bcc_addr.as_deref(),
-            SendSurface::Cli,
+            surface,
             Some(id),
             &attachments,
             in_reply_to.is_some(),
+            declared,
         );
+        // gate_with_attribution refuses an unattributed/invalid request BEFORE
+        // Governor is spawned; the send-claim guard releases the draft on bail.
+        // The canonical `{status, error}` payload is carried as the error string
+        // so the MCP/CLI surface reports structured attribution/Governor recovery.
         let gov_outcome = super::governor_gate::gate_and_record(&db, &acct.id, &gov_req);
         if !gov_outcome.allowed {
-            bail!(
-                "send blocked by governor: {} ({})",
-                gov_outcome
-                    .block_reason
-                    .clone()
-                    .unwrap_or_else(|| "governor did not permit this send".to_string()),
-                gov_outcome
-                    .block_code
-                    .clone()
-                    .unwrap_or_else(|| "governor_blocked".to_string())
-            );
+            bail!("{}", gov_outcome.response_json());
         }
-    }
+        gov_outcome.success_attribution()
+    };
 
     // ── Send via SMTP (full path so In-Reply-To / References survive) ──
     // A reply must carry its parent in References even when neither the draft
@@ -2738,6 +2907,7 @@ pub(crate) async fn send_existing_draft(
         "sent_mail": sent_mail_proof_json(&acct.id, &sent_mail_proof),
         "provider_sent_copy": provider_sent_copy,
         "client_appended_copy": client_appended_copy,
+        "attribution": gov_attribution,
         "ui": sent_ui,
         "draft_ui": ui::draft_ui(&acct.id, id),
     });
@@ -3370,6 +3540,144 @@ mod tests {
         db.update_draft_imap_uid(&draft.id, 77).unwrap();
         let with_uid = db.get_draft(&draft.id).unwrap().unwrap();
         assert!(provider_copy_may_exist(&with_uid));
+    }
+
+    fn seed_account_and_bot_draft(
+        db: &envelope_email_store::Database,
+        to: &str,
+    ) -> envelope_email_store::models::Draft {
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'T', 't@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        db.create_draft(
+            "acc1",
+            to,
+            Some("S"),
+            Some("b"),
+            None,
+            None,
+            None,
+            None,
+            Some("mcp"),
+        )
+        .unwrap()
+    }
+
+    /// The validated revision reaches the CAS on the happy path: precheck resolves
+    /// the declaration against revision R, and queueing at R (no concurrent edit)
+    /// schedules the draft with the declaration bound to R.
+    #[test]
+    fn precheck_revision_reaches_queue_cas_and_binds_declaration() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let draft = seed_account_and_bot_draft(&db, "safe@partner.example");
+        let declared = vec!["informational".to_string()];
+
+        let precheck = precheck_draft(&db, &draft.id, SendSurface::Mcp, &declared, None)
+            .expect("precheck loads draft + account");
+        assert!(
+            precheck.refusal.is_none(),
+            "a valid declaration passes the precheck"
+        );
+        assert!(precheck.resolution.is_attributed());
+
+        queue_bot_draft_for_send(
+            &db,
+            &draft.id,
+            precheck.revision,
+            "2000-01-01T00:00:00Z",
+            &declared,
+        )
+        .expect("queue at the validated revision succeeds");
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Draft, "scheduled + due");
+        assert_eq!(reloaded.send_after.as_deref(), Some("2000-01-01T00:00:00Z"));
+        let attr = reloaded.metadata.unwrap()["attribution"].clone();
+        assert_eq!(attr["declared_attrs"][0], "informational");
+        assert_eq!(
+            attr["revision"], precheck.revision,
+            "declaration bound to the validated revision"
+        );
+    }
+
+    /// Handler-level race (the exact Codex path): a concurrent recipient edit
+    /// after precheck bumps the revision. Because the queue CAS binds to the
+    /// EXACT validated revision (never a reload), it must conflict and leave the
+    /// draft un-scheduled, un-attributed, and NOT resurrected — the stale
+    /// declaration is never bound to the edited content.
+    #[test]
+    fn precheck_then_concurrent_edit_conflicts_without_binding_stale_declaration() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let draft = seed_account_and_bot_draft(&db, "safe@partner.example");
+        let declared = vec!["informational".to_string()];
+
+        // 1) Bot validates its declaration against the current revision.
+        let precheck = precheck_draft(&db, &draft.id, SendSurface::Mcp, &declared, None)
+            .expect("precheck loads");
+        assert!(precheck.refusal.is_none());
+        let validated_rev = precheck.revision;
+
+        // 2) A concurrent material edit lands BEFORE the queue CAS.
+        db.update_draft_content(
+            &draft.id,
+            Some("attacker@evil.example"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let edited = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_ne!(
+            edited.revision, validated_rev,
+            "the edit bumped the revision"
+        );
+
+        // 3) Queue at the VALIDATED revision → conflict; nothing is bound.
+        let err = queue_bot_draft_for_send(
+            &db,
+            &draft.id,
+            validated_rev,
+            "2000-01-01T00:00:00Z",
+            &declared,
+        )
+        .expect_err("a stale-revision queue must conflict");
+        assert!(
+            matches!(
+                err.downcast_ref::<envelope_email_store::StoreError>(),
+                Some(envelope_email_store::StoreError::DraftModifiedConcurrently(
+                    _
+                ))
+            ),
+            "expected a concurrent-modification conflict, got: {err:?}"
+        );
+
+        // The edited draft was NOT scheduled and carries NO stale declaration.
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.to_addr, "attacker@evil.example", "the edit persisted");
+        assert_eq!(
+            after.status,
+            DraftStatus::Draft,
+            "not resurrected/transitioned by the failed queue"
+        );
+        assert!(
+            after.send_after.is_none(),
+            "no schedule was bound to the edited content"
+        );
+        assert!(
+            after
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none(),
+            "the stale declaration was never bound to the edited content"
+        );
     }
 
     /// A mismatched --account/credential context must refuse before any

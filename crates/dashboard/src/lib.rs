@@ -646,14 +646,143 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             Some(thread_references.as_slice())
         };
 
+        // ── Attribution inputs from the draft's DURABLE state ──
+        //
+        // Load the declaration the bot validated at queue time and decide whether
+        // a declaration is required. A human-attested draft (revision-bound) does
+        // not require a bot declaration and lets Envelope derive `tyler_approved`;
+        // every other draft is bot-originated and a non-empty derived set never
+        // excuses a missing/stale declaration. A material edit bumps the revision,
+        // which makes the persisted declaration stale (dropped) and resets the
+        // attempt counter for free.
+        let persisted =
+            envelope_email_transport::attribution_persist::PersistedDeclaration::from_metadata(
+                draft.metadata.as_ref(),
+            );
+        let (declared, require_declaration) =
+            envelope_email_transport::attribution_persist::scheduled_attribution_inputs(
+                draft.created_by.as_deref(),
+                draft.human_approved(),
+                persisted.as_ref(),
+                draft.revision,
+            );
+        let prior_attempts = persisted
+            .as_ref()
+            .filter(|d| d.is_current(draft.revision))
+            .map(|d| d.attempts)
+            .unwrap_or(0);
+
         // ── Governor gate (fail-closed before any real SMTP) ──
         //
         // The scheduled-send sweep is the one place that actually transmits
         // queued mail, so it must run the Governor gate against the reloaded,
         // claimed row. When Governor is required and missing/errors/denies/
         // reviews, the send is refused and the claim is released per reason.
-        let gov_outcome = run_governor_gate(state, draft, &creds, subject, &attachments).await;
+        let gov_outcome = run_governor_gate(
+            state,
+            draft,
+            &creds,
+            subject,
+            &attachments,
+            &declared,
+            require_declaration,
+        )
+        .await;
         if !gov_outcome.allowed {
+            // ── Bot-originated attribution failure: bounded correction loop ──
+            //
+            // The declaration is missing/stale/invalid for this bot draft (never
+            // declared, or a material edit invalidated it). Governor was NOT
+            // spawned. Retry a bounded number of times so an async correction can
+            // land, then park for human review — never a retry storm.
+            if gov_outcome.is_attribution_failure() {
+                use envelope_email_transport::attribution_persist::{
+                    AttributionFailureAction, attribution_failure_action, scheduled_origin,
+                };
+                // The correction loop is decided from the draft's DURABLE origin.
+                // Bot/Unknown origins run the bounded retry→park loop with their
+                // bot provenance preserved; a genuinely human-originated draft
+                // (stale approval) is parked for human re-approval WITHOUT
+                // fabricating any bot declaration — its human origin survives so a
+                // fresh attestation can recover it.
+                let origin = scheduled_origin(
+                    draft.created_by.as_deref(),
+                    persisted.as_ref(),
+                    draft.revision,
+                );
+                let action =
+                    attribution_failure_action(origin, &declared, draft.revision, prior_attempts);
+                let outcome_label = match &action {
+                    AttributionFailureAction::HumanReview
+                    | AttributionFailureAction::Park { .. } => "blocked",
+                    AttributionFailureAction::Retry { .. } => "deferred",
+                };
+                let persisted_ok = {
+                    let db = state.db.lock().await;
+                    match &action {
+                        AttributionFailureAction::HumanReview => {
+                            // Park for re-approval, preserving human origin: release
+                            // the claim into pending_review; no attribution block is
+                            // rewritten. (release logs its own outcome.)
+                            db.release_sending_draft(
+                                &draft.id,
+                                &lease,
+                                envelope_email_store::DraftStatus::PendingReview,
+                            )
+                            .unwrap_or(false)
+                        }
+                        AttributionFailureAction::Park { value } => db
+                            .park_attribution_exhausted(&draft.id, &lease, value)
+                            .unwrap_or(false),
+                        AttributionFailureAction::Retry { value } => db
+                            .defer_attribution_retry(&draft.id, &lease, value)
+                            .unwrap_or(false),
+                    }
+                };
+                tracing::warn!(
+                    "scheduled send: draft {} failed attribution at SMTP time ({}); origin={} — {}{}",
+                    draft.id,
+                    gov_outcome
+                        .block_code
+                        .clone()
+                        .unwrap_or_else(|| "attributes_required".to_string()),
+                    origin.as_str(),
+                    match &action {
+                        AttributionFailureAction::HumanReview =>
+                            "parking pending_review for human re-approval (human origin preserved)"
+                                .to_string(),
+                        AttributionFailureAction::Park { .. } =>
+                            "parking pending_review (attribution_exhausted)".to_string(),
+                        AttributionFailureAction::Retry { value } => format!(
+                            "left due for correction (attempt {} of {})",
+                            value["attempts"],
+                            envelope_email_transport::attribution_persist::MAX_ATTRIBUTION_ATTEMPTS
+                        ),
+                    },
+                    if persisted_ok {
+                        ""
+                    } else {
+                        " [WARNING: transition matched no owned row; the claim stays inert as `sending`]"
+                    },
+                );
+                // Only claim the blocked/deferred transition when it actually
+                // persisted. On an owner-token mismatch / concurrent transition
+                // the helper returned false and the claim stays inert as
+                // `sending`; publishing `blocked`/`deferred` there would be a lie,
+                // so emit a truthful `transition_failed` diagnostic instead.
+                let published_outcome = transition_outcome(persisted_ok, outcome_label);
+                state
+                    .events
+                    .publish(crate::events::DashboardEvent::SendStatus {
+                        account_id: draft.account_id.clone(),
+                        draft_id: draft.id.clone(),
+                        outcome: published_outcome,
+                        governor_decision: Some(gov_outcome.decision.clone()),
+                        governor_block_code: gov_outcome.block_code.clone(),
+                    });
+                continue;
+            }
+
             // A durable Governor verdict (review/deny/block) must not be retried
             // on every sweep: release the claim into `pending_review`, dropping
             // the draft out of the due query while it stays preserved, editable,
@@ -674,7 +803,7 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     " — releasing claim for retry"
                 }
             );
-            release_claim(
+            let released = release_claim(
                 state,
                 &draft.id,
                 &lease,
@@ -686,17 +815,25 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             )
             .await;
             // Metadata-level send status: decision + optional block code only.
-            // No recipients, subject, or body ever cross this channel.
+            // No recipients, subject, or body ever cross this channel. Publish
+            // the blocked/deferred outcome ONLY when the transition actually
+            // persisted; on an owner-token mismatch/failed release the claim is
+            // inert as `sending`, so emit a truthful `transition_failed` instead
+            // of a false blocked/deferred.
+            let outcome = transition_outcome(
+                released,
+                if pause_for_review {
+                    "blocked"
+                } else {
+                    "deferred"
+                },
+            );
             state
                 .events
                 .publish(crate::events::DashboardEvent::SendStatus {
                     account_id: draft.account_id.clone(),
                     draft_id: draft.id.clone(),
-                    outcome: if pause_for_review {
-                        "blocked"
-                    } else {
-                        "deferred"
-                    },
+                    outcome,
                     governor_decision: Some(gov_outcome.decision.clone()),
                     governor_block_code: gov_outcome.block_code.clone(),
                 });
@@ -806,29 +943,54 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The truthful send-status outcome for a claim transition: the `intended`
+/// label (`blocked`/`deferred`) ONLY when the owned transition actually
+/// persisted, otherwise the inert `transition_failed` diagnostic. An owner-token
+/// mismatch / concurrent transition leaves the claim inert as `sending`, so the
+/// sweep must never publish a `blocked`/`deferred`/`parked` outcome that did not
+/// happen.
+fn transition_outcome(persisted: bool, intended: &'static str) -> &'static str {
+    if persisted {
+        intended
+    } else {
+        "transition_failed"
+    }
+}
+
 /// Release a sweep claim into `to`, logging (but never panicking on) failure.
 /// Only ever called before SMTP acceptance. A transmitted or inconclusive
 /// delivery leaves the claim through `park_delivery_uncertain` or
 /// `mark_draft_sent`. If the release fails, the row stays `sending`: stranded
 /// but inert, and never re-selected for a duplicate transmission.
+///
+/// Returns `true` only when the owned `sending` row was actually transitioned.
+/// A `false` (owner-token mismatch, already transitioned, or DB error) means the
+/// intended `to` state did NOT persist — callers must NOT publish an outcome
+/// (blocked/deferred) that claims it did.
 async fn release_claim(
     state: &AppState,
     draft_id: &str,
     lease: &str,
     to: envelope_email_store::DraftStatus,
-) {
+) -> bool {
     let db = state.db.lock().await;
     match db.release_sending_draft(draft_id, lease, to.clone()) {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            "scheduled send: claim release for draft {draft_id} matched no `sending` row \
-             (already transitioned?)"
-        ),
-        Err(e) => tracing::error!(
-            "scheduled send: claim release for draft {draft_id} → {} failed: {e} — the \
-             draft stays parked in `sending` (inert, never re-sent) until repaired",
-            to.as_str()
-        ),
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                "scheduled send: claim release for draft {draft_id} matched no `sending` row \
+                 (already transitioned?)"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                "scheduled send: claim release for draft {draft_id} → {} failed: {e} — the \
+                 draft stays parked in `sending` (inert, never re-sent) until repaired",
+                to.as_str()
+            );
+            false
+        }
     }
 }
 
@@ -1122,23 +1284,108 @@ fn scheduled_send_context(
     }
 }
 
+/// The additive success `attribution` block for a **human-queued** dashboard
+/// draft (compose, reply, and the draft queue-for-send). The durable human
+/// attestation is the origin: `tyler_approved` is derived from the persisted,
+/// revision-bound approval, and **no bot declaration is fabricated**
+/// (`declared_attrs` stays empty for a human-originated send). The real Governor
+/// decision runs later at the scheduled-send sweep, so the block is deferred
+/// (`governor: null`, `governor_decision_pending` set) — matching the CLI/MCP
+/// queued success block. Sanitized: never a score, weight, threshold, body, raw
+/// recipient, secret, or attachment byte.
+///
+/// Reflects the same origin/attestation logic the sweep enforces via
+/// [`scheduled_attribution_inputs`], so the advertised block matches what the
+/// sweep will actually resolve. `account_username` is the account's email — the
+/// domain is derived from it exactly as the sweep does ([`account_domain_from_username`]),
+/// and the attachment host facts (`has_attachment`, `sensitive_attachment`) are
+/// derived from the draft's own persisted snapshots, so an attachment-bearing
+/// queue's advertised block agrees with the sweep's derivation rather than
+/// omitting those facts.
+pub(crate) fn human_queue_attribution_block(
+    draft: &envelope_email_store::Draft,
+    account_username: &str,
+) -> serde_json::Value {
+    use envelope_email_transport::attribution::resolve;
+    use envelope_email_transport::attribution_persist::{
+        PersistedDeclaration, scheduled_attribution_inputs, success_attribution_block,
+    };
+    let persisted = PersistedDeclaration::from_metadata(draft.metadata.as_ref());
+    let (declared, require) = scheduled_attribution_inputs(
+        draft.created_by.as_deref(),
+        draft.human_approved(),
+        persisted.as_ref(),
+        draft.revision,
+    );
+    let account_domain = account_domain_from_username(account_username);
+    let attachments = draft_attachment_stubs(draft);
+    let ctx = scheduled_send_context(draft, account_domain, &attachments);
+    let resolution = resolve(&declared, &ctx, require);
+    success_attribution_block(&resolution, None, None, true)
+}
+
+/// The account's lowercased mail domain from its username/email — the SAME
+/// derivation the scheduled-send sweep uses in [`run_governor_gate`], so a
+/// human-queued draft's advertised attribution resolves host facts identically
+/// to what the sweep will derive.
+pub(crate) fn account_domain_from_username(username: &str) -> Option<String> {
+    username
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+}
+
+/// Body-free attachment stubs (filename + content_type only) from a draft's
+/// persisted snapshots, for deriving the `has_attachment`/`sensitive_attachment`
+/// host facts without rehydrating the snapshotted bytes. Uses the same snapshot
+/// fields the sweep decodes, so the derived attribute set is identical.
+fn draft_attachment_stubs(
+    draft: &envelope_email_store::Draft,
+) -> Vec<envelope_email_transport::smtp::Attachment> {
+    draft
+        .attachments
+        .iter()
+        .map(|s| envelope_email_transport::smtp::Attachment {
+            filename: s
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("attachment")
+                .to_string(),
+            content_type: s
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            data: Vec::new(),
+        })
+        .collect()
+}
+
 /// Run the Governor gate for a due scheduled draft and record a sanitized audit
 /// event. Returns the outcome; the sweep must refuse SMTP unless allowed.
+///
+/// This is the authoritative actual-send gate for queued/scheduled mail. It
+/// re-derives fresh host facts from the persisted draft AND loads the durable
+/// declaration the bot validated at queue time (`declared` + `require_declaration`,
+/// computed by the caller from [`scheduled_attribution_inputs`]), then resolves
+/// `declared ∪ derived` through [`gate_with_attribution`] — which refuses an
+/// unattributed/invalid request BEFORE Governor is ever spawned. A bot-originated
+/// draft with no valid current declaration therefore fails closed here even when
+/// the derived set is rich; host facts never substitute for the bot's attribution.
 async fn run_governor_gate(
     state: &AppState,
     draft: &envelope_email_store::Draft,
     creds: &envelope_email_store::models::AccountWithCredentials,
     subject: &str,
     attachments: &[envelope_email_transport::smtp::Attachment],
+    declared: &[String],
+    require_declaration: bool,
 ) -> envelope_email_transport::outbound::GovernorOutcome {
-    use envelope_email_transport::outbound::{GovernorConfig, GovernorRequest, SendSurface, gate};
+    use envelope_email_transport::outbound::{
+        GovernorConfig, GovernorRequest, SendSurface, gate_with_attribution,
+    };
 
-    let account_domain = creds
-        .account
-        .username
-        .rsplit_once('@')
-        .map(|(_, d)| d.trim().to_ascii_lowercase())
-        .filter(|d| !d.is_empty());
+    let account_domain = account_domain_from_username(&creds.account.username);
 
     let attachment_sizes: Vec<(String, u64)> = attachments
         .iter()
@@ -1146,24 +1393,29 @@ async fn run_governor_gate(
         .collect();
 
     // Re-derive the FINAL attributed context from the persisted draft just
-    // before SMTP. This is the authoritative gate: recipients, attachments, and
-    // threading are read from what will actually be transmitted.
+    // before SMTP, and resolve it against the durable bot declaration. This is
+    // the authoritative gate: recipients, attachments, and threading are read
+    // from what will actually be transmitted.
     let ctx = scheduled_send_context(draft, account_domain, attachments);
-    let req = GovernorRequest::from_context(
+    let req = GovernorRequest::from_context_with_declared(
         &draft.account_id,
         subject,
         SendSurface::Scheduled,
         Some(&draft.id),
         &attachment_sizes,
         &ctx,
+        declared,
+        require_declaration,
     );
 
     let config = GovernorConfig::from_env();
-    let outcome = gate(&config, &req);
+    let outcome = gate_with_attribution(&config, &req);
 
     // Record a sanitized audit event (no bodies, no full addresses, no bytes).
     let event_type = if outcome.allowed {
         "send_governor.allowed"
+    } else if outcome.is_attribution_failure() {
+        "send_governor.attribution_refused"
     } else {
         "send_governor.blocked"
     };
@@ -1458,6 +1710,695 @@ mod tests {
         assert_eq!(references, vec!["root@example.net", "parent@example.net"]);
     }
 
+    /// Replicate the exact attribution composition `run_governor_gate` performs
+    /// (context + persisted-declaration inputs + attributed gate), pointed at a
+    /// nonexistent Governor binary in required mode so the outcome is decided
+    /// entirely by the pre-spawn attribution logic.
+    fn scheduled_gate_outcome(
+        draft: &envelope_email_store::Draft,
+    ) -> envelope_email_transport::outbound::GovernorOutcome {
+        scheduled_gate_outcome_mode(
+            draft,
+            envelope_email_transport::outbound::GovernorMode::Required,
+        )
+    }
+
+    fn scheduled_gate_outcome_mode(
+        draft: &envelope_email_store::Draft,
+        mode: envelope_email_transport::outbound::GovernorMode,
+    ) -> envelope_email_transport::outbound::GovernorOutcome {
+        use envelope_email_transport::attribution_persist::{
+            PersistedDeclaration, scheduled_attribution_inputs,
+        };
+        use envelope_email_transport::outbound::{
+            GovernorConfig, GovernorRequest, SendSurface, gate_with_attribution,
+        };
+        let persisted = PersistedDeclaration::from_metadata(draft.metadata.as_ref());
+        let (declared, require) = scheduled_attribution_inputs(
+            draft.created_by.as_deref(),
+            draft.human_approved(),
+            persisted.as_ref(),
+            draft.revision,
+        );
+        let ctx = scheduled_send_context(draft, Some("example.com".to_string()), &[]);
+        let req = GovernorRequest::from_context_with_declared(
+            &draft.account_id,
+            draft.subject.as_deref().unwrap_or(""),
+            SendSurface::Scheduled,
+            Some(&draft.id),
+            &[],
+            &ctx,
+            &declared,
+            require,
+        );
+        let config = GovernorConfig {
+            mode,
+            bin: "/nonexistent/governor-binary-xyz".to_string(),
+        };
+        gate_with_attribution(&config, &req)
+    }
+
+    fn sweep_test_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn scheduled_bot_draft_without_declaration_fails_closed_not_governor_unavailable() {
+        // A bot-originated queued draft (created_by=agent) with NO persisted
+        // declaration but a rich external context must be refused with
+        // attributes_required BEFORE Governor is spawned — a nonexistent binary
+        // would otherwise yield governor_unavailable. Host facts never substitute.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("Quarterly numbers"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(!fetched.human_approved());
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(!outcome.allowed);
+        assert!(
+            outcome.is_attribution_failure(),
+            "bot draft with no declaration must fail attribution, not spawn Governor"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_ne!(outcome.decision, "unavailable");
+    }
+
+    #[test]
+    fn scheduled_bot_draft_with_valid_declaration_reaches_governor() {
+        // With a valid current bot declaration the sweep resolves attributed and
+        // actually spawns Governor — a missing binary is governor_unavailable,
+        // which is an operator failure, NOT an attribution failure.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.set_draft_attribution(
+            &draft.id,
+            &envelope_email_transport::attribution_persist::PersistedDeclaration::new_bot(
+                &["financial_content".to_string()],
+                0,
+            )
+            .to_value(),
+        )
+        .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(!outcome.allowed);
+        assert!(
+            !outcome.is_attribution_failure(),
+            "a validly-declared draft reaches Governor; the failure is operator-side"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+    }
+
+    #[test]
+    fn scheduled_bot_draft_human_approved_without_declaration_fails_closed() {
+        // THE mandatory-declaration invariant: a bot-originated draft
+        // (created_by=agent) that a human later approved in the dashboard still
+        // requires the bot's factual declaration. Human approval SUPPLEMENTS
+        // (adds tyler_approved) — it never erases the bot's attribution
+        // responsibility. With no persisted bot declaration, the sweep must fail
+        // closed with attributes_required BEFORE Governor is spawned; host facts
+        // and the human attestation never substitute for the missing declaration.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-08T09:00:00Z")
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(fetched.human_approved(), "the human attestation is present");
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(!outcome.allowed);
+        assert!(
+            outcome.is_attribution_failure(),
+            "a bot draft with no declaration fails closed even after human approval"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_ne!(
+            outcome.decision, "unavailable",
+            "Governor must never be spawned for an unattributed bot draft"
+        );
+    }
+
+    #[test]
+    fn scheduled_bot_draft_human_approved_with_declaration_carries_both_sets() {
+        // Bot origin + human approval + a valid bot declaration: the send is
+        // attributed and reaches Governor, and the resolved set carries BOTH the
+        // bot's declared fact AND the host-attested tyler_approved. Approval
+        // supplements the declaration; it does not replace it.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.set_draft_attribution(
+            &draft.id,
+            &envelope_email_transport::attribution_persist::PersistedDeclaration::new_bot(
+                &["financial_content".to_string()],
+                0,
+            )
+            .to_value(),
+        )
+        .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-08T09:00:00Z")
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(fetched.human_approved());
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(
+            !outcome.is_attribution_failure(),
+            "a validly-declared bot draft reaches Governor"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+        let resolution = outcome.resolution.expect("attributed resolution present");
+        assert!(
+            resolution
+                .declared_attrs
+                .contains(&"financial_content".to_string()),
+            "the bot declaration is preserved"
+        );
+        assert!(
+            resolution
+                .governor_attrs
+                .iter()
+                .any(|a| a == "tyler_approved"),
+            "human approval adds tyler_approved on top of the declaration"
+        );
+        assert!(
+            resolution
+                .governor_attrs
+                .contains(&"financial_content".to_string()),
+            "the declared fact reaches Governor alongside the attestation"
+        );
+    }
+
+    #[test]
+    fn scheduled_warn_mode_bot_draft_without_declaration_still_fails_closed() {
+        // Warn mode does NOT waive the attribution precondition at the sweep: a
+        // bot draft with no declaration is refused with attributes_required and
+        // Governor is never spawned, exactly as in required mode. Warn only
+        // softens a Governor VERDICT on an already-attributed send.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let outcome = scheduled_gate_outcome_mode(
+            &fetched,
+            envelope_email_transport::outbound::GovernorMode::Warn,
+        );
+        assert!(!outcome.allowed, "warn must fail closed at the sweep too");
+        assert!(outcome.is_attribution_failure());
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_ne!(outcome.decision, "unavailable");
+    }
+
+    #[test]
+    fn scheduled_warn_mode_bot_draft_with_invalid_declaration_fails_closed() {
+        // A stale/invalid declaration in warn mode is still refused — never
+        // allowed through as an unattributed send.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // Persist a declaration keyed to a WRONG (stale) revision so it is dropped.
+        db.set_draft_attribution(
+            &draft.id,
+            &envelope_email_transport::attribution_persist::PersistedDeclaration::new_bot(
+                &["financial_content".to_string()],
+                999,
+            )
+            .to_value(),
+        )
+        .unwrap();
+        // set_draft_attribution re-stamps the revision from the row, so force a
+        // genuine mismatch by bumping the row revision via a material body edit.
+        db.update_draft_content(&draft.id, None, None, None, None, Some("edited body"), None)
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            fetched.metadata.is_some(),
+            "the stale attribution block is still present but keyed to the old revision"
+        );
+
+        let outcome = scheduled_gate_outcome_mode(
+            &fetched,
+            envelope_email_transport::outbound::GovernorMode::Warn,
+        );
+        assert!(!outcome.allowed);
+        assert!(outcome.is_attribution_failure());
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+    }
+
+    #[test]
+    fn scheduled_unknown_legacy_draft_fails_closed() {
+        // A legacy/unknown-provenance scheduled draft (no created_by marker, no
+        // persisted declaration, no human attestation) must be treated as
+        // bot-originated and fail closed — never silently treated as human.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                None, // unknown provenance
+            )
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(!fetched.human_approved());
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(!outcome.allowed);
+        assert!(outcome.is_attribution_failure());
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+    }
+
+    #[test]
+    fn scheduled_human_attested_draft_does_not_require_a_bot_declaration() {
+        // A revision-bound human attestation lifts the bot-declaration rule: the
+        // sweep resolves attributed (tyler_approved derived) with no bot
+        // declaration, and reaches Governor (unavailable here, never an
+        // attribution failure). No bot declaration is fabricated.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-08T09:00:00Z")
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(fetched.human_approved());
+
+        let outcome = scheduled_gate_outcome(&fetched);
+        assert!(!outcome.is_attribution_failure());
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+        // The resolved set carried tyler_approved but never a fabricated bot decl.
+        let resolution = outcome.resolution.expect("attributed resolution present");
+        assert!(
+            resolution
+                .governor_attrs
+                .iter()
+                .any(|a| a == "tyler_approved")
+        );
+        assert!(
+            resolution.declared_attrs.is_empty(),
+            "no bot declaration fabricated"
+        );
+    }
+
+    #[test]
+    fn bot_draft_bounded_retry_then_parks_without_storm() {
+        // End-to-end proof of the bounded attribution correction loop, driving the
+        // exact sweep transitions against the real store: a bot draft that never
+        // carries a valid declaration is retried at attempts 1 and 2, parked at
+        // attempt 3 (pending_review, scheduling disabled, park_reason recorded),
+        // and never selected as due again.
+        use envelope_email_transport::attribution_persist::{
+            AttributionFailureAction, PARK_REASON_ATTRIBUTION_EXHAUSTED,
+            attribution_failure_action, scheduled_attribution_inputs, scheduled_origin,
+        };
+
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+
+        for expected in 1..=3u32 {
+            // The draft must be due and claimable at the start of each sweep.
+            let due = db.list_drafts_due_for_send().unwrap();
+            assert_eq!(due.len(), 1, "attempt {expected}: draft should be due");
+            let scanned = &due[0];
+            let lease = db
+                .claim_draft_for_sending(&scanned.id, scanned.revision)
+                .unwrap()
+                .expect("claim");
+            let claimed = db.get_draft(&scanned.id).unwrap().unwrap();
+
+            // The gate fails closed (attributes_required) — Governor never spawns.
+            let outcome = scheduled_gate_outcome(&claimed);
+            assert!(outcome.is_attribution_failure());
+
+            // Drive the exact decision the sweep now makes, from durable origin.
+            let persisted =
+                envelope_email_transport::attribution_persist::PersistedDeclaration::from_metadata(
+                    claimed.metadata.as_ref(),
+                );
+            let (declared, _require) = scheduled_attribution_inputs(
+                claimed.created_by.as_deref(),
+                claimed.human_approved(),
+                persisted.as_ref(),
+                claimed.revision,
+            );
+            let prior = persisted
+                .as_ref()
+                .filter(|d| d.is_current(claimed.revision))
+                .map(|d| d.attempts)
+                .unwrap_or(0);
+            let origin = scheduled_origin(
+                claimed.created_by.as_deref(),
+                persisted.as_ref(),
+                claimed.revision,
+            );
+            let action = attribution_failure_action(origin, &declared, claimed.revision, prior);
+            match action {
+                AttributionFailureAction::Park { value } => {
+                    assert_eq!(expected, 3, "bot draft parks at attempt 3");
+                    assert!(
+                        db.park_attribution_exhausted(&claimed.id, &lease, &value)
+                            .unwrap()
+                    );
+                }
+                AttributionFailureAction::Retry { value } => {
+                    assert!(expected < 3);
+                    assert_eq!(value["origin"], "bot", "bot origin preserved");
+                    assert!(
+                        db.defer_attribution_retry(&claimed.id, &lease, &value)
+                            .unwrap()
+                    );
+                }
+                AttributionFailureAction::HumanReview => {
+                    panic!("bot draft must not take the human path")
+                }
+            }
+        }
+
+        // Attempt 3 parked it: pending_review, no scheduling, honest park_reason,
+        // and never due again — no retry storm.
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            parked.status,
+            envelope_email_store::DraftStatus::PendingReview
+        );
+        assert_eq!(parked.send_after, None);
+        let parked_attr = parked.metadata.unwrap()["attribution"].clone();
+        assert_eq!(
+            parked_attr["park_reason"],
+            PARK_REASON_ATTRIBUTION_EXHAUSTED
+        );
+        assert_eq!(parked_attr["origin"], "bot");
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn human_queue_attribution_block_reflects_attestation_without_fabricating_bot() {
+        // Block 7: a human-queued dashboard draft's additive success block carries
+        // the durable human attestation (tyler_approved derived) with NO fabricated
+        // bot declaration, and defers the Governor decision to the sweep.
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-08T09:00:00Z")
+            .unwrap();
+        let attested = db.get_draft(&draft.id).unwrap().unwrap();
+
+        // The account domain is derived from the username, exactly as the sweep
+        // does (`agent@example.com` → `example.com`).
+        let block = human_queue_attribution_block(&attested, "agent@example.com");
+        assert_eq!(block["attribution_state"], "attributed");
+        assert!(
+            block["declared_attrs"].as_array().unwrap().is_empty(),
+            "no fabricated bot declaration"
+        );
+        assert!(
+            block["derived_attrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "tyler_approved"),
+            "the durable human attestation is derived: {block}"
+        );
+        assert_eq!(block["governor"], serde_json::Value::Null);
+        assert!(block.get("governor_decision_pending").is_some());
+        let text = block.to_string();
+        for banned in ["\"score\"", "weight", "threshold"] {
+            assert!(!text.contains(banned), "block leaked {banned}");
+        }
+    }
+
+    /// An attachment-bearing human-queued draft must advertise the real
+    /// attachment host facts (`has_attachment`, and `sensitive_attachment` for a
+    /// sensitive filename) — derived from the draft's own snapshots — so the
+    /// advertised block agrees with what the sweep will derive, instead of
+    /// omitting them by resolving against an empty attachment list.
+    #[test]
+    fn human_queue_attribution_block_reflects_real_attachment_facts() {
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Invoice"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        // A sensitive attachment snapshot (filename/content_type only — bytes are
+        // irrelevant to the derived facts).
+        db.update_draft_attachments(
+            &draft.id,
+            &[serde_json::json!({
+                "filename": "statement.pdf",
+                "content_type": "application/pdf",
+                "size": 3,
+                "data_base64": "AAAA",
+            })],
+        )
+        .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-08T09:00:00Z")
+            .unwrap();
+        let attested = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let block = human_queue_attribution_block(&attested, "agent@example.com");
+        let derived: Vec<&str> = block["derived_attrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(
+            derived.contains(&"has_attachment"),
+            "attachment fact must be derived from the snapshot, not omitted: {block}"
+        );
+        assert!(
+            derived.contains(&"sensitive_attachment"),
+            "a sensitive attachment must be classified from the snapshot: {block}"
+        );
+    }
+
+    #[test]
+    fn human_origin_attribution_failure_parks_for_reapproval_without_bot_fabrication() {
+        // A genuinely human-originated draft (created_by=human:*) whose approval is
+        // stale/missing fails the attribution precondition at the sweep. It must be
+        // parked for honest human re-approval WITHOUT fabricating a bot
+        // declaration — its human origin survives so a fresh attestation recovers it.
+        use envelope_email_transport::attribution_persist::{
+            AttributionFailureAction, DeclarationOrigin, PersistedDeclaration, ScheduledOrigin,
+            attribution_failure_action, scheduled_attribution_inputs, scheduled_origin,
+        };
+
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+
+        let due = db.list_drafts_due_for_send().unwrap();
+        let scanned = &due[0];
+        let lease = db
+            .claim_draft_for_sending(&scanned.id, scanned.revision)
+            .unwrap()
+            .expect("claim");
+        let claimed = db.get_draft(&scanned.id).unwrap().unwrap();
+        assert!(!claimed.human_approved(), "no current attestation");
+
+        let outcome = scheduled_gate_outcome(&claimed);
+        assert!(outcome.is_attribution_failure());
+
+        let persisted = PersistedDeclaration::from_metadata(claimed.metadata.as_ref());
+        let (declared, require) = scheduled_attribution_inputs(
+            claimed.created_by.as_deref(),
+            claimed.human_approved(),
+            persisted.as_ref(),
+            claimed.revision,
+        );
+        assert!(
+            require,
+            "a stale human approval still requires re-attestation"
+        );
+        let origin = scheduled_origin(
+            claimed.created_by.as_deref(),
+            persisted.as_ref(),
+            claimed.revision,
+        );
+        assert_eq!(origin, ScheduledOrigin::Human);
+        let action = attribution_failure_action(origin, &declared, claimed.revision, 0);
+        assert_eq!(action, AttributionFailureAction::HumanReview);
+
+        // The sweep's HumanReview transition: release to pending_review only.
+        assert!(
+            db.release_sending_draft(
+                &claimed.id,
+                &lease,
+                envelope_email_store::DraftStatus::PendingReview
+            )
+            .unwrap()
+        );
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            parked.status,
+            envelope_email_store::DraftStatus::PendingReview
+        );
+        // NO fabricated bot declaration was written.
+        let after = PersistedDeclaration::from_metadata(parked.metadata.as_ref());
+        assert!(
+            after.as_ref().map(|d| d.origin) != Some(DeclarationOrigin::Bot),
+            "human draft must never be rewritten as bot-originated"
+        );
+        // Recoverable: still human-originated for a fresh attestation, and not due.
+        assert_eq!(
+            scheduled_origin(
+                parked.created_by.as_deref(),
+                after.as_ref(),
+                parked.revision
+            ),
+            ScheduledOrigin::Human
+        );
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
     fn governor_outcome(
         decision: &str,
         block_code: Option<&str>,
@@ -1467,10 +2408,16 @@ mod tests {
             mode: envelope_email_transport::outbound::GovernorMode::Required,
             decision: decision.to_string(),
             state: None,
-            score: None,
             review_ticket_id: None,
             block_code: block_code.map(str::to_string),
             block_reason: Some("blocked".to_string()),
+            route: None,
+            resolution: None,
+            suggestions: Vec::new(),
+            surface: None,
+            action_echo: None,
+            parked: false,
+            parked_draft_id: None,
         }
     }
 
@@ -1999,6 +2946,93 @@ mod tests {
                 .any(|candidate| candidate.id == draft.id),
             "an inconclusive SMTP attempt must not remain visible as due"
         );
+    }
+
+    #[test]
+    fn transition_outcome_never_claims_an_unpersisted_transition() {
+        // Persisted → the intended label; failed persistence → the truthful
+        // inert diagnostic, never a false blocked/deferred.
+        assert_eq!(transition_outcome(true, "blocked"), "blocked");
+        assert_eq!(transition_outcome(true, "deferred"), "deferred");
+        assert_eq!(transition_outcome(false, "blocked"), "transition_failed");
+        assert_eq!(transition_outcome(false, "deferred"), "transition_failed");
+    }
+
+    /// Owner-token mismatch (a concurrent transition stole/changed the lease):
+    /// every claim-transition helper the sweep uses must return `false`, the
+    /// published outcome must be the truthful `transition_failed` (never a false
+    /// `blocked`/`deferred`/`parked`), and the row must stay inert as `sending`
+    /// — still due, never marked sent, so no send happens on this pass.
+    #[test]
+    fn owner_token_mismatch_publishes_transition_failed_and_sends_nothing() {
+        use envelope_email_store::DraftStatus;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, \
+                 imap_host, imap_port, encrypted_password) \
+                 VALUES ('acc1', 'Agent', 'agent@example.com', 'example.com', \
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Queued"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let _real_lease = db
+            .claim_draft_for_sending(&draft.id, draft.revision)
+            .unwrap()
+            .expect("due draft is claimed before SMTP");
+
+        // A different (stale/stolen) lease: every transition helper refuses.
+        let wrong = "not-the-owner-lease";
+        let attr = serde_json::json!({ "declared_attrs": [], "attempts": 3 });
+        assert!(
+            !db.defer_attribution_retry(&draft.id, wrong, &attr).unwrap(),
+            "defer under a non-owner lease must not persist"
+        );
+        assert!(
+            !db.park_attribution_exhausted(&draft.id, wrong, &attr)
+                .unwrap(),
+            "park under a non-owner lease must not persist"
+        );
+        assert!(
+            !db.release_sending_draft(&draft.id, wrong, DraftStatus::PendingReview)
+                .unwrap(),
+            "release under a non-owner lease must not persist"
+        );
+
+        // Therefore the sweep publishes the truthful outcome, never a false one.
+        assert_eq!(transition_outcome(false, "blocked"), "transition_failed");
+        assert_eq!(transition_outcome(false, "deferred"), "transition_failed");
+
+        // The row is untouched: still claimed as `sending`, still scheduled,
+        // never marked sent — so this pass transmitted nothing and parked nothing.
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            DraftStatus::Sending,
+            "an owner-mismatch leaves the claim inert, not blocked/parked"
+        );
+        assert_eq!(
+            after.send_after.as_deref(),
+            Some("2000-01-01T00:00:00Z"),
+            "no schedule change on a failed transition"
+        );
+        assert!(after.sent_at.is_none(), "nothing was sent");
     }
 
     /// When even the anti-duplicate park fails, the outcome must say so —

@@ -168,6 +168,17 @@ impl DraftStatus {
     pub fn is_editable(&self) -> bool {
         matches!(self, Self::Draft | Self::PendingReview | Self::Blocked)
     }
+
+    /// Whether a row in this status may be (re-)queued for send by the atomic
+    /// queue CAS. Only `draft` and the deliberately supported `pending_review`
+    /// recovery path are queueable. `blocked` is intentionally excluded even
+    /// though it is [`Self::is_editable`]: a Governor-denied row must never be
+    /// resurrected into a due `draft` by a re-queue — deny "must not be retried
+    /// unchanged". A blocked draft first needs a material edit (which clears the
+    /// block via the human review surfaces), not a silent re-schedule.
+    pub fn is_queueable(&self) -> bool {
+        matches!(self, Self::Draft | Self::PendingReview)
+    }
 }
 
 impl std::str::FromStr for DraftStatus {

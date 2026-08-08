@@ -329,7 +329,7 @@ fn contract_export_declares_agent_identity_block() {
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
 
     // Stays v1 (additive).
-    assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+    assert_eq!(contract["schema"], "envelope.agent_contract.v2");
 
     let block = &contract["agent_identity"];
     assert_eq!(block["env"], "ENVELOPE_AGENT_TOKEN");

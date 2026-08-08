@@ -13,10 +13,11 @@ use crate::commands::attachments::{
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
 use crate::commands::drafts::sent_mail_proof_json;
 use crate::commands::governor_gate::{
-    account_domain, gate_and_record_with_agent, governor_request,
+    account_domain, gate_and_record_with_agent, governor_request, precheck_attribution,
 };
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
+use envelope_email_transport::attribution_persist::success_attribution_block;
 use envelope_email_transport::outbound::{
     IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
     SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
@@ -160,9 +161,18 @@ fn tool_folder<'a>(tool_name: &str, params: &'a Value) -> Option<&'a str> {
         | "get_draft"
         | "modify_draft"
         | "create_forward_draft"
+        | "governor_catalog"
         | "send" => None,
         _ => params.get("folder").and_then(|v| v.as_str()),
     }
+}
+
+/// Read-only discovery tools that are ALWAYS authorized, even under a
+/// deny-by-default agent policy, so a restricted agent can still learn how to
+/// comply. This allowlist exposes public names/descriptions only (no weights, no
+/// mailbox access) and never widens any other policy action.
+fn is_always_allowed_readonly(tool_name: &str) -> bool {
+    matches!(tool_name, "governor_catalog")
 }
 
 /// Resolve the account string a policy check should be evaluated against. Uses
@@ -188,6 +198,11 @@ fn authorize_tool_call(
     tool_name: &str,
     params: &Value,
 ) -> Result<(), String> {
+    // Read-only discovery tools are always authorized so a deny-by-default agent
+    // can still discover how to comply.
+    if is_always_allowed_readonly(tool_name) {
+        return Ok(());
+    }
     let Some(ctx) = ctx else {
         return Ok(());
     };
@@ -231,6 +246,7 @@ async fn handle_tool_call(
         "modify_draft" => handle_modify_draft(params, backend).await,
         "get_draft" => handle_get_draft(params, backend).await,
         "send_draft" => handle_send_draft(params, backend, ctx).await,
+        "governor_catalog" => handle_governor_catalog(params).await,
         "move_message" => handle_move(params, backend, ctx).await,
         "flag" => handle_flag(params, backend, ctx).await,
         "folders" => handle_folders(params, backend).await,
@@ -244,6 +260,29 @@ async fn handle_tool_call(
         "snooze" => handle_snooze(params, backend, ctx).await,
         _ => Err(format!("unknown tool: {tool_name}")),
     }
+}
+
+/// Read-only Governor catalog discovery: the vendored, weight-free Envelope
+/// projection (key/description/category/provenance + declaration guidance). No
+/// mailbox access, no Governor spawn, no weights or scores — works even when the
+/// Governor binary is absent.
+async fn handle_governor_catalog(params: &Value) -> Result<Value, String> {
+    if let Some(cat) = params.get("catalog").and_then(|v| v.as_str())
+        && cat != envelope_email_transport::governor_catalog::CATALOG_NAME
+    {
+        return Err(json!({
+            "status": "invalid",
+            "error": {
+                "code": "unknown_catalog",
+                "reason": format!(
+                    "no vendored projection for catalog `{cat}`; only `{}` is available",
+                    envelope_email_transport::governor_catalog::CATALOG_NAME
+                )
+            }
+        })
+        .to_string());
+    }
+    Ok(envelope_email_transport::governor_catalog::envelope_projection())
 }
 
 async fn handle_accounts(_backend: CredentialBackend) -> Result<Value, String> {
@@ -407,6 +446,14 @@ async fn handle_send(
         .get("confirm_send_now")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Factual Governor attribution the bot declares for this message. v2 makes a
+    // non-empty declaration mandatory at the handler boundary — before any policy
+    // downgrade — so a missing declaration returns structured attributes_required
+    // even when the outcome would be draft-only.
+    let declared = optional_string_array(params, &["attributes"])?;
+    if attributes_missing(&declared) {
+        return Err(missing_attributes_error(SendSurface::Mcp));
+    }
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -472,6 +519,34 @@ async fn handle_send(
 
     let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
 
+    // ── Attribution precheck (before ANY side effect: no draft, no SMTP, no
+    // Governor spawn on an unattributed/invalid request) ──
+    let precheck_req = governor_request(
+        &creds.account.id,
+        account_domain(&creds.account.username),
+        subject,
+        to,
+        cc,
+        bcc,
+        SendSurface::Mcp,
+        None,
+        &attachments_meta(&attachment_snapshots),
+        false,
+        &declared,
+    );
+    if let Some(outcome) = precheck_attribution(
+        &db,
+        &creds.account.id,
+        &precheck_req,
+        agent_context::agent_id_of(ctx),
+    ) {
+        return Err(outcome.response_json().to_string());
+    }
+    let queued_attribution = precheck_req
+        .resolution
+        .as_ref()
+        .map(|r| success_attribution_block(r, None, None, true));
+
     // ── Default actual-send cooldown (outbox queueing) ──
     // An allowed MCP send queues by default. Real SMTP only happens later via
     // the scheduled-send sweep, after the Governor gate permits it. Immediate
@@ -511,8 +586,18 @@ async fn handle_send(
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            db.update_draft_send_after(&draft.id, &send_at)
-                .map_err(|e| e.to_string())?;
+            // Bind the validated declaration, the schedule, and the due status in
+            // ONE atomic CAS at the draft's current revision (attachments bumped
+            // it). No partial schedule; no stale declaration on a later edit.
+            let revision = db
+                .get_draft(&draft.id)
+                .map_err(|e| e.to_string())?
+                .map(|d| d.revision)
+                .ok_or_else(|| format!("draft not found: {}", draft.id))?;
+            crate::commands::drafts::queue_bot_draft_for_send(
+                &db, &draft.id, revision, &send_at, &declared,
+            )
+            .map_err(|e| e.to_string())?;
             return Ok(json!({
                 "sent": false,
                 "status": "queued",
@@ -523,6 +608,7 @@ async fn handle_send(
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
                 "attachments": attachment_summaries(&attachment_snapshots),
+                "attribution": queued_attribution,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
@@ -543,6 +629,7 @@ async fn handle_send(
         None,
         &attachments,
         false,
+        &declared,
     );
     let gov_outcome = gate_and_record_with_agent(
         &db,
@@ -551,11 +638,7 @@ async fn handle_send(
         agent_context::agent_id_of(ctx),
     );
     if !gov_outcome.allowed {
-        return Err(json!({
-            "status": "blocked",
-            "error": gov_outcome.denial_json(),
-        })
-        .to_string());
+        return Err(gov_outcome.response_json().to_string());
     }
 
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
@@ -624,6 +707,7 @@ async fn handle_send(
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
         "provider_sent_copy": provider_sent_copy,
         "client_appended_copy": client_appended_copy,
+        "attribution": gov_outcome.success_attribution(),
         "attachments": attachment_summaries(&attachment_snapshots),
         "ui": sent_ui,
     }))
@@ -678,6 +762,28 @@ fn optional_str<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
     params.get(name).and_then(|v| v.as_str())
 }
 
+/// Lightweight attachment metadata (filename + content type, no bytes) from
+/// attachment snapshots, for the attribution precheck. Attribution needs only
+/// the count and filename classification, not the payload.
+fn attachments_meta(snapshots: &[Value]) -> Vec<envelope_email_transport::smtp::Attachment> {
+    snapshots
+        .iter()
+        .map(|s| envelope_email_transport::smtp::Attachment {
+            filename: s
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("attachment")
+                .to_string(),
+            content_type: s
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            data: Vec::new(),
+        })
+        .collect()
+}
+
 fn optional_string_array(params: &Value, names: &[&str]) -> Result<Vec<String>, String> {
     for name in names {
         if let Some(value) = params.get(*name) {
@@ -695,6 +801,38 @@ fn optional_string_array(params: &Value, names: &[&str]) -> Result<Vec<String>, 
         }
     }
     Ok(Vec::new())
+}
+
+/// Whether the parsed `attributes` declaration is empty (missing, `[]`, or all
+/// blank tokens). v2 requires a non-empty factual declaration for every
+/// actual-send tool.
+fn attributes_missing(declared: &[String]) -> bool {
+    declared.iter().all(|s| s.trim().is_empty())
+}
+
+/// The canonical `attributes_required` refusal for a send/reply/send_draft tool
+/// invoked with no (or empty) `attributes`. v2 makes a non-empty factual
+/// declaration mandatory at the handler boundary — enforced BEFORE any policy
+/// downgrade, so even a draft-only outcome returns this structured recovery
+/// instead of silently creating a draft or emitting generic schema noise.
+///
+/// An empty declaration against an empty context resolves to Unattributed;
+/// building the outcome through `gate_with_attribution` never spawns Governor.
+fn missing_attributes_error(surface: SendSurface) -> String {
+    use envelope_email_transport::attribution::AttributedSendContext;
+    use envelope_email_transport::outbound::{
+        GovernorConfig, GovernorMode, GovernorRequest, gate_with_attribution,
+    };
+    let ctx = AttributedSendContext::default();
+    let req =
+        GovernorRequest::from_context_with_declared("", "", surface, None, &[], &ctx, &[], true);
+    let cfg = GovernorConfig {
+        mode: GovernorMode::Required,
+        bin: String::new(),
+    };
+    gate_with_attribution(&cfg, &req)
+        .response_json()
+        .to_string()
 }
 
 fn required_uid(params: &Value) -> Result<u32, String> {
@@ -761,6 +899,12 @@ async fn handle_reply(
         .get("confirm_send_now")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Factual Governor attribution the bot declares for this reply. v2 requires a
+    // non-empty declaration at the handler boundary (before any downgrade).
+    let declared = optional_string_array(params, &["attributes"])?;
+    if attributes_missing(&declared) {
+        return Err(missing_attributes_error(SendSurface::Mcp));
+    }
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -857,6 +1001,33 @@ async fn handle_reply(
 
     let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
 
+    // ── Attribution precheck (before ANY side effect) ──
+    let precheck_req = governor_request(
+        &creds.account.id,
+        account_domain(&creds.account.username),
+        &headers.subject,
+        &headers.to,
+        cc_str.as_deref(),
+        None,
+        SendSurface::Mcp,
+        None,
+        &attachments_meta(&attachment_snapshots),
+        true,
+        &declared,
+    );
+    if let Some(outcome) = precheck_attribution(
+        &db,
+        &creds.account.id,
+        &precheck_req,
+        agent_context::agent_id_of(ctx),
+    ) {
+        return Err(outcome.response_json().to_string());
+    }
+    let queued_attribution = precheck_req
+        .resolution
+        .as_ref()
+        .map(|r| success_attribution_block(r, None, None, true));
+
     // ── Default actual-send cooldown (outbox queueing) ──
     // An allowed MCP reply queues by default; real SMTP happens later via the
     // scheduled-send sweep, after the Governor gate permits it. Immediate
@@ -906,8 +1077,19 @@ async fn handle_reply(
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            db.update_draft_send_after(&draft.id, &send_at)
-                .map_err(|e| e.to_string())?;
+            // Bind the validated declaration, the schedule, and the due status in
+            // ONE atomic CAS at the draft's final revision (set_draft_metadata /
+            // update_draft_attachments bumped it), merging alongside the reply
+            // threading metadata. No partial schedule; no stale declaration.
+            let revision = db
+                .get_draft(&draft.id)
+                .map_err(|e| e.to_string())?
+                .map(|d| d.revision)
+                .ok_or_else(|| format!("draft not found: {}", draft.id))?;
+            crate::commands::drafts::queue_bot_draft_for_send(
+                &db, &draft.id, revision, &send_at, &declared,
+            )
+            .map_err(|e| e.to_string())?;
             return Ok(json!({
                 "sent": false,
                 "status": "queued",
@@ -919,6 +1101,7 @@ async fn handle_reply(
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
                 "in_reply_to": headers.in_reply_to,
                 "attachments": attachment_summaries(&attachment_snapshots),
+                "attribution": queued_attribution,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
@@ -939,6 +1122,7 @@ async fn handle_reply(
         None,
         &attachments,
         true,
+        &declared,
     );
     let gov_outcome = gate_and_record_with_agent(
         &db,
@@ -947,11 +1131,7 @@ async fn handle_reply(
         agent_context::agent_id_of(ctx),
     );
     if !gov_outcome.allowed {
-        return Err(json!({
-            "status": "blocked",
-            "error": gov_outcome.denial_json(),
-        })
-        .to_string());
+        return Err(gov_outcome.response_json().to_string());
     }
 
     let message_id = envelope_email_transport::smtp::SmtpSender::send(
@@ -1018,6 +1198,7 @@ async fn handle_reply(
         "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
         "provider_sent_copy": provider_sent_copy,
         "client_appended_copy": client_appended_copy,
+        "attribution": gov_outcome.success_attribution(),
         "attachments": attachment_summaries(&attachment_snapshots),
         "in_reply_to": headers.in_reply_to,
         "ui": sent_ui,
@@ -1155,6 +1336,13 @@ async fn handle_send_draft(
 ) -> Result<Value, String> {
     let id = required_str(params, "draft_id")?;
     let account_arg = optional_str(params, "account");
+    // Factual Governor attribution the bot declares for this draft send. v2
+    // requires a non-empty declaration at the handler boundary, before the
+    // confirm/ceiling checks, so even a draft-only ceiling outcome requires it.
+    let declared = optional_string_array(params, &["attributes"])?;
+    if attributes_missing(&declared) {
+        return Err(missing_attributes_error(SendSurface::Mcp));
+    }
     let confirm_send = params
         .get("confirm_send")
         .and_then(|v| v.as_bool())
@@ -1207,15 +1395,35 @@ async fn handle_send_draft(
             agent_context::agent_id_of(ctx),
         );
         if matches!(decision, SendPolicyDecision::DraftOnly) {
-            return Ok(json!({
-                "sent": false,
-                "status": "drafted",
-                "send_mode": send_mode,
-                "draft_id": draft.id,
-                "ui": ui::draft_ui(&draft.account_id, &draft.id),
-            }));
+            return Ok(crate::commands::contract::send_body::mcp_drafted(
+                json!(send_mode),
+                &draft.id,
+                ui::draft_ui(&draft.account_id, &draft.id),
+            ));
         }
     }
+
+    // ── Attribution precheck (before ANY side effect: no queueing, no SMTP,
+    // no Governor spawn on an unattributed/invalid request) ──
+    //
+    // Capture the EXACT validated revision + resolution so the queue CAS binds
+    // to the revision the declaration was validated against — never a reloaded,
+    // possibly concurrently-edited newer revision.
+    let precheck = {
+        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let precheck = crate::commands::drafts::precheck_draft(
+            &db,
+            id,
+            SendSurface::Mcp,
+            &declared,
+            agent_context::agent_id_of(ctx),
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(outcome) = &precheck.refusal {
+            return Err(outcome.response_json().to_string());
+        }
+        precheck
+    };
 
     let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
     let send_now = params
@@ -1248,23 +1456,33 @@ async fn handle_send_draft(
             cooldown_seconds: cd,
         } => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
-            let draft = db
-                .get_draft(id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("draft not found: {id}"))?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            db.update_draft_send_after(&draft.id, &send_at)
-                .map_err(|e| e.to_string())?;
-            return Ok(json!({
-                "sent": false,
-                "status": "scheduled",
-                "draft_id": draft.id,
-                "send_after": send_at,
-                "cooldown_seconds": cd,
-                "ui": ui::draft_ui(&draft.account_id, &draft.id),
-            }));
+            // One atomic CAS bound to the EXACT revision the declaration was
+            // validated against at precheck (never a reloaded revision): a
+            // concurrent material edit conflicts rather than binding a stale
+            // declaration to newer content or leaving a partial schedule.
+            crate::commands::drafts::queue_bot_draft_for_send(
+                &db,
+                id,
+                precheck.revision,
+                &send_at,
+                &declared,
+            )
+            .map_err(|e| e.to_string())?;
+            // The additive success block is built from the SAME validated
+            // resolution — no re-resolve that could observe edited content.
+            let queued_attribution =
+                success_attribution_block(&precheck.resolution, None, None, true);
+            return Ok(crate::commands::contract::send_body::draft_scheduled(
+                true,
+                id,
+                &send_at,
+                cd,
+                queued_attribution,
+                ui::draft_ui(&precheck.account_id, id),
+            ));
         }
         SendDisposition::Immediate => {}
     }
@@ -1273,9 +1491,15 @@ async fn handle_send_draft(
     // the Governor gate internally before any SMTP, returns structured JSON
     // (safe over the MCP stdio transport), and marks the local draft row sent so
     // a successful send can never leave the local DB at status=draft.
-    let outcome = crate::commands::drafts::send_existing_draft(id, account_arg, backend)
-        .await
-        .map_err(|e| e.to_string())?;
+    let outcome = crate::commands::drafts::send_existing_draft(
+        id,
+        account_arg,
+        backend,
+        SendSurface::Mcp,
+        &declared,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(outcome.json)
 }
 
@@ -2356,10 +2580,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_draft_denies_without_confirm_send() {
-        // The MCP send_draft surface must default to draft-safe: without an
-        // explicit confirm_send it returns a stable denial and never touches
-        // SMTP/IMAP. This returns before any DB or network access.
-        let params = serde_json::json!({ "draft_id": "abc-123" });
+        // The MCP send_draft surface must default to draft-safe: with a valid
+        // declaration but without an explicit confirm_send it returns a stable
+        // denial and never touches SMTP/IMAP. Returns before any DB/network.
+        let params = serde_json::json!({ "draft_id": "abc-123", "attributes": ["informational"] });
         let out = handle_send_draft(&params, CredentialBackend::File, None)
             .await
             .expect("denial path must not error");
@@ -2368,6 +2592,20 @@ mod tests {
         // Regression: the old stub returned this code instead of sending. The
         // wired path must never advertise itself as unimplemented.
         assert_ne!(out["error"]["code"], "mcp_send_draft_not_wired");
+    }
+
+    #[tokio::test]
+    async fn send_draft_without_attributes_is_attributes_required_at_the_boundary() {
+        // v2: send_draft requires a non-empty attributes declaration at the
+        // handler boundary — before the confirm/ceiling checks. Returns the
+        // canonical structured refusal (as the error string) with no side effect.
+        let params = serde_json::json!({ "draft_id": "abc-123", "confirm_send": true });
+        let err = handle_send_draft(&params, CredentialBackend::File, None)
+            .await
+            .expect_err("missing attributes must be refused");
+        let v: serde_json::Value = serde_json::from_str(&err).expect("structured error json");
+        assert_eq!(v["status"], "invalid");
+        assert_eq!(v["error"]["code"], "attributes_required");
     }
 
     #[tokio::test]

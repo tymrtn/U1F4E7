@@ -177,6 +177,13 @@ enum Commands {
         /// File attachment (repeatable — one --attach per file)
         #[arg(long = "attach")]
         attach: Vec<String>,
+        /// Required factual risk attribute: a bounded signal Governor uses to assess
+        /// this action's stakes and risk (repeatable, one --attr per true signal; e.g.
+        /// --attr informational, --attr financial_content). Attributes provide risk
+        /// context, not permission, and every send needs at least one. Discover the
+        /// full catalog with `envelope governor catalog --json`.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -304,6 +311,12 @@ enum Commands {
         subcommand: DraftCmd,
     },
 
+    /// Governor attribution: discover the catalog agents declare against
+    Governor {
+        #[command(subcommand)]
+        subcommand: GovernorCmd,
+    },
+
     /// Start the localhost dashboard
     Serve {
         /// Port to listen on
@@ -418,6 +431,15 @@ enum Commands {
         /// Actually execute the unsubscribe (default is dry-run)
         #[arg(long)]
         confirm: bool,
+        /// Required factual attribute: a bounded label TRUE of the unsubscribe
+        /// message (repeatable — one --attr per fact). A `mailto:` unsubscribe is a
+        /// real SMTP send and REQUIRES at least one valid key (e.g. --attr
+        /// informational); a missing/invalid declaration fails closed before
+        /// Governor/SMTP with attributes_required/attributes_invalid. Discover keys
+        /// with `envelope governor catalog --json`. HTTPS one-click unsubscribe (no
+        /// SMTP) does not use this.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
     },
 
     /// Poll for a verification/OTP code from a recent email
@@ -757,6 +779,13 @@ enum AttachmentCmd {
 }
 
 #[derive(Subcommand)]
+enum GovernorCmd {
+    /// Show the vendored Governor attribution catalog (weight-free projection).
+    /// Add `--json` for the machine-readable projection used by agents.
+    Catalog,
+}
+
+#[derive(Subcommand)]
 enum DraftCmd {
     /// Create a new draft (IMAP-first: appends to server Drafts folder)
     Create {
@@ -903,6 +932,11 @@ enum DraftCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Required factual attribute: a bounded label TRUE of this draft
+        /// (repeatable — one --attr per fact). Discover the catalog with
+        /// `envelope governor catalog --json`.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
         /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
         #[arg(long)]
         cooldown_seconds: Option<i64>,
@@ -1965,6 +1999,7 @@ fn main() {
             bcc,
             reply_to,
             attach,
+            attr,
             account,
             at,
             send_mode,
@@ -1984,6 +2019,7 @@ fn main() {
             bcc.as_deref(),
             reply_to.as_deref(),
             &attach,
+            &attr,
             account.as_deref(),
             cli.json,
             backend,
@@ -2194,12 +2230,14 @@ fn main() {
             DraftCmd::Send {
                 id,
                 account,
+                attr,
                 cooldown_seconds,
                 send_now,
                 confirm_send_now,
             } => commands::drafts::run_send(
                 &id,
                 account.as_deref(),
+                &attr,
                 cli.json,
                 backend,
                 cooldown_seconds,
@@ -2209,6 +2247,10 @@ fn main() {
             DraftCmd::Discard { id, account } => {
                 commands::drafts::run_discard(&id, cli.json, account.as_deref(), backend)
             }
+        },
+
+        Commands::Governor { subcommand } => match subcommand {
+            GovernorCmd::Catalog => commands::governor::run_catalog(cli.json),
         },
 
         Commands::Serve {
@@ -2560,11 +2602,13 @@ fn main() {
             folder,
             account,
             confirm,
+            attr,
         } => commands::unsubscribe_cmd::run(
             uid,
             &folder,
             account.as_deref(),
             confirm,
+            &attr,
             cli.json,
             backend,
         ),
@@ -2771,7 +2815,7 @@ mod tests {
         ));
 
         let contract = commands::contract::agent_contract();
-        assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+        assert_eq!(contract["schema"], "envelope.agent_contract.v2");
         let surfaces = contract["surfaces"].as_array().expect("surfaces array");
         for required in [
             "inbox", "read", "search", "thread", "draft", "send", "watch", "otp", "rules",

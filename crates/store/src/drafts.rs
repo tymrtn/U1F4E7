@@ -191,6 +191,24 @@ impl Database {
         }
     }
 
+    /// Explain why a queue CAS ([`Self::queue_draft_for_send`]) matched zero
+    /// rows. Identical precedence to [`Self::classify_guarded_update_miss`],
+    /// except a `blocked` row is reported as [`StoreError::DraftNotEditable`]
+    /// rather than a concurrent-edit conflict: `blocked` is
+    /// [`DraftStatus::is_editable`] (a human may edit it) but NOT
+    /// [`DraftStatus::is_queueable`], so a denied row that a caller tried to
+    /// re-schedule gets a truthful "not queueable" refusal, never a resurrection.
+    fn classify_queue_miss(&self, id: &str) -> StoreError {
+        match self.get_draft(id) {
+            Ok(None) => StoreError::DraftNotFound(id.to_string()),
+            Ok(Some(current)) if !current.status.is_queueable() => {
+                StoreError::DraftNotEditable(current.status.as_str().to_string())
+            }
+            Ok(Some(_)) => StoreError::DraftModifiedConcurrently(id.to_string()),
+            Err(e) => e,
+        }
+    }
+
     /// Edit a draft's recipients, subject, and body.
     ///
     /// `to_addr`/`subject` are per-field: `None` keeps the stored value.
@@ -626,6 +644,156 @@ impl Database {
         Ok(rows == 1)
     }
 
+    /// Persist a bot's validated attribution declaration onto a queued/scheduled
+    /// draft, merged under the `attribution` metadata key.
+    ///
+    /// The block is bound to the row's authoritative `revision` (stamped from the
+    /// column in the same statement), so any later material edit — which bumps the
+    /// revision — makes it stale and the scheduled-send sweep treats it as no
+    /// declaration at all. All other metadata keys (reply threading, contextual
+    /// state, storage, human approval) are preserved via `json_set` rather than a
+    /// blob replace, and the revision is NOT bumped so the declaration stays
+    /// current for the sweep. The `attribution` value is caller-supplied
+    /// (`PersistedDeclaration::to_value`) and contains no score/weight/threshold.
+    ///
+    /// Editable-status guard: a claimed (`sending`/`syncing`) or terminal row
+    /// refuses atomically. The attribution wire key mirrors the transport crate's
+    /// `ATTRIBUTION_METADATA_KEY`.
+    pub fn set_draft_attribution(&self, id: &str, attribution: &serde_json::Value) -> Result<()> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![serialized, id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        Ok(())
+    }
+
+    /// Atomically queue a draft for scheduled sending in ONE compare-and-set:
+    /// validate the row is still at `expected_revision` and in a queueable
+    /// (editable) status, persist the already-validated attribution declaration
+    /// bound to that revision, set the `send_after` schedule, and transition the
+    /// row to the due `draft` status — all together or not at all.
+    ///
+    /// This is the single atomic replacement for the previous
+    /// `update_draft_send_after` + `set_draft_attribution` sequence, and it closes
+    /// three races that sequence allowed:
+    ///
+    /// - A concurrent material edit after the caller validated its declaration
+    ///   bumps the revision; the CAS then matches zero rows and refuses, so a
+    ///   stale declaration can never be stamped onto newer content.
+    /// - Scheduling and attribution persistence are one statement, so a failure
+    ///   can never strand a `send_after` with no declaration (or vice versa).
+    /// - A `pending_review` row is transitioned to `draft`, so a valid re-queue
+    ///   is actually visible to [`Self::list_drafts_due_for_send`] (which selects
+    ///   `status='draft'`) instead of being reported "scheduled" while remaining
+    ///   invisible to the sweep. A `blocked` (Governor-denied) row is deliberately
+    ///   NOT queueable (see [`DraftStatus::is_queueable`]): it refuses so a denied
+    ///   send can never be resurrected into a due draft.
+    ///
+    /// The revision is deliberately NOT bumped: the persisted declaration must
+    /// stay current for the sweep, which claims at this same revision. A stale
+    /// `expected_revision`, a claimed/terminal/blocked row, or a missing draft
+    /// returns the classified miss (`DraftModifiedConcurrently` /
+    /// `DraftNotEditable` / `DraftNotFound`) and nothing is scheduled or
+    /// persisted. The `attribution` value is caller-supplied
+    /// (`PersistedDeclaration::to_value`) and carries no score/weight/threshold.
+    pub fn queue_draft_for_send(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        send_after: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<()> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'draft',
+                send_after = ?1,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?2), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?3 AND revision = ?4
+               AND status IN ('draft', 'pending_review')",
+            params![send_after, serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_queue_miss(id));
+        }
+        Ok(())
+    }
+
+    /// Record a failed SMTP-time attribution attempt and leave the draft due for a
+    /// later sweep to retry. Under the owner `sending` lease: back to `draft`,
+    /// clear the token, merge the advanced attempt state under `attribution`
+    /// (revision re-stamped from the column, which is unchanged since the claim),
+    /// and DO NOT touch `send_after` (the draft stays due) or bump the revision.
+    /// A non-owner or non-`sending` row matches nothing and returns `false`.
+    pub fn defer_attribution_retry(
+        &self,
+        id: &str,
+        token: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'draft', operation_token = NULL,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+            params![serialized, id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Park a draft that exhausted its attribution correction attempts.
+    ///
+    /// Under the owner `sending` lease: move to `pending_review`, clear
+    /// `send_after` (disable automatic transmission scheduling — the due query
+    /// never selects it again, so there is no retry storm), clear the token, and
+    /// merge the terminal attempt state (with `park_reason`) under `attribution`.
+    /// The revision is NOT bumped, so the pending-review draft carries an honest
+    /// record of why it parked. A non-owner or non-`sending` row changes nothing.
+    pub fn park_attribution_exhausted(
+        &self,
+        id: &str,
+        token: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'pending_review', send_after = NULL, operation_token = NULL,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+            params![serialized, id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
     /// Release a `sending` claim into `to`: `draft` to retry on a later sweep
     /// (transient failure), or `pending_review`/`blocked` to park it for
     /// explicit human action. Guarded on the current status being `sending`,
@@ -825,6 +993,12 @@ impl Database {
     /// **viewed** — all in one transaction. If the final approval fails (e.g.
     /// a concurrent content edit), nothing persists: no partially queued,
     /// unapproved state.
+    ///
+    /// Returns the exact atomically-queued, attested [`Draft`] row (read inside
+    /// the same transaction before commit) so the caller never has to reload —
+    /// a post-commit reload could fail or race and let a handler report success
+    /// off pre-attestation state. `blocked` is refused ([`DraftStatus::is_queueable`]
+    /// is false): a Governor-denied row is never resurrected by human queueing.
     pub fn queue_draft_with_human_approval(
         &self,
         id: &str,
@@ -832,7 +1006,7 @@ impl Database {
         send_after: &str,
         approved_by: &str,
         approved_at: &str,
-    ) -> Result<()> {
+    ) -> Result<Draft> {
         let tx = self.conn().unchecked_transaction()?;
         let current = self
             .get_draft(id)?
@@ -855,8 +1029,13 @@ impl Database {
         }
         self.update_draft_send_after(id, send_after)?;
         self.record_draft_human_approval(id, expected_revision, approved_by, approved_at)?;
+        // Read the attested row inside the transaction, then commit. The caller
+        // receives exactly what was queued — no reload, no fallback.
+        let attested = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
         tx.commit()?;
-        Ok(())
+        Ok(attested)
     }
 
     /// Store the RFC822 Message-ID for a draft (set during IMAP APPEND).
@@ -939,6 +1118,486 @@ mod tests {
             )
             .unwrap();
         db
+    }
+
+    fn attribution_of(db: &Database, id: &str) -> serde_json::Value {
+        db.get_draft(id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .unwrap()
+            .get("attribution")
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn set_draft_attribution_merges_without_clobber_and_stamps_revision() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // Pre-existing reply/threading metadata that must survive.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({"draft_kind": "reply", "in_reply_to": "<parent@x>"}),
+        )
+        .unwrap();
+        let rev_before = db.get_draft(&draft.id).unwrap().unwrap().revision;
+
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({
+                "protocol": "envelope.attribution.v1",
+                "origin": "bot",
+                "declared_attrs": ["financial_content"],
+                "revision": 999,       // must be overridden by the column value
+                "attempts": 0,
+            }),
+        )
+        .unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        // Persisting attribution must NOT bump the revision (declaration stays current).
+        assert_eq!(reloaded.revision, rev_before);
+        let meta = reloaded.metadata.unwrap();
+        // Sibling keys preserved.
+        assert_eq!(meta["draft_kind"], "reply");
+        assert_eq!(meta["in_reply_to"], "<parent@x>");
+        // Attribution merged, revision stamped from the column (not the 999 passed).
+        assert_eq!(
+            meta["attribution"]["declared_attrs"][0],
+            "financial_content"
+        );
+        assert_eq!(meta["attribution"]["revision"], rev_before);
+    }
+
+    fn bot_attribution(declared: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "envelope.attribution.v1",
+            "origin": "bot",
+            "declared_attrs": declared,
+            "attempts": 0,
+        })
+    }
+
+    // ── Block 2: one atomic CAS for declaration + schedule + due status ──────
+
+    #[test]
+    fn queue_draft_for_send_binds_declaration_schedule_and_due_status_atomically() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let past = "2000-01-01T00:00:00Z";
+        db.queue_draft_for_send(
+            &draft.id,
+            rev,
+            past,
+            &bot_attribution(&["financial_content"]),
+        )
+        .unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            reloaded.status,
+            DraftStatus::Draft,
+            "queued row is due-status"
+        );
+        assert_eq!(reloaded.send_after.as_deref(), Some(past));
+        assert_eq!(
+            reloaded.revision, rev,
+            "queueing must not bump the revision"
+        );
+        let attr = reloaded.metadata.unwrap()["attribution"].clone();
+        assert_eq!(attr["declared_attrs"][0], "financial_content");
+        assert_eq!(attr["revision"], rev, "declaration bound to this revision");
+        // Visible to the sweep's due query.
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(due.iter().any(|d| d.id == draft.id));
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_stale_revision_with_no_partial_write() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        // Caller's expected revision is stale (off by one).
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev + 1,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["financial_content"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftModifiedConcurrently(_)),
+            "stale revision must conflict, got {err:?}"
+        );
+        // Nothing partial: no schedule, no attribution.
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(reloaded.send_after.is_none(), "no send_after was written");
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none(),
+            "no attribution was written"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_no_clobber_when_content_edited_after_validation() {
+        // The declaration was validated against revision R. A concurrent material
+        // edit bumps to R+1 before queueing; queueing at R must refuse rather than
+        // bind the stale declaration to the edited content.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let validated_rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.update_draft_content(
+            &draft.id,
+            Some("edited@test.com"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                validated_rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["financial_content"]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DraftModifiedConcurrently(_)));
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(reloaded.send_after.is_none());
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_transitions_pending_review_to_due() {
+        // A re-queued draft that was parked in pending_review must become due
+        // (status='draft') so the sweep can see it — never "scheduled" yet invisible.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+        // Before: a pending_review row is invisible to the due query even with a
+        // past send_after — proving the transition is required.
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.queue_draft_for_send(
+            &draft.id,
+            rev,
+            "2000-01-01T00:00:00Z",
+            &bot_attribution(&["informational"]),
+        )
+        .unwrap();
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Draft);
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(
+            due.iter().any(|d| d.id == draft.id),
+            "re-queued draft is now due"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_claimed_row() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let _token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+        // The row is now `sending`; queueing must refuse (not editable).
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["informational"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_blocked_row_with_no_partial_write() {
+        // A `blocked` row is Governor-denied. It is `is_editable` (a human may
+        // still edit it) but NOT `is_queueable`: a re-queue must refuse rather
+        // than resurrect a denied send into a due `draft`. The refusal is a
+        // truthful DraftNotEditable and nothing is scheduled or persisted.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::Blocked)
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["informational"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(_)),
+            "blocked must refuse as not-editable, got {err:?}"
+        );
+        // Still blocked, still no schedule, still no attribution: no resurrection.
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Blocked);
+        assert!(reloaded.send_after.is_none(), "no send_after was written");
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none(),
+            "no attribution was written onto a blocked row"
+        );
+        // The sweep's due query never sees it.
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(!due.iter().any(|d| d.id == draft.id));
+    }
+
+    #[test]
+    fn material_revision_makes_persisted_attribution_stale() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({"protocol": "envelope.attribution.v1", "declared_attrs": ["informational"], "attempts": 0}),
+        )
+        .unwrap();
+        let stamped = attribution_of(&db, &draft.id)["revision"].as_i64().unwrap();
+
+        // A material edit (recipients) bumps the row revision; the persisted
+        // declaration's stamped revision no longer matches — it is stale.
+        db.update_draft_content(
+            &draft.id,
+            Some("new@test.com"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(after.revision > stamped, "material edit bumps revision");
+        // The block survives an edit that only strips human_approval, but its
+        // stamped revision is now stale relative to the row.
+        let block_rev = after.metadata.unwrap()["attribution"]["revision"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(block_rev, stamped);
+        assert_ne!(block_rev, after.revision, "declaration is stale after edit");
+    }
+
+    #[test]
+    fn defer_attribution_retry_returns_to_due_under_lease() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.update_draft_send_after(&draft.id, past).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        // Wrong token changes nothing.
+        assert!(
+            !db.defer_attribution_retry(
+                &draft.id,
+                "wrong-token",
+                &serde_json::json!({"attempts": 1})
+            )
+            .unwrap()
+        );
+
+        assert!(
+            db.defer_attribution_retry(
+                &draft.id,
+                &token,
+                &serde_json::json!({"protocol": "envelope.attribution.v1", "declared_attrs": [], "attempts": 1}),
+            )
+            .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Draft, "returned to due");
+        assert_eq!(
+            after.send_after.as_deref(),
+            Some(past),
+            "still due, not cleared"
+        );
+        assert_eq!(after.revision, rev, "attempt bump does not change revision");
+        assert_eq!(after.metadata.unwrap()["attribution"]["attempts"], 1);
+        // Still claimable by a later sweep at the same revision.
+        assert!(
+            db.claim_draft_for_sending(&draft.id, rev)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn park_attribution_exhausted_clears_scheduling_under_lease() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        assert!(
+            !db.park_attribution_exhausted(&draft.id, "wrong", &serde_json::json!({"attempts": 3}))
+                .unwrap()
+        );
+        assert!(
+            db.park_attribution_exhausted(
+                &draft.id,
+                &token,
+                &serde_json::json!({"attempts": 3, "park_reason": "attribution_exhausted"}),
+            )
+            .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert_eq!(after.send_after, None, "scheduling disabled");
+        assert_eq!(
+            after.metadata.unwrap()["attribution"]["park_reason"],
+            "attribution_exhausted"
+        );
+        // Never selected as due again — no retry storm.
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
     }
 
     #[test]

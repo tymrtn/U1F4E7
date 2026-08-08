@@ -339,24 +339,25 @@ pub async fn block(
 /// content never inherits `tyler_approved` (an input attribute for Governor's
 /// blind scoring, never a gate bypass).
 ///
-/// Returns the resolved `send_after` timestamp.
+/// Returns the resolved `send_after` timestamp and the exact attested [`Draft`]
+/// row the atomic queue produced (no post-commit reload).
 fn queue_draft_for_outbox(
     db: &Database,
     draft_id: &str,
     expected_revision: i64,
     cooldown_seconds: i64,
-) -> envelope_email_store::errors::Result<String> {
+) -> envelope_email_store::errors::Result<(String, envelope_email_store::Draft)> {
     let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_seconds))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    db.queue_draft_with_human_approval(
+    let attested = db.queue_draft_with_human_approval(
         draft_id,
         expected_revision,
         &send_at,
         "human:dashboard",
         &crate::timefmt::utc_now_string(),
     )?;
-    Ok(send_at)
+    Ok((send_at, attested))
 }
 
 pub async fn send(
@@ -389,7 +390,22 @@ pub async fn send(
     // dashboard SMTP bypass.
     let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
     match queue_draft_for_outbox(&db, &draft.id, req.expected_revision, cooldown) {
-        Ok(send_after) => {
+        Ok((send_after, attested)) => {
+            // The additive human-origin attribution block (tyler_approved derived;
+            // no fabricated bot declaration) is built from the EXACT attested row
+            // the queue returned — no reload, no pre-attestation fallback — with
+            // the account domain derived from the username exactly as the sweep
+            // does. If the account cannot be loaded, fail rather than fabricate.
+            let account = match db.get_account(&draft.account_id) {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    return draft_error(envelope_email_store::StoreError::AccountNotFound(
+                        draft.account_id.clone(),
+                    ));
+                }
+                Err(e) => return draft_error(e),
+            };
+            let attribution = crate::human_queue_attribution_block(&attested, &account.username);
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftQueued {
@@ -405,6 +421,7 @@ pub async fn send(
                 "cooldown_seconds": cooldown,
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
+                "attribution": attribution,
             }))
             .into_response()
         }
@@ -541,7 +558,28 @@ mod tests {
         .unwrap();
         let draft = db.get_draft(&draft.id).unwrap().unwrap();
 
-        let send_at = super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+        let (send_at, attested) =
+            super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+
+        // The queue returns the EXACT attested row (no reload): approved, promoted,
+        // and scheduled — the row the handler builds its success block from.
+        assert!(attested.human_approved(), "returned row is attested");
+        assert_eq!(attested.status, DraftStatus::Draft);
+        assert_eq!(attested.send_after.as_deref(), Some(send_at.as_str()));
+
+        // The attribution block built from that row carries the real attachment
+        // fact (derived from the persisted snapshot), agreeing with the sweep.
+        let block = crate::human_queue_attribution_block(&attested, "agent@example.com");
+        let derived: Vec<&str> = block["derived_attrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(
+            derived.contains(&"has_attachment"),
+            "attachment fact derived from the attested row: {block}"
+        );
 
         let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
         // Queued, not sent: sweep-eligible status and a future send_after, with no
@@ -595,6 +633,61 @@ mod tests {
             .filter(|d| d.id == reloaded.id)
             .collect();
         assert_eq!(due_later.len(), 1, "due draft must reach the sweep");
+    }
+
+    /// A failed queue transition (stale/edited revision) must surface as an
+    /// error — the handler then fails loud, never reports success off
+    /// pre-attestation state. There is no reload/fallback path anymore.
+    #[test]
+    fn queue_for_outbox_transition_failure_is_an_error_not_stale_success() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let stale_rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        // A concurrent edit bumps the revision after the human viewed `stale_rev`.
+        db.update_draft_content(
+            &draft.id,
+            Some("attacker@evil.example"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let err = super::queue_draft_for_outbox(&db, &draft.id, stale_rev, 120)
+            .expect_err("a stale-revision queue must fail rather than fall back");
+        assert!(
+            matches!(
+                err,
+                envelope_email_store::StoreError::DraftModifiedConcurrently(_)
+            ),
+            "{err:?}"
+        );
+
+        // Nothing was queued or approved off the stale revision.
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            !after.human_approved(),
+            "no attestation persisted on a failed transition"
+        );
+        assert!(
+            after.send_after.is_none(),
+            "no schedule persisted on a failed transition"
+        );
     }
 
     /// Queueing must promote a pending-review draft to sweep-eligible `draft`
@@ -759,6 +852,70 @@ mod tests {
             db.get_draft(&draft.id).unwrap().unwrap().status,
             DraftStatus::Discarded
         );
+    }
+
+    /// Block 7: the dashboard draft-send handler RESPONSE carries the same
+    /// sanitized additive `attribution` block as CLI/MCP, reflecting the durable
+    /// human attestation (tyler_approved) — never a fabricated bot declaration.
+    #[tokio::test]
+    async fn dashboard_send_response_carries_human_attribution_block() {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+
+        let resp = super::send(
+            AxumState(state),
+            AxumPath(("acc1".to_string(), draft.id.clone())),
+            axum::Json(super::DraftSendRequest {
+                confirm: true,
+                expected_revision: rev,
+                cooldown_seconds: Some(120),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "queued");
+        let attr = &v["attribution"];
+        assert_eq!(attr["attribution_state"], "attributed");
+        assert!(
+            attr["declared_attrs"].as_array().unwrap().is_empty(),
+            "no fabricated bot declaration in the dashboard response"
+        );
+        assert!(
+            attr["derived_attrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "tyler_approved"),
+            "response advertises the durable human attestation: {v}"
+        );
+        assert_eq!(attr["governor"], serde_json::Value::Null);
+        assert!(!v.to_string().contains("\"score\""), "no score leaked");
     }
 
     /// The dashboard send handler source must not call any direct simple-send

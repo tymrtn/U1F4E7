@@ -128,9 +128,11 @@ fn draft_only_human_approved_edited_emit_intent_keys() {
 }
 
 #[test]
-fn human_edited_suppresses_agent_drafted() {
-    // A draft the human touched after generation is human-edited, not a raw
-    // agent draft — we never claim both.
+fn human_edited_and_agent_drafted_can_both_be_true() {
+    // Operator-reviewed correction: AI origin and later human editing can BOTH be
+    // true and may intentionally offset one another. The protocol does not force
+    // them mutually exclusive until catalog semantics are calibrated; each is
+    // emitted on its own observed truth.
     let ctx = AttributedSendContext {
         human_edited: Some(true),
         agent_drafted: Some(true),
@@ -138,7 +140,7 @@ fn human_edited_suppresses_agent_drafted() {
     };
     let attrs = ctx.to_governor_attrs();
     assert!(attrs.contains(&"human_edited"));
-    assert!(!attrs.contains(&"agent_drafted"));
+    assert!(attrs.contains(&"agent_drafted"));
 }
 
 #[test]
