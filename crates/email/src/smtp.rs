@@ -222,9 +222,9 @@ pub fn build_message(
         .mailbox(header::To::from(parse_mailboxes(to, "to")?))
         .subject(subject)
         // Set the Message-ID explicitly so it is always present and matches the
-        // value we hand back to the caller. lettre wraps the bare id in angle
-        // brackets when it serializes the header.
-        .message_id(Some(strip_brackets(message_id_bare)));
+        // value we hand back to the caller. Lettre preserves an explicit value
+        // verbatim, so supply the RFC 5322 angle brackets ourselves.
+        .message_id(Some(format!("<{}>", strip_brackets(message_id_bare))));
 
     if let Some(cc_addr) = cc {
         if !cc_addr.trim().is_empty() {
@@ -518,6 +518,15 @@ mod tests {
         );
         // The returned value matches what is on the wire.
         assert_eq!(returned, header);
+        assert!(
+            header.starts_with('<') && header.ends_with('>'),
+            "wire Message-ID must be RFC 5322 bracketed: {header}"
+        );
+        let wire = String::from_utf8(email.formatted()).unwrap();
+        assert!(
+            wire.contains(&format!("Message-ID: {header}\r\n")),
+            "serialized message must contain the bracketed Message-ID: {wire}"
+        );
         // The bare id we generated is preserved (modulo angle brackets).
         assert!(
             header.contains(strip_brackets(&bare).as_str()),
