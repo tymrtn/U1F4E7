@@ -43,7 +43,11 @@ impl Provenance {
     }
 }
 
-/// Author-context facts a bot declares (6). The host cannot yet observe these.
+/// Author-context facts a bot declares (7). The host cannot observe these from a
+/// generic CLI/MCP process. `agent_drafted` is authorship the bot alone knows —
+/// Envelope has no durable, verifiable origin signal for it at send time, so it
+/// is declared, never inferred (a human CLI user is never silently marked
+/// agent-drafted). See [`crate::attribution::AttributedSendContext`].
 pub const DECLARABLE: &[&str] = &[
     "informational",
     "financial_content",
@@ -51,12 +55,13 @@ pub const DECLARABLE: &[&str] = &[
     "commitment_language",
     "has_pii",
     "uncited_claims",
+    "agent_drafted",
 ];
 
 /// Human-authority facts a bot can never declare (2).
 pub const REQUIRES_ATTESTATION: &[&str] = &["tyler_approved", "authorized_campaign"];
 
-/// Structural/store facts Envelope derives (22). A redundant, consistent bot
+/// Structural/store facts Envelope derives (21). A redundant, consistent bot
 /// declaration is accepted (recorded as redundant); a contradiction is fatal.
 pub const HOST_DERIVED: &[&str] = &[
     "reply_to_thread",
@@ -70,7 +75,6 @@ pub const HOST_DERIVED: &[&str] = &[
     "unauthorized_outreach",
     "human_edited",
     "short_body",
-    "agent_drafted",
     "has_attachment",
     "sensitive_attachment",
     "internal_domain",

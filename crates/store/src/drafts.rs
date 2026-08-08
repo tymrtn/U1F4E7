@@ -342,8 +342,22 @@ impl Database {
     /// sent, which closes the cross-path double-send (scheduled sweep vs
     /// CLI/MCP immediate send). The token is cleared on the terminal state.
     pub fn mark_draft_sent(&self, id: &str, token: &str, message_id: Option<&str>) -> Result<()> {
+        // On the terminal `sent` state, `send_after` and the Drafts-folder
+        // `imap_uid` are both cleared:
+        //  - `send_after`: a transmitted draft is no longer scheduled/due, so no
+        //    surface can infer it is still queued (real evidence: a scheduled
+        //    allowed send left `send_after` at the expired timestamp even after
+        //    the row flipped to `sent`). Immediate sends carry no `send_after`,
+        //    so clearing it there is a harmless no-op.
+        //  - `imap_uid` is the IMAP *Drafts*-folder UID; once sent, the provider
+        //    Drafts copy is being cleaned up (the send paths take the cleanup
+        //    identity from the pre-transition in-memory snapshot, not this row),
+        //    so the stored UID is stale. Clearing it keeps `imap_uid`
+        //    Drafts-folder-only and prevents Sent proof from ever being conflated
+        //    with a Drafts UID. Sent-folder proof lives in `metadata.sent_copy`.
         let rows = self.conn().execute(
             "UPDATE drafts SET status = 'sent', message_id = ?1, operation_token = NULL,
+             send_after = NULL, imap_uid = NULL,
              sent_at = datetime('now'), updated_at = datetime('now')
              WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
             params![message_id, id, token],
@@ -790,6 +804,72 @@ impl Database {
                 updated_at = datetime('now')
              WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
             params![serialized, id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Park a `sending` claim as `pending_review` after a durable Governor
+    /// **review** verdict (the scheduled send routed review, not allow).
+    ///
+    /// Under the owner `sending` lease, one atomic statement: move to
+    /// `pending_review`, clear `send_after` (so no surface — dashboard, CLI, or
+    /// the due query — can present the parked draft as still queued or show a
+    /// stale countdown), and clear the token. The reviewable body/attachment
+    /// snapshot, metadata (including the persisted declaration), and revision are
+    /// preserved untouched, so the human decision path (approve / edit / discard /
+    /// send) still works. Nothing is transmitted and no Sent copy is written. A
+    /// non-owner or non-`sending` row changes nothing and returns `false`.
+    ///
+    /// Distinct from [`Self::release_sending_draft`] into `pending_review`, which
+    /// left `send_after` intact — the exact defect that made a parked-for-review
+    /// draft read as "Queued for sending".
+    pub fn park_for_review(&self, id: &str, token: &str) -> Result<bool> {
+        let rows = self.conn().execute(
+            "UPDATE drafts SET status = 'pending_review', send_after = NULL,
+                operation_token = NULL, updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
+            params![id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Record the resolved Sent-folder copy proof on an already-`sent` draft.
+    ///
+    /// Best-effort bookkeeping run after [`Self::mark_draft_sent`]. The Sent-copy
+    /// proof is stored ONLY under the dedicated, folder-qualified
+    /// `metadata.sent_copy` object — `folder`, `uid` (explicit JSON `null` when
+    /// unresolved, never a retained stale value), `lookup_status`, and the stable
+    /// `copy_source` label (`provider` / `client_appended` / `unresolved` /
+    /// `not_attempted`). It never writes the Drafts-folder `imap_uid` column, so a
+    /// Sent UID is never presented as a Drafts UID. Arguments are primitives (not
+    /// a transport `SentMailProof`) so there is no store→email dependency cycle;
+    /// the caller passes the truthful `copy_source` from the source-aware
+    /// resolver, so a client-appended copy is never recorded as provider proof.
+    /// Guarded on the terminal `sent` status; a non-`sent`/missing row returns
+    /// `false`.
+    pub fn record_sent_copy_proof(
+        &self,
+        id: &str,
+        folder: Option<&str>,
+        uid: Option<u32>,
+        lookup_status: &str,
+        copy_source: &str,
+    ) -> Result<bool> {
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.sent_copy',
+                    json_object(
+                        'folder', ?1,
+                        'uid', ?2,
+                        'lookup_status', ?3,
+                        'copy_source', ?4
+                    )
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?5 AND status = 'sent'",
+            params![folder, uid, lookup_status, copy_source, id],
         )?;
         Ok(rows == 1)
     }
@@ -1598,6 +1678,214 @@ mod tests {
         );
         // Never selected as due again — no retry storm.
         assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_draft_sent_clears_send_after_so_a_sent_draft_is_not_still_scheduled() {
+        // Real evidence: a scheduled allowed send left `send_after` at the expired
+        // timestamp after the row flipped to `sent`, so downstream surfaces could
+        // still infer it was queued. mark_draft_sent must neutralize it.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sent);
+        assert!(after.sent_at.is_some(), "sent_at must be set");
+        assert_eq!(after.message_id.as_deref(), Some("<mid@host>"));
+        assert_eq!(
+            after.send_after, None,
+            "a sent draft must no longer carry a scheduled send_after"
+        );
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn park_for_review_parks_pending_review_and_clears_send_after_under_lease() {
+        // Real evidence: a scheduled send that routed `review` was released to
+        // `pending_review` but kept its expired `send_after`, so the dashboard
+        // rendered it "Queued for sending" with a stale countdown. park_for_review
+        // must clear send_after atomically under the owner lease.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        // A non-owner cannot park it.
+        assert!(!db.park_for_review(&draft.id, "wrong-token").unwrap());
+        // The owner parks it for review.
+        assert!(db.park_for_review(&draft.id, &token).unwrap());
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert_eq!(
+            after.send_after, None,
+            "a review-parked draft must not look queued/due"
+        );
+        assert!(after.sent_at.is_none(), "review parking never sends");
+        // Never selected as due again.
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_draft_sent_clears_the_stale_drafts_imap_uid() {
+        // The `imap_uid` column is the IMAP *Drafts*-folder UID. Once the draft is
+        // sent it is stale (the provider Drafts copy is cleaned up from the
+        // pre-transition snapshot), so mark_draft_sent must clear it. This keeps
+        // the field Drafts-folder-only and prevents Sent proof being conflated
+        // with a Drafts UID.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().imap_uid,
+            Some(4242)
+        );
+
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sent);
+        assert_eq!(
+            after.imap_uid, None,
+            "the stale Drafts-folder UID must clear on sent"
+        );
+    }
+
+    #[test]
+    fn record_sent_copy_proof_stores_folder_qualified_metadata_never_the_drafts_uid() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // A pre-existing Drafts UID that mark_draft_sent will clear.
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        // A resolved provider copy: folder-qualified in metadata.sent_copy, and
+        // the Drafts `imap_uid` column stays cleared (never repurposed).
+        assert!(
+            db.record_sent_copy_proof(&draft.id, Some("Sent"), Some(77), "found", "provider")
+                .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            after.imap_uid, None,
+            "Sent UID must never be written to the Drafts imap_uid column"
+        );
+        let sent_copy = &after.metadata.unwrap()["sent_copy"];
+        assert_eq!(sent_copy["folder"], "Sent");
+        assert_eq!(sent_copy["uid"], 77);
+        assert_eq!(sent_copy["lookup_status"], "found");
+        assert_eq!(sent_copy["copy_source"], "provider");
+    }
+
+    #[test]
+    fn record_sent_copy_proof_unresolved_stores_explicit_null_uid() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        // Unresolved proof: uid is recorded as explicit JSON null, NOT retained
+        // from the stale Drafts UID.
+        assert!(
+            db.record_sent_copy_proof(&draft.id, None, None, "not_found", "unresolved")
+                .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.imap_uid, None);
+        let sent_copy = &after.metadata.unwrap()["sent_copy"];
+        assert!(
+            sent_copy.get("uid").is_some() && sent_copy["uid"].is_null(),
+            "unresolved Sent UID must be explicit JSON null, got {sent_copy:?}"
+        );
+        assert_eq!(sent_copy["copy_source"], "unresolved");
+        assert_eq!(sent_copy["lookup_status"], "not_found");
     }
 
     #[test]

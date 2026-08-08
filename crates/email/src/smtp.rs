@@ -108,6 +108,7 @@ impl SmtpSender {
             from_override,
             cc,
             bcc,
+            false, // real send: drop Bcc from the wire (no leak to recipients)
             reply_to,
             in_reply_to,
             references,
@@ -200,6 +201,11 @@ pub fn build_message(
     from_override: Option<&str>,
     cc: Option<&str>,
     bcc: Option<&str>,
+    // Retain the `Bcc` header in the serialized message instead of dropping it
+    // after the envelope is computed. Real SMTP sends pass `false` (lettre's
+    // default) so recipients never see the BCC list; the sender-private Sent
+    // archive passes `true` so the sender keeps the true recipient record.
+    keep_bcc: bool,
     reply_to: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&[String]>,
@@ -236,6 +242,13 @@ pub fn build_message(
         if !bcc_addr.trim().is_empty() {
             builder = builder.mailbox(header::Bcc::from(parse_mailboxes(bcc_addr, "bcc")?));
         }
+    }
+
+    // By default lettre strips the `Bcc` header from the wire after deriving the
+    // envelope recipients (so normal sends never leak BCC). The sender-private
+    // Sent archive opts into keeping it.
+    if keep_bcc {
+        builder = builder.keep_bcc();
     }
 
     if let Some(reply) = reply_to {
@@ -500,6 +513,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -555,6 +569,7 @@ mod tests {
             None,
             Some("carol@example.com"),
             None,
+            false,
             None,
             Some("<parent@martin.fm>"),
             Some(refs.as_slice()),
@@ -566,6 +581,63 @@ mod tests {
         assert!(!header.trim().is_empty());
         assert_eq!(returned, header);
         assert!(header.contains(strip_brackets(&bare).as_str()));
+    }
+
+    #[test]
+    fn build_message_drops_bcc_by_default_and_keeps_it_when_requested() {
+        let acct = test_account("alice@martin.fm", None);
+        let bare = generate_message_id(&acct);
+
+        // Default (a real SMTP send): the Bcc address is used to derive the
+        // envelope recipients but stripped from the serialized message, so To/Cc
+        // recipients never see the BCC list.
+        let (dropped, _) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Hi",
+            Some("body"),
+            None,
+            None,
+            Some("carol@example.com"),
+            Some("hidden@example.com"),
+            false,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let wire = String::from_utf8(dropped.formatted()).unwrap();
+        assert!(
+            !wire.contains("hidden@example.com"),
+            "a normal send must not leak BCC onto the wire: {wire}"
+        );
+
+        // Sender-private Sent archive: keep_bcc=true retains the Bcc header so the
+        // sender keeps the true recipient record in their own Sent folder.
+        let (kept, _) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Hi",
+            Some("body"),
+            None,
+            None,
+            Some("carol@example.com"),
+            Some("hidden@example.com"),
+            true,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let wire = String::from_utf8(kept.formatted()).unwrap();
+        assert!(
+            wire.contains("Bcc:") && wire.contains("hidden@example.com"),
+            "the archive copy must retain the BCC recipient record: {wire}"
+        );
     }
 
     #[test]
@@ -636,6 +708,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,

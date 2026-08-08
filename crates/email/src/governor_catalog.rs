@@ -246,12 +246,15 @@ mod tests {
     }
 
     #[test]
-    fn declarable_keys_are_the_six_author_context_keys() {
+    fn declarable_keys_are_the_seven_author_context_keys() {
+        // `agent_drafted` is declarable author-context: only the bot knows its own
+        // authorship and Envelope has no durable, verifiable origin signal for it.
         let mut d = declarable_keys();
         d.sort();
         assert_eq!(
             d,
             vec![
+                "agent_drafted",
                 "commitment_language",
                 "financial_content",
                 "has_pii",
@@ -265,8 +268,8 @@ mod tests {
     #[test]
     fn agent_submittable_keys_are_declarable_plus_host_derived_without_attestation() {
         let submittable = agent_submittable_keys();
-        // Declarable ∪ HostDerived = 6 + 22 = 28; attestation keys excluded.
-        assert_eq!(submittable.len(), 28, "6 declarable + 22 host-derived");
+        // Declarable ∪ HostDerived = 7 + 21 = 28; attestation keys excluded.
+        assert_eq!(submittable.len(), 28, "7 declarable + 21 host-derived");
         // Every declarable and host-derived key is submittable.
         for k in declarable_keys() {
             assert!(

@@ -146,10 +146,10 @@
   const statusEditable = $derived(!!draft && isEditableDraftStatus(draft.status));
 
   /**
-   * A persisted `send_after` means the draft is ALREADY sitting in the outbox,
-   * whether or not this page is the one that put it there.
+   * A persisted `send_after` on a `draft`-status row means the draft is ALREADY
+   * sitting in the outbox, whether or not this page is the one that put it there.
    *
-   * `list_drafts_due_for_send` selects every `draft`-status row whose
+   * `list_drafts_due_for_send` selects ONLY `status='draft'` rows whose
    * `send_after` has come due, and the edit statement does not clear
    * `send_after` — it only strips the approval attestation. So editing a queued
    * draft does not pull it back: the edited content still ships, just without
@@ -157,11 +157,14 @@
    * draft itself on every load, not just from the response of a send this page
    * performed.
    *
-   * Terminal rows keep the `send_after` they were queued with, so this is
-   * scoped to statuses the sweep can still act on.
+   * Scoped strictly to `draft` status: a `pending_review` draft is parked for a
+   * human decision and is NEVER due — the backend clears `send_after` when it
+   * parks for review, and this guard is the matching defense-in-depth so a
+   * review-parked draft renders "Pending review", never "Queued" with a stale
+   * countdown, even if a `send_after` somehow lingered.
    */
   const persistedQueue = $derived(
-    !!draft && draft.send_after != null && isSendableDraftStatus(draft.status)
+    !!draft && draft.send_after != null && draft.status === 'draft'
   );
   const isQueued = $derived(!!queued || persistedQueue);
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);

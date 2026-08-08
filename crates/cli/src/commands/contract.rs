@@ -63,7 +63,7 @@ pub fn agent_contract() -> Value {
         "consumers": ["cli", "mcp", "hermes", "codex"],
         "outbound_safety": {
             "actual_send_cooldown": {
-                "default_seconds": 120,
+                "default_seconds": 60,
                 "env": "ENVELOPE_SEND_COOLDOWN_SECONDS",
                 "behavior": "Allowed sends (CLI send, MCP send/reply allowed modes, draft send / send_draft) queue into the outbox with a future send_after by default; real SMTP only happens later when the scheduled-send sweep finds them due. Queued responses include queued_reason_code=safety_cooldown and a human-readable queued_reason so agents know the delay is intentional safety time to report and correct issues.",
                 "bypass": "Immediate transmission requires an explicit, confirmed bypass: send_now (or cooldown_seconds=0) together with confirm_send_now.",
@@ -282,7 +282,7 @@ fn surfaces() -> Value {
                 "send_mode": string("Applied send safety mode when policy was evaluated"),
                 "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary"}),
                 "send_after": string("ISO8601 time the queued/scheduled send becomes due for the outbox sweep"),
-                "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)"}),
+                "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 60)"}),
                 "queued_reason_code": string("Stable reason code for queued sends; safety_cooldown means Envelope intentionally delayed SMTP for review/correction time"),
                 "queued_reason": string("Human-readable explanation that the message is queued in the outbox for the safety cooldown so agents/operators can report and correct issues before SMTP transmission"),
                 "message_id": json!({"type": ["string", "null"], "description": "SMTP Message-ID when sent immediately; null/absent on a queued, scheduled, or draft-only outcome"}),
@@ -511,7 +511,7 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send",
-            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 120s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         (
             "reply",
@@ -539,7 +539,7 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send_draft",
-            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 120s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         ("move_message", "Move a message to another IMAP folder."),
         (
@@ -662,7 +662,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "reply_all": json!({"type": "boolean", "description": "Reply to all recipients", "default": false}),
                     "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "draft-only", "description": "MCP reply safety mode"}),
                     "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
-                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
                     "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send"})),
@@ -752,7 +752,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "draft_id": string("Local draft id"),
                     "attributes": attributes_schema(),
                     "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP", "default": false}),
-                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
                     "account": string("Account ID or email address")
@@ -1149,7 +1149,7 @@ fn send_input_schema() -> Value {
             "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "autonomous-send", "description": "CLI send safety mode; MCP defaults this field to draft-only"}),
             "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
             "allow_recipient": array_of(string("Allowed email address or domain for allowlisted-send")),
-            "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+            "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
             "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
             "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
             "account": string("Account ID or email address")
@@ -1290,10 +1290,7 @@ mod tests {
     fn contract_advertises_cooldown_and_governor() {
         let contract = agent_contract();
         let safety = &contract["outbound_safety"];
-        assert_eq!(
-            safety["actual_send_cooldown"]["default_seconds"],
-            json!(120)
-        );
+        assert_eq!(safety["actual_send_cooldown"]["default_seconds"], json!(60));
         assert_eq!(
             safety["actual_send_cooldown"]["denial_code"],
             json!("immediate_send_requires_confirmation")
@@ -1488,7 +1485,7 @@ mod tests {
                 json!("autonomous-send"),
                 "d1",
                 "2026-08-08T00:02:00Z",
-                120,
+                60,
                 envelope_email_transport::outbound::OUTBOX_COOLDOWN_REASON_CODE,
                 envelope_email_transport::outbound::OUTBOX_COOLDOWN_REASON,
                 attachments.clone(),
@@ -1556,7 +1553,7 @@ mod tests {
                 true,
                 "d1",
                 "2026-08-08T00:02:00Z",
-                120,
+                60,
                 deferred_attribution(),
                 ui.clone(),
             ),
@@ -1565,7 +1562,7 @@ mod tests {
                 false,
                 "d1",
                 "2026-08-08T00:02:00Z",
-                120,
+                60,
                 deferred_attribution(),
                 ui.clone(),
             ),

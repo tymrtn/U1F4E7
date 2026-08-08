@@ -11,7 +11,9 @@ use crate::commands::attachments::{
     attachment_summaries, decode_attachments, snapshot_attachments,
 };
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
-use crate::commands::drafts::sent_mail_proof_json;
+use crate::commands::drafts::{
+    SentMailProofUi, sent_copy_convenience_objects, sent_mail_proof_json,
+};
 use crate::commands::governor_gate::{
     account_domain, gate_and_record_with_agent, governor_request, precheck_attribution,
 };
@@ -532,6 +534,8 @@ async fn handle_send(
         None,
         &attachments_meta(&attachment_snapshots),
         false,
+        body,
+        html,
         &declared,
     );
     if let Some(outcome) = precheck_attribution(
@@ -629,6 +633,8 @@ async fn handle_send(
         None,
         &attachments,
         false,
+        body,
+        html,
         &declared,
     );
     let gov_outcome = gate_and_record_with_agent(
@@ -673,6 +679,8 @@ async fn handle_send(
         body,
         html,
         cc,
+        bcc,
+        reply_to,
         None,
         &[],
         &message_id,
@@ -683,16 +691,8 @@ async fn handle_send(
     let sent_mail_appended = copy_result.sent_mail_appended;
     let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
     let sent_mail_proof = copy_result.proof;
-    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
-    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
+    let (provider_sent_copy, client_appended_copy) =
+        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -1013,6 +1013,8 @@ async fn handle_reply(
         None,
         &attachments_meta(&attachment_snapshots),
         true,
+        Some(body),
+        html,
         &declared,
     );
     if let Some(outcome) = precheck_attribution(
@@ -1122,6 +1124,8 @@ async fn handle_reply(
         None,
         &attachments,
         true,
+        Some(body),
+        html,
         &declared,
     );
     let gov_outcome = gate_and_record_with_agent(
@@ -1164,6 +1168,8 @@ async fn handle_reply(
         Some(body),
         html,
         cc_str.as_deref(),
+        None, // bcc — reply path carries none
+        None, // reply_to — reply path carries none
         headers.in_reply_to.as_deref(),
         &headers.references,
         &message_id,
@@ -1174,16 +1180,8 @@ async fn handle_reply(
     let sent_mail_appended = copy_result.sent_mail_appended;
     let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
     let sent_mail_proof = copy_result.proof;
-    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
-    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
+    let (provider_sent_copy, client_appended_copy) =
+        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 

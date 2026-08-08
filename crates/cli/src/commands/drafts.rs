@@ -9,11 +9,11 @@ use envelope_email_transport::SmtpSender;
 use envelope_email_transport::compose::{
     self, ContextBlock, DEFAULT_PREVIEW_WORD_LIMIT, DraftKind,
 };
+use envelope_email_transport::detect_drafts_folder;
 use envelope_email_transport::imap;
 use envelope_email_transport::outbound::SendSurface;
 use envelope_email_transport::reply;
 use envelope_email_transport::smtp::Attachment;
-use envelope_email_transport::{detect_drafts_folder, detect_sent_folder};
 use lettre::message::Mailboxes;
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
@@ -23,6 +23,45 @@ use super::attachments::{attachment_summaries, decode_attachments, snapshot_atta
 use super::common::{resolve_account, setup_credentials};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
+
+// The source-aware Sent-folder proof resolver is shared with the scheduled-send
+// sweep (which lives in the dashboard crate) so every real SMTP path — immediate
+// CLI/MCP and the background sweep alike — resolves Sent copies through the SAME
+// implementation. Re-exported so existing `crate::commands::drafts::*` call sites
+// keep resolving to it.
+#[cfg(test)]
+pub(crate) use envelope_email_transport::sent_proof::{
+    SentCopyDecision, decide_sent_copy_action, determine_copy_source, provider_auto_saves_sent,
+};
+pub(crate) use envelope_email_transport::sent_proof::{
+    SentMailProof, resolve_sent_copy_after_send,
+};
+
+/// CLI presentation for a [`SentMailProof`]: the dashboard message URL and UI
+/// block. Kept in the CLI (not the transport crate) because it depends on the
+/// CLI `ui` routing helpers.
+pub(crate) trait SentMailProofUi {
+    fn message_url(&self, account_id: &str) -> Option<String>;
+    fn ui(&self, account_id: &str) -> serde_json::Value;
+}
+
+impl SentMailProofUi for SentMailProof {
+    fn message_url(&self, account_id: &str) -> Option<String> {
+        let folder = self.folder.as_deref()?;
+        let uid = self.uid?;
+        ui::message_ui(account_id, uid, folder)
+            .get("message_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    fn ui(&self, account_id: &str) -> serde_json::Value {
+        match (self.folder.as_deref(), self.uid) {
+            (Some(folder), Some(uid)) => ui::message_ui(account_id, uid, folder),
+            _ => ui::account_ui(account_id),
+        }
+    }
+}
 
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
@@ -68,105 +107,6 @@ pub(crate) fn strip_brackets(s: &str) -> String {
         .to_string()
 }
 
-/// Return true when the SMTP provider is known to place submitted messages in
-/// Sent Mail automatically.
-///
-/// Gmail does this for smtp.gmail.com. If Envelope also IMAP-APPENDs a second
-/// copy after SMTP success, Gmail shows two sent messages: the provider's real
-/// sent copy plus Envelope's manually appended local copy. Keep this deliberately
-/// conservative; generic IMAP/SMTP providers still need Envelope's Sent append.
-pub(crate) fn provider_auto_saves_sent(provider_type: Option<&str>, smtp_host: &str) -> bool {
-    let provider = provider_type
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if matches!(provider.as_str(), "gmail" | "google" | "google_workspace") {
-        return true;
-    }
-
-    let host = smtp_host.trim().to_ascii_lowercase();
-    host == "smtp.gmail.com" || host.ends_with(".smtp.gmail.com") || host.contains("googlemail.com")
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SentMailProof {
-    pub folder: Option<String>,
-    pub uid: Option<u32>,
-    pub lookup_status: &'static str,
-    pub lookup_error: Option<String>,
-    /// Stable label describing who created the Sent-folder copy.
-    ///
-    /// - `provider`: SMTP provider auto-filed the message (e.g. Gmail).
-    /// - `client_appended`: Envelope IMAP-APPENDed an archive copy.
-    /// - `unresolved`: Provider should auto-save but lookup hasn't found it yet.
-    /// - `not_attempted`: No IMAP available; no copy confirmed.
-    pub copy_source: &'static str,
-}
-
-impl SentMailProof {
-    pub(crate) fn new(
-        folder: Option<String>,
-        uid: Option<u32>,
-        lookup_status: &'static str,
-        lookup_error: Option<String>,
-    ) -> Self {
-        Self {
-            folder,
-            uid,
-            lookup_status,
-            lookup_error,
-            copy_source: "unresolved",
-        }
-    }
-
-    pub(crate) fn message_url(&self, account_id: &str) -> Option<String> {
-        let folder = self.folder.as_deref()?;
-        let uid = self.uid?;
-        ui::message_ui(account_id, uid, folder)
-            .get("message_url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    }
-
-    pub(crate) fn ui(&self, account_id: &str) -> serde_json::Value {
-        match (self.folder.as_deref(), self.uid) {
-            (Some(folder), Some(uid)) => ui::message_ui(account_id, uid, folder),
-            _ => ui::account_ui(account_id),
-        }
-    }
-}
-
-/// Determine the stable `copy_source` label based on send-path context.
-///
-/// Arguments:
-/// - `has_imap`: account has an IMAP host configured
-/// - `provider_auto_saves`: provider is known to auto-file Sent (e.g. Gmail)
-/// - `client_appended`: Envelope successfully IMAP-APPENDed an archive copy
-/// - `lookup_found`: the post-send Sent-folder lookup found the message
-#[cfg(test)]
-pub(crate) fn determine_copy_source(
-    has_imap: bool,
-    provider_auto_saves: bool,
-    client_appended: bool,
-    lookup_found: bool,
-) -> &'static str {
-    if !has_imap {
-        return "not_attempted";
-    }
-    if client_appended {
-        return "client_appended";
-    }
-    if provider_auto_saves {
-        if lookup_found {
-            return "provider";
-        } else {
-            return "unresolved";
-        }
-    }
-    // No IMAP append happened and provider doesn't auto-save — no copy confirmed.
-    "not_attempted"
-}
-
 pub(crate) fn sent_mail_proof_json(account_id: &str, proof: &SentMailProof) -> serde_json::Value {
     serde_json::json!({
         "folder": proof.folder,
@@ -179,106 +119,29 @@ pub(crate) fn sent_mail_proof_json(account_id: &str, proof: &SentMailProof) -> s
     })
 }
 
-/// Decision produced by pre-append Sent-folder lookup semantics (issue #77).
-#[derive(Debug, PartialEq)]
-pub(crate) enum SentCopyDecision {
-    /// Account has no IMAP — no copy possible.
-    NoImap,
-    /// Pre-send lookup found the message: provider already filed the copy.
-    ProviderFound,
-    /// Provider is known to auto-save but pre-send lookup missed it (timing).
-    ProviderUnresolved,
-    /// Provider does not auto-save and message not yet in Sent: client must append.
-    NeedsClientAppend,
-}
-
-/// Pure function: determine the sent-copy action from IMAP availability, provider
-/// auto-save flag, and whether the pre-append lookup found the message.
-pub(crate) fn decide_sent_copy_action(
-    has_imap: bool,
-    provider_auto_saves: bool,
-    pre_lookup_found: bool,
-) -> SentCopyDecision {
-    if !has_imap {
-        return SentCopyDecision::NoImap;
-    }
-    if pre_lookup_found {
-        return SentCopyDecision::ProviderFound;
-    }
-    if provider_auto_saves {
-        return SentCopyDecision::ProviderUnresolved;
-    }
-    SentCopyDecision::NeedsClientAppend
-}
-
-/// Result of resolving the Sent-folder copy after SMTP success.
-pub(crate) struct SentCopyResult {
-    pub sent_mail_appended: bool,
-    pub sent_mail_append_skipped_reason: Option<&'static str>,
-    pub proof: SentMailProof,
-}
-
-pub(crate) async fn find_sent_mail_by_message_id(
-    db: &Database,
-    creds: &AccountWithCredentials,
-    message_id: &str,
-) -> SentMailProof {
-    if message_id.trim().is_empty() {
-        return SentMailProof::new(None, None, "no_message_id", None);
-    }
-    if creds.account.imap_host.trim().is_empty() {
-        return SentMailProof::new(None, None, "no_imap", None);
-    }
-
-    let mut client = match imap::connect(creds).await {
-        Ok(client) => client,
-        Err(e) => {
-            return SentMailProof::new(None, None, "imap_connect_failed", Some(e.to_string()));
-        }
-    };
-
-    let sent_folder = match detect_sent_folder(&mut client, db, &creds.account.id).await {
-        Ok(Some(folder)) => folder,
-        Ok(None) => return SentMailProof::new(None, None, "sent_folder_not_found", None),
-        Err(e) => {
-            return SentMailProof::new(
-                None,
-                None,
-                "sent_folder_detection_failed",
-                Some(e.to_string()),
-            );
-        }
-    };
-
-    let mid_clean = message_id.trim_matches(|c| c == '<' || c == '>');
-    let mut last_error: Option<String> = None;
-    for attempt in 0..3 {
-        match imap::find_uid_by_message_id(&mut client, &sent_folder, mid_clean).await {
-            Ok(Some(uid)) => {
-                return SentMailProof::new(Some(sent_folder), Some(uid), "found", None);
-            }
-            Ok(None) => {
-                last_error = None;
-            }
-            Err(e) => {
-                last_error = Some(e.to_string());
-            }
-        }
-        if attempt < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    }
-
-    SentMailProof::new(
-        Some(sent_folder),
-        None,
-        if last_error.is_some() {
-            "lookup_failed"
-        } else {
-            "not_found"
-        },
-        last_error,
-    )
+/// Project a resolved [`SentMailProof`] into the two convenience proof objects
+/// (`provider_sent_copy`, `client_appended_copy`) that every CLI/MCP actual-send
+/// output advertises. Populated STRICTLY by `copy_source`:
+/// - `provider_sent_copy` only when the copy was observed provider-side
+///   (`copy_source == "provider"`);
+/// - `client_appended_copy` only for a client IMAP-APPEND archive
+///   (`copy_source == "client_appended"`).
+///
+/// `unresolved` and `not_attempted` yield `None` for both — an unresolved lookup
+/// is never presented as provider proof (upholding the contract's
+/// generic-provider-null guarantee). The canonical `sent_mail` object still
+/// truthfully exposes `copy_source`, folder, uid, and lookup status. Centralized
+/// so the four actual-send call sites (CLI send, MCP send/reply, durable draft
+/// send) cannot drift.
+pub(crate) fn sent_copy_convenience_objects(
+    account_id: &str,
+    proof: &SentMailProof,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let provider_sent_copy =
+        (proof.copy_source == "provider").then(|| sent_mail_proof_json(account_id, proof));
+    let client_appended_copy =
+        (proof.copy_source == "client_appended").then(|| sent_mail_proof_json(account_id, proof));
+    (provider_sent_copy, client_appended_copy)
 }
 
 /// Build a full RFC822 draft supporting HTML, References, In-Reply-To, and an
@@ -358,182 +221,6 @@ pub(crate) fn build_rfc822_full(
         .unwrap_or_default();
 
     Ok((rfc822.into_bytes(), message_id))
-}
-
-/// After a successful immediate SMTP send, append a copy to the account's Sent
-/// folder for providers that do not auto-save SMTP submissions.
-///
-/// Gmail/Google save submitted mail to `[Gmail]/Sent Mail` automatically, so we
-/// skip them to avoid a visible duplicate. Generic IMAP/SMTP providers (martin.fm
-/// / inbox.eu and friends) do not, so without this the message is never visible
-/// in Sent and `find_sent_mail_by_message_id` can only ever report `not_found`.
-///
-/// The appended copy is rebuilt from the same fields and the *same* Message-ID
-/// that was transmitted, so the subsequent proof lookup resolves it. This mirrors
-/// the draft-send path's Sent-copy logic. Best-effort: connection/append failures
-/// are logged and surfaced as not-appended rather than failing the send.
-///
-/// Returns `(appended, skipped_reason)`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn append_sent_copy_for_immediate_send(
-    db: &Database,
-    creds: &AccountWithCredentials,
-    provider_type: Option<&str>,
-    from: &str,
-    to: &str,
-    subject: &str,
-    text: Option<&str>,
-    html: Option<&str>,
-    cc: Option<&str>,
-    in_reply_to: Option<&str>,
-    references: &[String],
-    message_id: &str,
-    attachments: &[Attachment],
-) -> (bool, Option<&'static str>) {
-    let acct = &creds.account;
-    if acct.imap_host.trim().is_empty() {
-        return (false, Some("no_imap"));
-    }
-    if provider_auto_saves_sent(provider_type, &acct.smtp_host) {
-        return (false, Some("provider_auto_saves_sent"));
-    }
-
-    let rfc822 = match build_rfc822_full(
-        from,
-        to,
-        subject,
-        text,
-        html,
-        cc,
-        in_reply_to,
-        references,
-        Some(message_id),
-        attachments,
-    ) {
-        Ok((bytes, _)) => bytes,
-        Err(e) => {
-            warn!("failed to build Sent copy for immediate send: {e}");
-            return (false, Some("rfc822_build_failed"));
-        }
-    };
-
-    let mut client = match imap::connect(creds).await {
-        Ok(client) => client,
-        Err(e) => {
-            warn!("failed to connect to IMAP to append Sent copy: {e}");
-            return (false, Some("imap_connect_failed"));
-        }
-    };
-
-    match detect_sent_folder(&mut client, db, &acct.id).await {
-        Ok(Some(sent_folder)) => {
-            match imap::append_message(&mut client, &sent_folder, "(\\Seen)", &rfc822).await {
-                Ok(_) => (true, None),
-                Err(e) => {
-                    warn!("failed to append Sent copy to {sent_folder}: {e}");
-                    (false, Some("append_failed"))
-                }
-            }
-        }
-        Ok(None) => (false, Some("sent_folder_not_found")),
-        Err(e) => {
-            warn!("failed to detect Sent folder for immediate send: {e}");
-            (false, Some("sent_folder_detection_failed"))
-        }
-    }
-}
-
-/// After a successful SMTP send, determine the Sent-folder copy semantics using
-/// a **pre-append** lookup.
-///
-/// Decision flow:
-/// 1. No IMAP → `copy_source="not_attempted"`, skip everything.
-/// 2. Pre-append lookup finds the message → `copy_source="provider"`, skip client append.
-/// 3. Provider auto-saves but lookup missed → `copy_source="unresolved"`, skip client append.
-/// 4. Provider does not auto-save and not found → client IMAP APPEND, then post-append
-///    lookup; `copy_source="client_appended"` on append success.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_sent_copy_after_send(
-    db: &Database,
-    creds: &AccountWithCredentials,
-    provider_type: Option<&str>,
-    from: &str,
-    to: &str,
-    subject: &str,
-    text: Option<&str>,
-    html: Option<&str>,
-    cc: Option<&str>,
-    in_reply_to: Option<&str>,
-    references: &[String],
-    message_id: &str,
-    attachments: &[Attachment],
-) -> SentCopyResult {
-    let has_imap = !creds.account.imap_host.trim().is_empty();
-    let provider_auto_saves = provider_auto_saves_sent(provider_type, &creds.account.smtp_host);
-
-    if !has_imap {
-        let mut proof = SentMailProof::new(None, None, "no_imap", None);
-        proof.copy_source = "not_attempted";
-        return SentCopyResult {
-            sent_mail_appended: false,
-            sent_mail_append_skipped_reason: Some("no_imap"),
-            proof,
-        };
-    }
-
-    // Pre-append lookup: check whether the provider already filed the message.
-    let pre_proof = find_sent_mail_by_message_id(db, creds, message_id).await;
-
-    match decide_sent_copy_action(has_imap, provider_auto_saves, pre_proof.uid.is_some()) {
-        SentCopyDecision::NoImap => unreachable!("has_imap checked above"),
-        SentCopyDecision::ProviderFound => {
-            let mut proof = pre_proof;
-            proof.copy_source = "provider";
-            SentCopyResult {
-                sent_mail_appended: false,
-                sent_mail_append_skipped_reason: Some("provider_auto_saves_sent"),
-                proof,
-            }
-        }
-        SentCopyDecision::ProviderUnresolved => {
-            let mut proof = pre_proof;
-            proof.copy_source = "unresolved";
-            SentCopyResult {
-                sent_mail_appended: false,
-                sent_mail_append_skipped_reason: Some("provider_auto_saves_sent"),
-                proof,
-            }
-        }
-        SentCopyDecision::NeedsClientAppend => {
-            let (appended, skip_reason) = append_sent_copy_for_immediate_send(
-                db,
-                creds,
-                provider_type,
-                from,
-                to,
-                subject,
-                text,
-                html,
-                cc,
-                in_reply_to,
-                references,
-                message_id,
-                attachments,
-            )
-            .await;
-            let mut proof = find_sent_mail_by_message_id(db, creds, message_id).await;
-            proof.copy_source = if appended {
-                "client_appended"
-            } else {
-                "not_attempted"
-            };
-            SentCopyResult {
-                sent_mail_appended: appended,
-                sent_mail_append_skipped_reason: skip_reason,
-                proof,
-            }
-        }
-    }
 }
 
 /// Build an RFC822-formatted draft message suitable for IMAP APPEND.
@@ -1509,6 +1196,7 @@ fn emit_draft_envelope(draft: &Draft, json: bool) {
         .and_then(|v| v.as_str())
         .unwrap_or("draft");
     println!("Draft ({kind}) created: {}", draft.id);
+    println!("  Status:  {}", draft_display_status(draft));
     println!("  To:      {}", draft.to_addr);
     if let Some(ref s) = draft.subject {
         println!("  Subject: {s}");
@@ -1545,6 +1233,33 @@ fn emit_draft_envelope(draft: &Draft, json: bool) {
     }
 }
 
+/// The truthful persisted status for `draft show` / the draft envelope, derived
+/// from the durable `DraftStatus` (and `send_after` for a queued draft).
+///
+/// Previously the envelope hard-coded `"drafted"`, so `draft show` reported a
+/// SENT or PENDING-REVIEW draft as an ordinary local draft (real evidence). This
+/// distinguishes at least `sent`, `pending_review`, `queued` (a `draft` row with a
+/// `send_after` schedule), and ordinary `drafted`, and never collapses them.
+fn draft_display_status(draft: &Draft) -> &'static str {
+    use envelope_email_store::DraftStatus;
+    match draft.status {
+        DraftStatus::Sent => "sent",
+        DraftStatus::PendingReview => "pending_review",
+        DraftStatus::Blocked => "blocked",
+        DraftStatus::Sending => "sending",
+        DraftStatus::Syncing => "syncing",
+        DraftStatus::DeliveryUncertain => "delivery_uncertain",
+        DraftStatus::Discarded => "discarded",
+        DraftStatus::Draft => {
+            if draft.send_after.is_some() {
+                "queued"
+            } else {
+                "drafted"
+            }
+        }
+    }
+}
+
 /// Render the scope-defined draft envelope JSON from a stored draft + metadata.
 pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
     let meta = draft
@@ -1577,7 +1292,7 @@ pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
     );
 
     serde_json::json!({
-        "status": "drafted",
+        "status": draft_display_status(draft),
         "draft_id": draft.id,
         "account_id": draft.account_id,
         "draft_kind": draft_kind,
@@ -2388,6 +2103,8 @@ pub(crate) fn precheck_draft(
         Some(draft_id),
         &attachments,
         draft.in_reply_to.is_some(),
+        draft.text_content.as_deref(),
+        draft.html_content.as_deref(),
         declared,
     );
     // `governor_request` always resolves attribution, so this is present; treat a
@@ -2708,6 +2425,8 @@ pub(crate) async fn send_existing_draft(
             Some(id),
             &attachments,
             in_reply_to.is_some(),
+            text_body.as_deref(),
+            html_body.as_deref(),
             declared,
         );
         // gate_with_attribution refuses an unattributed/invalid request BEFORE
@@ -2867,6 +2586,8 @@ pub(crate) async fn send_existing_draft(
         text_body.as_deref(),
         html_body.as_deref(),
         cc_addr.as_deref(),
+        bcc_addr.as_deref(),
+        reply_to.as_deref(),
         in_reply_to.as_deref(),
         &references,
         &message_id,
@@ -2878,16 +2599,33 @@ pub(crate) async fn send_existing_draft(
     let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
     let sent_mail_proof = copy_result.proof;
 
-    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
-        Some(sent_mail_proof_json(&acct.id, &sent_mail_proof))
-    } else {
-        None
-    };
-    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
-        Some(sent_mail_proof_json(&acct.id, &sent_mail_proof))
-    } else {
-        None
-    };
+    // ── Durable Sent-proof annotation (direct/scheduled parity) ──
+    // Persist the same dedicated, folder-qualified Sent proof the scheduled sweep
+    // records, so an immediate `draft send` / MCP `send_draft` no longer diverges
+    // from a scheduled send. Only a durable draft row has anything to persist;
+    // a plain direct send with no local draft does not. Strictly AFTER terminal
+    // sent persistence and best-effort — a proof failure never retransmits.
+    if let Some(d) = &local_draft
+        && sent_recorded
+    {
+        match db.record_sent_copy_proof(
+            &d.id,
+            sent_mail_proof.folder.as_deref(),
+            sent_mail_proof.uid,
+            sent_mail_proof.lookup_status,
+            sent_mail_proof.copy_source,
+        ) {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "draft {}: Sent-copy proof not recorded (row is not `sent`)",
+                d.id
+            ),
+            Err(e) => warn!("draft {}: failed to record Sent-copy proof: {e}", d.id),
+        }
+    }
+
+    let (provider_sent_copy, client_appended_copy) =
+        sent_copy_convenience_objects(&acct.id, &sent_mail_proof);
 
     let sent_message_url = sent_mail_proof.message_url(&acct.id);
     let sent_ui = sent_mail_proof.ui(&acct.id);
@@ -3737,6 +3475,67 @@ mod tests {
             value["storage"]["sync_status_reason"], "imap_sync_failed",
             "sync_status_reason must be surfaced in storage block"
         );
+        // An ordinary local draft (no send_after) reports `drafted`.
+        assert_eq!(value["status"], "drafted");
+    }
+
+    /// Real evidence: `draft show` reported a durably SENT / PENDING-REVIEW /
+    /// QUEUED draft as an ordinary `drafted` local draft. The envelope status must
+    /// reflect the true persisted `DraftStatus` (and `send_after` for a queue).
+    #[test]
+    fn draft_envelope_status_reflects_true_persisted_status() {
+        fn draft_with(status: DraftStatus, send_after: Option<&str>) -> Draft {
+            Draft {
+                id: "d1".to_string(),
+                account_id: "acct@example.com".to_string(),
+                status,
+                to_addr: "b@example.com".to_string(),
+                cc_addr: None,
+                bcc_addr: None,
+                reply_to: None,
+                subject: Some("Test".to_string()),
+                text_content: Some("hi".to_string()),
+                html_content: None,
+                in_reply_to: None,
+                metadata: None,
+                attachments: vec![],
+                message_id: None,
+                send_after: send_after.map(str::to_string),
+                snoozed_until: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                sent_at: None,
+                created_by: Some("cli".to_string()),
+                imap_uid: None,
+                revision: 0,
+            }
+        }
+
+        assert_eq!(
+            draft_envelope_json(&draft_with(DraftStatus::Sent, None))["status"],
+            "sent"
+        );
+        assert_eq!(
+            draft_envelope_json(&draft_with(DraftStatus::PendingReview, None))["status"],
+            "pending_review"
+        );
+        // A `draft` row carrying a schedule is queued, not an ordinary draft.
+        assert_eq!(
+            draft_envelope_json(&draft_with(
+                DraftStatus::Draft,
+                Some("2026-01-01T00:02:00Z")
+            ))["status"],
+            "queued"
+        );
+        // An ordinary local draft with no schedule stays `drafted`.
+        assert_eq!(
+            draft_envelope_json(&draft_with(DraftStatus::Draft, None))["status"],
+            "drafted"
+        );
+        assert_eq!(
+            draft_envelope_json(&draft_with(DraftStatus::Blocked, None))["status"],
+            "blocked"
+        );
     }
 
     /// A reply whose parent lives only in the `in_reply_to` column (no
@@ -3846,13 +3645,16 @@ mod tests {
 
     #[test]
     fn copy_source_is_provider_when_auto_saved_and_lookup_found() {
-        assert_eq!(determine_copy_source(true, true, false, true), "provider");
+        assert_eq!(
+            determine_copy_source(true, true, false, false, true),
+            "provider"
+        );
     }
 
     #[test]
     fn copy_source_is_unresolved_when_auto_saved_but_lookup_not_found() {
         assert_eq!(
-            determine_copy_source(true, true, false, false),
+            determine_copy_source(true, true, false, false, false),
             "unresolved"
         );
     }
@@ -3860,7 +3662,7 @@ mod tests {
     #[test]
     fn copy_source_is_client_appended_when_client_wrote_archive_and_lookup_found() {
         assert_eq!(
-            determine_copy_source(true, false, true, true),
+            determine_copy_source(true, false, true, true, true),
             "client_appended"
         );
     }
@@ -3869,7 +3671,7 @@ mod tests {
     fn copy_source_is_client_appended_when_append_done_but_lookup_not_found() {
         // Lookup may still be delayed; source is still client_appended.
         assert_eq!(
-            determine_copy_source(true, false, true, false),
+            determine_copy_source(true, false, true, true, false),
             "client_appended"
         );
     }
@@ -3877,7 +3679,7 @@ mod tests {
     #[test]
     fn copy_source_is_not_attempted_when_no_imap() {
         assert_eq!(
-            determine_copy_source(false, false, false, false),
+            determine_copy_source(false, false, false, false, false),
             "not_attempted"
         );
     }
@@ -3886,7 +3688,7 @@ mod tests {
     fn copy_source_not_attempted_overrides_provider_auto_saves_when_no_imap() {
         // No IMAP means we couldn't verify provider copy either.
         assert_eq!(
-            determine_copy_source(false, true, false, false),
+            determine_copy_source(false, true, false, false, false),
             "not_attempted"
         );
     }
@@ -3934,29 +3736,54 @@ mod tests {
         assert!(value["uid"].is_null());
     }
 
+    #[test]
+    fn direct_draft_send_persists_sent_proof_after_resolving_it() {
+        // Finding 3 (direct side of direct/scheduled durable parity): the shared
+        // durable draft-send path (send_existing_draft — CLI `draft send` and MCP
+        // `send_draft`) must persist the resolved Sent proof, not resolve it and
+        // drop it as before. Ordering: resolve first, then annotate. A full send
+        // needs live SMTP/IMAP, so guard the wiring/ordering at the source
+        // boundary (mirrors `cli_send_no_longer_calls_append_helper_directly`).
+        let src = include_str!("drafts.rs");
+        let fn_start = src
+            .find("pub(crate) async fn send_existing_draft")
+            .expect("shared durable draft-send helper present");
+        let body = &src[fn_start..];
+        let resolve_at = body
+            .find("resolve_sent_copy_after_send(")
+            .expect("direct path resolves the Sent copy");
+        let record_at = body
+            .find("record_sent_copy_proof(")
+            .expect("direct path records the Sent proof durably");
+        assert!(
+            record_at > resolve_at,
+            "must resolve the Sent copy before persisting the proof"
+        );
+    }
+
     // ─── decide_sent_copy_action (issue #77 pre-lookup semantics) ────────────
 
     #[test]
     fn decide_sent_copy_no_imap_always_returns_no_imap() {
         assert_eq!(
-            decide_sent_copy_action(false, false, false),
+            decide_sent_copy_action(false, false, "not_found"),
             SentCopyDecision::NoImap
         );
         assert_eq!(
-            decide_sent_copy_action(false, true, true),
+            decide_sent_copy_action(false, true, "found"),
             SentCopyDecision::NoImap
         );
     }
 
     #[test]
     fn decide_sent_copy_pre_lookup_found_means_provider_copy() {
-        // Pre-lookup found message before any append → provider placed it.
+        // Exact unique copy found before any append → provider placed it.
         assert_eq!(
-            decide_sent_copy_action(true, false, true),
+            decide_sent_copy_action(true, false, "found"),
             SentCopyDecision::ProviderFound
         );
         assert_eq!(
-            decide_sent_copy_action(true, true, true),
+            decide_sent_copy_action(true, true, "found"),
             SentCopyDecision::ProviderFound
         );
     }
@@ -3964,7 +3791,7 @@ mod tests {
     #[test]
     fn decide_sent_copy_auto_saves_but_lookup_missed_is_unresolved() {
         assert_eq!(
-            decide_sent_copy_action(true, true, false),
+            decide_sent_copy_action(true, true, "not_found"),
             SentCopyDecision::ProviderUnresolved
         );
     }
@@ -3972,8 +3799,117 @@ mod tests {
     #[test]
     fn decide_sent_copy_no_auto_save_and_not_found_needs_client_append() {
         assert_eq!(
-            decide_sent_copy_action(true, false, false),
+            decide_sent_copy_action(true, false, "not_found"),
             SentCopyDecision::NeedsClientAppend
         );
+    }
+
+    #[test]
+    fn decide_sent_copy_ambiguous_never_appends() {
+        // Multiple exact copies already exist: never APPEND another archive.
+        for auto_saves in [false, true] {
+            assert_eq!(
+                decide_sent_copy_action(true, auto_saves, "ambiguous"),
+                SentCopyDecision::Unresolved("ambiguous_sent_copies")
+            );
+        }
+    }
+
+    #[test]
+    fn decide_sent_copy_inconclusive_lookup_never_appends() {
+        for status in ["lookup_failed", "imap_connect_failed", "no_message_id"] {
+            assert_eq!(
+                decide_sent_copy_action(true, false, status),
+                SentCopyDecision::Unresolved("sent_lookup_inconclusive")
+            );
+        }
+    }
+
+    // ─── sent_copy_convenience_objects projection (never mislabel unresolved) ──
+
+    fn proof_with_source(source: &'static str) -> SentMailProof {
+        SentMailProof {
+            folder: Some("Sent".to_string()),
+            uid: Some(7),
+            lookup_status: "found",
+            lookup_error: None,
+            copy_source: source,
+        }
+    }
+
+    #[test]
+    fn convenience_provider_populates_only_provider_sent_copy() {
+        let (provider, client) =
+            sent_copy_convenience_objects("acct@example.com", &proof_with_source("provider"));
+        assert!(
+            provider.is_some(),
+            "provider copy_source → provider_sent_copy"
+        );
+        assert!(
+            client.is_none(),
+            "provider copy_source → no client_appended_copy"
+        );
+        assert_eq!(provider.unwrap()["copy_source"], "provider");
+    }
+
+    #[test]
+    fn convenience_client_appended_populates_only_client_appended_copy() {
+        let (provider, client) = sent_copy_convenience_objects(
+            "acct@example.com",
+            &proof_with_source("client_appended"),
+        );
+        assert!(
+            provider.is_none(),
+            "client_appended → no provider_sent_copy"
+        );
+        assert!(client.is_some(), "client_appended → client_appended_copy");
+        assert_eq!(client.unwrap()["copy_source"], "client_appended");
+    }
+
+    #[test]
+    fn convenience_unresolved_is_never_presented_as_provider_proof() {
+        // Blocker regression: `unresolved` (e.g. a generic-provider APPEND
+        // failure) must never be surfaced as provider proof. Both convenience
+        // objects are null; the canonical `sent_mail` still carries copy_source.
+        let (provider, client) =
+            sent_copy_convenience_objects("acct@example.com", &proof_with_source("unresolved"));
+        assert!(
+            provider.is_none(),
+            "unresolved must not be presented as provider_sent_copy"
+        );
+        assert!(
+            client.is_none(),
+            "unresolved must not be client_appended_copy"
+        );
+    }
+
+    #[test]
+    fn convenience_generic_provider_append_failure_yields_null_provider_copy() {
+        // A generic-provider APPEND failure resolves as `unresolved` with a null
+        // UID; the projection must not fabricate provider proof from it.
+        let proof = SentMailProof {
+            folder: Some("Sent".to_string()),
+            uid: None,
+            lookup_status: "not_found",
+            lookup_error: None,
+            copy_source: "unresolved",
+        };
+        let (provider, client) = sent_copy_convenience_objects("acct@example.com", &proof);
+        assert!(provider.is_none());
+        assert!(client.is_none());
+    }
+
+    #[test]
+    fn convenience_not_attempted_leaves_both_objects_null() {
+        let proof = SentMailProof {
+            folder: None,
+            uid: None,
+            lookup_status: "no_imap",
+            lookup_error: None,
+            copy_source: "not_attempted",
+        };
+        let (provider, client) = sent_copy_convenience_objects("acct@example.com", &proof);
+        assert!(provider.is_none());
+        assert!(client.is_none());
     }
 }

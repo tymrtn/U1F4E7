@@ -18,7 +18,10 @@ use std::str::FromStr;
 use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::common::setup_credentials;
 use super::datetime::parse_send_at;
-use super::drafts::{resolve_sent_copy_after_send, sent_mail_proof_json};
+use super::drafts::{
+    SentMailProofUi, resolve_sent_copy_after_send, sent_copy_convenience_objects,
+    sent_mail_proof_json,
+};
 use super::governor_gate::{
     account_domain, gate_and_record, governor_request, precheck_attribution,
 };
@@ -179,6 +182,8 @@ pub async fn run(
         None,
         &precheck_attachments,
         false,
+        body,
+        html,
         &declared,
     );
     if let Some(outcome) = precheck_attribution(&db, &creds.account.id, &precheck_req, None) {
@@ -416,6 +421,8 @@ pub async fn run(
         None,
         &attachments,
         false,
+        body,
+        html,
         &declared,
     );
     let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
@@ -469,6 +476,8 @@ pub async fn run(
         body,
         html,
         cc,
+        bcc,
+        reply_to,
         None,
         &[],
         &message_id,
@@ -479,16 +488,8 @@ pub async fn run(
     let sent_mail_appended = copy_result.sent_mail_appended;
     let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
     let sent_mail_proof = copy_result.proof;
-    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
-    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
+    let (provider_sent_copy, client_appended_copy) =
+        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -553,7 +554,9 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::drafts::{SentMailProof, provider_auto_saves_sent, sent_mail_proof_json};
+    use crate::commands::drafts::{
+        SentMailProof, provider_auto_saves_sent, sent_copy_convenience_objects,
+    };
 
     // Regression: CLI immediate send must call resolve_sent_copy_after_send
     // (pre-lookup before append), not the old append helper directly.
@@ -572,20 +575,13 @@ mod tests {
     fn cli_send_json_output_shape_includes_sent_copy_source_fields() {
         // Simulate the proof that resolve_sent_copy_after_send would return for a
         // provider-auto-save path (e.g. Gmail). provider_sent_copy should be Some,
-        // client_appended_copy should be None.
+        // client_appended_copy should be None. Uses the shared projection the CLI
+        // send path actually calls, so the two can never drift.
         let mut proof = SentMailProof::new(Some("Sent Mail".to_string()), Some(42), "found", None);
         proof.copy_source = "provider";
 
-        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
-        let client_appended_copy = if proof.copy_source == "client_appended" {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
 
         assert!(
             provider_sent_copy.is_some(),
@@ -606,16 +602,8 @@ mod tests {
         let mut proof = SentMailProof::new(Some("Sent".to_string()), Some(99), "found", None);
         proof.copy_source = "client_appended";
 
-        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
-        let client_appended_copy = if proof.copy_source == "client_appended" {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
 
         assert!(
             provider_sent_copy.is_none(),
@@ -629,6 +617,23 @@ mod tests {
             client_appended_copy.as_ref().unwrap()["copy_source"],
             "client_appended"
         );
+    }
+
+    #[test]
+    fn cli_send_unresolved_never_reports_provider_sent_copy() {
+        // Blocker regression: a generic-provider APPEND failure resolves as
+        // `unresolved`; the CLI send output must not present it as provider proof.
+        let mut proof = SentMailProof::new(Some("Sent".to_string()), None, "not_found", None);
+        proof.copy_source = "unresolved";
+
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
+
+        assert!(
+            provider_sent_copy.is_none(),
+            "unresolved must never be presented as provider_sent_copy"
+        );
+        assert!(client_appended_copy.is_none());
     }
 
     #[test]

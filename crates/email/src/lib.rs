@@ -28,6 +28,7 @@ pub mod provider;
 pub mod reply;
 pub mod rules;
 pub mod send_policy;
+pub mod sent_proof;
 pub mod sieve;
 pub mod smtp;
 pub mod threading;

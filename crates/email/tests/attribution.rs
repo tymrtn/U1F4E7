@@ -27,7 +27,6 @@ const CANONICAL_SEND_KEYS: &[&str] = &[
     "informational",
     "human_edited",
     "short_body",
-    "agent_drafted",
     "has_attachment",
     "has_pii",
     "uncited_claims",
@@ -72,7 +71,6 @@ fn external_unknown_freemail_recipient_emits_risk_keys() {
         account_domain: Some("martin.fm".into()),
         recipient_domains: vec!["gmail.com".into()],
         recipient_count: 1,
-        agent_drafted: Some(true),
         cold_email: Some(true),
         unknown_domain: Some(true),
         ..Default::default()
@@ -81,7 +79,6 @@ fn external_unknown_freemail_recipient_emits_risk_keys() {
     assert!(attrs.contains(&"freemail_domain"));
     assert!(attrs.contains(&"unknown_domain"));
     assert!(attrs.contains(&"cold_email"));
-    assert!(attrs.contains(&"agent_drafted"));
     assert!(!attrs.contains(&"internal_domain"));
     assert!(!attrs.contains(&"known_contact"));
 }
@@ -128,31 +125,21 @@ fn draft_only_human_approved_edited_emit_intent_keys() {
 }
 
 #[test]
-fn human_edited_and_agent_drafted_can_both_be_true() {
-    // Operator-reviewed correction: AI origin and later human editing can BOTH be
-    // true and may intentionally offset one another. The protocol does not force
-    // them mutually exclusive until catalog semantics are calibrated; each is
-    // emitted on its own observed truth.
+fn agent_drafted_is_not_a_derived_host_fact() {
+    // agent_drafted is declarable author-context, never host-observed: even a
+    // context that (were the field to exist) claimed AI origin cannot make
+    // `to_governor_attrs` emit it. Envelope only ever emits `human_edited` from
+    // its own observation; agent authorship must be DECLARED by the bot.
     let ctx = AttributedSendContext {
         human_edited: Some(true),
-        agent_drafted: Some(true),
         ..Default::default()
     };
     let attrs = ctx.to_governor_attrs();
     assert!(attrs.contains(&"human_edited"));
-    assert!(attrs.contains(&"agent_drafted"));
-}
-
-#[test]
-fn agent_drafted_emitted_when_not_human_edited() {
-    let ctx = AttributedSendContext {
-        agent_drafted: Some(true),
-        human_edited: Some(false),
-        ..Default::default()
-    };
-    let attrs = ctx.to_governor_attrs();
-    assert!(attrs.contains(&"agent_drafted"));
-    assert!(!attrs.contains(&"human_edited"));
+    assert!(
+        !attrs.contains(&"agent_drafted"),
+        "agent_drafted must never be auto-derived — it is declarable author-context"
+    );
 }
 
 #[test]

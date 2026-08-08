@@ -721,15 +721,11 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     let db = state.db.lock().await;
                     match &action {
                         AttributionFailureAction::HumanReview => {
-                            // Park for re-approval, preserving human origin: release
-                            // the claim into pending_review; no attribution block is
-                            // rewritten. (release logs its own outcome.)
-                            db.release_sending_draft(
-                                &draft.id,
-                                &lease,
-                                envelope_email_store::DraftStatus::PendingReview,
-                            )
-                            .unwrap_or(false)
+                            // Park for re-approval, preserving human origin: no
+                            // attribution block is rewritten. `park_for_review`
+                            // clears `send_after` atomically so the parked draft
+                            // never reads as still-queued / due.
+                            db.park_for_review(&draft.id, &lease).unwrap_or(false)
                         }
                         AttributionFailureAction::Park { value } => db
                             .park_attribution_exhausted(&draft.id, &lease, value)
@@ -803,17 +799,21 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     " — releasing claim for retry"
                 }
             );
-            let released = release_claim(
-                state,
-                &draft.id,
-                &lease,
-                if pause_for_review {
-                    envelope_email_store::DraftStatus::PendingReview
-                } else {
-                    envelope_email_store::DraftStatus::Draft
-                },
-            )
-            .await;
+            // A durable review verdict parks pending_review AND clears send_after
+            // (`park_review_claim`) so no surface can present it as queued/due; a
+            // transient gate failure releases back to `draft` WITH send_after
+            // intact so a later sweep retries once Governor is reachable.
+            let released = if pause_for_review {
+                park_review_claim(state, &draft.id, &lease).await
+            } else {
+                release_claim(
+                    state,
+                    &draft.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Draft,
+                )
+                .await
+            };
             // Metadata-level send status: decision + optional block code only.
             // No recipients, subject, or body ever cross this channel. Publish
             // the blocked/deferred outcome ONLY when the transition actually
@@ -890,6 +890,21 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                 // detected folder + persisted Message-ID (a stored UID is not
                 // required and never trusted).
                 if persistence == SentPersistence::Recorded {
+                    // Sent-folder proof parity with the immediate CLI/MCP paths:
+                    // resolve (and client-append when needed) the Sent copy and
+                    // persist truthful proof/UID. Strictly after durable sent-state
+                    // persistence, and best-effort — a Sent-copy failure never
+                    // downgrades the confirmed send.
+                    resolve_and_record_sent_copy(
+                        creds,
+                        draft,
+                        &message_id,
+                        subject,
+                        &attachments,
+                        thread_in_reply_to.as_deref(),
+                        &thread_references,
+                    )
+                    .await;
                     cleanup_provider_draft_after_send(state, draft).await;
                 }
                 state
@@ -991,6 +1006,140 @@ async fn release_claim(
             );
             false
         }
+    }
+}
+
+/// Park a `sending` claim as `pending_review` after a durable Governor **review**
+/// verdict, clearing `send_after` under the owner lease so no surface (dashboard,
+/// CLI, or the due query) can present the parked draft as still queued or show a
+/// stale countdown. Nothing is transmitted and no Sent copy is written. Returns
+/// `true` only when the owned `sending` row was actually parked.
+async fn park_review_claim(state: &AppState, draft_id: &str, lease: &str) -> bool {
+    let db = state.db.lock().await;
+    match db.park_for_review(draft_id, lease) {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                "scheduled send: review park for draft {draft_id} matched no owned `sending` \
+                 row (already transitioned?)"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                "scheduled send: review park for draft {draft_id} failed: {e} — the draft \
+                 stays parked in `sending` (inert, never re-sent) until repaired"
+            );
+            false
+        }
+    }
+}
+
+/// Resolve and durably record the Sent-folder copy for a scheduled send that was
+/// transmitted and recorded `sent`, using the SAME source-aware resolver the
+/// immediate CLI/MCP paths use ([`envelope_email_transport::sent_proof`]). The
+/// archive copy (when the provider does not auto-file) is rebuilt with the SAME
+/// builder and Message-ID that was transmitted, so attachments and threading
+/// headers are preserved and a client-appended copy is never labeled provider
+/// proof. Best-effort: a failed lookup/append is logged (draft id, folder, uid,
+/// copy_source only — never addresses or content) and never downgrades the send.
+///
+/// The resolver borrows `&Database` across its IMAP awaits, and `Database` is
+/// `!Sync`, so it cannot run inside the `Send`-bound scheduled-send sweep future
+/// directly. It runs on a dedicated blocking thread with its own current-thread
+/// runtime and its own DB connection — the same bridge the event-delivery sweeper
+/// uses. `creds` is moved in (it is not needed again in this iteration).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_and_record_sent_copy(
+    creds: envelope_email_store::models::AccountWithCredentials,
+    draft: &envelope_email_store::Draft,
+    message_id: &str,
+    subject: &str,
+    attachments: &[envelope_email_transport::smtp::Attachment],
+    in_reply_to: Option<&str>,
+    references: &[String],
+) {
+    let draft_id = draft.id.clone();
+    let account_id = draft.account_id.clone();
+    let to = draft.to_addr.clone();
+    let subject = subject.to_string();
+    let text = draft.text_content.clone();
+    let html = draft.html_content.clone();
+    let cc = draft.cc_addr.clone();
+    let bcc = draft.bcc_addr.clone();
+    let reply_to = draft.reply_to.clone();
+    let in_reply_to = in_reply_to.map(str::to_string);
+    let references = references.to_vec();
+    let message_id = message_id.to_string();
+    let attachments = attachments.to_vec();
+
+    let join = tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(
+                    "scheduled send: sent-copy runtime build failed for draft {draft_id}: {e}"
+                );
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let db = match Database::open_default() {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::warn!(
+                        "scheduled send: sent-copy db open failed for draft {draft_id}: {e}"
+                    );
+                    return;
+                }
+            };
+            let provider_type = db.get_provider_type(&account_id).ok().flatten();
+            let result = envelope_email_transport::sent_proof::resolve_sent_copy_after_send(
+                &db,
+                &creds,
+                provider_type.as_deref(),
+                "", // account-default From, matching the scheduled SMTP send (no override)
+                &to,
+                &subject,
+                text.as_deref(),
+                html.as_deref(),
+                cc.as_deref(),
+                bcc.as_deref(),
+                reply_to.as_deref(),
+                in_reply_to.as_deref(),
+                &references,
+                &message_id,
+                &attachments,
+            )
+            .await;
+            match db.record_sent_copy_proof(
+                &draft_id,
+                result.proof.folder.as_deref(),
+                result.proof.uid,
+                result.proof.lookup_status,
+                result.proof.copy_source,
+            ) {
+                Ok(true) => info!(
+                    "scheduled send: recorded Sent copy for draft {draft_id} \
+                     (copy_source={}, uid={:?}, folder={:?})",
+                    result.proof.copy_source, result.proof.uid, result.proof.folder
+                ),
+                Ok(false) => tracing::warn!(
+                    "scheduled send: Sent-copy proof for draft {draft_id} not recorded \
+                     (row is not `sent`)"
+                ),
+                Err(e) => tracing::warn!(
+                    "scheduled send: failed to record Sent-copy proof for draft {draft_id}: {e}"
+                ),
+            }
+        });
+    })
+    .await;
+    if let Err(e) = join {
+        tracing::warn!("scheduled send: sent-copy task join failed: {e}");
     }
 }
 
@@ -1280,6 +1429,14 @@ fn scheduled_send_context(
         attachment_count: attachments.len(),
         sensitive_attachment,
         human_approved: draft.human_approved(),
+        // Derive `short_body` from the FINAL persisted bodies being transmitted
+        // via the one canonical policy, so the sweep corroborates a bot's
+        // `short_body` declaration identically to the direct CLI/MCP boundary and
+        // for every body shape (text, HTML-only, dual, empty). Always observable.
+        short_body: Some(envelope_email_transport::attribution::final_body_is_short(
+            draft.text_content.as_deref(),
+            draft.html_content.as_deref(),
+        )),
         ..Default::default()
     }
 }
@@ -2547,6 +2704,90 @@ mod tests {
         assert!(!attrs.contains(&"internal_domain"), "{attrs:?}");
     }
 
+    #[test]
+    fn scheduled_send_context_derives_short_body_for_every_body_shape() {
+        // Finding 1 (scheduled boundary): the sweep derives `short_body` from the
+        // FINAL persisted bodies for every shape — text, HTML-only, dual, empty —
+        // via the one canonical policy, so a truthful declaration is corroborated
+        // identically to the direct CLI/MCP boundary and is always observable.
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Agent', 'agent@martin.fm', 'martin.fm',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let long_words = vec!["word"; 120].join(" ");
+        let long_html = format!("<p>{}</p>", vec!["word"; 120].join(" "));
+
+        let short_for = |text: Option<&str>, html: Option<&str>| {
+            let draft = db
+                .create_draft(
+                    "acc1",
+                    "to@ex.com",
+                    Some("S"),
+                    text,
+                    html,
+                    None,
+                    None,
+                    None,
+                    Some("agent"),
+                )
+                .unwrap();
+            scheduled_send_context(&draft, Some("martin.fm".to_string()), &[]).short_body
+        };
+
+        assert_eq!(
+            short_for(Some("just a few words"), None),
+            Some(true),
+            "text short"
+        );
+        assert_eq!(short_for(Some(&long_words), None), Some(false), "text long");
+        assert_eq!(
+            short_for(None, Some("<html><body><p>tiny note</p></body></html>")),
+            Some(true),
+            "html-only short"
+        );
+        assert_eq!(
+            short_for(None, Some(&long_html)),
+            Some(false),
+            "html-only long"
+        );
+        assert_eq!(
+            short_for(Some("short text alt"), Some(&long_html)),
+            Some(true),
+            "dual: text alternative canonical"
+        );
+        // Empty body: zero words → short, and still observable (never unknown).
+        assert_eq!(short_for(Some(""), None), Some(true), "empty body");
+    }
+
+    #[test]
+    fn scheduled_sweep_persists_sent_proof_after_resolving_it() {
+        // Finding 3 (scheduled side of direct/scheduled durable parity): the sweep
+        // resolves the Sent copy, then annotates the durable draft row with the
+        // dedicated folder-qualified proof. Full send needs live SMTP/IMAP, so
+        // guard the wiring/ordering at the source boundary.
+        let src = include_str!("lib.rs");
+        let fn_start = src
+            .find("async fn resolve_and_record_sent_copy")
+            .expect("scheduled sent-copy resolver present");
+        let body = &src[fn_start..];
+        let resolve_at = body
+            .find("resolve_sent_copy_after_send(")
+            .expect("scheduled path resolves the Sent copy");
+        let record_at = body
+            .find("record_sent_copy_proof(")
+            .expect("scheduled path records the Sent proof durably");
+        assert!(
+            record_at > resolve_at,
+            "must resolve the Sent copy before persisting the proof"
+        );
+    }
+
     /// Scheduled attribution must declare `tyler_approved` only from the
     /// durable human attestation — never from agent-created state alone — so a
     /// human-approved send does not come back from Governor as review_required
@@ -2738,6 +2979,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,

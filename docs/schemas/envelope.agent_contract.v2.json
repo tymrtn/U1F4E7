@@ -189,7 +189,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v2",
-      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 120s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -279,7 +279,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "from": {
@@ -412,7 +412,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "folder": {
@@ -701,7 +701,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v2",
-      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 120s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -758,7 +758,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds). Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "draft_id": {
@@ -1202,7 +1202,7 @@
     "actual_send_cooldown": {
       "behavior": "Allowed sends (CLI send, MCP send/reply allowed modes, draft send / send_draft) queue into the outbox with a future send_after by default; real SMTP only happens later when the scheduled-send sweep finds them due. Queued responses include queued_reason_code=safety_cooldown and a human-readable queued_reason so agents know the delay is intentional safety time to report and correct issues.",
       "bypass": "Immediate transmission requires an explicit, confirmed bypass: send_now (or cooldown_seconds=0) together with confirm_send_now.",
-      "default_seconds": 120,
+      "default_seconds": 60,
       "denial_code": "immediate_send_requires_confirmation",
       "env": "ENVELOPE_SEND_COOLDOWN_SECONDS"
     },
@@ -1639,7 +1639,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "from": {
@@ -1716,7 +1716,7 @@
             ]
           },
           "cooldown_seconds": {
-            "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)",
+            "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 60)",
             "type": [
               "integer",
               "null"
@@ -2452,7 +2452,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "folder": {
@@ -2981,7 +2981,7 @@
             "type": "boolean"
           },
           "cooldown_seconds": {
-            "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
+            "description": "Override the default actual-send cooldown (seconds). Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS",
             "type": "integer"
           },
           "draft_id": {

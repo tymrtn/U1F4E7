@@ -1261,6 +1261,44 @@ pub async fn find_unique_uid_by_exact_message_id(
     folder: &str,
     message_id: &str,
 ) -> Result<Option<u32>, ImapError> {
+    Ok(
+        match find_exact_message_id_match(client, folder, message_id).await? {
+            ExactMessageIdMatch::Unique(uid) => Some(uid),
+            ExactMessageIdMatch::None | ExactMessageIdMatch::Ambiguous => None,
+        },
+    )
+}
+
+/// Classification of an exact Message-ID lookup, distinguishing "no exact match"
+/// from "more than one exact match" so callers can report an explicit, stable
+/// ambiguous status instead of collapsing both to `None` and inventing a UID.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ExactMessageIdMatch {
+    /// Exactly one candidate's Message-ID matched exactly (its UID).
+    Unique(u32),
+    /// No candidate matched exactly.
+    None,
+    /// More than one candidate matched exactly (duplicate Message-IDs) — no
+    /// arbitrary UID is returned.
+    Ambiguous,
+}
+
+/// Resolve a Message-ID to a single UID by exact header match, distinguishing
+/// zero / unique / ambiguous outcomes.
+///
+/// IMAP `SEARCH HEADER` is a substring match returning an arbitrary hit order,
+/// so its results are treated only as *candidates*: this fetches every
+/// candidate's actual Message-ID header (`BODY.PEEK`, no flag changes), compares
+/// exactly after normalization, and returns [`ExactMessageIdMatch::Unique`] only
+/// when exactly one candidate matches. Multiple exact matches yield
+/// [`ExactMessageIdMatch::Ambiguous`] (never an arbitrary UID). Bounded: it
+/// fetches only Message-ID headers of the search hits and never marks anything
+/// read.
+pub async fn find_exact_message_id_match(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+) -> Result<ExactMessageIdMatch, ImapError> {
     validate_imap_input(folder)?;
 
     client
@@ -1278,7 +1316,7 @@ pub async fn find_unique_uid_by_exact_message_id(
 
     let mut candidate_uids: Vec<u32> = uid_set.into_iter().collect();
     if candidate_uids.is_empty() {
-        return Ok(None);
+        return Ok(ExactMessageIdMatch::None);
     }
     candidate_uids.sort_unstable();
     let uid_set_arg = candidate_uids
@@ -1290,7 +1328,7 @@ pub async fn find_unique_uid_by_exact_message_id(
     let headers = fetch_message_headers_selected_uid_set(client, folder, &uid_set_arg).await?;
     let candidates: Vec<(u32, Option<String>)> =
         headers.into_iter().map(|h| (h.uid, h.message_id)).collect();
-    Ok(select_unique_exact_message_id(&candidates, message_id))
+    Ok(classify_exact_message_id_match(&candidates, message_id))
 }
 
 /// Pure candidate selection for [`find_unique_uid_by_exact_message_id`]:
@@ -1302,16 +1340,35 @@ pub fn select_unique_exact_message_id(
     candidates: &[(u32, Option<String>)],
     wanted: &str,
 ) -> Option<u32> {
-    let wanted = normalize_message_id(wanted)?;
+    match classify_exact_message_id_match(candidates, wanted) {
+        ExactMessageIdMatch::Unique(uid) => Some(uid),
+        ExactMessageIdMatch::None | ExactMessageIdMatch::Ambiguous => None,
+    }
+}
+
+/// Pure classification of exact Message-ID candidates: among `(uid, Message-ID
+/// header)` candidates from a substring search, distinguish no exact match, a
+/// single exact match, and multiple exact matches (duplicate Message-IDs) after
+/// normalization. Backs [`find_exact_message_id_match`].
+pub fn classify_exact_message_id_match(
+    candidates: &[(u32, Option<String>)],
+    wanted: &str,
+) -> ExactMessageIdMatch {
+    let Some(wanted) = normalize_message_id(wanted) else {
+        return ExactMessageIdMatch::None;
+    };
     let mut exact = candidates.iter().filter_map(|(uid, header)| {
         let candidate = normalize_message_id(header.as_deref()?)?;
         (candidate == wanted).then_some(*uid)
     });
-    let unique = exact.next()?;
+    let Some(unique) = exact.next() else {
+        return ExactMessageIdMatch::None;
+    };
     if exact.next().is_some() {
-        return None;
+        ExactMessageIdMatch::Ambiguous
+    } else {
+        ExactMessageIdMatch::Unique(unique)
     }
-    Some(unique)
 }
 
 /// Normalize a Message-ID for exact comparison: trim surrounding whitespace
@@ -1922,6 +1979,51 @@ mod tests {
         assert_eq!(
             select_unique_exact_message_id(&candidates, "dup@martin.fm"),
             None
+        );
+    }
+
+    #[test]
+    fn classify_exact_message_id_match_distinguishes_none_unique_ambiguous() {
+        // Unique: exactly one exact match among substring collisions.
+        let unique = vec![
+            (7, Some("<queued-1@martin.fm>".to_string())),
+            (11, Some("<queued-1@martin.fm.suffix>".to_string())),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&unique, "queued-1@martin.fm"),
+            ExactMessageIdMatch::Unique(7)
+        );
+
+        // None: only substring collisions, no exact match — distinct from ambiguity.
+        let none = vec![
+            (9, Some("<zzz-queued-1@martin.fm.evil>".to_string())),
+            (13, None),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&none, "queued-1@martin.fm"),
+            ExactMessageIdMatch::None
+        );
+        assert_eq!(
+            classify_exact_message_id_match(&[], "queued-1@martin.fm"),
+            ExactMessageIdMatch::None
+        );
+
+        // Ambiguous: duplicate exact Message-IDs — an explicit, stable status
+        // that never collapses to None or fabricates a UID.
+        let ambiguous = vec![
+            (7, Some("<dup@martin.fm>".to_string())),
+            (9, Some(" <DUP-not-equal@martin.fm> ".to_string())),
+            (12, Some("<dup@martin.fm>".to_string())),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&ambiguous, "dup@martin.fm"),
+            ExactMessageIdMatch::Ambiguous
+        );
+
+        // Empty / bracket-only wanted normalizes away → None.
+        assert_eq!(
+            classify_exact_message_id_match(&unique, "   "),
+            ExactMessageIdMatch::None
         );
     }
 

@@ -35,7 +35,7 @@ use crate::governor_catalog::HONESTY_RULES;
 pub const GOVERNOR_CATALOG: &str = "envelope";
 
 /// Default actual-send cooldown, in seconds, when nothing overrides it.
-pub const DEFAULT_COOLDOWN_SECONDS: i64 = 120;
+pub const DEFAULT_COOLDOWN_SECONDS: i64 = 60;
 
 /// Stable reason code included when an allowed send is queued instead of
 /// transmitted immediately.
@@ -1302,7 +1302,9 @@ mod tests {
     }
 
     #[test]
-    fn default_cooldown_is_120_seconds() {
+    fn default_cooldown_is_60_seconds() {
+        // The built-in default cooldown for a normal Governor-allowed send is 60s.
+        assert_eq!(DEFAULT_COOLDOWN_SECONDS, 60);
         // Explicit override wins.
         assert_eq!(resolve_cooldown_seconds(Some(45)), 45);
         // Negative override clamps to zero.

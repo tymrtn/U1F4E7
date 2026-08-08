@@ -86,7 +86,7 @@ beforeEach(() => {
     sent: false,
     status: 'queued',
     send_after: '2026-07-30T10:02:00Z',
-    cooldown_seconds: 120,
+    cooldown_seconds: 60,
     queued_reason_code: 'outbox_cooldown',
     queued_reason: 'held in the outbox cooldown'
   });
@@ -392,6 +392,37 @@ describe('DraftComposer queued state recovered on reload', () => {
   });
 });
 
+// ── Review-parked drafts render "Pending review", never "Queued" ───────
+//
+// Real evidence: a scheduled send that routed `review` was parked
+// `pending_review` but kept its expired `send_after`, so the dashboard rendered
+// it "Queued for sending" with a stale countdown and a locked composer — a
+// dangerously false picture, because the backend durably parked it for a human
+// decision and it must NOT send. The backend now clears `send_after` when it
+// parks for review; the frontend guard below is the matching defense-in-depth,
+// so `pending_review` never reads as queued even if a `send_after` lingered.
+
+describe('DraftComposer review-parked drafts render pending review, never queued', () => {
+  it('renders pending_review as Pending review with no queued banner even with a lingering send_after', async () => {
+    await renderLoaded({ status: 'pending_review', send_after: '2026-07-30T10:02:00Z' });
+
+    // Never presented as queued / due.
+    expect(document.getElementById('draft-queued')).toBeFalsy();
+    expect(screen.queryByText(/queued for sending/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/waiting in the outbox/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('Queued')).not.toBeInTheDocument();
+    // Explicit human-decision framing instead.
+    expect(screen.getByText('Pending review')).toBeInTheDocument();
+  });
+
+  it('renders a cleanly parked pending_review draft (no send_after) as Pending review', async () => {
+    await renderLoaded({ status: 'pending_review', send_after: null });
+
+    expect(document.getElementById('draft-queued')).toBeFalsy();
+    expect(screen.getByText('Pending review')).toBeInTheDocument();
+  });
+});
+
 // ── Recipient guard ───────────────────────────────────────────────────
 
 describe('DraftComposer recipient guard', () => {
@@ -503,7 +534,7 @@ describe('DraftComposer queue cancellation race', () => {
       sent: false,
       status: 'queued',
       send_after: '2026-07-30T10:02:00Z',
-      cooldown_seconds: 120,
+      cooldown_seconds: 60,
       queued_reason_code: 'safety_cooldown',
       queued_reason: 'held in the outbox cooldown'
     });

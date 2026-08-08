@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] — 2026-08-08
+
+### Changed
+
+- Normal Governor-allowed sends now queue for a **60-second** cooldown by default (down from 120s) before the outbox sweep transmits. Explicit confirmed immediate send (`send_now`/`--send-now` + `confirm_send_now`) still transmits now, honestly-declared review still parks the draft, and deny/invalid still stays unsent. Override precedence (`cooldown_seconds`, `ENVELOPE_SEND_COOLDOWN_SECONDS`) is unchanged, and the active `envelope.agent_contract.v2` schema was regenerated to advertise the 60-second default.
+- `short_body` is now derived from the **final body actually being sent** through one canonical policy at both the direct (CLI/MCP) and scheduled boundaries, covering every body shape: text (word count), HTML-only (visible-text word count, not markup tokens), dual-format (the text alternative is canonical), and empty/bodyless (zero words → short). A truthful `short_body` declaration on an HTML-only or bodyless message is now corroborated instead of left `host_verification_unavailable`.
+- Attribute provenance reconciled honestly for bot-originated sends: `agent_drafted` is now **declarable author-context** (the bot declares its own authorship; Envelope never infers it for a human CLI user). The weight-free public catalog projection reflects the updated per-key provenance; Governor weights, scores, and thresholds remain external and unchanged.
+
+### Fixed
+
+- Sent-folder proof is stored only in a dedicated, folder-qualified `metadata.sent_copy` object (`folder`, `uid` — explicit JSON `null` when unresolved — `lookup_status`, and `copy_source`) and is never written to the Drafts-folder `imap_uid` column. `mark_draft_sent` clears the stale Drafts UID along with `send_after` on the terminal `sent` state (provider Drafts cleanup still uses the pre-transition snapshot), so a Sent UID can never be conflated with a Drafts UID.
+- Immediate `draft send` and MCP `send_draft` now persist the resolved Sent-folder proof on the draft row, matching the scheduled sweep — direct and scheduled durable behavior no longer diverge. Ordering is preserved: SMTP accepted → terminal `sent` state → best-effort Sent lookup/append → durable proof annotation; a proof failure never retransmits.
+- The client-appended Sent archive copy now preserves the `Reply-To` header that SMTP transmitted, and keeps `Bcc` on the sender-private archive (normal sends still strip `Bcc` from the wire) so the sender retains the true recipient record. It already preserved Message-ID, To/Cc, subject, text/HTML, attachments, and threading headers.
+- Sent-copy resolution now matches the transmitted Message-ID **exactly and uniquely** — treating IMAP `SEARCH HEADER` hits as candidates and comparing their actual Message-ID headers after normalization — instead of taking an arbitrary substring hit; duplicate exact copies yield a stable `ambiguous` status with no UID. `copy_source` is now coherent with the observed outcome: a client append that fails and finds no exact copy is `unresolved` (never `not_attempted`), and a provider-side copy observed after a failed append is labeled `provider`.
+- Scheduled allowed sends resolve Sent-folder proof through the same source-aware resolver as the immediate CLI/MCP paths: after SMTP success the background sweep looks up the provider Sent copy by Message-ID and, when the provider does not auto-file, client-appends exactly one archive copy and records the truthful proof.
+- A scheduled send that the Governor routes to **review** is now parked `pending_review` with `send_after` cleared, so no surface can present a parked-for-review draft as queued. The dashboard draft page renders explicit *Pending review* (never "Queued for sending", a locked-until-it-sends composer, or a stale countdown); the composer no longer treats any `pending_review` row as queued.
+- `envelope draft show` now reports the true persisted draft status — distinguishing `sent`, `pending_review`, `queued` (a scheduled `draft` row), and ordinary `drafted` — instead of always emitting `drafted`.
+
 ## [1.0.5] — 2026-08-04
 
 ### Added

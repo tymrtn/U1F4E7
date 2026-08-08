@@ -202,7 +202,7 @@ enum Commands {
         /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
         #[arg(long)]
         confirm_new_re_subject: bool,
-        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        /// Override the actual-send cooldown before the outbox sweep may transmit (built-in default 60s; ENVELOPE_SEND_COOLDOWN_SECONDS also overrides)
         #[arg(long)]
         cooldown_seconds: Option<i64>,
         /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
@@ -937,7 +937,7 @@ enum DraftCmd {
         /// `envelope governor catalog --json`.
         #[arg(long = "attr")]
         attr: Vec<String>,
-        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        /// Override the actual-send cooldown before the outbox sweep may transmit (built-in default 60s; ENVELOPE_SEND_COOLDOWN_SECONDS also overrides)
         #[arg(long)]
         cooldown_seconds: Option<i64>,
         /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.

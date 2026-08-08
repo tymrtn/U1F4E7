@@ -72,9 +72,8 @@ pub struct AttributedSendContext {
     pub human_approved: bool,
     /// The draft was edited by a human after agent generation.
     pub human_edited: Option<bool>,
-    /// The content was drafted by an AI agent (and not human-edited).
-    pub agent_drafted: Option<bool>,
-    /// The body is under 100 words (count only, never the content).
+    /// The body is under 100 words (count only, never the content). Derived from
+    /// the final bodies via [`final_body_is_short`] at the send boundary.
     pub short_body: Option<bool>,
     /// The recipient is a known contact (store lookup).
     pub known_contact: Option<bool>,
@@ -141,12 +140,13 @@ impl AttributedSendContext {
         push_if(&mut attrs, "informational", self.informational);
 
         // ── Content ─────────────────────────────────────────────────────
-        // AI origin and later human editing can BOTH be true — they may
-        // intentionally offset one another. Per the operator-reviewed design the
-        // protocol does not force them mutually exclusive; each is emitted on its
-        // own observed truth, and any exclusivity is a future catalog decision.
+        // `agent_drafted` is declarable author-context (see
+        // `attribution_provenance`): only the bot knows its own authorship, and
+        // Envelope has no durable, verifiable origin signal for it at send time,
+        // so it is never inferred here — a human CLI user is never silently
+        // marked agent-drafted. `human_edited` stays host-derived, and AI origin
+        // plus later human editing can still both be declared/observed.
         push_if(&mut attrs, "human_edited", self.human_edited);
-        push_if(&mut attrs, "agent_drafted", self.agent_drafted);
         push_if(&mut attrs, "short_body", self.short_body);
         if self.attachment_count > 0 {
             attrs.push("has_attachment");
@@ -258,8 +258,9 @@ impl AttributedSendContext {
                 }
             }
             // Content-shape classifier facts: observed only when the classifier ran.
+            // `agent_drafted` is intentionally NOT here — it is declarable
+            // author-context, resolved by the `Declarable` arm, never host-observed.
             "human_edited" => self.human_edited,
-            "agent_drafted" => self.agent_drafted,
             "short_body" => self.short_body,
             // Host-derived keys Envelope has no signal for (e.g.
             // `unauthorized_outreach`): unobservable → declaration unverifiable.
@@ -725,6 +726,127 @@ mod resolve_tests {
         assert_eq!(rej.code, "host_verification_unavailable");
     }
 
+    // ── Provenance repair: agent_drafted declarable, short_body derived ─────
+
+    #[test]
+    fn agent_drafted_is_declarable_author_context_accepted_without_host_signal() {
+        // agent_drafted is authorship only the bot knows; Envelope cannot verify
+        // it from a generic CLI/MCP process. Declaring it is accepted verbatim as
+        // author-context, never rejected `host_verification_unavailable`.
+        let ctx = AttributedSendContext {
+            account_domain: Some("martin.fm".into()),
+            recipient_domains: vec!["acme.example".into()],
+            recipient_count: 1,
+            ..Default::default()
+        };
+        let res = resolve(&["agent_drafted".into()], &ctx, true);
+        assert_eq!(res.state, AttributionState::Attributed);
+        assert!(res.rejected_attrs.is_empty(), "{:?}", res.rejected_attrs);
+        assert!(res.governor_attrs.contains(&"agent_drafted".to_string()));
+        // It is the bot's DECLARATION, never a host inference.
+        assert!(!res.derived_attrs.contains(&"agent_drafted".to_string()));
+    }
+
+    #[test]
+    fn agent_drafted_is_never_auto_derived_for_human_cli_origin() {
+        // A generic CLI send that does not declare agent_drafted must never have
+        // Envelope silently infer AI authorship for it.
+        let ctx = AttributedSendContext {
+            account_domain: Some("martin.fm".into()),
+            recipient_domains: vec!["acme.example".into()],
+            recipient_count: 1,
+            ..Default::default()
+        };
+        let res = resolve(&["informational".into()], &ctx, true);
+        assert!(!res.derived_attrs.contains(&"agent_drafted".to_string()));
+        assert!(!res.governor_attrs.contains(&"agent_drafted".to_string()));
+    }
+
+    #[test]
+    fn short_body_declaration_is_corroborated_when_body_is_short() {
+        // With Envelope observing the final body is short (short_body = Some(true),
+        // as the send boundary now derives via `is_short_body`), a bot's short_body
+        // declaration is corroborated and accepted — never rejected
+        // `host_verification_unavailable` while the body was actually available.
+        let ctx = AttributedSendContext {
+            account_domain: Some("martin.fm".into()),
+            recipient_domains: vec!["acme.example".into()],
+            recipient_count: 1,
+            short_body: Some(true),
+            ..Default::default()
+        };
+        let res = resolve(&["short_body".into()], &ctx, true);
+        assert_eq!(res.state, AttributionState::Attributed);
+        assert!(res.accepted_redundant.contains(&"short_body".to_string()));
+        assert!(res.governor_attrs.contains(&"short_body".to_string()));
+    }
+
+    #[test]
+    fn is_short_body_counts_words_under_100() {
+        assert!(is_short_body("just a few words"));
+        assert!(is_short_body(""), "an empty body is trivially short");
+        let hundred = vec!["word"; 100].join(" ");
+        assert!(
+            !is_short_body(&hundred),
+            "exactly 100 words is not under 100"
+        );
+        let ninety_nine = vec!["w"; 99].join(" ");
+        assert!(is_short_body(&ninety_nine));
+    }
+
+    #[test]
+    fn final_body_is_short_resolves_every_final_body_shape() {
+        let long_words = vec!["word"; 120].join(" ");
+        let long_html = format!("<p>{}</p>", vec!["word"; 120].join(" "));
+
+        // Text-only: short and long.
+        assert!(final_body_is_short(Some("just a handful of words"), None));
+        assert!(!final_body_is_short(Some(&long_words), None));
+
+        // HTML-only: visible-text word count, not markup tokens. A short visible
+        // body wrapped in heavy markup is still short.
+        assert!(final_body_is_short(
+            None,
+            Some("<html><body><p>hi <b>there</b> friend</p></body></html>")
+        ));
+        assert!(!final_body_is_short(None, Some(&long_html)));
+
+        // HTML-only where the markup tokens alone would exceed 100 but the
+        // visible text is tiny: still short (we count visible text).
+        let markup_heavy = format!(
+            "<div class=\"{}\">short visible text</div>",
+            vec!["x"; 200].join(" ")
+        );
+        assert!(
+            final_body_is_short(None, Some(&markup_heavy)),
+            "visible text is short even when attribute markup is long"
+        );
+
+        // <script>/<style> contents are never counted as visible words.
+        let scripted = format!(
+            "<style>{}</style><script>{}</script><p>tiny body</p>",
+            vec!["z"; 200].join(" "),
+            vec!["q"; 200].join(" ")
+        );
+        assert!(final_body_is_short(None, Some(&scripted)));
+
+        // Dual format: the text alternative is canonical (short text wins even
+        // if the HTML alternative were long).
+        assert!(final_body_is_short(
+            Some("short text alt"),
+            Some(&long_html)
+        ));
+        // ...and a long text alternative makes it long regardless of HTML.
+        assert!(!final_body_is_short(Some(&long_words), Some("<p>hi</p>")));
+
+        // Empty / bodyless: zero words, therefore short — never unknown.
+        assert!(final_body_is_short(None, None));
+        assert!(final_body_is_short(Some(""), None));
+        assert!(final_body_is_short(Some("   "), Some("   ")));
+        // An empty text alternative falls back to the HTML alternative.
+        assert!(!final_body_is_short(Some("  "), Some(&long_html)));
+    }
+
     #[test]
     fn no_host_derived_key_is_silently_accepted_without_positive_observation() {
         // Coverage: with an empty context (no facts observed), declaring ANY
@@ -786,6 +908,106 @@ fn unverifiable_detail(key: &str) -> String {
     format!(
         "Envelope could not verify `{key}` at send time; a host-derived declaration is accepted only when Envelope independently observes it true — declare a fact Envelope can corroborate, or an author-context attribute you alone know"
     )
+}
+
+/// A body is `short_body` when its human-readable word count is under this.
+const SHORT_BODY_MAX_WORDS: usize = 100;
+
+/// Envelope's host-derived observation of the `short_body` catalog key from a
+/// single already-plain body string: it is under 100 words.
+///
+/// Word count only — the body text itself never enters an
+/// [`AttributedSendContext`] or the emitted key set. Prefer [`final_body_is_short`]
+/// at real send boundaries, which resolves every final-body shape (text / HTML /
+/// dual / empty); this primitive is the plain-text word count it builds on. An
+/// empty body is trivially short.
+pub fn is_short_body(body: &str) -> bool {
+    body.split_whitespace().count() < SHORT_BODY_MAX_WORDS
+}
+
+/// Canonical final-body policy for the `short_body` Governor attribute.
+///
+/// Returns whether the FINAL human-readable body actually being transmitted is
+/// under 100 words, resolving every final-body shape to a definite answer so a
+/// truthful `short_body` declaration is always independently observable with the
+/// final bodies in hand (never left `host_verification_unavailable`):
+///
+/// - non-empty text alternative present → count its words;
+/// - HTML-only → count the *visible* text (tags plus `<script>`/`<style>`
+///   contents stripped), never the markup tokens;
+/// - dual format → the text alternative is canonical (it carries the same
+///   semantic content and is already plain);
+/// - empty/bodyless → zero words, therefore short.
+///
+/// Word count only — no body text ever enters an [`AttributedSendContext`] or
+/// the emitted key set. This is the single helper the direct (CLI/MCP) and the
+/// scheduled send boundaries both call, so they derive `short_body` identically.
+pub fn final_body_is_short(text: Option<&str>, html: Option<&str>) -> bool {
+    final_body_word_count(text, html) < SHORT_BODY_MAX_WORDS
+}
+
+fn final_body_word_count(text: Option<&str>, html: Option<&str>) -> usize {
+    if let Some(t) = text
+        && !t.trim().is_empty()
+    {
+        return t.split_whitespace().count();
+    }
+    if let Some(h) = html
+        && !h.trim().is_empty()
+    {
+        return html_visible_word_count(h);
+    }
+    0
+}
+
+/// Count the words of the human-readable text inside an HTML body.
+///
+/// Drops `<script>`/`<style>` element contents and every `<...>` tag (treating
+/// each tag as a word boundary so `a<br>b` counts as two words), then counts the
+/// remaining whitespace-separated words. Deliberately dependency-free: only a
+/// word COUNT is needed, not faithful rendering, so small over/undercounting of
+/// markup-heavy bodies never changes the under-100 verdict in practice.
+fn html_visible_word_count(html: &str) -> usize {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < html.len() {
+        // Skip <script>/<style> element contents entirely (never visible text).
+        if lower[i..].starts_with("<script") || lower[i..].starts_with("<style") {
+            let close = if lower[i..].starts_with("<script") {
+                "</script"
+            } else {
+                "</style"
+            };
+            i = match lower[i..].find(close) {
+                Some(rel) => {
+                    let after = i + rel;
+                    match html[after..].find('>') {
+                        Some(gt) => after + gt + 1,
+                        None => html.len(),
+                    }
+                }
+                None => html.len(),
+            };
+            out.push(' ');
+            continue;
+        }
+        let ch = html[i..].chars().next().expect("i is a char boundary");
+        if ch == '<' {
+            i = match html[i..].find('>') {
+                Some(gt) => i + gt + 1,
+                None => html.len(),
+            };
+            out.push(' ');
+            continue;
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .split_whitespace()
+        .count()
 }
 
 /// Push `key` only when the tri-state flag was observed *true*. `Some(false)` and

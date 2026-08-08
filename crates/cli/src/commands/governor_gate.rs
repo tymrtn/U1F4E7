@@ -44,6 +44,8 @@ pub(crate) fn governor_request(
     draft_id: Option<&str>,
     attachments: &[Attachment],
     is_reply: bool,
+    text_body: Option<&str>,
+    html_body: Option<&str>,
     declared: &[String],
 ) -> GovernorRequest {
     let summary = collect_recipient_domains(to, cc, bcc);
@@ -58,6 +60,14 @@ pub(crate) fn governor_request(
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        // Derive `short_body` from the FINAL bodies actually being sent via the
+        // one canonical policy, so a bot's `short_body` declaration is
+        // corroborated (not rejected host_verification_unavailable) for every
+        // body shape — text, HTML-only, dual, and empty. With the final bodies
+        // in hand `short_body` is always observable, never left unknown.
+        short_body: Some(envelope_email_transport::attribution::final_body_is_short(
+            text_body, html_body,
+        )),
         ..Default::default()
     };
     let sizes: Vec<(String, u64)> = attachments
@@ -286,6 +296,124 @@ mod tests {
         assert!(!outcome.allowed);
         assert!(!outcome.is_attribution_failure());
         assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+    }
+
+    #[test]
+    fn governor_request_derives_short_body_from_the_final_body() {
+        // Regression: a bot declaring `short_body` on a genuinely short body must
+        // be corroborated — not rejected `host_verification_unavailable` because
+        // the send boundary failed to observe the body (real evidence case C).
+        let short = "just a handful of words in this short body";
+        let req = governor_request(
+            "acc1",
+            Some("example.com".into()),
+            "subject",
+            "to@example.com",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            Some(short),
+            None,
+            &["short_body".to_string()],
+        );
+        let res = req.resolution.expect("governor_request always resolves");
+        assert!(
+            res.is_attributed(),
+            "short body should corroborate declared short_body: {:?}",
+            res.rejected_attrs
+        );
+        assert!(res.governor_attrs.contains(&"short_body".to_string()));
+        assert!(res.accepted_redundant.contains(&"short_body".to_string()));
+    }
+
+    #[test]
+    fn governor_request_derives_short_body_from_html_only_body() {
+        // Real evidence: an HTML-only send left `short_body` unobserved because
+        // the boundary inspected only the text alternative. The canonical policy
+        // now counts the HTML's visible text, so a truthful `short_body`
+        // declaration on an HTML-only message is corroborated.
+        let req = governor_request(
+            "acc1",
+            Some("example.com".into()),
+            "subject",
+            "to@example.com",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            None,
+            Some("<html><body><p>a short html-only note</p></body></html>"),
+            &["short_body".to_string()],
+        );
+        let res = req.resolution.expect("governor_request always resolves");
+        assert!(
+            res.is_attributed(),
+            "html-only short body must corroborate declared short_body: {:?}",
+            res.rejected_attrs
+        );
+        assert!(res.accepted_redundant.contains(&"short_body".to_string()));
+    }
+
+    #[test]
+    fn governor_request_rejects_short_body_declaration_on_a_long_body() {
+        // The derivation is honest in both directions: declaring `short_body` on a
+        // long body contradicts Envelope's observation and fails the request.
+        let long = vec!["word"; 150].join(" ");
+        let req = governor_request(
+            "acc1",
+            Some("example.com".into()),
+            "subject",
+            "to@example.com",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            Some(&long),
+            None,
+            &["short_body".to_string()],
+        );
+        let res = req.resolution.expect("governor_request always resolves");
+        assert!(!res.is_attributed());
+        assert!(
+            res.rejected_attrs
+                .iter()
+                .any(|r| r.key == "short_body" && r.code == "conflicts_with_host_observation"),
+            "long body must contradict declared short_body: {:?}",
+            res.rejected_attrs
+        );
+    }
+
+    #[test]
+    fn governor_request_accepts_agent_drafted_as_declarable_author_context() {
+        // agent_drafted is now declarable author-context: a bot declaring it on a
+        // generic CLI process is accepted, never rejected
+        // host_verification_unavailable (real evidence case C).
+        let req = governor_request(
+            "acc1",
+            Some("example.com".into()),
+            "subject",
+            "to@example.com",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            Some("a short body"),
+            None,
+            &["agent_drafted".to_string()],
+        );
+        let res = req.resolution.expect("governor_request always resolves");
+        assert!(res.is_attributed(), "{:?}", res.rejected_attrs);
+        assert!(res.governor_attrs.contains(&"agent_drafted".to_string()));
+        assert!(!res.derived_attrs.contains(&"agent_drafted".to_string()));
     }
 
     #[test]
