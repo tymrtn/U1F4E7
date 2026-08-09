@@ -546,8 +546,17 @@ pub async fn apply_core(
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            let action_result =
-                execute_action(client, &action, uid, folder, Some(&rule.name), Some(&ctx)).await;
+            let action_result = execute_action(
+                client,
+                db,
+                account_id,
+                &action,
+                uid,
+                folder,
+                Some(&rule.name),
+                Some(&ctx),
+            )
+            .await;
             match &action_result {
                 Ok(desc) => {
                     info!("rule '{}' fired on UID {uid}: {desc}", rule.name);
@@ -674,6 +683,8 @@ pub async fn run_apply(
 /// trying to fabricate a bounce on already-delivered mail.
 async fn execute_action(
     client: &mut imap::ImapClient,
+    db: &envelope_email_store::Database,
+    account_id: &str,
     action: &Action,
     uid: u32,
     folder: &str,
@@ -685,10 +696,25 @@ async fn execute_action(
     }
     match action {
         Action::Move(dest) => {
-            imap::move_message(client, uid, folder, dest)
+            // A canonical sentinel (`\Junk`/`\Archive`/`\Trash`) is resolved to
+            // this account's real provider folder before moving; a literal folder
+            // passes through unchanged. An unresolved sentinel fails loudly rather
+            // than misfiling into a literal `\Junk` mailbox.
+            let real = envelope_email_transport::folders::resolve_move_destination(
+                client, db, account_id, dest,
+            )
+            .await
+            .with_context(|| format!("failed to resolve move target {dest} for UID {uid}"))?
+            .with_context(|| {
+                format!(
+                    "no provider folder for canonical move target {dest} (UID {uid}); \
+                     not moving into a literal {dest}"
+                )
+            })?;
+            imap::move_message(client, uid, folder, &real)
                 .await
-                .with_context(|| format!("failed to move UID {uid} to {dest}"))?;
-            Ok(format!("moved to {dest}"))
+                .with_context(|| format!("failed to move UID {uid} to {real}"))?;
+            Ok(format!("moved to {real}"))
         }
         Action::Flag(flag) => {
             imap::set_flag(client, folder, uid, flag)

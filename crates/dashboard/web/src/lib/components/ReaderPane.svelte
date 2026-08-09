@@ -7,7 +7,11 @@
   //   • Headers block with from/to/cc/date/subject; to+cc collapsed behind Details
   //   • Thread strip (ThreadStrip)
   //   • Attachment list (AttachmentList)
-  //   • Explicit read toggle (never auto-marks read — invariant)
+  //   • Read-on-open: a successful open marks the message \Seen through an
+  //     intentional STORE mutation (the content fetch stays BODY.PEEK). A
+  //     failed load never marks read; re-opening a read message is idempotent.
+  //     Evidence/export paths are read-only and never reach this component.
+  //   • Explicit read/unread toggle (restores unread after auto-read)
   //   • MonoTag copy affordances for uid + message-id (click-to-copy, toast)
 
   import { page } from '$app/state';
@@ -24,6 +28,7 @@
     type ThreadMessage
   } from '$lib/reader-api';
   import { EnvelopeApiError } from '$lib/api';
+  import { readState } from '$lib/read-state.svelte';
 
   // ── Route params ──────────────────────────────────────────────────────
 
@@ -139,6 +144,15 @@
       const res = await fetchMessageDetail(acct, u, f);
       message = res.message;
 
+      // Read-on-open: the successful load is the operator's explicit read
+      // action. Fire an intentional \Seen STORE (not a BODY[] side effect).
+      // Idempotent — skip when the message already carries \Seen.
+      if (!isSeen(message.flags)) {
+        void markReadOnOpen(acct, u, f);
+      } else {
+        readState.markRead(acct, f, u);
+      }
+
       // Thread: load if message_id is present (fire-and-forget, no blocking).
       if (message.message_id) {
         threadLoading = true;
@@ -169,6 +183,23 @@
     }
   }
 
+  // Mark a freshly-opened unread message \Seen. On success, reflect Read in
+  // this pane and in the shared list store so the row un-bolds without a
+  // refetch. On failure, leave the message unread and say so (never silent).
+  async function markReadOnOpen(acct: string, u: number, f: string) {
+    try {
+      await postFlags(acct, u, f, ['\\Seen'], []);
+    } catch {
+      showToast('Couldn’t mark read', 'warn');
+      return;
+    }
+    readState.markRead(acct, f, u);
+    // Only reflect in this pane if it's still showing the same message.
+    if (accountId === acct && uid === u && folder === f) {
+      localSeen = true;
+    }
+  }
+
   $effect(() => {
     const key = `${accountId}:${uid}:${folder}`;
     if (accountId && uid && key !== loadKey) {
@@ -188,6 +219,8 @@
     try {
       await postFlags(accountId, uid, folder, add, remove);
       localSeen = !currentlyRead;
+      if (localSeen) readState.markRead(accountId, folder, uid);
+      else readState.markUnread(accountId, folder, uid);
       showToast(currentlyRead ? 'Marked unread' : 'Marked read');
     } catch (e) {
       const err = e as EnvelopeApiError;
@@ -277,9 +310,6 @@
           </button>
         </div>
       </header>
-
-      <!-- Reading note — plain language, no protocol jargon -->
-      <p class="reader-read-note">Reading here never marks messages as read.</p>
 
       <!-- ── Thread strip ───────────────────────────────────────────── -->
       {#if threadLoading || threadMessages.length > 1}
@@ -426,7 +456,7 @@
     <!-- Empty / no-message-selected state -->
     <div class="reader-empty" id="reader-empty">
       <p class="reader-empty-msg">Select a message to read it.</p>
-      <p class="reader-empty-note">Reading here never marks messages as read.</p>
+      <p class="reader-empty-note">Opening a message marks it read.</p>
     </div>
   {/if}
 </div>
@@ -524,13 +554,6 @@
     align-items: center;
     gap: 0.5rem;
     flex-shrink: 0;
-  }
-
-  /* Reader note */
-  .reader-read-note {
-    margin: 0 0 0.75rem;
-    font-size: 0.75rem;
-    color: var(--env-muted);
   }
 
   /* Meta dl */

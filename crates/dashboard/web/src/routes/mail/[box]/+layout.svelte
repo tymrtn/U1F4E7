@@ -15,6 +15,7 @@
   import UndoToast from '$lib/components/UndoToast.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
   import { SelectionStore } from '$lib/selection.svelte';
+  import { readState } from '$lib/read-state.svelte';
   import { getLiveStore } from '$lib/live.svelte';
   import { getComposerStore } from '$lib/composer.svelte';
   import {
@@ -238,6 +239,23 @@
     page.params.box === 'unified' ? 'INBOX' : 'INBOX'
   );
 
+  // Per-message context the toolbar needs for truthful junk-rules (exact
+  // sender), snooze (message-id/subject for the round-trip), and per-item folder
+  // dispatch. The unified inbox carries each row's real source folder, so use it
+  // rather than assuming the route folder — a unified surface can span mailboxes.
+  const unifiedMessageIndex = $derived.by(() => {
+    const idx: Record<string, { from: string; folder: string; message_id: string | null; subject: string | null }> = {};
+    for (const m of unifiedMessages) {
+      idx[`${m.account_id}:${m.uid}`] = {
+        from: m.from_addr ?? '',
+        folder: m.folder ?? 'INBOX',
+        message_id: m.message_id ?? null,
+        subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
   async function handleOperated() {
     const slug = page.params.box ?? 'unified';
     if (slug === 'unified') await loadUnified();
@@ -388,6 +406,7 @@
         {selection}
         folder={currentFolder}
         {folders}
+        messageIndex={unifiedMessageIndex}
         onoperated={handleOperated}
       />
     {/if}
@@ -480,7 +499,7 @@
                   from: senderLabel(m),
                   date: m.date,
                   snippet: m.snippet,
-                  unread: m.unread,
+                  unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
                   accountChip: m.account_display_name || m.account_username,
                   href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,

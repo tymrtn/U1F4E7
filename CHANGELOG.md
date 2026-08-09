@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.9] — 2026-08-08
+
+### Added
+
+- The dashboard Unified Inbox now exposes a sticky, accessible selection toolbar for Archive, provider-aware Trash/Junk, Flag, Snooze, read/unread, custom Move, and exact-sender junk-rule creation. Multi-account operations retain failed selections and report partial results honestly; the 390px layout uses full-size touch targets without overflow.
+- Dashboard Snooze now has a real validated API path with presets and custom UTC times, backed by Envelope's existing `Snoozed` folder and return sweep.
+
+### Changed
+
+- Opening a message in the interactive dashboard intentionally marks it `\\Seen` after a successful `BODY.PEEK` load and immediately updates the mounted list row. CLI, MCP, quickstart, and evidence reads remain non-mutating.
+- Archive, Junk, and Trash actions use canonical semantic destinations resolved against each account's detected provider folders; Gmail, Outlook, and generic IMAP names are never assumed. Exact operator-selected custom folders remain literal.
+
+### Fixed
+
+- Read-state overrides are keyed by account, folder, and UID, preventing mailbox-scoped UID collisions between Inbox, Sent, Junk, and other folders.
+- Dashboard Delete now moves ordinary messages to provider Trash instead of permanently expunging them. Hard delete remains explicit and confirmed only from Trash.
+- Canonical move targets used by dashboard-created junk rules are resolved by both dashboard and CLI rule executors; unresolved targets fail without creating or moving into a misleading literal folder.
+
 ## [1.0.8] — 2026-08-08
 
 ### Changed

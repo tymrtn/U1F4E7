@@ -41,6 +41,7 @@ import {
   type ThreadMessage
 } from '$lib/reader-api';
 import { EnvelopeApiError } from '$lib/api';
+import { __resetReadState } from '$lib/read-state.svelte';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -67,6 +68,7 @@ beforeEach(() => {
   readerApiMock.fetchMessageDetail.mockResolvedValue({ message: BASE_MSG });
   readerApiMock.fetchThread.mockResolvedValue(null);
   readerApiMock.postFlags.mockResolvedValue({ ok: true, uid: 42, added: [], removed: [] });
+  __resetReadState();
 });
 
 afterEach(() => {
@@ -309,8 +311,8 @@ describe('ReaderPane', () => {
     await waitFor(() =>
       expect(screen.getByText('Select a message to read it.')).toBeInTheDocument()
     );
-    // The "never marks read" note uses plain language.
-    expect(screen.getByText('Reading here never marks messages as read.')).toBeInTheDocument();
+    // The empty-state hint sets read-on-open expectations in plain language.
+    expect(screen.getByText('Opening a message marks it read.')).toBeInTheDocument();
   });
 
   it('shows text/HTML toggle when both bodies are present', async () => {
@@ -323,15 +325,13 @@ describe('ReaderPane', () => {
     expect(screen.getByRole('button', { name: /Plain text/i })).toBeInTheDocument();
   });
 
-  it('calls postFlags when mark-read button is clicked', async () => {
+  it('auto-marks an unread message read on successful open (postFlags add \\Seen, exactly once)', async () => {
     readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
       message: { ...BASE_MSG, flags: [] } // unread
     });
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
 
-    const btn = screen.getByRole('button', { name: /mark read/i });
-    await fireEvent.click(btn);
     await waitFor(() =>
       expect(readerApiMock.postFlags).toHaveBeenCalledWith(
         'acct-a',
@@ -341,6 +341,27 @@ describe('ReaderPane', () => {
         []
       )
     );
+    expect(readerApiMock.postFlags).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT auto-mark read when the detail load fails', async () => {
+    readerApiMock.fetchMessageDetail.mockRejectedValueOnce(
+      new EnvelopeApiError(502, 'imap_unavailable', 'IMAP down', null)
+    );
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(readerApiMock.postFlags).not.toHaveBeenCalled();
+  });
+
+  it('does NOT re-mark an already-read message on open (idempotent)', async () => {
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
+      message: { ...BASE_MSG, flags: ['\\Seen'] } // already read
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    // Give any async auto-mark a chance to (wrongly) fire.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(readerApiMock.postFlags).not.toHaveBeenCalled();
   });
 
   it('calls postFlags to remove \\Seen when marking unread', async () => {
@@ -372,19 +393,19 @@ describe('ReaderPane', () => {
     expect(screen.queryByText('Unread')).not.toBeInTheDocument();
   });
 
-  it('shows "Unread" badge when message has no \\Seen flag', async () => {
-    render(ReaderPane);
-    await waitFor(() => expect(screen.getByText('Unread')).toBeInTheDocument());
+  it('flips the badge to "Read" after auto-marking an unread message on open', async () => {
+    render(ReaderPane); // BASE_MSG is unread (flags: [])
+    await waitFor(() => expect(screen.getByText('Read')).toBeInTheDocument());
+    expect(screen.queryByText('Unread')).not.toBeInTheDocument();
   });
 
-  it('reader note uses plain language — no protocol jargon', async () => {
+  it('reader UI uses plain language — no protocol jargon', async () => {
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
-    // Must contain the human note.
-    expect(screen.getByText('Reading here never marks messages as read.')).toBeInTheDocument();
     // Must NOT expose protocol names to the user.
     const bodyText = document.body.textContent ?? '';
     expect(bodyText).not.toContain('BODY.PEEK');
+    expect(bodyText).not.toContain('\\Seen');
   });
 
   it('renders thread strip when thread has multiple messages', async () => {

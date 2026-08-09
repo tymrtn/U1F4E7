@@ -144,10 +144,11 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
 
     if (!res.ok) {
       const errBody = (await safeJson(res)) as
-        | { code?: string; error?: string; message?: string }
+        | { code?: string; error?: string; message?: string; reason?: string }
         | undefined;
       const code = errBody?.code ?? `http_${res.status}`;
-      const message = errBody?.message ?? errBody?.error ?? `request failed (${res.status})`;
+      const message =
+        errBody?.message ?? errBody?.error ?? errBody?.reason ?? `request failed (${res.status})`;
       throw new EnvelopeApiError(res.status, code, message, errBody);
     }
 
@@ -658,6 +659,33 @@ export const api = {
   },
 
   /**
+   * POST /api/accounts/{id}/messages/{uid}/snooze
+   * Moves a message to the Snoozed folder until `return_at` and records it so
+   * the background sweep returns it. `return_at` is a wall-clock timestamp
+   * (`YYYY-MM-DDTHH:MM:SS`) — the same shape `envelope snooze set` writes.
+   */
+  snoozeMessage(
+    accountId: string,
+    uid: number,
+    opts: { folder?: string; return_at: string; message_id?: string | null; subject?: string | null },
+    o?: RequestOptions
+  ): Promise<{ ok: boolean; uid: number; return_at: string; snoozed_folder: string }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/snooze`,
+      {
+        ...o,
+        method: 'POST',
+        body: {
+          folder: opts.folder ?? 'INBOX',
+          return_at: opts.return_at,
+          message_id: opts.message_id ?? null,
+          subject: opts.subject ?? null
+        }
+      }
+    );
+  },
+
+  /**
    * GET /api/accounts/{id}/search?q=...&folder=...
    * Account-scoped IMAP search.
    */
@@ -811,6 +839,12 @@ export type BulkOp =
 export interface BulkItem {
   accountId: string;
   uid: number;
+  /**
+   * The message's own source folder. IMAP UIDs are mailbox-scoped, so a unified
+   * selection can span folders; each item is dispatched with its own folder,
+   * falling back to the op's folder when absent (single-folder surfaces).
+   */
+  folder?: string;
 }
 
 export interface BulkProgress {
@@ -840,20 +874,23 @@ export async function bulkClient(
   async function runOne(item: BulkItem): Promise<void> {
     try {
       const o: RequestOptions = fetchImpl ? { fetchImpl } : {};
+      // Each item carries its own source folder (unified selections span
+      // mailboxes); the op-level folder is only the fallback default.
+      const folder = item.folder ?? op.folder ?? 'INBOX';
       if (op.type === 'flags') {
         await request(
           `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/flags`,
-          { ...o, method: 'POST', body: { folder: op.folder ?? 'INBOX', add: op.add ?? [], remove: op.remove ?? [] } }
+          { ...o, method: 'POST', body: { folder, add: op.add ?? [], remove: op.remove ?? [] } }
         );
       } else if (op.type === 'move') {
         await request(
           `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/move`,
-          { ...o, method: 'POST', body: { folder: op.folder ?? 'INBOX', to_folder: op.to_folder } }
+          { ...o, method: 'POST', body: { folder, to_folder: op.to_folder } }
         );
       } else if (op.type === 'delete') {
         await request(
           `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}`,
-          { ...o, method: 'DELETE', query: { folder: op.folder ?? 'INBOX' } }
+          { ...o, method: 'DELETE', query: { folder } }
         );
       }
     } catch (e) {

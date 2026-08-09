@@ -390,6 +390,8 @@ pub async fn run_enabled(
             let action_result = {
                 let mut client = client_arc.lock().await;
                 execute_action(
+                    &state,
+                    &account_id,
                     &mut client,
                     &action,
                     uid,
@@ -765,6 +767,8 @@ pub async fn disable(
 }
 
 async fn execute_action(
+    state: &AppState,
+    account_id: &str,
     client: &mut envelope_email_transport::ImapClient,
     action: &Action,
     uid: u32,
@@ -777,10 +781,34 @@ async fn execute_action(
     }
     match action {
         Action::Move(dest) => {
-            envelope_email_transport::imap::move_message(client, uid, folder, dest)
+            // A canonical sentinel (`\Junk`/`\Archive`/`\Trash`) is a
+            // provider-aware SEMANTIC target: resolve it to this account's real
+            // folder before moving so an exact-sender junk rule reaches
+            // Gmail's Spam / Outlook's Junk Email / the detected special-use
+            // folder rather than a literal `\Junk`. A literal folder name passes
+            // through unchanged. An unresolved sentinel FAILS the move loudly —
+            // never a silent misfile into a literal `\Junk` mailbox.
+            let real = match envelope_email_transport::folders::canonical_move_key(dest) {
+                Some(canonical_type) => super::messages::resolve_canonical_folder(
+                    state,
+                    client,
+                    account_id,
+                    canonical_type,
+                )
                 .await
-                .with_context(|| format!("failed to move UID {uid} to {dest}"))?;
-            Ok(format!("moved to {dest}"))
+                .with_context(|| format!("failed to resolve move target {dest} for UID {uid}"))?
+                .with_context(|| {
+                    format!(
+                        "no provider folder for canonical move target {dest} (UID {uid}); \
+                         not moving into a literal {dest}"
+                    )
+                })?,
+                None => dest.clone(),
+            };
+            envelope_email_transport::imap::move_message(client, uid, folder, &real)
+                .await
+                .with_context(|| format!("failed to move UID {uid} to {real}"))?;
+            Ok(format!("moved to {real}"))
         }
         Action::Flag(flag) => {
             envelope_email_transport::imap::set_flag(client, folder, uid, flag)

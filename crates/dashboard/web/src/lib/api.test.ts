@@ -132,6 +132,30 @@ describe('request() CSRF handling', () => {
     expect(err.code).toBe('dashboard_auth_required');
     expect(err.status).toBe(401);
   });
+
+  it('surfaces a backend reason as the actionable error message', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          code: 'folder_not_resolved',
+          reason: 'No provider Trash folder was detected; choose a folder with Move… instead.'
+        },
+        { status: 422 }
+      )
+    );
+
+    const err = await request('/accounts/acct/messages/7/move', { fetchImpl }).then(
+      () => {
+        throw new Error('expected request to fail');
+      },
+      (error: unknown) => error
+    );
+    expect(err).toBeInstanceOf(EnvelopeApiError);
+    if (!(err instanceof EnvelopeApiError)) throw new Error('expected EnvelopeApiError');
+    expect(err.code).toBe('folder_not_resolved');
+    expect(err.status).toBe(422);
+    expect(err.message).toContain('No provider Trash folder was detected');
+  });
 });
 
 describe('api.health()', () => {
@@ -153,5 +177,35 @@ describe('api.health()', () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ code: 'boom' }, { status: 500 }));
 
     await expect(api.health({ fetchImpl })).rejects.toBeInstanceOf(EnvelopeApiError);
+  });
+});
+
+describe('api.snoozeMessage()', () => {
+  it('POSTs /messages/{uid}/snooze with folder + return_at body', async () => {
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url).includes('/api/csrf')) return jsonResponse({ token: 'tok' });
+      return jsonResponse({ ok: true, uid: 42, return_at: '2026-08-09T09:00:00', snoozed_folder: 'Snoozed' });
+    });
+
+    const res = await api.snoozeMessage(
+      'acct-a',
+      42,
+      { folder: 'INBOX', return_at: '2026-08-09T09:00:00', message_id: '<m@x>', subject: 'Hi' },
+      { fetchImpl }
+    );
+
+    expect(res.snoozed_folder).toBe('Snoozed');
+    const call = fetchCalls(fetchImpl).find(([u]) => String(u).includes('/messages/42/snooze'));
+    expect(call).toBeTruthy();
+    const [url, init] = call!;
+    expect(url).toBe('/api/accounts/acct-a/messages/42/snooze');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('POST');
+    const body = JSON.parse(String(init?.body));
+    expect(body).toMatchObject({
+      folder: 'INBOX',
+      return_at: '2026-08-09T09:00:00',
+      message_id: '<m@x>',
+      subject: 'Hi'
+    });
   });
 });

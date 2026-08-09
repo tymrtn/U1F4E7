@@ -1,9 +1,37 @@
 <script lang="ts">
   import { Badge, Button, Drawer, EmptyState, Modal, MonoTag, Spinner, Toast } from '$lib/components';
+  import { SelectionStore } from '$lib/selection.svelte';
+  import MessageRow from '$lib/components/MessageRow.svelte';
+  import BulkToolbar from '$lib/components/BulkToolbar.svelte';
 
   let modalOpen = $state(false);
   let drawerOpen = $state(false);
   let showToast = $state(true);
+
+  // Selection-toolbar showcase (no backend): two rows, both pre-selected so the
+  // sticky action surface renders. Junk/Snooze menus are pure UI state.
+  const demoSelection = new SelectionStore();
+  const demoMessages = [
+    {
+      key: 'demo:1', uid: 1, accountId: 'demo',
+      subject: 'Re: [NousResearch/hermes-agent] Add linked-activity startup notices',
+      from: 'notifications@github.com', date: '2026-07-29T10:00:00Z', snippet: null,
+      unread: true, starred: false, accountChip: 'ty@tmrtn.com', href: '#'
+    },
+    {
+      key: 'demo:2', uid: 2, accountId: 'demo',
+      subject: 'Celebra el Día Mundial del Tigre en el Zoo',
+      from: 'newsletter@info.zoomadrid.com', date: '2026-07-29T09:00:00Z', snippet: null,
+      unread: false, starred: true, accountChip: 'ty@tmrtn.com', href: '#'
+    }
+  ];
+  const demoOrdered = demoMessages.map((m) => m.key);
+  demoSelection.toggle('demo:1');
+  demoSelection.toggle('demo:2');
+  const demoIndex: Record<string, { from: string; folder: string; message_id?: string; subject?: string }> = {
+    'demo:1': { from: 'notifications@github.com', folder: 'INBOX', message_id: '<1@x>', subject: 'Re: hermes-agent' },
+    'demo:2': { from: 'newsletter@info.zoomadrid.com', folder: 'INBOX' }
+  };
 </script>
 
 <div class="sink">
@@ -68,6 +96,29 @@
           <Button variant="ghost">Compose</Button>
         {/snippet}
       </EmptyState>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2 class="block-head">Selection toolbar</h2>
+    <p class="block-note">
+      Appears when rows are selected · icon+label, 44px targets on phone · Snooze/Junk are split
+      menus · secondary actions (Mark read/unread · Unflag · Move…) live behind More · from an
+      ordinary mailbox Delete moves to Trash (reversible).
+    </p>
+    <div class="framed sink-list">
+      <BulkToolbar selection={demoSelection} folder="INBOX" messageIndex={demoIndex} />
+      <ul class="sink-msg-list">
+        {#each demoMessages as m (m.key)}
+          <li>
+            <MessageRow message={m} selection={demoSelection} orderedKeys={demoOrdered} />
+          </li>
+        {/each}
+      </ul>
+    </div>
+    <p class="block-note">In the Trash view, Delete becomes a permanent, count + account-scope confirmed hard-delete:</p>
+    <div class="framed sink-list">
+      <BulkToolbar selection={demoSelection} folder="Trash" messageIndex={demoIndex} />
     </div>
   </section>
 
@@ -141,5 +192,13 @@
     border: 1px solid var(--env-rule);
     border-radius: var(--radius-md, 5px);
     background: var(--env-surface);
+  }
+  .sink-list {
+    overflow: hidden;
+  }
+  .sink-msg-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
   }
 </style>

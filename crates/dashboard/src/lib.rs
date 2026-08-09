@@ -309,6 +309,10 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/messages/{uid}",
             delete(handlers::messages::delete),
         )
+        .route(
+            "/accounts/{id}/messages/{uid}/snooze",
+            post(handlers::messages::snooze),
+        )
         .route("/accounts/{id}/search", get(handlers::messages::search))
         // Rules — read
         .route(

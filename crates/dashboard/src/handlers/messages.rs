@@ -9,7 +9,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use envelope_email_store::ThreadContext;
 use envelope_email_store::models::{
     Account, IndexedMessageInput, IndexedMessageSummary, Message, MessageSummary,
@@ -828,7 +828,101 @@ pub async fn flags(
 pub struct MoveRequest {
     #[serde(default = "default_folder")]
     pub folder: String,
+    /// Destination. Either a literal folder name (operator-picked `Move…`) or a
+    /// canonical special-use sentinel (`\Archive`, `\Junk`, `\Trash`) that is
+    /// resolved to the account's real provider folder before any move. See
+    /// [`envelope_email_transport::folders::canonical_move_key`].
     pub to_folder: String,
+}
+
+/// Send-safe canonical folder resolution against the shared (mutex-guarded) DB.
+///
+/// Mirrors [`envelope_email_transport::folders::detect_folder`] — cache →
+/// provider-resolve-and-verify → candidate fallback → `None` — but reuses only
+/// the crate's PURE provider machinery (`detect_provider` / `resolve_folder` /
+/// `all_candidates_for`) so the DB guard is never held across the IMAP
+/// `list_folders` await. `Database` is `!Sync`, so a `&Database` held across an
+/// await would make the axum handler future `!Send`; every DB touch here is a
+/// short synchronous critical section. `Ok(None)` means the provider has no
+/// such special-use folder — callers must NOT fall back to a literal mailbox.
+pub(crate) async fn resolve_canonical_folder(
+    state: &AppState,
+    client: &mut envelope_email_transport::ImapClient,
+    account_id: &str,
+    canonical_type: &str,
+) -> Result<Option<String>, envelope_email_transport::errors::ImapError> {
+    use envelope_email_transport::provider::{self, ProviderType};
+
+    // 1. Cache hit — no socket, no await while the guard is held.
+    let cached = {
+        let db = state.db.lock().await;
+        db.get_detected_folders(account_id).ok().and_then(|rows| {
+            rows.into_iter()
+                .find(|(ftype, _)| ftype == canonical_type)
+                .map(|(_, name)| name)
+        })
+    };
+    if let Some(name) = cached {
+        return Ok(Some(name));
+    }
+
+    // 2. Stored provider type (sync read).
+    let stored = {
+        let db = state.db.lock().await;
+        db.get_provider_type(account_id).ok().flatten()
+    };
+    let mut provider = stored
+        .as_deref()
+        .map(ProviderType::from_str_value)
+        .unwrap_or(ProviderType::Unknown);
+
+    // 3. Folder inventory — the one IMAP round-trip, with NO DB guard held.
+    let folders = envelope_email_transport::imap::list_folders(client).await?;
+
+    // Detect + persist the provider when it was unknown.
+    if provider == ProviderType::Unknown {
+        provider = provider::detect_provider(&folders);
+        if provider != ProviderType::Unknown {
+            let db = state.db.lock().await;
+            let _ = db.set_provider_type(account_id, provider.as_str());
+        }
+    }
+
+    // 4. Provider-resolved name, verified to actually exist on the server.
+    if provider != ProviderType::Unknown {
+        let resolved = provider::resolve_folder(provider, canonical_type).to_string();
+        if folders.iter().any(|f| f == &resolved) {
+            let db = state.db.lock().await;
+            let _ = db.set_detected_folder(account_id, canonical_type, &resolved);
+            return Ok(Some(resolved));
+        }
+    }
+
+    // 5. Candidate fallback across every known provider variant for this type.
+    for candidate in provider::all_candidates_for(canonical_type) {
+        if folders.iter().any(|f| f == candidate) {
+            let db = state.db.lock().await;
+            let _ = db.set_detected_folder(account_id, canonical_type, candidate);
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Stable JSON failure for a canonical move target that resolved to no real
+/// provider folder. Returned BEFORE any mutation; carries only the requested
+/// target token (no recipients, bodies, or folder listings).
+fn move_target_unresolved(target: &str) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "code": "folder_not_resolved",
+            "reason": format!(
+                "no provider folder matched the canonical target {target}; pick a folder with Move… instead"
+            ),
+        }),
+    )
 }
 
 pub async fn mv(
@@ -844,17 +938,38 @@ pub async fn mv(
     };
     let mut client = client_arc.lock().await;
 
-    match envelope_email_transport::imap::move_message(
-        &mut client,
-        uid,
-        &req.folder,
-        &req.to_folder,
-    )
-    .await
-    {
-        Ok(()) => {
-            Json(json!({ "ok": true, "uid": uid, "moved_to": req.to_folder })).into_response()
+    // Resolve a canonical sentinel (`\Archive`/`\Junk`/`\Trash`) to the account's
+    // actual provider folder; a literal `Move…` folder passes straight through.
+    // Unresolved canonical targets fail with a stable code and NEVER fall back to
+    // creating or moving into a literal `Archive`/`Junk`/`Trash`.
+    let to_folder = match envelope_email_transport::folders::canonical_move_key(&req.to_folder) {
+        Some(canonical_type) => {
+            match resolve_canonical_folder(&state, &mut client, &account_id, canonical_type).await {
+                Ok(Some(name)) => name,
+                Ok(None) => {
+                    let (status, body) = move_target_unresolved(&req.to_folder);
+                    return (status, Json(body)).into_response();
+                }
+                Err(e) => {
+                    state.evict_imap(&account_id).await;
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "code": "folder_resolution_failed",
+                            "reason": format!("could not resolve move target: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
+        None => req.to_folder.clone(),
+    };
+
+    match envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, &to_folder)
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true, "uid": uid, "moved_to": to_folder })).into_response(),
         Err(e) => {
             state.evict_imap(&account_id).await;
             (StatusCode::BAD_GATEWAY, format!("move: {e}")).into_response()
@@ -887,6 +1002,119 @@ pub async fn delete(
             state.evict_imap(&account_id).await;
             (StatusCode::BAD_GATEWAY, format!("delete: {e}")).into_response()
         }
+    }
+}
+
+/// The app-managed folder snoozed mail is parked in (matches `envelope snooze`).
+const SNOOZED_FOLDER: &str = "Snoozed";
+
+/// Normalize a client snooze target into UTC wall-clock (`%Y-%m-%dT%H:%M:%S`) —
+/// the exact shape `envelope snooze set` writes and the background unsnooze
+/// sweep compares against UTC now. Accepts an RFC3339 instant (`…Z`/offset) or a
+/// naive timestamp (treated as UTC). Rejects empty and non-future times.
+fn normalize_snooze_return_at(input: &str, now: NaiveDateTime) -> Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("return_at is required");
+    }
+    let naive = if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        dt.with_timezone(&Utc).naive_utc()
+    } else if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        ndt
+    } else if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M") {
+        ndt
+    } else {
+        return Err("return_at must be an ISO-8601 timestamp (YYYY-MM-DDTHH:MM:SS)");
+    };
+    if naive <= now {
+        return Err("return_at must be in the future");
+    }
+    Ok(naive.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+#[derive(Deserialize)]
+pub struct SnoozeRequest {
+    #[serde(default = "default_folder")]
+    pub folder: String,
+    pub return_at: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+/// POST /api/accounts/{id}/messages/{uid}/snooze
+/// Move a message to the Snoozed folder until `return_at`, and record it so the
+/// existing background sweep returns it to its origin folder. Reuses the same
+/// primitives as `envelope snooze set` (create-folder + move + `create_snoozed`).
+pub async fn snooze(
+    State(state): State<AppState>,
+    Path((account_id, uid)): Path<(String, u32)>,
+    Json(req): Json<SnoozeRequest>,
+) -> impl IntoResponse {
+    // Validate the target time BEFORE any IMAP work so bad input never touches
+    // the mailbox and returns a stable, machine-readable error.
+    let return_at = match normalize_snooze_return_at(&req.return_at, Utc::now().naive_utc()) {
+        Ok(v) => v,
+        Err(code) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "invalid_return_at", "error": code })),
+            )
+                .into_response();
+        }
+    };
+
+    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
+        }
+    };
+    let mut client = client_arc.lock().await;
+
+    // Ensure the Snoozed folder exists (idempotent; may already be present).
+    if let Err(e) = envelope_email_transport::imap::create_folder(&mut client, SNOOZED_FOLDER).await
+    {
+        tracing::warn!("snooze: could not ensure {SNOOZED_FOLDER} folder (may exist): {e}");
+    }
+
+    if let Err(e) =
+        envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, SNOOZED_FOLDER)
+            .await
+    {
+        state.evict_imap(&account_id).await;
+        return (StatusCode::BAD_GATEWAY, format!("snooze move: {e}")).into_response();
+    }
+    drop(client);
+
+    // Record so the sweep can return it. `account` is the path id — matching how
+    // the dashboard snoozed list/unsnooze query rows back.
+    let db = state.db.lock().await;
+    match db.create_snoozed(
+        &account_id,
+        uid,
+        &req.folder,
+        SNOOZED_FOLDER,
+        &return_at,
+        req.message_id.as_deref(),
+        req.subject.as_deref(),
+        Some("dashboard"),
+        None,
+        None,
+    ) {
+        Ok(_) => Json(json!({
+            "ok": true,
+            "uid": uid,
+            "return_at": return_at,
+            "snoozed_folder": SNOOZED_FOLDER
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "code": "snooze_record_failed", "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -953,8 +1181,73 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDateTime;
     use envelope_email_store::{CredentialBackend, Database};
     use serde_json::json;
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn move_target_unresolved_returns_stable_code_and_leaks_nothing() {
+        // A canonical move target that resolves to no real provider folder must
+        // fail with a stable machine code BEFORE any mutation, carrying only the
+        // requested target label — never a recipient, body, or folder listing.
+        let (status, body) = move_target_unresolved("\\Trash");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "folder_not_resolved");
+        let reason = body["reason"].as_str().unwrap();
+        assert!(reason.contains("\\Trash"));
+        // No leakage: the reason is a fixed template plus the target token only.
+        assert!(!reason.contains('@'));
+    }
+
+    #[test]
+    fn snooze_return_at_rfc3339_z_stored_as_utc_wallclock() {
+        // The sweep compares against UTC now; storage must be UTC wall-clock,
+        // no offset/Z, matching `envelope snooze set`.
+        let out =
+            normalize_snooze_return_at("2026-08-09T14:30:00Z", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out, "2026-08-09T14:30:00");
+    }
+
+    #[test]
+    fn snooze_return_at_offset_converted_to_utc() {
+        // 09:00-05:00 == 14:00 UTC.
+        let out =
+            normalize_snooze_return_at("2026-08-09T09:00:00-05:00", at("2026-08-08T12:00:00"))
+                .unwrap();
+        assert_eq!(out, "2026-08-09T14:00:00");
+    }
+
+    #[test]
+    fn snooze_return_at_naive_kept_as_utc() {
+        let out =
+            normalize_snooze_return_at("2026-08-09T09:00:00", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out, "2026-08-09T09:00:00");
+        // datetime-local without seconds is also accepted.
+        let out2 =
+            normalize_snooze_return_at("2026-08-09T09:00", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out2, "2026-08-09T09:00:00");
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_empty() {
+        assert!(normalize_snooze_return_at("   ", at("2026-08-08T12:00:00")).is_err());
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_past() {
+        assert!(
+            normalize_snooze_return_at("2026-08-07T09:00:00Z", at("2026-08-08T12:00:00")).is_err()
+        );
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_garbage() {
+        assert!(normalize_snooze_return_at("next tuesday", at("2026-08-08T12:00:00")).is_err());
+    }
 
     fn summary(uid: u32, date: Option<&str>) -> MessageSummary {
         MessageSummary {
