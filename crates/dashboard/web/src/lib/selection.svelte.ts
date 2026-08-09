@@ -77,4 +77,13 @@ export class SelectionStore {
   deselectAll() {
     this.clear();
   }
+
+  /** Remove exactly these keys, leaving every other selected key untouched.
+   *  Used when only some items in a compound/partial operation actually
+   *  succeeded — the rest must stay selected and retryable. */
+  deselect(keys: Iterable<string>) {
+    const next = new Set(this.selected);
+    for (const key of keys) next.delete(key);
+    this.selected = next;
+  }
 }

@@ -39,7 +39,12 @@ export interface RuleResponse {
 
 /** Simple single-field match conditions surfaced in the UI. */
 export interface MatchFields {
+  /** Glob sender match (`*`/`?` wildcards). Mutually exclusive with `fromExact`. */
   from?: string;
+  /** Literal (non-glob) sender match — a local-part containing `*`/`?` is
+   *  matched exactly, never reinterpreted as a wildcard. Mutually exclusive
+   *  with `from`. */
+  fromExact?: string;
   to?: string;
   subject?: string;
   tag?: string;
@@ -58,7 +63,10 @@ export interface MatchFields {
 export function buildMatchExpr(f: MatchFields): unknown | null {
   const conditions: unknown[] = [];
 
-  if (f.from?.trim()) conditions.push({ from: f.from.trim() });
+  // Exact takes precedence when both are somehow set — the two are mutually
+  // exclusive in the editor UI (a single "From" field toggled by a checkbox).
+  if (f.fromExact?.trim()) conditions.push({ from_exact: f.fromExact.trim() });
+  else if (f.from?.trim()) conditions.push({ from: f.from.trim() });
   if (f.to?.trim()) conditions.push({ to: f.to.trim() });
   if (f.subject?.trim()) conditions.push({ subject: f.subject.trim() });
   if (f.tag?.trim()) conditions.push({ has_tag: f.tag.trim() });
@@ -106,6 +114,7 @@ export function parseMatchExpr(raw: string): MatchFields & { _raw?: string } {
     if (leaf && typeof leaf === 'object') {
       const obj = leaf as Record<string, unknown>;
       if (typeof obj.from === 'string') fields.from = obj.from;
+      else if (typeof obj.from_exact === 'string') fields.fromExact = obj.from_exact;
       else if (typeof obj.to === 'string') fields.to = obj.to;
       else if (typeof obj.subject === 'string') fields.subject = obj.subject;
       else if (typeof obj.has_tag === 'string') fields.tag = obj.has_tag;
@@ -240,6 +249,7 @@ function describeExpr(expr: unknown, depth: number): string {
   const obj = expr as Record<string, unknown>;
 
   if (typeof obj.from === 'string') return `from ${obj.from}`;
+  if (typeof obj.from_exact === 'string') return `from exactly ${obj.from_exact}`;
   if (typeof obj.to === 'string') return `to ${obj.to}`;
   if (typeof obj.subject === 'string') return `subject matches "${obj.subject}"`;
   if (typeof obj.has_tag === 'string') return `tagged "${obj.has_tag}"`;

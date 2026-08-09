@@ -18,17 +18,44 @@
   import Toast from './Toast.svelte';
   import MonoTag from './MonoTag.svelte';
 
-  type RetryOp = 'archive' | 'trash-move' | 'delete' | 'junk' | 'read' | 'unread' | 'flag' | 'unflag';
+  type RetryOp =
+    | 'archive'
+    | 'trash-move'
+    | 'delete'
+    | 'junk'
+    | 'read'
+    | 'unread'
+    | 'flag'
+    | 'unflag'
+    | 'block-junk';
   type ToastItem = {
     id: number;
     variant: 'ok' | 'warn' | 'danger';
     text: string;
     retryItems?: BulkItem[];
+    /** Retry payload for the compound 'block-junk' op — carries `from` too. */
+    retryCompound?: DetailedItem[];
     retryOp?: RetryOp;
   };
 
-  /** Per-message context the list supplies so junk-rules and snooze are truthful. */
-  type MsgInfo = { from: string; folder?: string; message_id?: string | null; subject?: string | null };
+  /**
+   * Per-message context the list supplies so junk-rules, snooze, and every
+   * mailbox action are truthful. `accountId`/`uid` are the message's REAL IMAP
+   * identity — the toolbar reads them ONLY from here, never by inferring them
+   * from the shape of the (opaque) selection key. Selection keys vary by
+   * surface (`acct:uid` for unified, `search:acct:uid` for search hits,
+   * `draft:acct:id` for drafts, `snoozed:acct:uid` for snoozed) and are not a
+   * parseable contract — a key with no messageIndex entry has no derivable
+   * real identity and is dropped rather than guessed.
+   */
+  type MsgInfo = {
+    accountId: string;
+    uid: number;
+    from: string;
+    folder?: string;
+    message_id?: string | null;
+    subject?: string | null;
+  };
 
   let {
     selection,
@@ -36,12 +63,16 @@
     folders = [],
     messageIndex = {},
     onoperated,
+    loading = false,
   }: {
     selection: SelectionStore;
     folder?: string;
     folders?: FolderStats[];
     messageIndex?: Record<string, MsgInfo>;
     onoperated?: () => void;
+    /** True while the parent list is (re)loading data — mailbox actions stay
+     *  disabled but the toolbar (and any in-flight retry state) stays mounted. */
+    loading?: boolean;
   } = $props();
 
   // Canonical special-use MOVE sentinels. The dashboard `/move` boundary and the
@@ -82,34 +113,66 @@
   let opProgress = $state<{ done: number; total: number } | null>(null);
 
   // ── Selection helpers ────────────────────────────────────────────────
+  //
+  // Selection keys are opaque and shaped differently per surface. The ONLY
+  // trustworthy source for a message's account/uid is `messageIndex[key]`,
+  // which every actionable (mailbox-backed) surface must populate. Production
+  // code never derives identity by parsing the key itself — a key with no
+  // messageIndex entry has no derivable real identity and is dropped.
+
+  type ResolvedItem = { accountId: string; uid: number; folder: string };
+
+  function resolveItem(key: string): ResolvedItem | null {
+    const info = messageIndex[key];
+    if (!info || typeof info.accountId !== 'string' || !info.accountId || typeof info.uid !== 'number' || !Number.isFinite(info.uid)) {
+      return null;
+    }
+    return { accountId: info.accountId, uid: info.uid, folder: info.folder ?? folder };
+  }
+
+  function resolvedSelection(): ResolvedItem[] {
+    return Array.from(selection.selected)
+      .map(resolveItem)
+      .filter((item): item is ResolvedItem => item !== null);
+  }
+
+  /** False when any selected key fails to resolve to a real account/uid — the
+   *  mailbox actions must not run (or silently report zero-item "success")
+   *  against a partially-resolvable selection. */
+  const allSelectedResolve = $derived(resolvedSelection().length === selection.count);
+
+  const controlsDisabled = $derived(opRunning || loading || !allSelectedResolve);
 
   function selectedItems(): BulkItem[] {
-    return Array.from(selection.selected).map((key) => {
-      const [accountId, uid] = key.split(':');
-      // Dispatch each item with its own source folder (a unified selection can
-      // span mailboxes); fall back to the toolbar's folder when unknown.
-      return { accountId, uid: Number(uid), folder: messageIndex[key]?.folder ?? folder };
-    });
+    // Dispatch each item with its own source folder (a unified selection can
+    // span mailboxes); fall back to the toolbar's folder when unknown.
+    return resolvedSelection().map(({ accountId, uid, folder }) => ({ accountId, uid, folder }));
   }
 
   function selectedDetailed() {
-    return Array.from(selection.selected).map((key) => {
-      const [accountId, uid] = key.split(':');
+    return Array.from(selection.selected).flatMap((key) => {
+      const resolved = resolveItem(key);
+      if (!resolved) return [];
       const info = messageIndex[key];
-      return {
-        accountId,
-        uid: Number(uid),
-        from: info?.from ?? '',
-        folder: info?.folder ?? folder,
-        message_id: info?.message_id ?? null,
-        subject: info?.subject ?? null,
-      };
+      return [
+        {
+          key,
+          accountId: resolved.accountId,
+          uid: resolved.uid,
+          from: info?.from ?? '',
+          folder: resolved.folder,
+          message_id: info?.message_id ?? null,
+          subject: info?.subject ?? null,
+        },
+      ];
     });
   }
 
+  type DetailedItem = ReturnType<typeof selectedDetailed>[number];
+
   const selectedAccounts = $derived.by(() => {
     const set = new Set<string>();
-    for (const key of selection.selected) set.add(key.split(':')[0]);
+    for (const item of resolvedSelection()) set.add(item.accountId);
     return Array.from(set);
   });
 
@@ -137,11 +200,29 @@
     return Array.from(set);
   });
 
+  /** Selected items with no readable, valid sender address. These can never
+   *  be blocked (there is nothing to write a rule against), so the compound
+   *  Block & move confirm must refuse to run while any are present rather
+   *  than silently treating them as "move only, nothing to block". */
+  const invalidSenderItems = $derived.by(() =>
+    selectedDetailed().filter((it) => {
+      const email = normalizedAddress(it.from);
+      return !email || !isValidEmail(email);
+    })
+  );
+  const hasInvalidSender = $derived(invalidSenderItems.length > 0);
+
   // ── Toasts ───────────────────────────────────────────────────────────
 
-  function addToast(variant: ToastItem['variant'], text: string, retryItems?: BulkItem[], retryOp?: RetryOp) {
+  function addToast(
+    variant: ToastItem['variant'],
+    text: string,
+    retryItems?: BulkItem[],
+    retryOp?: RetryOp,
+    retryCompound?: DetailedItem[]
+  ) {
     const id = ++toastSeq;
-    toasts = [...toasts, { id, variant, text, retryItems, retryOp }];
+    toasts = [...toasts, { id, variant, text, retryItems, retryOp, retryCompound }];
     if (variant === 'ok') setTimeout(() => dismissToast(id), 5000);
   }
 
@@ -180,7 +261,16 @@
     return result;
   }
 
+  /** Defensive guard mirroring the disabled buttons: even if a click somehow
+   *  reaches a handler while the selection isn't fully resolvable (e.g. a
+   *  stray event before the disabled state paints), the op must never run
+   *  against a partially-resolved selection nor report a false success. */
+  function requireFullyResolved(): boolean {
+    return allSelectedResolve;
+  }
+
   async function archive() {
+    if (!requireFullyResolved()) return;
     await runBulkOp({ type: 'move', folder, to_folder: ARCHIVE_TARGET }, selectedItems(), 'archived', 'archive');
   }
 
@@ -217,20 +307,24 @@
 
   async function markRead() {
     moreMenuOpen = false;
+    if (!requireFullyResolved()) return;
     await runReadStateOp(selectedItems(), true, 'marked read', 'read');
   }
 
   async function markUnread() {
     moreMenuOpen = false;
+    if (!requireFullyResolved()) return;
     await runReadStateOp(selectedItems(), false, 'marked unread', 'unread');
   }
 
   async function flag() {
+    if (!requireFullyResolved()) return;
     await runBulkOp({ type: 'flags', folder, add: ['\\Flagged'], remove: [] }, selectedItems(), 'flagged', 'flag');
   }
 
   async function unflag() {
     moreMenuOpen = false;
+    if (!requireFullyResolved()) return;
     await runBulkOp({ type: 'flags', folder, add: [], remove: ['\\Flagged'] }, selectedItems(), 'unflagged', 'unflag');
   }
 
@@ -238,6 +332,7 @@
 
   async function junkOnly() {
     junkMenuOpen = false;
+    if (!requireFullyResolved()) return;
     await runBulkOp({ type: 'move', folder, to_folder: JUNK_TARGET }, selectedItems(), 'moved to Junk', 'junk');
   }
 
@@ -246,36 +341,161 @@
     blockConfirmOpen = true;
   }
 
-  async function confirmBlockAndJunk() {
-    blockConfirmOpen = false;
-    const targets = blockTargets();
+  /** Short, non-PII, collision-resistant suffix for auto-created rule names. */
+  function blockRuleSuffix(): string {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+      return crypto.randomUUID().slice(0, 8);
+    }
+    return Math.random().toString(36).slice(2, 10);
+  }
+
+  function blockRuleKey(accountId: string, sender: string): string {
+    return `${accountId}\0${sender}`;
+  }
+
+  /** Senders whose block rule has already been created successfully. Persists
+   *  across a retry so a retry never creates a duplicate rule for a sender
+   *  that already got one — only the still-failed pairs are retried. */
+  let createdBlockRuleKeys = new Set<string>();
+
+  /**
+   * Block-sender + move-to-Junk is ONE compound operator request: rule
+   * creation and the mailbox move are two separate network calls, so a
+   * partial failure (rule ok / move failed, or rule failed / move never
+   * attempted) must never be reported as a plain success, and the affected
+   * items must stay selected so "Retry failed" can pick them back up —
+   * without recreating a rule that already exists.
+   */
+  async function runBlockAndJunk(items: DetailedItem[]) {
+    if (items.length === 0) return;
     opRunning = true;
+
+    // Pass 1 — ensure a block rule exists for every distinct (account, exact
+    // sender) pair in this batch, skipping pairs already confirmed created.
+    const pairs = new Map<string, { accountId: string; sender: string }>();
+    for (const it of items) {
+      const email = normalizedAddress(it.from);
+      if (!email || !isValidEmail(email)) continue;
+      pairs.set(blockRuleKey(it.accountId, email), { accountId: it.accountId, sender: email });
+    }
+    const pairOutcome = new Map<string, boolean>();
     let created = 0;
     let ruleFailures = 0;
-    for (const [accountId, senders] of targets) {
-      for (const sender of senders) {
-        try {
-          await rulesApi.create(accountId, {
-            name: `Junk: ${sender}`,
-            match_expr: { from: sender },
-            // Canonical semantic target: the rule engine resolves `\Junk` to the
-            // account's real Spam/Junk folder per provider when it later runs —
-            // never a stored literal "Junk" that mis-files on Gmail/Outlook.
-            action: { move: JUNK_TARGET },
-            enabled: true,
-          });
-          created += 1;
-        } catch {
-          ruleFailures += 1;
-        }
+    for (const [key, { accountId, sender }] of pairs) {
+      if (createdBlockRuleKeys.has(key)) {
+        pairOutcome.set(key, true);
+        continue;
+      }
+      try {
+        await rulesApi.create(accountId, {
+          // No sender address in the rule name: rule executors log the fired
+          // rule's name on every match, so a raw address here would leak PII
+          // into tracing/audit output on every future hit. `blockSenders`
+          // already shows the exact address in the confirm modal before
+          // creation — the name only needs to be a stable, non-PII label.
+          name: `Junk: blocked sender (${blockRuleSuffix()})`,
+          // `from_exact` is a literal (non-glob) comparison — never `from`,
+          // whose `*`/`?` are wildcards. A local-part that happens to
+          // contain those characters (a valid, if unusual, email address)
+          // must match only that exact address, never broaden into every
+          // sender at the domain.
+          match_expr: { from_exact: sender },
+          // Canonical semantic target: the rule engine resolves `\Junk` to the
+          // account's real Spam/Junk folder per provider when it later runs —
+          // never a stored literal "Junk" that mis-files on Gmail/Outlook.
+          action: { move: JUNK_TARGET },
+          enabled: true,
+        });
+        createdBlockRuleKeys.add(key);
+        pairOutcome.set(key, true);
+        created += 1;
+      } catch {
+        pairOutcome.set(key, false);
+        ruleFailures += 1;
       }
     }
+
+    // Pass 2 — only move items whose sender's block rule is confirmed in
+    // place. An item whose rule failed is left unmoved and selected: the
+    // compound op is not "done" for it, so it must stay retryable rather
+    // than silently landing in Junk without the block rule the operator
+    // asked for. An item with no readable/valid sender at all can never have
+    // a rule — it must never be treated as rule-success or silently moved;
+    // it stays selected (never deselected) so the operator can explicitly
+    // deselect it or move it separately via plain "Move to Junk".
+    const moveEligible: DetailedItem[] = [];
+    const blockedByRuleFailure: DetailedItem[] = [];
+    const skippedInvalidSender: DetailedItem[] = [];
+    for (const it of items) {
+      const email = normalizedAddress(it.from);
+      if (!email || !isValidEmail(email)) {
+        skippedInvalidSender.push(it);
+        continue;
+      }
+      const key = blockRuleKey(it.accountId, email);
+      const ruleOk = pairOutcome.get(key) !== false;
+      (ruleOk ? moveEligible : blockedByRuleFailure).push(it);
+    }
+
+    opProgress = moveEligible.length ? { done: 0, total: moveEligible.length } : null;
+    const moveResult = moveEligible.length
+      ? await bulkClient(
+          { type: 'move', folder, to_folder: JUNK_TARGET },
+          moveEligible.map(({ accountId, uid, folder }) => ({ accountId, uid, folder })),
+          (p) => {
+            opProgress = { done: p.done, total: p.total };
+          }
+        )
+      : { total: 0, done: 0, failed: [] as BulkProgress['failed'] };
     opRunning = false;
-    const ruleNote =
-      ruleFailures === 0
-        ? `moved to Junk · ${created} sender rule${created === 1 ? '' : 's'} added`
-        : `moved to Junk · ${created} rule${created === 1 ? '' : 's'} added, ${ruleFailures} failed`;
-    await runBulkOp({ type: 'move', folder, to_folder: JUNK_TARGET }, selectedItems(), ruleNote, 'junk');
+    opProgress = null;
+
+    const moveFailedIds = new Set(
+      moveResult.failed.map(({ item }) => itemIdentity(item))
+    );
+    const movedOk = moveEligible.filter((it) => !moveFailedIds.has(itemIdentity(it)));
+    const moveFailed = moveEligible.filter((it) => moveFailedIds.has(itemIdentity(it)));
+
+    // Only items that cleared BOTH the rule step and the move are done.
+    selection.deselect(movedOk.map((it) => it.key));
+    const retryable = [...blockedByRuleFailure, ...moveFailed];
+
+    const parts: string[] = [];
+    if (movedOk.length > 0) parts.push(`${movedOk.length} moved to Junk`);
+    if (created > 0) parts.push(`${created} rule${created === 1 ? '' : 's'} added`);
+    if (ruleFailures > 0) {
+      parts.push(`${ruleFailures} rule${ruleFailures === 1 ? '' : 's'} failed (not moved)`);
+    }
+    if (moveFailed.length > 0) {
+      parts.push(`${moveFailed.length} move${moveFailed.length === 1 ? '' : 's'} failed`);
+    }
+    if (skippedInvalidSender.length > 0) {
+      parts.push(
+        `${skippedInvalidSender.length} skipped (no valid sender)`
+      );
+    }
+    const text = parts.length > 0 ? parts.join(', ') : 'nothing to do';
+    const variant: ToastItem['variant'] =
+      ruleFailures === 0 && moveFailed.length === 0 && skippedInvalidSender.length === 0
+        ? 'ok'
+        : movedOk.length === 0 && created === 0
+          ? 'danger'
+          : 'warn';
+
+    addToast(
+      variant,
+      text,
+      undefined,
+      retryable.length > 0 ? 'block-junk' : undefined,
+      retryable.length > 0 ? retryable : undefined
+    );
+    onoperated?.();
+  }
+
+  async function confirmBlockAndJunk() {
+    blockConfirmOpen = false;
+    if (!requireFullyResolved() || hasInvalidSender) return;
+    await runBlockAndJunk(selectedDetailed());
   }
 
   // ── Snooze (presets + custom) ────────────────────────────────────────
@@ -305,6 +525,7 @@
 
   async function snoozeTo(returnAt: string) {
     snoozeMenuOpen = false;
+    if (!requireFullyResolved()) return;
     const items = selectedDetailed();
     opRunning = true;
     opProgress = { done: 0, total: items.length };
@@ -360,6 +581,7 @@
   }
 
   async function deleteToTrash() {
+    if (!requireFullyResolved()) return;
     await runBulkOp(
       { type: 'move', folder, to_folder: TRASH_TARGET },
       selectedItems(),
@@ -378,6 +600,7 @@
   }
   async function confirmDelete() {
     if (!simpleConfirm && deleteTyped !== String(selection.count)) return;
+    if (!requireFullyResolved()) return;
     closeDeleteConfirm();
     await runBulkOp({ type: 'delete', folder }, selectedItems(), 'permanently deleted', 'delete');
   }
@@ -391,23 +614,53 @@
   }
   async function confirmMove() {
     if (!selectedMoveFolder) return;
+    if (!requireFullyResolved()) return;
     moveFolderPickerOpen = false;
     await runBulkOp({ type: 'move', folder, to_folder: selectedMoveFolder }, selectedItems(), `moved to ${selectedMoveFolder}`);
   }
 
   // ── Retry ────────────────────────────────────────────────────────────
 
-  async function retryFailed(items: BulkItem[], op?: RetryOp) {
+  function isCurrentRetryItem(item: BulkItem): boolean {
+    return resolvedSelection().some((current) => itemIdentity(current) === itemIdentity(item));
+  }
+
+  function isCurrentCompoundRetryItem(item: DetailedItem): boolean {
+    if (!selection.isSelected(item.key)) return false;
+    const current = resolveItem(item.key);
+    return current !== null && itemIdentity(current) === itemIdentity(item);
+  }
+
+  async function retryFailed(toastId: number, items: BulkItem[] | undefined, op?: RetryOp, compound?: DetailedItem[]) {
+    // Dismiss the stale toast BEFORE dispatching the retry so its own
+    // "Retry failed" control can never be clicked twice — the fresh outcome
+    // toast produced below becomes the sole authoritative one.
+    dismissToast(toastId);
     if (!op) return;
-    const map: Record<RetryOp, () => Promise<unknown>> = {
-      archive: () => runBulkOp({ type: 'move', folder, to_folder: ARCHIVE_TARGET }, items, 'archived (retry)', 'archive'),
-      'trash-move': () => runBulkOp({ type: 'move', folder, to_folder: TRASH_TARGET }, items, 'moved to Trash (retry)', 'trash-move'),
-      delete: () => runBulkOp({ type: 'delete', folder }, items, 'permanently deleted (retry)', 'delete'),
-      junk: () => runBulkOp({ type: 'move', folder, to_folder: JUNK_TARGET }, items, 'moved to Junk (retry)', 'junk'),
-      read: () => runReadStateOp(items, true, 'marked read (retry)', 'read'),
-      unread: () => runReadStateOp(items, false, 'marked unread (retry)', 'unread'),
-      flag: () => runBulkOp({ type: 'flags', folder, add: ['\\Flagged'] }, items, 'flagged (retry)', 'flag'),
-      unflag: () => runBulkOp({ type: 'flags', folder, remove: ['\\Flagged'] }, items, 'unflagged (retry)', 'unflag'),
+    if (op === 'block-junk') {
+      const current = compound?.filter(isCurrentCompoundRetryItem) ?? [];
+      if (current.length === 0) {
+        addToast('warn', 'Retry expired after mailbox or search changed');
+        return;
+      }
+      await runBlockAndJunk(current);
+      return;
+    }
+    if (!items) return;
+    const current = items.filter(isCurrentRetryItem);
+    if (current.length === 0) {
+      addToast('warn', 'Retry expired after mailbox or search changed');
+      return;
+    }
+    const map: Record<Exclude<RetryOp, 'block-junk'>, () => Promise<unknown>> = {
+      archive: () => runBulkOp({ type: 'move', folder, to_folder: ARCHIVE_TARGET }, current, 'archived (retry)', 'archive'),
+      'trash-move': () => runBulkOp({ type: 'move', folder, to_folder: TRASH_TARGET }, current, 'moved to Trash (retry)', 'trash-move'),
+      delete: () => runBulkOp({ type: 'delete', folder }, current, 'permanently deleted (retry)', 'delete'),
+      junk: () => runBulkOp({ type: 'move', folder, to_folder: JUNK_TARGET }, current, 'moved to Junk (retry)', 'junk'),
+      read: () => runReadStateOp(current, true, 'marked read (retry)', 'read'),
+      unread: () => runReadStateOp(current, false, 'marked unread (retry)', 'unread'),
+      flag: () => runBulkOp({ type: 'flags', folder, add: ['\\Flagged'] }, current, 'flagged (retry)', 'flag'),
+      unflag: () => runBulkOp({ type: 'flags', folder, remove: ['\\Flagged'] }, current, 'unflagged (retry)', 'unflag'),
     };
     await map[op]();
   }
@@ -421,13 +674,13 @@
     </div>
 
     <div class="bulk-actions">
-      <button type="button" class="bulk-btn" aria-label="Archive" title="Archive" onclick={archive} disabled={opRunning}>
+      <button type="button" class="bulk-btn" aria-label="Archive" title="Archive" onclick={archive} disabled={controlsDisabled}>
         <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="3" rx="0.5"/><path d="M3 6.5v6.5h10V6.5"/><path d="M6.3 9.2h3.4"/></svg>
         <span class="bulk-label">Archive</span>
       </button>
 
       <div class="bulk-split">
-        <button type="button" class="bulk-btn" aria-label="Snooze" title="Snooze" aria-haspopup="menu" aria-expanded={snoozeMenuOpen} onclick={() => (snoozeMenuOpen = !snoozeMenuOpen)} disabled={opRunning}>
+        <button type="button" class="bulk-btn" aria-label="Snooze" title="Snooze" aria-haspopup="menu" aria-expanded={snoozeMenuOpen} onclick={() => (snoozeMenuOpen = !snoozeMenuOpen)} disabled={controlsDisabled}>
           <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8.5" r="5.3"/><path d="M8 5.3V8.7l2.2 1.4"/></svg>
           <span class="bulk-label">Snooze</span>
           <span class="bulk-caret" aria-hidden="true">▾</span>
@@ -447,13 +700,13 @@
         {/if}
       </div>
 
-      <button type="button" class="bulk-btn" aria-label="Flag" title="Flag" onclick={flag} disabled={opRunning}>
+      <button type="button" class="bulk-btn" aria-label="Flag" title="Flag" onclick={flag} disabled={controlsDisabled}>
         <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.2v11.6"/><path d="M4 3h7.5l-1.6 2.6L11.5 8H4"/></svg>
         <span class="bulk-label">Flag</span>
       </button>
 
       <div class="bulk-split">
-        <button type="button" class="bulk-btn" aria-label="Junk" title="Junk" aria-haspopup="menu" aria-expanded={junkMenuOpen} onclick={() => (junkMenuOpen = !junkMenuOpen)} disabled={opRunning}>
+        <button type="button" class="bulk-btn" aria-label="Junk" title="Junk" aria-haspopup="menu" aria-expanded={junkMenuOpen} onclick={() => (junkMenuOpen = !junkMenuOpen)} disabled={controlsDisabled}>
           <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M4.1 4.1l7.8 7.8"/></svg>
           <span class="bulk-label">Junk</span>
           <span class="bulk-caret" aria-hidden="true">▾</span>
@@ -472,14 +725,14 @@
         aria-label={inTrash ? 'Delete permanently' : 'Delete'}
         title={inTrash ? 'Delete permanently' : 'Move to Trash'}
         onclick={onDeleteClick}
-        disabled={opRunning}
+        disabled={controlsDisabled}
       >
         <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10"/><path d="M5 4l.6 9h4.8L11 4"/><path d="M6.5 4V2.6h3V4"/></svg>
         <span class="bulk-label">{inTrash ? 'Delete permanently' : 'Delete'}</span>
       </button>
 
       <div class="bulk-split">
-        <button type="button" class="bulk-btn" aria-label="More" title="More actions" aria-haspopup="menu" aria-expanded={moreMenuOpen} onclick={() => (moreMenuOpen = !moreMenuOpen)} disabled={opRunning}>
+        <button type="button" class="bulk-btn" aria-label="More" title="More actions" aria-haspopup="menu" aria-expanded={moreMenuOpen} onclick={() => (moreMenuOpen = !moreMenuOpen)} disabled={controlsDisabled}>
           <svg class="bulk-ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.5" cy="8" r="1.1"/><circle cx="8" cy="8" r="1.1"/><circle cx="12.5" cy="8" r="1.1"/></svg>
           <span class="bulk-label">More</span>
           <span class="bulk-caret" aria-hidden="true">▾</span>
@@ -506,8 +759,8 @@
   {#each toasts as t (t.id)}
     <Toast variant={t.variant} onclose={() => dismissToast(t.id)}>
       {t.text}
-      {#if t.retryItems && t.retryOp}
-        <button type="button" class="toast-retry" onclick={() => retryFailed(t.retryItems!, t.retryOp)}>Retry failed</button>
+      {#if t.retryOp && (t.retryItems || t.retryCompound)}
+        <button type="button" class="toast-retry" onclick={() => retryFailed(t.id, t.retryItems, t.retryOp, t.retryCompound)}>Retry failed</button>
       {/if}
     </Toast>
   {/each}
@@ -555,7 +808,10 @@
   onclose={() => (blockConfirmOpen = false)}
 >
   {#if blockSenders.length === 0}
-    <p class="block-hint">None of the selected messages have a readable sender address to block. They can still be moved to Junk.</p>
+    <p class="block-hint">
+      None of the selected messages have a readable sender address to block. Use "Move to Junk"
+      instead, or deselect these messages.
+    </p>
   {:else}
     <p class="block-intro">
       This moves the selected message{selection.count === 1 ? '' : 's'} to Junk and creates an
@@ -568,10 +824,17 @@
         <li><MonoTag>{s}</MonoTag></li>
       {/each}
     </ul>
+    {#if hasInvalidSender}
+      <p class="block-hint block-hint-warn">
+        {invalidSenderItems.length} selected message{invalidSenderItems.length === 1 ? '' : 's'}
+        {invalidSenderItems.length === 1 ? 'has' : 'have'} no readable sender and can't be blocked.
+        Deselect {invalidSenderItems.length === 1 ? 'it' : 'them'} or use "Move to Junk" instead.
+      </p>
+    {/if}
   {/if}
   {#snippet footer()}
     <button type="button" class="modal-cancel" onclick={() => (blockConfirmOpen = false)}>Cancel</button>
-    <button type="button" class="modal-delete" onclick={confirmBlockAndJunk}>
+    <button type="button" class="modal-delete" onclick={confirmBlockAndJunk} disabled={hasInvalidSender}>
       Block &amp; move to Junk
     </button>
   {/snippet}
@@ -830,6 +1093,10 @@
     margin: 0 0 0.6rem;
     font-size: 0.8125rem;
     line-height: 1.45;
+  }
+  .block-hint-warn {
+    margin-top: 0.6rem;
+    color: var(--env-warn);
   }
   .block-hint,
   .move-hint {

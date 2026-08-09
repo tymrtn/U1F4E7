@@ -1,1 +1,0 @@
-import{$ as e}from"../chunks/YX4-0TRN.js";import"../chunks/xihTtKlq.js";import{t}from"../chunks/64JJjUSZ.js";import"../chunks/Crh-foYf.js";var n=e({prerender:()=>!1,ssr:()=>!1});function r(e){t(e,{})}export{r as component,n as universal};

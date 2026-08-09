@@ -28,9 +28,15 @@
   const demoOrdered = demoMessages.map((m) => m.key);
   demoSelection.toggle('demo:1');
   demoSelection.toggle('demo:2');
-  const demoIndex: Record<string, { from: string; folder: string; message_id?: string; subject?: string }> = {
-    'demo:1': { from: 'notifications@github.com', folder: 'INBOX', message_id: '<1@x>', subject: 'Re: hermes-agent' },
-    'demo:2': { from: 'newsletter@info.zoomadrid.com', folder: 'INBOX' }
+  const demoIndex: Record<
+    string,
+    { accountId: string; uid: number; from: string; folder: string; message_id?: string; subject?: string }
+  > = {
+    'demo:1': {
+      accountId: 'demo', uid: 1,
+      from: 'notifications@github.com', folder: 'INBOX', message_id: '<1@x>', subject: 'Re: hermes-agent'
+    },
+    'demo:2': { accountId: 'demo', uid: 2, from: 'newsletter@info.zoomadrid.com', folder: 'INBOX' }
   };
 </script>
 

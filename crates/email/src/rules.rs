@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 pub enum MatchExpr {
     /// Glob match on sender address. `*` matches any sequence, `?` matches one char.
     From(String),
+    /// Exact (case-insensitive) match on sender address — no glob interpretation.
+    /// Used wherever a sender string must be matched literally: a local-part
+    /// containing `*` or `?` (both valid, if unusual, email characters) must
+    /// never be reinterpreted as a wildcard.
+    FromExact(String),
     /// Glob match on recipient address.
     To(String),
     /// Glob match on subject line.
@@ -154,6 +159,9 @@ pub struct MessageContext {
 pub fn evaluate(expr: &MatchExpr, ctx: &MessageContext) -> bool {
     match expr {
         MatchExpr::From(pattern) => glob_match(pattern, &ctx.from_addr),
+        MatchExpr::FromExact(addr) => {
+            addr.trim().to_lowercase() == ctx.from_addr.trim().to_lowercase()
+        }
         MatchExpr::To(pattern) => glob_match(pattern, &ctx.to_addr),
         MatchExpr::Subject(pattern) => glob_match(pattern, &ctx.subject),
         MatchExpr::HasTag(tag) => ctx.tags.iter().any(|t| t == tag),
@@ -338,6 +346,22 @@ mod tests {
     }
 
     #[test]
+    fn match_from_exact_does_not_treat_glob_chars_as_wildcards() {
+        // A literal local-part of "*" must match only that exact address —
+        // never broaden into every sender at the domain.
+        let expr = MatchExpr::FromExact("*@example.com".to_string());
+        assert!(evaluate(&expr, &ctx("*@example.com", "", "")));
+        assert!(!evaluate(&expr, &ctx("anything@example.com", "", "")));
+        assert!(!evaluate(&expr, &ctx("evil@example.com", "", "")));
+    }
+
+    #[test]
+    fn match_from_exact_is_case_insensitive_and_trims() {
+        let expr = MatchExpr::FromExact("Alice@Example.com".to_string());
+        assert!(evaluate(&expr, &ctx(" alice@example.com ", "", "")));
+    }
+
+    #[test]
     fn match_subject() {
         let expr = MatchExpr::Subject("*invoice*".to_string());
         assert!(evaluate(&expr, &ctx("", "", "Your invoice for March")));
@@ -424,6 +448,15 @@ mod tests {
             },
         ]);
         let json = serde_json::to_string(&expr).unwrap();
+        let parsed: MatchExpr = serde_json::from_str(&json).unwrap();
+        assert_eq!(expr, parsed);
+    }
+
+    #[test]
+    fn from_exact_json_roundtrip() {
+        let expr = MatchExpr::FromExact("*@example.com".to_string());
+        let json = serde_json::to_string(&expr).unwrap();
+        assert_eq!(json, r#"{"from_exact":"*@example.com"}"#);
         let parsed: MatchExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(expr, parsed);
     }

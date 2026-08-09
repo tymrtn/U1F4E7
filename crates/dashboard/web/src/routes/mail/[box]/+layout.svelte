@@ -64,8 +64,25 @@
   let loadedBox = $state<string | null>(null);
   let folders = $state<FolderStats[]>([]);
 
+  /** A search hit tagged with the account it was actually found in — the
+   *  per-account search endpoint doesn't return this, so it's attached here
+   *  as results are merged. Bulk actions and navigation both need the real
+   *  account, never a placeholder. */
+  type SearchHit = SearchMessageSummary & { account_id: string };
+
+  /** BulkToolbar's `messageIndex` entry shape — the message's real identity
+   *  (account/uid) plus the context junk-rules/snooze need. */
+  type MsgIndexEntry = {
+    accountId: string;
+    uid: number;
+    from: string;
+    folder: string;
+    message_id: string | null;
+    subject: string | null;
+  };
+
   const searchQuery = $derived(page.url.searchParams.get('q') ?? '');
-  let searchResults = $state<SearchMessageSummary[]>([]);
+  let searchResults = $state<SearchHit[]>([]);
   let searching = $state(false);
   let searchError = $state<string | null>(null);
   const isSearching = $derived(searchQuery.length > 0);
@@ -167,6 +184,10 @@
 
   $effect(() => {
     const q = searchQuery;
+    // A search query change swaps the result set under any selection —
+    // stale hidden selections from the prior list/query must never persist
+    // to act against messages the operator can no longer see.
+    selection.clear();
     if (!q) {
       searchResults = [];
       searchError = null;
@@ -180,12 +201,15 @@
     searchError = null;
     try {
       const { accounts } = await api.listAccounts();
-      const merged: SearchMessageSummary[] = [];
+      const merged: SearchHit[] = [];
       await Promise.all(
         accounts.map(async (acct) => {
           try {
             const res = await api.searchMessages(acct.id, q);
-            merged.push(...res.messages);
+            // Tag each hit with the account it actually came from — the
+            // per-account search response doesn't carry this, and a search
+            // spanning accounts must not blur which account owns which hit.
+            merged.push(...res.messages.map((m) => ({ ...m, account_id: acct.id })));
           } catch {
             // partial ok
           }
@@ -232,25 +256,67 @@
     unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
   );
   const orderedSearchKeys = $derived(
-    searchResults.map((m, i) => `search:${i}:${m.uid}`)
+    searchResults.map((m) => `search:${m.account_id}:${m.uid}`)
   );
 
   const currentFolder = $derived(
     page.params.box === 'unified' ? 'INBOX' : 'INBOX'
   );
+  // Retry payloads are valid only inside the mailbox/search context that
+  // created them. Loading within the same context keeps the component mounted;
+  // changing mailbox or query remounts it and drops stale toasts/caches.
+  const toolbarContextKey = $derived(`${page.params.box ?? 'unified'}\0${searchQuery}`);
 
   // Per-message context the toolbar needs for truthful junk-rules (exact
   // sender), snooze (message-id/subject for the round-trip), and per-item folder
   // dispatch. The unified inbox carries each row's real source folder, so use it
   // rather than assuming the route folder — a unified surface can span mailboxes.
   const unifiedMessageIndex = $derived.by(() => {
-    const idx: Record<string, { from: string; folder: string; message_id: string | null; subject: string | null }> = {};
+    const idx: Record<string, MsgIndexEntry> = {};
     for (const m of unifiedMessages) {
       idx[`${m.account_id}:${m.uid}`] = {
+        accountId: m.account_id,
+        uid: m.uid,
         from: m.from_addr ?? '',
         folder: m.folder ?? 'INBOX',
         message_id: m.message_id ?? null,
         subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
+  /** Search hits carry their own real account (tagged in `runSearch`) and
+   *  folder — a search spans mailboxes just like the unified inbox does, so
+   *  bulk actions must dispatch against each hit's actual identity. */
+  const searchMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const m of searchResults) {
+      idx[`search:${m.account_id}:${m.uid}`] = {
+        accountId: m.account_id,
+        uid: m.uid,
+        from: m.from_addr ?? '',
+        folder: 'INBOX',
+        message_id: m.message_id ?? null,
+        subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
+  /** A snoozed message physically resides in `snoozed_folder` until the sweep
+   *  returns it — bulk actions (archive/flag/move/etc.) must target that real
+   *  current location, not `original_folder` (where it isn't right now). */
+  const snoozedMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const s of snoozed) {
+      idx[`snoozed:${s.account_id}:${s.uid}`] = {
+        accountId: s.account_id,
+        uid: s.uid,
+        from: s.from_addr ?? '',
+        folder: s.snoozed_folder,
+        message_id: s.message_id ?? null,
+        subject: s.subject ?? null,
       };
     }
     return idx;
@@ -401,14 +467,26 @@
       {/if}
     </div>
 
-    {#if box?.wired && !loading}
-      <BulkToolbar
-        {selection}
-        folder={currentFolder}
-        {folders}
-        messageIndex={unifiedMessageIndex}
-        onoperated={handleOperated}
-      />
+    <!-- Drafts have no real IMAP identity (no account/folder/UID — they live
+         in the drafts store, not a mailbox), so mailbox bulk actions (move,
+         flag, junk, delete…) are never exposed there. Search and snoozed DO
+         have a real identity (via searchMessageIndex/snoozedMessageIndex
+         below) and get the toolbar like the unified inbox. -->
+    {#if box?.wired && box.slug !== 'drafts'}
+      {#key toolbarContextKey}
+        <BulkToolbar
+          {selection}
+          folder={currentFolder}
+          {folders}
+          messageIndex={isSearching
+            ? searchMessageIndex
+            : box.slug === 'snoozed'
+              ? snoozedMessageIndex
+              : unifiedMessageIndex}
+          onoperated={handleOperated}
+          {loading}
+        />
+      {/key}
     {/if}
 
     {#if !box}
@@ -449,21 +527,21 @@
         <EmptyState title="No results" hint="No messages matched your search." />
       {:else}
         <ul id="search-results-list" class="msg-list">
-          {#each searchResults as m, i (`search:${i}:${m.uid}`)}
-            {@const key = `search:${i}:${m.uid}`}
+          {#each searchResults as m (`search:${m.account_id}:${m.uid}`)}
+            {@const key = `search:${m.account_id}:${m.uid}`}
             <li>
               <MessageRow
                 message={{
                   key,
                   uid: m.uid,
-                  accountId: '',
+                  accountId: m.account_id,
                   subject: m.subject,
                   from: m.from_addr,
                   date: m.date,
                   snippet: null,
-                  unread: m.unread,
-                  starred: isStarred(m.uid, '', m.flags),
-                  href: `${base}/mail/${page.params.box}/search/${m.uid}`,
+                  unread: readState.isUnread(m.account_id, 'INBOX', m.uid, m.unread),
+                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,
                 }}
                 {selection}
                 orderedKeys={orderedSearchKeys}
@@ -561,7 +639,7 @@
                   from: s.from_addr ?? s.account_id,
                   date: s.snooze_until,
                   snippet: null,
-                  unread: false,
+                  unread: readState.isUnread(s.account_id, s.snoozed_folder, s.uid, false),
                   starred: false,
                   accountChip: s.account_id,
                   href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}`,

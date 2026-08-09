@@ -14,6 +14,26 @@ fn is_sieve_exportable(match_expr: &str, action: &str) -> bool {
 
     !LOCAL_MATCH_KEYS.iter().any(|key| match_expr.contains(key))
         && !LOCAL_ACTION_KEYS.iter().any(|key| action.contains(key))
+        && !move_action_targets_canonical_sentinel(action)
+}
+
+/// True when `action` is a `move` whose destination is a canonical special-use
+/// sentinel (`\Junk`, `\Archive`, `\Trash`, `\All`, `\Spam`, `\Sent`,
+/// `\Drafts`) — the store crate cannot resolve these to a real provider
+/// mailbox (that needs a live IMAP connection, which lives in the transport
+/// crate this crate is a dependency of), so exporting such a rule to Sieve
+/// would emit a `fileinto` naming the literal backslash-prefixed sentinel
+/// string rather than a real mailbox. Marking the rule non-exportable is the
+/// safe default; the sentinel still resolves correctly for local execution
+/// via `envelope_email_transport::folders::resolve_move_destination`.
+fn move_action_targets_canonical_sentinel(action: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(action) else {
+        return false;
+    };
+    value
+        .get("move")
+        .and_then(|v| v.as_str())
+        .is_some_and(|dest| dest.starts_with('\\'))
 }
 
 impl Database {
@@ -271,6 +291,77 @@ mod tests {
             )
             .unwrap();
         assert!(!rule.sieve_exportable);
+    }
+
+    #[test]
+    fn rule_sieve_exportable_false_for_canonical_move_destination() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "Junk sender rule",
+                r#"{"from_exact":"someone@example.com"}"#,
+                r#"{"move":"\\Junk"}"#,
+                100,
+                false,
+            )
+            .unwrap();
+        assert!(
+            !rule.sieve_exportable,
+            "a canonical \\Junk destination cannot be exported as a literal Sieve fileinto target"
+        );
+    }
+
+    #[test]
+    fn rule_sieve_exportable_true_for_literal_move_destination() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "Custom folder rule",
+                r#"{"from":"*@example.com"}"#,
+                r#"{"move":"Junk"}"#,
+                100,
+                false,
+            )
+            .unwrap();
+        assert!(
+            rule.sieve_exportable,
+            "a literal (non-backslash) folder name is a real mailbox and stays exportable"
+        );
+    }
+
+    #[test]
+    fn update_rule_re_derives_false_when_moved_to_canonical_sentinel() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "Rule",
+                r#"{"from":"*@example.com"}"#,
+                r#"{"move":"Archive"}"#,
+                100,
+                false,
+            )
+            .unwrap();
+        assert!(rule.sieve_exportable);
+
+        let updated = db
+            .update_rule(
+                &rule.id,
+                "acct1",
+                "Rule",
+                r#"{"from":"*@example.com"}"#,
+                r#"{"move":"\\Archive"}"#,
+                100,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            !updated.sieve_exportable,
+            "switching to a canonical sentinel destination must re-derive sieve_exportable=false"
+        );
     }
 
     #[test]

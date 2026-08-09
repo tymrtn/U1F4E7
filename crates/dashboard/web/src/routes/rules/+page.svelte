@@ -77,6 +77,9 @@
 
   // Matcher fields
   let fFrom = $state('');
+  /** When true, the From field builds `from_exact` (literal, no glob
+   *  interpretation) instead of `from` (glob). */
+  let fFromExact = $state(false);
   let fTo = $state('');
   let fSubject = $state('');
   let fTag = $state('');
@@ -220,6 +223,7 @@
     fStop = false;
     fEnabled = true;
     fFrom = '';
+    fFromExact = false;
     fTo = '';
     fSubject = '';
     fTag = '';
@@ -241,7 +245,8 @@
 
     // Parse match expr
     const mf = parseMatchExpr(rule.match_expr);
-    fFrom = mf.from ?? '';
+    fFrom = mf.from ?? mf.fromExact ?? '';
+    fFromExact = mf.fromExact !== undefined;
     fTo = mf.to ?? '';
     fSubject = mf.subject ?? '';
     fTag = mf.tag ?? '';
@@ -270,7 +275,7 @@
     editorError = null;
 
     const matchFields: MatchFields = {
-      from: fFrom,
+      ...(fFromExact ? { fromExact: fFrom } : { from: fFrom }),
       to: fTo,
       subject: fSubject,
       tag: fTag,
@@ -580,8 +585,20 @@
         <p class="editor-section-hint">All filled fields are AND'd together.</p>
 
         <div class="field-group">
-          <label class="field-label" for="ef-from">From (glob, e.g. *@github.com)</label>
-          <input id="ef-from" class="field-input" type="text" placeholder="*@example.com" bind:value={fFrom} />
+          <label class="field-label" for="ef-from">
+            From ({fFromExact ? 'exact address, no wildcards' : 'glob, e.g. *@github.com'})
+          </label>
+          <input
+            id="ef-from"
+            class="field-input"
+            type="text"
+            placeholder={fFromExact ? 'someone@example.com' : '*@example.com'}
+            bind:value={fFrom}
+          />
+          <label class="check-label">
+            <input id="ef-from-exact" type="checkbox" bind:checked={fFromExact} />
+            Exact match (a literal address, never a glob — `*`/`?` in the address match themselves)
+          </label>
         </div>
 
         <div class="field-group">
