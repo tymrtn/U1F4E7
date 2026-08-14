@@ -290,6 +290,37 @@ pub fn prefix_forward_subject(subject: &str) -> String {
     }
 }
 
+/// Normalize a serialized RFC822 message to strict CRLF line endings.
+///
+/// IMAP APPEND (RFC 3501) requires CRLF everywhere; servers reject messages
+/// containing a bare LF or CR ("Message contains bare newlines"). Composed
+/// messages can pick up bare LFs when quoted parent content with CRLF endings
+/// is mixed with `\n`-joined glue: mail-builder 0.3.2's quoted-printable body
+/// encoder only tracks its previous character on the plain-char path, so a
+/// `\n` that follows a CRLF pair is written out bare (issue #87). Composed
+/// bodies are always 7bit/QP/base64-encoded, so every LF/CR in the serialized
+/// bytes is a line break, never payload — rewriting is lossless here. Do NOT
+/// use on fetched originals (backup restore / migrate), where byte fidelity
+/// is the contract.
+pub fn normalize_crlf(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 16);
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'\r' => {
+                out.extend_from_slice(b"\r\n");
+                if input.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => out.extend_from_slice(b"\r\n"),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
 // ── internal helpers ────────────────────────────────────────────────
 
 /// Build the `On <date> <from> wrote:` attribution line.
@@ -616,6 +647,25 @@ mod tests {
         assert!(edited.text.contains("> orig"));
         assert!(edited.text.starts_with("Draft two"));
         assert!(!edited.text.contains("Draft one"));
+    }
+
+    // ── normalize_crlf ───────────────────────────────────────────────
+
+    #[test]
+    fn normalize_crlf_fixes_mixed_and_bare_line_endings() {
+        assert_eq!(normalize_crlf(b"a\r\nb"), b"a\r\nb");
+        assert_eq!(normalize_crlf(b"a\nb"), b"a\r\nb");
+        assert_eq!(normalize_crlf(b"a\rb"), b"a\r\nb");
+        // The mail-builder QP failure shape: CRLF immediately followed by LF.
+        assert_eq!(normalize_crlf(b"a\r\n\nb"), b"a\r\n\r\nb");
+        assert_eq!(normalize_crlf(b"\n"), b"\r\n");
+        assert_eq!(normalize_crlf(b""), b"");
+    }
+
+    #[test]
+    fn normalize_crlf_is_idempotent() {
+        let once = normalize_crlf("l\u{ed}nea uno\r\n\nline two\ntail\r".as_bytes());
+        assert_eq!(normalize_crlf(&once), once);
     }
 
     // ── prefix_forward_subject ───────────────────────────────────────

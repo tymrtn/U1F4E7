@@ -584,6 +584,49 @@ mod tests {
     }
 
     #[test]
+    fn normalized_sent_copy_is_strict_crlf_and_keeps_message_id() {
+        // Mirrors sent_proof::append_sent_copy: the client_appended Sent
+        // archive is build_message → formatted() → normalize_crlf before IMAP
+        // APPEND (issue #87). Strict CRLF must hold for a mixed-line-ending
+        // body, and the transmitted Message-ID must survive normalization
+        // byte-for-byte or the post-append proof lookup breaks.
+        let acct = test_account("alice@martin.fm", Some("Alice"));
+        let bare = generate_message_id(&acct);
+        let (email, returned) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Re: mixed endings",
+            Some("línea uno\r\n\nline two é\nline three\r"),
+            Some("<p>Hola señor,</p>\r\n<p>línea</p>\r\n\n<p>tail</p>"),
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let rfc822 = crate::compose::normalize_crlf(&email.formatted());
+        for (i, &b) in rfc822.iter().enumerate() {
+            if b == b'\n' {
+                assert!(i > 0 && rfc822[i - 1] == b'\r', "bare LF at byte {i}");
+            }
+            if b == b'\r' {
+                assert_eq!(rfc822.get(i + 1), Some(&b'\n'), "bare CR at byte {i}");
+            }
+        }
+        let wire = String::from_utf8(rfc822).unwrap();
+        assert!(
+            wire.contains(&format!("Message-ID: {returned}\r\n")),
+            "normalized Sent copy must keep the transmitted Message-ID: {wire}"
+        );
+    }
+
+    #[test]
     fn build_message_drops_bcc_by_default_and_keeps_it_when_requested() {
         let acct = test_account("alice@martin.fm", None);
         let bare = generate_message_id(&acct);

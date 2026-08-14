@@ -344,7 +344,9 @@ async fn append_sent_copy(
         references_opt,
         attachments,
     ) {
-        Ok((email, _)) => email.formatted(),
+        // IMAP APPEND requires strict CRLF; normalize the composed copy so a
+        // body with mixed line endings can't be rejected as "bare newlines".
+        Ok((email, _)) => crate::compose::normalize_crlf(&email.formatted()),
         Err(e) => {
             warn!("failed to build Sent copy for send: {e}");
             return (false, Some("rfc822_build_failed"));

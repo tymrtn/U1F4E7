@@ -220,7 +220,7 @@ pub(crate) fn build_rfc822_full(
         })
         .unwrap_or_default();
 
-    Ok((rfc822.into_bytes(), message_id))
+    Ok((compose::normalize_crlf(rfc822.as_bytes()), message_id))
 }
 
 /// Build an RFC822-formatted draft message suitable for IMAP APPEND.
@@ -286,7 +286,7 @@ fn build_rfc822_draft(
         })
         .unwrap_or_default();
 
-    Ok((rfc822.into_bytes(), message_id))
+    Ok((compose::normalize_crlf(rfc822.as_bytes()), message_id))
 }
 
 /// Convert an RFC5322 mailbox list into `mail-builder`'s address-list type.
@@ -3911,5 +3911,70 @@ mod tests {
         let (provider, client) = sent_copy_convenience_objects("acct@example.com", &proof);
         assert!(provider.is_none());
         assert!(client.is_none());
+    }
+
+    // ─── bare newline rejection on IMAP APPEND (issue #87) ──────────────
+
+    /// Fail if the serialized message contains a LF not preceded by CR, or a
+    /// CR not followed by LF — servers reject either as "bare newlines".
+    fn assert_strict_crlf(rfc822: &[u8]) {
+        for (i, &b) in rfc822.iter().enumerate() {
+            if b == b'\n' && (i == 0 || rfc822[i - 1] != b'\r') {
+                panic!(
+                    "bare LF at byte {i}: ...{:?}",
+                    String::from_utf8_lossy(&rfc822[i.saturating_sub(40)..i + 1])
+                );
+            }
+            if b == b'\r' && rfc822.get(i + 1) != Some(&b'\n') {
+                panic!(
+                    "bare CR at byte {i}: ...{:?}",
+                    String::from_utf8_lossy(&rfc822[i.saturating_sub(40)..=i])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reply_rfc822_with_crlf_quoted_html_has_no_bare_newlines() {
+        // Mirrors a real contextual reply: the quoted parent HTML keeps its
+        // CRLF line endings while Envelope's own glue joins with `\n`, and
+        // non-ASCII content forces quoted-printable encoding. The CRLF+LF
+        // boundary sequences must not serialize to bare newlines.
+        let html = "<div class=\"envelope-agent-body\"><div>Repro body.</div></div>\n<br>\n\
+                    <div class=\"gmail_quote\">\n  <div>On 2026-08-12, Ana María wrote:</div>\n  \
+                    <blockquote class=\"gmail_quote\">\n<p>Hola señor Martin,</p>\r\n\
+                    <p>segunda línea</p>\r\n\n  </blockquote>\n</div>";
+        let (rfc822, _) = build_rfc822_full(
+            "Agent <agent@example.com>",
+            "a@example.com",
+            "Re: mixed line endings",
+            Some("Repro body.\n\n> Hola señor Martin,\n> segunda línea"),
+            Some(html),
+            None,
+            Some("<parent@example.com>"),
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_strict_crlf(&rfc822);
+    }
+
+    #[test]
+    fn draft_rfc822_with_mixed_line_ending_body_has_no_bare_newlines() {
+        // Draft create with a CRLF-terminated body that still mixes in bare
+        // LFs (the reported repro: fully CRLF-terminated --body did not help).
+        let (rfc822, _) = build_rfc822_draft(
+            "agent@example.com",
+            "a@example.com",
+            Some("mixed endings"),
+            Some("línea uno\r\n\nline two é\nline three\r\n"),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_strict_crlf(&rfc822);
     }
 }

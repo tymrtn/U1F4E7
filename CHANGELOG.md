@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.10] — 2026-08-13
+
+### Fixed
+
+- Reply, forward, and new drafts with mixed CRLF/LF content no longer fail IMAP APPEND with "Message contains bare newlines". All composed RFC822 messages (draft create/reply/forward/modify and the client-appended Sent archive copy) are normalized to strict CRLF before APPEND. Root cause was mail-builder 0.3.2's quoted-printable body encoder emitting a bare LF for a `\n` that follows a CRLF pair — triggered whenever a quoted parent body kept CRLF endings while Envelope's glue joined with `\n`. Backup restore and migration APPENDs are deliberately untouched: they transfer fetched originals byte-for-byte. ([#87](https://github.com/tymrtn/U1F4E7/issues/87))
+
 ## [1.0.9] — 2026-08-08
 
 ### Added

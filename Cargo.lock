@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-dashboard"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-store"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-transport"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "async-imap",
