@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Removing an account now removes the address book derived from its mail. `contacts` and the per-account reconciliation boundary are deleted in the same transaction as the account row; previously they survived it, leaving every correspondent's name and address in the database under an account the user believed they had removed. Other accounts keep their own rows, including addresses they share with the removed one.
+- CLI/MCP `ui` deep links and dashboard Cockpit/rules message links no longer open the dashboard's 404 page. `message_url` now emits the canonical reader route `/mail/unified/{account}/{uid}?folder={folder}`, and the cockpit/rules links emit the global `/cockpit` and `/rules` routes. The v2 SPA never had `/accounts/{id}/messages/{uid}`, `/accounts/{id}/cockpit`, or `/accounts/{id}/rules` client routes, so those links resolved to the SPA shell and the SvelteKit router then rendered its own 404 inside an HTTP 200. Historical links keep working: the dashboard now answers all three legacy shapes with a 308 to the canonical route, preserving the `folder` query (INBOX when absent).
+- Dashboard message rows now carry their own mailbox in the link. Unified-inbox rows use each row's real `folder`, snoozed rows use `snoozed_folder`, and search hits are tagged with the folder the search ran against. IMAP UIDs are mailbox-scoped, so a folder-less link opened whatever message held that UID in INBOX.
+
+### Compatibility
+
+- The `ui` object's keys and types are unchanged (`dashboard_url`, `dashboard_path`, `cockpit_url`, `message_url`, `rules_url`, `review_url`), so the agent contract schema id is unchanged. Only the path *values* moved to the canonical routes. Draft `review_url` still points at `/accounts/{account}/drafts/{draft}`, which is a real SPA route. Consumers that parse an account id out of a `message_url` path should read it from the response body instead.
 
 ## [1.0.10] — 2026-08-13
 

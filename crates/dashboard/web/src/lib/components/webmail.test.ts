@@ -259,8 +259,8 @@ describe('Unified inbox list (mail layout)', () => {
     expect(unreadRow?.classList.contains('is-unread')).toBe(true);
     expect(readRow?.classList.contains('is-unread')).toBe(false);
 
-    // Row links to the deep-linkable reader URL.
-    expect(unreadRow?.getAttribute('href')).toBe('/v2/mail/unified/acct-ok/101');
+    // Row links to the deep-linkable reader URL, carrying its own folder.
+    expect(unreadRow?.getAttribute('href')).toBe('/v2/mail/unified/acct-ok/101?folder=INBOX');
     // Account chip present.
     expect(screen.getAllByText('Work Mail').length).toBeGreaterThan(0);
   });

@@ -27,7 +27,7 @@ mod ui_paths;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::http::{HeaderValue, Method, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use envelope_email_store::{CredentialBackend, Database};
@@ -476,8 +476,21 @@ pub fn dashboard_router(state: AppState) -> Router {
     // client-side routes (`/cockpit`, `/rules`, `/mail/...`) built with
     // `paths.base = ''`. The old v1 static dashboard and its `/v2` mount are
     // gone. CLI/MCP `ui` deep links resolve through the same SPA shell.
+    //
+    // The three `/accounts/...` routes below are the pre-1.0.11 link shapes,
+    // which the SPA has no client route for — the fallback served the shell and
+    // the SvelteKit router then rendered its own 404 inside a 200. They are
+    // matched here, ahead of the fallback, and redirected to the canonical
+    // routes so links already in agent transcripts, notifications, and mail keep
+    // resolving. `/api/accounts/...` is a separate nest and is unaffected.
     Router::new()
         .route("/", get(spa_shell))
+        .route(
+            "/accounts/{account}/messages/{uid}",
+            get(legacy_message_redirect),
+        )
+        .route("/accounts/{account}/cockpit", get(legacy_cockpit_redirect))
+        .route("/accounts/{account}/rules", get(legacy_rules_redirect))
         .nest("/api", api)
         .fallback(spa_fallback)
         .with_state(state)
@@ -1721,6 +1734,48 @@ async fn spa_fallback(uri: axum::http::Uri) -> Response {
             .unwrap();
     }
     spa_shell().await
+}
+
+// ── Historical deep-link compatibility ───────────────────────────────
+
+/// The `folder` query of a pre-1.0.11 message deep link. Absent (or blank) means
+/// the link predates folder-aware deep links, when INBOX was the only mailbox
+/// those links could name.
+#[derive(serde::Deserialize)]
+struct LegacyFolderQuery {
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+/// Redirect `/accounts/{account}/messages/{uid}` to the canonical reader route.
+///
+/// Axum hands over the account percent-decoded from the path and the folder
+/// percent-decoded from the query; both are re-encoded by
+/// [`ui_paths::message_dashboard_path`] on the way out, so a `/` or `?` inside
+/// either value cannot forge an extra path segment or query parameter. A
+/// non-numeric uid fails the extractor with 400 rather than being spliced into
+/// the target.
+async fn legacy_message_redirect(
+    axum::extract::Path((account, uid)): axum::extract::Path<(String, u32)>,
+    axum::extract::Query(query): axum::extract::Query<LegacyFolderQuery>,
+) -> Redirect {
+    let folder = query
+        .folder
+        .as_deref()
+        .filter(|folder| !folder.is_empty())
+        .unwrap_or("INBOX");
+    Redirect::permanent(&ui_paths::message_dashboard_path(&account, folder, uid))
+}
+
+/// Redirect `/accounts/{account}/cockpit` to the global cockpit route. The
+/// account is dropped because the SPA cockpit spans every account.
+async fn legacy_cockpit_redirect() -> Redirect {
+    Redirect::permanent("/cockpit")
+}
+
+/// Redirect `/accounts/{account}/rules` to the global rules route.
+async fn legacy_rules_redirect() -> Redirect {
+    Redirect::permanent("/rules")
 }
 
 /// JSON 404 for unmatched `/api/*` paths (keeps API errors machine-readable
@@ -3738,17 +3793,155 @@ mod tests {
         assert!(html.contains("/_app/"));
     }
 
+    /// `Location` header of a response, as a string.
+    fn location_of(response: &Response) -> &str {
+        response
+            .headers()
+            .get(header::LOCATION)
+            .expect("redirect response must carry a Location header")
+            .to_str()
+            .expect("Location is ASCII")
+    }
+
+    /// Historical `/accounts/<id>/messages/<uid>` links (emitted by every
+    /// Envelope release through 1.0.10) have no client route in the v2 bundle and
+    /// render the SvelteKit 404 page. Serving the SPA shell for them — which the
+    /// old test asserted — is exactly the failure: HTTP 200 with a 404 rendered
+    /// inside it. They must redirect to the canonical reader route instead.
     #[tokio::test]
-    async fn spa_fallback_serves_index_for_message_and_cockpit_deep_links() {
-        // Issue #47: URLs emitted by CLI/MCP `ui` metadata
-        // (`/accounts/<id>/messages/<uid>?folder=INBOX`, `/accounts/<id>/cockpit`)
-        // must resolve to the SPA shell instead of 404 so the links are clickable.
+    async fn legacy_message_deep_link_redirects_to_the_canonical_reader_route() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/accounts/109c5747-8498-4614-945a-837462ae0aaf/messages/33281\
+                         ?folder=%5BGmail%5D%2FSent%20Mail",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            location_of(&response),
+            "/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281\
+             ?folder=%5BGmail%5D%2FSent%20Mail"
+        );
+    }
+
+    /// A legacy link without a `folder` query predates folder-aware deep links;
+    /// INBOX is the only defensible default and must be explicit in the target.
+    #[tokio::test]
+    async fn legacy_message_deep_link_without_folder_defaults_to_inbox() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/accounts/acc1/messages/57")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(location_of(&response), "/mail/unified/acc1/57?folder=INBOX");
+    }
+
+    /// A present-but-blank `folder=` deserializes to `Some("")`, which would
+    /// otherwise emit `?folder=` and leave the reader with no mailbox to scope
+    /// the uid to. It takes the same INBOX default as an absent query.
+    #[tokio::test]
+    async fn legacy_message_deep_link_with_blank_folder_defaults_to_inbox() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/accounts/acc1/messages/57?folder=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(location_of(&response), "/mail/unified/acc1/57?folder=INBOX");
+    }
+
+    /// A uid that is not a number cannot name an IMAP message, so the extractor
+    /// rejects it outright. Redirecting would mint a canonical-looking link that
+    /// 404s one hop later, and the raw segment must never reach the target.
+    #[tokio::test]
+    async fn legacy_message_deep_link_rejects_a_nonnumeric_uid() {
         let (state, _, _) = test_state();
         let app = dashboard_router(state);
 
         for uri in [
-            "/accounts/acc1/messages/57?folder=INBOX",
-            "/accounts/acc1/cockpit",
+            "/accounts/acc1/messages/not-a-uid",
+            "/accounts/acc1/messages/-1?folder=INBOX",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} must be rejected, not redirected"
+            );
+            assert!(
+                response.headers().get(header::LOCATION).is_none(),
+                "{uri} must not carry a Location header"
+            );
+        }
+    }
+
+    /// An account id with reserved characters arrives percent-encoded, is decoded
+    /// by the router, and must be re-encoded into the redirect target — never
+    /// spliced in raw, which would forge extra path segments or a query.
+    #[tokio::test]
+    async fn legacy_message_deep_link_reencodes_the_decoded_account() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/accounts/acct%2Fone%3Fx/messages/9?folder=Sent%20Items%20%26%20More")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            location_of(&response),
+            "/mail/unified/acct%2Fone%3Fx/9?folder=Sent%20Items%20%26%20More"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_account_cockpit_and_rules_links_redirect_to_global_routes() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        for (uri, expected) in [
+            ("/accounts/acc1/cockpit", "/cockpit"),
+            ("/accounts/acct%2Fone/cockpit", "/cockpit"),
+            ("/accounts/acc1/rules", "/rules"),
+            ("/accounts/acct%2Fone/rules", "/rules"),
         ] {
             let response = app
                 .clone()
@@ -3757,16 +3950,34 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "deep link {uri} should serve the SPA shell, not 404"
+                StatusCode::PERMANENT_REDIRECT,
+                "{uri} must permanently redirect"
             );
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            assert_eq!(location_of(&response), expected, "{uri} target");
+        }
+    }
+
+    /// The redirects live on the root router; the `/api` surface uses the same
+    /// `/accounts/...` shapes and must keep serving JSON.
+    #[tokio::test]
+    async fn api_account_routes_are_not_redirected() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        for uri in ["/api/accounts/acc1/rules", "/api/accounts/acc1/cockpit"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "{uri} is an API route and must not redirect"
+            );
             assert!(
-                html.contains("<title>Envelope</title>") && html.contains("/_app/"),
-                "deep link {uri} should return the dashboard SPA index"
+                response.headers().get(header::LOCATION).is_none(),
+                "{uri} must not carry a Location header"
             );
         }
     }
@@ -3842,6 +4053,34 @@ mod tests {
         assert!(
             route_id_matches(DRAFT_REVIEW_ROUTE_ID, &generated),
             "generated draft link {generated} is not matched by client route {DRAFT_REVIEW_ROUTE_ID}"
+        );
+    }
+
+    /// Redirecting (or emitting) a path the SvelteKit bundle cannot route just
+    /// relocates the 404. Every canonical target must exist in the embedded
+    /// client route table, and the generated message path must actually match the
+    /// reader route id.
+    #[test]
+    fn embedded_spa_bundle_routes_every_canonical_deep_link_target() {
+        let entry = embedded_spa_entry_chunk();
+
+        for route_id in [CONTROL_ROUTE_ID, "/cockpit", "/rules"] {
+            assert!(
+                entry.contains(&format!("\"{route_id}\"")),
+                "canonical route {route_id} missing from the embedded route table — deep \
+                 links to it render the SvelteKit 404 page"
+            );
+        }
+
+        let generated = crate::ui_paths::message_dashboard_path(
+            "109c5747-8498-4614-945a-837462ae0aaf",
+            "[Gmail]/Sent Mail",
+            33281,
+        );
+        let path = generated.split('?').next().unwrap();
+        assert!(
+            route_id_matches(CONTROL_ROUTE_ID, path),
+            "generated message link {generated} is not matched by client route {CONTROL_ROUTE_ID}"
         );
     }
 
