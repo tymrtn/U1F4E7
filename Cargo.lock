@@ -877,6 +877,9 @@ name = "email_address"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "encoding_rs"
@@ -928,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -958,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-dashboard"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "anyhow",
  "axum",
@@ -982,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-store"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -990,6 +993,7 @@ dependencies = [
  "base64",
  "chrono",
  "dirs-next",
+ "email_address",
  "hostname",
  "keyring",
  "rand 0.8.7",
@@ -1007,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-email-transport"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "anyhow",
  "async-imap",

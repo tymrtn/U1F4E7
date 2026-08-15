@@ -510,6 +510,22 @@ export interface ComposeResponse {
   references?: string[] | null;
 }
 
+/**
+ * One recipient autocomplete row. Address-book metadata only — the backend
+ * deliberately withholds subjects, snippets, and the ranking signal.
+ */
+export interface AddressSuggestion {
+  email: string;
+  name: string | null;
+}
+
+export interface AddressSuggestionsResponse {
+  account_id: string;
+  query: string;
+  limit: number;
+  suggestions: AddressSuggestion[];
+}
+
 // ── Typed endpoint helpers ────────────────────────────────────────────
 
 export const api = {
@@ -593,6 +609,23 @@ export const api = {
     return request(`/accounts/${encodeURIComponent(accountId)}`, {
       ...o,
       method: 'DELETE'
+    });
+  },
+
+  /**
+   * GET /api/accounts/{id}/address-suggestions — ranked recipients from the
+   * account's local address history. Read-only and never IMAP-backed, so it is
+   * safe to call on every keystroke.
+   */
+  addressSuggestions(
+    accountId: string,
+    q: string,
+    limit = 8,
+    o?: RequestOptions
+  ): Promise<AddressSuggestionsResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/address-suggestions`, {
+      ...o,
+      query: { q, limit }
     });
   },
 

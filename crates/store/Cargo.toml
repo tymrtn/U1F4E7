@@ -23,6 +23,11 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+# The address validator lettre uses at the SMTP edge (`lettre::Address` calls
+# `EmailAddress::is_valid_local_part` / `is_valid_domain`). Reused here so the
+# address book can never suggest a recipient the send path would refuse.
+email_address = "0.2"
+
 # Crypto
 aes-gcm.workspace = true
 argon2.workspace = true

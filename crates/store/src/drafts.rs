@@ -341,6 +341,11 @@ impl Database {
     /// actor that did not acquire the claim (or lost it) cannot mark a draft
     /// sent, which closes the cross-path double-send (scheduled sweep vs
     /// CLI/MCP immediate send). The token is cleared on the terminal state.
+    ///
+    /// Being the one edge every send path crosses, this is also where the
+    /// draft's recipients enter the compose autocomplete's address history —
+    /// after SMTP acceptance, never before, and never on a transition the
+    /// caller did not own. See [`Database::record_sent_draft_recipients`].
     pub fn mark_draft_sent(&self, id: &str, token: &str, message_id: Option<&str>) -> Result<()> {
         // On the terminal `sent` state, `send_after` and the Drafts-folder
         // `imap_uid` are both cleared:
@@ -370,6 +375,21 @@ impl Database {
                     current.status.as_str()
                 )),
             });
+        }
+
+        // The send is durable from the statement above; everything past it is
+        // cache maintenance. A suggestion cache that could not be written is a
+        // stale dropdown until the next reconcile — reporting it as a send
+        // failure would be far worse, because the callers answer that by
+        // parking the draft as `delivery_uncertain` and telling an operator to
+        // go verify delivery of a message that was, in fact, delivered.
+        if let Err(e) = self.record_sent_draft_recipients(id) {
+            tracing::warn!(
+                draft_id = %id,
+                "draft was sent, but its recipients could not be folded into the \
+                 address history: {e} — they will appear in compose autocomplete \
+                 after the next reconcile"
+            );
         }
         Ok(())
     }

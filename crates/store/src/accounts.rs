@@ -257,11 +257,31 @@ impl Database {
         })
     }
 
-    /// Delete an account by ID.
+    /// Delete an account by ID, together with the address book derived from
+    /// its mail.
+    ///
+    /// `contacts` and `address_history_state` are deleted explicitly and in
+    /// the same transaction as the account row. Nothing enables
+    /// `PRAGMA foreign_keys` on this connection, so no declared cascade fires
+    /// and a plain `DELETE FROM accounts` would leave every address this
+    /// account had ever corresponded with sitting in the database — names and
+    /// addresses, keyed to an account the user believes they removed. One
+    /// transaction so a failure part-way cannot leave the account gone and its
+    /// address book behind.
+    ///
+    /// Scoped to `account_id`: every other account keeps its own rows. Other
+    /// account-scoped tables are deliberately untouched here — this closes the
+    /// address book the autocomplete work opened, and widening it is a
+    /// separate decision.
     pub fn delete_account(&self, id: &str) -> Result<bool> {
-        let rows = self
-            .conn()
-            .execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+        let tx = self.conn().unchecked_transaction()?;
+        tx.execute("DELETE FROM contacts WHERE account_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM address_history_state WHERE account_id = ?1",
+            params![id],
+        )?;
+        let rows = tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(rows > 0)
     }
 
@@ -479,5 +499,116 @@ mod tests {
 
         assert!(db.delete_account(&account.id).unwrap());
         assert!(db.get_account(&account.id).unwrap().is_none());
+    }
+
+    /// Removing an account removes the address book derived from its mail.
+    /// Nothing turns on `PRAGMA foreign_keys`, so no declared cascade runs and
+    /// this has to be explicit: otherwise every correspondent's name and
+    /// address stays in the database after the user removed the account they
+    /// came from.
+    #[test]
+    fn delete_account_takes_its_address_history_with_it() {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Test", "a@b.com", "pw", "s.b.com", 587, "i.b.com", 993, "pp",
+            )
+            .unwrap();
+
+        db.upsert_contact(&crate::models::Contact {
+            id: "c-1".into(),
+            account_id: account.id.clone(),
+            email: "correspondent@example.test".into(),
+            name: Some("Correspondent".into()),
+            tags: "[]".into(),
+            notes: None,
+            message_count: 3,
+            first_seen: None,
+            last_seen: None,
+            created_at: "2026-01-01T00:00:00".into(),
+            updated_at: "2026-01-01T00:00:00".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO address_history_state
+                    (account_id, source_version, last_thread_message_id)
+                 VALUES (?1, 2, 41)",
+                params![account.id],
+            )
+            .unwrap();
+
+        assert!(db.delete_account(&account.id).unwrap());
+
+        assert!(db.list_contacts(&account.id, None).unwrap().is_empty());
+        let boundaries: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM address_history_state WHERE account_id = ?1",
+                params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundaries, 0, "the reconciliation boundary goes too");
+    }
+
+    /// And it takes nobody else's.
+    #[test]
+    fn delete_account_leaves_other_accounts_address_history_alone() {
+        let db = Database::open_memory().unwrap();
+        let doomed = db
+            .create_account(
+                "Doomed", "a@b.com", "pw", "s.b.com", 587, "i.b.com", 993, "pp",
+            )
+            .unwrap();
+        let kept = db
+            .create_account(
+                "Kept", "c@d.com", "pw", "s.d.com", 587, "i.d.com", 993, "pp",
+            )
+            .unwrap();
+
+        for (index, account_id) in [&doomed.id, &kept.id].into_iter().enumerate() {
+            db.upsert_contact(&crate::models::Contact {
+                id: format!("c-{index}"),
+                account_id: account_id.clone(),
+                email: "shared@example.test".into(),
+                name: None,
+                tags: "[]".into(),
+                notes: None,
+                message_count: 1,
+                first_seen: None,
+                last_seen: None,
+                created_at: "2026-01-01T00:00:00".into(),
+                updated_at: "2026-01-01T00:00:00".into(),
+            })
+            .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO address_history_state
+                        (account_id, source_version, last_thread_message_id)
+                     VALUES (?1, 2, 7)",
+                    params![account_id],
+                )
+                .unwrap();
+        }
+
+        assert!(db.delete_account(&doomed.id).unwrap());
+
+        assert!(db.list_contacts(&doomed.id, None).unwrap().is_empty());
+        assert_eq!(
+            db.list_contacts(&kept.id, None).unwrap().len(),
+            1,
+            "the surviving account keeps its address book, shared address and all"
+        );
+        let boundaries: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM address_history_state WHERE account_id = ?1",
+                params![kept.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundaries, 1);
+        assert!(db.get_account(&kept.id).unwrap().is_some());
     }
 }

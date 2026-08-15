@@ -9,6 +9,7 @@
 //! connection pool.
 
 pub mod accounts;
+pub mod address_book;
 pub mod agents;
 pub mod attachments;
 pub mod cockpit;

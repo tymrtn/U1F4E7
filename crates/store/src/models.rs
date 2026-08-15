@@ -435,6 +435,13 @@ pub struct ThreadMessage {
     pub from_address: Option<String>,
     /// Comma-separated list of recipient addresses.
     pub to_addresses: Option<String>,
+    /// Comma-separated `Cc` recipients, when the scan saw the header.
+    /// `None` on rows cached before Envelope retained Cc.
+    pub cc_addresses: Option<String>,
+    /// Comma-separated `Bcc` recipients, when the scan saw the header — only
+    /// the sender's own copy of an outbound message carries one. `None` on
+    /// rows cached before Envelope retained Bcc.
+    pub bcc_addresses: Option<String>,
     /// ISO 8601 datetime of the message's `Date:` header.
     pub date: Option<String>,
     /// Subject as it appeared on this specific message (before normalization).

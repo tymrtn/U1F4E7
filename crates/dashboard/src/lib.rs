@@ -138,6 +138,11 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
     let db = Database::open_default().map_err(|e| anyhow::anyhow!("{e}"))?;
     let state = AppState::new(db, backend).with_auth(auth);
 
+    {
+        let state = state.clone();
+        tokio::spawn(async move { backfill_address_history(&state).await });
+    }
+
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
             let s = origin.to_str().unwrap_or("");
@@ -206,6 +211,38 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("server error: {e}"))
+}
+
+/// Local backfill of the compose autocomplete address history, once per
+/// account, resumable across restarts.
+///
+/// Address history is reconciled whenever `envelope thread` scans a mailbox or
+/// something POSTs `/api/messages/unified/refresh`. Without this pass, an
+/// install whose thread cache and message index were already populated before
+/// this feature existed would offer no suggestions until the next refresh — a
+/// working feature that looks broken.
+///
+/// Everything here is local SQL over rows already on disk: no IMAP and no
+/// credential decryption. It runs as a background task rather than before the
+/// listener because the first pass over an established install walks the whole
+/// thread cache; the store hands it back in bounded chunks and records how far
+/// it got, so the dashboard answers requests throughout and a restart mid-pass
+/// resumes instead of starting over. A failure only warns — recipient
+/// autocomplete is never worth refusing to start the dashboard over.
+async fn backfill_address_history(state: &AppState) {
+    let accounts = {
+        let db = state.db.lock().await;
+        match db.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!("address history backfill skipped; could not list accounts: {e}");
+                return;
+            }
+        }
+    };
+    for account in accounts {
+        handlers::address_book::catch_up_account(state, &account.id).await;
+    }
 }
 
 /// Validate the dashboard exposure boundary before opening a listener.
@@ -284,6 +321,12 @@ pub fn dashboard_router(state: AppState) -> Router {
         )
         // Watch + delivery health browser (read-only aggregate).
         .route("/watches", get(handlers::watches::get))
+        // Recipient autocomplete for the compose surfaces (read-only, local
+        // address history — never IMAP).
+        .route(
+            "/accounts/{id}/address-suggestions",
+            get(handlers::address_book::suggest),
+        )
         // Folders
         .route("/accounts/{id}/folders", get(handlers::folders::list))
         // Messages
@@ -1765,6 +1808,106 @@ mod tests {
             draft.id,
             other_draft.id,
         )
+    }
+
+    #[tokio::test]
+    async fn address_history_backfill_populates_contacts_from_the_local_index() {
+        use envelope_email_store::models::IndexedMessageInput;
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Work', 'me@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'x')",
+                [],
+            )
+            .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acc1",
+            "INBOX",
+            1,
+            &[IndexedMessageInput {
+                uid: 1,
+                message_id: Some("<a@example.test>".into()),
+                from_addr: "Ada Lovelace <ada@example.test>".into(),
+                to_addr: "me@example.test".into(),
+                subject: "Quarterly filing".into(),
+                date: Some("Tue, 12 May 2026 12:00:00 +0000".into()),
+                flags: Vec::new(),
+                size: 10,
+                snippet: None,
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+
+        // Years of correspondence already cached locally, none of it in the
+        // dashboard's small INBOX snapshot.
+        let thread = db
+            .create_thread(
+                "hearing",
+                "2026-04-01T09:00:00Z",
+                "2026-04-01T09:00:00Z",
+                "acc1",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            9,
+            Some("<t9@court.test>"),
+            None,
+            None,
+            "Sent",
+            "me@example.test",
+            "clerk@court.test",
+            None,
+            None,
+            "2026-04-01T09:00:00Z",
+            "Hearing date",
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Both caches predate the address book — exactly the upgrade case this
+        // backfill exists for.
+        assert!(db.list_contacts("acc1", None).unwrap().is_empty());
+
+        let state = AppState::new(db, CredentialBackend::File);
+        backfill_address_history(&state).await;
+
+        let db = state.db.lock().await;
+        let suggestions = db.suggest_addresses("acc1", "ada", 8).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].email, "ada@example.test");
+        assert_eq!(suggestions[0].name.as_deref(), Some("Ada Lovelace"));
+
+        let from_threads = db.suggest_addresses("acc1", "clerk", 8).unwrap();
+        assert_eq!(from_threads.len(), 1, "the thread cache must be backfilled");
+        assert_eq!(from_threads[0].email, "clerk@court.test");
+
+        // Backfill is a boundary, not a per-request cost: running it again
+        // reads no thread rows and changes no counts.
+        drop(db);
+        backfill_address_history(&state).await;
+        let db = state.db.lock().await;
+        let again = db.reconcile_address_history("acc1").unwrap();
+        assert_eq!(again.thread_rows, 0);
+        // `history_count` is the derived counter this backfill owns;
+        // `message_count` belongs to `envelope contacts add|import` and stays
+        // untouched for a contact the backfill invented.
+        let clerk: (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT history_count, message_count FROM contacts
+                 WHERE account_id = 'acc1' AND email = 'clerk@court.test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(clerk, (1, 0));
     }
 
     #[tokio::test]

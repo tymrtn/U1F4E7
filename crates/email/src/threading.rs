@@ -221,6 +221,19 @@ pub async fn build_threads(
         threads_updated += sent_indexed.threads_updated;
     }
 
+    // Fold whatever the scan just wrote into the contacts address history that
+    // compose autocomplete reads. Local SQL over the rows already on disk: the
+    // store reads above a durable watermark, so an ordinary scan costs the
+    // messages it added rather than a rescan of the thread cache. A scan that
+    // rewrote an address on an already-cached row, or wiped a folder after a
+    // UIDVALIDITY change, has marked the account for a rebuild instead — that
+    // pass re-folds the account's thread cache from the start, which is the
+    // price of the corrected data being visible at all. A failure here is not a
+    // scan failure — the threads are indexed either way.
+    if let Err(e) = db.reconcile_address_history(account_id) {
+        warn!("address history reconcile failed for {account_email}: {e}");
+    }
+
     Ok(ThreadBuildResult {
         messages_indexed: total_indexed,
         threads_created,
@@ -380,9 +393,15 @@ where
                     .map(|d| d.to_rfc3339())
                     .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-                // From/To
+                // From/To/Cc/Bcc. Cc recipients are correspondents exactly as
+                // the To line is; Bcc only ever appears on the sender's own
+                // copy of an outbound message, and is kept for the same reason
+                // the Sent archive keeps it — the sender's record of who
+                // actually received it.
                 let from_addr = mp_first_address(parsed.from());
                 let to_addr = mp_all_addresses(parsed.to());
+                let cc_addr = non_empty(mp_all_addresses(parsed.cc()));
+                let bcc_addr = non_empty(mp_all_addresses(parsed.bcc()));
 
                 // Is this outbound? (sent from our account)
                 let is_outbound = from_addr.to_lowercase() == account_email.to_lowercase();
@@ -469,6 +488,8 @@ where
                     folder,
                     &from_addr,
                     &to_addr,
+                    cc_addr.as_deref(),
+                    bcc_addr.as_deref(),
                     &date,
                     &subject,
                     is_outbound,
@@ -567,6 +588,16 @@ fn mp_all_addresses(header: Option<&mail_parser::Address<'_>>) -> String {
                 .join(", "),
         },
         None => String::new(),
+    }
+}
+
+/// `None` for a header that was absent or held no parseable address, so an
+/// empty Cc is stored as NULL rather than an empty string.
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 

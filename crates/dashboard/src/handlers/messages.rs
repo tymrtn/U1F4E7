@@ -329,6 +329,14 @@ pub async fn refresh_unified_inbox(
                     let error = format!("index {folder}: {e}");
                     persist_refresh_error(&state, &account.id, &folder, &error).await;
                     refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
+                } else {
+                    // Fold the freshly-indexed metadata — plus this account's
+                    // sent drafts and any thread-cache rows that arrived since
+                    // the last pass — into the contacts address history that
+                    // compose autocomplete reads. Purely local SQL over rows
+                    // already on disk: no extra IMAP work, and it rides the
+                    // explicit refresh rather than the aggregate inbox load.
+                    crate::handlers::address_book::catch_up_account(&state, &account.id).await;
                 }
             }
             Err(e) => {
@@ -1444,6 +1452,8 @@ mod tests {
             "INBOX",
             "sender@example.test",
             "me@example.test",
+            None,
+            None,
             "2026-05-12T12:00:00Z",
             "cached first paint",
             false,
@@ -1459,6 +1469,8 @@ mod tests {
             "Sent",
             "me@example.test",
             "sender@example.test",
+            None,
+            None,
             "2026-05-12T13:00:00Z",
             "Re: cached first paint",
             true,
