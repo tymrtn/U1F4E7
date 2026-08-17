@@ -19,6 +19,7 @@ const { apiMock } = vi.hoisted(() => ({
     cockpit: vi.fn(),
     stats: vi.fn(),
     unifiedInbox: vi.fn(),
+    refreshUnifiedInbox: vi.fn(),
     compose: vi.fn(),
     composeReply: vi.fn(),
     discardDraft: vi.fn(),
@@ -82,6 +83,10 @@ beforeEach(() => {
   apiMock.unifiedInbox.mockResolvedValue({
     scope: 'unified_inbox', status: 'empty', folder: 'INBOX', limit: 50,
     unread_count: 0, freshness: 'empty', accounts: [], errors: [], messages: []
+  });
+  apiMock.refreshUnifiedInbox.mockResolvedValue({
+    scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+    unread_count: 0, freshness: 'fresh', accounts: [], errors: [], messages: []
   });
   apiMock.folders.mockResolvedValue({
     folders: [],
@@ -467,6 +472,30 @@ describe('SSE wiring — layout refreshes unified on mount', () => {
     });
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledWith(50));
+    expect(apiMock.refreshUnifiedInbox).not.toHaveBeenCalled();
+  });
+
+  it('refreshes when an account cache is stale', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'partial', folder: 'INBOX', limit: 50,
+      unread_count: 1, freshness: 'partial',
+      accounts: [{ freshness: 'stale' }, { freshness: 'unavailable' }],
+      errors: [], messages: []
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.refreshUnifiedInbox).toHaveBeenCalledWith(50));
+  });
+
+  it('does not refresh a partial inbox whose reachable caches are fresh', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'partial', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'partial',
+      accounts: [{ freshness: 'fresh' }, { freshness: 'unavailable' }],
+      errors: [], messages: []
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledWith(50));
+    expect(apiMock.refreshUnifiedInbox).not.toHaveBeenCalled();
   });
 
   it('compose button is present in the list pane header', async () => {

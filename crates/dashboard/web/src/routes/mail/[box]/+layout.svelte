@@ -93,19 +93,60 @@
   const isSearching = $derived(searchQuery.length > 0);
 
   let starOverrides = $state<Map<string, boolean>>(new Map());
+  let unifiedLoadGen = 0;
+  let unifiedRefreshInFlight = false;
+
+  function accountCacheIsStale(account: unknown): boolean {
+    if (!account || typeof account !== 'object') return false;
+    const freshness = (account as { freshness?: unknown }).freshness;
+    return freshness === 'stale' || freshness === 'expired';
+  }
+
+  // Top-level `partial` is the steady state when a couple of accounts are
+  // permanently unreachable. Refresh only when some account cache is actually
+  // stale — otherwise every page open would re-IMAP the whole fleet.
+  function inboxNeedsFlagRefresh(res: { freshness: string; accounts: unknown[] }): boolean {
+    if (res.freshness === 'stale' || res.freshness === 'expired') return true;
+    return Array.isArray(res.accounts) && res.accounts.some(accountCacheIsStale);
+  }
+
+  function applyUnified(res: { messages: UnifiedInboxMessage[]; errors?: UnifiedInboxError[] }) {
+    unifiedMessages = res.messages;
+    listErrors = res.errors ?? [];
+  }
+
+  async function refreshStaleUnified(gen: number) {
+    if (unifiedRefreshInFlight) return;
+    unifiedRefreshInFlight = true;
+    try {
+      const refreshed = await api.refreshUnifiedInbox(50);
+      if (gen !== unifiedLoadGen) return;
+      applyUnified(refreshed);
+    } catch {
+      // Keep the painted cache. A failed refresh must not blank the list.
+    } finally {
+      unifiedRefreshInFlight = false;
+    }
+  }
 
   async function loadUnified() {
-    loading = true;
+    const gen = ++unifiedLoadGen;
+    loading = unifiedMessages.length === 0;
     error = null;
     try {
       const res = await api.unifiedInbox(50);
-      unifiedMessages = res.messages;
-      listErrors = res.errors ?? [];
+      if (gen !== unifiedLoadGen) return;
+      applyUnified(res);
+      loading = false;
+      if (inboxNeedsFlagRefresh(res)) {
+        await refreshStaleUnified(gen);
+      }
     } catch (e) {
+      if (gen !== unifiedLoadGen) return;
       const err = e as EnvelopeApiError;
       error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load messages.' };
     } finally {
-      loading = false;
+      if (gen === unifiedLoadGen) loading = false;
     }
   }
 
