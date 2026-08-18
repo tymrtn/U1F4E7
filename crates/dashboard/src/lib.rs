@@ -421,6 +421,10 @@ pub fn dashboard_router(state: AppState) -> Router {
             post(handlers::drafts::discard),
         )
         .route(
+            "/accounts/{id}/drafts/{draft_id}/hold",
+            post(handlers::drafts::hold),
+        )
+        .route(
             "/accounts/{id}/drafts/{draft_id}/block",
             post(handlers::drafts::block),
         )
@@ -781,11 +785,19 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
                     let db = state.db.lock().await;
                     match &action {
                         AttributionFailureAction::HumanReview => {
-                            // Park for re-approval, preserving human origin: no
-                            // attribution block is rewritten. `park_for_review`
-                            // clears `send_after` atomically so the parked draft
-                            // never reads as still-queued / due.
-                            db.park_for_review(&draft.id, &lease).unwrap_or(false)
+                            // Park for re-approval with a user-facing reason.
+                            // Silent pending_review is not allowed.
+                            db.park_for_review_with_block(
+                                &draft.id,
+                                &lease,
+                                &serde_json::json!({
+                                    "code": "attributes_required",
+                                    "title": "This send was stopped",
+                                    "explanation": "Envelope paused this message before sending because it was missing a required fact label. Nothing was transmitted.",
+                                    "action": "send"
+                                }),
+                            )
+                            .unwrap_or(false)
                         }
                         AttributionFailureAction::Park { value } => db
                             .park_attribution_exhausted(&draft.id, &lease, value)
@@ -864,7 +876,18 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             // transient gate failure releases back to `draft` WITH send_after
             // intact so a later sweep retries once Governor is reachable.
             let released = if pause_for_review {
-                park_review_claim(state, &draft.id, &lease).await
+                park_review_claim_with_block(
+                    state,
+                    &draft.id,
+                    &lease,
+                    &serde_json::json!({
+                        "code": gov_outcome.block_code.clone().unwrap_or_else(|| "governor_blocked".to_string()),
+                        "title": "This send was stopped",
+                        "explanation": "Envelope paused this message for review before sending. Nothing was transmitted.",
+                        "action": "send"
+                    }),
+                )
+                .await
             } else {
                 release_claim(
                     state,
@@ -1072,11 +1095,17 @@ async fn release_claim(
 /// Park a `sending` claim as `pending_review` after a durable Governor **review**
 /// verdict, clearing `send_after` under the owner lease so no surface (dashboard,
 /// CLI, or the due query) can present the parked draft as still queued or show a
-/// stale countdown. Nothing is transmitted and no Sent copy is written. Returns
+/// stale countdown. Persist a user-facing `send_block` so the page cannot stay
+/// silent. Nothing is transmitted and no Sent copy is written. Returns
 /// `true` only when the owned `sending` row was actually parked.
-async fn park_review_claim(state: &AppState, draft_id: &str, lease: &str) -> bool {
+async fn park_review_claim_with_block(
+    state: &AppState,
+    draft_id: &str,
+    lease: &str,
+    block: &serde_json::Value,
+) -> bool {
     let db = state.db.lock().await;
-    match db.park_for_review(draft_id, lease) {
+    match db.park_for_review_with_block(draft_id, lease, block) {
         Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
@@ -1601,6 +1630,41 @@ async fn run_governor_gate(
     use envelope_email_transport::outbound::{
         GovernorConfig, GovernorRequest, SendSurface, gate_with_attribution,
     };
+
+    // A current dashboard/human attestation is a human send. Governor does not
+    // score, review, or park it — that is what stranded operator-clicked mail
+    // as `pending_review` for days.
+    if draft.human_approved() {
+        let outcome = envelope_email_transport::outbound::GovernorOutcome::human_dashboard_send();
+        let event = envelope_email_store::Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id: draft.account_id.clone(),
+            event_type: "send.human_dashboard".to_string(),
+            folder: "policy".to_string(),
+            uid: None,
+            message_id: None,
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(
+                serde_json::json!({
+                    "draft_id": draft.id,
+                    "surface": "dashboard",
+                    "governor": "skipped",
+                })
+                .to_string(),
+            ),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some(chrono::Utc::now().to_rfc3339()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        {
+            let db = state.db.lock().await;
+            let _ = db.insert_event(&event);
+        }
+        return outcome;
+    }
 
     let account_domain = account_domain_from_username(&creds.account.username);
 

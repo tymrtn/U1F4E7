@@ -141,9 +141,236 @@ mod tests {
         assert!(serialized.contains("packet.txt"));
         assert_eq!(summaries[0]["size"], 5);
     }
+
+    // ── hold: unqueue without discarding ──────────────────────────────
+
+    fn seeded_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.conn().execute("INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password) VALUES ('acc1', 'Test', 'op@example.com', 'example.com', 'smtp.example.com', 587, 'imap.example.com', 993, 'x')", []).unwrap();
+        db
+    }
+
+    fn scheduled_draft(db: &Database, send_after: &str) -> String {
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Quarterly update"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, send_after).unwrap();
+        draft.id
+    }
+
+    #[test]
+    fn hold_clears_send_after_and_keeps_the_draft() {
+        let db = seeded_db();
+        // Hours out, not a 60s cooldown: this is the schedule discard ruins.
+        let id = scheduled_draft(&db, "2030-01-01T09:00:00");
+
+        let result = hold_scheduled(&db, &id, None).unwrap();
+
+        assert_eq!(result["action"], "hold");
+        assert_eq!(result["status"], "draft");
+        assert_eq!(result["send_after"], serde_json::Value::Null);
+        assert_eq!(result["was_scheduled_for"], "2030-01-01T09:00:00");
+        assert_eq!(result["discarded"], false);
+
+        let after = db.get_draft(&id).unwrap().unwrap();
+        assert!(after.send_after.is_none());
+        assert_eq!(after.status.as_str(), "draft");
+        assert_eq!(after.subject.as_deref(), Some("Quarterly update"));
+        assert_eq!(after.text_content.as_deref(), Some("Body"));
+    }
+
+    #[test]
+    fn a_held_draft_is_no_longer_listed_as_scheduled() {
+        let db = seeded_db();
+        let id = scheduled_draft(&db, "2000-01-01T00:00:00");
+        assert_eq!(db.list_drafts_due_for_send().unwrap().len(), 1);
+
+        hold_scheduled(&db, &id, None).unwrap();
+
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+        // `scheduled list` filters on send_after, so the held draft leaves that
+        // listing too — while still being there as a normal draft.
+        let listed = db.list_drafts("acc1", Some("draft"), 100, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].send_after.is_none());
+    }
+
+    /// The whole reason `hold` exists: `cancel` destroys the message.
+    #[test]
+    fn hold_keeps_the_draft_where_cancel_would_discard_it() {
+        let db = seeded_db();
+        let held_id = scheduled_draft(&db, "2030-01-01T09:00:00");
+        let cancelled_id = scheduled_draft(&db, "2030-01-01T09:00:00");
+
+        hold_scheduled(&db, &held_id, None).unwrap();
+        db.discard_draft(&cancelled_id).unwrap();
+
+        assert_eq!(
+            db.get_draft(&held_id).unwrap().unwrap().status.as_str(),
+            "draft"
+        );
+        assert_eq!(
+            db.get_draft(&cancelled_id)
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "discarded"
+        );
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_that_was_never_scheduled() {
+        let db = seeded_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Unscheduled"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        let err = hold_scheduled(&db, &draft.id, None).unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to hold scheduled draft"),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("not scheduled"),
+            "the refusal must say why: {err:#}"
+        );
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_the_send_sweep_already_claimed() {
+        let db = seeded_db();
+        let id = scheduled_draft(&db, "2000-01-01T00:00:00");
+        let rev = db.get_draft(&id).unwrap().unwrap().revision;
+        assert!(db.claim_draft_for_sending(&id, rev).unwrap().is_some());
+
+        let err = hold_scheduled(&db, &id, None).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("not editable"),
+            "a claimed send must not be yanked back: {err:#}"
+        );
+        assert_eq!(
+            db.get_draft(&id).unwrap().unwrap().status.as_str(),
+            "sending"
+        );
+    }
+
+    #[test]
+    fn hold_refuses_a_missing_draft() {
+        let db = seeded_db();
+        let err = hold_scheduled(&db, "no-such-draft", None).unwrap_err();
+        assert!(err.to_string().contains("draft not found"), "{err:#}");
+    }
+
+    #[test]
+    fn hold_enforces_the_account_scope_when_one_is_given() {
+        let db = seeded_db();
+        db.conn().execute("INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password) VALUES ('acc2', 'Other', 'other@example.com', 'example.com', 'smtp.example.com', 587, 'imap.example.com', 993, 'x')", []).unwrap();
+        let id = scheduled_draft(&db, "2030-01-01T09:00:00");
+
+        let err = hold_scheduled(&db, &id, Some("other@example.com")).unwrap_err();
+
+        assert!(err.to_string().contains("does not belong to"), "{err:#}");
+        assert!(
+            db.get_draft(&id).unwrap().unwrap().send_after.is_some(),
+            "a cross-account hold must not clear the schedule"
+        );
+
+        // The owning account still holds it.
+        hold_scheduled(&db, &id, Some("op@example.com")).unwrap();
+        assert!(db.get_draft(&id).unwrap().unwrap().send_after.is_none());
+    }
+}
+
+/// Take a scheduled message back out of the outbox WITHOUT discarding it.
+///
+/// The non-destructive counterpart to [`run_cancel`]: `send_after` is cleared
+/// so the scheduled-send sweep can never pick the draft up, and the row stays
+/// in `draft` status so it can be edited and re-queued later. Reach for this
+/// whenever the message is still wanted and only the timing is wrong — cancel
+/// throws the message away.
+///
+/// Unlike [`run_cancel`], `--account` is enforced when supplied: an id that
+/// belongs to another account is refused rather than silently held.
+fn hold_scheduled(db: &Database, id: &str, account: Option<&str>) -> Result<serde_json::Value> {
+    let draft = db
+        .get_draft(id)
+        .context("failed to get draft")?
+        .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
+    let was_scheduled_for = draft.send_after.clone();
+
+    if let Some(a) = account {
+        let acct = resolve_account(db, Some(a))?;
+        if draft.account_id != acct.id {
+            bail!("draft {id} does not belong to account {}", acct.username);
+        }
+    }
+
+    let held = db
+        .hold_scheduled_draft(id)
+        .with_context(|| format!("failed to hold scheduled draft {id}"))?;
+
+    Ok(serde_json::json!({
+        "action": "hold",
+        "draft_id": held.id,
+        "account_id": held.account_id,
+        "status": held.status.as_str(),
+        "to": held.to_addr,
+        "subject": held.subject,
+        "send_after": held.send_after,
+        "was_scheduled_for": was_scheduled_for,
+        "discarded": false,
+    }))
+}
+
+/// CLI entry point for `envelope scheduled hold <id>`.
+pub fn run_hold(id: &str, account: Option<&str>, json: bool) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let result = hold_scheduled(&db, id, account)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Held scheduled message: {id}");
+        println!("  To:       {}", result["to"].as_str().unwrap_or("-"));
+        if let Some(s) = result["subject"].as_str() {
+            println!("  Subject:  {s}");
+        }
+        if let Some(sa) = result["was_scheduled_for"].as_str() {
+            println!("  Was scheduled for: {sa}");
+        }
+        println!("  Status:   draft (editable — re-send when you are ready)");
+    }
+
+    Ok(())
 }
 
 /// Cancel a scheduled message by discarding the draft.
+///
+/// Destructive: the draft is gone afterwards. [`run_hold`] is the verb for
+/// stopping the clock while keeping the message.
 pub fn run_cancel(id: &str, _account: Option<&str>, json: bool) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
 

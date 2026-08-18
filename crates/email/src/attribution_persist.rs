@@ -252,21 +252,20 @@ pub fn scheduled_origin(
 /// The attribution inputs the scheduled-send sweep resolves with, derived from a
 /// draft's durable state.
 ///
-/// Origin is decided from durable provenance ([`scheduled_origin`]), never from
-/// the human attestation alone. Only a **genuinely human-originated** draft that
-/// also carries a current human attestation (`human_approved`) lifts the
-/// bot-declaration requirement — it then proceeds on its durable host attestation
-/// (`tyler_approved`, derived by Envelope) without a fabricated bot declaration.
+/// Origin is decided from durable provenance ([`scheduled_origin`]) **unless**
+/// a current human dashboard attestation is on the row. A human clicking Send
+/// on the dashboard is a human send, even when an agent drafted the body:
+/// Governor must not require a bot declaration or block that transmission.
 ///
-/// Every bot-originated draft requires a valid, *current* persisted declaration
-/// **even after a human approves it**: approval supplements the declaration
-/// (adding `tyler_approved` to the derived set) but never erases the bot's
-/// attribution responsibility. Unknown-provenance drafts fail closed as bot.
-/// A non-empty derived set never substitutes for a missing/stale declaration.
+/// Without a current `human_approved` attestation, bot and unknown origins
+/// still require a valid current declaration. Human-authored drafts without a
+/// current attestation also fail closed — provenance alone is not a send.
+/// A non-empty derived set never substitutes for a missing/stale declaration
+/// on those bot paths.
 ///
 /// Returns `(declared_attrs, require_declaration)`.
 pub fn scheduled_attribution_inputs(
-    created_by: Option<&str>,
+    _created_by: Option<&str>,
     human_approved: bool,
     persisted: Option<&PersistedDeclaration>,
     draft_revision: i64,
@@ -275,11 +274,9 @@ pub fn scheduled_attribution_inputs(
     let declared = current
         .map(|d| d.declared_attrs.clone())
         .unwrap_or_default();
-    let origin = scheduled_origin(created_by, persisted, draft_revision);
-    // The ONLY path that lifts the bot-declaration requirement: a genuinely
-    // human-originated send that is currently human-attested. Bot and unknown
-    // origins always require a declaration, human approval notwithstanding.
-    let require_declaration = !(origin == ScheduledOrigin::Human && human_approved);
+    // A current dashboard/human attestation is the send. Agent-drafted bodies
+    // that an operator clicked Send on are not bot sends.
+    let require_declaration = !human_approved;
     (declared, require_declaration)
 }
 
@@ -538,29 +535,33 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_inputs_bot_human_approved_still_requires_declaration() {
-        // Human approval SUPPLEMENTS a bot send; it never erases the bot's
-        // attribution responsibility. A bot draft with a human attestation but no
-        // declaration still requires one and fails closed.
+    fn scheduled_inputs_dashboard_click_does_not_require_bot_declaration() {
+        // An agent may have drafted the body. The operator clicking Send on the
+        // dashboard is the send: no bot declaration is required, and host
+        // derivation of tyler_approved is enough to attribute.
         let (declared, require) = scheduled_attribution_inputs(Some("agent"), true, None, 1);
-        assert!(require, "human approval does not waive the bot declaration");
+        assert!(
+            !require,
+            "a current dashboard attestation is a human send, even on an agent-drafted row"
+        );
         assert!(declared.is_empty());
         let mut ctx = sample_ctx();
         ctx.human_approved = true;
         let res = resolve(&declared, &ctx, require);
-        assert_eq!(
-            res.state,
-            crate::attribution::AttributionState::Unattributed
-        );
-        assert!(res.governor_attrs.is_empty(), "nothing reaches Governor");
+        assert_eq!(res.state, crate::attribution::AttributionState::Attributed);
+        assert!(res.governor_attrs.iter().any(|a| a == "tyler_approved"));
     }
 
     #[test]
-    fn scheduled_inputs_unknown_origin_fails_closed_even_when_approved() {
-        // An unknown-provenance draft is never silently treated as human, even
-        // with a (mismatched) human attestation present.
+    fn scheduled_inputs_current_approval_wins_even_if_created_by_is_unknown() {
+        // `human_approved` is already fail-closed (human: prefix, RFC 3339,
+        // revision-bound). If that is true, created_by=None is not a reason to
+        // treat the send as a bot send.
         let (_declared, require) = scheduled_attribution_inputs(None, true, None, 1);
-        assert!(require, "unknown provenance fails closed as bot");
+        assert!(
+            !require,
+            "a current human attestation is the send, even when created_by is unknown"
+        );
     }
 
     #[test]

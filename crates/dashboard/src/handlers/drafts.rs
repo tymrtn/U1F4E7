@@ -290,6 +290,44 @@ pub async fn discard(
     }
 }
 
+/// Take a queued draft back out of the outbox without discarding it.
+///
+/// The destructive counterpart lives at `/discard`. This one clears
+/// `send_after` and leaves the row in `draft` status, so the review composer
+/// unlocks and the operator can finish the message and re-queue it later —
+/// which is what "I need more time" actually means, and what discarding a
+/// queued draft could never give them.
+///
+/// Deliberately NOT revision-guarded. Hold only ever removes a pending send, so
+/// there is nothing a concurrent edit could make unsafe about it; refusing on a
+/// stale revision would strand an operator watching a countdown they cannot
+/// stop. The real race — the sweep having already claimed the row — is settled
+/// in the store by the `status = 'draft'` guard, which surfaces here as 409.
+pub async fn hold(
+    State(state): State<AppState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    match ensure_draft_account(&db, &account_id, &draft_id)
+        .and_then(|draft| db.hold_scheduled_draft(&draft.id))
+    {
+        Ok(draft) => {
+            // The status did not change (`draft` → `draft`), but the queue did:
+            // any surface showing this row as scheduled — the cockpit panel, an
+            // open second tab — has to drop the countdown.
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftStatusChanged {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    status: DraftStatus::Draft.as_str().to_string(),
+                });
+            Json(json!({ "draft": draft, "status": "held" })).into_response()
+        }
+        Err(e) => draft_error(e),
+    }
+}
+
 pub async fn block(
     State(state): State<AppState>,
     Path((account_id, draft_id)): Path<(String, String)>,
@@ -458,6 +496,9 @@ fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response 
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
         envelope_email_store::StoreError::DraftModifiedConcurrently(_) => {
+            (StatusCode::CONFLICT, format!("{e}")).into_response()
+        }
+        envelope_email_store::StoreError::DraftNotScheduled(_) => {
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
@@ -916,6 +957,200 @@ mod tests {
         );
         assert_eq!(attr["governor"], serde_json::Value::Null);
         assert!(!v.to_string().contains("\"score\""), "no score leaked");
+    }
+
+    // ── Hold: unqueue without discarding ──────────────────────────────
+
+    /// Queue a fresh draft through the real dashboard send path and hand back
+    /// the state plus the draft id, so hold is exercised against a draft that
+    /// was genuinely queued (attestation and all), not a hand-built row.
+    async fn queued_through_dashboard_send() -> (crate::AppState, String) {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+        let resp = super::send(
+            AxumState(state.clone()),
+            AxumPath(("acc1".to_string(), draft.id.clone())),
+            axum::Json(super::DraftSendRequest {
+                confirm: true,
+                expected_revision: rev,
+                // A long schedule, not a 60s undo window: hold has to work for
+                // a send parked hours out, which is the case discard ruins.
+                cooldown_seconds: Some(6 * 60 * 60),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        (state, draft.id)
+    }
+
+    async fn hold_response(
+        state: &crate::AppState,
+        account: &str,
+        draft_id: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let resp = super::hold(
+            AxumState(state.clone()),
+            AxumPath((account.to_string(), draft_id.to_string())),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The core promise: hold returns an editable draft, not a discarded one.
+    #[tokio::test]
+    async fn hold_clears_the_schedule_and_returns_an_editable_draft() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+
+        let (status, body) = hold_response(&state, "acc1", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "held");
+        assert_eq!(v["draft"]["status"], "draft");
+        assert_eq!(v["draft"]["send_after"], serde_json::Value::Null);
+        // The message survives — that is the whole difference from discard.
+        assert_eq!(v["draft"]["subject"], "Hi");
+        assert_eq!(v["draft"]["text_content"], "Body");
+
+        let db = state.db.lock().await;
+        let held = db.get_draft(&draft_id).unwrap().unwrap();
+        assert_eq!(held.status, DraftStatus::Draft);
+        assert!(held.send_after.is_none());
+        assert!(
+            db.list_drafts_due_for_send().unwrap().is_empty(),
+            "a held draft must be out of the sweep's reach"
+        );
+    }
+
+    /// Hold is account-scoped exactly like every other operator primitive: a
+    /// caller naming the wrong account cannot unqueue someone else's draft.
+    #[tokio::test]
+    async fn hold_is_account_scoped() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+        {
+            let db = state.db.lock().await;
+            seed_account(&db, "acc2", "other@example.com");
+        }
+
+        let (status, _) = hold_response(&state, "acc2", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let db = state.db.lock().await;
+        assert!(
+            db.get_draft(&draft_id)
+                .unwrap()
+                .unwrap()
+                .send_after
+                .is_some(),
+            "a cross-account hold must not touch the schedule"
+        );
+    }
+
+    /// Once the sweep owns the row there is nothing to hold — report the
+    /// conflict rather than pretending the send was stopped.
+    #[tokio::test]
+    async fn hold_conflicts_once_the_sweep_has_claimed_the_draft() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+        {
+            let db = state.db.lock().await;
+            // Bring the schedule due, then let the sweep claim it.
+            db.update_draft_send_after(&draft_id, "2000-01-01T00:00:00")
+                .unwrap();
+            let rev = db.get_draft(&draft_id).unwrap().unwrap().revision;
+            assert!(
+                db.claim_draft_for_sending(&draft_id, rev)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let (status, _) = hold_response(&state, "acc1", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        let db = state.db.lock().await;
+        assert_eq!(
+            db.get_draft(&draft_id).unwrap().unwrap().status,
+            DraftStatus::Sending
+        );
+    }
+
+    /// A draft that was never queued gets a truthful refusal, not a no-op 200
+    /// that claims a schedule was cleared.
+    #[tokio::test]
+    async fn hold_conflicts_on_a_draft_that_was_never_queued() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+
+        let (status, _) = hold_response(&state, "acc1", &draft.id).await;
+
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    /// Hold must never be a quiet discard. Guards the handler source against a
+    /// regression that swaps the store primitive for the destructive one.
+    #[test]
+    fn hold_handler_never_discards() {
+        let source = include_str!("drafts.rs");
+        let hold_fn = source
+            .split("pub async fn hold(")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub async fn ").next())
+            .expect("hold handler must exist");
+        assert!(
+            hold_fn.contains("hold_scheduled_draft"),
+            "hold must go through the non-destructive store primitive"
+        );
+        assert!(
+            !hold_fn.contains("discard_draft"),
+            "hold must never discard the draft it unqueues"
+        );
     }
 
     /// The dashboard send handler source must not call any direct simple-send

@@ -528,6 +528,24 @@ impl GovernorOutcome {
         self
     }
 
+    /// A human clicked Send on the dashboard. Governor does not score or block
+    /// that transmission — the click is the send. Used by the scheduled sweep
+    /// when the claimed row still carries a current `human_approval`.
+    pub fn human_dashboard_send() -> Self {
+        let mut outcome = Self::bare(
+            true,
+            GovernorMode::Off,
+            "human_dashboard",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        outcome.surface = Some(SendSurface::Scheduled);
+        outcome
+    }
+
     /// Sanitized JSON for **durable operator-facing** audit/event rows. Records
     /// the route/state and the three attribution sets + state + count — never a
     /// score, weight, threshold, or breakdown.

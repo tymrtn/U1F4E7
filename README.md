@@ -377,7 +377,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope contract [--surface <name>]` | Export the versioned agent JSON/MCP contract |
 | `envelope mcp [--config]` | MCP server (stdio) for Claude Code, Cursor, Zed |
 | `envelope send --at "monday 9am"` | Scheduled send with flexible datetime |
-| `envelope scheduled list/cancel` | Manage scheduled messages |
+| `envelope scheduled list/hold/cancel` | Manage scheduled messages (`hold` unqueues and keeps the draft; `cancel` discards it) |
 | `envelope contacts add/list/show/tag/import` | Contact store with rules integration |
 | `envelope serve` | Localhost dashboard |
 
