@@ -440,6 +440,40 @@ impl Database {
         Ok(())
     }
 
+    /// Replace the draft's `attachments` JSON array, bound to the revision the
+    /// caller was shown.
+    ///
+    /// The revision-guarded sibling of [`Self::update_draft_attachments`], for
+    /// interactive surfaces where the operator is looking at a rendered list of
+    /// attachments: adding or removing one is an edit to what will be sent, so
+    /// it has to lose a race with a concurrent change rather than rebuild the
+    /// array from a stale view. Same atomic statement, same editable-status
+    /// guard, same approval invalidation — plus `revision = ?3`.
+    pub fn update_draft_attachments_for_revision(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        attachments: &[serde_json::Value],
+    ) -> Result<Draft> {
+        let serialized = serde_json::to_string(attachments)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET attachments = ?1,
+                metadata = json_remove(metadata, '$.human_approval'),
+                revision = revision + 1,
+                updated_at = datetime('now')
+             WHERE id = ?2
+               AND status IN ('draft', 'pending_review', 'blocked')
+               AND revision = ?3",
+            params![serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+
+        self.get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+    }
+
     /// Set the `send_after` timestamp on a draft (for scheduled sending).
     pub fn update_draft_send_after(&self, id: &str, send_after: &str) -> Result<()> {
         // Editable-status guard in the same statement: rescheduling a claimed
@@ -3654,6 +3688,118 @@ mod tests {
         assert_eq!(fetched.attachments[0]["filename"], "packet.txt");
         assert_eq!(fetched.attachments[0]["size"], 5);
         assert_eq!(fetched.attachments[1]["data_base64"], "Zm9v");
+    }
+
+    /// The revision-guarded variant is what interactive surfaces use: the
+    /// operator is looking at a rendered list, so a stale view must lose the
+    /// race instead of writing back an array rebuilt from what it last saw.
+    #[test]
+    fn update_draft_attachments_for_revision_enforces_the_caller_view() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let one = vec![serde_json::json!({
+            "filename": "one.txt",
+            "content_type": "text/plain",
+            "size": 1,
+            "data_base64": "YQ==",
+        })];
+        let updated = db
+            .update_draft_attachments_for_revision(&draft.id, draft.revision, &one)
+            .unwrap();
+        assert_eq!(updated.attachments.len(), 1);
+        assert_eq!(
+            updated.revision,
+            draft.revision + 1,
+            "an attachment change is an edit and bumps the revision"
+        );
+
+        // A second writer still holding the pre-update revision is refused, and
+        // its view of the array (empty) is not written back.
+        let err = db
+            .update_draft_attachments_for_revision(&draft.id, draft.revision, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftModifiedConcurrently(_)),
+            "stale revision must conflict, got {err:?}"
+        );
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().attachments.len(),
+            1
+        );
+    }
+
+    /// Changing what will be attached invalidates the approval that was given
+    /// for the previous set — same contract as a body edit.
+    #[test]
+    fn update_draft_attachments_for_revision_drops_the_approval() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // `set_draft_metadata` strips `human_approval` by design — the
+        // attestation only exists via the atomic queue path, so that is what
+        // this test has to go through.
+        let approved = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2026-08-18T12:00:00Z",
+                "human:dashboard",
+                "2026-08-18T11:59:00Z",
+            )
+            .unwrap();
+        assert!(
+            approved
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("human_approval"))
+                .is_some(),
+            "the queue path must record the attestation this test then invalidates"
+        );
+
+        let updated = db
+            .update_draft_attachments_for_revision(
+                &approved.id,
+                approved.revision,
+                &[serde_json::json!({
+                    "filename": "late.txt",
+                    "content_type": "text/plain",
+                    "size": 1,
+                    "data_base64": "YQ==",
+                })],
+            )
+            .unwrap();
+        assert!(
+            updated
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("human_approval"))
+                .is_none(),
+            "attaching after approval must invalidate it"
+        );
     }
 
     #[test]

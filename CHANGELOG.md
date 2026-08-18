@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.12] — 2026-08-18
+
+### Added
+
+- Draft attachments are visible and editable on the draft review page. Each attachment renders as a chip carrying its filename, media type, and size, with the panel summarising the count and total; clicking a chip downloads that file, and the `×` on it detaches the file from the draft. `Attach files` and drag-and-drop add more, up to 25 MB per message — the ceiling is checked in the browser before a file is read and again server-side against the draft's running total. Previously this surface rendered a bare sentence ("3 attachments stay on this draft"), naming nothing and offering no way to open, add, or remove anything.
+- New endpoints `POST /api/accounts/{id}/drafts/{draft_id}/attachments`, `DELETE /api/accounts/{id}/drafts/{draft_id}/attachments/{filename}`, and `GET /api/accounts/{id}/drafts/{draft_id}/attachments/{filename}`. Download streams from the bytes stored on the draft rather than from IMAP, because an unsent draft's files exist nowhere else; it sends `X-Content-Type-Options: nosniff` and inlines images only, so a mislabelled entry cannot render as active content on the dashboard's origin. Attaching and detaching are edits: both carry the `expected_revision` the operator was shown, bump the revision, and clear any human-approval attestation — a draft cannot pick up a file after approval and still ride that approval.
+- Uploaded filenames are reduced to one path segment (`../../etc/passwd` attaches as `passwd`), and a name that collides with an existing attachment is suffixed `name (2).ext`. Downloads address an attachment by name, so a duplicate name would otherwise make one of the two files unreachable.
+- Attaching a file no longer costs unsaved work. The review page adopts the server's new revision and attachment list without re-seeding the editor, so text typed but not yet saved survives an attach, and the following save carries the revision the attachment write produced rather than conflicting with it.
+
+### Fixed
+
+- Draft JSON no longer ships attachment bytes to the client. `GET /drafts`, `GET /drafts/{id}`, `by-imap-uid`, and the approve/edit/block responses all strip `data_base64` from each attachment entry, leaving filename, media type, and size. The review page was downloading every attachment in full on each load and rendering only a count — a draft carrying a 10 MB PDF moved 13 MB of base64 per fetch — and the field is one the store is explicit about never logging or echoing, which the CLI has honoured since its first attachment listing. Attachment bytes now leave the API through the download route alone.
+
 ## [1.0.11] — 2026-08-15
 
 ### Added

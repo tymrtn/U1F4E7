@@ -27,6 +27,7 @@
   } from '$lib/addresses';
   import Badge from './Badge.svelte';
   import Button from './Button.svelte';
+  import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
   import Modal from './Modal.svelte';
   import MonoTag from './MonoTag.svelte';
@@ -328,6 +329,25 @@
     showBcc = bccRaw.length > 0;
     conflict = false;
     baseline = snapshot();
+  }
+
+  /**
+   * Adopt the server's draft after an attachment change — revision and
+   * attachment list only.
+   *
+   * `applyDraft` cannot be used here: it re-seeds the editor fields and the
+   * baseline from the server row, which on a draft with unsaved edits would
+   * silently discard whatever the operator had typed. Attaching a file
+   * mid-sentence must not cost them the sentence. Taking the fresh revision
+   * matters just as much — the next save has to echo the revision the
+   * attachment write produced, or it 409s against a change this page made.
+   */
+  function adoptAttachmentChange(next: Draft) {
+    draft = next;
+    conflict = false;
+    // The attachment write cleared any approval attestation server-side, so a
+    // "saved" badge from before it would now overstate what is approved.
+    saved = false;
   }
 
   function snapshot(): Snapshot {
@@ -645,13 +665,13 @@
       ></textarea>
     </div>
 
-    {#if draft.attachments.length > 0}
-      <p class="draft-attachment-note">
-        {draft.attachments.length}
-        {draft.attachments.length === 1 ? 'attachment stays' : 'attachments stay'} on this draft. Editing
-        the message here does not change them.
-      </p>
-    {/if}
+    <DraftAttachments
+      {draft}
+      accountId={accountId}
+      editable={editable && identityMatches}
+      onchange={adoptAttachmentChange}
+      onconflict={() => (conflict = true)}
+    />
 
     <footer class="draft-actions">
       <div class="draft-actions-status">
@@ -968,12 +988,6 @@
     color: var(--env-muted);
     -webkit-text-fill-color: var(--env-muted);
     opacity: 1;
-  }
-  .draft-attachment-note {
-    margin: 0;
-    color: var(--env-muted);
-    font-family: var(--font-mono);
-    font-size: 0.6875rem;
   }
 
   /* ── Actions ── */

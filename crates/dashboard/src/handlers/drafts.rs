@@ -93,6 +93,33 @@ pub struct DraftSendRequest {
     pub cooldown_seconds: Option<i64>,
 }
 
+/// Serialize a draft for the JSON API with attachment bytes stripped.
+///
+/// Draft attachment entries carry `data_base64` — the snapshot the send sweep
+/// transmits from. The store is explicit that the field is never logged or
+/// echoed, and the CLI has stripped it since its first attachment listing
+/// (`cli::commands::attachments::attachment_summary`). Serializing the raw row
+/// put it on the wire anyway: every draft fetch shipped every attachment in
+/// full to the browser, which then rendered a count. Callers that want the
+/// bytes ask for one file by name at
+/// `GET /accounts/{id}/drafts/{draft_id}/attachments/{filename}`.
+pub(crate) fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
+    let mut value = serde_json::to_value(draft).unwrap_or_else(|_| json!({}));
+    if let Some(attachments) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
+        for entry in attachments.iter_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("data_base64");
+            }
+        }
+    }
+    value
+}
+
+/// [`draft_json`] over a slice, for list responses.
+fn drafts_json(drafts: &[envelope_email_store::Draft]) -> Vec<serde_json::Value> {
+    drafts.iter().map(draft_json).collect()
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -107,7 +134,7 @@ pub async fn list(
     };
 
     match db.list_drafts(&account.id, Some("draft"), 100, 0) {
-        Ok(drafts) => Json(json!({ "drafts": drafts })).into_response(),
+        Ok(drafts) => Json(json!({ "drafts": drafts_json(&drafts) })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
@@ -140,7 +167,7 @@ pub async fn show(
     let dashboard_url = draft_dashboard_url(&headers, &account.id, &draft.id);
 
     Json(json!({
-        "draft": draft,
+        "draft": draft_json(&draft),
         "account": account,
         "dashboard_path": dashboard_path,
         "dashboard_url": dashboard_url,
@@ -180,7 +207,7 @@ pub async fn show_by_imap_uid(
     let dashboard_url = draft_dashboard_url(&headers, &account.id, &draft.id);
 
     Json(json!({
-        "draft": draft,
+        "draft": draft_json(&draft),
         "account": account,
         "dashboard_path": dashboard_path,
         "dashboard_url": dashboard_url,
@@ -233,7 +260,7 @@ pub async fn approve(
                     draft_id: draft.id.clone(),
                     status: DraftStatus::Draft.as_str().to_string(),
                 });
-            Json(json!({ "draft": draft, "status": "approved" })).into_response()
+            Json(json!({ "draft": draft_json(&draft), "status": "approved" })).into_response()
         }
         Err(e) => draft_error(e),
     }
@@ -257,7 +284,9 @@ pub async fn edit(
             req.html_content.as_deref(),
         )
     }) {
-        Ok(draft) => Json(json!({ "draft": draft, "status": "edited" })).into_response(),
+        Ok(draft) => {
+            Json(json!({ "draft": draft_json(&draft), "status": "edited" })).into_response()
+        }
         Err(e) => draft_error(e),
     }
 }
@@ -309,7 +338,7 @@ pub async fn block(
                     status: DraftStatus::Blocked.as_str().to_string(),
                 });
             Json(json!({
-                "draft": draft,
+                "draft": draft_json(&draft),
                 "status": "blocked",
                 "reason": req.reason.unwrap_or_else(|| "changes requested".to_string())
             }))
@@ -429,7 +458,7 @@ pub async fn send(
     }
 }
 
-fn ensure_draft_account(
+pub(crate) fn ensure_draft_account(
     db: &envelope_email_store::Database,
     account_id: &str,
     draft_id: &str,
@@ -449,7 +478,7 @@ fn ensure_draft_account(
     Ok(draft)
 }
 
-fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
+pub(crate) fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
     match e {
         envelope_email_store::StoreError::DraftNotFound(_) => {
             (StatusCode::NOT_FOUND, format!("{e}")).into_response()

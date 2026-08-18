@@ -428,6 +428,17 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/drafts/{draft_id}/send",
             post(handlers::drafts::send),
         )
+        // Draft attachments. The bytes live in the draft row, so download
+        // reads the stored snapshot rather than IMAP — an unsent draft's
+        // files exist nowhere else. Upload/remove are revision-guarded edits.
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/attachments",
+            post(handlers::draft_attachments::upload),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/attachments/{filename}",
+            get(handlers::draft_attachments::download).delete(handlers::draft_attachments::remove),
+        )
         // Snoozed
         .route("/accounts/{id}/snoozed", get(handlers::snoozed::list))
         .route(
