@@ -180,6 +180,33 @@ describe('api.health()', () => {
   });
 });
 
+describe('api.draftByImapUid()', () => {
+  it('GETs the by-imap-uid draft route and returns the local draft', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        draft: { id: 'draft-abc' },
+        dashboard_path: '/accounts/acct-a/drafts/draft-abc',
+        review_url: 'http://localhost:3141/accounts/acct-a/drafts/draft-abc'
+      })
+    );
+
+    const res = await api.draftByImapUid('acct a', 38311, { fetchImpl });
+
+    expect(res.draft.id).toBe('draft-abc');
+    const [url, init] = fetchCalls(fetchImpl)[0]!;
+    expect(url).toBe('/api/accounts/acct%20a/drafts/by-imap-uid/38311');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('propagates a missing local draft as a 404 EnvelopeApiError', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: 'draft not found' }, { status: 404 }));
+
+    await expect(api.draftByImapUid('acct-a', 999, { fetchImpl })).rejects.toMatchObject({
+      status: 404
+    });
+  });
+});
+
 describe('api.snoozeMessage()', () => {
   it('POSTs /messages/{uid}/snooze with folder + return_at body', async () => {
     const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {

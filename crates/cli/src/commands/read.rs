@@ -15,7 +15,7 @@ pub async fn run(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -26,7 +26,10 @@ pub async fn run(
     match message {
         Some(msg) => {
             if json {
-                let value = ui::with_ui(&msg, ui::message_ui(&creds.account.id, msg.uid, folder));
+                let value = ui::with_ui(
+                    &msg,
+                    ui::message_or_draft_ui(&db, &creds.account.id, msg.uid, folder),
+                );
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("From: {}", msg.from_addr);

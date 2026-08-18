@@ -1516,7 +1516,7 @@ pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBack
                             "flags": s.flags,
                             "source": "imap",
                             "folder": drafts_folder,
-                            "ui": ui::message_ui(&acct.id, s.uid, &drafts_folder),
+                            "ui": ui::message_or_draft_ui(&db, &acct.id, s.uid, &drafts_folder),
                         })
                     })
                     .collect();

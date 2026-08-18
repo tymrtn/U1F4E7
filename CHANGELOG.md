@@ -5,7 +5,16 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 1.0.13-dev
+
+### Fixed
+
+- Drafts deep links now open the draft review composer instead of the read-only reader. A message link whose folder is a Drafts mailbox (`Drafts`, `[Gmail]/Drafts`, `INBOX.Drafts`, and the other spellings `classify_folder` recognizes) resolves through the local draft that carries that IMAP UID, so `envelope read`, `envelope draft list`, `envelope inbox`, `envelope search`, and the matching MCP tools emit `/accounts/{account}/drafts/{draft}` on both `review_url` and `message_url`. Historical `/accounts/{account}/messages/{uid}?folder=Drafts` links 308 to the same review path. Everything outside a Drafts folder keeps the canonical reader route `/mail/unified/{account}/{uid}?folder={folder}`.
+- Opening a Drafts UID in the dashboard no longer loads the message endpoint or marks the draft read. The reader hands off to the review composer before fetching anything; a Drafts UID with no local draft row renders a draft card explaining that there is no editable copy, rather than the SvelteKit 404 or a read-only message with no Send.
+
+### Compatibility
+
+- The `ui` object's keys and types are unchanged, so the agent contract schema id is unchanged. Only path *values* moved: a Drafts-folder `message_url` now carries the review path. A Drafts UID with no local draft still emits the reader URL.
 
 ## [1.0.11] — 2026-08-15
 

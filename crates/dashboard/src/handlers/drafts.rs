@@ -198,7 +198,10 @@ pub async fn show_by_imap_uid(
     .into_response()
 }
 
-fn resolve_account(db: &Database, account_id: &str) -> Result<Option<Account>, StoreError> {
+pub(crate) fn resolve_account(
+    db: &Database,
+    account_id: &str,
+) -> Result<Option<Account>, StoreError> {
     if let Some(account) = db.get_account(account_id)? {
         return Ok(Some(account));
     }

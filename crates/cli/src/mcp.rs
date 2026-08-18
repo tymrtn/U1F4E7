@@ -306,7 +306,7 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
         .and_then(|v| v.as_str())
         .unwrap_or("INBOX");
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -323,7 +323,7 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
             .map(|message| {
                 ui::with_ui(
                     message,
-                    ui::message_ui(&creds.account.id, message.uid, folder),
+                    ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
                 )
             })
             .collect(),
@@ -341,7 +341,7 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -355,7 +355,7 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
 
     Ok(wrap_untrusted(ui::with_ui(
         &message,
-        ui::message_ui(&creds.account.id, message.uid, folder),
+        ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
     )))
 }
 
@@ -371,7 +371,7 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
-    let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
+    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
@@ -388,7 +388,7 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
             .map(|message| {
                 ui::with_ui(
                     message,
-                    ui::message_ui(&creds.account.id, message.uid, folder),
+                    ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
                 )
             })
             .collect(),

@@ -32,7 +32,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use envelope_email_store::{CredentialBackend, Database};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::assets::WebAssets;
 use crate::auth::AuthConfig;
@@ -1747,7 +1747,9 @@ struct LegacyFolderQuery {
     folder: Option<String>,
 }
 
-/// Redirect `/accounts/{account}/messages/{uid}` to the canonical reader route.
+/// Redirect `/accounts/{account}/messages/{uid}` to the surface that can act on
+/// it: the draft review composer when the uid names a synced local draft, the
+/// canonical reader route otherwise.
 ///
 /// Axum hands over the account percent-decoded from the path and the folder
 /// percent-decoded from the query; both are re-encoded by
@@ -1755,7 +1757,12 @@ struct LegacyFolderQuery {
 /// either value cannot forge an extra path segment or query parameter. A
 /// non-numeric uid fails the extractor with 400 rather than being spliced into
 /// the target.
+///
+/// A Drafts uid with no local draft row still redirects to the reader route
+/// rather than 404ing — the frontend intercepts a drafts-classified folder there
+/// and renders a draft card instead of the read-only reader.
 async fn legacy_message_redirect(
+    axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path((account, uid)): axum::extract::Path<(String, u32)>,
     axum::extract::Query(query): axum::extract::Query<LegacyFolderQuery>,
 ) -> Redirect {
@@ -1764,7 +1771,42 @@ async fn legacy_message_redirect(
         .as_deref()
         .filter(|folder| !folder.is_empty())
         .unwrap_or("INBOX");
+
+    if envelope_email_transport::provider::classify_folder(folder) == Some("drafts")
+        && let Some(path) = draft_review_path_for_imap_uid(&state, &account, uid).await
+    {
+        return Redirect::permanent(&path);
+    }
+
     Redirect::permanent(&ui_paths::message_dashboard_path(&account, folder, uid))
+}
+
+/// Resolve `{account, imap uid}` to the draft review path, the same way
+/// [`handlers::drafts::show_by_imap_uid`] resolves it for the API. `None` when
+/// the account or the draft is unknown, or the lookup errors — the caller then
+/// falls back to a link that still resolves.
+async fn draft_review_path_for_imap_uid(
+    state: &AppState,
+    account: &str,
+    uid: u32,
+) -> Option<String> {
+    let db = state.db.lock().await;
+    let account = match handlers::drafts::resolve_account(&db, account) {
+        Ok(Some(account)) => account,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("legacy draft deep link: account lookup failed: {e}");
+            return None;
+        }
+    };
+    match db.get_draft_by_imap_uid(&account.id, uid) {
+        Ok(Some(draft)) => Some(ui_paths::draft_dashboard_path(&account.id, &draft.id)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("legacy draft deep link: draft lookup failed: {e}");
+            None
+        }
+    }
 }
 
 /// Redirect `/accounts/{account}/cockpit` to the global cockpit route. The
@@ -3832,6 +3874,109 @@ mod tests {
             "/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281\
              ?folder=%5BGmail%5D%2FSent%20Mail"
         );
+    }
+
+    /// A Drafts-folder uid names a message the reader cannot edit or send. When
+    /// a local draft row carries that uid, the legacy link must land on the
+    /// review composer — the account resolves by id or by email, and every
+    /// folder name `classify_folder` calls drafts takes the same path.
+    #[tokio::test]
+    async fn legacy_draft_deep_link_redirects_to_the_review_composer() {
+        let (state, draft_id, _) = test_state();
+        let app = dashboard_router(state);
+        let expected = format!("/accounts/acc1/drafts/{draft_id}");
+
+        for uri in [
+            "/accounts/acc1/messages/38103?folder=Drafts",
+            "/accounts/acc1/messages/38103?folder=%5BGmail%5D%2FDrafts",
+            "/accounts/acc1/messages/38103?folder=INBOX.Drafts",
+            "/accounts/editor%40spainexpat.com/messages/38103?folder=Drafts",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "{uri} must permanently redirect"
+            );
+            assert_eq!(location_of(&response), expected, "{uri} target");
+        }
+    }
+
+    /// A Drafts uid with no local draft row has no review surface to offer, and
+    /// a 404 would be worse than the reader — the frontend intercepts the
+    /// drafts folder there and renders a draft card. Drafts belonging to another
+    /// account must never be handed over either.
+    #[tokio::test]
+    async fn legacy_draft_deep_link_without_a_local_draft_stays_resolvable() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        for (uri, expected) in [
+            (
+                "/accounts/acc1/messages/99999?folder=Drafts",
+                "/mail/unified/acc1/99999?folder=Drafts",
+            ),
+            // acc2 has a draft, but not one synced to 38103.
+            (
+                "/accounts/acc2/messages/38103?folder=Drafts",
+                "/mail/unified/acc2/38103?folder=Drafts",
+            ),
+            (
+                "/accounts/unknown-account/messages/38103?folder=Drafts",
+                "/mail/unified/unknown-account/38103?folder=Drafts",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "{uri} must permanently redirect, not 404"
+            );
+            assert_eq!(location_of(&response), expected, "{uri} target");
+        }
+    }
+
+    /// The draft lookup is scoped to drafts-classified folders. A uid that
+    /// happens to match a synced draft's uid in any other mailbox is a different
+    /// message and must keep going to the reader.
+    #[tokio::test]
+    async fn legacy_message_deep_link_keeps_the_reader_for_non_draft_folders() {
+        let (state, _, _) = test_state();
+        let app = dashboard_router(state);
+
+        for (uri, expected) in [
+            (
+                "/accounts/acc1/messages/57?folder=INBOX",
+                "/mail/unified/acc1/57?folder=INBOX",
+            ),
+            (
+                "/accounts/acc1/messages/38103?folder=INBOX",
+                "/mail/unified/acc1/38103?folder=INBOX",
+            ),
+            (
+                "/accounts/acc1/messages/38103?folder=%5BGmail%5D%2FSent%20Mail",
+                "/mail/unified/acc1/38103?folder=%5BGmail%5D%2FSent%20Mail",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+            assert_eq!(location_of(&response), expected, "{uri} target");
+        }
     }
 
     /// A legacy link without a `folder` query predates folder-aware deep links;

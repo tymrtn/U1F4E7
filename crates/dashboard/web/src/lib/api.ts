@@ -576,6 +576,20 @@ export const api = {
   },
 
   /**
+   * GET /api/accounts/{id}/drafts/by-imap-uid/{uid} — the local draft behind a
+   * Drafts-folder IMAP UID. CLI/agent links identify a draft by its server-side
+   * UID, but only the local draft row has an editable review surface, so a
+   * Drafts deep link resolves through here before it can render. 404 means the
+   * UID has no local draft (read-only mailbox copy), not an error.
+   */
+  draftByImapUid(accountId: string, imapUid: number, o?: RequestOptions): Promise<DraftResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/by-imap-uid/${imapUid}`,
+      o
+    );
+  },
+
+  /**
    * Agent Cockpit aggregate. Passing no `accountId` hits the global
    * `/api/cockpit` (all accounts) — used by the rail to badge every account
    * from one read. Passing an id scopes the payload to that account.

@@ -17,8 +17,11 @@
 //! and folder/query names go into URLs, and folder/draft values are
 //! percent-encoded so embedded `?` / `/` / spaces don't break the path.
 
+use envelope_email_store::Database;
+use envelope_email_transport::provider;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 /// Default dashboard origin when no dashboard base URL is configured.
 pub const DEFAULT_DASHBOARD_BASE: &str = "http://localhost:3141";
@@ -121,6 +124,55 @@ pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
         "cockpit_url": join(COCKPIT_PATH),
         "message_url": join(&msg_path),
     })
+}
+
+/// UI metadata for a message UID that may name an editable draft.
+///
+/// A UID in the Drafts folder points at a message the reader route can only
+/// *display*: `/mail/unified/...` has no recipient fields and no Send. When the
+/// folder classifies as drafts and a local draft row carries that UID, the link
+/// must resolve to the draft review composer instead — the one surface that can
+/// edit and send it.
+///
+/// `message_url` is set to the same review URL as `review_url` because callers
+/// already read `message_url` off message payloads; leaving it on the reader
+/// would hand out the dead-end link next to the working one. Every other folder
+/// keeps today's [`message_ui`] shape.
+pub fn message_or_draft_ui(db: &Database, account_id: &str, uid: u32, folder: &str) -> Value {
+    match local_draft_for_imap_uid(db, account_id, uid, folder) {
+        Some(draft_id) => {
+            let mut ui = draft_ui(account_id, &draft_id);
+            let review_url = ui["review_url"].clone();
+            if let Value::Object(map) = &mut ui {
+                map.insert("message_url".to_string(), review_url);
+            }
+            ui
+        }
+        None => message_ui(account_id, uid, folder),
+    }
+}
+
+/// The local draft id behind an IMAP Drafts-folder UID, when there is one.
+///
+/// A lookup failure is reported and treated as "no local draft": the reader URL
+/// is still a correct link for the UID, so a degraded database must not take
+/// down the whole command that was only annotating a response.
+fn local_draft_for_imap_uid(
+    db: &Database,
+    account_id: &str,
+    uid: u32,
+    folder: &str,
+) -> Option<String> {
+    if provider::classify_folder(folder) != Some("drafts") {
+        return None;
+    }
+    match db.get_draft_by_imap_uid(account_id, uid) {
+        Ok(draft) => draft.map(|d| d.id),
+        Err(e) => {
+            warn!("draft lookup for {folder} uid {uid} failed, linking to the reader instead: {e}");
+            None
+        }
+    }
 }
 
 /// In-place: attach `ui` to a JSON object. Non-objects are left unchanged.
@@ -286,6 +338,97 @@ mod tests {
             ui["message_url"],
             "http://localhost:3141/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281\
              ?folder=%5BGmail%5D%2FSent%20Mail"
+        );
+    }
+
+    /// In-memory database holding one account with a single local draft that
+    /// has been synced to the given Drafts UID.
+    fn db_with_synced_draft(account_id: &str, imap_uid: u32) -> (Database, String) {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES (?1, 'Spain Expat', 'editor@spainexpat.com', 'spainexpat.com',
+                         'smtp.spainexpat.com', 587, 'imap.spainexpat.com', 993, 'encrypted')",
+                [account_id],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                account_id,
+                "tyler@example.com",
+                Some("Review this reply"),
+                Some("Looks ready to send."),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, imap_uid).unwrap();
+        (db, draft.id)
+    }
+
+    /// The bug: `envelope read --folder Drafts --json` handed back the
+    /// `/mail/unified/...` reader, which cannot edit or send. A Drafts UID that
+    /// resolves to a local draft must link to the review composer instead, on
+    /// both `review_url` and `message_url`.
+    #[test]
+    fn message_or_draft_ui_resolves_a_synced_draft_to_the_review_composer() {
+        let _guard = isolated_dashboard_config("draft-by-imap-uid");
+        let (db, draft_id) = db_with_synced_draft("acct-1", 38311);
+
+        for folder in ["Drafts", "[Gmail]/Drafts", "INBOX.Drafts", "drafts"] {
+            let ui = message_or_draft_ui(&db, "acct-1", 38311, folder);
+            let expected = format!("http://localhost:3141/accounts/acct-1/drafts/{draft_id}");
+            assert_eq!(
+                ui["dashboard_path"],
+                format!("/accounts/acct-1/drafts/{draft_id}"),
+                "{folder} dashboard_path"
+            );
+            assert_eq!(ui["review_url"], expected, "{folder} review_url");
+            assert_eq!(ui["message_url"], expected, "{folder} message_url");
+        }
+    }
+
+    /// Non-draft folders are untouched: the reader is the right surface there,
+    /// and a Drafts UID that has no local draft row has nothing better to offer.
+    #[test]
+    fn message_or_draft_ui_keeps_the_reader_route_for_everything_else() {
+        let _guard = isolated_dashboard_config("draft-by-imap-uid-miss");
+        let (db, _) = db_with_synced_draft("acct-1", 38311);
+
+        let inbox = message_or_draft_ui(&db, "acct-1", 57, "INBOX");
+        assert_eq!(
+            inbox["dashboard_path"],
+            "/mail/unified/acct-1/57?folder=INBOX"
+        );
+        assert_eq!(
+            inbox["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/57?folder=INBOX"
+        );
+        assert!(inbox.get("review_url").is_none());
+
+        let sent = message_or_draft_ui(&db, "acct-1", 38311, "[Gmail]/Sent Mail");
+        assert_eq!(
+            sent["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/38311?folder=%5BGmail%5D%2FSent%20Mail"
+        );
+
+        // Drafts folder, but no local draft carries this uid.
+        let orphan = message_or_draft_ui(&db, "acct-1", 999, "Drafts");
+        assert_eq!(
+            orphan["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/999?folder=Drafts"
+        );
+
+        // Right uid, wrong account — drafts must never leak across accounts.
+        let other = message_or_draft_ui(&db, "acct-2", 38311, "Drafts");
+        assert_eq!(
+            other["message_url"],
+            "http://localhost:3141/mail/unified/acct-2/38311?folder=Drafts"
         );
     }
 

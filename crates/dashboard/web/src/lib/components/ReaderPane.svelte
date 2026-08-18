@@ -13,8 +13,15 @@
   //     Evidence/export paths are read-only and never reach this component.
   //   • Explicit read/unread toggle (restores unread after auto-read)
   //   • MonoTag copy affordances for uid + message-id (click-to-copy, toast)
+  //   • Drafts intercept: a Drafts-folder deep link never loads the reader. It
+  //     resolves the local draft by IMAP UID and hands off to the review
+  //     composer, which is the only surface that can edit and send. The message
+  //     endpoint is not called (it can 404 while the draft row is fine) and the
+  //     draft is never marked Seen.
 
   import { page } from '$app/state';
+  import { goto } from '$app/navigation';
+  import { base } from '$app/paths';
   import { Spinner, MonoTag, Badge, Toast } from '$lib/components';
   import BodyFrame from '$lib/components/BodyFrame.svelte';
   import ThreadStrip from '$lib/components/ThreadStrip.svelte';
@@ -27,7 +34,8 @@
     type MessageDetailFull,
     type ThreadMessage
   } from '$lib/reader-api';
-  import { EnvelopeApiError } from '$lib/api';
+  import { api, EnvelopeApiError } from '$lib/api';
+  import { isDraftsFolder } from '$lib/mailboxes';
   import { readState } from '$lib/read-state.svelte';
 
   // ── Route params ──────────────────────────────────────────────────────
@@ -43,6 +51,11 @@
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadKey = $state('');
+
+  // ── Drafts state ──────────────────────────────────────────────────────
+  // Set only when a Drafts UID has no local draft to hand off to. The reader
+  // would render it read-only and mark it Seen, so this card stands in instead.
+  let draftFallback = $state<{ uid: number; folder: string } | null>(null);
 
   // ── Thread state ──────────────────────────────────────────────────────
 
@@ -139,6 +152,12 @@
     localSeen = null;
     remoteImages = false;
     remoteBlockedCount = 0;
+    draftFallback = null;
+
+    if (isDraftsFolder(f)) {
+      await loadDraft(acct, u, f);
+      return;
+    }
 
     try {
       const res = await fetchMessageDetail(acct, u, f);
@@ -178,6 +197,38 @@
         code: err.code ?? 'reader_load_error',
         message: err.message ?? 'Failed to load this message.'
       };
+    } finally {
+      loading = false;
+    }
+  }
+
+  // Resolve a Drafts-folder UID to its local draft and hand off to the review
+  // composer. Deliberately does NOT touch the message endpoint: an IMAP draft
+  // can be gone from the mailbox while the local row is still editable, and
+  // loading it here would also mark an unsent draft Seen.
+  async function loadDraft(acct: string, u: number, f: string) {
+    try {
+      const res = await api.draftByImapUid(acct, u);
+      const localId = res.draft?.id;
+      if (localId) {
+        await goto(
+          `${base}/accounts/${encodeURIComponent(acct)}/drafts/${encodeURIComponent(localId)}`
+        );
+        return;
+      }
+      // 200 with no draft would be a backend contract break; say so rather
+      // than falling through to a surface that cannot send.
+      draftFallback = { uid: u, folder: f };
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      if (err?.status === 404) {
+        draftFallback = { uid: u, folder: f };
+      } else {
+        error = {
+          code: err.code ?? 'draft_lookup_error',
+          message: err.message ?? 'Failed to open this draft.'
+        };
+      }
     } finally {
       loading = false;
     }
@@ -288,6 +339,19 @@
         Try again
       </button>
     </div>
+  {:else if draftFallback}
+    <section class="draft-card" id="draft-card">
+      <h1 class="draft-card-title">Draft</h1>
+      <p class="draft-card-msg">
+        This draft only exists in the mailbox on your mail server, so there is no editable copy
+        here yet and it can't be sent from this page.
+      </p>
+      <p class="draft-card-meta">
+        <MonoTag>uid {draftFallback.uid}</MonoTag>
+        <MonoTag>{draftFallback.folder}</MonoTag>
+      </p>
+      <a class="draft-card-link" href="{base}/mail/drafts">Open Drafts</a>
+    </section>
   {:else if message}
     <article class="msg" id="msg-{message.uid}">
       <!-- ── Header ──────────────────────────────────────────────────── -->
@@ -513,6 +577,41 @@
     padding: 0;
     cursor: pointer;
     text-decoration: underline;
+  }
+
+  /* Draft fallback card — a Drafts uid with no local draft to review. */
+  .draft-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 1rem 1.15rem;
+    border: 1px solid var(--env-accent);
+    border-left-width: 3px;
+    border-radius: var(--radius-xs, 2px);
+    background: var(--env-accent-soft);
+  }
+  .draft-card-title {
+    margin: 0;
+    font-size: 1.0625rem;
+    font-weight: 600;
+    color: var(--env-ink);
+  }
+  .draft-card-msg {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--env-ink);
+  }
+  .draft-card-meta {
+    display: flex;
+    gap: 0.4rem;
+    margin: 0;
+    flex-wrap: wrap;
+  }
+  .draft-card-link {
+    font-size: 0.8125rem;
+    color: var(--env-accent);
   }
 
   /* Empty state */
