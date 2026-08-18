@@ -16,6 +16,7 @@ const { apiMock } = vi.hoisted(() => ({
     cockpit: vi.fn(),
     stats: vi.fn(),
     unifiedInbox: vi.fn(),
+    refreshUnifiedInbox: vi.fn(),
     message: vi.fn(),
     verifyAccount: vi.fn(),
     deleteAccount: vi.fn(),

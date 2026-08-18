@@ -14,6 +14,9 @@
   //     Governor gate — so this surface reports "queued", never "sent".
   //   • Sending is blocked while edits are unsaved, so the queued copy is
   //     always the copy the operator actually read.
+  //   • A queued draft can be HELD: `send_after` is cleared, the row stays a
+  //     `draft`, and the editor unlocks. Holding is never a discard — that is
+  //     a separate, deliberate action.
   //   • CSRF is handled by the shared request() helper in $lib/api. Nothing
   //     here bypasses it, and there is no direct-send path.
 
@@ -60,7 +63,11 @@
     { label: string; variant: 'ok' | 'warn' | 'pending' | 'danger'; note: string }
   > = {
     draft: { label: 'Draft', variant: 'pending', note: '' },
-    pending_review: { label: 'Pending review', variant: 'pending', note: '' },
+    pending_review: {
+      label: 'Pending review',
+      variant: 'warn',
+      note: ''
+    },
     blocked: {
       label: 'Blocked',
       variant: 'warn',
@@ -134,10 +141,11 @@
   let saving = $state(false);
   let saved = $state(false);
   let queueing = $state(false);
+  let holding = $state(false);
   let confirmOpen = $state(false);
   let queued = $state<DraftQueuedResponse | null>(null);
   let conflict = $state(false);
-  let actionError = $state<{ code: string; message: string } | null>(null);
+  let actionError = $state<{ code: string; message: string; reload?: boolean } | null>(null);
 
   // ── Derived ───────────────────────────────────────────────────────────
 
@@ -174,7 +182,89 @@
     !!draft && draft.send_after != null && draft.status === 'draft'
   );
   const isQueued = $derived(!!queued || persistedQueue);
+
+  /**
+   * A parked or blocked draft must never look silent. Prefer the stored
+   * `metadata.send_block`; fall back to attribution park_reason; then a
+   * generic "stopped, nothing transmitted" so older rows still explain themselves.
+   */
+  type SendBlock = { code: string; title: string; explanation: string; action?: string };
+  function asSendBlock(value: unknown): SendBlock | null {
+    if (!value || typeof value !== 'object') return null;
+    const o = value as Record<string, unknown>;
+    const title = typeof o.title === 'string' ? o.title.trim() : '';
+    const explanation = typeof o.explanation === 'string' ? o.explanation.trim() : '';
+    if (!title && !explanation) return null;
+    return {
+      code: typeof o.code === 'string' && o.code ? o.code : 'send_stopped',
+      title: title || 'This send was stopped',
+      explanation: explanation || 'Nothing was transmitted.',
+      action: typeof o.action === 'string' ? o.action : undefined
+    };
+  }
+  const sendBlock = $derived.by((): SendBlock | null => {
+    if (!draft) return null;
+    if (draft.status !== 'pending_review' && draft.status !== 'blocked') return null;
+    const stored = asSendBlock(draft.metadata?.send_block);
+    if (stored) return stored;
+    const attribution = draft.metadata?.attribution;
+    const park =
+      attribution && typeof attribution === 'object'
+        ? (attribution as Record<string, unknown>).park_reason
+        : null;
+    if (park === 'attribution_exhausted') {
+      return {
+        code: 'attribution_exhausted',
+        title: 'This send was stopped',
+        explanation:
+          'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
+        action: 'send'
+      };
+    }
+    if (draft.status === 'blocked') {
+      return {
+        code: 'blocked',
+        title: 'This send was stopped',
+        explanation: STATUS_META.blocked.note,
+        action: 'edit'
+      };
+    }
+    return {
+      code: 'send_stopped',
+      title: 'This send was stopped',
+      explanation:
+        'Envelope paused this message before it left. Nothing was transmitted. Envelope did not record a more specific reason on this draft.',
+      action: 'send'
+    };
+  });
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);
+
+  // ── Live countdown ────────────────────────────────────────────────────
+  //
+  // A wall-clock send time alone cannot tell an operator whether they have
+  // forty seconds or six hours, which is exactly the decision the queued
+  // banner exists to support: a `--at` schedule days out and the 60s safety
+  // cooldown otherwise render identically. So the remaining time is computed
+  // here and ticked locally rather than waiting on a reload.
+
+  let nowMs = $state(Date.now());
+
+  const dueAtMs = $derived(queuedAt ? parseWhen(queuedAt) : null);
+  /** True once the send time has passed — the sweep may fire at any moment. */
+  const pastDue = $derived(dueAtMs != null && dueAtMs - nowMs <= 0);
+  /** Remaining time, or `null` when `send_after` could not be parsed. */
+  const countdown = $derived(
+    dueAtMs == null ? null : pastDue ? 'due now' : remaining(dueAtMs - nowMs)
+  );
+
+  // Ticks only while something is actually counting down: an unqueued draft,
+  // an unparsable timestamp, or an already-due one has nothing to update.
+  // `nowMs` is written but never read here, so this does not re-trigger itself.
+  $effect(() => {
+    if (!isQueued || dueAtMs == null || pastDue) return;
+    const timer = setInterval(() => (nowMs = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
 
   const editable = $derived(statusEditable && !isQueued);
   const sendable = $derived(!!draft && isSendableDraftStatus(draft.status) && !isQueued);
@@ -256,6 +346,7 @@
     loadGeneration += 1;
     confirmOpen = false;
     queueing = false;
+    holding = false;
     saving = false;
     queued = null;
     conflict = false;
@@ -437,6 +528,64 @@
     }
   }
 
+  // ── Hold (unqueue, keep the draft) ────────────────────────────────────
+
+  const canHold = $derived(isQueued && !holding && identityMatches);
+
+  /**
+   * Pull a queued draft back out of the outbox and keep it. The endpoint clears
+   * `send_after` and leaves the row in `draft` status, so adopting the returned
+   * draft is what unlocks the editor — no reload, no second round trip.
+   *
+   * No confirmation and no `expected_revision`: hold only ever REMOVES a
+   * pending send, so there is nothing here to guard content against, and an
+   * operator watching a countdown must be able to stop it in one click.
+   * Discarding stays the deliberate, separate destructive path.
+   */
+  async function hold() {
+    if (!draft || !canHold) return;
+    const generation = loadGeneration;
+    const targetAccount = accountId;
+    const targetDraft = draftId;
+
+    holding = true;
+    conflict = false;
+    actionError = null;
+
+    try {
+      const res = await api.holdDraft(targetAccount, targetDraft);
+      if (generation !== loadGeneration) return;
+      // Clear the transient send result before adopting the draft: `isQueued`
+      // ORs it with the persisted `send_after`, so a stale `queued` would keep
+      // the banner and the editor lock over a draft that is no longer queued.
+      queued = null;
+      applyDraft(res.draft);
+      saved = false;
+    } catch (e) {
+      if (generation !== loadGeneration) return;
+      const err = e as EnvelopeApiError;
+      if (err.status === 409) {
+        // Not the revision guard: the sweep has already claimed this draft for
+        // transmission, or it is no longer queued at all. Either way the state
+        // on screen is stale, and the honest move is to say so and reload —
+        // never to report a hold that did not happen.
+        actionError = {
+          code: err.code ?? 'draft_not_held',
+          message:
+            'Envelope would not take this draft back. It has either already started sending, or it is no longer queued. Reload to see where it actually stands.',
+          reload: true
+        };
+        return;
+      }
+      actionError = {
+        code: err.code ?? 'unknown',
+        message: err.message ?? 'Could not take this draft out of the outbox.'
+      };
+    } finally {
+      if (generation === loadGeneration) holding = false;
+    }
+  }
+
   /**
    * 409 is the revision guard, not a generic failure: the draft changed since
    * it was loaded and the server refused rather than clobbering it. Surface it
@@ -454,15 +603,44 @@
 
   // ── Formatting ────────────────────────────────────────────────────────
 
-  function formatWhen(iso: string): string {
+  /**
+   * Epoch ms for a stored timestamp. Rows written before the RFC 3339 switch
+   * carry a naive `YYYY-MM-DDTHH:MM:SS` that is UTC by contract, so an absent
+   * zone is read as `Z` — the same frame the backend's due comparison uses.
+   * `null` for anything unparsable, so callers can fall back rather than
+   * render `NaN`.
+   */
+  function parseWhen(iso: string): number | null {
     const ms = Date.parse(iso.includes('Z') || iso.includes('+') ? iso : `${iso}Z`);
-    if (Number.isNaN(ms)) return iso;
+    return Number.isNaN(ms) ? null : ms;
+  }
+
+  function formatWhen(iso: string): string {
+    const ms = parseWhen(iso);
+    if (ms == null) return iso;
     return new Date(ms).toLocaleString([], {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit'
     });
+  }
+
+  /**
+   * Time left, at whatever resolution is decision-useful: seconds when the
+   * send is imminent, coarser as it recedes. Always leads with the largest
+   * non-zero unit so a multi-day schedule can never be misread as a cooldown.
+   */
+  function remaining(ms: number): string {
+    const total = Math.floor(ms / 1000);
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${String(mins).padStart(2, '0')}m`;
+    if (mins > 0) return `${mins}m ${String(secs).padStart(2, '0')}s`;
+    return `${secs}s`;
   }
 </script>
 
@@ -529,22 +707,63 @@
       <div class="draft-banner is-error" id="draft-action-error" role="alert">
         <p>{actionError.message}</p>
         <MonoTag>{actionError.code}</MonoTag>
+        {#if actionError.reload}
+          <div class="draft-banner-action">
+            <Button variant="ghost" onclick={() => load()}>Reload latest</Button>
+          </div>
+        {/if}
       </div>
     {/if}
 
     {#if isQueued}
       <div class="draft-banner is-queued" id="draft-queued" role="status">
         <p class="draft-banner-title">Queued for sending</p>
-        <p>
-          This message is waiting in the Envelope outbox{queuedAt
-            ? ` until ${formatWhen(queuedAt)}`
-            : ''}, which gives you time to catch a mistake. Envelope's scheduled sender delivers it
-          after that — nothing has been transmitted yet. It is locked while it waits, because
-          editing it here would not pull it back out of the queue.
-        </p>
-        {#if queued}
-          <MonoTag>{queued.queued_reason_code}</MonoTag>
+        {#if queuedAt}
+          <p class="draft-countdown" id="draft-countdown">
+            {#if countdown}
+              <!-- The banner is a role="status" live region, so an unmuted
+                   per-second value would be announced every tick. The number is
+                   read on demand instead; the send time beside it still is. -->
+              <span class="draft-countdown-value" aria-live="off">{countdown}</span>
+            {/if}
+            <span class="draft-countdown-at">
+              {pastDue ? 'was due' : 'sends'}
+              {formatWhen(queuedAt)}
+            </span>
+          </p>
         {/if}
+        <p>
+          Nothing has been transmitted yet — Envelope's scheduled sender picks this message up when
+          its time comes. The editor is locked while it waits, because an edit made here would ship
+          with it rather than pull it back.
+        </p>
+        <div class="draft-banner-action draft-queued-actions">
+          <Button variant="ghost" disabled={!canHold} onclick={hold}>
+            {#if holding}<Spinner label="Holding" />{/if}
+            {holding ? 'Holding' : 'Hold as draft'}
+          </Button>
+          <a class="draft-outbox-link" id="draft-outbox-link" href="/cockpit#scheduled-panel">
+            See every queued send
+          </a>
+        </div>
+        <p class="draft-queued-note">
+          Holding takes this message out of the outbox and unlocks the editor. Your draft is kept —
+          throwing it away is a separate, deliberate action.
+          {#if queued}<MonoTag>{queued.queued_reason_code}</MonoTag>{/if}
+        </p>
+      </div>
+    {/if}
+
+    {#if sendBlock}
+      <div class="draft-banner is-stopped" id="draft-send-block" role="alert">
+        <p class="draft-banner-title">{sendBlock.title}</p>
+        <p>{sendBlock.explanation}</p>
+        <MonoTag>{sendBlock.code}</MonoTag>
+        <div class="draft-banner-action">
+          {#if sendable}
+            <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send again</Button>
+          {/if}
+        </div>
       </div>
     {/if}
 
@@ -662,7 +881,10 @@
         {:else if saved}
           <span class="is-saved">Changes saved.</span>
         {:else if isQueued}
-          <span class="is-saved">Waiting in the outbox — locked until it sends.</span>
+          <span class="is-saved">
+            {pastDue || !countdown ? 'Waiting in the outbox' : `Sends in ${countdown}`} — Hold to
+            unlock the editor.
+          </span>
         {:else if sendable && !recipientsValid}
           <span class="is-warn">Add a valid recipient before sending.</span>
         {:else if !statusEditable && statusMeta}
@@ -693,9 +915,13 @@
     <strong>Subject</strong>
     {subjectRaw.trim() || '(no subject)'}
   </p>
+  <!-- "Hold" now names the unqueue control, so this copy says "waits" instead
+       — a confirmation that reads "Envelope holds this message" beside a Hold
+       button describes the opposite of what that button does. -->
   <p class="draft-confirm-note">
-    Envelope holds this message in the outbox for a short cooldown, then sends it on your behalf.
-    You are approving this exact version — editing it afterwards withdraws that approval.
+    This message waits in the outbox for a cooldown, then Envelope sends it on your behalf. You are
+    approving this exact version — editing it afterwards withdraws that approval. The next screen
+    counts the wait down and can take the message back out of the outbox.
   </p>
   {#if queueing}
     <p class="draft-confirm-note is-locked">
@@ -822,6 +1048,55 @@
   }
   .is-queued .draft-banner-title {
     color: var(--env-accent);
+  }
+  .is-stopped {
+    border-color: var(--env-warn);
+    background: var(--env-warn-soft);
+    color: var(--env-ink);
+  }
+  .is-stopped .draft-banner-title {
+    color: var(--env-warn);
+  }
+
+  /* The countdown is the banner's headline fact — how long is left, not what
+     o'clock it is — so it carries the weight and the clock time trails it. */
+  .draft-banner .draft-countdown {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0.15rem 0 0.35rem;
+  }
+  .draft-countdown-value {
+    color: var(--env-accent);
+    font-family: var(--font-mono);
+    font-size: 1.375rem;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    line-height: 1.1;
+  }
+  .draft-countdown-at {
+    color: var(--env-muted);
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .draft-queued-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .draft-outbox-link {
+    color: var(--env-accent);
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+  }
+  .draft-banner .draft-queued-note {
+    margin-top: 0.5rem;
+    color: var(--env-muted);
+    font-size: 0.75rem;
   }
 
   /* ── Fields ── */

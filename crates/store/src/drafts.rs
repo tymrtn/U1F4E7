@@ -455,6 +455,62 @@ impl Database {
         Ok(())
     }
 
+    /// Take a queued draft back out of the outbox WITHOUT discarding it.
+    ///
+    /// Clears `send_after` so [`Self::list_drafts_due_for_send`] can never
+    /// select the row again, and leaves it in `draft` status so the composer
+    /// unlocks and the operator can edit it and re-queue it later. This is the
+    /// non-destructive counterpart to [`Self::discard_draft`]: a hold loses the
+    /// schedule, never the message.
+    ///
+    /// One guarded UPDATE. The `status = 'draft'` guard is the race boundary
+    /// against the send sweep — once [`Self::claim_draft_for_sending`] has
+    /// flipped the row to `sending`, this matches nothing and reports
+    /// [`StoreError::DraftNotEditable`], so a transmission already in flight is
+    /// never yanked back. `send_after IS NOT NULL` keeps the verb honest: a
+    /// draft that was not queued reports [`StoreError::DraftNotScheduled`]
+    /// instead of a silent no-op success.
+    ///
+    /// The human-approval attestation is stripped alongside the schedule. That
+    /// approval authorized *this* send and the operator just withdrew it; a
+    /// later re-queue re-attests through
+    /// [`Self::queue_draft_with_human_approval`]. The revision is deliberately
+    /// NOT bumped — no content changed, so an editor holding
+    /// `expected_revision` stays valid and can save without a spurious 409.
+    ///
+    /// Returns the held row.
+    pub fn hold_scheduled_draft(&self, id: &str) -> Result<Draft> {
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                send_after = NULL,
+                metadata = json_remove(COALESCE(metadata, '{}'), '$.human_approval'),
+                updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'draft' AND send_after IS NOT NULL",
+            params![id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_hold_miss(id));
+        }
+        self.get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+    }
+
+    /// Explain why [`Self::hold_scheduled_draft`] matched zero rows, in
+    /// precedence order: missing row → [`StoreError::DraftNotFound`]; a row the
+    /// sweep claimed or that reached a terminal/parked state →
+    /// [`StoreError::DraftNotEditable`] (the status names which); otherwise the
+    /// row is a plain unqueued draft → [`StoreError::DraftNotScheduled`].
+    fn classify_hold_miss(&self, id: &str) -> StoreError {
+        match self.get_draft(id) {
+            Ok(None) => StoreError::DraftNotFound(id.to_string()),
+            Ok(Some(current)) if current.status != DraftStatus::Draft => {
+                StoreError::DraftNotEditable(current.status.as_str().to_string())
+            }
+            Ok(Some(_)) => StoreError::DraftNotScheduled(id.to_string()),
+            Err(e) => e,
+        }
+    }
+
     /// Atomically claim a due scheduled draft for transmission.
     ///
     /// One CAS UPDATE: only a `draft`-status row at exactly `expected_revision`
@@ -844,13 +900,40 @@ impl Database {
     /// left `send_after` intact — the exact defect that made a parked-for-review
     /// draft read as "Queued for sending".
     pub fn park_for_review(&self, id: &str, token: &str) -> Result<bool> {
+        self.park_for_review_with_block(id, token, &Self::default_send_block())
+    }
+
+    /// Same lease park as [`Self::park_for_review`], and persist a user-facing
+    /// `metadata.send_block` so no surface can show a silent stop. The payload
+    /// is caller-supplied (code/title/explanation/action only — never scores,
+    /// recipients, or body).
+    pub fn park_for_review_with_block(
+        &self,
+        id: &str,
+        token: &str,
+        block: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(block)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET status = 'pending_review', send_after = NULL,
-                operation_token = NULL, updated_at = datetime('now')
+                operation_token = NULL,
+                metadata = json_set(COALESCE(metadata, '{}'), '$.send_block', json(?3)),
+                updated_at = datetime('now')
              WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
-            params![id, token],
+            params![id, token, serialized],
         )?;
         Ok(rows == 1)
+    }
+
+    /// Operator-facing stop record when a caller parks without a richer reason.
+    /// A silent `pending_review` badge is not allowed.
+    pub fn default_send_block() -> serde_json::Value {
+        serde_json::json!({
+            "code": "send_stopped",
+            "title": "This send was stopped",
+            "explanation": "Envelope paused this message before it left. Nothing was transmitted.",
+            "action": "send"
+        })
     }
 
     /// Record the resolved Sent-folder copy proof on an already-`sent` draft.
@@ -1775,6 +1858,16 @@ mod tests {
             "a review-parked draft must not look queued/due"
         );
         assert!(after.sent_at.is_none(), "review parking never sends");
+        let block = after.metadata.as_ref().unwrap()["send_block"].clone();
+        assert_eq!(block["code"], "send_stopped");
+        assert_eq!(block["title"], "This send was stopped");
+        assert!(
+            block["explanation"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was transmitted"),
+            "{block}"
+        );
         // Never selected as due again.
         assert!(db.list_drafts_due_for_send().unwrap().is_empty());
     }
@@ -3678,5 +3771,231 @@ mod tests {
         let drafts = db.list_drafts("acc1", Some("draft"), 100, 0).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].imap_uid, Some(99));
+    }
+
+    // ── Hold: unqueue without discarding ──────────────────────────────
+    //
+    // Cancelling a scheduled send used to mean discarding the draft, so an
+    // operator who only wanted to stop the clock and finish the message later
+    // had to lose it. Hold is the non-destructive verb: the schedule goes, the
+    // draft stays.
+
+    /// Queue a fresh draft `send_after` seconds-from-nothing (a literal
+    /// timestamp) and return it.
+    fn queued_draft(db: &Database, send_after: &str) -> Draft {
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, send_after).unwrap();
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn hold_clears_send_after_and_keeps_an_editable_draft() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert!(held.send_after.is_none(), "the schedule must be cleared");
+        assert_eq!(
+            held.status,
+            DraftStatus::Draft,
+            "hold must not discard or park the draft"
+        );
+        assert!(held.status.is_editable());
+        // The message itself is untouched — that is the whole point of hold.
+        assert_eq!(held.to_addr, "to@test.com");
+        assert_eq!(held.subject.as_deref(), Some("Subject"));
+        assert_eq!(held.text_content.as_deref(), Some("Body"));
+        // No content changed, so an open editor's expected_revision stays good.
+        assert_eq!(held.revision, queued.revision);
+    }
+
+    #[test]
+    fn a_held_draft_is_no_longer_due_for_the_send_sweep() {
+        let db = setup();
+        // Already due: without the hold this is exactly what the sweep sends.
+        let queued = queued_draft(&db, "2000-01-01T00:00:00");
+        assert_eq!(db.list_drafts_due_for_send().unwrap().len(), 1);
+
+        db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert!(
+            db.list_drafts_due_for_send().unwrap().is_empty(),
+            "a held draft must be invisible to the scheduled-send sweep"
+        );
+    }
+
+    #[test]
+    fn hold_withdraws_the_human_approval_attestation() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let attested = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2030-01-01T00:00:00",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+        assert!(attested.human_approved());
+
+        let held = db.hold_scheduled_draft(&draft.id).unwrap();
+
+        assert!(
+            !held.human_approved(),
+            "the approval authorized this send; holding withdraws it"
+        );
+        assert!(
+            held.metadata
+                .as_ref()
+                .is_none_or(|m| m.get("human_approval").is_none())
+        );
+    }
+
+    #[test]
+    fn hold_preserves_unrelated_draft_metadata() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        db.conn()
+            .execute(
+                "UPDATE drafts SET metadata = json('{\"reply_to_uid\": 42}') WHERE id = ?1",
+                params![queued.id],
+            )
+            .unwrap();
+
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert_eq!(held.metadata.as_ref().unwrap()["reply_to_uid"], 42);
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_the_send_sweep_already_claimed() {
+        let db = setup();
+        let queued = queued_draft(&db, "2000-01-01T00:00:00");
+        let token = db
+            .claim_draft_for_sending(&queued.id, queued.revision)
+            .unwrap();
+        assert!(token.is_some(), "the sweep must win the claim first");
+
+        let err = db.hold_scheduled_draft(&queued.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(ref s) if s == "sending"),
+            "a send already in flight must not be yanked back: {err}"
+        );
+        // The claim is intact — hold changed nothing.
+        let after = db.get_draft(&queued.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sending);
+        assert_eq!(after.send_after.as_deref(), Some("2000-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_that_was_never_queued() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        let err = db.hold_scheduled_draft(&draft.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotScheduled(_)),
+            "an unqueued draft must not report a schedule was cleared: {err}"
+        );
+    }
+
+    #[test]
+    fn hold_refuses_a_missing_draft() {
+        let db = setup();
+        let err = db.hold_scheduled_draft("no-such-draft").unwrap_err();
+        assert!(matches!(err, StoreError::DraftNotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn hold_refuses_a_discarded_draft() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        assert!(db.discard_draft(&queued.id).unwrap());
+
+        let err = db.hold_scheduled_draft(&queued.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(ref s) if s == "discarded"),
+            "{err}"
+        );
+    }
+
+    /// Hold is reversible: the operator edits the held draft and queues it
+    /// again, which re-attests the approval the hold withdrew.
+    #[test]
+    fn a_held_draft_can_be_edited_and_re_queued() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &held.id,
+                held.revision,
+                None,
+                None,
+                None,
+                Some("Second thoughts"),
+                Some("Rewritten body"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(edited.subject.as_deref(), Some("Second thoughts"));
+        assert!(
+            edited.send_after.is_none(),
+            "editing a held draft must not resurrect the schedule"
+        );
+
+        let requeued = db
+            .queue_draft_with_human_approval(
+                &edited.id,
+                edited.revision,
+                "2030-06-01T00:00:00",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(requeued.send_after.as_deref(), Some("2030-06-01T00:00:00"));
+        assert!(requeued.human_approved());
     }
 }

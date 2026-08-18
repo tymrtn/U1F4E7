@@ -450,6 +450,16 @@ export interface DraftQueuedResponse {
 }
 
 /**
+ * Response to POST /api/accounts/{id}/drafts/{draftId}/hold. The draft comes
+ * back with `send_after` cleared and `status` still `draft` — holding unqueues
+ * the message, it never discards it.
+ */
+export interface DraftHeldResponse {
+  draft: Draft;
+  status: string;
+}
+
+/**
  * Agent Cockpit aggregate. The full payload is broad; we type only the slices
  * the v2 rail derives account health from. `auth.items` and `actions.failed`
  * each carry an `account_id`, so the global (no-account) call is enough to
@@ -819,8 +829,27 @@ export const api = {
   },
 
   /**
+   * POST /api/accounts/{id}/drafts/{draftId}/hold
+   * Take a queued draft back out of the outbox WITHOUT discarding it: the
+   * schedule is cleared, the draft stays editable. Not revision-guarded —
+   * holding only ever removes a pending send, and an operator watching a
+   * countdown must always be able to stop it. Returns 409 once the sweep has
+   * claimed the draft for transmission.
+   */
+  holdDraft(
+    accountId: string,
+    draftId: string,
+    o?: RequestOptions
+  ): Promise<DraftHeldResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/hold`,
+      { ...o, method: 'POST', body: {} }
+    );
+  },
+
+  /**
    * POST /api/accounts/{id}/drafts/{draftId}/discard
-   * Discard a queued draft (undo send).
+   * Discard a queued draft (destructive — `holdDraft` unqueues and keeps it).
    */
   discardDraft(
     accountId: string,

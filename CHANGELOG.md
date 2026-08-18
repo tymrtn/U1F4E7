@@ -5,7 +5,18 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.13-dev
+## [Unreleased] — 1.0.15-dev
+
+### Added
+
+- A queued draft's review page now counts down. The banner leads with the time actually remaining — `45s`, `12m 30s`, `2h 05m`, `3d 4h` — ticking every second and rolling over to `due now` once the send time passes, with the wall-clock send time kept beside it as secondary text. Until now the page showed only a clock time, which made a `--at` schedule days out and the 60-second safety cooldown read identically.
+- Hold: a queued draft can be taken back out of the outbox without being destroyed. `send_after` is cleared, the row stays a `draft`, and the review composer unlocks so the message can be finished and re-queued later. The human-approval attestation is withdrawn along with the schedule, since it authorized the send that was just called off; re-queueing re-attests it. Available as a control on the queued banner, as `POST /api/accounts/{id}/drafts/{draftId}/hold`, and as `envelope scheduled hold <id>`.
+- The queued banner links to `/cockpit#scheduled-panel`, so the whole outbox is one click from any individual queued draft.
+
+### Changed
+
+- `envelope scheduled cancel` is unchanged and still discards the draft — it is now documented as the destructive verb, with `hold` as the one to reach for when the message is still wanted and only the timing is wrong.
+- Holding races the scheduled-send sweep honestly. The store guards on `status = 'draft'` inside the UPDATE, so once the sweep has claimed a row for transmission the hold matches nothing and returns 409 rather than appearing to stop a send already in flight. The dashboard surfaces that as "already started sending, or no longer queued" with a reload, never as the revision-conflict banner.
 
 ### Fixed
 

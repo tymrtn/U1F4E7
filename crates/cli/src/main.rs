@@ -1207,7 +1207,16 @@ enum ScheduledCmd {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Cancel a scheduled message
+    /// Take a scheduled message back out of the outbox, keeping the draft
+    Hold {
+        /// Draft ID
+        id: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Cancel a scheduled message by discarding the draft (destructive — use
+    /// `hold` to unqueue and keep it)
     Cancel {
         /// Draft ID
         id: String,
@@ -2411,6 +2420,9 @@ fn main() {
         Commands::Scheduled { subcommand } => match subcommand {
             ScheduledCmd::List { account } => {
                 commands::scheduled::run_list(account.as_deref(), cli.json, backend)
+            }
+            ScheduledCmd::Hold { id, account } => {
+                commands::scheduled::run_hold(&id, account.as_deref(), cli.json)
             }
             ScheduledCmd::Cancel { id, account } => {
                 commands::scheduled::run_cancel(&id, account.as_deref(), cli.json)

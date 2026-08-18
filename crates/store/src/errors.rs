@@ -23,6 +23,13 @@ pub enum StoreError {
     #[error("draft modified concurrently, approval not recorded: {0}")]
     DraftModifiedConcurrently(String),
 
+    /// A hold/unqueue was asked of a draft that carries no `send_after`.
+    /// Distinct from [`StoreError::DraftNotEditable`]: the row is perfectly
+    /// editable, it simply was never queued, so reporting success would claim
+    /// a schedule was cleared that never existed.
+    #[error("draft is not scheduled (no send_after set): {0}")]
+    DraftNotScheduled(String),
+
     #[error("encryption error: {0}")]
     Encryption(String),
 

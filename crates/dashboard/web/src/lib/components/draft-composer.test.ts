@@ -10,6 +10,8 @@
 //   • not-found / API error / loading states
 //   • send is explicit: confirmation required, confirm=true + revision sent,
 //     and blocked while edits are unsaved
+//   • a queued draft shows a live countdown, a link to the outbox, and a Hold
+//     control that unqueues without discarding
 //   • non-editable statuses render read-only
 
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
@@ -22,6 +24,7 @@ const { apiMock } = vi.hoisted(() => ({
     draft: vi.fn(),
     editDraft: vi.fn(),
     sendDraft: vi.fn(),
+    holdDraft: vi.fn(),
     discardDraft: vi.fn(),
     // Recipient autocomplete. Stubbed empty so these tests exercise the draft
     // save/send contract rather than the suggestion dropdown, which has its own
@@ -125,6 +128,10 @@ beforeEach(() => {
     queued_reason_code: 'outbox_cooldown',
     queued_reason: 'held in the outbox cooldown'
   });
+  // Hold clears send_after server-side and leaves the row a plain draft.
+  apiMock.holdDraft.mockImplementation(() =>
+    Promise.resolve({ draft: { ...BASE_DRAFT, send_after: null }, status: 'held' })
+  );
 });
 
 afterEach(() => {
@@ -459,6 +466,262 @@ describe('DraftComposer queued state recovered on reload', () => {
   });
 });
 
+// ── Queued countdown, outbox link, and Hold ───────────────────────────
+//
+// A wall-clock send time cannot answer the only question an operator has in
+// front of a queued draft: how long have I got? A 60-second safety cooldown
+// and an `--at` schedule days out rendered identically, and the only exit was
+// discard, which throws the message away. So the banner counts down, points at
+// the outbox, and offers Hold — unqueue, keep the draft, unlock the editor.
+
+describe('DraftComposer queued countdown', () => {
+  /** ISO timestamp `seconds` from now, in the stored UTC form. */
+  function inSeconds(seconds: number): string {
+    return new Date(Date.now() + seconds * 1000).toISOString();
+  }
+
+  function banner(): HTMLElement {
+    return document.getElementById('draft-queued') as HTMLElement;
+  }
+
+  it('counts down the time remaining rather than only naming a clock time', async () => {
+    await renderLoaded({ send_after: inSeconds(2 * 60 * 60 + 30 * 60) });
+
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/\b2h [23]\dm\b/);
+  });
+
+  it('shows seconds when the send is imminent', async () => {
+    await renderLoaded({ send_after: inSeconds(45) });
+
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/\b4[2-5]s\b/);
+  });
+
+  it('distinguishes a multi-day schedule from a short cooldown', async () => {
+    await renderLoaded({ send_after: inSeconds(3 * 24 * 60 * 60) });
+
+    // The exact defect: a long --at schedule must never read as a 60s window.
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/\b[23]d \d+h\b/);
+    expect(document.getElementById('draft-countdown')?.textContent).not.toMatch(/\b\d+s\b/);
+  });
+
+  it('reads due now once the send time has passed', async () => {
+    await renderLoaded({ send_after: '2020-01-01T00:00:00Z' });
+
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/due now/i);
+  });
+
+  it('ticks the countdown down on its own and rolls over to due now', async () => {
+    await renderLoaded({ send_after: inSeconds(3) });
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/\b[123]s\b/);
+
+    // No reload, no user action: the banner updates itself.
+    await waitFor(
+      () => expect(document.getElementById('draft-countdown')?.textContent).toMatch(/due now/i),
+      { timeout: 6000 }
+    );
+  }, 10000);
+
+  it('keeps the absolute send time as secondary text', async () => {
+    const at = '2026-07-30T10:02:00Z';
+    await renderLoaded({ send_after: at });
+
+    const secondary = banner().querySelector('.draft-countdown-at');
+    expect(secondary?.textContent).toMatch(/\d/);
+    // Resolved for the reader, not the raw stored string.
+    expect(secondary?.textContent).not.toContain(at);
+  });
+
+  it('links to the cockpit outbox panel', async () => {
+    await renderLoaded({ send_after: '2026-07-30T10:02:00Z' });
+
+    const link = document.getElementById('draft-outbox-link') as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.getAttribute('href')).toBe('/cockpit#scheduled-panel');
+  });
+
+  it('does not count down a draft that is not queued', async () => {
+    await renderLoaded({ send_after: null });
+
+    expect(document.getElementById('draft-countdown')).toBeFalsy();
+  });
+});
+
+describe('DraftComposer hold', () => {
+  const QUEUED_AT = '2026-12-30T10:02:00Z';
+
+  function holdButton(): HTMLElement {
+    return screen.getByRole('button', { name: /hold/i });
+  }
+
+  it('offers Hold on a queued draft', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+
+    expect(holdButton()).toBeEnabled();
+  });
+
+  it('offers no Hold on a draft that was never queued', async () => {
+    await renderLoaded({ send_after: null });
+
+    expect(screen.queryByRole('button', { name: /hold/i })).not.toBeInTheDocument();
+  });
+
+  it('calls the hold endpoint for the routed draft', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(apiMock.holdDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT));
+  });
+
+  it('unlocks the editor once the draft is held', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    expect(screen.getByLabelText('Subject')).toBeDisabled();
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(screen.getByLabelText('Subject')).not.toBeDisabled());
+    expect(screen.getByLabelText('To')).not.toBeDisabled();
+    expect(screen.getByLabelText('Message')).not.toBeDisabled();
+  });
+
+  it('drops the queued banner and countdown once the draft is held', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    expect(document.getElementById('draft-queued')).toBeTruthy();
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+    expect(document.getElementById('draft-countdown')).toBeFalsy();
+    expect(screen.queryByText('Queued')).not.toBeInTheDocument();
+  });
+
+  it('restores Save and Send on the held draft', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^send/i })).toBeInTheDocument()
+    );
+    // Held content is unchanged, so Send is live again and Save waits on an edit.
+    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
+  });
+
+  it('keeps the draft content — holding is never a discard', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Quarterly update');
+    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Hello there');
+    expect(apiMock.discardDraft).not.toHaveBeenCalled();
+  });
+
+  it('holds a draft queued by this page in the same session', async () => {
+    await renderLoaded();
+    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+
+    await fireEvent.click(holdButton());
+
+    // The transient send response must not keep the banner alive after a hold.
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+    expect(screen.getByLabelText('Subject')).not.toBeDisabled();
+  });
+
+  it('disables Hold while the request is in flight', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    let resolveHold!: (value: unknown) => void;
+    apiMock.holdDraft.mockReturnValueOnce(new Promise((r) => (resolveHold = r)));
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(holdButton()).toBeDisabled());
+    resolveHold({ draft: { ...BASE_DRAFT, send_after: null }, status: 'held' });
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+  });
+
+  it('reports a 409 honestly and keeps the draft locked', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    apiMock.holdDraft.mockRejectedValueOnce(
+      new EnvelopeApiError(409, 'draft_not_editable', 'draft not editable (status: sending)', null)
+    );
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(document.getElementById('draft-action-error')).toBeTruthy());
+    // Not the revision-conflict banner: nothing was clobbered, the send is gone.
+    expect(document.getElementById('draft-conflict')).toBeFalsy();
+    expect(document.getElementById('draft-action-error')?.textContent).toMatch(
+      /already started sending|no longer queued/i
+    );
+    // The composer must not pretend the hold worked.
+    expect(document.getElementById('draft-queued')).toBeTruthy();
+    expect(screen.getByLabelText('Subject')).toBeDisabled();
+  });
+
+  it('offers a reload out of a failed hold', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    apiMock.holdDraft.mockRejectedValueOnce(
+      new EnvelopeApiError(409, 'draft_not_editable', 'draft not editable (status: sending)', null)
+    );
+
+    await fireEvent.click(holdButton());
+    await waitFor(() => expect(document.getElementById('draft-action-error')).toBeTruthy());
+
+    const reload = within(document.getElementById('draft-action-error') as HTMLElement).getByRole(
+      'button',
+      { name: /reload/i }
+    );
+    await fireEvent.click(reload);
+
+    await waitFor(() => expect(apiMock.draft).toHaveBeenCalledTimes(2));
+  });
+
+  it('reports a server error and leaves the draft queued', async () => {
+    await renderLoaded({ send_after: QUEUED_AT });
+    apiMock.holdDraft.mockRejectedValueOnce(
+      new EnvelopeApiError(500, 'db_error', 'database unavailable', null)
+    );
+
+    await fireEvent.click(holdButton());
+
+    await waitFor(() => expect(document.getElementById('draft-action-error')).toBeTruthy());
+    expect(document.getElementById('draft-queued')).toBeTruthy();
+    // Recoverable: Hold is offered again rather than left spinning.
+    expect(holdButton()).toBeEnabled();
+  });
+
+  it('ignores a hold that resolves after the route moved to another draft', async () => {
+    let resolveHold!: (value: unknown) => void;
+    apiMock.holdDraft.mockReturnValueOnce(new Promise((r) => (resolveHold = r)));
+    apiMock.draft
+      .mockResolvedValueOnce(draftResponse({ send_after: QUEUED_AT }))
+      .mockResolvedValueOnce(draftResponse({ id: DRAFT_B, subject: 'Draft B' }));
+
+    render(DraftComposer);
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+    await fireEvent.click(holdButton());
+
+    pageState.params = { account: ACCOUNT, draft: DRAFT_B };
+    pageState.url = new URL(
+      `http://localhost/accounts/${ACCOUNT}/drafts/${DRAFT_B}`
+    ) as typeof pageState.url;
+    await waitFor(() =>
+      expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Draft B')
+    );
+
+    // Draft A's hold lands late; it must not repaint draft B.
+    resolveHold({ draft: { ...BASE_DRAFT, send_after: null }, status: 'held' });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Draft B');
+  });
+});
+
 // ── Review-parked drafts render "Pending review", never "Queued" ───────
 //
 // Real evidence: a scheduled send that routed `review` was parked
@@ -487,6 +750,40 @@ describe('DraftComposer review-parked drafts render pending review, never queued
 
     expect(document.getElementById('draft-queued')).toBeFalsy();
     expect(screen.getByText('Pending review')).toBeInTheDocument();
+  });
+});
+
+describe('DraftComposer never silently parks a send', () => {
+  it('explains a stored send_block and offers Send again', async () => {
+    await renderLoaded({
+      status: 'pending_review',
+      send_after: null,
+      metadata: {
+        send_block: {
+          code: 'governor_blocked',
+          title: 'This send was stopped',
+          explanation: 'Envelope paused this message for review before sending. Nothing was transmitted.',
+          action: 'send'
+        }
+      }
+    });
+
+    const banner = document.getElementById('draft-send-block');
+    expect(banner).toBeTruthy();
+    expect(banner).toHaveTextContent('This send was stopped');
+    expect(banner).toHaveTextContent('Nothing was transmitted');
+    expect(banner).toHaveTextContent('governor_blocked');
+    expect(screen.getByRole('button', { name: /send again/i })).toBeEnabled();
+  });
+
+  it('still explains a legacy pending_review row with no stored reason', async () => {
+    await renderLoaded({ status: 'pending_review', send_after: null, metadata: null });
+
+    const banner = document.getElementById('draft-send-block');
+    expect(banner).toBeTruthy();
+    expect(banner).toHaveTextContent('This send was stopped');
+    expect(banner).toHaveTextContent('did not record a more specific reason');
+    expect(screen.getByRole('button', { name: /send again/i })).toBeEnabled();
   });
 });
 
