@@ -353,7 +353,7 @@ pub async fn hold(
                     draft_id: draft.id.clone(),
                     status: DraftStatus::Draft.as_str().to_string(),
                 });
-            Json(json!({ "draft": draft, "status": "held" })).into_response()
+            Json(json!({ "draft": draft_json(&draft), "status": "held" })).into_response()
         }
         Err(e) => draft_error(e),
     }
@@ -612,6 +612,31 @@ mod tests {
         let listed = serde_json::to_string(&drafts_json(&[stored])).unwrap();
         assert!(!listed.contains("data_base64"), "list form: {listed}");
         assert!(listed.contains("packet.pdf"));
+    }
+
+    /// Every handler that returns a draft must route it through [`draft_json`].
+    /// `hold` did not: it was added after the stripping fix was written, so it
+    /// serialized the raw row and shipped `data_base64` on every hold. The
+    /// stripping helper only protects the responses that actually call it, so
+    /// guard the call sites rather than trusting each new handler to remember.
+    #[test]
+    fn every_draft_response_strips_attachment_bytes() {
+        let source = include_str!("drafts.rs");
+        let raw: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                (line.contains("\"draft\":") || line.contains("\"drafts\":"))
+                    && !line.contains("draft_json")
+                    && !line.contains("drafts_json")
+            })
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "these responses serialize a raw draft and leak data_base64 — \
+             wrap each in draft_json()/drafts_json(): {raw:?}"
+        );
     }
 
     #[test]
