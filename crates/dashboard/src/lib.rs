@@ -1631,10 +1631,17 @@ async fn run_governor_gate(
         GovernorConfig, GovernorRequest, SendSurface, gate_with_attribution,
     };
 
-    // A current dashboard/human attestation is a human send. Governor does not
-    // score, review, or park it — that is what stranded operator-clicked mail
-    // as `pending_review` for days.
-    if draft.human_approved() {
+    // A human-ORIGINATED send that is currently human-attested is a human send:
+    // Governor does not score, review, or park it — that is what stranded
+    // operator-clicked mail as `pending_review` for days.
+    //
+    // `require_declaration` is the single source of that decision
+    // (`scheduled_attribution_inputs`): it is false only when `scheduled_origin`
+    // says `Human` AND the row carries a current attestation. Gating on the
+    // attestation alone would let an agent-drafted body skip the gate the moment
+    // an operator clicked Approve — approval supplements a bot's declaration, it
+    // never replaces it.
+    if !require_declaration && draft.human_approved() {
         let outcome = envelope_email_transport::outbound::GovernorOutcome::human_dashboard_send();
         let event = envelope_email_store::Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -2348,6 +2355,80 @@ mod tests {
         assert_ne!(
             outcome.decision, "unavailable",
             "Governor must never be spawned for an unattributed bot draft"
+        );
+    }
+
+    /// The other half of the gate-skip rule, and the reason `run_governor_gate`
+    /// keys on `require_declaration` rather than the attestation alone: a draft
+    /// the operator actually composed on the dashboard (or the Tauri shell, which
+    /// posts to the same API and is stamped `human:dashboard` by `compose.rs`) and
+    /// then attested IS a human send. It needs no bot declaration, so the gate is
+    /// skipped and the send is never parked as `pending_review`.
+    #[test]
+    fn scheduled_human_originated_attested_draft_skips_the_gate() {
+        use envelope_email_transport::attribution_persist::scheduled_attribution_inputs;
+
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&draft.id, rev, "human:dashboard", "2026-08-18T09:00:00Z")
+            .unwrap();
+        let fetched = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(fetched.human_approved(), "the human attestation is present");
+
+        let (_declared, require) = scheduled_attribution_inputs(
+            fetched.created_by.as_deref(),
+            fetched.human_approved(),
+            None,
+            fetched.revision,
+        );
+        assert!(
+            !require,
+            "a human-composed, human-attested draft needs no bot declaration"
+        );
+        // `run_governor_gate` skips on exactly `!require_declaration &&
+        // human_approved`, so this row takes the human-send path.
+        assert!(!require && fetched.human_approved());
+
+        // Contrast: the same attestation on an agent-drafted row does NOT skip.
+        let bot = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("S"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let bot_rev = db.get_draft(&bot.id).unwrap().unwrap().revision;
+        db.record_draft_human_approval(&bot.id, bot_rev, "human:dashboard", "2026-08-18T09:00:00Z")
+            .unwrap();
+        let bot = db.get_draft(&bot.id).unwrap().unwrap();
+        let (_d, bot_require) = scheduled_attribution_inputs(
+            bot.created_by.as_deref(),
+            bot.human_approved(),
+            None,
+            bot.revision,
+        );
+        assert!(
+            bot_require,
+            "an agent-drafted row still requires its declaration after human approval"
         );
     }
 
