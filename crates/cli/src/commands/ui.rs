@@ -55,6 +55,14 @@ pub fn encode_segment(s: &str) -> String {
     out
 }
 
+/// The dashboard's cockpit client route. It is global, not account-scoped —
+/// the SPA has no `/accounts/{id}/cockpit` route and renders its own 404 there.
+const COCKPIT_PATH: &str = "/cockpit";
+
+/// The dashboard's rules client route. Global for the same reason as
+/// [`COCKPIT_PATH`].
+const RULES_PATH: &str = "/rules";
+
 /// Root-level UI metadata when there is no account/draft/message context.
 pub fn root_ui() -> Value {
     json!({
@@ -63,56 +71,54 @@ pub fn root_ui() -> Value {
     })
 }
 
-/// UI metadata anchored at an account's agent cockpit.
-pub fn account_ui(account_id: &str) -> Value {
-    let acct = encode_segment(account_id);
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+/// UI metadata anchored at the agent cockpit.
+///
+/// `account_id` is accepted so every call site stays account-aware, but the
+/// cockpit itself is a single global route: the account is selected inside the
+/// page, not in the URL.
+pub fn account_ui(_account_id: &str) -> Value {
     json!({
         "dashboard_url": dashboard_base(),
-        "dashboard_path": cockpit_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "dashboard_path": COCKPIT_PATH,
+        "cockpit_url": join(COCKPIT_PATH),
     })
 }
 
 /// UI metadata for a specific draft: `review_url` points at the draft
-/// approval surface inside the cockpit.
+/// approval surface, which *is* account-scoped in the SPA.
 pub fn draft_ui(account_id: &str, draft_id: &str) -> Value {
     let acct = encode_segment(account_id);
     let draft = encode_segment(draft_id);
     let draft_path = format!("/accounts/{acct}/drafts/{draft}");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
     json!({
         "dashboard_url": dashboard_base(),
         "dashboard_path": draft_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "cockpit_url": join(COCKPIT_PATH),
         "review_url": join(&draft_path),
     })
 }
 
 /// UI metadata for rule-related responses; `rules_url` is the rules panel.
-pub fn rules_ui(account_id: &str) -> Value {
-    let acct = encode_segment(account_id);
-    let rules_path = format!("/accounts/{acct}/rules");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+pub fn rules_ui(_account_id: &str) -> Value {
     json!({
         "dashboard_url": dashboard_base(),
-        "dashboard_path": rules_path.clone(),
-        "cockpit_url": join(&cockpit_path),
-        "rules_url": join(&rules_path),
+        "dashboard_path": RULES_PATH,
+        "cockpit_url": join(COCKPIT_PATH),
+        "rules_url": join(RULES_PATH),
     })
 }
 
-/// UI metadata for a specific message; `message_url` includes the folder
-/// as a query parameter so the dashboard can re-resolve the UID.
+/// UI metadata for a specific message; `message_url` is the canonical reader
+/// route and carries the folder as a query parameter, because IMAP UIDs are
+/// mailbox-scoped and the dashboard must re-resolve the UID in the right one.
 pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
     let acct = encode_segment(account_id);
     let folder_enc = encode_segment(folder);
-    let msg_path = format!("/accounts/{acct}/messages/{uid}?folder={folder_enc}");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+    let msg_path = format!("/mail/unified/{acct}/{uid}?folder={folder_enc}");
     json!({
         "dashboard_url": dashboard_base(),
         "dashboard_path": msg_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "cockpit_url": join(COCKPIT_PATH),
         "message_url": join(&msg_path),
     })
 }
@@ -191,15 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn account_ui_includes_cockpit_url() {
+    fn account_ui_points_at_the_global_cockpit_route() {
         let _guard = isolated_dashboard_config("account-default");
         let ui = account_ui("acct-1");
         assert_eq!(ui["dashboard_url"], "http://localhost:3141");
-        assert_eq!(ui["dashboard_path"], "/accounts/acct-1/cockpit");
-        assert_eq!(
-            ui["cockpit_url"],
-            "http://localhost:3141/accounts/acct-1/cockpit"
-        );
+        assert_eq!(ui["dashboard_path"], "/cockpit");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -209,35 +212,32 @@ mod tests {
 
         let ui = account_ui("acct/one");
         assert_eq!(ui["dashboard_url"], "https://dash.example.test/envelope");
-        assert_eq!(ui["dashboard_path"], "/accounts/acct%2Fone/cockpit");
+        assert_eq!(ui["dashboard_path"], "/cockpit");
         assert_eq!(
             ui["cockpit_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/cockpit"
+            "https://dash.example.test/envelope/cockpit"
         );
     }
 
     #[test]
-    fn draft_ui_includes_review_url() {
+    fn draft_ui_keeps_review_url_and_uses_global_cockpit() {
         let _guard = isolated_dashboard_config("draft-default");
         let ui = draft_ui("acct-1", "draft-abc");
+        assert_eq!(ui["dashboard_path"], "/accounts/acct-1/drafts/draft-abc");
         assert_eq!(
             ui["review_url"],
             "http://localhost:3141/accounts/acct-1/drafts/draft-abc"
         );
-        assert_eq!(
-            ui["cockpit_url"],
-            "http://localhost:3141/accounts/acct-1/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
-    fn rules_ui_includes_rules_url() {
+    fn rules_ui_points_at_the_global_rules_route() {
         let _guard = isolated_dashboard_config("rules-default");
         let ui = rules_ui("acct-1");
-        assert_eq!(
-            ui["rules_url"],
-            "http://localhost:3141/accounts/acct-1/rules"
-        );
+        assert_eq!(ui["dashboard_path"], "/rules");
+        assert_eq!(ui["rules_url"], "http://localhost:3141/rules");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -245,8 +245,12 @@ mod tests {
         let _guard = isolated_dashboard_config("message-default");
         let ui = message_ui("acct-1", 42, "Sent Items");
         assert_eq!(
+            ui["dashboard_path"],
+            "/mail/unified/acct-1/42?folder=Sent%20Items"
+        );
+        assert_eq!(
             ui["message_url"],
-            "http://localhost:3141/accounts/acct-1/messages/42?folder=Sent%20Items"
+            "http://localhost:3141/mail/unified/acct-1/42?folder=Sent%20Items"
         );
     }
 
@@ -258,11 +262,30 @@ mod tests {
         let ui = message_ui("acct/one", 42, "Sent/Items & Stuff");
         assert_eq!(
             ui["message_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/messages/42?folder=Sent%2FItems%20%26%20Stuff"
+            "https://dash.example.test/envelope/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
         );
         assert_eq!(
             ui["cockpit_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/cockpit"
+            "https://dash.example.test/envelope/cockpit"
+        );
+    }
+
+    /// The exact link shape reproduced against installed 1.0.10: a UUID account
+    /// and a Gmail folder carrying both `[` `]` and a space. The old
+    /// `/accounts/{id}/messages/{uid}` shape had no client route and rendered the
+    /// SvelteKit 404 page.
+    #[test]
+    fn message_ui_emits_the_canonical_reader_route_for_gmail_sent_mail() {
+        let _guard = isolated_dashboard_config("message-gmail-sent");
+        let ui = message_ui(
+            "109c5747-8498-4614-945a-837462ae0aaf",
+            33281,
+            "[Gmail]/Sent Mail",
+        );
+        assert_eq!(
+            ui["message_url"],
+            "http://localhost:3141/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281\
+             ?folder=%5BGmail%5D%2FSent%20Mail"
         );
     }
 

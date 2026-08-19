@@ -12,7 +12,7 @@
 //     and blocked while edits are unsaved
 //   • non-editable statuses render read-only
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { page as pageState } from '$app/state';
@@ -22,7 +22,11 @@ const { apiMock } = vi.hoisted(() => ({
     draft: vi.fn(),
     editDraft: vi.fn(),
     sendDraft: vi.fn(),
-    discardDraft: vi.fn()
+    discardDraft: vi.fn(),
+    // Recipient autocomplete. Stubbed empty so these tests exercise the draft
+    // save/send contract rather than the suggestion dropdown, which has its own
+    // suite in RecipientField.test.ts.
+    addressSuggestions: vi.fn()
   }
 }));
 
@@ -73,11 +77,42 @@ async function renderLoaded(overrides: Partial<Draft> = {}) {
   await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 }
 
+/** The token field wrapping a recipient input. */
+function recipientField(label: string): HTMLElement {
+  return screen.getByLabelText(label).closest('.recipient-field') as HTMLElement;
+}
+
+/** Chip labels currently held by a recipient field. */
+function chips(label: string): string[] {
+  return within(recipientField(label))
+    .queryAllByRole('button', { name: /^Remove / })
+    .map((button) => (button.getAttribute('aria-label') ?? '').replace(/^Remove /, ''));
+}
+
+/**
+ * Replace every recipient in a token field. Recipients are chips now, so
+ * "retype the To line" means removing what is there before typing.
+ */
+async function setRecipients(label: string, next: string) {
+  let remove = within(recipientField(label)).queryAllByRole('button', { name: /^Remove / });
+  while (remove.length > 0) {
+    await fireEvent.click(remove[0]);
+    remove = within(recipientField(label)).queryAllByRole('button', { name: /^Remove / });
+  }
+  await fireEvent.input(screen.getByLabelText(label), { target: { value: next } });
+}
+
 beforeEach(() => {
   pageState.params = { account: ACCOUNT, draft: DRAFT };
   pageState.url = new URL(`http://localhost/accounts/${ACCOUNT}/drafts/${DRAFT}`) as typeof pageState.url;
 
   apiMock.draft.mockResolvedValue(draftResponse());
+  apiMock.addressSuggestions.mockResolvedValue({
+    account_id: ACCOUNT,
+    query: '',
+    limit: 8,
+    suggestions: []
+  });
   apiMock.editDraft.mockImplementation((_a: string, _d: string, body: { expected_revision: number }) =>
     Promise.resolve({ draft: { ...BASE_DRAFT, revision: body.expected_revision + 1 }, status: 'edited' })
   );
@@ -115,8 +150,10 @@ describe('DraftComposer load', () => {
 
   it('renders an editable composer with the draft content — not a read-only card', async () => {
     await renderLoaded();
-    expect((screen.getByLabelText('To') as HTMLInputElement).value).toBe('buyer@example.com');
-    expect((screen.getByLabelText('Cc') as HTMLInputElement).value).toBe('cc@example.com');
+    // Recipients render as chips; the input itself holds only pending text.
+    expect(chips('To')).toEqual(['buyer@example.com']);
+    expect(chips('Cc')).toEqual(['cc@example.com']);
+    expect((screen.getByLabelText('To') as HTMLInputElement).value).toBe('');
     expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Quarterly update');
     expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Hello there');
     for (const field of ['To', 'Cc', 'Subject', 'Message']) {
@@ -149,7 +186,7 @@ describe('DraftComposer edit', () => {
   it('saves recipients, subject and body with the viewed expected_revision', async () => {
     await renderLoaded();
 
-    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'new@example.com' } });
+    await setRecipients('To', 'new@example.com');
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Revised subject' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Revised body' } });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -162,6 +199,36 @@ describe('DraftComposer edit', () => {
       bcc_addr: '',
       subject: 'Revised subject',
       text_content: 'Revised body'
+    });
+  });
+
+  it('saves an autocompleted recipient into the existing edit payload', async () => {
+    apiMock.addressSuggestions.mockResolvedValue({
+      account_id: ACCOUNT,
+      query: 'ada',
+      limit: 8,
+      suggestions: [{ email: 'ada@example.com', name: 'Ada Lovelace' }]
+    });
+    await renderLoaded();
+
+    await setRecipients('To', 'ada');
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole('listbox', { name: 'To suggestions' })).getAllByRole('option')
+      ).toHaveLength(1)
+    );
+    await fireEvent.keyDown(screen.getByLabelText('To'), { key: 'Enter' });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
+    // Same payload shape as before — a chip is a rendering of the header
+    // string, not a new field on the edit contract.
+    expect(apiMock.editDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT, {
+      expected_revision: 7,
+      to_addr: 'Ada Lovelace <ada@example.com>',
+      cc_addr: 'cc@example.com',
+      bcc_addr: '',
+      subject: 'Quarterly update'
     });
   });
 
@@ -462,8 +529,9 @@ describe('DraftComposer recipient guard', () => {
 
   it('re-disables Send when the recipient is edited down to nothing', async () => {
     await renderLoaded();
-    await fireEvent.input(screen.getByLabelText('To'), { target: { value: '' } });
+    await setRecipients('To', '');
 
+    expect(chips('To')).toEqual([]);
     expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
   });
@@ -722,7 +790,7 @@ describe('DraftComposer body preservation', () => {
 
   it('omits both body fields on a recipient-only save', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'someone@example.com' } });
+    await setRecipients('To', 'someone@example.com');
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());

@@ -16,13 +16,16 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
+/// The canonical reader deep link. The folder rides as a query parameter
+/// because IMAP UIDs are mailbox-scoped: the same uid names a different message
+/// in INBOX than in `[Gmail]/Sent Mail`.
 pub(crate) fn message_dashboard_path(
     account_id: &str,
     folder: &str,
     uid: impl std::fmt::Display,
 ) -> String {
     format!(
-        "/accounts/{}/messages/{}?folder={}",
+        "/mail/unified/{}/{}?folder={}",
         encode_path_segment(account_id),
         uid,
         encode_path_segment(folder)
@@ -45,7 +48,21 @@ mod tests {
     fn message_dashboard_path_uses_router_shape_and_percent_encoding() {
         assert_eq!(
             message_dashboard_path("acc 1", "Sent Items & Archive", 42),
-            "/accounts/acc%201/messages/42?folder=Sent%20Items%20%26%20Archive"
+            "/mail/unified/acc%201/42?folder=Sent%20Items%20%26%20Archive"
+        );
+    }
+
+    /// Cockpit/rules message links must land on the same canonical reader route
+    /// the CLI emits, for the Gmail folder shape that reproduced the 404.
+    #[test]
+    fn message_dashboard_path_matches_the_canonical_reader_route() {
+        assert_eq!(
+            message_dashboard_path(
+                "109c5747-8498-4614-945a-837462ae0aaf",
+                "[Gmail]/Sent Mail",
+                33281
+            ),
+            "/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281?folder=%5BGmail%5D%2FSent%20Mail"
         );
     }
 

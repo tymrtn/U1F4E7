@@ -18,12 +18,20 @@
   //     here bypasses it, and there is no direct-send path.
 
   import { page } from '$app/state';
-  import { optionalAddrsValid, validateAddrs } from '$lib/addresses';
+  import {
+    addrKey,
+    optionalAddrsValid,
+    parseAddrs,
+    serializeAddrs,
+    validateAddrs
+  } from '$lib/addresses';
   import Badge from './Badge.svelte';
   import Button from './Button.svelte';
+  import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
   import Modal from './Modal.svelte';
   import MonoTag from './MonoTag.svelte';
+  import RecipientField from './RecipientField.svelte';
   import Spinner from './Spinner.svelte';
   import {
     api,
@@ -203,6 +211,13 @@
     validateAddrs(toRaw) && optionalAddrsValid(ccRaw) && optionalAddrsValid(bccRaw)
   );
 
+  // No address may appear in two recipient fields of the same draft.
+  const usedAddrs = $derived({
+    to: parseAddrs(toRaw).map(addrKey),
+    cc: parseAddrs(ccRaw).map(addrKey),
+    bcc: parseAddrs(bccRaw).map(addrKey)
+  });
+
   const canSave = $derived(editable && dirty && recipientPresent && !saving && identityMatches);
   const canSend = $derived(
     sendable && !dirty && recipientsValid && !saving && !queueing && identityMatches
@@ -301,15 +316,38 @@
       next.text_content == null && next.html_content != null ? 'html' : 'text';
 
     draft = next;
-    toRaw = next.to_addr ?? '';
-    ccRaw = next.cc_addr ?? '';
-    bccRaw = next.bcc_addr ?? '';
+    // Normalized to the recipient field's canonical `a@x, b@y` form BEFORE the
+    // baseline snapshot: the field re-serializes whatever it is given, so an
+    // un-normalized server value would come back changed and read as an
+    // unsaved edit the operator never made — which blocks Send.
+    toRaw = serializeAddrs(next.to_addr ?? '');
+    ccRaw = serializeAddrs(next.cc_addr ?? '');
+    bccRaw = serializeAddrs(next.bcc_addr ?? '');
     subjectRaw = next.subject ?? '';
     bodyRaw = (format === 'html' ? next.html_content : next.text_content) ?? '';
     bodyFormat = format;
     showBcc = bccRaw.length > 0;
     conflict = false;
     baseline = snapshot();
+  }
+
+  /**
+   * Adopt the server's draft after an attachment change — revision and
+   * attachment list only.
+   *
+   * `applyDraft` cannot be used here: it re-seeds the editor fields and the
+   * baseline from the server row, which on a draft with unsaved edits would
+   * silently discard whatever the operator had typed. Attaching a file
+   * mid-sentence must not cost them the sentence. Taking the fresh revision
+   * matters just as much — the next save has to echo the revision the
+   * attachment write produced, or it 409s against a change this page made.
+   */
+  function adoptAttachmentChange(next: Draft) {
+    draft = next;
+    conflict = false;
+    // The attachment write cleared any approval attestation server-side, so a
+    // "saved" badge from before it would now overstate what is approved.
+    saved = false;
   }
 
   function snapshot(): Snapshot {
@@ -541,31 +579,27 @@
         <span class="draft-field-value">{accountLabel || accountId}</span>
       </div>
 
-      <div class="draft-field-row">
-        <label for="draft-to">To</label>
-        <input
-          id="draft-to"
-          type="text"
-          inputmode="email"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="recipient@example.com"
-          bind:value={toRaw}
-          disabled={inputsLocked}
-        />
-      </div>
+      <RecipientField
+        id="draft-to"
+        label="To"
+        bind:value={toRaw}
+        {accountId}
+        disabled={inputsLocked}
+        exclude={[...usedAddrs.cc, ...usedAddrs.bcc]}
+        placeholder="recipient@example.com"
+        invalid={toRaw.trim() !== '' && !validateAddrs(toRaw)}
+      />
 
-      <div class="draft-field-row">
-        <label for="draft-cc">Cc</label>
-        <input
+      <div class="draft-recipient-row">
+        <RecipientField
           id="draft-cc"
-          type="text"
-          inputmode="email"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="Optional"
+          label="Cc"
           bind:value={ccRaw}
+          {accountId}
           disabled={inputsLocked}
+          exclude={[...usedAddrs.to, ...usedAddrs.bcc]}
+          placeholder="Optional"
+          invalid={!optionalAddrsValid(ccRaw)}
         />
         {#if !showBcc && !inputsLocked}
           <button class="draft-bcc-toggle" type="button" onclick={() => (showBcc = true)}>Bcc</button>
@@ -573,19 +607,16 @@
       </div>
 
       {#if showBcc}
-        <div class="draft-field-row">
-          <label for="draft-bcc">Bcc</label>
-          <input
-            id="draft-bcc"
-            type="text"
-            inputmode="email"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="Optional"
-            bind:value={bccRaw}
-            disabled={inputsLocked}
-          />
-        </div>
+        <RecipientField
+          id="draft-bcc"
+          label="Bcc"
+          bind:value={bccRaw}
+          {accountId}
+          disabled={inputsLocked}
+          exclude={[...usedAddrs.to, ...usedAddrs.cc]}
+          placeholder="Optional"
+          invalid={!optionalAddrsValid(bccRaw)}
+        />
       {/if}
 
       <div class="draft-field-row">
@@ -634,13 +665,13 @@
       ></textarea>
     </div>
 
-    {#if draft.attachments.length > 0}
-      <p class="draft-attachment-note">
-        {draft.attachments.length}
-        {draft.attachments.length === 1 ? 'attachment stays' : 'attachments stay'} on this draft. Editing
-        the message here does not change them.
-      </p>
-    {/if}
+    <DraftAttachments
+      {draft}
+      accountId={accountId}
+      editable={editable && identityMatches}
+      onchange={adoptAttachmentChange}
+      onconflict={() => (conflict = true)}
+    />
 
     <footer class="draft-actions">
       <div class="draft-actions-status">
@@ -874,6 +905,23 @@
     font-size: 0.6875rem;
   }
 
+  /* Cc shares its row with the Bcc reveal, so the rule that separates address
+     rows moves out to the wrapper and off the field itself. */
+  .draft-recipient-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    border-bottom: 1px solid var(--env-rule);
+  }
+  .draft-recipient-row :global(.recipient-field) {
+    flex: 1;
+    min-width: 0;
+    border-bottom: 0;
+  }
+  .draft-recipient-row .draft-bcc-toggle {
+    padding-top: 0.85rem;
+  }
+
   /* ── Editor ── */
   .draft-editor {
     flex: 1;
@@ -940,12 +988,6 @@
     color: var(--env-muted);
     -webkit-text-fill-color: var(--env-muted);
     opacity: 1;
-  }
-  .draft-attachment-note {
-    margin: 0;
-    color: var(--env-muted);
-    font-family: var(--font-mono);
-    font-size: 0.6875rem;
   }
 
   /* ── Actions ── */

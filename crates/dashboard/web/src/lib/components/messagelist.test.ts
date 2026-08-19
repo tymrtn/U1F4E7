@@ -1384,3 +1384,100 @@ describe('Search/Snoozed read-state rendering', () => {
     await waitFor(() => expect(row.classList.contains('is-unread')).toBe(true));
   });
 });
+
+// ── 13. Row deep links carry the row's real mailbox identity ──────────
+
+describe('Message row deep links', () => {
+  /** The `href` the row's subject link actually navigates to. */
+  function hrefFor(subject: string): string {
+    const row = screen.getAllByRole('row').find((r) => r.textContent?.includes(subject))!;
+    return row.querySelector('a.msg-body')!.getAttribute('href')!;
+  }
+
+  it('unified rows link to the reader with their own folder, not the route default', async () => {
+    // A Gmail Sent Mail row: the folder carries both brackets and a space, and
+    // the account id is a UUID. Dropping the folder opens the INBOX UID instead,
+    // which is a different message (IMAP UIDs are mailbox-scoped).
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [],
+      messages: [{
+        uid: 33281, message_id: '<g@x>', from_addr: 'alice@example.com',
+        to_addr: 'work@example.com', subject: 'Gmail sent row',
+        date: '2026-07-08T10:00:00Z', flags: [], size: 10, unread: false,
+        account_id: '109c5747-8498-4614-945a-837462ae0aaf',
+        account_username: 'work@example.com', account_display_name: 'Work Mail',
+        folder: '[Gmail]/Sent Mail', uidvalidity: 1, snippet: null,
+        thread_id: null, indexed_at: null, index_freshness: 'fresh'
+      }]
+    });
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Gmail sent row')).toBeInTheDocument());
+
+    expect(hrefFor('Gmail sent row')).toBe(
+      '/v2/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281?folder=%5BGmail%5D%2FSent%20Mail'
+    );
+  });
+
+  it('search hit rows link with the folder the search actually ran against', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [], messages: []
+    });
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct/one', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    apiMock.searchMessages.mockResolvedValue({
+      messages: [{
+        uid: 200, message_id: '<b@x>', from_addr: 'carol@example.com',
+        to_addr: 'work@example.com', subject: 'Search hit subject',
+        date: '2026-07-09T10:00:00Z', flags: [], size: 10, unread: true
+      }],
+      query: 'carol'
+    });
+
+    pageState.url = new URL('http://localhost/v2/mail/unified?q=carol') as typeof pageState.url;
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Search hit subject')).toBeInTheDocument());
+
+    // The search response carries no folder, so the hit is tagged with the
+    // folder the request was issued against. Search fans out across accounts
+    // while staying inside INBOX, so that folder must be the literal argument
+    // and the literal href — the account id round-trips encoded so a reserved
+    // character cannot forge a path segment.
+    expect(apiMock.searchMessages).toHaveBeenCalledWith('acct/one', 'carol', 'INBOX');
+    expect(hrefFor('Search hit subject')).toBe('/v2/mail/unified/acct%2Fone/200?folder=INBOX');
+  });
+
+  it('snoozed rows link to where the message physically is, not its original folder', async () => {
+    pageState.params = { box: 'snoozed' };
+    pageState.url = new URL('http://localhost/v2/mail/snoozed') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct-ok', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    apiMock.snoozed.mockResolvedValue({
+      snoozed: [{
+        id: 'snz-1', account_id: 'acct-ok', uid: 55, message_id: '<s@x>',
+        subject: 'Snoozed subject', from_addr: 'dana@example.com',
+        snoozed_folder: 'Envelope/Snoozed Mail', original_folder: 'INBOX',
+        snooze_until: '2026-08-01T09:00:00Z', created_at: '2026-07-08T10:00:00Z'
+      }]
+    });
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Snoozed subject')).toBeInTheDocument());
+
+    expect(hrefFor('Snoozed subject')).toBe(
+      '/v2/mail/snoozed/acct-ok/55?folder=Envelope%2FSnoozed%20Mail'
+    );
+  });
+});

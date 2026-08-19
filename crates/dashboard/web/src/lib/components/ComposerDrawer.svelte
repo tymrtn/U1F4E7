@@ -1,6 +1,7 @@
 <script lang="ts">
   import Drawer from './Drawer.svelte';
   import Button from './Button.svelte';
+  import RecipientField from './RecipientField.svelte';
   import Spinner from './Spinner.svelte';
   import {
     api,
@@ -10,7 +11,7 @@
     type ComposeResponse
   } from '$lib/api';
   import { getComposerStore, type ComposerMode } from '$lib/composer.svelte';
-  import { optionalAddrsValid, validateAddrs } from '$lib/addresses';
+  import { addrKey, optionalAddrsValid, parseAddrs, serializeAddrs, validateAddrs } from '$lib/addresses';
 
   type PendingAttachment = ComposeAttachment & { size: number };
 
@@ -51,6 +52,13 @@
   const subjectReady = $derived(isFreshMessage ? subject.trim().length > 0 : true);
   const deliveryReady = $derived(fromAccountId.length > 0);
 
+  // Each recipient field must not offer an address the other two already hold.
+  const usedAddrs = $derived({
+    to: parseAddrs(toRaw).map(addrKey),
+    cc: parseAddrs(ccRaw).map(addrKey),
+    bcc: parseAddrs(bccRaw).map(addrKey)
+  });
+
   const selectedAccount = $derived(accounts.find((account) => account.id === fromAccountId));
   const accountContext = $derived.by(() => {
     if (!selectedAccount) return 'Choose an account before sending.';
@@ -90,7 +98,9 @@
     openSession = session;
 
     fromAccountId = ctx.accountId || (accounts[0]?.id ?? '');
-    toRaw = isFreshMessage ? (ctx.to ?? '') : '';
+    // Normalized on the way in so the recipient field's own re-serialization is
+    // a no-op rather than an immediate change to the prefilled value.
+    toRaw = isFreshMessage ? serializeAddrs(ctx.to ?? '') : '';
     subject = isFreshMessage ? (ctx.subject ?? '') : '';
     body = ctx.bodyPrefix ?? '';
     ccRaw = '';
@@ -230,55 +240,43 @@
         </div>
 
         {#if isFreshMessage}
-          <div class="composer-field-row" class:is-invalid={!toValid && toRaw.trim() !== ''}>
-            <label for="composer-to">To</label>
-            <input
-              id="composer-to"
-              type="text"
-              inputmode="email"
-              placeholder="recipient@example.com"
-              autocomplete="off"
-              spellcheck="false"
-              bind:value={toRaw}
-              disabled={sending}
-              aria-invalid={!toValid && toRaw.trim() !== ''}
-            />
-          </div>
+          <RecipientField
+            id="composer-to"
+            label="To"
+            bind:value={toRaw}
+            accountId={fromAccountId}
+            disabled={sending}
+            exclude={[...usedAddrs.cc, ...usedAddrs.bcc]}
+            placeholder="recipient@example.com"
+            invalid={!toValid && toRaw.trim() !== ''}
+          />
           {#if !toValid && toRaw.trim() !== ''}
             <p class="composer-validation-note">Enter valid email addresses separated by commas.</p>
           {/if}
-          <div class="composer-field-row" class:is-invalid={!ccValid}>
-            <label for="composer-cc">Cc</label>
-            <input
-              id="composer-cc"
-              type="text"
-              inputmode="email"
-              placeholder="Optional"
-              autocomplete="off"
-              spellcheck="false"
-              bind:value={ccRaw}
-              disabled={sending}
-              aria-invalid={!ccValid}
-            />
-          </div>
+          <RecipientField
+            id="composer-cc"
+            label="Cc"
+            bind:value={ccRaw}
+            accountId={fromAccountId}
+            disabled={sending}
+            exclude={[...usedAddrs.to, ...usedAddrs.bcc]}
+            placeholder="Optional"
+            invalid={!ccValid}
+          />
           {#if !ccValid}
             <p class="composer-validation-note">Enter valid Cc addresses separated by commas.</p>
           {/if}
           {#if showBcc}
-            <div class="composer-field-row" class:is-invalid={!bccValid}>
-              <label for="composer-bcc">Bcc</label>
-              <input
-                id="composer-bcc"
-                type="text"
-                inputmode="email"
-                placeholder="Optional"
-                autocomplete="off"
-                spellcheck="false"
-                bind:value={bccRaw}
-                disabled={sending}
-                aria-invalid={!bccValid}
-              />
-            </div>
+            <RecipientField
+              id="composer-bcc"
+              label="Bcc"
+              bind:value={bccRaw}
+              accountId={fromAccountId}
+              disabled={sending}
+              exclude={[...usedAddrs.to, ...usedAddrs.cc]}
+              placeholder="Optional"
+              invalid={!bccValid}
+            />
             {#if !bccValid}
               <p class="composer-validation-note">Enter valid Bcc addresses separated by commas.</p>
             {/if}
@@ -430,9 +428,6 @@
   }
   .composer-field-row:focus-within {
     box-shadow: inset 2px 0 0 var(--env-accent);
-  }
-  .composer-field-row.is-invalid {
-    box-shadow: inset 2px 0 0 var(--env-warn);
   }
   .composer-validation-note {
     margin: 0 -0.875rem;

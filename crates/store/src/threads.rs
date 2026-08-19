@@ -13,7 +13,7 @@ const THREAD_COLS: &str =
 
 /// The full SELECT column list for thread_messages.
 const THREAD_MSG_COLS: &str = "id, thread_id, uid, message_id, in_reply_to, reference_ids, folder, \
-     from_address, to_addresses, date, subject, is_outbound, snippet";
+     from_address, to_addresses, date, subject, is_outbound, snippet, cc_addresses, bcc_addresses";
 
 /// Reduce a Message-ID to its bare `local@domain` form for comparison.
 ///
@@ -134,6 +134,12 @@ impl Database {
 
     /// Insert or update a thread message (upsert by message_id + folder within an account).
     /// Returns the thread_message id.
+    ///
+    /// `cc_addresses`/`bcc_addresses` are the Cc/Bcc header values when the
+    /// scan saw them. They are recipients like the To line, so compose
+    /// autocomplete reads them; rows cached before they existed keep NULL
+    /// until a later scan revisits the message.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_thread_message(
         &self,
         thread_id: &str,
@@ -144,6 +150,8 @@ impl Database {
         folder: &str,
         from_address: &str,
         to_addresses: &str,
+        cc_addresses: Option<&str>,
+        bcc_addresses: Option<&str>,
         date: &str,
         subject: &str,
         is_outbound: bool,
@@ -178,12 +186,30 @@ impl Database {
         let is_outbound_int: i32 = if is_outbound { 1 } else { 0 };
 
         if let Some(id) = existing_id {
-            // Update existing
+            // The address history is derived above a watermark on this table's
+            // monotonic id, so an id that has already been folded in is never
+            // read again. Rewriting the addresses on such a row would leave
+            // the derived counts describing headers that are no longer there —
+            // so a rewrite that actually changes an address-bearing field
+            // invalidates the account's history instead. An unchanged rescan
+            // (the common case: `envelope thread` re-reading a folder) touches
+            // nothing.
+            let addresses_changed = self.thread_message_addresses_changed(
+                id,
+                from_address,
+                to_addresses,
+                cc_addresses,
+                bcc_addresses,
+                date,
+                is_outbound,
+            )?;
+
             self.conn().execute(
                 "UPDATE thread_messages SET
                     thread_id = ?1, uid = ?2, in_reply_to = ?3, reference_ids = ?4,
                     from_address = ?5, to_addresses = ?6, date = ?7, subject = ?8,
-                    is_outbound = ?9, snippet = ?10
+                    is_outbound = ?9, snippet = ?10, cc_addresses = ?12,
+                    bcc_addresses = ?13
                  WHERE id = ?11",
                 params![
                     thread_id,
@@ -196,17 +222,23 @@ impl Database {
                     subject,
                     is_outbound_int,
                     snippet,
-                    id
+                    id,
+                    cc_addresses,
+                    bcc_addresses
                 ],
             )?;
+            if addresses_changed {
+                self.invalidate_address_history_for_thread(thread_id)?;
+            }
             Ok(id)
         } else {
             // Insert new
             self.conn().execute(
                 "INSERT INTO thread_messages
                     (thread_id, uid, message_id, in_reply_to, reference_ids, folder,
-                     from_address, to_addresses, date, subject, is_outbound, snippet)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     from_address, to_addresses, date, subject, is_outbound, snippet,
+                     cc_addresses, bcc_addresses)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     thread_id,
                     uid as i64,
@@ -219,11 +251,52 @@ impl Database {
                     date,
                     subject,
                     is_outbound_int,
-                    snippet
+                    snippet,
+                    cc_addresses,
+                    bcc_addresses
                 ],
             )?;
             Ok(self.conn().last_insert_rowid())
         }
+    }
+
+    /// True when re-indexing this row would change a field the address history
+    /// derives from. Deliberately narrow: the subject, snippet, and threading
+    /// headers move around without changing who was on the message.
+    ///
+    /// `IS` rather than `=` so a NULL Cc compares equal to an absent one —
+    /// otherwise every rescan of a message without a Cc header would read as a
+    /// change. The row is always present (its id was just looked up), so a
+    /// count of zero means the values differ.
+    #[allow(clippy::too_many_arguments)]
+    fn thread_message_addresses_changed(
+        &self,
+        id: i64,
+        from_address: &str,
+        to_addresses: &str,
+        cc_addresses: Option<&str>,
+        bcc_addresses: Option<&str>,
+        date: &str,
+        is_outbound: bool,
+    ) -> Result<bool> {
+        let unchanged: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM thread_messages
+             WHERE id = ?1
+               AND from_address IS ?2 AND to_addresses IS ?3
+               AND cc_addresses IS ?4 AND bcc_addresses IS ?5
+               AND date IS ?6 AND is_outbound IS ?7",
+            params![
+                id,
+                from_address,
+                to_addresses,
+                cc_addresses,
+                bcc_addresses,
+                date,
+                i64::from(is_outbound)
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(unchanged == 0)
     }
 
     /// Get all messages in a thread, ordered by date ascending.
@@ -454,6 +527,14 @@ impl Database {
              (SELECT thread_id FROM threads WHERE account_id = ?2)",
             params![folder, account_id],
         )?;
+        if deleted > 0 {
+            // Those rows are gone, and the rescan that follows re-inserts the
+            // same messages under fresh ids above the address-history
+            // watermark — which would count every one of them a second time.
+            // Invalidating forces the next reconcile to rebuild the account's
+            // derived counts from what is actually on disk.
+            self.invalidate_address_history(account_id)?;
+        }
 
         // Clean up any threads that now have zero messages
         self.conn().execute(
@@ -511,6 +592,8 @@ impl Database {
             subject: row.get(10)?,
             is_outbound: is_outbound_int != 0,
             snippet: row.get(12)?,
+            cc_addresses: row.get(13)?,
+            bcc_addresses: row.get(14)?,
         })
     }
 }
@@ -592,6 +675,8 @@ mod tests {
             "INBOX",
             "alice@example.com",
             "bob@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test Subject",
             false,
@@ -609,6 +694,8 @@ mod tests {
             "Sent",
             "bob@example.com",
             "alice@example.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test Subject",
             true,
@@ -654,6 +741,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -698,6 +787,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -735,6 +826,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -776,6 +869,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -818,6 +913,8 @@ mod tests {
             "INBOX",
             "them@x.com",
             "me@x.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -833,6 +930,8 @@ mod tests {
             "Sent",
             "me@x.com",
             "them@x.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,
@@ -973,6 +1072,8 @@ mod tests {
                 "INBOX",
                 "a@b.com",
                 "c@d.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Test",
                 false,
@@ -991,6 +1092,8 @@ mod tests {
                 "INBOX",
                 "a@b.com",
                 "c@d.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Test",
                 false,
@@ -1027,6 +1130,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -1074,6 +1179,8 @@ mod tests {
                 "INBOX",
                 &format!("{account_name}@example.com"),
                 "recipient@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Duplicate UID",
                 false,
@@ -1125,6 +1232,8 @@ mod tests {
                 "INBOX",
                 "sender@example.com",
                 "alice@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Shared Message",
                 false,
@@ -1142,6 +1251,8 @@ mod tests {
                 "INBOX",
                 "sender@example.com",
                 "bob@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Shared Message",
                 false,
@@ -1192,6 +1303,8 @@ mod tests {
             "INBOX",
             "sender@example.com",
             "alice@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Shared Subject",
             false,
@@ -1209,6 +1322,8 @@ mod tests {
             "INBOX",
             "sender@example.com",
             "bob@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Shared Subject",
             false,
@@ -1284,6 +1399,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -1299,6 +1416,8 @@ mod tests {
             "INBOX",
             "c@d.com",
             "a@b.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,
@@ -1359,6 +1478,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -1376,6 +1497,8 @@ mod tests {
             "Sent",
             "c@d.com",
             "a@b.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,

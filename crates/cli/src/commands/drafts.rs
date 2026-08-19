@@ -2878,7 +2878,7 @@ mod tests {
             value["message_url"]
                 .as_str()
                 .unwrap()
-                .contains("/messages/42")
+                .ends_with("/mail/unified/acct%40example.com/42?folder=Sent%20Messages")
         );
         assert!(
             value["ui"]["message_url"]

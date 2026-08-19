@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(payload["events"]["recent"][0]["outcome"], "needs_review");
         assert_eq!(
             payload["events"]["recent"][0]["message_link"],
-            "/accounts/acc1/messages/101?folder=INBOX"
+            "/mail/unified/acc1/101?folder=INBOX"
         );
         assert_eq!(payload["events"]["recent"][0]["ack_state"], "pending");
     }

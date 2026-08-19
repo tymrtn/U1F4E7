@@ -64,11 +64,16 @@
   let loadedBox = $state<string | null>(null);
   let folders = $state<FolderStats[]>([]);
 
-  /** A search hit tagged with the account it was actually found in — the
-   *  per-account search endpoint doesn't return this, so it's attached here
-   *  as results are merged. Bulk actions and navigation both need the real
-   *  account, never a placeholder. */
-  type SearchHit = SearchMessageSummary & { account_id: string };
+  /** A search hit tagged with the account and folder it was actually found in
+   *  — the per-account search endpoint returns neither, so both are attached
+   *  here as results are merged. Bulk actions and navigation both need the real
+   *  identity, never a placeholder. */
+  type SearchHit = SearchMessageSummary & { account_id: string; folder: string };
+
+  /** The mailbox `runSearch` searches. Tagged onto every hit so links and bulk
+   *  dispatch name the folder the UIDs are actually scoped to, rather than
+   *  assuming INBOX at each use site. */
+  const SEARCH_FOLDER = 'INBOX';
 
   /** BulkToolbar's `messageIndex` entry shape — the message's real identity
    *  (account/uid) plus the context junk-rules/snooze need. */
@@ -205,11 +210,13 @@
       await Promise.all(
         accounts.map(async (acct) => {
           try {
-            const res = await api.searchMessages(acct.id, q);
-            // Tag each hit with the account it actually came from — the
-            // per-account search response doesn't carry this, and a search
+            const res = await api.searchMessages(acct.id, q, SEARCH_FOLDER);
+            // Tag each hit with the account and folder it actually came from —
+            // the per-account search response carries neither, and a search
             // spanning accounts must not blur which account owns which hit.
-            merged.push(...res.messages.map((m) => ({ ...m, account_id: acct.id })));
+            merged.push(
+              ...res.messages.map((m) => ({ ...m, account_id: acct.id, folder: SEARCH_FOLDER }))
+            );
           } catch {
             // partial ok
           }
@@ -286,9 +293,10 @@
     return idx;
   });
 
-  /** Search hits carry their own real account (tagged in `runSearch`) and
-   *  folder — a search spans mailboxes just like the unified inbox does, so
-   *  bulk actions must dispatch against each hit's actual identity. */
+  /** Search hits carry their own real account and the folder the search ran
+   *  against (both tagged in `runSearch`): search fans out across every account
+   *  while staying inside `SEARCH_FOLDER`, so bulk actions must dispatch against
+   *  each hit's actual identity. */
   const searchMessageIndex = $derived.by(() => {
     const idx: Record<string, MsgIndexEntry> = {};
     for (const m of searchResults) {
@@ -296,7 +304,7 @@
         accountId: m.account_id,
         uid: m.uid,
         from: m.from_addr ?? '',
-        folder: 'INBOX',
+        folder: m.folder,
         message_id: m.message_id ?? null,
         subject: m.subject ?? null,
       };
@@ -539,9 +547,9 @@
                   from: m.from_addr,
                   date: m.date,
                   snippet: null,
-                  unread: readState.isUnread(m.account_id, 'INBOX', m.uid, m.unread),
+                  unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
-                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedSearchKeys}
@@ -580,7 +588,7 @@
                   unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
                   accountChip: m.account_display_name || m.account_username,
-                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedUnifiedKeys}
@@ -642,7 +650,7 @@
                   unread: readState.isUnread(s.account_id, s.snoozed_folder, s.uid, false),
                   starred: false,
                   accountChip: s.account_id,
-                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}`,
+                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}?folder=${encodeURIComponent(s.snoozed_folder)}`,
                 }}
                 {selection}
                 orderedKeys={snoozed.map((x) => `snoozed:${x.account_id}:${x.uid}`)}

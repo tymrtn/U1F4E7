@@ -729,6 +729,135 @@ mod tests {
         assert!(err.to_string().contains("invalid bcc address"));
     }
 
+    /// The recipient headers are the narrowest address gate in the product,
+    /// and narrower than the bare-address validator it is easy to mistake for
+    /// it: `lettre::Address::from_str` accepts a quoted local part, but every
+    /// To/Cc/Bcc value goes through `Mailboxes`, which does not.
+    ///
+    /// Two other layers mirror this rule and must not drift from it —
+    /// `normalize_email` in `crates/store/src/address_book.rs` decides what the
+    /// address book may suggest, and `isValidEmail` in
+    /// `crates/dashboard/web/src/lib/addresses.ts` decides what the composer
+    /// will queue. An address either of them admitted here would reach SMTP and
+    /// fail. This test is what pins the rule they are mirroring.
+    #[test]
+    fn parse_mailboxes_rejects_what_the_suggestion_and_composer_gates_also_reject() {
+        for unsendable in [
+            // Quoted local part: `Address::from_str` says yes, `Mailboxes` no.
+            "\"john..doe\"@example.com",
+            "\"john doe\"@example.com",
+            // Non-breaking space — invisible in a chip, fatal at SMTP.
+            "a\u{a0}b@example.com",
+            "a..b@example.com",
+            "ada@-example.com",
+        ] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} must not be sendable"
+            );
+        }
+
+        // The tightening must not cost ordinary addresses, accented ones
+        // included: the local part is Unicode-aware on every layer.
+        for sendable in ["ada@example.com", "josé@example.com", "me+filing@x.test"] {
+            assert!(
+                parse_mailboxes(sendable, "to").is_ok(),
+                "{sendable:?} must stay sendable"
+            );
+        }
+    }
+
+    /// `Mailboxes` parses the WHOLE header value: `mailbox_list` is terminated
+    /// by `eof`, so text left over after the last mailbox fails the parse
+    /// rather than being ignored.
+    ///
+    /// The composer used to extract an angle address with a substring match,
+    /// which found `<ada@example.com>` inside `Ada <ada@example.com> trailing`
+    /// and validated only that. The entry passed every frontend gate and then
+    /// failed here. `isValidEmail` now requires the `>` to close the entry.
+    #[test]
+    fn parse_mailboxes_rejects_text_left_over_after_the_angle_address() {
+        for unsendable in [
+            "Ada <ada@example.com> trailing",
+            "<ada@example.com> <bob@example.com>",
+            "<ada@example.com>x",
+            "ada@example.com>",
+            "Ada <ada@example.com",
+        ] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} must not be sendable"
+            );
+        }
+
+        for sendable in [
+            "Ada <ada@example.com>",
+            "<ada@example.com>",
+            "\"Doe, Jane\" <jane@example.com>",
+        ] {
+            assert!(
+                parse_mailboxes(sendable, "to").is_ok(),
+                "{sendable:?} must stay sendable"
+            );
+        }
+    }
+
+    /// The size limits `lettre` enforces are BYTE limits — `email_address`
+    /// compares `str::len()` against 64 for the local part, 254 for the domain
+    /// and 63 for a label. A frontend counting UTF-16 code units instead reads
+    /// a 66-byte accented local part as 33 and queues a draft that dies here,
+    /// so `isValidEmail` measures with `TextEncoder`.
+    ///
+    /// Beyond the limits, `atext` is `char::is_alphanumeric` plus a fixed ASCII
+    /// set — NOT all of non-ASCII. An accented letter is admitted; a middle dot
+    /// or an emoji is not.
+    #[test]
+    fn parse_mailboxes_measures_addresses_in_utf8_bytes() {
+        // 33 × 'é' is 66 UTF-8 bytes but only 33 UTF-16 code units.
+        let overlong = format!("{}@example.com", "é".repeat(33));
+        assert!(
+            parse_mailboxes(&overlong, "to").is_err(),
+            "a 66-byte local part is over the 64-byte limit"
+        );
+        // 32 × 'é' is exactly 64 bytes, and stays sendable.
+        let at_limit = format!("{}@example.com", "é".repeat(32));
+        assert!(
+            parse_mailboxes(&at_limit, "to").is_ok(),
+            "a 64-byte local part is at the limit, not over it"
+        );
+
+        for unsendable in ["a\u{b7}b@example.com", "a\u{1f600}b@example.com"] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} is non-ASCII but not alphanumeric"
+            );
+        }
+    }
+
+    /// Where the composer is deliberately NARROWER than this gate.
+    ///
+    /// `Address::check_domain` admits a Unicode domain — either `atext` takes
+    /// it directly or the `idna` fallback does — but nothing rewrites it: the
+    /// address goes on the wire in its Unicode spelling, and
+    /// `Connection::send` then refuses the envelope outright unless the server
+    /// advertises SMTPUTF8. A domain has a canonical ASCII spelling (punycode)
+    /// that costs the recipient nothing, so `isValidEmail` and
+    /// `normalize_email` require it and neither can offer a recipient whose
+    /// delivery depends on an extension the server may not have. A local part
+    /// has no such spelling, which is why the accented ones above stay
+    /// admitted on every layer.
+    #[test]
+    fn a_unicode_domain_parses_here_and_the_composer_still_refuses_it() {
+        assert!(
+            parse_mailboxes("ada@exämple.com", "to").is_ok(),
+            "the send edge itself parses a Unicode domain"
+        );
+        assert!(
+            parse_mailboxes("ada@xn--exmple-cua.com", "to").is_ok(),
+            "the punycode spelling the composer requires is sendable"
+        );
+    }
+
     #[test]
     fn unknown_content_type_falls_back_to_octet_stream() {
         let result: ContentType = "not/a valid mime type!!"
