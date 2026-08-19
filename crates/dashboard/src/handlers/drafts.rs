@@ -95,14 +95,15 @@ pub struct DraftSendRequest {
 
 /// Serialize a draft for the JSON API with attachment bytes stripped.
 ///
-/// Draft attachment entries carry `data_base64` — the byte snapshot the send
-/// path transmits from. The store is explicit that the field is never logged
-/// or echoed, and the CLI has stripped it since its first attachment listing
+/// Draft attachment entries carry `data_base64` — the snapshot the send sweep
+/// transmits from. The store is explicit that the field is never logged or
+/// echoed, and the CLI has stripped it since its first attachment listing
 /// (`cli::commands::attachments::attachment_summary`). Serializing the raw row
 /// put it on the wire anyway: every draft fetch shipped every attachment in
-/// full to the client, which needs only the filename, media type, and size to
-/// describe what is attached.
-fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
+/// full to the browser, which then rendered a count. Callers that want the
+/// bytes ask for one file by name at
+/// `GET /accounts/{id}/drafts/{draft_id}/attachments/{filename}`.
+pub(crate) fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
     let mut value = serde_json::to_value(draft).unwrap_or_else(|_| json!({}));
     if let Some(attachments) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
         for entry in attachments.iter_mut() {
@@ -498,7 +499,7 @@ pub async fn send(
     }
 }
 
-fn ensure_draft_account(
+pub(crate) fn ensure_draft_account(
     db: &envelope_email_store::Database,
     account_id: &str,
     draft_id: &str,
@@ -518,7 +519,7 @@ fn ensure_draft_account(
     Ok(draft)
 }
 
-fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
+pub(crate) fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
     match e {
         envelope_email_store::StoreError::DraftNotFound(_) => {
             (StatusCode::NOT_FOUND, format!("{e}")).into_response()

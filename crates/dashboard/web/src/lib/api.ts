@@ -357,6 +357,20 @@ export function isSendableDraftStatus(status: DraftStatus): boolean {
   return SENDABLE_DRAFT_STATUSES.includes(status);
 }
 
+/**
+ * One attachment on a draft, as the JSON API reports it.
+ *
+ * Metadata only. The stored entry also holds the base64 bytes the send sweep
+ * transmits, but `handlers::drafts::draft_json` strips that field from every
+ * draft the API serializes — the bytes are reachable only through
+ * `draftAttachmentDownloadUrl`, one file at a time.
+ */
+export interface DraftAttachment {
+  filename: string;
+  content_type: string;
+  size: number;
+}
+
 export interface Draft {
   id: string;
   account_id: string;
@@ -370,7 +384,7 @@ export interface Draft {
   html_content: string | null;
   in_reply_to: string | null;
   metadata: Record<string, unknown> | null;
-  attachments: unknown[];
+  attachments: DraftAttachment[];
   message_id: string | null;
   send_after: string | null;
   snoozed_until: string | null;
@@ -422,6 +436,44 @@ export interface DraftEditBody {
 export interface DraftEditResponse {
   draft: Draft;
   status: string;
+}
+
+/**
+ * Body for POST /api/accounts/{id}/drafts/{draftId}/attachments. Mirrors
+ * `DraftAttachmentUploadRequest` (`deny_unknown_fields`).
+ *
+ * Attaching a file changes what will be sent, so it carries the same
+ * `expected_revision` contract as an edit: a concurrent change returns 409, and
+ * a successful call bumps the revision and clears any approval attestation.
+ */
+export interface DraftAttachmentUploadBody {
+  expected_revision: number;
+  attachments: ComposeAttachment[];
+}
+
+export interface DraftAttachmentResponse {
+  draft: Draft;
+  status: string;
+}
+
+/** Total attachment bytes one draft may carry. Mirrors MAX_DRAFT_ATTACHMENT_BYTES. */
+export const MAX_DRAFT_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/**
+ * URL that streams one draft attachment's bytes.
+ *
+ * `inline` is honoured for images only — the backend serves everything else as
+ * a download with `X-Content-Type-Options: nosniff`, so a mislabelled entry
+ * cannot render as active content on the dashboard's origin.
+ */
+export function draftAttachmentDownloadUrl(
+  accountId: string,
+  draftId: string,
+  filename: string,
+  inline = false
+): string {
+  const base = `/api/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(filename)}`;
+  return inline ? `${base}?inline=true` : base;
 }
 
 /**
@@ -807,6 +859,40 @@ export const api = {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/edit`,
       { ...o, method: 'POST', body }
+    );
+  },
+
+  /**
+   * POST /api/accounts/{id}/drafts/{draftId}/attachments
+   * Attach one or more files to a draft. Same revision contract as editDraft.
+   */
+  uploadDraftAttachments(
+    accountId: string,
+    draftId: string,
+    body: DraftAttachmentUploadBody,
+    o?: RequestOptions
+  ): Promise<DraftAttachmentResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/attachments`,
+      { ...o, method: 'POST', body }
+    );
+  },
+
+  /**
+   * DELETE /api/accounts/{id}/drafts/{draftId}/attachments/{filename}
+   * Detach one file by name. `expected_revision` rides in the query string
+   * because a DELETE body is not reliably forwarded.
+   */
+  deleteDraftAttachment(
+    accountId: string,
+    draftId: string,
+    filename: string,
+    expectedRevision: number,
+    o?: RequestOptions
+  ): Promise<DraftAttachmentResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(filename)}`,
+      { ...o, method: 'DELETE', query: { expected_revision: expectedRevision } }
     );
   },
 
