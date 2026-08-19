@@ -88,6 +88,32 @@ pub struct DraftSendRequest {
     pub cooldown_seconds: Option<i64>,
 }
 
+/// Serialize a draft for the JSON API with attachment bytes stripped.
+///
+/// Draft attachment entries carry `data_base64` — the byte snapshot the send
+/// path transmits from. The store is explicit that the field is never logged
+/// or echoed, and the CLI has stripped it since its first attachment listing
+/// (`cli::commands::attachments::attachment_summary`). Serializing the raw row
+/// put it on the wire anyway: every draft fetch shipped every attachment in
+/// full to the client, which needs only the filename, media type, and size to
+/// describe what is attached.
+fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
+    let mut value = serde_json::to_value(draft).unwrap_or_else(|_| json!({}));
+    if let Some(attachments) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
+        for entry in attachments.iter_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("data_base64");
+            }
+        }
+    }
+    value
+}
+
+/// [`draft_json`] over a slice, for list responses.
+fn drafts_json(drafts: &[envelope_email_store::Draft]) -> Vec<serde_json::Value> {
+    drafts.iter().map(draft_json).collect()
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -102,7 +128,7 @@ pub async fn list(
     };
 
     match db.list_drafts(&account.id, Some("draft"), 100, 0) {
-        Ok(drafts) => Json(json!({ "drafts": drafts })).into_response(),
+        Ok(drafts) => Json(json!({ "drafts": drafts_json(&drafts) })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
@@ -135,7 +161,7 @@ pub async fn show(
     let dashboard_url = draft_dashboard_url(&headers, &account.id, &draft.id);
 
     Json(json!({
-        "draft": draft,
+        "draft": draft_json(&draft),
         "account": account,
         "dashboard_path": dashboard_path,
         "dashboard_url": dashboard_url,
@@ -175,7 +201,7 @@ pub async fn show_by_imap_uid(
     let dashboard_url = draft_dashboard_url(&headers, &account.id, &draft.id);
 
     Json(json!({
-        "draft": draft,
+        "draft": draft_json(&draft),
         "account": account,
         "dashboard_path": dashboard_path,
         "dashboard_url": dashboard_url,
@@ -228,7 +254,7 @@ pub async fn approve(
                     draft_id: draft.id.clone(),
                     status: DraftStatus::Draft.as_str().to_string(),
                 });
-            Json(json!({ "draft": draft, "status": "approved" })).into_response()
+            Json(json!({ "draft": draft_json(&draft), "status": "approved" })).into_response()
         }
         Err(e) => draft_error(e),
     }
@@ -252,7 +278,9 @@ pub async fn edit(
             req.html_content.as_deref(),
         )
     }) {
-        Ok(draft) => Json(json!({ "draft": draft, "status": "edited" })).into_response(),
+        Ok(draft) => {
+            Json(json!({ "draft": draft_json(&draft), "status": "edited" })).into_response()
+        }
         Err(e) => draft_error(e),
     }
 }
@@ -304,7 +332,7 @@ pub async fn block(
                     status: DraftStatus::Blocked.as_str().to_string(),
                 });
             Json(json!({
-                "draft": draft,
+                "draft": draft_json(&draft),
                 "status": "blocked",
                 "reason": req.reason.unwrap_or_else(|| "changes requested".to_string())
             }))
@@ -445,6 +473,80 @@ fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response 
 #[cfg(test)]
 mod tests {
     use envelope_email_store::{Database, DraftStatus};
+
+    use super::{draft_json, drafts_json};
+
+    /// Attachment bytes must not ride the JSON API. The store is explicit that
+    /// `data_base64` is never logged or echoed, and the CLI has stripped it
+    /// from every attachment listing since the field existed; serializing the
+    /// raw draft row put it on the wire regardless, shipping every attachment
+    /// in full on each fetch to a client that needs only name, type, and size.
+    #[test]
+    fn draft_json_strips_attachment_bytes_and_keeps_the_metadata() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "a@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("With attachments"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_attachments(
+            &draft.id,
+            &[
+                serde_json::json!({
+                    "filename": "packet.pdf",
+                    "content_type": "application/pdf",
+                    "size": 5,
+                    "data_base64": "aGVsbG8=",
+                }),
+                serde_json::json!({
+                    "filename": "notes.txt",
+                    "content_type": "text/plain",
+                    "size": 3,
+                    "data_base64": "Zm9v",
+                }),
+            ],
+        )
+        .unwrap();
+        let stored = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let value = draft_json(&stored);
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(
+            !serialized.contains("data_base64"),
+            "draft JSON must not carry the bytes field: {serialized}"
+        );
+        assert!(!serialized.contains("aGVsbG8="));
+        assert!(!serialized.contains("Zm9v"));
+
+        // Everything the client actually renders survives.
+        let attachments = value["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0]["filename"], "packet.pdf");
+        assert_eq!(attachments[0]["content_type"], "application/pdf");
+        assert_eq!(attachments[0]["size"], 5);
+        assert_eq!(attachments[1]["filename"], "notes.txt");
+        // And so does the rest of the draft.
+        assert_eq!(value["id"], stored.id);
+        assert_eq!(value["subject"], "With attachments");
+        assert_eq!(value["revision"], stored.revision);
+
+        // The bytes are still in the store — only the wire form drops them.
+        assert_eq!(stored.attachments[0]["data_base64"], "aGVsbG8=");
+
+        // The list form strips identically.
+        let listed = serde_json::to_string(&drafts_json(&[stored])).unwrap();
+        assert!(!listed.contains("data_base64"), "list form: {listed}");
+        assert!(listed.contains("packet.pdf"));
+    }
 
     #[test]
     fn draft_operator_primitives_are_account_scoped() {

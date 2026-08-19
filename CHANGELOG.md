@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Draft JSON no longer ships attachment bytes to the client. `GET /accounts/{id}/drafts`, `GET /accounts/{id}/drafts/{draft_id}`, `by-imap-uid`, and the approve/edit/block responses all strip `data_base64` from each attachment entry, leaving the filename, media type, and size a client needs to describe what is attached. Every draft fetch previously carried each attachment in full — a draft holding a 10 MB PDF moved roughly 13 MB of base64 per request — and `data_base64` is a field the store is explicit about never logging or echoing, which the CLI has honoured since its first attachment listing.
+
 ## [1.0.0] — 2026-07-11
 
 First public release. Envelope is a bring-your-own-mailbox email client with
