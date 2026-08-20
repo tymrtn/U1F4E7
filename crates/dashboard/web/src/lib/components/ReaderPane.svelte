@@ -36,13 +36,23 @@
   } from '$lib/reader-api';
   import { api, EnvelopeApiError } from '$lib/api';
   import { isDraftsFolder } from '$lib/mailboxes';
+  import { folderHints } from '$lib/folder-hints.svelte';
   import { readState } from '$lib/read-state.svelte';
 
   // ── Route params ──────────────────────────────────────────────────────
 
   const accountId = $derived(page.params.account ?? '');
   const uid = $derived(Number(page.params.uid ?? 0));
-  const folder = $derived(page.url.searchParams.get('folder') ?? 'INBOX');
+  // Folder resolution, most trustworthy first: an explicit `?folder=` (the only
+  // source that can name a mailbox the list never loaded), then the folder the
+  // unified list recorded for this exact account+uid, then INBOX. The hint
+  // means a link that lost its query string opens the right mailbox instead of
+  // 404ing against INBOX — and a Drafts uid still reaches the drafts intercept.
+  const folder = $derived(
+    page.url.searchParams.get('folder') ||
+      folderHints.folderFor(page.params.account ?? null, Number(page.params.uid) || null) ||
+      'INBOX'
+  );
   const box = $derived(page.params.box ?? 'unified');
 
   // ── Message state ─────────────────────────────────────────────────────

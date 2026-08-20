@@ -14,6 +14,8 @@
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
+  import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
+  import { folderHints } from '$lib/folder-hints.svelte';
   import { SelectionStore } from '$lib/selection.svelte';
   import { readState } from '$lib/read-state.svelte';
   import { getLiveStore } from '$lib/live.svelte';
@@ -96,23 +98,45 @@
   let unifiedLoadGen = 0;
   let unifiedRefreshInFlight = false;
 
-  function accountCacheIsStale(account: unknown): boolean {
-    if (!account || typeof account !== 'object') return false;
-    const freshness = (account as { freshness?: unknown }).freshness;
-    return freshness === 'stale' || freshness === 'expired';
-  }
+  // ── Where the open message sits in the list ───────────────────────
+  // The unified list is a flat merge of every account, so "which one am I
+  // reading, and where is it?" is not answerable from the reader alone. This
+  // drives both the "4 of 50" readout and the scroll-into-view below; it is
+  // null when the deep link names a message older than the loaded page.
+  const selectedPosition = $derived(
+    box?.slug === 'unified' && !isSearching
+      ? positionOf(unifiedMessages, selectedAccount, selectedUid)
+      : null
+  );
 
-  // Top-level `partial` is the steady state when a couple of accounts are
-  // permanently unreachable. Refresh only when some account cache is actually
-  // stale — otherwise every page open would re-IMAP the whole fleet.
-  function inboxNeedsFlagRefresh(res: { freshness: string; accounts: unknown[] }): boolean {
-    if (res.freshness === 'stale' || res.freshness === 'expired') return true;
-    return Array.isArray(res.accounts) && res.accounts.some(accountCacheIsStale);
-  }
+  // Bring the open message into view when a deep link lands on a row that is
+  // scrolled out of sight. Keyed on the row's identity, so re-running the
+  // effect for an unrelated list update does not yank the viewport around.
+  let lastScrolledKey: string | null = null;
+  $effect(() => {
+    const key =
+      selectedAccount !== null && selectedUid !== null
+        ? `${selectedAccount}:${selectedUid}`
+        : null;
+    if (!key || selectedPosition === null) {
+      if (key === null) lastScrolledKey = null;
+      return;
+    }
+    if (key === lastScrolledKey) return;
+    const row = document.querySelector(
+      `#unified-msg-list [data-msg-key="${CSS.escape(key)}"]`
+    );
+    if (!row) return;
+    lastScrolledKey = key;
+    row.scrollIntoView({ block: 'nearest' });
+  });
 
   function applyUnified(res: { messages: UnifiedInboxMessage[]; errors?: UnifiedInboxError[] }) {
     unifiedMessages = res.messages;
     listErrors = res.errors ?? [];
+    // Record the mailbox each row came from, so a reader link that lost its
+    // `?folder=` can still resolve one instead of guessing INBOX.
+    folderHints.remember(res.messages);
   }
 
   async function refreshStaleUnified(gen: number) {
@@ -138,7 +162,7 @@
       if (gen !== unifiedLoadGen) return;
       applyUnified(res);
       loading = false;
-      if (inboxNeedsFlagRefresh(res)) {
+      if (unifiedNeedsRefresh(res)) {
         await refreshStaleUnified(gen);
       }
     } catch (e) {
@@ -475,7 +499,7 @@
 <svelte:window onkeydown={handleGlobalKey} />
 
 <div class="mail-shell" class:is-reading={selectedUid !== null}>
-  <Rail />
+  <Rail activeAccountId={selectedAccount} />
 
   <section id="msg-list-pane" class="list" aria-label="Message list">
     <header class="pane-head">
@@ -483,7 +507,11 @@
       <div class="pane-head-right">
         {#if box?.wired}
           <span class="pane-count">
-            <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+            {#if selectedPosition}
+              <MonoTag>{selectedPosition.position} of {selectedPosition.total}</MonoTag>
+            {:else}
+              <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+            {/if}
           </span>
           <SearchBar
             hint="Search {box.label}…"
