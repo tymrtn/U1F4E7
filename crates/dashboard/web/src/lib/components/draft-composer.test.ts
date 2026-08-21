@@ -80,6 +80,11 @@ async function renderLoaded(overrides: Partial<Draft> = {}) {
   await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 }
 
+/** An HTML body opens rendered; drop to the source textarea to type into it. */
+async function openSource() {
+  await fireEvent.click(screen.getByRole('button', { name: /edit html/i }));
+}
+
 /** The token field wrapping a recipient input. */
 function recipientField(label: string): HTMLElement {
   return screen.getByLabelText(label).closest('.recipient-field') as HTMLElement;
@@ -241,6 +246,7 @@ describe('DraftComposer edit', () => {
 
   it('sends only the edited body format so the stale alternate is cleared', async () => {
     await renderLoaded({ text_content: null, html_content: '<p>Hi</p>' });
+    await openSource();
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: '<p>Bye</p>' } });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -1099,28 +1105,32 @@ describe('DraftComposer body preservation', () => {
 
   it('still replaces the pair — clearing the stale alternate — when the body changes', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Rewritten' } });
+    await openSource();
+    await fireEvent.input(screen.getByLabelText('Message'), {
+      target: { value: '<p>Rewritten</p>' }
+    });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
     const body = apiMock.editDraft.mock.calls[0][2];
-    expect(body.text_content).toBe('Rewritten');
-    expect(body).not.toHaveProperty('html_content');
+    expect(body.html_content).toBe('<p>Rewritten</p>');
+    expect(body).not.toHaveProperty('text_content');
   });
 
   it('sends the body when only the format changed', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
     const body = apiMock.editDraft.mock.calls[0][2];
-    expect(body).toHaveProperty('html_content');
-    expect(body).not.toHaveProperty('text_content');
+    expect(body).toHaveProperty('text_content');
+    expect(body).not.toHaveProperty('html_content');
   });
 
   it('warns before a body edit drops the draft’s other format', async () => {
     await renderLoaded(DUAL);
+    await openSource();
     expect(screen.queryByText(/drops the other format/i)).not.toBeInTheDocument();
 
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Rewritten' } });
@@ -1176,9 +1186,10 @@ describe('DraftComposer optional-recipient validation', () => {
 
 // ── Body format switching ─────────────────────────────────────────────
 //
-// The Text/HTML control picks which of the draft's two alternatives is being
-// edited, so switching has to swap the body in the box. Merely relabelling the
-// plain-text body as HTML is how a draft's real HTML part gets overwritten
+// A draft with an HTML part opens on it, rendered: that body is the message
+// the recipient sees. The Text/HTML control picks which alternative is being
+// edited, so switching has to swap the body in the box — relabelling the
+// plain-text body as HTML is how a draft's real HTML part got overwritten
 // with its plain-text twin on the next save.
 
 describe('DraftComposer body format switching', () => {
@@ -1188,47 +1199,65 @@ describe('DraftComposer body format switching', () => {
     return screen.getByLabelText('Message') as HTMLTextAreaElement;
   }
 
-  it('shows the HTML alternative when the format switches to HTML', async () => {
+  it('opens a draft that has an HTML body on its rendered HTML', async () => {
     await renderLoaded(DUAL);
-    expect(messageBox().value).toBe('Plain body');
 
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    expect(screen.getByRole('button', { name: 'HTML' })).toHaveAttribute('aria-pressed', 'true');
+    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    expect(frame.getAttribute('srcdoc')).toContain('Rich body');
+    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
+  });
+
+  it('opens a text-only draft in plain text', async () => {
+    await renderLoaded({ text_content: 'Only text', html_content: null });
+
+    expect(screen.getByRole('button', { name: 'Text' })).toHaveAttribute('aria-pressed', 'true');
+    expect(messageBox().value).toBe('Only text');
+  });
+
+  it('shows the plain-text alternative when the format switches to Text', async () => {
+    await renderLoaded(DUAL);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    expect(messageBox().value).toBe('Plain body');
+  });
+
+  it('shows the HTML source behind Edit HTML', async () => {
+    await renderLoaded(DUAL);
+
+    await openSource();
 
     expect(messageBox().value).toBe('<p>Rich body</p>');
   });
 
-  it('shows the plain-text alternative again when the format switches back', async () => {
+  it('returns the HTML body, not the plain-text one, after a round trip', async () => {
     await renderLoaded(DUAL);
-
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
-
-    expect(messageBox().value).toBe('Plain body');
-  });
-
-  it('saves the HTML body it displayed, not the plain-text one', async () => {
-    await renderLoaded(DUAL);
     await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
-    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
-    await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
-    expect(apiMock.editDraft.mock.calls[0][2].html_content).toBe('<p>Rich body</p>');
+    await openSource();
+
+    expect(messageBox().value).toBe('<p>Rich body</p>');
   });
 
   it('keeps an unsaved edit when the format is switched away and back', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.input(messageBox(), { target: { value: 'Half-written reply' } });
+    await openSource();
+    await fireEvent.input(messageBox(), { target: { value: '<p>Half-written</p>' } });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await openSource();
 
-    expect(messageBox().value).toBe('Half-written reply');
+    expect(messageBox().value).toBe('<p>Half-written</p>');
   });
 
   it('carries the body over when the draft has no alternative in that format', async () => {
     await renderLoaded({ text_content: 'Only text', html_content: null });
 
     await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await openSource();
 
     expect(messageBox().value).toBe('Only text');
   });
@@ -1244,54 +1273,48 @@ describe('DraftComposer HTML preview', () => {
   const DUAL = { text_content: 'Plain body', html_content: '<p>Rich body</p>' };
 
   it('offers no preview while the body is plain text', async () => {
-    await renderLoaded(DUAL);
+    await renderLoaded({ text_content: 'Only text', html_content: null });
 
-    expect(screen.queryByRole('button', { name: /preview/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /preview|edit html/i })).not.toBeInTheDocument();
   });
 
-  it('renders the HTML body in a sandboxed frame instead of its source', async () => {
+  it('renders the HTML body in a sandboxed frame', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
-    await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
 
     const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
     const sandbox = frame.getAttribute('sandbox') ?? '';
     expect(sandbox).toContain('allow-same-origin');
     expect(sandbox).not.toContain('allow-scripts');
-    expect(frame.getAttribute('srcdoc')).toContain('Rich body');
-    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
   });
 
   it('previews the unsaved edit rather than the saved body', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await openSource();
     await fireEvent.input(screen.getByLabelText('Message'), {
       target: { value: '<p>Rewritten</p>' }
     });
+
     await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
 
     const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
     expect(frame.getAttribute('srcdoc')).toContain('Rewritten');
   });
 
-  it('returns to the source when the preview is turned off', async () => {
+  it('leaves the preview when the format switches to plain text', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
-    await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
-    await fireEvent.click(screen.getByRole('button', { name: /edit html/i }));
 
-    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe(
-      '<p>Rich body</p>'
-    );
-  });
-
-  it('leaves the preview when the format switches back to plain text', async () => {
-    await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
-    await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
     await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
 
     expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Plain body');
     expect(screen.queryByTitle('Message body')).not.toBeInTheDocument();
+  });
+
+  it('renders again when the format switches back to HTML', async () => {
+    await renderLoaded(DUAL);
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+
+    expect(await screen.findByTitle('Message body')).toBeInTheDocument();
   });
 });

@@ -415,12 +415,13 @@
 
   /** Adopt a server draft as the new editing baseline. */
   function applyDraft(next: Draft) {
-    // A draft with only an HTML body opens in HTML mode; everything else opens
-    // in plain text. Saving writes back exactly the format shown, which clears
-    // the other alternate server-side — that is what stops a stale HTML part
-    // from being delivered instead of the edit.
-    const format: BodyFormat =
-      next.text_content == null && next.html_content != null ? 'html' : 'text';
+    // A draft that HAS an HTML body opens on it, rendered. That body is the
+    // message the recipient sees; the text part is the fallback alternative,
+    // and opening on the fallback showed bare tracking URLs where the real
+    // email has buttons. Saving still writes back exactly the format shown,
+    // which clears the other alternate server-side — that is what stops a
+    // stale HTML part from being delivered instead of the edit.
+    const format: BodyFormat = next.html_content != null ? 'html' : 'text';
 
     draft = next;
     // Normalized to the recipient field's canonical `a@x, b@y` form BEFORE the
@@ -440,6 +441,9 @@
     };
     bodyRaw = bodyByFormat[format];
     bodyFormat = format;
+    // HTML opens rendered. Reading markup is the exception, so it lives behind
+    // the toggle rather than being what a review lands on.
+    previewing = format === 'html';
     showBcc = bccRaw.length > 0;
     conflict = false;
     baseline = snapshot();
@@ -474,8 +478,8 @@
     bodyByFormat[bodyFormat] = bodyRaw;
     bodyRaw = bodyByFormat[next];
     bodyFormat = next;
-    // There is nothing to render for plain text.
-    if (next !== 'html') previewing = false;
+    // Entering HTML renders it; plain text has nothing to render.
+    previewing = next === 'html';
   }
 
   function snapshot(): Snapshot {

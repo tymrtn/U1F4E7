@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Opening a message now shows where it sits. The list header reads `4 of 50` instead of a bare count while a message is open, the selected row scrolls into view when a deep link lands on something below the fold, and the left rail marks the account the message actually belongs to (`open here`) rather than only highlighting the smart mailbox you are browsing. The unified list merges every account, so until now nothing on screen said which mailbox you were reading from.
 - A reader link that lost its `?folder=` resolves the mailbox from the list instead of guessing INBOX. The unified list records the folder for every row it paints; the reader consults that when the query string says nothing. An explicit `?folder=` still wins, since only the URL can name a mailbox the list never loaded.
-- The draft review composer can render its own HTML body. A Preview control beside the Text/HTML tabs swaps the markup for the reader's sandboxed `BodyFrame` — same `srcdoc` iframe, same CSP, `allow-scripts` still absent — with remote images blocked until asked for. An HTML part is only approvable by someone who can read it, and the review page had nothing to offer but its source.
+- The draft review composer renders HTML mail. A draft carrying an HTML part now opens on it, rendered through the reader's sandboxed `BodyFrame` — same `srcdoc` iframe, same CSP, `allow-scripts` still absent — with remote images blocked until asked for and the markup behind an `Edit HTML` toggle. Review used to land on the plain-text alternative, which shows bare tracking URLs where the real message has buttons, and reaching the HTML only produced its source.
 
 ### Fixed
 
