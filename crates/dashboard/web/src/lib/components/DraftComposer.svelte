@@ -29,6 +29,7 @@
     validateAddrs
   } from '$lib/addresses';
   import Badge from './Badge.svelte';
+  import BodyFrame from './BodyFrame.svelte';
   import Button from './Button.svelte';
   import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
@@ -134,6 +135,18 @@
   let subjectRaw = $state('');
   let bodyRaw = $state('');
   let bodyFormat = $state<BodyFormat>('text');
+  // The editor keeps one body per format. Both slots are seeded when the draft
+  // loads, so switching format shows that format's own body instead of
+  // relabelling whatever is already in the box — relabelling is how a save
+  // overwrote a draft's real HTML part with its plain-text twin. Parking the
+  // live body on the way out means switching back returns the operator's
+  // unsaved edit rather than the server copy.
+  let bodyByFormat = $state<Record<BodyFormat, string>>({ text: '', html: '' });
+  // Approving an HTML body means seeing what the recipient will see, so the
+  // preview renders it through the same sandboxed frame the reader uses.
+  let previewing = $state(false);
+  let remoteImages = $state(false);
+  let remoteBlockedCount = $state(0);
   let showBcc = $state(false);
   let baseline = $state<Snapshot>({ to: '', cc: '', bcc: '', subject: '', body: '', format: 'text' });
 
@@ -359,6 +372,9 @@
     loadedForKey = '';
     accountLabel = '';
     loading = true;
+    previewing = false;
+    remoteImages = false;
+    remoteBlockedCount = 0;
   }
 
   async function load() {
@@ -415,7 +431,14 @@
     ccRaw = serializeAddrs(next.cc_addr ?? '');
     bccRaw = serializeAddrs(next.bcc_addr ?? '');
     subjectRaw = next.subject ?? '';
-    bodyRaw = (format === 'html' ? next.html_content : next.text_content) ?? '';
+    // A draft carrying only one alternative seeds the empty slot from the one
+    // it has: switching format there means "send this body as the other
+    // format", not "start from an empty box".
+    bodyByFormat = {
+      text: (next.text_content ?? next.html_content) ?? '',
+      html: (next.html_content ?? next.text_content) ?? ''
+    };
+    bodyRaw = bodyByFormat[format];
     bodyFormat = format;
     showBcc = bccRaw.length > 0;
     conflict = false;
@@ -439,6 +462,20 @@
     // The attachment write cleared any approval attestation server-side, so a
     // "saved" badge from before it would now overstate what is approved.
     saved = false;
+  }
+
+  /**
+   * Switch which alternative is being edited, swapping the body along with the
+   * label. The edit endpoint writes whichever body it is handed and clears the
+   * other, so a format that shows the wrong body sends the wrong body.
+   */
+  function setFormat(next: BodyFormat) {
+    if (next === bodyFormat) return;
+    bodyByFormat[bodyFormat] = bodyRaw;
+    bodyRaw = bodyByFormat[next];
+    bodyFormat = next;
+    // There is nothing to render for plain text.
+    if (next !== 'html') previewing = false;
   }
 
   function snapshot(): Snapshot {
@@ -858,16 +895,31 @@
             class:is-active={bodyFormat === 'text'}
             aria-pressed={bodyFormat === 'text'}
             disabled={inputsLocked}
-            onclick={() => (bodyFormat = 'text')}>Text</button
+            onclick={() => setFormat('text')}>Text</button
           >
           <button
             type="button"
             class:is-active={bodyFormat === 'html'}
             aria-pressed={bodyFormat === 'html'}
             disabled={inputsLocked}
-            onclick={() => (bodyFormat = 'html')}>HTML</button
+            onclick={() => setFormat('html')}>HTML</button
           >
         </div>
+        {#if bodyFormat === 'html'}
+          <button
+            type="button"
+            class="draft-preview-toggle"
+            aria-pressed={previewing}
+            onclick={() => (previewing = !previewing)}
+          >
+            {previewing ? 'Edit HTML' : 'Preview'}
+          </button>
+        {/if}
+        {#if previewing && remoteBlockedCount > 0 && !remoteImages}
+          <button type="button" class="draft-remote-btn" onclick={() => (remoteImages = true)}>
+            Load remote images ({remoteBlockedCount} blocked)
+          </button>
+        {/if}
         {#if bodyChanged && hasBothBodies}
           <p class="draft-format-note">
             This draft has both a plain-text and an HTML version. Saving replaces the body with
@@ -875,13 +927,23 @@
           </p>
         {/if}
       </div>
-      <label class="draft-sr-only" for="draft-body">Message</label>
-      <textarea
-        id="draft-body"
-        placeholder="Write your message"
-        bind:value={bodyRaw}
-        disabled={inputsLocked}
-      ></textarea>
+      {#if previewing && bodyFormat === 'html'}
+        <div class="draft-preview">
+          <BodyFrame
+            html={bodyRaw}
+            {remoteImages}
+            onRemoteBlocked={(count) => (remoteBlockedCount = count)}
+          />
+        </div>
+      {:else}
+        <label class="draft-sr-only" for="draft-body">Message</label>
+        <textarea
+          id="draft-body"
+          placeholder="Write your message"
+          bind:value={bodyRaw}
+          disabled={inputsLocked}
+        ></textarea>
+      {/if}
     </div>
 
     <DraftAttachments
@@ -1239,6 +1301,27 @@
   .draft-format button:disabled {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+  .draft-preview-toggle,
+  .draft-remote-btn {
+    min-height: 1.875rem;
+    padding: 0 0.6rem;
+    border: 1px solid var(--env-rule);
+    background: var(--env-surface);
+    color: var(--env-muted);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+  }
+  .draft-preview-toggle[aria-pressed='true'] {
+    background: var(--env-ink);
+    color: var(--env-surface);
+  }
+  .draft-preview {
+    flex: 1;
+    min-height: 16rem;
+    overflow-y: auto;
+    background: var(--env-surface);
   }
   .draft-format-note {
     margin: 0;
