@@ -878,7 +878,7 @@ enum DraftCmd {
     },
     /// Edit a draft's authored body (preserves the quoted/forwarded block)
     Edit {
-        /// Draft ID (local UUID)
+        /// Draft ID (local UUID) or IMAP Drafts UID (numeric)
         id: String,
         /// Override the From header (sender identity). SMTP auth still uses --account credentials.
         #[arg(long)]

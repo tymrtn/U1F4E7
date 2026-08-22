@@ -940,7 +940,7 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
             subject,
             draft.text_content.as_deref(),
             draft.html_content.as_deref(),
-            None, // from override — not persisted for scheduled sends
+            draft_from_override(draft),
             draft.cc_addr.as_deref(),
             draft.bcc_addr.as_deref(),
             draft.reply_to.as_deref(),
@@ -1050,6 +1050,19 @@ async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Return the explicit sending identity persisted by draft create/edit.
+/// Scheduled sends must use the same identity as immediate sends and the
+/// provider Drafts copy; falling back remains the SMTP account default.
+fn draft_from_override(draft: &envelope_email_store::Draft) -> Option<&str> {
+    draft
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("from"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
 }
 
 /// The truthful send-status outcome for a claim transition: the `intended`
@@ -1167,6 +1180,7 @@ async fn resolve_and_record_sent_copy(
     let html = draft.html_content.clone();
     let cc = draft.cc_addr.clone();
     let bcc = draft.bcc_addr.clone();
+    let from_override = draft_from_override(draft).map(str::to_string);
     let reply_to = draft.reply_to.clone();
     let in_reply_to = in_reply_to.map(str::to_string);
     let references = references.to_vec();
@@ -1201,7 +1215,7 @@ async fn resolve_and_record_sent_copy(
                 &db,
                 &creds,
                 provider_type.as_deref(),
-                "", // account-default From, matching the scheduled SMTP send (no override)
+                from_override.as_deref().unwrap_or(""),
                 &to,
                 &subject,
                 text.as_deref(),
@@ -1937,6 +1951,46 @@ mod tests {
         assert!(validate_dashboard_bind(broad, 3141, &token).is_ok());
         assert!(
             validate_dashboard_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), 3141, &identity_only).is_ok()
+        );
+    }
+
+    #[test]
+    fn scheduled_send_uses_persisted_from_override() {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Bruno', 'bruno@spainexpat.com', 'spainexpat.com',
+                         'smtp.spainexpat.com', 587, 'imap.spainexpat.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "member@example.test",
+                Some("Questionnaire"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                "from": "SpainExpat Plus Ultra <plusultra@spainexpat.com>"
+            }),
+        )
+        .unwrap();
+        let stored = db.get_draft(&draft.id).unwrap().unwrap();
+
+        assert_eq!(
+            draft_from_override(&stored),
+            Some("SpainExpat Plus Ultra <plusultra@spainexpat.com>")
         );
     }
 
