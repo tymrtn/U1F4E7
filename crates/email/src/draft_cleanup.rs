@@ -69,6 +69,16 @@ pub enum ProviderDraftCleanup {
     Skipped(&'static str),
 }
 
+/// Result of clearing provider copies before replacing an edited draft.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProviderDraftReplaceCleanup {
+    /// Every exact copy of the logical draft was deleted and expunged.
+    Deleted { uids: Vec<u32> },
+    /// No exact copy remains. This is idempotent success: a prior attempt may
+    /// already have removed the old copy before failing later in the edit.
+    AlreadyAbsent,
+}
+
 /// Delete the provider draft copy identified by `target`, verifying identity
 /// on the server first: the deleted UID is the **single** message in the
 /// exact detected folder whose Message-ID header exactly equals the
@@ -89,6 +99,29 @@ pub async fn delete_provider_draft_exact(
             "provider draft copy not uniquely identified by exact Message-ID",
         )),
     }
+}
+
+/// Clear every exact provider copy before APPENDing an edited replacement.
+///
+/// Unlike post-send cleanup, replacement must recover from duplicates created
+/// by an interrupted older edit. Multiple UIDs are safe to remove only after
+/// each candidate's Message-ID header has been fetched and verified as an exact
+/// match for the persisted logical draft identity. Similar/substring matches
+/// are never returned by `find_uids_by_exact_message_id` and are untouched.
+pub async fn clear_provider_draft_copies_for_replace(
+    client: &mut ImapClient,
+    target: &DraftCleanupTarget,
+) -> Result<ProviderDraftReplaceCleanup, ImapError> {
+    let uids =
+        imap::find_uids_by_exact_message_id(client, &target.folder, &target.message_id).await?;
+    if uids.is_empty() {
+        return Ok(ProviderDraftReplaceCleanup::AlreadyAbsent);
+    }
+
+    for uid in &uids {
+        imap::delete_message(client, &target.folder, *uid).await?;
+    }
+    Ok(ProviderDraftReplaceCleanup::Deleted { uids })
 }
 
 #[cfg(test)]

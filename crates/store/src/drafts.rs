@@ -124,6 +124,37 @@ impl Database {
         Ok(draft)
     }
 
+    /// Find active local drafts carrying an exact canonical Message-ID.
+    ///
+    /// IMAP UIDs change whenever a draft is replaced, while Message-ID is the
+    /// stable identity Envelope persists for that logical draft. Callers must
+    /// still require exactly one result before repairing a UID mapping: two
+    /// local rows with the same Message-ID are ambiguous and must not be merged.
+    pub fn find_editable_drafts_by_message_id(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<Draft>> {
+        let wanted = crate::models::canonical_message_id(message_id);
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to, subject,
+                    text_content, html_content, in_reply_to, metadata, attachments, message_id,
+                    send_after, snoozed_until, created_at, updated_at, sent_at, created_by,
+                    imap_uid, revision
+             FROM drafts
+             WHERE account_id = ?1
+               AND status IN ('draft', 'pending_review', 'blocked')
+               AND trim(trim(message_id), '<>') = ?2
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, wanted], Self::map_draft)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_drafts(
         &self,
         account_id: &str,
@@ -725,7 +756,7 @@ impl Database {
         let serialized = serde_json::to_string(&metadata)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET
-                imap_uid = COALESCE(?1, imap_uid),
+                imap_uid = ?1,
                 metadata = ?2,
                 updated_at = datetime('now')
              WHERE id = ?3 AND status = 'syncing' AND operation_token = ?4",
@@ -1061,6 +1092,35 @@ impl Database {
         if rows == 0 {
             return Err(self.classify_guarded_update_miss(id));
         }
+        Ok(())
+    }
+
+    /// Atomically make `imap_uid` identify exactly one active draft in an
+    /// account, clearing any stale active mapping before assigning the target.
+    /// Used only after the provider UID's Message-ID has been verified.
+    pub fn relink_editable_draft_imap_uid(
+        &self,
+        account_id: &str,
+        id: &str,
+        imap_uid: u32,
+    ) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        tx.execute(
+            "UPDATE drafts SET imap_uid = NULL, updated_at = datetime('now')
+             WHERE account_id = ?1 AND imap_uid = ?2 AND id <> ?3
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![account_id, imap_uid as i64, id],
+        )?;
+        let rows = tx.execute(
+            "UPDATE drafts SET imap_uid = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND account_id = ?3
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![imap_uid as i64, id, account_id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3178,6 +3238,18 @@ mod tests {
             finalized.metadata.as_ref().unwrap()["storage"]["imap_synced"],
             true
         );
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            None,
+            &serde_json::json!({"imap_synced": true, "uid_lookup": "missed"}),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().imap_uid,
+            None,
+            "a missed replacement UID must clear the deleted old UID"
+        );
 
         // Release restores the prior status (owner token required, cleared on
         // release); releasing again is a no-op.
@@ -3626,6 +3698,54 @@ mod tests {
             .unwrap();
         let fetched = db.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(fetched.message_id, Some("<test@example.com>".to_string()));
+    }
+
+    #[test]
+    fn find_editable_drafts_by_message_id_is_canonical_account_scoped_and_active_only() {
+        let db = setup();
+        let active = db
+            .create_draft(
+                "acc1",
+                "active@test.com",
+                Some("Active"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_draft_message_id(&active.id, "<stable@example.com>")
+            .unwrap();
+
+        let discarded = db
+            .create_draft(
+                "acc1",
+                "discarded@test.com",
+                Some("Discarded"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_draft_message_id(&discarded.id, "stable@example.com")
+            .unwrap();
+        db.discard_draft(&discarded.id).unwrap();
+
+        let matches = db
+            .find_editable_drafts_by_message_id("acc1", "  <stable@example.com>  ")
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, active.id);
+        assert!(
+            db.find_editable_drafts_by_message_id("other-account", "stable@example.com")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

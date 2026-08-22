@@ -1299,6 +1299,26 @@ pub async fn find_exact_message_id_match(
     folder: &str,
     message_id: &str,
 ) -> Result<ExactMessageIdMatch, ImapError> {
+    let exact_uids = find_uids_by_exact_message_id(client, folder, message_id).await?;
+    Ok(match exact_uids.as_slice() {
+        [] => ExactMessageIdMatch::None,
+        [uid] => ExactMessageIdMatch::Unique(*uid),
+        _ => ExactMessageIdMatch::Ambiguous,
+    })
+}
+
+/// Return every UID whose Message-ID header exactly matches `message_id`.
+///
+/// This keeps IMAP's substring-based SEARCH result out of destructive code:
+/// every candidate header is fetched with BODY.PEEK and compared after strict
+/// Message-ID normalization. Replacement cleanup may then remove all verified
+/// copies of one logical draft, including duplicates left by an interrupted
+/// earlier edit, without touching a merely similar Message-ID.
+pub async fn find_uids_by_exact_message_id(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+) -> Result<Vec<u32>, ImapError> {
     validate_imap_input(folder)?;
 
     client
@@ -1316,7 +1336,7 @@ pub async fn find_exact_message_id_match(
 
     let mut candidate_uids: Vec<u32> = uid_set.into_iter().collect();
     if candidate_uids.is_empty() {
-        return Ok(ExactMessageIdMatch::None);
+        return Ok(Vec::new());
     }
     candidate_uids.sort_unstable();
     let uid_set_arg = candidate_uids
@@ -1326,9 +1346,19 @@ pub async fn find_exact_message_id_match(
         .join(",");
 
     let headers = fetch_message_headers_selected_uid_set(client, folder, &uid_set_arg).await?;
-    let candidates: Vec<(u32, Option<String>)> =
-        headers.into_iter().map(|h| (h.uid, h.message_id)).collect();
-    Ok(classify_exact_message_id_match(&candidates, message_id))
+    let Some(wanted) = normalize_message_id(message_id) else {
+        return Ok(Vec::new());
+    };
+    let mut exact_uids: Vec<u32> = headers
+        .into_iter()
+        .filter_map(|header| {
+            let candidate = normalize_message_id(header.message_id.as_deref()?)?;
+            (candidate == wanted).then_some(header.uid)
+        })
+        .collect();
+    exact_uids.sort_unstable();
+    exact_uids.dedup();
+    Ok(exact_uids)
 }
 
 /// Pure candidate selection for [`find_unique_uid_by_exact_message_id`]:
