@@ -415,6 +415,22 @@ pub(crate) fn account_from_header(creds: &AccountWithCredentials) -> String {
     }
 }
 
+/// Resolve the sending identity persisted by `draft create --from` or supplied
+/// explicitly to `draft edit --from`. Drafts without either keep the account
+/// default, preserving the existing behavior for replies and forwards.
+pub(crate) fn from_header_for_draft(
+    metadata: Option<&serde_json::Value>,
+    creds: &AccountWithCredentials,
+) -> String {
+    metadata
+        .and_then(|m| m.get("from"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| account_from_header(creds))
+}
+
 /// Reconstruct the preserved [`ContextBlock`] from a draft's metadata blob.
 fn context_from_metadata(meta: &serde_json::Value) -> ContextBlock {
     let c = meta.get("context");
@@ -864,6 +880,7 @@ pub(crate) async fn modify_draft(
     db: &Database,
     creds: &AccountWithCredentials,
     id: &str,
+    from: Option<&str>,
     body: Option<&str>,
     html: Option<&str>,
     to: Option<&str>,
@@ -894,10 +911,19 @@ pub(crate) async fn modify_draft(
         &creds.account.username,
     )?;
 
-    let meta = draft
+    let mut meta = draft
         .metadata
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(from) = from {
+        let from = from.trim();
+        if from.is_empty() {
+            bail!("from address cannot be empty");
+        }
+        meta.as_object_mut()
+            .expect("draft metadata is always an object")
+            .insert("from".to_string(), serde_json::json!(from));
+    }
     let context = context_from_metadata(&meta);
 
     // Agent body: override or keep prior authored content.
@@ -966,7 +992,7 @@ pub(crate) async fn modify_draft(
     let attachments =
         decode_attachments(&attachment_snapshots).context("failed to decode draft attachments")?;
 
-    let from = account_from_header(creds);
+    let from = from_header_for_draft(Some(&meta), creds);
     let (rfc822, message_id_hdr) = build_rfc822_full(
         &from,
         &new_to,
@@ -1412,6 +1438,7 @@ pub async fn run_edit(
     account: Option<&str>,
     json: bool,
     backend: CredentialBackend,
+    from: Option<&str>,
     body: Option<&str>,
     html: Option<&str>,
     to: Option<&str>,
@@ -1428,6 +1455,7 @@ pub async fn run_edit(
         &db,
         &creds,
         id,
+        from,
         body,
         html,
         to,
@@ -1696,6 +1724,14 @@ pub async fn run_create(
     // Store the message_id in local DB
     if !message_id.is_empty() {
         let _ = db.mark_draft_message_id(&draft.id, &message_id);
+    }
+
+    // A send-as identity is part of the draft, not merely the first RFC822
+    // append. Persist it so later edits cannot silently revert to the mailbox
+    // used for authentication.
+    if let Some(from_override) = from {
+        db.set_draft_metadata(&draft.id, &serde_json::json!({ "from": from_override }))
+            .context("failed to persist draft from identity")?;
     }
 
     // Persist the (non-secret metadata + base64 payload) attachment snapshots so
@@ -3205,6 +3241,99 @@ mod tests {
         assert!(
             from.contains("\"Martin, Tyler\""),
             "comma in name must be quoted: {from}"
+        );
+    }
+
+    #[test]
+    fn draft_from_header_prefers_persisted_send_as_identity() {
+        let creds = make_creds(
+            "bruno@spainexpat.com",
+            None,
+            "SpainExpat Plus Ultra Member Desk",
+        );
+        let metadata = serde_json::json!({
+            "from": "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>"
+        });
+
+        let from = from_header_for_draft(Some(&metadata), &creds);
+        assert_eq!(
+            from,
+            "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>"
+        );
+        assert!(!from.contains("bruno@spainexpat.com"));
+    }
+
+    #[tokio::test]
+    async fn draft_edit_from_override_repairs_a_legacy_alias_draft() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-test', 'SpainExpat Plus Ultra Member Desk',
+                         'bruno@spainexpat.com', 'spainexpat.com',
+                         'smtp.example.com', 587, '', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acct-test",
+                "member@example.net",
+                Some("Old subject"),
+                Some("old body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        let mut creds = make_creds(
+            "bruno@spainexpat.com",
+            None,
+            "SpainExpat Plus Ultra Member Desk",
+        );
+        creds.account.imap_host = String::new();
+        let alias = "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>";
+
+        let edited = modify_draft(
+            &db,
+            &creds,
+            &draft.id,
+            Some(alias),
+            Some("new body"),
+            Some("<p>new body</p>"),
+            None,
+            None,
+            None,
+            Some("New subject"),
+            None,
+            &[],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            edited
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("from"))
+                .and_then(|value| value.as_str()),
+            Some(alias)
+        );
+        assert_eq!(
+            from_header_for_draft(edited.metadata.as_ref(), &creds),
+            alias
+        );
+        assert_eq!(edited.subject.as_deref(), Some("New subject"));
+        assert!(
+            edited
+                .html_content
+                .as_deref()
+                .is_some_and(|html| html.contains("<p>new body</p>"))
         );
     }
 

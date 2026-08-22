@@ -1300,6 +1300,7 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
         &db,
         &creds,
         id,
+        optional_str(params, "from"),
         optional_str(params, "body"),
         optional_str(params, "html"),
         optional_str(params, "to"),
