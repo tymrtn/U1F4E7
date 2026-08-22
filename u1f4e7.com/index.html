@@ -30,6 +30,7 @@
       <nav>
         <a href="#use-cases">Use cases</a>
         <a href="#workflows">What it does</a>
+        <a href="#product">Product</a>
         <a href="#control">Human control</a>
         <a href="#why-not">Why not hosted</a>
         <a href="#pricing">Pricing</a>
@@ -126,6 +127,42 @@ envelope mcp --config</code></pre>
           </article>
 
         </div>
+
+        <div id="product" class="product-gallery">
+          <p class="eyebrow">See it in action</p>
+          <h2>One inbox. Every agent. Full human control.</h2>
+          <p class="lede">Read and triage mail, review agent work, inspect Governor decisions, act on several messages at once, and compose without leaving the local control plane.</p>
+
+          <div class="screenshot-grid">
+            <figure class="product-shot product-shot-wide">
+              <a href="assets/screenshots/inbox-reader.webp">
+                <img src="assets/screenshots/inbox-reader.webp" width="1440" height="900" alt="Envelope unified inbox with message list, thread reader, and attachment details">
+              </a>
+              <figcaption><strong>Unified inbox + reader.</strong> Multiple mailboxes, one view, with thread context and attachments.</figcaption>
+            </figure>
+
+            <figure class="product-shot">
+              <a href="assets/screenshots/agent-cockpit.webp">
+                <img src="assets/screenshots/agent-cockpit.webp" width="1440" height="900" alt="Envelope Agent Cockpit with named agents, approval queue, scheduled sends, and Governor verdicts">
+              </a>
+              <figcaption><strong>Agent Cockpit.</strong> Attribution, draft approvals, watch health, and allow/review/block decisions.</figcaption>
+            </figure>
+
+            <figure class="product-shot">
+              <a href="assets/screenshots/compose-drawer.webp">
+                <img src="assets/screenshots/compose-drawer.webp" width="1440" height="900" alt="Envelope compose drawer over the unified inbox">
+              </a>
+              <figcaption><strong>Compose in context.</strong> A focused draft window without surrendering the inbox.</figcaption>
+            </figure>
+
+            <figure class="product-shot product-shot-wide">
+              <a href="assets/screenshots/bulk-actions.webp">
+                <img src="assets/screenshots/bulk-actions.webp" width="1440" height="900" alt="Envelope unified inbox with several messages selected and the bulk actions toolbar visible">
+              </a>
+              <figcaption><strong>Fast bulk triage.</strong> Archive, move, mark, star, or delete several messages at once.</figcaption>
+            </figure>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -159,12 +196,13 @@ envelope mcp --config</code></pre>
         <p class="eyebrow">Works with your existing stack</p>
         <h2>Any harness. Any IMAP provider.</h2>
         <p class="lede" style="margin-bottom:1.5rem">If it can run a CLI command or speak MCP, it works with Envelope. The same JSON surface works from a shell script, a Hermes pipeline, a Claude Code tool call, or a Codex exec loop.</p>
-        <div class="cards five-up">
+        <div class="cards six-up">
           <article class="card"><h3>Claude Code</h3><p>Drop in via MCP. Full inbox access as a tool call.</p></article>
           <article class="card"><h3>OpenAI Codex</h3><p>CLI + JSON surface for terminal-native autonomous loops.</p></article>
           <article class="card"><h3>Hermes</h3><p>First-class skill for Hermes profiles and multi-agent pipelines.</p></article>
           <article class="card"><h3>OCPlatform</h3><p>OTP handling, watch events, and thread-aware follow-up.</p></article>
           <article class="card"><h3>OpenHands</h3><p>Long-running loops that wait on email before continuing.</p></article>
+          <article class="card"><h3>Tailscale</h3><p>Secure, identity-aware dashboard access across devices with Tailscale Serve.</p></article>
         </div>
       </div>
     </section>
@@ -199,7 +237,7 @@ envelope mcp --config</code></pre>
             <p class="eyebrow">Annual licensing</p>
             <h2>Personal use is free. Commercial rollout is a flat annual license.</h2>
           </div>
-          <p class="muted maxw">Annual bands sized by mailbox users on your domain. No per-message metering, no seat trickery.</p>
+          <p class="muted maxw">Annual bands sized by mailbox users on your domain. No per-message metering, no seat trickery. Every paid band also lifts the free tier's two-agent cap.</p>
         </div>
 
         <div class="cards pricing-grid">
@@ -210,6 +248,7 @@ envelope mcp --config</code></pre>
             <ul class="checklist">
               <li>Personal, non-commercial use on your own mailboxes</li>
               <li>Full CLI, dashboard, and MCP surface</li>
+              <li>Up to 2 active agent identities (a third asks for a license key)</li>
               <li>Community support via GitHub issues</li>
             </ul>
             <a class="button button-secondary full" href="https://github.com/tymrtn/U1F4E7">Get the repo</a>
@@ -222,6 +261,7 @@ envelope mcp --config</code></pre>
             <ul class="checklist">
               <li>Commercial use license for one organization</li>
               <li>Up to 10 mailbox users across one primary domain</li>
+              <li>Unlimited agent identities</li>
               <li>Email support, best-effort next-business-day response</li>
               <li>Annual renewal, invoiced</li>
             </ul>
@@ -235,6 +275,7 @@ envelope mcp --config</code></pre>
             <ul class="checklist">
               <li>Commercial use license for one organization</li>
               <li>Up to 25 mailbox users across one primary domain</li>
+              <li>Unlimited agent identities</li>
               <li>Priority email support, next-business-day response target</li>
               <li>Annual renewal, invoiced</li>
             </ul>
