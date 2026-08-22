@@ -202,7 +202,16 @@
    * `metadata.send_block`; fall back to attribution park_reason; then a
    * generic "stopped, nothing transmitted" so older rows still explain themselves.
    */
-  type SendBlock = { code: string; title: string; explanation: string; action?: string };
+  type SendBlock = {
+    code: string;
+    title: string;
+    explanation: string;
+    action?: string;
+    /** Whether approving again could plausibly clear the block. */
+    retryable: boolean;
+    /** Where the block CAN be cleared, when it cannot be cleared here. */
+    remedy?: string;
+  };
   function asSendBlock(value: unknown): SendBlock | null {
     if (!value || typeof value !== 'object') return null;
     const o = value as Record<string, unknown>;
@@ -213,7 +222,8 @@
       code: typeof o.code === 'string' && o.code ? o.code : 'send_stopped',
       title: title || 'This send was stopped',
       explanation: explanation || 'Nothing was transmitted.',
-      action: typeof o.action === 'string' ? o.action : undefined
+      action: typeof o.action === 'string' ? o.action : undefined,
+      retryable: true
     };
   }
   const sendBlock = $derived.by((): SendBlock | null => {
@@ -227,12 +237,28 @@
         ? (attribution as Record<string, unknown>).park_reason
         : null;
     if (park === 'attribution_exhausted') {
+      const record = attribution as Record<string, unknown>;
+      const declared = Array.isArray(record.declared_attrs) ? record.declared_attrs : [];
+      const attempts = typeof record.attempts === 'number' ? record.attempts : 0;
+      // Approving again re-runs the identical declaration-free attempt: it
+      // spends another try and parks on the same reason. Say that instead of
+      // offering the button. Which label would pass is deliberately NOT shown —
+      // the park record carries no such field, and coaching one would turn a
+      // blind declaration into lock-picking.
+      const stuck = record.origin === 'bot' && declared.length === 0;
       return {
         code: 'attribution_exhausted',
         title: 'This send was stopped',
-        explanation:
-          'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
-        action: 'send'
+        explanation: stuck
+          ? `Envelope paused this message because the send is bot-attributed and carries no fact labels. ` +
+            `${attempts} attempts were spent and no fact labels were declared for this revision. ` +
+            `Approving it here repeats the same attempt, so that button is withheld.`
+          : 'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
+        action: stuck ? undefined : 'send',
+        retryable: !stuck,
+        remedy: stuck
+          ? `Declaring is the sending agent's job, and only the CLI can carry it: envelope draft send ${draft.id} --attr <label>`
+          : undefined
       };
     }
     if (draft.status === 'blocked') {
@@ -240,7 +266,8 @@
         code: 'blocked',
         title: 'This send was stopped',
         explanation: STATUS_META.blocked.note,
-        action: 'edit'
+        action: 'edit',
+        retryable: true
       };
     }
     return {
@@ -248,7 +275,8 @@
       title: 'This send was stopped',
       explanation:
         'Envelope paused this message before it left. Nothing was transmitted. Envelope did not record a more specific reason on this draft.',
-      action: 'send'
+      action: 'send',
+      retryable: true
     };
   });
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);
@@ -820,8 +848,11 @@
         <p class="draft-banner-title">{sendBlock.title}</p>
         <p>{sendBlock.explanation}</p>
         <MonoTag>{sendBlock.code}</MonoTag>
+        {#if sendBlock.remedy}
+          <p class="draft-banner-remedy">{sendBlock.remedy}</p>
+        {/if}
         <div class="draft-banner-action">
-          {#if sendable}
+          {#if sendable && sendBlock.retryable}
             <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send again</Button>
           {/if}
         </div>
@@ -1326,6 +1357,12 @@
     min-height: 16rem;
     overflow-y: auto;
     background: var(--env-surface);
+  }
+  .draft-banner-remedy {
+    margin: 0.4rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
   }
   .draft-format-note {
     margin: 0;

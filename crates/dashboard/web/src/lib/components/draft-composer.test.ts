@@ -1318,3 +1318,62 @@ describe('DraftComposer HTML preview', () => {
     expect(await screen.findByTitle('Message body')).toBeInTheDocument();
   });
 });
+
+// ── Attribution park ──────────────────────────────────────────────────
+//
+// A bot-origin draft parked for attribution cannot be unstuck by approving it
+// again: the queue path re-runs the same declaration-free attempt, burns
+// another try, and re-parks. The banner has to say so rather than offering a
+// button that only spends attempts.
+
+describe('DraftComposer attribution park', () => {
+  function parked(attribution: Record<string, unknown>) {
+    return {
+      status: 'pending_review' as const,
+      metadata: { attribution: { park_reason: 'attribution_exhausted', ...attribution } }
+    };
+  }
+
+  it('does not offer Send again when no declaration is on record', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    expect(screen.queryByRole('button', { name: /send again/i })).not.toBeInTheDocument();
+  });
+
+  it('says what the attribution record actually holds', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).toMatch(/4 attempts/i);
+    expect(banner.textContent).toMatch(/no fact labels/i);
+  });
+
+  it('points at the surface that can declare', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).toContain('envelope draft send');
+    expect(banner.textContent).toContain('--attr');
+  });
+
+  it('never names the label that would pass', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    // The catalog is blind by design: the park record carries no required-label
+    // field, and coaching one here would turn declaring into lock-picking.
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).not.toMatch(/agent_drafted|commitment_language|tyler_approved/);
+  });
+
+  it('still offers Send again when a declaration was recorded', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: ['agent_drafted'], attempts: 4 }));
+
+    expect(screen.getByRole('button', { name: /send again/i })).toBeInTheDocument();
+  });
+
+  it('still offers Send again on a park with no attribution record', async () => {
+    await renderLoaded({ status: 'pending_review', metadata: null });
+
+    expect(screen.getByRole('button', { name: /send again/i })).toBeInTheDocument();
+  });
+});

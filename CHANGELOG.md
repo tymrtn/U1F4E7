@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.18-dev
+## [Unreleased] — 1.0.19-dev
 
 ### Added
 
@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A draft parked for attribution no longer offers a button that cannot clear it. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop being the one unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — withholds `Send again` when re-approval provably cannot help, and points at `envelope draft send … --attr`, which is where declaring happens. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
 - The composer's Text/HTML control swaps the body along with the label. It set the format flag and left whatever was already in the box, so a draft carrying both alternatives — every agent-generated HTML message — opened in plain text and then showed that same plain text under an HTML heading. A format switch alone marks the draft dirty, so the next Save wrote the plain-text body into `html_content` and cleared `text_content`: a real HTML part replaced by its text twin, one click from the review screen. Each format now keeps its own buffer, so switching shows that format's body and switching back returns an unsaved edit rather than the server copy.
 - The unified inbox heals itself when its cache has been blanked. An account whose index row carries a `last_error` reports zero messages however many rows are actually indexed behind it, so a sidecar started without `ENVELOPE_MASTER_PASSPHRASE_FILE` — a GUI launch inherits no shell environment — could write a credential-store error into the SHARED index for every account and leave the dashboard showing "Inbox is empty" over a full index. The stale-refresh predicate only fired on `stale`/`expired`, never `unavailable`, so it never retried: one such incident sat for a day. An empty list with connected accounts now triggers one refresh to disprove itself, while the steady state of a couple of permanently-unreachable accounts still does not re-IMAP the fleet on every open.
 - The `hold` endpoint stripped no attachment bytes. `draft_json` landed before Hold existed, so the new handler serialized the raw store row and shipped every attachment's `data_base64` on each hold. It now routes through `draft_json` like every other draft response, and a guard test fails the build if any future handler serializes a raw draft.
