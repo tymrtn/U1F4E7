@@ -880,6 +880,9 @@ enum DraftCmd {
     Edit {
         /// Draft ID (local UUID)
         id: String,
+        /// Override the From header (sender identity). SMTP auth still uses --account credentials.
+        #[arg(long)]
+        from: Option<String>,
         /// New authored body (plain text)
         #[arg(long)]
         body: Option<String>,
@@ -2208,6 +2211,7 @@ fn main() {
             ),
             DraftCmd::Edit {
                 id,
+                from,
                 body,
                 html,
                 to,
@@ -2224,6 +2228,7 @@ fn main() {
                 account.as_deref(),
                 cli.json,
                 backend,
+                from.as_deref(),
                 body.as_deref(),
                 html.as_deref(),
                 to.as_deref(),
