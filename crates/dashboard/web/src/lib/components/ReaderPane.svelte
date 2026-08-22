@@ -38,6 +38,7 @@
   import { isDraftsFolder } from '$lib/mailboxes';
   import { folderHints } from '$lib/folder-hints.svelte';
   import { readState } from '$lib/read-state.svelte';
+  import { getComposerStore } from '$lib/composer.svelte';
 
   // ── Route params ──────────────────────────────────────────────────────
 
@@ -291,6 +292,95 @@
     }
   }
 
+  // ── Reply / reply-all / forward ──────────────────────────────────────
+  // The composer store is the coordination point: the reader opens it in the
+  // right mode with this message as the parent and ComposerDrawer (mounted in
+  // the mail layout) does the rest. Reply/reply-all let the server derive
+  // recipients and threading headers from the parent; the quoted original is
+  // prefilled client-side so the operator sees and can trim what they are
+  // answering. Forward is a fresh message, so subject + quoted body are
+  // prefilled here.
+
+  const composer = getComposerStore();
+
+  function stripHtml(html: string): string {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|tr|h[1-6])>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function plainBody(): string {
+    if (!message) return '';
+    if (message.text_body) return message.text_body;
+    if (message.html_body) return stripHtml(message.html_body);
+    return '';
+  }
+
+  function quoted(text: string): string {
+    return text
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n');
+  }
+
+  function replyBodyPrefix(): string {
+    if (!message) return '';
+    const when = message.date ? fmtAbsolute(message.date) : '';
+    const attribution = when
+      ? `On ${when}, ${message.from_addr} wrote:`
+      : `${message.from_addr} wrote:`;
+    return `\n\n${attribution}\n${quoted(plainBody())}`;
+  }
+
+  function forwardSubject(): string {
+    const subject = message?.subject ?? '';
+    return /^\s*fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`;
+  }
+
+  function forwardBodyPrefix(): string {
+    if (!message) return '';
+    const lines = [
+      '',
+      '',
+      '---------- Forwarded message ----------',
+      `From: ${message.from_addr}`
+    ];
+    if (message.date) lines.push(`Date: ${fmtAbsolute(message.date)}`);
+    lines.push(`Subject: ${message.subject ?? ''}`);
+    const to = addrList(message.to_addrs, message.to_addr);
+    if (to) lines.push(`To: ${to}`);
+    lines.push('', plainBody());
+    return lines.join('\n');
+  }
+
+  function openReply(mode: 'reply' | 'reply-all') {
+    if (!message) return;
+    composer.open(mode, {
+      accountId,
+      parentUid: uid,
+      parentFolder: folder,
+      bodyPrefix: replyBodyPrefix()
+    });
+  }
+
+  function openForward() {
+    if (!message) return;
+    composer.open('forward', {
+      accountId,
+      subject: forwardSubject(),
+      bodyPrefix: forwardBodyPrefix()
+    });
+  }
+
   // ── Date formatting ───────────────────────────────────────────────────
 
   function fmtAbsolute(iso: string | null): string {
@@ -384,6 +474,19 @@
           </button>
         </div>
       </header>
+
+      <!-- ── Reply / forward ───────────────────────────────────────── -->
+      <div class="msg-actions" role="group" aria-label="Message actions">
+        <button class="reader-action-btn" type="button" onclick={() => openReply('reply')}>
+          Reply
+        </button>
+        <button class="reader-action-btn" type="button" onclick={() => openReply('reply-all')}>
+          Reply all
+        </button>
+        <button class="reader-action-btn" type="button" onclick={openForward}>
+          Forward
+        </button>
+      </div>
 
       <!-- ── Thread strip ───────────────────────────────────────────── -->
       {#if threadLoading || threadMessages.length > 1}
@@ -663,6 +766,13 @@
     align-items: center;
     gap: 0.5rem;
     flex-shrink: 0;
+  }
+
+  .msg-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0 0 0.75rem;
   }
 
   /* Meta dl */

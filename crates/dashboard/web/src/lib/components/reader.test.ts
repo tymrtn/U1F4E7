@@ -42,6 +42,7 @@ import {
 } from '$lib/reader-api';
 import { EnvelopeApiError } from '$lib/api';
 import { __resetReadState } from '$lib/read-state.svelte';
+import { getComposerStore, __resetComposerStore } from '$lib/composer.svelte';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -74,6 +75,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
   sessionStorage.clear();
+  __resetComposerStore();
 });
 
 // ── reader-api utils ──────────────────────────────────────────────────
@@ -442,5 +444,69 @@ describe('ReaderPane', () => {
     render(ReaderPane);
     await waitFor(() => screen.getByRole('alert'));
     expect(screen.getByText('message_not_found')).toBeInTheDocument();
+  });
+});
+
+// ── ReaderPane reply / reply-all / forward ────────────────────────────
+// A human must be able to answer mail from the reader. The composer store is
+// the coordination point: the reader opens it in the right mode with the open
+// message as the parent; ComposerDrawer (mounted in the mail layout) does the
+// rest. Forward is a fresh message, so subject + quoted body are prefilled.
+
+describe('ReaderPane reply/forward actions', () => {
+  it('renders Reply, Reply all, and Forward once a message loads', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Reply' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reply all' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Forward' })).toBeInTheDocument();
+  });
+
+  it('Reply opens the composer in reply mode for the open message, quoting it', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply');
+    expect(composer.context.accountId).toBe('acct-a');
+    expect(composer.context.parentUid).toBe(42);
+    expect(composer.context.parentFolder).toBe('INBOX');
+    expect(composer.context.bodyPrefix).toContain('sender@example.com wrote:');
+    expect(composer.context.bodyPrefix).toContain('> Hello world');
+  });
+
+  it('Reply all opens the composer in reply-all mode', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply all' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply-all');
+    expect(composer.context.parentUid).toBe(42);
+  });
+
+  it('Forward opens a fresh message with a Fwd: subject and the original quoted', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Forward' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('forward');
+    expect(composer.context.accountId).toBe('acct-a');
+    expect(composer.context.subject).toBe('Fwd: Test subject');
+    expect(composer.context.bodyPrefix).toContain('---------- Forwarded message ----------');
+    expect(composer.context.bodyPrefix).toContain('From: sender@example.com');
+    expect(composer.context.bodyPrefix).toContain('Hello world');
+  });
+
+  it('does not re-prefix a subject that already carries Fwd:', async () => {
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
+      message: { ...BASE_MSG, subject: 'Fwd: Test subject' }
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Fwd: Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Forward' }));
+    expect(getComposerStore().context.subject).toBe('Fwd: Test subject');
   });
 });
