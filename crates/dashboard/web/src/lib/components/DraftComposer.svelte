@@ -241,6 +241,14 @@
   }
   const sendBlock = $derived.by((): SendBlock | null => {
     if (!draft) return null;
+    // A draft back in the outbox is no longer stopped. The queue endpoint
+    // promotes `pending_review` → `draft` server-side but returns no draft row,
+    // so after Send-again from this page the local `draft` still carries the
+    // pre-queue status and `metadata.send_block`; without this guard that
+    // history renders as a stop alert beside the fresh Queued banner. Stop and
+    // queued are mutually exclusive server-side too — every park clears
+    // `send_after` — so a reload agrees with this.
+    if (isQueued) return null;
     if (draft.status !== 'pending_review' && draft.status !== 'blocked') return null;
     const stored = asSendBlock(draft.metadata?.send_block);
     if (stored) return stored;

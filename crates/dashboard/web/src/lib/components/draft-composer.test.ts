@@ -826,6 +826,35 @@ describe('DraftComposer never silently parks a send', () => {
     expect(banner).toHaveTextContent('did not record a more specific reason');
     expect(screen.getByRole('button', { name: /send again/i })).toBeEnabled();
   });
+
+  it('drops the stop explanation once the draft is queued again from this page', async () => {
+    await renderLoaded({
+      status: 'pending_review',
+      send_after: null,
+      metadata: {
+        send_block: {
+          code: 'governor_blocked',
+          title: 'This send was stopped',
+          explanation: 'Envelope paused this message for review before sending. Nothing was transmitted.',
+          action: 'send'
+        }
+      }
+    });
+    expect(document.getElementById('draft-send-block')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: /send again/i }));
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+    // The draft is back in the outbox. The queue endpoint returns no draft row,
+    // so the local copy still says pending_review + send_block — that history
+    // must not render as a second, contradictory state beside the countdown.
+    expect(document.getElementById('draft-send-block')).toBeFalsy();
+    expect(screen.queryByText(/this send was stopped/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('governor_blocked')).not.toBeInTheDocument();
+    expect(screen.getByText('Queued')).toBeInTheDocument();
+  });
 });
 
 // ── Recipient guard ───────────────────────────────────────────────────

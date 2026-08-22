@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.22-dev
+## [Unreleased] — 1.0.23-dev
 
 ### Added
 
@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Re-queueing a stopped draft no longer leaves the stop alert on screen. After a Governor park, pressing Send again queued the draft correctly, but the review page kept rendering the red "This send was stopped" block beside the green countdown — two contradictory states for one message. The queue endpoint returns no draft row, so the page was still reading the pre-queue `pending_review` status and `metadata.send_block`; the stop explanation is now suppressed whenever the draft is queued, which is also what a reload shows.
 - Draft review now shows the effective send-as identity from `metadata.from`, with the transport account only as a fallback, and repeats that From identity in the final queue confirmation. The send path already preserved this header, but the dashboard displayed only the authenticating mailbox, making a correctly branded draft look unsafe to approve.
 
 - A draft parked for attribution no longer offers a button that cannot clear it. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop being the one unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — withholds `Send again` when re-approval provably cannot help, and points at `envelope draft send … --attr`, which is where declaring happens. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
