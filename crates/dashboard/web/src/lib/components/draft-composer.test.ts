@@ -173,6 +173,29 @@ describe('DraftComposer load', () => {
     }
   });
 
+  it('shows the effective send-as identity from draft metadata', async () => {
+    await renderLoaded({
+      metadata: { from: 'SpainExpat Plus Ultra <plusultra@spainexpat.com>' }
+    });
+
+    expect(document.getElementById('draft-from-identity')).toHaveTextContent(
+      'SpainExpat Plus Ultra <plusultra@spainexpat.com>'
+    );
+  });
+
+  it('falls back to the transport account when no send-as identity exists', async () => {
+    apiMock.draft.mockResolvedValueOnce({
+      ...draftResponse(),
+      account: { username: 'bruno@spainexpat.com' }
+    });
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+
+    expect(document.getElementById('draft-from-identity')).toHaveTextContent(
+      'bruno@spainexpat.com'
+    );
+  });
+
   it('shows a not-found state when the draft does not exist', async () => {
     apiMock.draft.mockRejectedValueOnce(
       new EnvelopeApiError(404, 'http_404', 'draft not found', null)
@@ -317,6 +340,18 @@ describe('DraftComposer send', () => {
 
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+  });
+
+  it('repeats the effective From identity in the final send confirmation', async () => {
+    await renderLoaded({
+      metadata: { from: 'SpainExpat Plus Ultra <plusultra@spainexpat.com>' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('From').parentElement).toHaveTextContent(
+      'SpainExpat Plus Ultra <plusultra@spainexpat.com>'
+    );
   });
 
   it('queues with confirm=true and the reviewed revision once confirmed', async () => {

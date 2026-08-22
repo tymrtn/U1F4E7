@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.19-dev
+## [Unreleased] — 1.0.22-dev
 
 ### Added
 
@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The draft review composer renders HTML mail. A draft carrying an HTML part now opens on it, rendered through the reader's sandboxed `BodyFrame` — same `srcdoc` iframe, same CSP, `allow-scripts` still absent — with remote images blocked until asked for and the markup behind an `Edit HTML` toggle. Review used to land on the plain-text alternative, which shows bare tracking URLs where the real message has buttons, and reaching the HTML only produced its source.
 
 ### Fixed
+
+- Draft review now shows the effective send-as identity from `metadata.from`, with the transport account only as a fallback, and repeats that From identity in the final queue confirmation. The send path already preserved this header, but the dashboard displayed only the authenticating mailbox, making a correctly branded draft look unsafe to approve.
 
 - A draft parked for attribution no longer offers a button that cannot clear it. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop being the one unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — withholds `Send again` when re-approval provably cannot help, and points at `envelope draft send … --attr`, which is where declaring happens. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
 - The composer's Text/HTML control swaps the body along with the label. It set the format flag and left whatever was already in the box, so a draft carrying both alternatives — every agent-generated HTML message — opened in plain text and then showed that same plain text under an HTML heading. A format switch alone marks the draft dirty, so the next Save wrote the plain-text body into `html_content` and cleared `text_content`: a real HTML part replaced by its text twin, one click from the review screen. Each format now keeps its own buffer, so switching shows that format's body and switching back returns an unsaved edit rather than the server copy.

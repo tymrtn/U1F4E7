@@ -171,6 +171,19 @@
    */
   const identityMatches = $derived(!!draft && loadedForKey === routeKey && draft.id === draftId);
 
+  /**
+   * The account authenticates the SMTP connection, but a draft may carry a
+   * validated send-as identity in metadata. Review must show the header that
+   * will actually reach the recipient, not merely the transport account.
+   */
+  function metadataFromIdentity(value: Draft | null): string | null {
+    const from = value?.metadata?.from;
+    if (typeof from !== 'string') return null;
+    const trimmed = from.trim();
+    return trimmed && !/[\r\n]/.test(trimmed) ? trimmed : null;
+  }
+  const effectiveFrom = $derived(metadataFromIdentity(draft) ?? (accountLabel || accountId));
+
   const statusMeta = $derived(draft ? STATUS_META[draft.status] : null);
   const statusEditable = $derived(!!draft && isEditableDraftStatus(draft.status));
 
@@ -867,7 +880,7 @@
     <div class="draft-card draft-addresses">
       <div class="draft-field-row is-static">
         <span class="draft-field-label">From</span>
-        <span class="draft-field-value">{accountLabel || accountId}</span>
+        <span class="draft-field-value" id="draft-from-identity">{effectiveFrom}</span>
       </div>
 
       <RecipientField
@@ -1024,6 +1037,10 @@
 </section>
 
 <Modal open={confirmOpen} title="Queue this draft for sending?" onclose={closeConfirm}>
+  <p class="draft-confirm-line">
+    <strong>From</strong>
+    {effectiveFrom}
+  </p>
   <p class="draft-confirm-line">
     <strong>To</strong>
     {toRaw.trim() || '(no recipient)'}
