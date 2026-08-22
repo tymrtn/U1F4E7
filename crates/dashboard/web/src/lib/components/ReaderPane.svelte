@@ -22,7 +22,7 @@
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { base } from '$app/paths';
-  import { Spinner, MonoTag, Badge, Toast } from '$lib/components';
+  import { Spinner, MonoTag, Badge, Toast, Modal } from '$lib/components';
   import BodyFrame from '$lib/components/BodyFrame.svelte';
   import ThreadStrip from '$lib/components/ThreadStrip.svelte';
   import AttachmentList from '$lib/components/AttachmentList.svelte';
@@ -34,7 +34,9 @@
     type MessageDetailFull,
     type ThreadMessage
   } from '$lib/reader-api';
-  import { api, EnvelopeApiError } from '$lib/api';
+  import { api, bulkClient, EnvelopeApiError } from '$lib/api';
+  import { looksLikeTrash } from '$lib/folder-kinds';
+  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
   import { isDraftsFolder } from '$lib/mailboxes';
   import { folderHints } from '$lib/folder-hints.svelte';
   import { readState } from '$lib/read-state.svelte';
@@ -161,6 +163,8 @@
     message = null;
     threadMessages = [];
     localSeen = null;
+    localFlagged = null;
+    actionError = null;
     remoteImages = false;
     remoteBlockedCount = 0;
     draftFallback = null;
@@ -381,6 +385,93 @@
     });
   }
 
+  // ── Mailbox actions: archive / delete / star ─────────────────────────
+  // Same canonical special-use targets and per-message endpoints BulkToolbar
+  // uses (the `/move` boundary resolves `\\Archive` / `\\Trash` to each
+  // provider's real folder). Delete is reversible (move to Trash) everywhere
+  // except inside Trash, where it is a confirmed permanent delete. A completed
+  // move leaves the reader: the list is told to refresh and we return to it.
+
+  const mailboxOps = getMailboxOpsStore();
+  let acting = $state(false);
+  let actionError = $state<string | null>(null);
+  let deleteConfirmOpen = $state(false);
+  let localFlagged = $state<boolean | null>(null);
+
+  const inTrash = $derived(looksLikeTrash(folder));
+
+  let isStarred = $derived(() => {
+    if (localFlagged !== null) return localFlagged;
+    if (!message) return false;
+    return message.flags.some((f) => f.toLowerCase() === '\\flagged');
+  });
+
+  function leaveToList() {
+    void goto(`${base}/mail/${encodeURIComponent(box)}`);
+  }
+
+  async function runMailboxOp(
+    op: Parameters<typeof bulkClient>[0],
+    verb: string
+  ): Promise<boolean> {
+    if (!message || acting) return false;
+    acting = true;
+    actionError = null;
+    try {
+      const result = await bulkClient(op, [{ accountId, uid, folder }]);
+      if (result.failed.length > 0) {
+        actionError = `Couldn’t ${verb}: ${result.failed[0].error}`;
+        return false;
+      }
+      mailboxOps.operated();
+      return true;
+    } finally {
+      acting = false;
+    }
+  }
+
+  async function archiveMessage() {
+    if (await runMailboxOp({ type: 'move', to_folder: '\\Archive', folder }, 'archive')) {
+      leaveToList();
+    }
+  }
+
+  async function trashMessage() {
+    if (await runMailboxOp({ type: 'move', to_folder: '\\Trash', folder }, 'move to Trash')) {
+      leaveToList();
+    }
+  }
+
+  async function deleteForever() {
+    deleteConfirmOpen = false;
+    if (await runMailboxOp({ type: 'delete', folder }, 'delete')) {
+      leaveToList();
+    }
+  }
+
+  async function toggleStar() {
+    if (!message || acting) return;
+    acting = true;
+    actionError = null;
+    const starred = isStarred();
+    try {
+      await postFlags(
+        accountId,
+        uid,
+        folder,
+        starred ? [] : ['\\Flagged'],
+        starred ? ['\\Flagged'] : []
+      );
+      localFlagged = !starred;
+      mailboxOps.operated();
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      actionError = `Couldn’t ${starred ? 'unstar' : 'star'}: ${err.message ?? 'flag update failed'}`;
+    } finally {
+      acting = false;
+    }
+  }
+
   // ── Date formatting ───────────────────────────────────────────────────
 
   function fmtAbsolute(iso: string | null): string {
@@ -486,7 +577,55 @@
         <button class="reader-action-btn" type="button" onclick={openForward}>
           Forward
         </button>
+        <span class="msg-actions-spacer" aria-hidden="true"></span>
+        <button class="reader-action-btn" type="button" disabled={acting} onclick={archiveMessage}>
+          Archive
+        </button>
+        {#if inTrash}
+          <button
+            class="reader-action-btn reader-action-danger"
+            type="button"
+            disabled={acting}
+            onclick={() => (deleteConfirmOpen = true)}
+          >
+            Delete forever
+          </button>
+        {:else}
+          <button class="reader-action-btn" type="button" disabled={acting} onclick={trashMessage}>
+            Delete
+          </button>
+        {/if}
+        <button
+          class="reader-action-btn"
+          class:is-starred={isStarred()}
+          type="button"
+          disabled={acting}
+          aria-pressed={isStarred()}
+          onclick={toggleStar}
+        >
+          {isStarred() ? 'Unstar' : 'Star'}
+        </button>
       </div>
+      {#if actionError}
+        <p class="msg-action-error" role="alert">{actionError}</p>
+      {/if}
+      <Modal
+        open={deleteConfirmOpen}
+        title="Delete this message forever?"
+        onclose={() => (deleteConfirmOpen = false)}
+      >
+        <p class="msg-delete-warn">
+          This permanently deletes the message from Trash. You can’t undo this.
+        </p>
+        {#snippet footer()}
+          <button type="button" class="modal-cancel" onclick={() => (deleteConfirmOpen = false)}>
+            Cancel
+          </button>
+          <button type="button" class="modal-delete" onclick={deleteForever}>
+            Permanently delete
+          </button>
+        {/snippet}
+      </Modal>
 
       <!-- ── Thread strip ───────────────────────────────────────────── -->
       {#if threadLoading || threadMessages.length > 1}
@@ -773,6 +912,36 @@
     flex-wrap: wrap;
     gap: 0.5rem;
     margin: 0 0 0.75rem;
+  }
+
+  .msg-actions-spacer {
+    flex: 1 1 auto;
+  }
+  .reader-action-danger {
+    color: var(--env-danger, #b42318);
+  }
+  .msg-action-error {
+    margin: -0.25rem 0 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--env-danger, #b42318);
+  }
+  .msg-delete-warn {
+    margin: 0;
+    font-size: 0.875rem;
+  }
+  .modal-cancel,
+  .modal-delete {
+    font: inherit;
+    padding: 0.4rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--env-rule);
+    background: transparent;
+    cursor: pointer;
+  }
+  .modal-delete {
+    color: #fff;
+    background: var(--env-danger, #b42318);
+    border-color: var(--env-danger, #b42318);
   }
 
   /* Meta dl */

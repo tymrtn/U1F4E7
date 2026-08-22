@@ -20,6 +20,7 @@
   import { readState } from '$lib/read-state.svelte';
   import { getLiveStore } from '$lib/live.svelte';
   import { getComposerStore } from '$lib/composer.svelte';
+  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
   import {
     api,
     EnvelopeApiError,
@@ -40,6 +41,20 @@
   const selectedAccount = $derived(page.params.account ?? null);
 
   const selection = new SelectionStore();
+
+  // ── Mailbox-ops signal ────────────────────────────────────────────
+  // The reader (nested route, no prop channel) announces archive / trash /
+  // delete / star through this shared store. Re-run the same refresh
+  // BulkToolbar triggers via `onoperated`, so the moved row disappears from the
+  // mounted list. Version-compare so a route change alone never re-fetches.
+  const mailboxOps = getMailboxOpsStore();
+  let seenOpsVersion = 0;
+  $effect(() => {
+    const v = mailboxOps.version;
+    if (v === seenOpsVersion) return;
+    seenOpsVersion = v;
+    void handleOperated();
+  });
 
   // ── SSE live store ────────────────────────────────────────────────
   // Started once on mount (onMount guard prevents SSR). When the stream is
