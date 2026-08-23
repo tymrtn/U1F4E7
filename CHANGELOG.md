@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 1.0.23-dev
 
+- fix(mcp,cli): the agent audit trail is now complete. Draft and send tool calls (`send`, `reply`, `send_draft`, `create_reply_draft`, `create_forward_draft`, `modify_draft`) are recorded for the acting agent with their outcome status and draft id, and every policy-denied tool call lands as a `denied` row — `envelope actions tail --agent <name>` used to come back empty after exactly these calls. `actions tail --agent <name>` with no `--account` now spans every account.
+
+- fix(cli): `envelope delete` now moves the message to the account's Trash (resolved through the same special-use detection the dashboard uses) instead of expunging it. `--permanent --confirm` deletes forever; `--permanent` alone is a dry run; a plain delete inside Trash is refused with the exact flags to use. JSON output carries `mode: trashed | dry_run | expunged` and `reversible`.
+
 ### Added
 
 - A queued draft's review page now counts down. The banner leads with the time actually remaining — `45s`, `12m 30s`, `2h 05m`, `3d 4h` — ticking every second and rolling over to `due now` once the send time passes, with the wall-clock send time kept beside it as secondary text. Until now the page showed only a clock time, which made a `--at` schedule days out and the 60-second safety cooldown read identically.
