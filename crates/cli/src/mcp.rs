@@ -229,13 +229,114 @@ fn authorize_tool_call(
         .map_err(|denial| denial.to_json().to_string())
 }
 
+/// Mutating tools whose outcome is recorded by the dispatcher. move/flag/tag/
+/// bulk/snooze log inside their own handlers (with richer metadata) and are
+/// deliberately absent here so nothing is recorded twice.
+const DISPATCH_LOGGED_TOOLS: &[&str] = &[
+    "send",
+    "reply",
+    "send_draft",
+    "create_reply_draft",
+    "create_forward_draft",
+    "modify_draft",
+];
+
+/// Record a completed draft/send tool call for the agent audit trail. No-op for
+/// anonymous sessions and for tools outside [`DISPATCH_LOGGED_TOOLS`]. Captures
+/// only the outcome status and draft id — never bodies or recipients.
+fn record_tool_outcome(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    tool_name: &str,
+    result: &Value,
+) {
+    if !DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
+        return;
+    }
+    let status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed");
+    let draft_id = result.get("draft_id").and_then(|v| v.as_str()).or_else(|| {
+        result
+            .get("draft")
+            .and_then(|d| d.get("id"))
+            .and_then(|v| v.as_str())
+    });
+    let taken = json!({ "status": status, "draft_id": draft_id }).to_string();
+    log_agent_mutation(db, ctx, account_id, tool_name, &taken, None);
+}
+
+/// Record a tool call that policy refused. The trail must show what an agent
+/// tried and was stopped from doing. No-op for anonymous sessions; the
+/// account may be unresolvable (the agent may have named one it cannot see),
+/// in which case the row is filed under `(unresolved)` rather than dropped.
+fn record_tool_denial(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: Option<&str>,
+    tool_name: &str,
+    reason: &str,
+) {
+    let Some(agent_id) = agent_context::agent_id_of(ctx) else {
+        return;
+    };
+    let _ = db.log_denied_action_with_agent(
+        account_id.unwrap_or("(unresolved)"),
+        tool_name,
+        reason,
+        Some(agent_id),
+    );
+}
+
+/// Best-effort account id for audit rows: the `account` param resolved the same
+/// way the tool itself would resolve it (id or email), or the default account.
+fn audit_account_id(db: &Database, params: &Value) -> Option<String> {
+    crate::commands::common::resolve_account(db, optional_str(params, "account"))
+        .ok()
+        .map(|a| a.id)
+}
+
+fn denial_code(denial_json: &str) -> String {
+    serde_json::from_str::<Value>(denial_json)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_else(|| denial_json.chars().take(120).collect())
+}
+
 async fn handle_tool_call(
     tool_name: &str,
     params: &Value,
     backend: CredentialBackend,
     ctx: Option<&AgentContext>,
 ) -> Result<Value, String> {
-    authorize_tool_call(ctx, tool_name, params)?;
+    if let Err(denial) = authorize_tool_call(ctx, tool_name, params) {
+        if agent_context::agent_id_of(ctx).is_some() {
+            if let Ok(db) = Database::open_default() {
+                let acct = audit_account_id(&db, params);
+                record_tool_denial(&db, ctx, acct.as_deref(), tool_name, &denial_code(&denial));
+            }
+        }
+        return Err(denial);
+    }
+    let result = dispatch_tool_call(tool_name, params, backend, ctx).await?;
+    if agent_context::agent_id_of(ctx).is_some() && DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
+        if let Ok(db) = Database::open_default() {
+            if let Some(acct) = audit_account_id(&db, params) {
+                record_tool_outcome(&db, ctx, &acct, tool_name, &result);
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn dispatch_tool_call(
+    tool_name: &str,
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     match tool_name {
         "accounts" => handle_accounts(backend).await,
         "inbox" => handle_inbox(params, backend).await,
@@ -3007,4 +3108,104 @@ pub async fn run(backend: CredentialBackend) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod audit_trail_tests {
+    use super::*;
+
+    // ── audit trail completeness (sweep blocker #6) ─────────────────────
+
+    fn test_ctx(agent_id: &str) -> crate::commands::agent_context::AgentContext {
+        use envelope_email_transport::{AgentPolicy as TransportPolicy, SendMode};
+        crate::commands::agent_context::AgentContext {
+            agent_id: agent_id.to_string(),
+            agent_name: "skippy".to_string(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".to_string()],
+                allowed_folders: vec!["*".to_string()],
+                allowed_actions: vec!["*".to_string()],
+                send_mode_ceiling: SendMode::DraftOnly,
+                allow_recipients: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn draft_and_send_tool_outcomes_are_recorded_for_the_agent() {
+        let db = Database::open_memory().unwrap();
+        let ctx = test_ctx("agent-42");
+        let result = json!({"status": "drafted", "draft_id": "d-1", "ui": {"account_id": "acc-1"}});
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "create_reply_draft", &result);
+        record_tool_outcome(
+            &db,
+            Some(&ctx),
+            "acc-1",
+            "send",
+            &json!({"status": "queued"}),
+        );
+        let rows = db.list_actions_for_agent("acc-1", "agent-42", 10).unwrap();
+        let types: Vec<&str> = rows.iter().map(|r| r.action_type.as_str()).collect();
+        assert!(types.contains(&"create_reply_draft"), "{types:?}");
+        assert!(types.contains(&"send"), "{types:?}");
+        assert!(rows.iter().all(|r| r.action_status == "completed"));
+    }
+
+    #[test]
+    fn read_only_tools_are_not_recorded_as_actions() {
+        let db = Database::open_memory().unwrap();
+        let ctx = test_ctx("agent-42");
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "inbox", &json!({"messages": []}));
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "read", &json!({"uid": 1}));
+        assert!(
+            db.list_actions_for_agent("acc-1", "agent-42", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn already_logged_mutations_are_not_double_recorded_by_the_dispatcher() {
+        // move/flag/tag/bulk/snooze log inside their handlers; the dispatcher
+        // must leave them alone or every move shows up twice.
+        let db = Database::open_memory().unwrap();
+        let ctx = test_ctx("agent-42");
+        record_tool_outcome(
+            &db,
+            Some(&ctx),
+            "acc-1",
+            "move_message",
+            &json!({"ok": true}),
+        );
+        assert!(
+            db.list_actions_for_agent("acc-1", "agent-42", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn policy_denials_are_recorded_with_denied_status() {
+        let db = Database::open_memory().unwrap();
+        let ctx = test_ctx("agent-7");
+        record_tool_denial(
+            &db,
+            Some(&ctx),
+            Some("acc-1"),
+            "send",
+            "agent_policy_denied_action",
+        );
+        let rows = db.list_actions_for_agent("acc-1", "agent-7", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action_status, "denied");
+        assert_eq!(rows[0].action_type, "send");
+    }
+
+    #[test]
+    fn anonymous_sessions_record_nothing() {
+        let db = Database::open_memory().unwrap();
+        record_tool_outcome(&db, None, "acc-1", "send", &json!({"status": "queued"}));
+        record_tool_denial(&db, None, Some("acc-1"), "send", "x");
+        assert!(db.list_actions("acc-1", 10).unwrap().is_empty());
+    }
 }
