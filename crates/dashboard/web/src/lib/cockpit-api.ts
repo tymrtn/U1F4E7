@@ -161,12 +161,12 @@ export const cockpitApi = {
   /**
    * A draft action against the existing per-account draft endpoints. `actionBase`
    * comes straight from the cockpit payload (`/api/accounts/{id}/drafts/{id}`);
-   * `action` is one of approve/edit/discard/block/send. POST + JSON body flow
+   * `action` is one of approve/edit/discard/block/send/hold. POST + JSON body flow
    * through the shared CSRF-aware core, matching how the mail UI acts on drafts.
    */
   draftAction(
     actionBase: string,
-    action: 'approve' | 'edit' | 'discard' | 'block' | 'send',
+    action: 'approve' | 'edit' | 'discard' | 'block' | 'send' | 'hold',
     body?: unknown,
     o?: RequestOptions
   ): Promise<unknown> {
