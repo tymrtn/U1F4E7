@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 1.0.23-dev
 
+- feat(dashboard): Reply, Reply all, and Forward from the reader. The webmail reader had no way to answer mail — the only composer entry point was the global `c` shortcut. ReaderPane now opens the shared composer in the matching mode with the open message as parent; reply paths let the server derive recipients and threading headers, forward is a fresh message with a `Fwd:` subject, and the original is quoted into the body so the operator sees what they are answering.
+- feat(dashboard): Archive, Delete, and Star from the reader. Moves use the same canonical special-use targets and per-message endpoints as the bulk toolbar; Delete is reversible (move to Trash) everywhere except inside Trash, where it is a confirmed permanent delete; a failed operation stays on the message and says why. A new shared `mailbox-ops` signal tells the mounted list to re-fetch after a reader-side mutation, and the Trash heuristic now lives in `$lib/folder-kinds` for both surfaces.
+
 ### Added
 
 - A queued draft's review page now counts down. The banner leads with the time actually remaining — `45s`, `12m 30s`, `2h 05m`, `3d 4h` — ticking every second and rolling over to `due now` once the send time passes, with the wall-clock send time kept beside it as secondary text. Until now the page showed only a clock time, which made a `--at` schedule days out and the 60-second safety cooldown read identically.
