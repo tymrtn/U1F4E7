@@ -244,13 +244,20 @@ enum Commands {
         account: Option<String>,
     },
 
-    /// Delete a message
+    /// Delete a message (moves it to Trash; --permanent --confirm deletes forever)
     Delete {
         /// Message UID
         uid: u32,
         /// IMAP folder
         #[arg(long, default_value = "INBOX")]
         folder: String,
+        /// Expunge instead of moving to Trash (irreversible; requires --confirm,
+        /// otherwise runs as a dry run)
+        #[arg(long)]
+        permanent: bool,
+        /// Confirm a --permanent delete
+        #[arg(long)]
+        confirm: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -2076,8 +2083,18 @@ fn main() {
         Commands::Delete {
             uid,
             folder,
+            permanent,
+            confirm,
             account,
-        } => commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend),
+        } => commands::messages::run_delete(
+            uid,
+            &folder,
+            permanent,
+            confirm,
+            account.as_deref(),
+            cli.json,
+            backend,
+        ),
 
         Commands::Flag { subcommand } => match subcommand {
             FlagCmd::Add {
