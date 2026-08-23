@@ -704,7 +704,7 @@
                   unread: false,
                   starred: false,
                   accountChip: d.account_id,
-                  href: `${base}/mail/drafts/${encodeURIComponent(d.account_id)}/${d.id}`,
+                  href: `${base}/accounts/${encodeURIComponent(d.account_id)}/drafts/${encodeURIComponent(d.id)}`,
                 }}
                 {selection}
                 orderedKeys={drafts.map((x) => `draft:${x.account_id}:${x.id}`)}
