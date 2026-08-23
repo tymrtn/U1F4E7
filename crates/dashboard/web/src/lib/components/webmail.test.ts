@@ -368,3 +368,34 @@ describe('mail layout refreshes on mailbox-ops signal', () => {
     expect(apiMock.unifiedInbox).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── Drafts box rows route to the review page ─────────────────────────
+// A draft row carries a local draft id, not an IMAP uid; the reader route
+// cannot render it ("Select a message to read it"). The only surface that can
+// edit and send a draft is /accounts/<id>/drafts/<draft>, so rows link there.
+
+describe('Drafts box rows', () => {
+  it('link to the per-account draft review page, not the reader', async () => {
+    pageState.params = { box: 'drafts' };
+    pageState.url = new URL('http://localhost/v2/mail/drafts') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({ accounts: [HEALTHY_ACCT] });
+    (apiMock as unknown as { drafts: ReturnType<typeof vi.fn> }).drafts = vi.fn().mockResolvedValue({
+      drafts: [
+        {
+          id: 'draft-abc',
+          account_id: 'acct-ok',
+          imap_uid: 77,
+          subject: 'Half-written reply',
+          to_addr: 'dana@example.com',
+          created_at: '2026-08-22T10:00:00Z',
+          text_content: 'hello',
+          status: 'draft'
+        }
+      ]
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Half-written reply')).toBeInTheDocument());
+    const row = screen.getByText('Half-written reply').closest('a');
+    expect(row?.getAttribute('href')).toBe('/v2/accounts/acct-ok/drafts/draft-abc');
+  });
+});
