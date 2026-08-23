@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.24-dev
+## [Unreleased] — 1.0.25-dev
 
 - fix(dashboard): Drafts box rows open the per-account draft review page (`/accounts/<id>/drafts/<draft>`) instead of dead-ending in the reader with "Select a message to read it" — a draft row carries a local draft id, which the reader route cannot resolve.
 - fix(dashboard): Cockpit "Cancel send" on a scheduled send now HOLDS the queued draft (it leaves the outbox and stays in Drafts) instead of silently discarding it, matching the review page's own "your draft is kept" contract.
