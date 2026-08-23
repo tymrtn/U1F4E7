@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -157,7 +156,7 @@ fn tool_call(
     let stdout = child.stdout.take().expect("stdout");
     let mut stdout = BufReader::new(stdout);
 
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({
             "jsonrpc": "2.0",
@@ -166,7 +165,7 @@ fn tool_call(
             "params": { "name": name, "arguments": arguments }
         }),
     );
-    let resp = read_framed(&mut stdout);
+    let resp = read_message(&mut stdout);
     drop(stdin);
     child.wait().expect("wait mcp");
 
@@ -208,7 +207,7 @@ fn tool_call_env(
     let stdout = child.stdout.take().expect("stdout");
     let mut stdout = BufReader::new(stdout);
 
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({
             "jsonrpc": "2.0",
@@ -217,7 +216,7 @@ fn tool_call_env(
             "params": { "name": name, "arguments": arguments }
         }),
     );
-    let resp = read_framed(&mut stdout);
+    let resp = read_message(&mut stdout);
     drop(stdin);
     child.wait().expect("wait mcp");
 
@@ -261,6 +260,15 @@ fn spawn_mcp(home: &std::path::Path) -> Child {
         .expect("spawn envelope mcp")
 }
 
+/// Spec framing (MCP stdio): one compact JSON-RPC object per line, `\n`-terminated.
+fn write_line(stdin: &mut ChildStdin, value: &Value) {
+    let mut body = serde_json::to_vec(value).expect("serialize request");
+    body.push(b'\n');
+    stdin.write_all(&body).expect("write line");
+    stdin.flush().expect("flush line");
+}
+
+/// Legacy LSP-style framing; the server still accepts it on input.
 fn write_framed(stdin: &mut ChildStdin, value: &Value) {
     let body = serde_json::to_vec(value).expect("serialize request");
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame header");
@@ -268,33 +276,20 @@ fn write_framed(stdin: &mut ChildStdin, value: &Value) {
     stdin.flush().expect("flush frame");
 }
 
-fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Value {
-    let started = Instant::now();
-    let mut content_length = None;
-
-    loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "timed out waiting for MCP response headers"
-        );
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read response header");
-        assert_ne!(bytes, 0, "EOF while reading response headers");
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
-            }
-        }
-    }
-
-    let len = content_length.expect("Content-Length header");
-    let mut body = vec![0; len];
-    stdout.read_exact(&mut body).expect("read response body");
-    serde_json::from_slice(&body).expect("parse response JSON")
+/// Read one server message: exactly one `\n`-terminated JSON line, no headers.
+fn read_message(stdout: &mut BufReader<ChildStdout>) -> Value {
+    let mut line = String::new();
+    let bytes = stdout.read_line(&mut line).expect("read response line");
+    assert_ne!(bytes, 0, "EOF while waiting for MCP response");
+    assert!(
+        line.ends_with('\n'),
+        "response must be newline-terminated, got: {line:?}"
+    );
+    assert!(
+        line.starts_with('{'),
+        "response must be a bare JSON line (no Content-Length header), got: {line:?}"
+    );
+    serde_json::from_str(line.trim_end_matches(['\r', '\n'])).expect("parse response JSON")
 }
 
 #[test]
@@ -318,7 +313,7 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
             }
         }),
     );
-    let init = read_framed(&mut stdout);
+    let init = read_message(&mut stdout);
     assert_eq!(init["jsonrpc"], "2.0");
     assert_eq!(init["id"], 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "envelope");
@@ -332,7 +327,7 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
             "params": {}
         }),
     );
-    let tools = read_framed(&mut stdout);
+    let tools = read_message(&mut stdout);
     let tool_entries = tools["result"]["tools"].as_array().expect("tools array");
     // 22 mailbox tools + the read-only governor_catalog discovery tool (v2).
     assert_eq!(tool_entries.len(), 23);
@@ -376,6 +371,74 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
 }
 
 #[test]
+fn mcp_stdio_speaks_newline_delimited_json_rpc_per_spec() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    // Official SDK clients (Python `stdio_client`, Claude Code, Codex) write one
+    // JSON object per line and expect the same back — no Content-Length header.
+    write_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "envelope-test", "version": "0" }
+            }
+        }),
+    );
+    let mut raw = String::new();
+    stdout
+        .read_line(&mut raw)
+        .expect("read initialize response");
+    assert!(
+        raw.starts_with('{') && raw.ends_with('\n'),
+        "expected a bare JSON line, got: {raw:?}"
+    );
+    assert!(
+        !raw.to_ascii_lowercase().contains("content-length"),
+        "no LSP headers on stdout: {raw:?}"
+    );
+    let init: Value = serde_json::from_str(raw.trim_end()).expect("parse initialize response");
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "envelope");
+
+    // The SDK follows initialize with a notification (no id, must not be
+    // answered); blank lines between messages are skipped.
+    write_line(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    stdin.write_all(b"\n").expect("blank line");
+    write_line(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    let tools = read_message(&mut stdout);
+    assert_eq!(
+        tools["id"], 2,
+        "notification must not produce a response; next line is tools/list"
+    );
+    assert_eq!(
+        tools["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .len(),
+        23
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for mcp process");
+    assert!(status.success());
+}
+
+#[test]
 fn mcp_content_tools_advertise_untrusted_trust_boundary() {
     // The content-returning MCP tools (read, inbox, search) must document that
     // their results are wrapped in the untrusted-content trust envelope, and
@@ -387,7 +450,7 @@ fn mcp_content_tools_advertise_untrusted_trust_boundary() {
     let stdout = child.stdout.take().expect("stdout");
     let mut stdout = BufReader::new(stdout);
 
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({
             "jsonrpc": "2.0",
@@ -400,9 +463,9 @@ fn mcp_content_tools_advertise_untrusted_trust_boundary() {
             }
         }),
     );
-    let _init = read_framed(&mut stdout);
+    let _init = read_message(&mut stdout);
 
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({
             "jsonrpc": "2.0",
@@ -411,7 +474,7 @@ fn mcp_content_tools_advertise_untrusted_trust_boundary() {
             "params": {}
         }),
     );
-    let tools = read_framed(&mut stdout);
+    let tools = read_message(&mut stdout);
     let entries = tools["result"]["tools"].as_array().expect("tools array");
 
     let description_of = |name: &str| -> String {
@@ -1451,16 +1514,16 @@ fn mcp_send_schema_attributes_enum_excludes_attestation_keys() {
     let stdout = child.stdout.take().expect("stdout");
     let mut stdout = BufReader::new(stdout);
 
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
     );
-    let _ = read_framed(&mut stdout);
-    write_framed(
+    let _ = read_message(&mut stdout);
+    write_line(
         &mut stdin,
         &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     );
-    let tools = read_framed(&mut stdout);
+    let tools = read_message(&mut stdout);
     drop(stdin);
     child.wait().expect("wait mcp");
 

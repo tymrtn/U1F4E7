@@ -2435,6 +2435,11 @@ fn shell_quote(value: &str) -> String {
 
 // ── Main loop ───────────────────────────────────────────────────────
 
+/// Read one JSON-RPC message from stdin. The MCP stdio spec is newline-delimited
+/// JSON (one message per line, no embedded newlines); that is the primary
+/// framing. A leading `Content-Length:` header switches to LSP-style framing
+/// for the one message — kept so callers written against the pre-1.0.23 server
+/// keep working. Framing is detected per message; blank lines are skipped.
 fn read_mcp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
     loop {
         let mut first_line = String::new();
@@ -2443,7 +2448,7 @@ fn read_mcp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
             return Ok(None);
         }
 
-        let trimmed = first_line.trim_end_matches(['\r', '\n']);
+        let trimmed = first_line.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -2479,14 +2484,17 @@ fn read_mcp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
             }
         }
 
-        // Compatibility for old Envelope toy clients that sent newline-delimited JSON-RPC.
-        return Ok(Some(first_line));
+        // Spec framing: the line is the whole message.
+        return Ok(Some(trimmed.to_string()));
     }
 }
 
+/// MCP stdio framing: one compact JSON-RPC object per line, `\n`-terminated, no
+/// headers. `serde_json::to_vec` never emits raw newlines (they are escaped
+/// inside strings), so the delimiter is the only `\n` on the wire.
 fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    let mut body = serde_json::to_vec(value)?;
+    body.push(b'\n');
     writer.write_all(&body)?;
     writer.flush()?;
     Ok(())
@@ -2495,6 +2503,104 @@ fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    // ── stdio framing (MCP spec: newline-delimited JSON-RPC) ──────────
+
+    #[test]
+    fn mcp_writer_emits_one_json_line_without_content_length_header() {
+        // The result carries an embedded "\n" (tool results ship pretty JSON in
+        // a text field); it must be escaped, never a raw byte on the wire.
+        let response = JsonRpcResponse::success(
+            Some(json!(1)),
+            json!({ "content": [{ "type": "text", "text": "line one\nline two" }] }),
+        );
+        let mut out = Vec::new();
+        write_mcp_message(&mut out, &response).expect("write message");
+
+        let text = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length"),
+            "stdio transport must not emit LSP-style headers, got: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "message must end with \\n: {text:?}");
+        assert_eq!(
+            text.matches('\n').count(),
+            1,
+            "exactly one newline (the delimiter), none embedded: {text:?}"
+        );
+        assert!(!text.contains('\r'), "no CR on the wire: {text:?}");
+        let parsed: Value = serde_json::from_str(text.trim_end_matches('\n')).expect("valid JSON");
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["result"]["content"][0]["text"], "line one\nline two");
+    }
+
+    #[test]
+    fn mcp_reader_parses_newline_delimited_request() {
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let mut input = Cursor::new(format!("{request}\n"));
+        let message = read_mcp_message(&mut input)
+            .expect("read ok")
+            .expect("one message");
+        assert_eq!(message, request);
+        assert!(
+            read_mcp_message(&mut input).expect("read ok").is_none(),
+            "EOF after the single message"
+        );
+    }
+
+    #[test]
+    fn mcp_reader_still_accepts_content_length_framed_request() {
+        let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+        let framed = format!("Content-Length: {}\r\n\r\n{request}", request.len());
+        let mut input = Cursor::new(framed);
+        let message = read_mcp_message(&mut input)
+            .expect("read ok")
+            .expect("one message");
+        assert_eq!(message, request);
+        assert!(read_mcp_message(&mut input).expect("read ok").is_none());
+    }
+
+    #[test]
+    fn mcp_reader_skips_blank_lines_between_messages() {
+        let first = r#"{"jsonrpc":"2.0","id":1,"method":"a"}"#;
+        let second = r#"{"jsonrpc":"2.0","id":2,"method":"b"}"#;
+        let mut input = Cursor::new(format!("\n\r\n{first}\n\n   \n{second}\r\n\n"));
+        assert_eq!(
+            read_mcp_message(&mut input).expect("read ok").as_deref(),
+            Some(first)
+        );
+        assert_eq!(
+            read_mcp_message(&mut input).expect("read ok").as_deref(),
+            Some(second)
+        );
+        assert!(read_mcp_message(&mut input).expect("read ok").is_none());
+    }
+
+    #[test]
+    fn mcp_reader_treats_pretty_printed_json_line_by_line_without_hanging() {
+        // The spec forbids embedded newlines, so a pretty-printed object is not
+        // one message. The reader stays line-oriented: every non-blank line is
+        // handed up as a candidate (the main loop answers each with -32700)
+        // and EOF is reached promptly — the reader never tries to accumulate a
+        // multi-line body and must never block waiting for a closing brace.
+        let pretty = "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"ping\"\n}\n";
+        let mut input = Cursor::new(pretty);
+        let mut lines = Vec::new();
+        while let Some(message) = read_mcp_message(&mut input).expect("read ok") {
+            lines.push(message);
+        }
+        assert_eq!(
+            lines.len(),
+            5,
+            "one candidate per non-blank line: {lines:?}"
+        );
+        assert_eq!(lines[0], "{");
+        assert!(
+            serde_json::from_str::<JsonRpcRequest>(&lines[0]).is_err(),
+            "a lone brace is a parse error, surfaced as -32700 by the main loop"
+        );
+    }
 
     #[test]
     fn agent_list_limit_accepts_default() {

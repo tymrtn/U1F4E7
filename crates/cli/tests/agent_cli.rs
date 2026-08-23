@@ -5,10 +5,9 @@
 //! per-agent identity contract. Each test runs the built binary against an
 //! isolated `HOME` so no real mailbox or DB is touched.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -34,37 +33,24 @@ fn json_stdout(out: &std::process::Output) -> Value {
     })
 }
 
-fn write_framed(stdin: &mut ChildStdin, value: &Value) {
-    let body = serde_json::to_vec(value).expect("serialize request");
-    write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame header");
-    stdin.write_all(&body).expect("write frame body");
-    stdin.flush().expect("flush frame");
+/// Spec framing (MCP stdio): one compact JSON-RPC object per line, `\n`-terminated.
+fn write_line(stdin: &mut ChildStdin, value: &Value) {
+    let mut body = serde_json::to_vec(value).expect("serialize request");
+    body.push(b'\n');
+    stdin.write_all(&body).expect("write line");
+    stdin.flush().expect("flush line");
 }
 
-fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Value {
-    let started = Instant::now();
-    let mut content_length = None;
-    loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "timed out waiting for MCP response headers"
-        );
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read response header");
-        assert_ne!(bytes, 0, "EOF while reading response headers");
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
-            }
-        }
-    }
-    let mut body = vec![0; content_length.expect("Content-Length header")];
-    stdout.read_exact(&mut body).expect("read response body");
-    serde_json::from_slice(&body).expect("parse response JSON")
+/// Read one server message: exactly one `\n`-terminated JSON line, no headers.
+fn read_message(stdout: &mut BufReader<ChildStdout>) -> Value {
+    let mut line = String::new();
+    let bytes = stdout.read_line(&mut line).expect("read response line");
+    assert_ne!(bytes, 0, "EOF while waiting for MCP response");
+    assert!(
+        line.starts_with('{') && line.ends_with('\n'),
+        "response must be a bare newline-terminated JSON line, got: {line:?}"
+    );
+    serde_json::from_str(line.trim_end_matches(['\r', '\n'])).expect("parse response JSON")
 }
 
 fn mcp_tool_call(home: &Path, token: &str, name: &str, arguments: Value) -> (Value, bool) {
@@ -81,7 +67,7 @@ fn mcp_tool_call(home: &Path, token: &str, name: &str, arguments: Value) -> (Val
     let mut stdin = child.stdin.take().expect("MCP stdin");
     let stdout = child.stdout.take().expect("MCP stdout");
     let mut stdout = BufReader::new(stdout);
-    write_framed(
+    write_line(
         &mut stdin,
         &json!({
             "jsonrpc": "2.0",
@@ -90,7 +76,7 @@ fn mcp_tool_call(home: &Path, token: &str, name: &str, arguments: Value) -> (Val
             "params": { "name": name, "arguments": arguments }
         }),
     );
-    let response = read_framed(&mut stdout);
+    let response = read_message(&mut stdout);
     drop(stdin);
     child.wait().expect("wait for MCP server");
 
