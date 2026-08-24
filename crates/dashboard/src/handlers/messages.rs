@@ -41,6 +41,10 @@ fn default_limit() -> u32 {
 pub struct UnifiedInboxQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Keyset cursor (all three or none): continue after this row.
+    pub before_epoch: Option<i64>,
+    pub before_uid: Option<u32>,
+    pub before_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +62,9 @@ pub struct UnifiedInboxMessage {
     pub thread_id: Option<String>,
     pub indexed_at: Option<String>,
     pub index_freshness: String,
+    /// Parsed message date (unix seconds) from the index; drives the keyset
+    /// pagination cursor. None when the header date was unreadable.
+    pub date_epoch: Option<i64>,
     #[serde(skip)]
     sort_index: usize,
 }
@@ -82,6 +89,7 @@ impl UnifiedInboxMessage {
             thread_id: indexed.thread_id,
             indexed_at: indexed.indexed_at,
             index_freshness: indexed.freshness,
+            date_epoch: indexed.date_epoch,
             sort_index,
         }
     }
@@ -209,6 +217,16 @@ pub struct UnifiedInboxResponse {
     pub unread_count: usize,
     pub freshness: UnifiedAccountFreshness,
     pub errors: Vec<UnifiedInboxError>,
+    /// Present when the page is full: pass these back as `before_*` query
+    /// params to continue exactly where this page ended.
+    pub next_cursor: Option<UnifiedNextCursor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnifiedNextCursor {
+    pub date_epoch: Option<i64>,
+    pub uid: u32,
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,11 +261,28 @@ pub async fn unified_inbox(
     };
 
     let folder = UNIFIED_INBOX_FOLDER.to_string();
-    let (messages, account_results) =
-        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit).await {
-            Ok(indexed) => indexed,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        };
+    let cursor = match (&q.before_epoch, q.before_uid, &q.before_account) {
+        (_, Some(uid), Some(account_id)) => {
+            Some(envelope_email_store::message_index::UnifiedPageCursor {
+                date_epoch: q.before_epoch,
+                uid,
+                account_id: account_id.clone(),
+            })
+        }
+        _ => None,
+    };
+    let (messages, account_results) = match load_indexed_unified_inbox(
+        &state,
+        &accounts,
+        &folder,
+        q.limit,
+        cursor.as_ref(),
+    )
+    .await
+    {
+        Ok(indexed) => indexed,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
 
     Json(build_unified_inbox_response(
         folder,
@@ -257,6 +292,117 @@ pub async fn unified_inbox(
     ))
     .into_response()
 }
+/// Run `f` for every account with bounded concurrency and a per-account
+/// timeout. The sweep found the refresh crawling 25 accounts serially — one
+/// slow provider pinned the whole pass past 240s. Order of results follows
+/// completion; every account appears exactly once.
+async fn refresh_accounts_bounded<F, Fut>(
+    accounts: Vec<Account>,
+    concurrency: usize,
+    per_account_timeout: std::time::Duration,
+    f: F,
+) -> Vec<(Account, Result<(), String>)>
+where
+    F: Fn(Account) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    use std::sync::Arc;
+    let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+        accounts,
+    )));
+    let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let workers = concurrency.max(1);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        let f = f.clone();
+        set.spawn(async move {
+            loop {
+                let account = { queue.lock().await.pop_front() };
+                let Some(account) = account else { break };
+                let outcome =
+                    match tokio::time::timeout(per_account_timeout, f(account.clone())).await {
+                        Ok(res) => res,
+                        Err(_) => Err(format!(
+                            "timed out after {}s",
+                            per_account_timeout.as_secs()
+                        )),
+                    };
+                results.lock().await.push((account, outcome));
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+    Arc::try_unwrap(results)
+        .map(|m| m.into_inner())
+        .unwrap_or_default()
+}
+
+/// One account's index refresh: connect, EXAMINE, fetch summaries read-only,
+/// upsert into the local index. Returns the failure string on any step; the
+/// caller persists errors and builds the response uniformly.
+async fn refresh_one_account(
+    state: AppState,
+    account: Account,
+    folder: String,
+    limit: u32,
+) -> Result<(), String> {
+    let (client_arc, _creds) = state
+        .get_or_create_imap(&account.id)
+        .await
+        .map_err(|e| format!("IMAP: {e}"))?;
+    let mut client = client_arc.lock().await;
+    let uidvalidity =
+        match envelope_email_transport::imap::examine_folder_info(&mut client, &folder).await {
+            Ok(info) => info.uid_validity.unwrap_or(0) as u64,
+            Err(e) => {
+                state.evict_imap(&account.id).await;
+                return Err(format!("EXAMINE {folder}: {e}"));
+            }
+        };
+    match envelope_email_transport::imap::fetch_folder_summaries_read_only(
+        &mut client,
+        &folder,
+        limit,
+    )
+    .await
+    {
+        Ok(summaries) => {
+            let inputs: Vec<IndexedMessageInput> = summaries
+                .iter()
+                .map(|summary| IndexedMessageInput {
+                    uid: summary.uid,
+                    message_id: summary.message_id.clone(),
+                    from_addr: summary.from_addr.clone(),
+                    to_addr: summary.to_addr.clone(),
+                    subject: summary.subject.clone(),
+                    date: summary.date.clone(),
+                    flags: summary.flags.clone(),
+                    size: summary.size,
+                    snippet: None,
+                    thread_id: None,
+                })
+                .collect();
+            let write_result = {
+                let db = state.db.lock().await;
+                db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
+            };
+            match write_result {
+                Ok(()) => {
+                    crate::handlers::address_book::catch_up_account(&state, &account.id).await;
+                    Ok(())
+                }
+                Err(e) => Err(format!("index {folder}: {e}")),
+            }
+        }
+        Err(e) => {
+            state.evict_imap(&account.id).await;
+            Err(format!("fetch {folder}: {e}"))
+        }
+    }
+}
+
 pub async fn refresh_unified_inbox(
     State(state): State<AppState>,
     Query(q): Query<UnifiedInboxQuery>,
@@ -273,83 +419,44 @@ pub async fn refresh_unified_inbox(
     };
 
     let folder = UNIFIED_INBOX_FOLDER.to_string();
-    let mut refresh_failures = Vec::new();
 
-    for account in &accounts {
-        let (client_arc, _creds) = match state.get_or_create_imap(&account.id).await {
-            Ok(c) => c,
-            Err(e) => {
-                let error = format!("IMAP: {e}");
-                persist_refresh_error(&state, &account.id, &folder, &error).await;
-                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                continue;
-            }
-        };
-        let mut client = client_arc.lock().await;
-        let uidvalidity =
-            match envelope_email_transport::imap::examine_folder_info(&mut client, &folder).await {
-                Ok(info) => info.uid_validity.unwrap_or(0) as u64,
-                Err(e) => {
-                    state.evict_imap(&account.id).await;
-                    let error = format!("EXAMINE {folder}: {e}");
-                    persist_refresh_error(&state, &account.id, &folder, &error).await;
-                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                    continue;
-                }
-            };
+    // Bounded fan-out with a per-account budget: the old serial crawl let one
+    // slow provider pin the whole pass past 240s while the UI spun.
+    const REFRESH_CONCURRENCY: usize = 6;
+    const REFRESH_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        match envelope_email_transport::imap::fetch_folder_summaries_read_only(
-            &mut client,
-            &folder,
-            q.limit,
+    let outcomes = {
+        let state = state.clone();
+        let folder = folder.clone();
+        let limit = q.limit;
+        refresh_accounts_bounded(
+            accounts.clone(),
+            REFRESH_CONCURRENCY,
+            REFRESH_ACCOUNT_TIMEOUT,
+            move |account: Account| {
+                let state = state.clone();
+                let folder = folder.clone();
+                refresh_one_account(state, account, folder, limit)
+            },
         )
         .await
-        {
-            Ok(summaries) => {
-                let inputs: Vec<IndexedMessageInput> = summaries
-                    .iter()
-                    .map(|summary| IndexedMessageInput {
-                        uid: summary.uid,
-                        message_id: summary.message_id.clone(),
-                        from_addr: summary.from_addr.clone(),
-                        to_addr: summary.to_addr.clone(),
-                        subject: summary.subject.clone(),
-                        date: summary.date.clone(),
-                        flags: summary.flags.clone(),
-                        size: summary.size,
-                        snippet: None,
-                        thread_id: None,
-                    })
-                    .collect();
-                let write_result = {
-                    let db = state.db.lock().await;
-                    db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
-                };
-                if let Err(e) = write_result {
-                    let error = format!("index {folder}: {e}");
-                    persist_refresh_error(&state, &account.id, &folder, &error).await;
-                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                } else {
-                    // Fold the freshly-indexed metadata — plus this account's
-                    // sent drafts and any thread-cache rows that arrived since
-                    // the last pass — into the contacts address history that
-                    // compose autocomplete reads. Purely local SQL over rows
-                    // already on disk: no extra IMAP work, and it rides the
-                    // explicit refresh rather than the aggregate inbox load.
-                    crate::handlers::address_book::catch_up_account(&state, &account.id).await;
-                }
-            }
-            Err(e) => {
+    };
+
+    let mut refresh_failures = Vec::new();
+    for (account, outcome) in outcomes {
+        if let Err(error) = outcome {
+            // A timed-out future was dropped mid-IMAP; force a reconnect so the
+            // shared client cannot be left in a half-run command state.
+            if error.starts_with("timed out") {
                 state.evict_imap(&account.id).await;
-                let error = format!("fetch {folder}: {e}");
-                persist_refresh_error(&state, &account.id, &folder, &error).await;
-                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
             }
+            persist_refresh_error(&state, &account.id, &folder, &error).await;
+            refresh_failures.push(UnifiedInboxAccountResult::err(&account, &folder, error));
         }
     }
 
     let (mut messages, mut account_results) =
-        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit).await {
+        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit, None).await {
             Ok(indexed) => indexed,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -432,10 +539,11 @@ async fn load_indexed_unified_inbox(
     accounts: &[Account],
     folder: &str,
     limit: u32,
+    cursor: Option<&envelope_email_store::message_index::UnifiedPageCursor>,
 ) -> Result<(Vec<UnifiedInboxMessage>, Vec<UnifiedInboxAccountResult>), String> {
     let db = state.db.lock().await;
     let indexed = db
-        .list_indexed_message_summaries(folder, limit)
+        .list_indexed_message_summaries_page(folder, limit, cursor)
         .map_err(|e| format!("db error: {e}"))?;
     let freshness = db
         .list_message_index_account_freshness(folder)
@@ -513,16 +621,27 @@ fn build_unified_inbox_response(
         })
         .collect();
 
+    let messages = merge_unified_messages(messages, limit);
+    let next_cursor = if messages.len() == limit as usize {
+        messages.last().map(|last| UnifiedNextCursor {
+            date_epoch: last.date_epoch,
+            uid: last.summary.uid,
+            account_id: last.account_id.clone(),
+        })
+    } else {
+        None
+    };
     UnifiedInboxResponse {
         scope: "unified_inbox",
         status,
         folder,
         limit,
-        messages: merge_unified_messages(messages, limit),
+        messages,
         accounts,
         unread_count,
         freshness,
         errors,
+        next_cursor,
     }
 }
 
@@ -1290,6 +1409,7 @@ mod tests {
             thread_id: Some(format!("thread-{uid}")),
             indexed_at: Some("2026-05-12T12:00:00Z".to_string()),
             index_freshness: "fresh".to_string(),
+            date_epoch: None,
             sort_index,
         }
     }
@@ -1334,6 +1454,98 @@ mod tests {
             indexed_at: ok.then(|| "2026-05-12T12:00:00Z".to_string()),
             error: error.map(str::to_string),
         }
+    }
+
+    // ── pagination cursor (sweep blocker #4) ────────────────────────────
+
+    #[test]
+    fn full_page_carries_a_next_cursor_from_its_last_row() {
+        let mut m1 = unified("acct-a", 10, Some("Tue, 12 May 2026 12:00:00 +0000"), 0);
+        m1.date_epoch = Some(1_000_000);
+        let mut m2 = unified("acct-b", 3, Some("Tue, 12 May 2026 11:00:00 +0000"), 1);
+        m2.date_epoch = Some(999_000);
+        let res = build_unified_inbox_response(
+            "INBOX".to_string(),
+            2,
+            vec![m1, m2],
+            vec![
+                account_result("acct-a", true, None),
+                account_result("acct-b", true, None),
+            ],
+        );
+        let cursor = res.next_cursor.expect("full page implies more may exist");
+        assert_eq!(cursor.date_epoch, Some(999_000));
+        assert_eq!(cursor.uid, 3);
+        assert_eq!(cursor.account_id, "acct-b");
+    }
+
+    #[test]
+    fn short_page_has_no_next_cursor() {
+        let m1 = unified("acct-a", 10, Some("Tue, 12 May 2026 12:00:00 +0000"), 0);
+        let res = build_unified_inbox_response(
+            "INBOX".to_string(),
+            50,
+            vec![m1],
+            vec![account_result("acct-a", true, None)],
+        );
+        assert!(res.next_cursor.is_none());
+    }
+
+    // ── bounded refresh fan-out (sweep blocker #4: 240s serial hang) ────
+
+    #[tokio::test]
+    async fn bounded_refresh_times_out_slow_accounts_instead_of_hanging() {
+        let accounts: Vec<Account> = ["a", "b", "c"]
+            .iter()
+            .map(|id| Account {
+                id: (*id).to_string(),
+                name: String::new(),
+                username: format!("{id}@example.test"),
+                domain: String::new(),
+                smtp_host: String::new(),
+                smtp_port: 0,
+                imap_host: String::new(),
+                imap_port: 0,
+                smtp_username: None,
+                imap_username: None,
+                display_name: None,
+                signature_text: None,
+                signature_html: None,
+                created_at: String::new(),
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let results = refresh_accounts_bounded(
+            accounts,
+            2,
+            std::time::Duration::from_millis(300),
+            |account: Account| async move {
+                if account.id == "b" {
+                    // Slower than the per-account budget: must be cut off.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Ok::<(), String>(())
+            },
+        )
+        .await;
+
+        assert_eq!(results.len(), 3);
+        let by_id = |id: &str| results.iter().find(|(a, _)| a.id == id).unwrap();
+        assert!(by_id("a").1.is_ok());
+        assert!(by_id("c").1.is_ok());
+        let err = by_id("b").1.as_ref().unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "slow account reported as timed out, got: {err}"
+        );
+        // Even with one pathological account, the whole pass is bounded by the
+        // per-account budget, never a serial 25×-connect crawl.
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(2),
+            "elapsed {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1499,7 +1711,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10, None)
             .await
             .unwrap();
 
@@ -1553,7 +1765,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10, None)
             .await
             .unwrap();
 
@@ -1600,7 +1812,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 0)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 0, None)
             .await
             .unwrap();
 

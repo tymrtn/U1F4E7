@@ -26,6 +26,7 @@
     api,
     EnvelopeApiError,
     type UnifiedInboxMessage,
+    type UnifiedNextCursor,
     type UnifiedInboxError,
     type Draft,
     type SnoozedItem,
@@ -74,6 +75,8 @@
   let undoToast = $state<{ res: ComposeResponse; accountId: string } | null>(null);
 
   let unifiedMessages = $state<UnifiedInboxMessage[]>([]);
+  let unifiedNextCursor = $state<UnifiedNextCursor | null>(null);
+  let unifiedLoadingMore = $state(false);
   let drafts = $state<Draft[]>([]);
   let snoozed = $state<SnoozedItem[]>([]);
   let listErrors = $state<UnifiedInboxError[]>([]);
@@ -153,12 +156,39 @@
     row.scrollIntoView({ block: 'nearest' });
   });
 
-  function applyUnified(res: { messages: UnifiedInboxMessage[]; errors?: UnifiedInboxError[] }) {
+  function applyUnified(res: {
+    messages: UnifiedInboxMessage[];
+    errors?: UnifiedInboxError[];
+    next_cursor?: UnifiedNextCursor | null;
+  }) {
     unifiedMessages = res.messages;
+    unifiedNextCursor = res.next_cursor ?? null;
     listErrors = res.errors ?? [];
     // Record the mailbox each row came from, so a reader link that lost its
     // `?folder=` can still resolve one instead of guessing INBOX.
     folderHints.remember(res.messages);
+  }
+
+  /** Fetch the next unified page with the keyset cursor and append it.
+   *  Deduped by account:uid so an overlap between pages can never render a
+   *  message twice; order is preserved (the server continues the same total
+   *  order the current tail ends on). */
+  async function loadMoreUnified() {
+    const cursor = unifiedNextCursor;
+    if (!cursor || unifiedLoadingMore) return;
+    unifiedLoadingMore = true;
+    try {
+      const res = await api.unifiedInbox(50, cursor);
+      const seen = new Set(unifiedMessages.map((m) => `${m.account_id}:${m.uid}`));
+      const fresh = res.messages.filter((m) => !seen.has(`${m.account_id}:${m.uid}`));
+      unifiedMessages = [...unifiedMessages, ...fresh];
+      unifiedNextCursor = res.next_cursor ?? null;
+      folderHints.remember(fresh);
+    } catch {
+      // Keep the loaded rows; the button stays for a retry.
+    } finally {
+      unifiedLoadingMore = false;
+    }
   }
 
   async function refreshStaleUnified(gen: number) {
@@ -725,7 +755,7 @@
     {:else if box.slug === 'unified'}
       {#if listErrors.length > 0}
         <p class="list-partial" role="status">
-          {listErrors.length} account(s) couldn't be reached; showing what loaded.
+          {listErrors.length} account{listErrors.length === 1 ? '' : 's'} couldn't be reached: {listErrors.map((e) => e.account_username).join(', ')} — showing what loaded.
         </p>
       {/if}
       {#if unifiedMessages.length === 0}
@@ -761,6 +791,18 @@
             </li>
           {/each}
         </ul>
+        {#if unifiedNextCursor}
+          <div class="load-more-row">
+            <button
+              class="load-more-btn"
+              type="button"
+              disabled={unifiedLoadingMore}
+              onclick={loadMoreUnified}
+            >
+              {unifiedLoadingMore ? 'Loading…' : 'Load more'}
+            </button>
+          </div>
+        {/if}
       {/if}
 
     {:else if box.slug === 'drafts'}
@@ -1056,5 +1098,24 @@
     margin: 0.5rem 0.75rem;
     font-size: 0.75rem;
     color: var(--env-muted);
+  }
+  .load-more-row {
+    display: flex;
+    justify-content: center;
+    padding: 0.6rem 0 1rem;
+  }
+  .load-more-btn {
+    font: inherit;
+    font-size: 0.8125rem;
+    color: var(--env-ink);
+    background: var(--env-surface);
+    border: 1px solid var(--env-rule);
+    border-radius: var(--radius-sm, 3px);
+    padding: 0.35rem 1.1rem;
+    cursor: pointer;
+  }
+  .load-more-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 </style>
