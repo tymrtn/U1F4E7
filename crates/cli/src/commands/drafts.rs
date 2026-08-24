@@ -18,7 +18,7 @@ use envelope_email_transport::imap;
 use envelope_email_transport::outbound::SendSurface;
 use envelope_email_transport::reply;
 use envelope_email_transport::smtp::Attachment;
-use lettre::message::Mailboxes;
+use lettre::message::{Mailbox, Mailboxes};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
 use tracing::{info, warn};
@@ -326,6 +326,33 @@ fn builder_from_address(from: &str) -> Result<BuilderAddress<'static>> {
         mailbox.name.clone(),
         mailbox.email.to_string(),
     ))
+}
+
+/// Validate and normalize an optional explicit send-as identity before a draft
+/// is created. Queued sends persist this exact mailbox in draft metadata so the
+/// dashboard, SMTP sweep, edits, and Sent-copy resolver all agree on `From:`.
+pub(crate) fn validate_from_override(from: Option<&str>) -> Result<Option<&str>> {
+    let Some(from) = from.map(str::trim).filter(|from| !from.is_empty()) else {
+        return Ok(None);
+    };
+    from.parse::<Mailbox>()
+        .with_context(|| "invalid from address")?;
+    Ok(Some(from))
+}
+
+/// Persist a validated explicit send-as identity on a newly-created draft.
+/// Draft creation starts with no metadata; later queueing merges attribution
+/// alongside this key rather than replacing it.
+pub(crate) fn persist_from_override(
+    db: &Database,
+    draft_id: &str,
+    from: Option<&str>,
+) -> Result<()> {
+    if let Some(from) = from {
+        db.set_draft_metadata(draft_id, &serde_json::json!({ "from": from }))
+            .context("failed to persist draft from identity")?;
+    }
+    Ok(())
 }
 
 fn builder_address_list(value: &str, field: &str) -> Result<BuilderAddress<'static>> {
@@ -3469,6 +3496,54 @@ mod tests {
             "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>"
         );
         assert!(!from.contains("bruno@spainexpat.com"));
+    }
+
+    #[test]
+    fn queued_send_from_override_is_validated_and_persisted() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-test', 'Member Desk', 'auth@example.test', 'example.test',
+                         'smtp.example.test', 587, '', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acct-test",
+                "member@example.net",
+                Some("Welcome"),
+                Some("body"),
+                Some("<p>body</p>"),
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        let alias = validate_from_override(Some("  Public Desk <desk@example.test>  ")).unwrap();
+
+        persist_from_override(&db, &draft.id, alias).unwrap();
+
+        let stored = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("from"))
+                .and_then(|value| value.as_str()),
+            Some("Public Desk <desk@example.test>")
+        );
+        assert_eq!(stored.revision, 1, "send-as identity is revision-bound");
+    }
+
+    #[test]
+    fn invalid_queued_send_from_override_fails_before_persistence() {
+        let error = validate_from_override(Some("not a mailbox")).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid from address"));
+        assert_eq!(validate_from_override(Some("   ")).unwrap(), None);
     }
 
     #[tokio::test]

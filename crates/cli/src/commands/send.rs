@@ -19,8 +19,8 @@ use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::common::setup_credentials;
 use super::datetime::parse_send_at;
 use super::drafts::{
-    SentMailProofUi, resolve_sent_copy_after_send, sent_copy_convenience_objects,
-    sent_mail_proof_json,
+    SentMailProofUi, persist_from_override, resolve_sent_copy_after_send,
+    sent_copy_convenience_objects, sent_mail_proof_json, validate_from_override,
 };
 use super::governor_gate::{
     account_domain, gate_and_record, governor_request, precheck_attribution,
@@ -81,6 +81,7 @@ pub async fn run(
     check_new_re_subject_guard(Some(subject), false, confirm_new_re_subject, json)?;
 
     let (db, creds) = setup_credentials(account, backend)?;
+    let from = validate_from_override(from)?;
     let mode = SendMode::from_str(send_mode).map_err(|e| anyhow::anyhow!(e))?;
     let policy_input = SendPolicyInput {
         to,
@@ -113,6 +114,7 @@ pub async fn run(
                 db.update_draft_attachments(&draft.id, &draft_attachments)
                     .context("failed to persist draft attachments")?;
             }
+            persist_from_override(&db, &draft.id, from)?;
             let attachment_summary = attachment_summaries(&draft_attachments);
             if json {
                 println!(
@@ -215,11 +217,6 @@ pub async fn run(
 
     // ── Scheduled send path ──
     if let Some(at_str) = at {
-        if from.is_some() {
-            anyhow::bail!(
-                "--from is not supported with --at (scheduled send does not persist sender override yet)"
-            );
-        }
         let send_at = parse_send_at(at_str).context("failed to parse --at value")?;
 
         // Snapshot attachment bytes at schedule time so delivery does not depend
@@ -247,6 +244,7 @@ pub async fn run(
             db.update_draft_attachments(&draft.id, &scheduled_attachments)
                 .context("failed to persist scheduled attachments")?;
         }
+        persist_from_override(&db, &draft.id, from)?;
         // One atomic CAS at the draft's final revision (attachments bumped it):
         // bind the declaration, set the schedule, and leave it at the due `draft`
         // status together — no partial schedule, no stale declaration.
@@ -339,6 +337,7 @@ pub async fn run(
                 db.update_draft_attachments(&draft.id, &queued_attachments)
                     .context("failed to persist queued attachments")?;
             }
+            persist_from_override(&db, &draft.id, from)?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
@@ -642,6 +641,22 @@ mod tests {
         // resolve_sent_copy_after_send for pre-lookup routing).
         assert!(provider_auto_saves_sent(Some("gmail"), "smtp.gmail.com"));
         assert!(!provider_auto_saves_sent(None, "smtp.migadu.com"));
+    }
+
+    #[test]
+    fn every_new_draft_send_path_persists_explicit_from_identity() {
+        let src = include_str!("send.rs");
+        let obsolete_rejection = concat!("scheduled send does not persist sender ", "override yet");
+        assert!(
+            !src.contains(obsolete_rejection),
+            "scheduled sends must accept a validated --from override"
+        );
+        let persistence_call = concat!("persist_from_override", "(&db, &draft.id, from)?;");
+        assert_eq!(
+            src.matches(persistence_call).count(),
+            3,
+            "draft-only, scheduled, and cooldown queue paths must all persist From"
+        );
     }
 }
 

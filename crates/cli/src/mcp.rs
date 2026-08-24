@@ -512,6 +512,7 @@ async fn handle_send(
     let body = params.get("body").and_then(|v| v.as_str());
     let html = params.get("html").and_then(|v| v.as_str());
     let from = params.get("from").and_then(|v| v.as_str());
+    let from = crate::commands::drafts::validate_from_override(from).map_err(|e| e.to_string())?;
     let cc = params.get("cc").and_then(|v| v.as_str());
     let bcc = params.get("bcc").and_then(|v| v.as_str());
     let reply_to = params.get("reply_to").and_then(|v| v.as_str());
@@ -600,6 +601,8 @@ async fn handle_send(
                 db.update_draft_attachments(&draft.id, &attachment_snapshots)
                     .map_err(|e| e.to_string())?;
             }
+            crate::commands::drafts::persist_from_override(&db, &draft.id, from)
+                .map_err(|e| e.to_string())?;
             return Ok(json!({
                 "sent": false,
                 "status": "drafted",
@@ -688,6 +691,8 @@ async fn handle_send(
                 db.update_draft_attachments(&draft.id, &attachment_snapshots)
                     .map_err(|e| e.to_string())?;
             }
+            crate::commands::drafts::persist_from_override(&db, &draft.id, from)
+                .map_err(|e| e.to_string())?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
