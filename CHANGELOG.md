@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.25-dev
+## [Unreleased] — 1.0.26-dev
 
 - fix(dashboard): search is usable at multi-account scale. Gmail-style operators (`from:`, `to:`, `subject:`, `is:unread/read/starred`, `before:`/`after:` dates, quoted phrases) parse to real IMAP criteria client-side, with raw-IMAP queries passing through untouched; the fan-out is bounded (4 in flight) with a 10s per-account timeout, so a slow provider can no longer pin "Searching…" for minutes or saturate the server; unreachable accounts are named in a status line instead of dying in the console; results render incrementally, deduplicated by account/folder/uid; a stale run can never overwrite a newer query's results (the double-fire on submit is gone); and a scope select narrows the search to one account.
 
