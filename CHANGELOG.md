@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.26-dev
+## [Unreleased] — 1.0.27-dev
 
 - fix(dashboard,store): the Unified Inbox is actually unified. The index listing ordered by an unparseable RFC 2822 date string, so the cap silently degenerated to "highest UID wins" and one account owned the whole 50-row page, flipping between loads; a parsed `date_epoch` is now stored (with a Rust backfill for existing rows) and the page is the true newest across accounts. Keyset pagination replaces the hard cap (`next_cursor` + a Load more that appends, deduplicated). The index refresh no longer crawls accounts serially — one slow provider used to pin the pass beyond 240 seconds; it now fans out 6 at a time with a 10-second per-account budget, times out stragglers (evicting their connection), and the unreachable-accounts banner names the accounts instead of only counting them.
 
