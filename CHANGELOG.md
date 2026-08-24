@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.28-dev
+
+- Fix queued, scheduled, and draft-only sends dropping an explicit `--from`
+  send-as identity. The review composer, SMTP sweep, and Sent-copy resolver now
+  use the same persisted public sender as the immediate-send path.
+
 All notable changes to Envelope Email are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
