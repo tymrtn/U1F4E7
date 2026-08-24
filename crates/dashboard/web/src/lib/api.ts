@@ -221,6 +221,12 @@ export interface UnifiedInboxError {
   error: string;
 }
 
+export interface UnifiedNextCursor {
+  date_epoch: number | null;
+  uid: number;
+  account_id: string;
+}
+
 export interface UnifiedInboxResponse {
   scope: 'unified_inbox';
   status: string;
@@ -231,6 +237,8 @@ export interface UnifiedInboxResponse {
   unread_count: number;
   freshness: string;
   errors?: UnifiedInboxError[];
+  /** Present when the page is full: pass back to `unifiedInbox` to continue. */
+  next_cursor?: UnifiedNextCursor | null;
 }
 
 export interface FolderMessagesResponse {
@@ -595,8 +603,20 @@ export const api = {
     return request('/accounts', o);
   },
 
-  unifiedInbox(limit = 50, o?: RequestOptions): Promise<UnifiedInboxResponse> {
-    return request('/messages/unified', { ...o, query: { limit } });
+  unifiedInbox(
+    limit = 50,
+    before?: UnifiedNextCursor | null,
+    o?: RequestOptions
+  ): Promise<UnifiedInboxResponse> {
+    return request('/messages/unified', {
+      ...o,
+      query: {
+        limit,
+        before_epoch: before?.date_epoch ?? undefined,
+        before_uid: before?.uid,
+        before_account: before?.account_id
+      }
+    });
   },
 
   refreshUnifiedInbox(limit = 50, o?: RequestOptions): Promise<UnifiedInboxResponse> {

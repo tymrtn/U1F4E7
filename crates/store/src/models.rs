@@ -326,6 +326,9 @@ pub struct IndexedMessageSummary {
     pub thread_id: Option<String>,
     pub indexed_at: Option<String>,
     pub freshness: String,
+    /// Parsed message date as unix seconds; None when the header date was
+    /// absent or unreadable. The unified cap and keyset cursor order on this.
+    pub date_epoch: Option<i64>,
 }
 
 /// Per-account cached summary freshness shown by aggregate dashboard surfaces.
