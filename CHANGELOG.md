@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 1.0.25-dev
 
+- fix(dashboard): search is usable at multi-account scale. Gmail-style operators (`from:`, `to:`, `subject:`, `is:unread/read/starred`, `before:`/`after:` dates, quoted phrases) parse to real IMAP criteria client-side, with raw-IMAP queries passing through untouched; the fan-out is bounded (4 in flight) with a 10s per-account timeout, so a slow provider can no longer pin "Searching…" for minutes or saturate the server; unreachable accounts are named in a status line instead of dying in the console; results render incrementally, deduplicated by account/folder/uid; a stale run can never overwrite a newer query's results (the double-fire on submit is gone); and a scope select narrows the search to one account.
+
 - fix(dashboard): Drafts box rows open the per-account draft review page (`/accounts/<id>/drafts/<draft>`) instead of dead-ending in the reader with "Select a message to read it" — a draft row carries a local draft id, which the reader route cannot resolve.
 - fix(dashboard): Cockpit "Cancel send" on a scheduled send now HOLDS the queued draft (it leaves the outbox and stays in Drafts) instead of silently discarding it, matching the review page's own "your draft is kept" contract.
 - feat(dashboard): the composer asks before discarding typed content. Esc / × / backdrop on a composer with recipients, subject, body, or attachments opens a "Discard this draft?" confirm (Keep editing / Discard draft); an empty composer still closes immediately. Escape while the confirm is showing means keep editing.
