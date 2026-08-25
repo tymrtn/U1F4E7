@@ -10,6 +10,29 @@ use crate::models::{
 };
 use rusqlite::params;
 
+/// Parse an envelope date (RFC 2822 as IMAP carries it, or RFC 3339) to unix
+/// seconds. Returns None rather than guessing when the string is unreadable.
+pub fn parse_date_epoch(raw: Option<&str>) -> Option<i64> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc2822(raw)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw))
+        .map(|d| d.timestamp())
+        .ok()
+}
+
+/// Keyset cursor for unified-inbox pagination: the (date_epoch, uid,
+/// account_id) of the last row of the previous page, matching the listing's
+/// total order exactly.
+#[derive(Debug, Clone)]
+pub struct UnifiedPageCursor {
+    pub date_epoch: Option<i64>,
+    pub uid: u32,
+    pub account_id: String,
+}
+
 const FRESH_AFTER_SECONDS: i64 = 5 * 60;
 const STALE_AFTER_SECONDS: i64 = 15 * 60;
 
@@ -36,8 +59,8 @@ impl Database {
                 "INSERT INTO indexed_message_summaries (
                     account_id, folder, uidvalidity, uid, message_id,
                     from_addr, to_addr, subject, date, flags_json, size,
-                    snippet, thread_id, indexed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    snippet, thread_id, indexed_at, date_epoch
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(account_id, folder, uidvalidity, uid) DO UPDATE SET
                     message_id = excluded.message_id,
                     from_addr = excluded.from_addr,
@@ -48,7 +71,8 @@ impl Database {
                     size = excluded.size,
                     snippet = excluded.snippet,
                     thread_id = excluded.thread_id,
-                    indexed_at = excluded.indexed_at",
+                    indexed_at = excluded.indexed_at,
+                    date_epoch = excluded.date_epoch",
                 params![
                     account_id,
                     folder,
@@ -64,6 +88,7 @@ impl Database {
                     message.snippet,
                     message.thread_id,
                     indexed_at,
+                    parse_date_epoch(message.date.as_deref()),
                 ],
             )?;
         }
@@ -105,11 +130,31 @@ impl Database {
     }
 
     /// List cached summaries across accounts for a folder, newest first.
+    /// Compatibility wrapper over the paginated listing (first page).
     pub fn list_indexed_message_summaries(
         &self,
         folder: &str,
         limit: u32,
     ) -> Result<Vec<IndexedMessageSummary>> {
+        self.list_indexed_message_summaries_page(folder, limit, None)
+    }
+
+    /// One page of cached summaries across accounts, newest first by parsed
+    /// date (`date_epoch`), tie-broken by uid then account id so the order is
+    /// total and a keyset cursor can continue it exactly. Rows whose account
+    /// has an active index error stay hidden, as before.
+    pub fn list_indexed_message_summaries_page(
+        &self,
+        folder: &str,
+        limit: u32,
+        cursor: Option<&UnifiedPageCursor>,
+    ) -> Result<Vec<IndexedMessageSummary>> {
+        let has_cursor = i64::from(cursor.is_some());
+        let cursor_epoch = cursor
+            .map(|c| c.date_epoch.unwrap_or(0))
+            .unwrap_or(i64::MAX);
+        let cursor_uid = cursor.map(|c| i64::from(c.uid)).unwrap_or(i64::MAX);
+        let cursor_account = cursor.map(|c| c.account_id.clone()).unwrap_or_default();
         let mut stmt = self.conn().prepare(
             "SELECT ims.account_id, a.username, a.display_name, ims.folder,
                     ims.uidvalidity, ims.uid, ims.message_id, ims.from_addr,
@@ -120,14 +165,18 @@ impl Database {
                         WHEN strftime('%s','now') - strftime('%s', ims.indexed_at) <= ?2 THEN 'fresh'
                         WHEN strftime('%s','now') - strftime('%s', ims.indexed_at) <= ?3 THEN 'stale'
                         ELSE 'expired'
-                    END AS freshness
+                    END AS freshness,
+                    ims.date_epoch
              FROM indexed_message_summaries ims
              INNER JOIN accounts a ON a.id = ims.account_id
              LEFT JOIN message_index_state mis
                ON mis.account_id = ims.account_id AND mis.folder = ims.folder
              WHERE ims.folder = ?1
                AND mis.last_error IS NULL
-             ORDER BY COALESCE(strftime('%s', ims.date), 0) DESC, ims.uid DESC
+               AND (?5 = 0
+                    OR (COALESCE(ims.date_epoch, 0), ims.uid, ims.account_id)
+                       < (?6, ?7, ?8))
+             ORDER BY COALESCE(ims.date_epoch, 0) DESC, ims.uid DESC, ims.account_id DESC
              LIMIT ?4",
         )?;
         let rows = stmt.query_map(
@@ -135,7 +184,11 @@ impl Database {
                 folder,
                 FRESH_AFTER_SECONDS,
                 STALE_AFTER_SECONDS,
-                limit as i64
+                limit as i64,
+                has_cursor,
+                cursor_epoch,
+                cursor_uid,
+                cursor_account,
             ],
             map_indexed_message_summary,
         )?;
@@ -210,12 +263,154 @@ fn map_indexed_message_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<Inde
         thread_id: row.get(14)?,
         indexed_at: row.get(15)?,
         freshness: row.get(16)?,
+        date_epoch: row.get(17)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(uid: u32, date: &str, subject: &str) -> IndexedMessageInput {
+        IndexedMessageInput {
+            uid,
+            message_id: Some(format!("<{uid}@x>")),
+            from_addr: "p@example.test".into(),
+            to_addr: "me@example.test".into(),
+            subject: subject.into(),
+            date: Some(date.into()),
+            flags: vec![],
+            size: 1,
+            snippet: None,
+            thread_id: None,
+        }
+    }
+
+    // ── unified ordering under the SQL cap (sweep blocker #4) ───────────
+    // The listing's ORDER BY parsed `ims.date` with strftime, which cannot
+    // read the RFC 2822 dates IMAP envelopes carry — every row collapsed to
+    // epoch 0 and the cap degenerated to "highest UID wins across accounts".
+    // One account's big UIDs then owned the whole page regardless of dates.
+
+    #[test]
+    fn cap_keeps_the_newest_message_across_accounts_not_the_biggest_uid() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-big-uids", "big@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-small-uids", "small@example.test")
+            .unwrap();
+        // Older message, huge UID.
+        db.upsert_indexed_message_summaries(
+            "acct-big-uids",
+            "INBOX",
+            1,
+            &[msg(90_000, "Fri, 01 Aug 2026 10:00:00 +0000", "older")],
+        )
+        .unwrap();
+        // Newer message, tiny UID.
+        db.upsert_indexed_message_summaries(
+            "acct-small-uids",
+            "INBOX",
+            1,
+            &[msg(5, "Sun, 23 Aug 2026 10:00:00 +0000", "newer")],
+        )
+        .unwrap();
+
+        let rows = db.list_indexed_message_summaries("INBOX", 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].summary.subject, "newer",
+            "the cap must keep the newest by date"
+        );
+        assert_eq!(rows[0].account_id, "acct-small-uids");
+    }
+
+    #[test]
+    fn rfc2822_and_rfc3339_dates_order_together() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-a", "a@example.test")
+            .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-a",
+            "INBOX",
+            1,
+            &[
+                msg(1, "Fri, 01 Aug 2026 10:00:00 +0000", "aug-1"),
+                msg(2, "2026-08-15T10:00:00Z", "aug-15"),
+                msg(3, "Sat, 22 Aug 2026 09:00:00 +0000", "aug-22"),
+            ],
+        )
+        .unwrap();
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+        let subjects: Vec<&str> = rows.iter().map(|r| r.summary.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["aug-22", "aug-15", "aug-1"]);
+    }
+
+    // ── keyset pagination ───────────────────────────────────────────────
+
+    #[test]
+    fn keyset_pagination_returns_the_next_page_without_overlap() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-a", "a@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-b", "b@example.test")
+            .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-a",
+            "INBOX",
+            1,
+            &[
+                msg(10, "Sun, 23 Aug 2026 10:00:00 +0000", "n1"),
+                msg(11, "Fri, 21 Aug 2026 10:00:00 +0000", "n3"),
+            ],
+        )
+        .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-b",
+            "INBOX",
+            1,
+            &[
+                msg(3, "Sat, 22 Aug 2026 10:00:00 +0000", "n2"),
+                msg(4, "Thu, 20 Aug 2026 10:00:00 +0000", "n4"),
+            ],
+        )
+        .unwrap();
+
+        let page1 = db
+            .list_indexed_message_summaries_page("INBOX", 2, None)
+            .unwrap();
+        let s1: Vec<&str> = page1.iter().map(|r| r.summary.subject.as_str()).collect();
+        assert_eq!(s1, vec!["n1", "n2"]);
+
+        let last = page1.last().unwrap();
+        let cursor = UnifiedPageCursor {
+            date_epoch: last.date_epoch,
+            uid: last.summary.uid,
+            account_id: last.account_id.clone(),
+        };
+        let page2 = db
+            .list_indexed_message_summaries_page("INBOX", 2, Some(&cursor))
+            .unwrap();
+        let s2: Vec<&str> = page2.iter().map(|r| r.summary.subject.as_str()).collect();
+        assert_eq!(
+            s2,
+            vec!["n3", "n4"],
+            "second page continues without overlap"
+        );
+
+        let page3 = db
+            .list_indexed_message_summaries_page(
+                "INBOX",
+                2,
+                Some(&UnifiedPageCursor {
+                    date_epoch: page2.last().unwrap().date_epoch,
+                    uid: page2.last().unwrap().summary.uid,
+                    account_id: page2.last().unwrap().account_id.clone(),
+                }),
+            )
+            .unwrap();
+        assert!(page3.is_empty(), "no third page");
+    }
 
     #[test]
     fn refreshed_empty_mailbox_reports_freshness_from_index_state() {

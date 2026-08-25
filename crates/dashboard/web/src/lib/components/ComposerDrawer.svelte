@@ -1,5 +1,6 @@
 <script lang="ts">
   import Drawer from './Drawer.svelte';
+  import Modal from './Modal.svelte';
   import Button from './Button.svelte';
   import RecipientField from './RecipientField.svelte';
   import Spinner from './Spinner.svelte';
@@ -38,6 +39,40 @@
   let readingAttachments = $state(false);
   let sendError = $state<{ code: string; message: string } | null>(null);
   let openSession = $state('');
+  // Discard protection: Esc / × / backdrop on a composer with content asks
+  // first. There is no autosave yet, so a stray Escape would otherwise throw
+  // typed work away with zero network calls.
+  let discardConfirmOpen = $state(false);
+  const isDirty = $derived(
+    toRaw.trim().length > 0 ||
+      ccRaw.trim().length > 0 ||
+      bccRaw.trim().length > 0 ||
+      subject.trim().length > 0 ||
+      body.trim().length > 0 ||
+      attachments.length > 0
+  );
+  function requestClose() {
+    if (sending) return;
+    // Escape while the confirm is showing means "keep editing".
+    if (discardConfirmOpen) {
+      discardConfirmOpen = false;
+      return;
+    }
+    if (isDirty) {
+      // Next tick, not synchronously: the Modal's own window Escape listener
+      // evaluates `open` at event time, so opening it during this same keydown
+      // would let the very same Escape close it again before it ever painted.
+      setTimeout(() => {
+        discardConfirmOpen = true;
+      }, 0);
+      return;
+    }
+    composer.close();
+  }
+  function discardDraft() {
+    discardConfirmOpen = false;
+    composer.close();
+  }
 
   const isFreshMessage = $derived(composer.mode === 'compose' || composer.mode === 'forward');
   const toValid = $derived(optionalAddrsValid(toRaw));
@@ -109,6 +144,7 @@
     bodyFormat = 'text';
     attachments = [];
     sendError = null;
+    discardConfirmOpen = false;
   });
 
   function attachmentPayloads(): ComposeAttachment[] {
@@ -222,7 +258,7 @@
   subtitle={accountContext}
   size="wide"
   actions={headerActions}
-  onclose={() => composer.close()}
+  onclose={requestClose}
 >
   <form id="composer-form" class="composer-form" onsubmit={(event) => { event.preventDefault(); send(); }}>
     <div class="composer-scroll">
@@ -363,6 +399,18 @@
     </footer>
   </form>
 </Drawer>
+
+<Modal
+  open={discardConfirmOpen}
+  title="Discard this draft?"
+  onclose={() => (discardConfirmOpen = false)}
+>
+  <p class="discard-warn">Nothing has been saved yet — closing now throws away what you typed.</p>
+  {#snippet footer()}
+    <button type="button" class="modal-keep" onclick={() => (discardConfirmOpen = false)}>Keep editing</button>
+    <button type="button" class="modal-discard" onclick={discardDraft}>Discard draft</button>
+  {/snippet}
+</Modal>
 
 <style>
   .composer-form {
@@ -630,5 +678,20 @@
     }
     .composer-review { grid-template-columns: 1fr; }
     #composer-body { min-height: 18rem; padding: 0.875rem; }
+  }
+  .discard-warn { margin: 0; font-size: 0.875rem; }
+  .modal-keep,
+  .modal-discard {
+    font: inherit;
+    padding: 0.4rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--env-rule);
+    background: transparent;
+    cursor: pointer;
+  }
+  .modal-discard {
+    color: #fff;
+    background: var(--env-danger, #b42318);
+    border-color: var(--env-danger, #b42318);
   }
 </style>

@@ -14,6 +14,7 @@
   import { rulesApi } from '$lib/rules-api';
   import { normalizedAddress, isValidEmail } from '$lib/addresses';
   import { readState } from '$lib/read-state.svelte';
+  import { looksLikeTrash } from '$lib/folder-kinds';
   import Modal from './Modal.svelte';
   import Toast from './Toast.svelte';
   import MonoTag from './MonoTag.svelte';
@@ -86,11 +87,6 @@
   // True when the toolbar is acting on a Trash view: only then does Delete mean
   // a permanent, confirmed hard-delete. Everywhere else Delete moves to Trash.
   const inTrash = $derived(looksLikeTrash(folder));
-
-  function looksLikeTrash(f: string): boolean {
-    const leaf = (f ?? '').split(/[/.]/).pop()?.trim().toLowerCase() ?? '';
-    return leaf === 'trash' || leaf === 'deleted items' || leaf === 'deleted messages';
-  }
 
   let toastSeq = $state(0);
   let toasts = $state<ToastItem[]>([]);

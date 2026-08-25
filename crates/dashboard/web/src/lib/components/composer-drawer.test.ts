@@ -94,3 +94,38 @@ describe('ComposerDrawer recipient gating', () => {
     expect(sendButton()).toBeEnabled();
   });
 });
+
+// ── Discard protection ────────────────────────────────────────────────
+// Esc / × / backdrop on a composer with content must not silently throw the
+// draft away: there is no autosave yet, so the only defence is a confirm.
+
+describe('ComposerDrawer discard protection', () => {
+  it('closes immediately when nothing has been typed', async () => {
+    getComposerStore().open('compose', { accountId: 'acc1' });
+    render(ComposerDrawer, { accounts: ACCOUNTS });
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(getComposerStore().isOpen).toBe(false);
+  });
+
+  it('keeps the draft and asks first when content is present', async () => {
+    await renderCompose();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(getComposerStore().isOpen).toBe(true);
+    expect(await screen.findByRole('button', { name: 'Keep editing' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard draft' })).toBeInTheDocument();
+    // Content survived the Escape.
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Hello');
+  });
+
+  it('Keep editing returns to the draft; Discard draft closes it', async () => {
+    await renderCompose();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Keep editing' }));
+    expect(getComposerStore().isOpen).toBe(true);
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Hello');
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Discard draft' }));
+    expect(getComposerStore().isOpen).toBe(false);
+  });
+});

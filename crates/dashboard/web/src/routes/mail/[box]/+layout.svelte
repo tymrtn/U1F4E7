@@ -20,10 +20,13 @@
   import { readState } from '$lib/read-state.svelte';
   import { getLiveStore } from '$lib/live.svelte';
   import { getComposerStore } from '$lib/composer.svelte';
+  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+  import { parseSearchQuery } from '$lib/search-query';
   import {
     api,
     EnvelopeApiError,
     type UnifiedInboxMessage,
+    type UnifiedNextCursor,
     type UnifiedInboxError,
     type Draft,
     type SnoozedItem,
@@ -40,6 +43,20 @@
   const selectedAccount = $derived(page.params.account ?? null);
 
   const selection = new SelectionStore();
+
+  // ── Mailbox-ops signal ────────────────────────────────────────────
+  // The reader (nested route, no prop channel) announces archive / trash /
+  // delete / star through this shared store. Re-run the same refresh
+  // BulkToolbar triggers via `onoperated`, so the moved row disappears from the
+  // mounted list. Version-compare so a route change alone never re-fetches.
+  const mailboxOps = getMailboxOpsStore();
+  let seenOpsVersion = 0;
+  $effect(() => {
+    const v = mailboxOps.version;
+    if (v === seenOpsVersion) return;
+    seenOpsVersion = v;
+    void handleOperated();
+  });
 
   // ── SSE live store ────────────────────────────────────────────────
   // Started once on mount (onMount guard prevents SSR). When the stream is
@@ -58,6 +75,8 @@
   let undoToast = $state<{ res: ComposeResponse; accountId: string } | null>(null);
 
   let unifiedMessages = $state<UnifiedInboxMessage[]>([]);
+  let unifiedNextCursor = $state<UnifiedNextCursor | null>(null);
+  let unifiedLoadingMore = $state(false);
   let drafts = $state<Draft[]>([]);
   let snoozed = $state<SnoozedItem[]>([]);
   let listErrors = $state<UnifiedInboxError[]>([]);
@@ -92,6 +111,12 @@
   let searchResults = $state<SearchHit[]>([]);
   let searching = $state(false);
   let searchError = $state<string | null>(null);
+  /** Accounts that failed or timed out in the current search run (usernames). */
+  let searchFailures = $state<string[]>([]);
+  /** 'all' or a single account id — narrows the fan-out. */
+  let searchScope = $state<string>('all');
+  let searchGen = 0;
+  let searchAbort: AbortController | null = null;
   const isSearching = $derived(searchQuery.length > 0);
 
   let starOverrides = $state<Map<string, boolean>>(new Map());
@@ -131,12 +156,39 @@
     row.scrollIntoView({ block: 'nearest' });
   });
 
-  function applyUnified(res: { messages: UnifiedInboxMessage[]; errors?: UnifiedInboxError[] }) {
+  function applyUnified(res: {
+    messages: UnifiedInboxMessage[];
+    errors?: UnifiedInboxError[];
+    next_cursor?: UnifiedNextCursor | null;
+  }) {
     unifiedMessages = res.messages;
+    unifiedNextCursor = res.next_cursor ?? null;
     listErrors = res.errors ?? [];
     // Record the mailbox each row came from, so a reader link that lost its
     // `?folder=` can still resolve one instead of guessing INBOX.
     folderHints.remember(res.messages);
+  }
+
+  /** Fetch the next unified page with the keyset cursor and append it.
+   *  Deduped by account:uid so an overlap between pages can never render a
+   *  message twice; order is preserved (the server continues the same total
+   *  order the current tail ends on). */
+  async function loadMoreUnified() {
+    const cursor = unifiedNextCursor;
+    if (!cursor || unifiedLoadingMore) return;
+    unifiedLoadingMore = true;
+    try {
+      const res = await api.unifiedInbox(50, cursor);
+      const seen = new Set(unifiedMessages.map((m) => `${m.account_id}:${m.uid}`));
+      const fresh = res.messages.filter((m) => !seen.has(`${m.account_id}:${m.uid}`));
+      unifiedMessages = [...unifiedMessages, ...fresh];
+      unifiedNextCursor = res.next_cursor ?? null;
+      folderHints.remember(fresh);
+    } catch {
+      // Keep the loaded rows; the button stays for a retry.
+    } finally {
+      unifiedLoadingMore = false;
+    }
   }
 
   async function refreshStaleUnified(gen: number) {
@@ -254,45 +306,103 @@
 
   $effect(() => {
     const q = searchQuery;
+    const scope = searchScope;
     // A search query change swaps the result set under any selection —
     // stale hidden selections from the prior list/query must never persist
     // to act against messages the operator can no longer see.
     selection.clear();
     if (!q) {
+      searchAbort?.abort();
+      searchGen += 1;
+      searching = false;
       searchResults = [];
       searchError = null;
+      searchFailures = [];
       return;
     }
-    runSearch(q);
+    runSearch(q, scope);
   });
 
-  async function runSearch(q: string) {
+  /** Per-account IMAP search timeout. An account that cannot answer within
+   *  this window is reported as unreachable instead of pinning the spinner —
+   *  the sweep found "Searching…" running 90–150s against slow providers. */
+  const SEARCH_ACCOUNT_TIMEOUT_MS = 10_000;
+  /** In-flight per-account searches at once. 25 simultaneous IMAP SELECTs
+   *  saturated the server (post-search navigation timed out); a small pool
+   *  keeps the box responsive while the fan-out drains. */
+  const SEARCH_CONCURRENCY = 4;
+
+  async function runSearch(q: string, scope: string) {
+    const gen = ++searchGen;
+    searchAbort?.abort();
+    const abort = new AbortController();
+    searchAbort = abort;
+
     searching = true;
     searchError = null;
+    searchFailures = [];
+    searchResults = [];
+
+    const { imap } = parseSearchQuery(q);
+    if (!imap) {
+      searching = false;
+      return;
+    }
+
     try {
       const { accounts } = await api.listAccounts();
-      const merged: SearchHit[] = [];
-      await Promise.all(
-        accounts.map(async (acct) => {
-          try {
-            const res = await api.searchMessages(acct.id, q, SEARCH_FOLDER);
-            // Tag each hit with the account and folder it actually came from —
-            // the per-account search response carries neither, and a search
-            // spanning accounts must not blur which account owns which hit.
-            merged.push(
-              ...res.messages.map((m) => ({ ...m, account_id: acct.id, folder: SEARCH_FOLDER }))
-            );
-          } catch {
-            // partial ok
-          }
-        })
-      );
-      searchResults = merged;
+      if (gen !== searchGen) return;
+      const targets = scope === 'all' ? accounts : accounts.filter((a) => a.id === scope);
+
+      const seen = new Set<string>();
+      const failures: string[] = [];
+
+      const searchOne = async (acct: Account) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const res = await Promise.race([
+            api.searchMessages(acct.id, imap, SEARCH_FOLDER, 50, { signal: abort.signal }),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                reject(new Error('timed out'));
+              }, SEARCH_ACCOUNT_TIMEOUT_MS);
+            })
+          ]);
+          if (gen !== searchGen) return;
+          // Results render as each account lands; identity-keyed dedupe means a
+          // hit can never appear twice no matter how responses interleave.
+          const fresh = res.messages
+            .map((m) => ({ ...m, account_id: acct.id, folder: SEARCH_FOLDER }))
+            .filter((m) => {
+              const key = `${m.account_id}:${m.folder}:${m.uid}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          if (fresh.length > 0) searchResults = [...searchResults, ...fresh];
+        } catch {
+          if (gen === searchGen) failures.push(acct.username || acct.name || acct.id);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
+      const queue = [...targets];
+      const workers = Array.from({ length: Math.min(SEARCH_CONCURRENCY, queue.length) }, async () => {
+        while (queue.length > 0 && gen === searchGen) {
+          const acct = queue.shift()!;
+          await searchOne(acct);
+        }
+      });
+      await Promise.all(workers);
+      if (gen !== searchGen) return;
+      searchFailures = failures;
     } catch (e) {
+      if (gen !== searchGen) return;
       const err = e as EnvelopeApiError;
       searchError = err.message ?? 'Search failed.';
     } finally {
-      searching = false;
+      if (gen === searchGen) searching = false;
     }
   }
 
@@ -514,10 +624,19 @@
             {/if}
           </span>
           <SearchBar
-            hint="Search {box.label}…"
-            onsubmit={(q) => runSearch(q)}
-            onreset={() => { searchResults = []; searchError = null; }}
+            hint="Search {box.label}… (from: to: subject: is:unread before:)"
+            onreset={() => { searchResults = []; searchError = null; searchFailures = []; }}
           />
+          <select
+            class="search-scope"
+            aria-label="Search scope"
+            bind:value={searchScope}
+          >
+            <option value="all">All accounts</option>
+            {#each allAccounts as acct (acct.id)}
+              <option value={acct.id}>{acct.username || acct.name}</option>
+            {/each}
+          </select>
         {/if}
         <button
           id="compose-btn"
@@ -593,14 +712,19 @@
       </div>
 
     {:else if isSearching}
-      {#if searching}
+      {#if searchFailures.length > 0}
+        <p class="search-failures" role="status">
+          {searchFailures.length} account{searchFailures.length === 1 ? '' : 's'} didn't respond: {searchFailures.join(', ')}
+        </p>
+      {/if}
+      {#if searching && searchResults.length === 0}
         <div class="list-loading"><Spinner label="Searching" /> <span>Searching…</span></div>
       {:else if searchError}
         <div class="list-error" role="alert">
           <p class="list-error-msg">Search failed.</p>
           <p class="list-error-detail">{searchError}</p>
         </div>
-      {:else if searchResults.length === 0}
+      {:else if searchResults.length === 0 && !searching}
         <EmptyState title="No results" hint="No messages matched your search." />
       {:else}
         <ul id="search-results-list" class="msg-list">
@@ -631,7 +755,7 @@
     {:else if box.slug === 'unified'}
       {#if listErrors.length > 0}
         <p class="list-partial" role="status">
-          {listErrors.length} account(s) couldn't be reached; showing what loaded.
+          {listErrors.length} account{listErrors.length === 1 ? '' : 's'} couldn't be reached: {listErrors.map((e) => e.account_username).join(', ')} — showing what loaded.
         </p>
       {/if}
       {#if unifiedMessages.length === 0}
@@ -667,6 +791,18 @@
             </li>
           {/each}
         </ul>
+        {#if unifiedNextCursor}
+          <div class="load-more-row">
+            <button
+              class="load-more-btn"
+              type="button"
+              disabled={unifiedLoadingMore}
+              onclick={loadMoreUnified}
+            >
+              {unifiedLoadingMore ? 'Loading…' : 'Load more'}
+            </button>
+          </div>
+        {/if}
       {/if}
 
     {:else if box.slug === 'drafts'}
@@ -689,7 +825,7 @@
                   unread: false,
                   starred: false,
                   accountChip: d.account_id,
-                  href: `${base}/mail/drafts/${encodeURIComponent(d.account_id)}/${d.id}`,
+                  href: `${base}/accounts/${encodeURIComponent(d.account_id)}/drafts/${encodeURIComponent(d.id)}`,
                 }}
                 {selection}
                 orderedKeys={drafts.map((x) => `draft:${x.account_id}:${x.id}`)}
@@ -946,5 +1082,40 @@
     .pane-head-right {
       justify-content: stretch;
     }
+  }
+  .search-scope {
+    flex-shrink: 0;
+    max-width: 11rem;
+    font: inherit;
+    font-size: 0.8125rem;
+    color: var(--env-ink);
+    background: var(--env-surface);
+    border: 1px solid var(--env-rule);
+    border-radius: var(--radius-sm, 3px);
+    padding: 0.3rem 0.4rem;
+  }
+  .search-failures {
+    margin: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--env-muted);
+  }
+  .load-more-row {
+    display: flex;
+    justify-content: center;
+    padding: 0.6rem 0 1rem;
+  }
+  .load-more-btn {
+    font: inherit;
+    font-size: 0.8125rem;
+    color: var(--env-ink);
+    background: var(--env-surface);
+    border: 1px solid var(--env-rule);
+    border-radius: var(--radius-sm, 3px);
+    padding: 0.35rem 1.1rem;
+    cursor: pointer;
+  }
+  .load-more-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 </style>

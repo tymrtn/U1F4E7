@@ -21,6 +21,15 @@ const { readerApiMock } = vi.hoisted(() => ({
   }
 }));
 
+const { apiMock } = vi.hoisted(() => ({
+  apiMock: { bulkClient: vi.fn() }
+}));
+
+vi.mock('$lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/api')>();
+  return { ...actual, bulkClient: apiMock.bulkClient };
+});
+
 vi.mock('$lib/reader-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/reader-api')>();
   return {
@@ -42,6 +51,9 @@ import {
 } from '$lib/reader-api';
 import { EnvelopeApiError } from '$lib/api';
 import { __resetReadState } from '$lib/read-state.svelte';
+import { getComposerStore, __resetComposerStore } from '$lib/composer.svelte';
+import { getMailboxOpsStore, __resetMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+import { goto } from '$app/navigation';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -68,12 +80,15 @@ beforeEach(() => {
   readerApiMock.fetchMessageDetail.mockResolvedValue({ message: BASE_MSG });
   readerApiMock.fetchThread.mockResolvedValue(null);
   readerApiMock.postFlags.mockResolvedValue({ ok: true, uid: 42, added: [], removed: [] });
+  apiMock.bulkClient.mockResolvedValue({ done: 1, total: 1, failed: [] });
   __resetReadState();
+  __resetMailboxOpsStore();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
   sessionStorage.clear();
+  __resetComposerStore();
 });
 
 // ── reader-api utils ──────────────────────────────────────────────────
@@ -442,5 +457,156 @@ describe('ReaderPane', () => {
     render(ReaderPane);
     await waitFor(() => screen.getByRole('alert'));
     expect(screen.getByText('message_not_found')).toBeInTheDocument();
+  });
+});
+
+// ── ReaderPane reply / reply-all / forward ────────────────────────────
+// A human must be able to answer mail from the reader. The composer store is
+// the coordination point: the reader opens it in the right mode with the open
+// message as the parent; ComposerDrawer (mounted in the mail layout) does the
+// rest. Forward is a fresh message, so subject + quoted body are prefilled.
+
+describe('ReaderPane reply/forward actions', () => {
+  it('renders Reply, Reply all, and Forward once a message loads', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Reply' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reply all' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Forward' })).toBeInTheDocument();
+  });
+
+  it('Reply opens the composer in reply mode for the open message, quoting it', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply');
+    expect(composer.context.accountId).toBe('acct-a');
+    expect(composer.context.parentUid).toBe(42);
+    expect(composer.context.parentFolder).toBe('INBOX');
+    expect(composer.context.bodyPrefix).toContain('sender@example.com wrote:');
+    expect(composer.context.bodyPrefix).toContain('> Hello world');
+  });
+
+  it('Reply all opens the composer in reply-all mode', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply all' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply-all');
+    expect(composer.context.parentUid).toBe(42);
+  });
+
+  it('Forward opens a fresh message with a Fwd: subject and the original quoted', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Forward' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('forward');
+    expect(composer.context.accountId).toBe('acct-a');
+    expect(composer.context.subject).toBe('Fwd: Test subject');
+    expect(composer.context.bodyPrefix).toContain('---------- Forwarded message ----------');
+    expect(composer.context.bodyPrefix).toContain('From: sender@example.com');
+    expect(composer.context.bodyPrefix).toContain('Hello world');
+  });
+
+  it('does not re-prefix a subject that already carries Fwd:', async () => {
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
+      message: { ...BASE_MSG, subject: 'Fwd: Test subject' }
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Fwd: Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Forward' }));
+    expect(getComposerStore().context.subject).toBe('Fwd: Test subject');
+  });
+});
+
+// ── ReaderPane mailbox actions: archive / delete / star ───────────────
+// Gmail parity: the open message can be archived, trashed (or permanently
+// deleted from inside Trash, behind a confirm), and starred without going back
+// to the list. Moves reuse the same canonical special-use targets and the same
+// per-message endpoints BulkToolbar uses; the list is told to refresh via the
+// shared mailbox-ops store, and the reader returns to the list.
+
+describe('ReaderPane mailbox actions', () => {
+  it('Archive moves the open message to \\Archive, refreshes the list, and returns to it', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    const ops = getMailboxOpsStore();
+    await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
+    expect(apiMock.bulkClient).toHaveBeenCalledWith(
+      { type: 'move', to_folder: '\\Archive', folder: 'INBOX' },
+      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
+    );
+    await waitFor(() => expect(ops.version).toBe(1));
+    expect(goto).toHaveBeenCalledWith('/v2/mail/unified');
+  });
+
+  it('Delete outside Trash moves the message to \\Trash without a confirm', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
+    expect(apiMock.bulkClient).toHaveBeenCalledWith(
+      { type: 'move', to_folder: '\\Trash', folder: 'INBOX' },
+      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
+    );
+    expect(goto).toHaveBeenCalledWith('/v2/mail/unified');
+  });
+
+  it('Delete inside Trash asks for confirmation, then permanently deletes', async () => {
+    pageState.url = new URL('http://localhost/v2/mail/unified/acct-a/42?folder=Trash') as typeof pageState.url;
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete forever' }));
+    // Nothing destructive yet: a confirm is showing.
+    expect(apiMock.bulkClient).not.toHaveBeenCalled();
+    const confirmBtn = await screen.findByRole('button', { name: 'Permanently delete' });
+    await fireEvent.click(confirmBtn);
+    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
+    expect(apiMock.bulkClient).toHaveBeenCalledWith(
+      { type: 'delete', folder: 'Trash' },
+      [{ accountId: 'acct-a', uid: 42, folder: 'Trash' }]
+    );
+  });
+
+  it('a failed move stays on the message and reports the error', async () => {
+    apiMock.bulkClient.mockResolvedValueOnce({
+      done: 1,
+      total: 1,
+      failed: [{ item: { accountId: 'acct-a', uid: 42, folder: 'INBOX' }, error: 'IMAP down' }]
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    await waitFor(() => expect(screen.getByText(/IMAP down/)).toBeInTheDocument());
+    expect(goto).not.toHaveBeenCalled();
+    expect(getMailboxOpsStore().version).toBe(0);
+  });
+
+  it('Star sets \\Flagged on the open message and flips to Unstar', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Star' }));
+    await waitFor(() =>
+      expect(readerApiMock.postFlags).toHaveBeenCalledWith('acct-a', 42, 'INBOX', ['\\Flagged'], [])
+    );
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Unstar' })).toBeInTheDocument());
+  });
+
+  it('Unstar removes \\Flagged when the message is already starred', async () => {
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
+      message: { ...BASE_MSG, flags: ['\\Flagged'] }
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Unstar' }));
+    await waitFor(() =>
+      expect(readerApiMock.postFlags).toHaveBeenCalledWith('acct-a', 42, 'INBOX', [], ['\\Flagged'])
+    );
   });
 });

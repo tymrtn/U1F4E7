@@ -50,6 +50,7 @@ import AccountDrawer from './AccountDrawer.svelte';
 import MailLayout from '../../routes/mail/[box]/+layout.svelte';
 import ReaderPage from '../../routes/mail/[box]/[account]/[uid]/+page.svelte';
 import { createRawSnippet } from 'svelte';
+import { getMailboxOpsStore, __resetMailboxOpsStore } from '$lib/mailbox-ops.svelte';
 
 // A trivial snippet to satisfy the layout's `children` slot in tests.
 const emptyChildren = createRawSnippet(() => ({ render: () => '<span></span>' }));
@@ -322,5 +323,79 @@ describe('Reader pane', () => {
     render(ReaderPage);
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText('imap_unavailable')).toBeInTheDocument();
+  });
+});
+
+// ── mailbox-ops → list refresh ────────────────────────────────────────
+// The reader (a nested route with no prop channel to this layout) announces
+// archive/trash/delete/star through the shared mailbox-ops store; the layout
+// must re-fetch the mounted list exactly as it does after BulkToolbar's
+// `onoperated`, so the moved row disappears without a page reload.
+
+describe('mail layout refreshes on mailbox-ops signal', () => {
+  const EMPTY_UNIFIED = {
+    scope: 'unified_inbox',
+    status: 'ok',
+    folder: 'INBOX',
+    limit: 50,
+    unread_count: 0,
+    freshness: 'fresh',
+    accounts: [],
+    errors: [],
+    messages: []
+  };
+
+  beforeEach(() => {
+    __resetMailboxOpsStore();
+    apiMock.unifiedInbox.mockResolvedValue(EMPTY_UNIFIED);
+  });
+  afterEach(() => __resetMailboxOpsStore());
+
+  it('re-fetches the unified list when the store reports an operation', async () => {
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledTimes(1));
+
+    getMailboxOpsStore().operated();
+
+    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledTimes(2));
+  });
+
+  it('does not re-fetch on mount when nothing has operated', async () => {
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledTimes(1));
+    // Give any stray effect a tick to fire.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(apiMock.unifiedInbox).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Drafts box rows route to the review page ─────────────────────────
+// A draft row carries a local draft id, not an IMAP uid; the reader route
+// cannot render it ("Select a message to read it"). The only surface that can
+// edit and send a draft is /accounts/<id>/drafts/<draft>, so rows link there.
+
+describe('Drafts box rows', () => {
+  it('link to the per-account draft review page, not the reader', async () => {
+    pageState.params = { box: 'drafts' };
+    pageState.url = new URL('http://localhost/v2/mail/drafts') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({ accounts: [HEALTHY_ACCT] });
+    (apiMock as unknown as { drafts: ReturnType<typeof vi.fn> }).drafts = vi.fn().mockResolvedValue({
+      drafts: [
+        {
+          id: 'draft-abc',
+          account_id: 'acct-ok',
+          imap_uid: 77,
+          subject: 'Half-written reply',
+          to_addr: 'dana@example.com',
+          created_at: '2026-08-22T10:00:00Z',
+          text_content: 'hello',
+          status: 'draft'
+        }
+      ]
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Half-written reply')).toBeInTheDocument());
+    const row = screen.getByText('Half-written reply').closest('a');
+    expect(row?.getAttribute('href')).toBe('/v2/accounts/acct-ok/drafts/draft-abc');
   });
 });
