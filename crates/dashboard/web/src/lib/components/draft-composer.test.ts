@@ -304,10 +304,53 @@ describe('DraftComposer edit', () => {
 
 // ── Sending ───────────────────────────────────────────────────────────
 
+describe('DraftComposer names the send action Human-only Send', () => {
+  it('explains what the operator is authorizing next to the button', async () => {
+    await renderLoaded();
+
+    const note = document.getElementById('draft-human-send-note');
+    expect(note).toBeTruthy();
+    // The four facts that make the name mean something: it is the operator's
+    // own send, the cooldown/Hold/Sent-proof handling is untouched, Governor
+    // does not score it, and an edit withdraws the approval.
+    expect(note).toHaveTextContent(/your explicit send/i);
+    expect(note).toHaveTextContent(/cooldown/i);
+    expect(note).toHaveTextContent(/hold/i);
+    expect(note).toHaveTextContent(/sent copy/i);
+    expect(note).toHaveTextContent(/governor/i);
+    expect(note).toHaveTextContent(/withdraws/i);
+  });
+
+  it('names the action in the confirmation too', async () => {
+    await renderLoaded();
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent(/human-only send/i);
+  });
+
+  it('renames the blocked-send retry as well', async () => {
+    await renderLoaded({
+      status: 'pending_review',
+      send_after: null,
+      metadata: {
+        send_block: {
+          code: 'governor_blocked',
+          title: 'This send was stopped',
+          explanation: 'Envelope paused this message for review before sending.',
+          action: 'send'
+        }
+      }
+    });
+
+    expect(screen.getByRole('button', { name: /^human-only send again$/i })).toBeEnabled();
+  });
+});
+
 describe('DraftComposer send', () => {
   it('requires explicit confirmation before queueing', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
@@ -315,7 +358,7 @@ describe('DraftComposer send', () => {
 
   it('queues with confirm=true and the reviewed revision once confirmed', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
 
@@ -329,7 +372,7 @@ describe('DraftComposer send', () => {
 
   it('reports the queued outcome honestly — queued, not sent', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
 
@@ -349,7 +392,7 @@ describe('DraftComposer send', () => {
 
   it('cancelling the confirmation queues nothing', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /keep editing/i }));
 
@@ -361,7 +404,7 @@ describe('DraftComposer send', () => {
     await renderLoaded();
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Unsaved' } });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
     expect(screen.getByText(/save your changes/i)).toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
   });
@@ -371,7 +414,7 @@ describe('DraftComposer send', () => {
     apiMock.sendDraft.mockRejectedValueOnce(
       new EnvelopeApiError(409, 'http_409', 'draft modified concurrently', null)
     );
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
 
@@ -389,7 +432,7 @@ describe('DraftComposer status guards', () => {
 
     expect(screen.getByLabelText('To')).toBeDisabled();
     expect(screen.getByLabelText('Message')).toBeDisabled();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^human-only send$/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
   });
 
@@ -400,7 +443,7 @@ describe('DraftComposer status guards', () => {
 
     expect(screen.getByLabelText('To')).not.toBeDisabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^human-only send$/i })).not.toBeInTheDocument();
   });
 
   it('renders a draft claimed by the send sweep read-only', async () => {
@@ -436,7 +479,7 @@ describe('DraftComposer queued state recovered on reload', () => {
     await renderLoaded({ send_after: QUEUED_AT });
 
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^human-only send$/i })).not.toBeInTheDocument();
   });
 
   it('shows the queued banner and the scheduled time without a fresh send response', async () => {
@@ -462,7 +505,7 @@ describe('DraftComposer queued state recovered on reload', () => {
     await renderLoaded({ send_after: null });
 
     expect(screen.getByLabelText('To')).not.toBeDisabled();
-    expect(screen.getByRole('button', { name: /^send/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeInTheDocument();
   });
 });
 
@@ -601,10 +644,10 @@ describe('DraftComposer hold', () => {
     await fireEvent.click(holdButton());
 
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /^send/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeInTheDocument()
     );
     // Held content is unchanged, so Send is live again and Save waits on an edit.
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeEnabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
   });
 
@@ -621,7 +664,7 @@ describe('DraftComposer hold', () => {
 
   it('holds a draft queued by this page in the same session', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
     await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
 
@@ -793,20 +836,20 @@ describe('DraftComposer recipient guard', () => {
   it('keeps Send disabled when the stored recipient is empty', async () => {
     await renderLoaded({ to_addr: '' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
     expect(screen.getByText(/valid recipient/i)).toBeInTheDocument();
   });
 
   it('keeps Send disabled when the stored recipient is not a usable address', async () => {
     await renderLoaded({ to_addr: 'not-an-address' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
   });
 
   it('never opens the confirmation for a draft with no recipient', async () => {
     await renderLoaded({ to_addr: '' });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
@@ -815,13 +858,13 @@ describe('DraftComposer recipient guard', () => {
   it('accepts a comma-separated recipient list', async () => {
     await renderLoaded({ to_addr: 'a@example.com, b@example.com' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeEnabled();
   });
 
   it('accepts a display-name address', async () => {
     await renderLoaded({ to_addr: 'Ada Lovelace <ada@example.com>' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeEnabled();
   });
 
   it('re-disables Send when the recipient is edited down to nothing', async () => {
@@ -829,7 +872,7 @@ describe('DraftComposer recipient guard', () => {
     await setRecipients('To', '');
 
     expect(chips('To')).toEqual([]);
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
   });
 });
@@ -878,7 +921,7 @@ describe('DraftComposer queue cancellation race', () => {
     let resolveSend!: (value: unknown) => void;
     apiMock.sendDraft.mockReturnValueOnce(new Promise((r) => (resolveSend = r)));
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
     await waitFor(() =>
@@ -941,7 +984,7 @@ describe('DraftComposer queue cancellation race', () => {
     let rejectSend!: (reason: unknown) => void;
     apiMock.sendDraft.mockReturnValueOnce(new Promise((_r, reject) => (rejectSend = reject)));
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
     await waitFor(() =>
@@ -1016,7 +1059,7 @@ describe('DraftComposer route change', () => {
 
   it('closes an open send confirmation when the route changes', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
 
     apiMock.draft.mockResolvedValueOnce(draftResponse({ id: DRAFT_B, subject: 'Draft B' }));
@@ -1057,7 +1100,7 @@ describe('DraftComposer route change', () => {
     navigateTo(DRAFT_B);
     await waitFor(() => expect(apiMock.draft).toHaveBeenCalledWith(ACCOUNT, DRAFT_B));
 
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^human-only send$/i })).not.toBeInTheDocument();
     expect(apiMock.editDraft).not.toHaveBeenCalled();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
   });
@@ -1142,32 +1185,32 @@ describe('DraftComposer optional-recipient validation', () => {
   it('blocks Send when Cc is present but malformed', async () => {
     await renderLoaded({ cc_addr: 'not-an-address' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
     expect(screen.getByText(/valid recipient/i)).toBeInTheDocument();
   });
 
   it('blocks Send when Bcc is present but malformed', async () => {
     await renderLoaded({ bcc_addr: 'nope@' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeDisabled();
   });
 
   it('allows Send when Cc and Bcc are empty', async () => {
     await renderLoaded({ cc_addr: null, bcc_addr: null });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeEnabled();
   });
 
   it('allows Send for valid multi-entry Cc and Bcc', async () => {
     await renderLoaded({ cc_addr: 'a@example.com, b@example.com', bcc_addr: 'c@example.com' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^human-only send$/i })).toBeEnabled();
   });
 
   it('never opens the confirmation when Cc is malformed', async () => {
     await renderLoaded({ cc_addr: 'broken' });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();

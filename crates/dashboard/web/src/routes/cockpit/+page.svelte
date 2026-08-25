@@ -180,6 +180,10 @@
             hint="Agent drafts land here for a human to approve, edit, or discard."
           />
         {:else}
+          <p class="approval-note" id="approval-human-send-note">
+            Approving is your explicit authorization of that exact version, so Governor stops scoring
+            it. Edit the draft instead to withdraw the approval and put it back under scoring.
+          </p>
           {#each agents.approval_queue as group (group.source)}
             <div class="approval-group">
               <h3 class="approval-group-title">{group.source} · {group.count}</h3>
@@ -324,6 +328,12 @@
   }
   .approval-group + .approval-group {
     margin-top: 1rem;
+  }
+  .approval-note {
+    margin: 0 0 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--env-muted);
   }
   .approval-group-title {
     margin: 0 0 0.5rem;

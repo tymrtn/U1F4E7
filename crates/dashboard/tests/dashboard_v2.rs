@@ -52,6 +52,42 @@ fn committed_v2_bundle_has_no_tailwind_cdn_reference() {
     );
 }
 
+#[test]
+fn committed_v2_bundle_ships_the_human_only_send_label() {
+    // `web/build/` is committed so `cargo install` never needs Node, which means
+    // a Svelte edit that is not rebuilt ships the OLD label to every operator.
+    // The send action's name is a safety-relevant word — it is what tells Tyler
+    // this click is his own send rather than a Governor-scored one — so a stale
+    // bundle has to fail here instead of shipping quietly.
+    let build_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/build/_app");
+    let mut found = false;
+    let mut scanned = 0usize;
+    let mut stack = vec![build_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("built SPA asset directory") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "js") {
+                scanned += 1;
+                if std::fs::read_to_string(&path).is_ok_and(|js| js.contains("Human-only Send")) {
+                    found = true;
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "no JS assets found under {}",
+        build_dir.display()
+    );
+    assert!(
+        found,
+        "committed bundle still carries the old Send label — run `npm run build` in \
+         crates/dashboard/web and commit web/build/ ({scanned} JS assets scanned)"
+    );
+}
+
 #[tokio::test]
 async fn v2_root_serves_the_spa_index() {
     let (status, body, content_type) = get("/").await;

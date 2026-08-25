@@ -781,7 +781,9 @@
         <MonoTag>{sendBlock.code}</MonoTag>
         <div class="draft-banner-action">
           {#if sendable}
-            <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send again</Button>
+            <Button variant="primary" disabled={!canSend} onclick={requestSend}>
+              Human-only Send again
+            </Button>
           {/if}
         </div>
       </div>
@@ -892,6 +894,15 @@
       onconflict={() => (conflict = true)}
     />
 
+    {#if sendable}
+      <p class="draft-banner draft-send-note" id="draft-human-send-note">
+        <strong>Human-only Send</strong> is your explicit send of this exact version. It still waits
+        out the outbox cooldown, Hold still takes it back, and Envelope still files the Sent copy as
+        proof. Governor does not score a message you send this way, and editing afterwards withdraws
+        your approval.
+      </p>
+    {/if}
+
     <footer class="draft-actions">
       <div class="draft-actions-status">
         {#if dirty && !recipientPresent}
@@ -919,14 +930,16 @@
           </Button>
         {/if}
         {#if sendable}
-          <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send</Button>
+          <Button variant="primary" disabled={!canSend} onclick={requestSend}>
+            Human-only Send
+          </Button>
         {/if}
       </div>
     </footer>
   {/if}
 </section>
 
-<Modal open={confirmOpen} title="Queue this draft for sending?" onclose={closeConfirm}>
+<Modal open={confirmOpen} title="Human-only Send this draft?" onclose={closeConfirm}>
   <p class="draft-confirm-line">
     <strong>To</strong>
     {toRaw.trim() || '(no recipient)'}
@@ -942,6 +955,10 @@
     This message waits in the outbox for a cooldown, then Envelope sends it on your behalf. You are
     approving this exact version — editing it afterwards withdraws that approval. The next screen
     counts the wait down and can take the message back out of the outbox.
+  </p>
+  <p class="draft-confirm-note">
+    Your approval carries the send. Governor scores what agents send on their own; it does not score
+    this one.
   </p>
   {#if queueing}
     <p class="draft-confirm-note is-locked">
@@ -1046,6 +1063,15 @@
   }
   .draft-banner-action {
     margin-top: 0.5rem;
+  }
+  /* Sits directly above the send controls, so it reads as the label's
+     explanation rather than another status banner. */
+  .draft-send-note {
+    border-bottom: 0;
+    font-size: 0.75rem;
+  }
+  .draft-send-note strong {
+    color: var(--env-ink);
   }
   .is-note {
     border-color: var(--env-pending);
