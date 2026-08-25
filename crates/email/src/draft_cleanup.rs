@@ -32,6 +32,12 @@ pub struct DraftCleanupTarget {
     /// Bare Message-ID (angle brackets stripped) persisted at APPEND time,
     /// used to locate/verify the copy before deletion.
     pub message_id: String,
+    /// Bare Message-IDs this draft previously carried on the provider, oldest
+    /// first. Each edit re-APPENDs under a new identity; if the pre-APPEND
+    /// delete failed or was interrupted, that older copy is still in the folder
+    /// and only these identities can find it. Verified exactly like the current
+    /// one — a retained identity is a lead, never a licence to delete.
+    pub superseded_message_ids: Vec<String>,
 }
 
 /// Decide whether the provider draft copy can be identified safely enough to
@@ -56,7 +62,17 @@ pub fn resolve_draft_cleanup_target(
     let Some(message_id) = message_id else {
         return Err("no persisted Message-ID to verify draft identity");
     };
-    Ok(DraftCleanupTarget { folder, message_id })
+    let superseded = draft
+        .superseded_message_ids()
+        .iter()
+        .filter_map(|id| imap::normalize_message_id(id))
+        .filter(|id| *id != message_id)
+        .collect();
+    Ok(DraftCleanupTarget {
+        folder,
+        message_id,
+        superseded_message_ids: superseded,
+    })
 }
 
 /// Outcome of an exact-verified provider draft deletion attempt.
@@ -88,12 +104,48 @@ pub async fn delete_provider_draft_exact(
     client: &mut ImapClient,
     target: &DraftCleanupTarget,
 ) -> Result<ProviderDraftCleanup, ImapError> {
+    // Sweep the identities this draft has previously worn first. Each edit
+    // re-APPENDs under a new Message-ID after deleting the old copy; when that
+    // delete failed or was interrupted, the older copy stays in the folder
+    // forever, because the row only ever names the newest identity. Removing
+    // them here is what stops one logical draft leaving a copy per revision.
+    //
+    // Every candidate is header-verified and must be the UNIQUE exact match —
+    // the same fail-closed rule as the current identity. A superseded identity
+    // that is ambiguous or absent is simply skipped.
+    let mut superseded_uids = Vec::new();
+    for stale in &target.superseded_message_ids {
+        match imap::find_unique_uid_by_exact_message_id(client, &target.folder, stale).await {
+            Ok(Some(uid)) => {
+                imap::delete_message(client, &target.folder, uid).await?;
+                superseded_uids.push(uid);
+            }
+            // Absent or ambiguous: nothing safely identifiable to remove.
+            Ok(None) => {}
+            // A lookup failure on a stale identity must not abort cleanup of
+            // the current copy, which is the one that definitely exists.
+            Err(e) => {
+                tracing::warn!(
+                    "draft cleanup: superseded copy lookup failed in {}: {e}",
+                    target.folder
+                );
+            }
+        }
+    }
+
     match imap::find_unique_uid_by_exact_message_id(client, &target.folder, &target.message_id)
         .await?
     {
         Some(uid) => {
             imap::delete_message(client, &target.folder, uid).await?;
             Ok(ProviderDraftCleanup::Deleted { uid })
+        }
+        None if !superseded_uids.is_empty() => {
+            // The current identity is gone but stale copies were removed. That
+            // is a real cleanup, not a skip.
+            Ok(ProviderDraftCleanup::Deleted {
+                uid: superseded_uids[superseded_uids.len() - 1],
+            })
         }
         None => Ok(ProviderDraftCleanup::Skipped(
             "provider draft copy not uniquely identified by exact Message-ID",
@@ -142,6 +194,42 @@ mod tests {
         db
     }
 
+    /// Identities retained across re-APPENDs reach the cleanup target, and the
+    /// current one is never duplicated among them. Without this, a draft that
+    /// was edited leaves one provider copy per revision: the row names only the
+    /// newest identity, so nothing can locate the older copies again.
+    #[test]
+    fn resolve_target_carries_superseded_identities() {
+        let db = seeded_db();
+        db.set_detected_folder("gmail1", "drafts", "[Gmail]/Drafts")
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "gmail1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "<current@mac.lan>")
+            .unwrap();
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                envelope_email_store::drafts::SUPERSEDED_MESSAGE_IDS:
+                    ["<older@mac.lan>", "<current@mac.lan>"]
+            }),
+        )
+        .unwrap();
+
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+        let target = resolve_draft_cleanup_target(&db, &draft).unwrap();
+
+        assert_eq!(target.message_id, "current@mac.lan");
+        assert_eq!(
+            target.superseded_message_ids,
+            vec!["older@mac.lan".to_string()],
+            "normalized, and the current identity is not swept twice"
+        );
+    }
+
     /// Shared-resolution regression: exact detected folder + normalized
     /// Message-ID, fail-closed on cache miss/error and missing Message-ID.
     /// Pure DB lookups — no mailbox or network access.
@@ -183,6 +271,8 @@ mod tests {
             DraftCleanupTarget {
                 folder: "[Gmail]/Drafts".to_string(),
                 message_id: "queued-1@martin.fm".to_string(),
+                // A draft that has never been re-appended wears one identity.
+                superseded_message_ids: Vec::new(),
             }
         );
 

@@ -97,6 +97,28 @@ impl Draft {
     /// human acted on. Agent-created state alone (a `created_by` of
     /// `agent`/`mcp`, agent-written threading metadata, etc.) never satisfies
     /// this — approval requires the explicit attestation object.
+    /// Message-IDs this draft previously carried on the provider, oldest first.
+    ///
+    /// Each edit re-APPENDs the draft under a new Message-ID. The replace path
+    /// deletes the old copy first, but that deletion can fail or be interrupted,
+    /// and drafts edited before this was tracked already have orphans on the
+    /// server. Post-send cleanup uses these to remove copies the current
+    /// identity would miss — every one still header-verified before deletion.
+    pub fn superseded_message_ids(&self) -> Vec<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(crate::drafts::SUPERSEDED_MESSAGE_IDS))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn human_approved(&self) -> bool {
         let Some(attestation) = self.metadata.as_ref().and_then(|m| m.get("human_approval")) else {
             return false;

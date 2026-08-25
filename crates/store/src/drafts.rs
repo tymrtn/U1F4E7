@@ -7,6 +7,23 @@ use crate::models::{Draft, DraftStatus};
 use rusqlite::params;
 use uuid::Uuid;
 
+/// Compare Message-IDs by their bare form: `<id@host>` and `id@host` name the
+/// same message, and both spellings are persisted by different call sites.
+fn bare_message_id(value: &str) -> &str {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+}
+
+/// Metadata key holding Message-IDs this draft previously had on the server.
+pub const SUPERSEDED_MESSAGE_IDS: &str = "superseded_message_ids";
+
+/// Upper bound on retained superseded identities, so an edit loop cannot grow
+/// the row without limit.
+pub const MAX_SUPERSEDED_MESSAGE_IDS: usize = 16;
+
 /// A held provider-sync lease: the opaque owner token plus the status to
 /// restore on release.
 #[derive(Debug, Clone, PartialEq)]
@@ -736,20 +753,75 @@ impl Database {
 
     /// Finalize provider-sync bookkeeping (replacement UID, Message-ID,
     /// storage metadata) — permitted ONLY to the lease holder.
+    /// Record the outcome of a provider re-sync under the exclusive `syncing`
+    /// claim.
+    ///
+    /// `appended_message_id` is the Message-ID of the replacement APPEND. It is
+    /// load-bearing: the replacement copy on the server carries a NEW
+    /// Message-ID, and post-send cleanup locates the copy to delete by the
+    /// Message-ID on this row. Leaving the old value here pointed cleanup at an
+    /// identity the server no longer had, so it found nothing, skipped, and the
+    /// copy survived — once per edit (a rev-4 draft left three copies behind,
+    /// each under a different Message-ID).
+    ///
+    /// The replaced identity is retained in `superseded_message_ids` rather than
+    /// discarded. The replace path deletes the old copy before appending, but
+    /// that deletion can fail or be interrupted, and drafts edited before this
+    /// bookkeeping existed already have orphans on the server. Remembering the
+    /// old identities lets cleanup remove them later; each is still verified by
+    /// exact Message-ID header before anything is deleted.
     pub fn finalize_synced_draft_bookkeeping(
         &self,
         id: &str,
         token: &str,
         imap_uid: Option<u32>,
         storage_metadata: &serde_json::Value,
+        appended_message_id: Option<&str>,
     ) -> Result<()> {
         let current = self
             .get_draft(id)?
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        let previous_message_id = current.message_id.clone();
         let mut metadata = match current.metadata {
             Some(m) if m.is_object() => m,
             _ => serde_json::json!({}),
         };
+
+        // The identity actually being replaced, if this APPEND changed it.
+        //
+        // Compared bare: the row may hold `<id@host>` while the APPEND header is
+        // recorded as `id@host`, and treating that purely-syntactic difference
+        // as a new identity records a phantom supersede for a draft whose
+        // Message-ID never changed (the replace path normally reuses it).
+        let superseded = previous_message_id.filter(|prev| {
+            appended_message_id.is_some_and(|next| {
+                !next.is_empty() && bare_message_id(next) != bare_message_id(prev)
+            })
+        });
+        if let Some(prev) = superseded {
+            let mut ids: Vec<String> = metadata
+                .get(SUPERSEDED_MESSAGE_IDS)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.contains(&prev) {
+                ids.push(prev);
+            }
+            // Bounded: an edit loop must not grow this row without limit. The
+            // oldest identities are the likeliest to be already gone.
+            let overflow = ids.len().saturating_sub(MAX_SUPERSEDED_MESSAGE_IDS);
+            if overflow > 0 {
+                ids.drain(0..overflow);
+            }
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(SUPERSEDED_MESSAGE_IDS.to_string(), serde_json::json!(ids));
+            }
+        }
+
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("storage".to_string(), storage_metadata.clone());
         }
@@ -758,9 +830,16 @@ impl Database {
             "UPDATE drafts SET
                 imap_uid = ?1,
                 metadata = ?2,
+                message_id = COALESCE(?5, message_id),
                 updated_at = datetime('now')
              WHERE id = ?3 AND status = 'syncing' AND operation_token = ?4",
-            params![imap_uid.map(|u| u as i64), serialized, id, token],
+            params![
+                imap_uid.map(|u| u as i64),
+                serialized,
+                id,
+                token,
+                appended_message_id.filter(|m| !m.is_empty()),
+            ],
         )?;
         if rows == 0 {
             return Err(self.classify_guarded_update_miss(id));
@@ -1581,6 +1660,108 @@ mod tests {
                 .and_then(|m| m.get("send_block"))
                 .is_none(),
             "a new send attempt clears the previous stop reason"
+        );
+    }
+
+    /// The replacement APPEND gives the provider copy a NEW Message-ID. If the
+    /// row keeps the old one, post-send cleanup searches the Drafts folder for
+    /// an identity that is no longer there, finds nothing, and skips — leaving
+    /// the copy behind. Every edit then adds another orphan (a rev-4 draft left
+    /// three copies on the server, each with a different Message-ID).
+    #[test]
+    fn finalize_sync_records_the_replacement_message_id() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "original@mac.lan").unwrap();
+        let claim = db.claim_draft_for_sync(&draft.id, draft.revision).unwrap().unwrap();
+
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            Some(42),
+            &serde_json::json!({"imap_synced": true}),
+            Some("replacement@mac.lan"),
+        )
+        .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            after.message_id.as_deref(),
+            Some("replacement@mac.lan"),
+            "the row must name the copy that is actually on the server"
+        );
+    }
+
+    /// The replace path normally re-APPENDs under the SAME Message-ID, and the
+    /// row and the header disagree only on angle brackets. That is one identity,
+    /// not two: recording a supersede here would invent a stale copy that never
+    /// existed, on every single edit.
+    #[test]
+    fn finalize_sync_ignores_a_bracket_only_message_id_difference() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "<same@mac.lan>").unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let claim = db.claim_draft_for_sync(&draft.id, rev).unwrap().unwrap();
+
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            Some(9),
+            &serde_json::json!({"imap_synced": true}),
+            Some("same@mac.lan"),
+        )
+        .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            after.superseded_message_ids().is_empty(),
+            "an unchanged identity is not a superseded one"
+        );
+    }
+
+    /// Identities the server may still hold are remembered, so cleanup can
+    /// remove copies left by earlier revisions and by interrupted edits — not
+    /// only the newest one.
+    #[test]
+    fn finalize_sync_retains_the_superseded_message_id() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "first@mac.lan").unwrap();
+
+        for next in ["second@mac.lan", "third@mac.lan"] {
+            let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+            let claim = db.claim_draft_for_sync(&draft.id, rev).unwrap().unwrap();
+            db.finalize_synced_draft_bookkeeping(
+                &draft.id,
+                &claim.token,
+                None,
+                &serde_json::json!({"imap_synced": true}),
+                Some(next),
+            )
+            .unwrap();
+            db.release_syncing_draft(&draft.id, &claim.token, DraftStatus::Draft)
+                .unwrap();
+        }
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.message_id.as_deref(), Some("third@mac.lan"));
+        assert_eq!(
+            after.superseded_message_ids(),
+            vec!["first@mac.lan".to_string(), "second@mac.lan".to_string()],
+            "every identity the server may still hold is remembered"
         );
     }
 
@@ -3397,6 +3578,7 @@ mod tests {
                 "not-the-owner",
                 Some(1),
                 &serde_json::json!({}),
+                None,
             )
             .is_err()
         );
@@ -3406,6 +3588,7 @@ mod tests {
             &claim.token,
             Some(4242),
             &serde_json::json!({"imap_synced": true}),
+            None,
         )
         .unwrap();
         let finalized = db.get_draft(&draft.id).unwrap().unwrap();
@@ -3419,6 +3602,7 @@ mod tests {
             &claim.token,
             None,
             &serde_json::json!({"imap_synced": true, "uid_lookup": "missed"}),
+            None,
         )
         .unwrap();
         assert_eq!(

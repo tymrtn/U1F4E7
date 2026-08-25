@@ -1158,6 +1158,9 @@ async fn modify_claimed_draft(
                 "imap_folder": null,
                 "local_only": true,
             }),
+            // Send-only account: nothing was appended, so the provider identity
+            // is unchanged.
+            None,
         )
         .context("failed to record storage state")?;
         return Ok(());
@@ -1250,8 +1253,24 @@ async fn modify_claimed_draft(
             "sync_status_reason": "stale_provider_copy_not_replaced",
         })
     };
-    db.finalize_synced_draft_bookkeeping(id, token, new_uid, &storage)
-        .context("failed to record storage state")?;
+    // Name the identity that is actually on the server now. The replacement
+    // APPEND carries `message_id_hdr`; without recording it the row keeps
+    // pointing at the copy that was just deleted, and post-send cleanup then
+    // searches for an identity the provider no longer has.
+    let appended_message_id = if imap_synced {
+        let bare = strip_brackets(message_id_hdr);
+        (!bare.is_empty()).then_some(bare)
+    } else {
+        None
+    };
+    db.finalize_synced_draft_bookkeeping(
+        id,
+        token,
+        new_uid,
+        &storage,
+        appended_message_id.as_deref(),
+    )
+    .context("failed to record storage state")?;
     Ok(())
 }
 
