@@ -115,6 +115,39 @@ impl Draft {
             .is_some_and(|approved_revision| approved_revision == self.revision);
         by_human && valid_timestamp && bound_to_current_revision
     }
+
+    /// The human surface that queued this draft through its own **send** action,
+    /// when that authorization is still current — `None` otherwise.
+    ///
+    /// Distinct from [`Self::human_approved`] on purpose. Approval is a review
+    /// decision about a revision; this is the record that a human surface
+    /// **queued the send of that revision itself**. Only
+    /// `Database::queue_draft_with_human_send` writes it, and it is written in
+    /// the same transaction as the queue transition, so it can never describe a
+    /// send some other path started.
+    ///
+    /// Fail-closed on the same three conditions as the approval attestation: the
+    /// object must exist with a `human:`-prefixed surface, `queued_at` must parse
+    /// as strict RFC 3339, and the recorded `revision` must equal the draft's
+    /// current revision. Any content, attachment, or metadata write strips the
+    /// key outright, as do Hold and an agent re-queue, so the authorization dies
+    /// with the exact queued send it authorized.
+    pub fn human_send_surface(&self) -> Option<&str> {
+        let authorization = self.metadata.as_ref()?.get("human_send")?;
+        let surface = authorization
+            .get("queued_by")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("human:"))?;
+        let valid_timestamp = authorization
+            .get("queued_at")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok());
+        let bound_to_current_revision = authorization
+            .get("revision")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|queued_revision| queued_revision == self.revision);
+        (valid_timestamp && bound_to_current_revision).then_some(surface)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -247,6 +247,11 @@ pub async fn approve(
     // request — never a server-side re-read of the latest row). A concurrent
     // content edit rolls the whole approval back (409) — the edited draft
     // never inherits `tyler_approved`.
+    //
+    // Review only. It queues nothing, so it sends nothing, and it writes no
+    // `human_send` authorization, so a later agent send of this draft (CLI
+    // `draft send`, MCP `send_draft`) is still fully Governor-gated. Sending
+    // from the dashboard is Human-only Send ([`send`]) — a separate click.
     match ensure_draft_account(&db, &account_id, &draft_id).and_then(|draft| {
         db.approve_draft_revision(
             &draft.id,
@@ -390,26 +395,30 @@ pub async fn block(
     }
 }
 
-/// Queue an approved draft into the Envelope outbox cooldown instead of
-/// transmitting it inline.
+/// Queue the operator's **Human-only Send** into the Envelope outbox cooldown
+/// instead of transmitting it inline.
 ///
 /// Setting `send_after` (and ensuring the draft stays in sweep-eligible `draft`
 /// status) hands the real send to the shared scheduled-send sweep
 /// (`run_scheduled_send_sweep`), which applies persisted attachment
-/// snapshots, reply threading headers, and the fail-closed Governor gate before
-/// any SMTP — exactly like CLI `draft send` and MCP `send_draft`. The draft is
-/// never marked sent here (that would drop it from the sweep and could strand it
-/// unsent) and never discarded.
+/// snapshots and reply threading headers before any SMTP — exactly like CLI
+/// `draft send` and MCP `send_draft`. The draft is never marked sent here (that
+/// would drop it from the sweep and could strand it unsent) and never discarded.
 ///
-/// Promotion, `send_after`, and the human-approval attestation are one atomic
-/// store transaction (`queue_draft_with_human_approval`), compare-and-set
-/// against `expected_revision` — the revision the human VIEWED, carried on the
-/// request rather than re-read server-side. A concurrent content edit rolls
-/// everything back: no partially queued, unapproved state, and the edited
-/// content never inherits `tyler_approved` (an input attribute for Governor's
-/// blind scoring, never a gate bypass).
+/// Promotion, `send_after`, the human-approval attestation, and the `human_send`
+/// authorization are one atomic store transaction
+/// (`queue_draft_with_human_send`), compare-and-set against `expected_revision`
+/// — the revision the human VIEWED, carried on the request rather than re-read
+/// server-side. A concurrent content edit rolls everything back: no partially
+/// queued state, and no authorization for a send that was not queued.
 ///
-/// Returns the resolved `send_after` timestamp and the exact attested [`Draft`]
+/// That authorization is what the sweep's Human-only Send exception reads
+/// (`dashboard_human_send_authorized`): this queue transition is the only thing
+/// that mints it, so the exception can only ever cover a send the operator
+/// started from here. Hold, an edit, and an agent re-queue each withdraw it, and
+/// approving a draft never creates one.
+///
+/// Returns the resolved `send_after` timestamp and the exact authorized [`Draft`]
 /// row the atomic queue produced (no post-commit reload).
 fn queue_draft_for_outbox(
     db: &Database,
@@ -420,7 +429,7 @@ fn queue_draft_for_outbox(
     let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_seconds))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    let attested = db.queue_draft_with_human_approval(
+    let attested = db.queue_draft_with_human_send(
         draft_id,
         expected_revision,
         &send_at,
@@ -932,8 +941,14 @@ mod tests {
             approved_at.ends_with('Z'),
             "attestation timestamp is canonical RFC 3339 UTC, got {approved_at}"
         );
-        // Sanitized: no recipient address anywhere in the attestation.
+        // The send authorization the sweep's Human-only Send exception reads,
+        // minted by this queue transition and bound to the queued revision.
+        assert_eq!(reloaded.human_send_surface(), Some("human:dashboard"));
+        let authorization = &reloaded.metadata.as_ref().unwrap()["human_send"];
+        assert_eq!(authorization["revision"], draft.revision);
+        // Sanitized: no recipient address anywhere in either record.
         assert!(!attestation.to_string().contains("buyer@example.com"));
+        assert!(!authorization.to_string().contains("buyer@example.com"));
         // Canonical UTC queue timestamp.
         assert!(reloaded.send_after.unwrap().ends_with('Z'));
     }
@@ -980,10 +995,18 @@ mod tests {
             !edited.human_approved(),
             "post-approval edit must clear the human-approval attestation"
         );
+        assert_eq!(
+            edited.human_send_surface(),
+            None,
+            "post-send edit must clear the send authorization too"
+        );
 
-        // Re-queueing (a fresh human send) approves the new revision.
+        // Re-queueing (a fresh human send) approves and authorizes the new
+        // revision.
         super::queue_draft_for_outbox(&db, &edited.id, edited.revision, 120).unwrap();
-        assert!(db.get_draft(&draft.id).unwrap().unwrap().human_approved());
+        let requeued = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(requeued.human_approved());
+        assert_eq!(requeued.human_send_surface(), Some("human:dashboard"));
     }
 
     /// Queueing must not override explicit blocked/discarded terminal operator

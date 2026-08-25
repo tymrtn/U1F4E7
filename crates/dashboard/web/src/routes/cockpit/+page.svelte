@@ -180,9 +180,11 @@
             hint="Agent drafts land here for a human to approve, edit, or discard."
           />
         {:else}
-          <p class="approval-note" id="approval-human-send-note">
-            Approving is your explicit authorization of that exact version, so Governor stops scoring
-            it. Edit the draft instead to withdraw the approval and put it back under scoring.
+          <p class="approval-note" id="approval-note">
+            Approve records that you reviewed this version. It does not send the draft, and it does
+            not exempt a later agent send from Governor — an agent that sends an approved draft is
+            scored exactly as it would be otherwise. To send one yourself, open it and use
+            <strong>Human-only Send</strong>.
           </p>
           {#each agents.approval_queue as group (group.source)}
             <div class="approval-group">
@@ -334,6 +336,9 @@
     font-size: 0.75rem;
     line-height: 1.5;
     color: var(--env-muted);
+  }
+  .approval-note strong {
+    color: var(--env-ink);
   }
   .approval-group-title {
     margin: 0 0 0.5rem;

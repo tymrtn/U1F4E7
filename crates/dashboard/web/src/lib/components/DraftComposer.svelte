@@ -898,8 +898,8 @@
       <p class="draft-banner draft-send-note" id="draft-human-send-note">
         <strong>Human-only Send</strong> is your explicit send of this exact version. It still waits
         out the outbox cooldown, Hold still takes it back, and Envelope still files the Sent copy as
-        proof. Governor does not score a message you send this way, and editing afterwards withdraws
-        your approval.
+        proof. Governor does not score a message you send this way. That covers this send alone —
+        editing the draft, holding it, or an agent queueing it again withdraws it.
       </p>
     {/if}
 
@@ -957,8 +957,8 @@
     counts the wait down and can take the message back out of the outbox.
   </p>
   <p class="draft-confirm-note">
-    Your approval carries the send. Governor scores what agents send on their own; it does not score
-    this one.
+    This click is the send. Governor scores what agents send on their own; it does not score this
+    one.
   </p>
   {#if queueing}
     <p class="draft-confirm-note is-locked">
