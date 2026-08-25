@@ -860,6 +860,70 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // ── Unified-inbox date ordering + keyset pagination ──────────────
+        // `indexed_message_summaries.date` holds whatever the IMAP envelope
+        // carried — usually RFC 2822 ("Fri, 14 Aug 2026 …"), which SQLite's
+        // strftime cannot parse, so the unified listing's date ordering
+        // silently degenerated to "highest UID wins across accounts" and one
+        // account owned the whole capped page. Store a parsed epoch at write
+        // time and order/paginate on that; the hook backfills existing rows in
+        // Rust, where RFC 2822 is parseable.
+        M::up_with_hook("", |tx: &Transaction| {
+            // Fixture-seeded partial schemas (upgrade tests) may lack the
+            // table entirely; the fresh-DB path creates it with date_epoch on
+            // first use, so skipping is correct there.
+            let table_exists = tx
+                .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .and_then(|mut s| {
+                    s.query_row(["indexed_message_summaries"], |row| row.get::<_, i64>(0))
+                })
+                .unwrap_or(0)
+                > 0;
+            let has_col = tx
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('indexed_message_summaries')
+                     WHERE name = 'date_epoch'",
+                )
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                > 0;
+            if table_exists && !has_col {
+                tx.execute_batch(
+                    "ALTER TABLE indexed_message_summaries ADD COLUMN date_epoch INTEGER;
+                     CREATE INDEX IF NOT EXISTS idx_indexed_message_summaries_folder_epoch
+                         ON indexed_message_summaries(folder, date_epoch DESC, uid DESC);",
+                )?;
+                let rows: Vec<(String, String, i64, i64, Option<String>)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT account_id, folder, uidvalidity, uid, date
+                         FROM indexed_message_summaries WHERE date IS NOT NULL",
+                    )?;
+                    let collected = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    collected
+                };
+                for (account_id, folder, uidvalidity, uid, date) in rows {
+                    if let Some(epoch) = crate::message_index::parse_date_epoch(date.as_deref()) {
+                        tx.execute(
+                            "UPDATE indexed_message_summaries SET date_epoch = ?1
+                             WHERE account_id = ?2 AND folder = ?3 AND uidvalidity = ?4 AND uid = ?5",
+                            rusqlite::params![epoch, account_id, folder, uidvalidity, uid],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }),
     ])
 }
 

@@ -1451,7 +1451,7 @@ describe('Message row deep links', () => {
     // while staying inside INBOX, so that folder must be the literal argument
     // and the literal href — the account id round-trips encoded so a reserved
     // character cannot forge a path segment.
-    expect(apiMock.searchMessages).toHaveBeenCalledWith('acct/one', 'carol', 'INBOX');
+    expect(apiMock.searchMessages).toHaveBeenCalledWith('acct/one', 'TEXT "carol"', 'INBOX', 50, expect.objectContaining({ signal: expect.anything() }));
     expect(hrefFor('Search hit subject')).toBe('/v2/mail/unified/acct%2Fone/200?folder=INBOX');
   });
 
