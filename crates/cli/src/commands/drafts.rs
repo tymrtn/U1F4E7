@@ -1,10 +1,14 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
 use envelope_email_store::credential_store::{self, CredentialBackend};
-use envelope_email_store::models::{AccountWithCredentials, AttachmentMeta, Draft};
+use envelope_email_store::models::{
+    AccountWithCredentials, AttachmentMeta, Draft, MessageSummary, canonical_message_id,
+};
 use envelope_email_transport::SmtpSender;
 use envelope_email_transport::compose::{
     self, ContextBlock, DEFAULT_PREVIEW_WORD_LIMIT, DraftKind,
@@ -159,6 +163,7 @@ pub(crate) fn build_rfc822_full(
     text: Option<&str>,
     html: Option<&str>,
     cc: Option<&str>,
+    bcc: Option<&str>,
     in_reply_to: Option<&str>,
     references: &[String],
     message_id: Option<&str>,
@@ -174,6 +179,11 @@ pub(crate) fn build_rfc822_full(
     if let Some(cc_addr) = cc {
         if !cc_addr.trim().is_empty() {
             builder = builder.cc(builder_address_list(cc_addr, "cc")?);
+        }
+    }
+    if let Some(bcc_addr) = bcc {
+        if !bcc_addr.trim().is_empty() {
+            builder = builder.bcc(builder_address_list(bcc_addr, "bcc")?);
         }
     }
     if let Some(irt) = in_reply_to {
@@ -415,6 +425,22 @@ pub(crate) fn account_from_header(creds: &AccountWithCredentials) -> String {
     }
 }
 
+/// Resolve the sending identity persisted by `draft create --from` or supplied
+/// explicitly to `draft edit --from`. Drafts without either keep the account
+/// default, preserving the existing behavior for replies and forwards.
+pub(crate) fn from_header_for_draft(
+    metadata: Option<&serde_json::Value>,
+    creds: &AccountWithCredentials,
+) -> String {
+    metadata
+        .and_then(|m| m.get("from"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| account_from_header(creds))
+}
+
 /// Reconstruct the preserved [`ContextBlock`] from a draft's metadata blob.
 fn context_from_metadata(meta: &serde_json::Value) -> ContextBlock {
     let c = meta.get("context");
@@ -485,7 +511,7 @@ async fn append_draft_best_effort(
         None
     } else {
         let mid_clean = message_id.trim_matches(|c| c == '<' || c == '>');
-        match imap::find_uid_by_message_id(&mut client, &folder, mid_clean).await {
+        match imap::find_unique_uid_by_exact_message_id(&mut client, &folder, mid_clean).await {
             Ok(u) => u,
             Err(e) => {
                 warn!("IMAP APPEND succeeded but UID lookup failed: {e}");
@@ -552,7 +578,7 @@ async fn append_draft_required(
         None
     } else {
         let mid_clean = message_id.trim_matches(|c| c == '<' || c == '>');
-        imap::find_uid_by_message_id(&mut client, &folder, mid_clean)
+        imap::find_unique_uid_by_exact_message_id(&mut client, &folder, mid_clean)
             .await
             .unwrap_or(None)
     };
@@ -619,6 +645,7 @@ async fn create_contextual_draft(
         Some(&assembled.text),
         assembled.html.as_deref(),
         spec.cc.as_deref(),
+        spec.bcc.as_deref(),
         spec.in_reply_to.as_deref(),
         &spec.references,
         None,
@@ -864,6 +891,7 @@ pub(crate) async fn modify_draft(
     db: &Database,
     creds: &AccountWithCredentials,
     id: &str,
+    from: Option<&str>,
     body: Option<&str>,
     html: Option<&str>,
     to: Option<&str>,
@@ -894,10 +922,19 @@ pub(crate) async fn modify_draft(
         &creds.account.username,
     )?;
 
-    let meta = draft
+    let mut meta = draft
         .metadata
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(from) = from {
+        let from = from.trim();
+        if from.is_empty() {
+            bail!("from address cannot be empty");
+        }
+        meta.as_object_mut()
+            .expect("draft metadata is always an object")
+            .insert("from".to_string(), serde_json::json!(from));
+    }
     let context = context_from_metadata(&meta);
 
     // Agent body: override or keep prior authored content.
@@ -908,12 +945,16 @@ pub(crate) async fn modify_draft(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
+        .or_else(|| draft.text_content.clone())
         .unwrap_or_default();
-    let agent_html = html.map(str::to_string).or_else(|| {
-        meta.get("agent_body_html")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
+    let agent_html = html
+        .map(str::to_string)
+        .or_else(|| {
+            meta.get("agent_body_html")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| draft.html_content.clone());
 
     // Signature: explicit flag, else preserve prior applied state.
     let signature = add_signature.unwrap_or_else(|| {
@@ -945,6 +986,7 @@ pub(crate) async fn modify_draft(
         .map(str::to_string)
         .unwrap_or_else(|| draft.to_addr.clone());
     let new_cc = cc.map(str::to_string).or_else(|| draft.cc_addr.clone());
+    let new_bcc = bcc.map(str::to_string).or_else(|| draft.bcc_addr.clone());
     let new_subject = subject
         .map(str::to_string)
         .or_else(|| draft.subject.clone())
@@ -966,7 +1008,7 @@ pub(crate) async fn modify_draft(
     let attachments =
         decode_attachments(&attachment_snapshots).context("failed to decode draft attachments")?;
 
-    let from = account_from_header(creds);
+    let from = from_header_for_draft(Some(&meta), creds);
     let (rfc822, message_id_hdr) = build_rfc822_full(
         &from,
         &new_to,
@@ -974,6 +1016,7 @@ pub(crate) async fn modify_draft(
         Some(&assembled.text),
         assembled.html.as_deref(),
         new_cc.as_deref(),
+        new_bcc.as_deref(),
         meta_in_reply_to.as_deref(),
         &meta_references,
         draft.message_id.as_deref(),
@@ -1006,7 +1049,7 @@ pub(crate) async fn modify_draft(
         &meta,
         &new_to,
         new_cc.as_deref(),
-        bcc.or(draft.bcc_addr.as_deref()),
+        new_bcc.as_deref(),
         &new_subject,
         &assembled,
         &agent_text,
@@ -1093,10 +1136,10 @@ async fn modify_claimed_draft(
         return Ok(());
     }
 
-    // ── Provider replace: delete old copy FIRST, exact + unique ──
+    // ── Provider replace: delete all exact old copies FIRST ──
     // The replacement APPEND reuses the same Message-ID, so before-the-append
     // is the only unambiguous window. If the old copy exists but cannot be
-    // confirmably removed (unresolvable identity, ambiguous match, or delete
+    // confirmably removed (unresolvable identity or delete
     // failure), the APPEND is SKIPPED — never a duplicate provider copy with
     // the same Message-ID. The local edit stands; the stale provider copy is
     // removed later by post-send exact cleanup, and storage metadata records
@@ -1105,7 +1148,8 @@ async fn modify_claimed_draft(
     let mut old_copy_cleared = !provider_copy_expected;
     if provider_copy_expected {
         use envelope_email_transport::draft_cleanup::{
-            ProviderDraftCleanup, delete_provider_draft_exact, resolve_draft_cleanup_target,
+            ProviderDraftReplaceCleanup, clear_provider_draft_copies_for_replace,
+            resolve_draft_cleanup_target,
         };
         // Recheck lease ownership immediately before the destructive delete.
         if !db.holds_sync_claim(id, token).unwrap_or(false) {
@@ -1113,28 +1157,32 @@ async fn modify_claimed_draft(
         }
         match resolve_draft_cleanup_target(db, pre_edit) {
             Ok(target) => match imap::connect(creds).await {
-                Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
-                    Ok(ProviderDraftCleanup::Deleted { uid }) => {
-                        old_copy_cleared = true;
-                        info!(
-                            "draft {id}: removed stale provider copy (UID {uid} in {})",
-                            target.folder
-                        );
-                    }
-                    Ok(ProviderDraftCleanup::Skipped(reason)) => {
-                        warn!(
-                            "draft {id}: stale provider copy in {} not removed ({reason}) — \
-                             replacement APPEND skipped to avoid a duplicate Message-ID",
-                            target.folder
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "draft {id}: stale provider copy removal failed ({e}) — \
+                Ok(mut client) => {
+                    match clear_provider_draft_copies_for_replace(&mut client, &target).await {
+                        Ok(ProviderDraftReplaceCleanup::Deleted { uids }) => {
+                            old_copy_cleared = true;
+                            info!(
+                                "draft {id}: removed {} stale provider copy/copies (UIDs {:?} in {})",
+                                uids.len(),
+                                uids,
+                                target.folder
+                            );
+                        }
+                        Ok(ProviderDraftReplaceCleanup::AlreadyAbsent) => {
+                            old_copy_cleared = true;
+                            info!(
+                                "draft {id}: provider copy already absent from {}; continuing replacement",
+                                target.folder
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "draft {id}: stale provider copy removal failed ({e}) — \
                              replacement APPEND skipped to avoid a duplicate Message-ID"
-                        );
+                            );
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     warn!(
                         "draft {id}: IMAP connect for provider re-sync failed ({e}) — \
@@ -1180,7 +1228,6 @@ async fn modify_claimed_draft(
     Ok(())
 }
 
-/// Build and print (or pretty-print) the consistent contextual-draft envelope.
 /// Build and print (or pretty-print) the consistent contextual-draft envelope.
 fn emit_draft_envelope(draft: &Draft, json: bool) {
     if json {
@@ -1401,6 +1448,140 @@ pub async fn run_forward(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LocalDraftIdentity {
+    Current(String),
+    Relinked(String),
+    Missing,
+    Ambiguous,
+}
+
+/// Relink one exact provider identity to its unique active local draft.
+fn relink_local_draft_uid(
+    db: &Database,
+    account_id: &str,
+    uid: u32,
+    message_id: &str,
+) -> Result<LocalDraftIdentity> {
+    let wanted = canonical_message_id(message_id);
+    if wanted.is_empty() {
+        return Ok(LocalDraftIdentity::Missing);
+    }
+    if let Some(draft) = db.get_draft_by_imap_uid(account_id, uid)? {
+        let mapped_message_id = draft
+            .message_id
+            .as_deref()
+            .map(canonical_message_id)
+            .unwrap_or("");
+        if mapped_message_id == wanted {
+            return Ok(LocalDraftIdentity::Current(draft.id));
+        }
+    }
+    let matches = db.find_editable_drafts_by_message_id(account_id, wanted)?;
+    match matches.as_slice() {
+        [draft] => {
+            db.relink_editable_draft_imap_uid(account_id, &draft.id, uid)?;
+            Ok(LocalDraftIdentity::Relinked(draft.id.clone()))
+        }
+        [] => Ok(LocalDraftIdentity::Missing),
+        _ => Ok(LocalDraftIdentity::Ambiguous),
+    }
+}
+
+/// Resolve a numeric Drafts UID back to one unique local Envelope draft.
+///
+/// A replacement APPEND can succeed while its UID lookup misses, leaving the
+/// local row temporarily unmapped. The server copy still carries Envelope's
+/// persisted Message-ID, so fetch that exact UID, match within the same account,
+/// and repair the local index. A truly foreign IMAP-only draft is not imported:
+/// doing so here could silently lose Bcc, attachment bytes, or review history.
+async fn resolve_edit_draft_id(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    id: &str,
+) -> Result<String> {
+    let Ok(uid) = id.parse::<u32>() else {
+        return Ok(id.to_string());
+    };
+
+    if creds.account.imap_host.is_empty() {
+        bail!("account {} has no IMAP mailbox", creds.account.username);
+    }
+
+    let mut client = imap::connect(creds)
+        .await
+        .context("failed to connect to IMAP to resolve draft UID")?;
+    let folder = detect_drafts_folder(&mut client, db, &creds.account.id)
+        .await
+        .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("no Drafts folder detected for {}", creds.account.username)
+        })?;
+    let message = imap::fetch_message(&mut client, &folder, uid)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch draft UID {uid} from {folder}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("draft UID {uid} not found in {folder}"))?;
+    let message_id = message.message_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "IMAP draft UID {uid} has no Message-ID and cannot be linked safely to a local draft"
+        )
+    })?;
+    match relink_local_draft_uid(db, &creds.account.id, uid, message_id)
+        .context("failed to repair local draft UID mapping")?
+    {
+        LocalDraftIdentity::Current(draft_id) | LocalDraftIdentity::Relinked(draft_id) => {
+            Ok(draft_id)
+        }
+        LocalDraftIdentity::Missing => {
+            bail!(
+                "IMAP draft UID {uid} is not an existing Envelope draft. Recreate/import it before editing so Bcc, attachments, and review history are preserved."
+            )
+        }
+        LocalDraftIdentity::Ambiguous => {
+            bail!(
+                "IMAP draft UID {uid} matches multiple local drafts by Message-ID; refusing an ambiguous edit"
+            )
+        }
+    }
+}
+
+/// Repair stale local UID mappings from a read of the provider Drafts folder.
+/// Only one-to-one Message-ID matches are linked; duplicate server copies or
+/// duplicate local rows remain visibly ambiguous for explicit edit cleanup.
+fn reconcile_local_draft_uids(
+    db: &Database,
+    account_id: &str,
+    summaries: &[MessageSummary],
+) -> Result<usize> {
+    let mut server_counts: HashMap<String, usize> = HashMap::new();
+    for summary in summaries {
+        if let Some(message_id) = summary.message_id.as_deref() {
+            let key = canonical_message_id(message_id);
+            if !key.is_empty() {
+                *server_counts.entry(key.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut repaired = 0;
+    for summary in summaries {
+        let Some(message_id) = summary.message_id.as_deref() else {
+            continue;
+        };
+        let key = canonical_message_id(message_id);
+        if key.is_empty() || server_counts.get(key).copied() != Some(1) {
+            continue;
+        }
+        if matches!(
+            relink_local_draft_uid(db, account_id, summary.uid, key)?,
+            LocalDraftIdentity::Relinked(_)
+        ) {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
 /// `envelope draft edit <id>` — modify the agent-authored part of a draft.
 ///
 /// The preserved quote/forward block is recombined automatically; the agent
@@ -1412,6 +1593,7 @@ pub async fn run_edit(
     account: Option<&str>,
     json: bool,
     backend: CredentialBackend,
+    from: Option<&str>,
     body: Option<&str>,
     html: Option<&str>,
     to: Option<&str>,
@@ -1424,10 +1606,12 @@ pub async fn run_edit(
     clear_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let resolved_id = resolve_edit_draft_id(&db, &creds, id).await?;
     let draft = modify_draft(
         &db,
         &creds,
-        id,
+        &resolved_id,
+        from,
         body,
         html,
         to,
@@ -1500,6 +1684,13 @@ pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBack
             let summaries = imap::fetch_inbox(&mut client, &drafts_folder, 100)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to fetch drafts from IMAP: {e}"))?;
+            match reconcile_local_draft_uids(&db, &acct.id, &summaries) {
+                Ok(count) if count > 0 => {
+                    info!("repaired {count} local draft UID mapping(s) from Message-ID")
+                }
+                Ok(_) => {}
+                Err(e) => warn!("failed to reconcile local draft UID mappings: {e}"),
+            }
 
             if json {
                 let items: Vec<serde_json::Value> = summaries
@@ -1697,6 +1888,28 @@ pub async fn run_create(
     if !message_id.is_empty() {
         let _ = db.mark_draft_message_id(&draft.id, &message_id);
     }
+
+    // The local row is the durable index for this provider copy. Persist both
+    // the send-as identity and APPEND provenance even when post-APPEND UID
+    // discovery missed, so a later edit knows an exact old copy may exist.
+    let mut metadata = serde_json::json!({
+        "agent_body_text": body,
+        "agent_body_html": null,
+        "signature_applied": false,
+        "storage": {
+            "imap_synced": true,
+            "imap_folder": drafts_folder_name,
+            "local_only": false,
+        }
+    });
+    if let Some(from_override) = from {
+        metadata
+            .as_object_mut()
+            .expect("draft metadata is an object")
+            .insert("from".to_string(), serde_json::json!(from_override));
+    }
+    db.set_draft_metadata(&draft.id, &metadata)
+        .context("failed to persist draft storage metadata")?;
 
     // Persist the (non-secret metadata + base64 payload) attachment snapshots so
     // a later `draft send` re-includes them rather than silently dropping.
@@ -2452,13 +2665,17 @@ pub(crate) async fn send_existing_draft(
     } else {
         Some(references.as_slice())
     };
+    let send_from = local_draft
+        .as_ref()
+        .map(|draft| from_header_for_draft(draft.metadata.as_ref(), &creds))
+        .unwrap_or_else(|| account_from_header(&creds));
     let message_id = SmtpSender::send(
         &creds,
         &to_addr,
         &subject,
         text_body.as_deref(),
         html_body.as_deref(),
-        None,
+        Some(&send_from),
         cc_addr.as_deref(),
         bcc_addr.as_deref(),
         reply_to.as_deref(),
@@ -2575,12 +2792,11 @@ pub(crate) async fn send_existing_draft(
     );
 
     // ── Resolve Sent-folder copy (pre-lookup before any client append) ──
-    let from = account_from_header(&creds);
     let copy_result = resolve_sent_copy_after_send(
         &db,
         &creds,
         provider_type.as_deref(),
-        &from,
+        &send_from,
         &to_addr,
         &subject,
         text_body.as_deref(),
@@ -2980,6 +3196,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             Some("<mid@example.test>"),
             &[],
@@ -3008,6 +3225,7 @@ mod tests {
             "recipient@example.test",
             "Subject",
             Some("body"),
+            None,
             None,
             None,
             None,
@@ -3046,6 +3264,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             Some("<mid@example.test>"),
             &[],
@@ -3078,6 +3297,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             Some("<mid@example.test>"),
             &[attachment],
@@ -3089,6 +3309,30 @@ mod tests {
         assert_eq!(from_line, "From: \"Display Name\" <user@example.test>");
         assert!(msg.contains("multipart/mixed"));
         assert!(msg.contains("report.pdf"));
+    }
+
+    #[test]
+    fn edited_provider_copy_preserves_bcc_header() {
+        let (rfc822, _) = build_rfc822_full(
+            "Agent <agent@example.test>",
+            "recipient@example.test",
+            "Subject",
+            Some("body"),
+            None,
+            None,
+            Some("audit@example.test"),
+            None,
+            &[],
+            Some("<mid@example.test>"),
+            &[],
+        )
+        .unwrap();
+        let msg = String::from_utf8(rfc822).unwrap();
+
+        assert!(
+            msg.contains("Bcc: <audit@example.test>"),
+            "serialized provider draft omitted Bcc:\n{msg}"
+        );
     }
 
     // ─── account_from_header / From identity ─────────────────────────────
@@ -3208,6 +3452,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn draft_from_header_prefers_persisted_send_as_identity() {
+        let creds = make_creds(
+            "bruno@spainexpat.com",
+            None,
+            "SpainExpat Plus Ultra Member Desk",
+        );
+        let metadata = serde_json::json!({
+            "from": "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>"
+        });
+
+        let from = from_header_for_draft(Some(&metadata), &creds);
+        assert_eq!(
+            from,
+            "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>"
+        );
+        assert!(!from.contains("bruno@spainexpat.com"));
+    }
+
+    #[tokio::test]
+    async fn draft_edit_from_override_repairs_a_legacy_alias_draft() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-test', 'SpainExpat Plus Ultra Member Desk',
+                         'bruno@spainexpat.com', 'spainexpat.com',
+                         'smtp.example.com', 587, '', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acct-test",
+                "member@example.net",
+                Some("Old subject"),
+                Some("old body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        let mut creds = make_creds(
+            "bruno@spainexpat.com",
+            None,
+            "SpainExpat Plus Ultra Member Desk",
+        );
+        creds.account.imap_host = String::new();
+        let alias = "SpainExpat Plus Ultra Member Desk <plusultra@spainexpat.com>";
+
+        let edited = modify_draft(
+            &db,
+            &creds,
+            &draft.id,
+            Some(alias),
+            Some("new body"),
+            Some("<p>new body</p>"),
+            None,
+            None,
+            None,
+            Some("New subject"),
+            None,
+            &[],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            edited
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("from"))
+                .and_then(|value| value.as_str()),
+            Some(alias)
+        );
+        assert_eq!(
+            from_header_for_draft(edited.metadata.as_ref(), &creds),
+            alias
+        );
+        assert_eq!(edited.subject.as_deref(), Some("New subject"));
+        assert!(
+            edited
+                .html_content
+                .as_deref()
+                .is_some_and(|html| html.contains("<p>new body</p>"))
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_draft_partial_edit_preserves_stored_body_and_bcc() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-test', 'Agent', 'agent@example.test', 'example.test',
+                         'smtp.example.test', 587, '', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "acct-test",
+                "member@example.net",
+                Some("Original subject"),
+                Some("Keep this body"),
+                None,
+                None,
+                None,
+                Some("audit@example.test"),
+                Some("cli"),
+            )
+            .unwrap();
+        let mut creds = make_creds("agent@example.test", None, "Agent");
+        creds.account.id = "acct-test".to_string();
+        creds.account.imap_host = String::new();
+
+        let edited = modify_draft(
+            &db,
+            &creds,
+            &draft.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("Updated subject"),
+            None,
+            &[],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(edited.text_content.as_deref(), Some("Keep this body"));
+        assert_eq!(edited.bcc_addr.as_deref(), Some("audit@example.test"));
+        assert_eq!(
+            edited
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("agent_body_text"))
+                .and_then(|value| value.as_str()),
+            Some("Keep this body")
+        );
+    }
+
     // ─── draft_envelope_json: sync_status_reason ─────────────────────────
 
     /// APPEND-succeeded/UID-missing provenance: a successful APPEND whose
@@ -3278,6 +3675,147 @@ mod tests {
         db.update_draft_imap_uid(&draft.id, 77).unwrap();
         let with_uid = db.get_draft(&draft.id).unwrap().unwrap();
         assert!(provider_copy_may_exist(&with_uid));
+    }
+
+    fn seed_relink_draft(
+        db: &envelope_email_store::Database,
+        message_id: &str,
+        uid: Option<u32>,
+    ) -> envelope_email_store::models::Draft {
+        let account_exists: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE id = 'acc1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if account_exists == 0 {
+            db.conn()
+                .execute(
+                    "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                     imap_host, imap_port, encrypted_password)
+                     VALUES ('acc1', 'T', 't@example.com', 'example.com',
+                             'smtp.example.com', 587, 'imap.example.com', 993, 'enc')",
+                    [],
+                )
+                .unwrap();
+        }
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@example.net",
+                Some("Relink"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, message_id).unwrap();
+        if let Some(uid) = uid {
+            db.update_draft_imap_uid(&draft.id, uid).unwrap();
+        }
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn numeric_uid_relinks_unique_local_draft_by_exact_message_id() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let draft = seed_relink_draft(&db, "<stable@example.com>", Some(41));
+
+        assert_eq!(
+            relink_local_draft_uid(&db, "acc1", 82, "stable@example.com").unwrap(),
+            LocalDraftIdentity::Relinked(draft.id.clone())
+        );
+        assert_eq!(db.get_draft(&draft.id).unwrap().unwrap().imap_uid, Some(82));
+        assert_eq!(
+            relink_local_draft_uid(&db, "acc1", 99, "missing@example.com").unwrap(),
+            LocalDraftIdentity::Missing
+        );
+        assert_eq!(
+            relink_local_draft_uid(&db, "acc1", 82, "<stable@example.com>").unwrap(),
+            LocalDraftIdentity::Current(draft.id)
+        );
+    }
+
+    #[test]
+    fn numeric_uid_relink_clears_a_stale_uid_collision_after_identity_verification() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let stale = seed_relink_draft(&db, "stale@example.com", Some(82));
+        let current = seed_relink_draft(&db, "current@example.com", Some(41));
+
+        assert_eq!(
+            relink_local_draft_uid(&db, "acc1", 82, "current@example.com").unwrap(),
+            LocalDraftIdentity::Relinked(current.id.clone())
+        );
+        assert!(db.get_draft(&stale.id).unwrap().unwrap().imap_uid.is_none());
+        assert_eq!(
+            db.get_draft(&current.id).unwrap().unwrap().imap_uid,
+            Some(82)
+        );
+    }
+
+    #[test]
+    fn numeric_uid_relink_refuses_ambiguous_local_message_id() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let first = seed_relink_draft(&db, "dup@example.com", None);
+        let second = seed_relink_draft(&db, "<dup@example.com>", None);
+
+        assert_eq!(
+            relink_local_draft_uid(&db, "acc1", 82, "dup@example.com").unwrap(),
+            LocalDraftIdentity::Ambiguous
+        );
+        assert!(db.get_draft(&first.id).unwrap().unwrap().imap_uid.is_none());
+        assert!(
+            db.get_draft(&second.id)
+                .unwrap()
+                .unwrap()
+                .imap_uid
+                .is_none()
+        );
+    }
+
+    fn draft_summary(uid: u32, message_id: &str) -> MessageSummary {
+        MessageSummary {
+            uid,
+            message_id: Some(message_id.to_string()),
+            from_addr: "from@example.com".to_string(),
+            to_addr: "to@example.com".to_string(),
+            subject: "Draft".to_string(),
+            date: None,
+            flags: vec!["Draft".to_string()],
+            size: 10,
+            provider_spam: None,
+        }
+    }
+
+    #[test]
+    fn draft_list_reconciliation_repairs_only_one_to_one_identities() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let unique = seed_relink_draft(&db, "unique@example.com", Some(10));
+        let duplicate = seed_relink_draft(&db, "duplicate@example.com", Some(20));
+        let summaries = vec![
+            draft_summary(11, "<unique@example.com>"),
+            draft_summary(21, "duplicate@example.com"),
+            draft_summary(22, "<duplicate@example.com>"),
+        ];
+
+        assert_eq!(
+            reconcile_local_draft_uids(&db, "acc1", &summaries).unwrap(),
+            1
+        );
+        assert_eq!(
+            db.get_draft(&unique.id).unwrap().unwrap().imap_uid,
+            Some(11)
+        );
+        assert_eq!(
+            db.get_draft(&duplicate.id).unwrap().unwrap().imap_uid,
+            Some(20),
+            "duplicate provider copies must stay explicit rather than map arbitrarily"
+        );
     }
 
     fn seed_account_and_bot_draft(
@@ -3950,6 +4488,7 @@ mod tests {
             "Re: mixed line endings",
             Some("Repro body.\n\n> Hola señor Martin,\n> segunda línea"),
             Some(html),
+            None,
             None,
             Some("<parent@example.com>"),
             &[],

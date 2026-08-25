@@ -29,6 +29,7 @@
     validateAddrs
   } from '$lib/addresses';
   import Badge from './Badge.svelte';
+  import BodyFrame from './BodyFrame.svelte';
   import Button from './Button.svelte';
   import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
@@ -134,6 +135,18 @@
   let subjectRaw = $state('');
   let bodyRaw = $state('');
   let bodyFormat = $state<BodyFormat>('text');
+  // The editor keeps one body per format. Both slots are seeded when the draft
+  // loads, so switching format shows that format's own body instead of
+  // relabelling whatever is already in the box — relabelling is how a save
+  // overwrote a draft's real HTML part with its plain-text twin. Parking the
+  // live body on the way out means switching back returns the operator's
+  // unsaved edit rather than the server copy.
+  let bodyByFormat = $state<Record<BodyFormat, string>>({ text: '', html: '' });
+  // Approving an HTML body means seeing what the recipient will see, so the
+  // preview renders it through the same sandboxed frame the reader uses.
+  let previewing = $state(false);
+  let remoteImages = $state(false);
+  let remoteBlockedCount = $state(0);
   let showBcc = $state(false);
   let baseline = $state<Snapshot>({ to: '', cc: '', bcc: '', subject: '', body: '', format: 'text' });
 
@@ -157,6 +170,19 @@
    * URL, which the API resolves server-side.
    */
   const identityMatches = $derived(!!draft && loadedForKey === routeKey && draft.id === draftId);
+
+  /**
+   * The account authenticates the SMTP connection, but a draft may carry a
+   * validated send-as identity in metadata. Review must show the header that
+   * will actually reach the recipient, not merely the transport account.
+   */
+  function metadataFromIdentity(value: Draft | null): string | null {
+    const from = value?.metadata?.from;
+    if (typeof from !== 'string') return null;
+    const trimmed = from.trim();
+    return trimmed && !/[\r\n]/.test(trimmed) ? trimmed : null;
+  }
+  const effectiveFrom = $derived(metadataFromIdentity(draft) ?? (accountLabel || accountId));
 
   const statusMeta = $derived(draft ? STATUS_META[draft.status] : null);
   const statusEditable = $derived(!!draft && isEditableDraftStatus(draft.status));
@@ -189,7 +215,16 @@
    * `metadata.send_block`; fall back to attribution park_reason; then a
    * generic "stopped, nothing transmitted" so older rows still explain themselves.
    */
-  type SendBlock = { code: string; title: string; explanation: string; action?: string };
+  type SendBlock = {
+    code: string;
+    title: string;
+    explanation: string;
+    action?: string;
+    /** Whether approving again could plausibly clear the block. */
+    retryable: boolean;
+    /** Where the block CAN be cleared, when it cannot be cleared here. */
+    remedy?: string;
+  };
   function asSendBlock(value: unknown): SendBlock | null {
     if (!value || typeof value !== 'object') return null;
     const o = value as Record<string, unknown>;
@@ -200,11 +235,20 @@
       code: typeof o.code === 'string' && o.code ? o.code : 'send_stopped',
       title: title || 'This send was stopped',
       explanation: explanation || 'Nothing was transmitted.',
-      action: typeof o.action === 'string' ? o.action : undefined
+      action: typeof o.action === 'string' ? o.action : undefined,
+      retryable: true
     };
   }
   const sendBlock = $derived.by((): SendBlock | null => {
     if (!draft) return null;
+    // A draft back in the outbox is no longer stopped. The queue endpoint
+    // promotes `pending_review` → `draft` server-side but returns no draft row,
+    // so after Send-again from this page the local `draft` still carries the
+    // pre-queue status and `metadata.send_block`; without this guard that
+    // history renders as a stop alert beside the fresh Queued banner. Stop and
+    // queued are mutually exclusive server-side too — every park clears
+    // `send_after` — so a reload agrees with this.
+    if (isQueued) return null;
     if (draft.status !== 'pending_review' && draft.status !== 'blocked') return null;
     const stored = asSendBlock(draft.metadata?.send_block);
     if (stored) return stored;
@@ -214,12 +258,28 @@
         ? (attribution as Record<string, unknown>).park_reason
         : null;
     if (park === 'attribution_exhausted') {
+      const record = attribution as Record<string, unknown>;
+      const declared = Array.isArray(record.declared_attrs) ? record.declared_attrs : [];
+      const attempts = typeof record.attempts === 'number' ? record.attempts : 0;
+      // Approving again re-runs the identical declaration-free attempt: it
+      // spends another try and parks on the same reason. Say that instead of
+      // offering the button. Which label would pass is deliberately NOT shown —
+      // the park record carries no such field, and coaching one would turn a
+      // blind declaration into lock-picking.
+      const stuck = record.origin === 'bot' && declared.length === 0;
       return {
         code: 'attribution_exhausted',
         title: 'This send was stopped',
-        explanation:
-          'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
-        action: 'send'
+        explanation: stuck
+          ? `Envelope paused this message because the send is bot-attributed and carries no fact labels. ` +
+            `${attempts} attempts were spent and no fact labels were declared for this revision. ` +
+            `Approving it here repeats the same attempt, so that button is withheld.`
+          : 'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
+        action: stuck ? undefined : 'send',
+        retryable: !stuck,
+        remedy: stuck
+          ? `Declaring is the sending agent's job, and only the CLI can carry it: envelope draft send ${draft.id} --attr <label>`
+          : undefined
       };
     }
     if (draft.status === 'blocked') {
@@ -227,7 +287,8 @@
         code: 'blocked',
         title: 'This send was stopped',
         explanation: STATUS_META.blocked.note,
-        action: 'edit'
+        action: 'edit',
+        retryable: true
       };
     }
     return {
@@ -235,7 +296,8 @@
       title: 'This send was stopped',
       explanation:
         'Envelope paused this message before it left. Nothing was transmitted. Envelope did not record a more specific reason on this draft.',
-      action: 'send'
+      action: 'send',
+      retryable: true
     };
   });
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);
@@ -359,6 +421,9 @@
     loadedForKey = '';
     accountLabel = '';
     loading = true;
+    previewing = false;
+    remoteImages = false;
+    remoteBlockedCount = 0;
   }
 
   async function load() {
@@ -399,12 +464,13 @@
 
   /** Adopt a server draft as the new editing baseline. */
   function applyDraft(next: Draft) {
-    // A draft with only an HTML body opens in HTML mode; everything else opens
-    // in plain text. Saving writes back exactly the format shown, which clears
-    // the other alternate server-side — that is what stops a stale HTML part
-    // from being delivered instead of the edit.
-    const format: BodyFormat =
-      next.text_content == null && next.html_content != null ? 'html' : 'text';
+    // A draft that HAS an HTML body opens on it, rendered. That body is the
+    // message the recipient sees; the text part is the fallback alternative,
+    // and opening on the fallback showed bare tracking URLs where the real
+    // email has buttons. Saving still writes back exactly the format shown,
+    // which clears the other alternate server-side — that is what stops a
+    // stale HTML part from being delivered instead of the edit.
+    const format: BodyFormat = next.html_content != null ? 'html' : 'text';
 
     draft = next;
     // Normalized to the recipient field's canonical `a@x, b@y` form BEFORE the
@@ -415,8 +481,18 @@
     ccRaw = serializeAddrs(next.cc_addr ?? '');
     bccRaw = serializeAddrs(next.bcc_addr ?? '');
     subjectRaw = next.subject ?? '';
-    bodyRaw = (format === 'html' ? next.html_content : next.text_content) ?? '';
+    // A draft carrying only one alternative seeds the empty slot from the one
+    // it has: switching format there means "send this body as the other
+    // format", not "start from an empty box".
+    bodyByFormat = {
+      text: (next.text_content ?? next.html_content) ?? '',
+      html: (next.html_content ?? next.text_content) ?? ''
+    };
+    bodyRaw = bodyByFormat[format];
     bodyFormat = format;
+    // HTML opens rendered. Reading markup is the exception, so it lives behind
+    // the toggle rather than being what a review lands on.
+    previewing = format === 'html';
     showBcc = bccRaw.length > 0;
     conflict = false;
     baseline = snapshot();
@@ -439,6 +515,20 @@
     // The attachment write cleared any approval attestation server-side, so a
     // "saved" badge from before it would now overstate what is approved.
     saved = false;
+  }
+
+  /**
+   * Switch which alternative is being edited, swapping the body along with the
+   * label. The edit endpoint writes whichever body it is handed and clears the
+   * other, so a format that shows the wrong body sends the wrong body.
+   */
+  function setFormat(next: BodyFormat) {
+    if (next === bodyFormat) return;
+    bodyByFormat[bodyFormat] = bodyRaw;
+    bodyRaw = bodyByFormat[next];
+    bodyFormat = next;
+    // Entering HTML renders it; plain text has nothing to render.
+    previewing = next === 'html';
   }
 
   function snapshot(): Snapshot {
@@ -779,8 +869,11 @@
         <p class="draft-banner-title">{sendBlock.title}</p>
         <p>{sendBlock.explanation}</p>
         <MonoTag>{sendBlock.code}</MonoTag>
+        {#if sendBlock.remedy}
+          <p class="draft-banner-remedy">{sendBlock.remedy}</p>
+        {/if}
         <div class="draft-banner-action">
-          {#if sendable}
+          {#if sendable && sendBlock.retryable}
             <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send again</Button>
           {/if}
         </div>
@@ -795,7 +888,7 @@
     <div class="draft-card draft-addresses">
       <div class="draft-field-row is-static">
         <span class="draft-field-label">From</span>
-        <span class="draft-field-value">{accountLabel || accountId}</span>
+        <span class="draft-field-value" id="draft-from-identity">{effectiveFrom}</span>
       </div>
 
       <RecipientField
@@ -858,16 +951,31 @@
             class:is-active={bodyFormat === 'text'}
             aria-pressed={bodyFormat === 'text'}
             disabled={inputsLocked}
-            onclick={() => (bodyFormat = 'text')}>Text</button
+            onclick={() => setFormat('text')}>Text</button
           >
           <button
             type="button"
             class:is-active={bodyFormat === 'html'}
             aria-pressed={bodyFormat === 'html'}
             disabled={inputsLocked}
-            onclick={() => (bodyFormat = 'html')}>HTML</button
+            onclick={() => setFormat('html')}>HTML</button
           >
         </div>
+        {#if bodyFormat === 'html'}
+          <button
+            type="button"
+            class="draft-preview-toggle"
+            aria-pressed={previewing}
+            onclick={() => (previewing = !previewing)}
+          >
+            {previewing ? 'Edit HTML' : 'Preview'}
+          </button>
+        {/if}
+        {#if previewing && remoteBlockedCount > 0 && !remoteImages}
+          <button type="button" class="draft-remote-btn" onclick={() => (remoteImages = true)}>
+            Load remote images ({remoteBlockedCount} blocked)
+          </button>
+        {/if}
         {#if bodyChanged && hasBothBodies}
           <p class="draft-format-note">
             This draft has both a plain-text and an HTML version. Saving replaces the body with
@@ -875,13 +983,23 @@
           </p>
         {/if}
       </div>
-      <label class="draft-sr-only" for="draft-body">Message</label>
-      <textarea
-        id="draft-body"
-        placeholder="Write your message"
-        bind:value={bodyRaw}
-        disabled={inputsLocked}
-      ></textarea>
+      {#if previewing && bodyFormat === 'html'}
+        <div class="draft-preview">
+          <BodyFrame
+            html={bodyRaw}
+            {remoteImages}
+            onRemoteBlocked={(count) => (remoteBlockedCount = count)}
+          />
+        </div>
+      {:else}
+        <label class="draft-sr-only" for="draft-body">Message</label>
+        <textarea
+          id="draft-body"
+          placeholder="Write your message"
+          bind:value={bodyRaw}
+          disabled={inputsLocked}
+        ></textarea>
+      {/if}
     </div>
 
     <DraftAttachments
@@ -927,6 +1045,10 @@
 </section>
 
 <Modal open={confirmOpen} title="Queue this draft for sending?" onclose={closeConfirm}>
+  <p class="draft-confirm-line">
+    <strong>From</strong>
+    {effectiveFrom}
+  </p>
   <p class="draft-confirm-line">
     <strong>To</strong>
     {toRaw.trim() || '(no recipient)'}
@@ -1239,6 +1361,33 @@
   .draft-format button:disabled {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+  .draft-preview-toggle,
+  .draft-remote-btn {
+    min-height: 1.875rem;
+    padding: 0 0.6rem;
+    border: 1px solid var(--env-rule);
+    background: var(--env-surface);
+    color: var(--env-muted);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+  }
+  .draft-preview-toggle[aria-pressed='true'] {
+    background: var(--env-ink);
+    color: var(--env-surface);
+  }
+  .draft-preview {
+    flex: 1;
+    min-height: 16rem;
+    overflow-y: auto;
+    background: var(--env-surface);
+  }
+  .draft-banner-remedy {
+    margin: 0.4rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
   }
   .draft-format-note {
     margin: 0;

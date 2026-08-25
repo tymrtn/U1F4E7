@@ -80,6 +80,11 @@ async function renderLoaded(overrides: Partial<Draft> = {}) {
   await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 }
 
+/** An HTML body opens rendered; drop to the source textarea to type into it. */
+async function openSource() {
+  await fireEvent.click(screen.getByRole('button', { name: /edit html/i }));
+}
+
 /** The token field wrapping a recipient input. */
 function recipientField(label: string): HTMLElement {
   return screen.getByLabelText(label).closest('.recipient-field') as HTMLElement;
@@ -168,6 +173,29 @@ describe('DraftComposer load', () => {
     }
   });
 
+  it('shows the effective send-as identity from draft metadata', async () => {
+    await renderLoaded({
+      metadata: { from: 'SpainExpat Plus Ultra <plusultra@spainexpat.com>' }
+    });
+
+    expect(document.getElementById('draft-from-identity')).toHaveTextContent(
+      'SpainExpat Plus Ultra <plusultra@spainexpat.com>'
+    );
+  });
+
+  it('falls back to the transport account when no send-as identity exists', async () => {
+    apiMock.draft.mockResolvedValueOnce({
+      ...draftResponse(),
+      account: { username: 'bruno@spainexpat.com' }
+    });
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+
+    expect(document.getElementById('draft-from-identity')).toHaveTextContent(
+      'bruno@spainexpat.com'
+    );
+  });
+
   it('shows a not-found state when the draft does not exist', async () => {
     apiMock.draft.mockRejectedValueOnce(
       new EnvelopeApiError(404, 'http_404', 'draft not found', null)
@@ -241,6 +269,7 @@ describe('DraftComposer edit', () => {
 
   it('sends only the edited body format so the stale alternate is cleared', async () => {
     await renderLoaded({ text_content: null, html_content: '<p>Hi</p>' });
+    await openSource();
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: '<p>Bye</p>' } });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -311,6 +340,18 @@ describe('DraftComposer send', () => {
 
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+  });
+
+  it('repeats the effective From identity in the final send confirmation', async () => {
+    await renderLoaded({
+      metadata: { from: 'SpainExpat Plus Ultra <plusultra@spainexpat.com>' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('From').parentElement).toHaveTextContent(
+      'SpainExpat Plus Ultra <plusultra@spainexpat.com>'
+    );
   });
 
   it('queues with confirm=true and the reviewed revision once confirmed', async () => {
@@ -785,6 +826,35 @@ describe('DraftComposer never silently parks a send', () => {
     expect(banner).toHaveTextContent('did not record a more specific reason');
     expect(screen.getByRole('button', { name: /send again/i })).toBeEnabled();
   });
+
+  it('drops the stop explanation once the draft is queued again from this page', async () => {
+    await renderLoaded({
+      status: 'pending_review',
+      send_after: null,
+      metadata: {
+        send_block: {
+          code: 'governor_blocked',
+          title: 'This send was stopped',
+          explanation: 'Envelope paused this message for review before sending. Nothing was transmitted.',
+          action: 'send'
+        }
+      }
+    });
+    expect(document.getElementById('draft-send-block')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: /send again/i }));
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+    // The draft is back in the outbox. The queue endpoint returns no draft row,
+    // so the local copy still says pending_review + send_block — that history
+    // must not render as a second, contradictory state beside the countdown.
+    expect(document.getElementById('draft-send-block')).toBeFalsy();
+    expect(screen.queryByText(/this send was stopped/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('governor_blocked')).not.toBeInTheDocument();
+    expect(screen.getByText('Queued')).toBeInTheDocument();
+  });
 });
 
 // ── Recipient guard ───────────────────────────────────────────────────
@@ -1099,28 +1169,32 @@ describe('DraftComposer body preservation', () => {
 
   it('still replaces the pair — clearing the stale alternate — when the body changes', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Rewritten' } });
+    await openSource();
+    await fireEvent.input(screen.getByLabelText('Message'), {
+      target: { value: '<p>Rewritten</p>' }
+    });
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
     const body = apiMock.editDraft.mock.calls[0][2];
-    expect(body.text_content).toBe('Rewritten');
-    expect(body).not.toHaveProperty('html_content');
+    expect(body.html_content).toBe('<p>Rewritten</p>');
+    expect(body).not.toHaveProperty('text_content');
   });
 
   it('sends the body when only the format changed', async () => {
     await renderLoaded(DUAL);
-    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
     const body = apiMock.editDraft.mock.calls[0][2];
-    expect(body).toHaveProperty('html_content');
-    expect(body).not.toHaveProperty('text_content');
+    expect(body).toHaveProperty('text_content');
+    expect(body).not.toHaveProperty('html_content');
   });
 
   it('warns before a body edit drops the draft’s other format', async () => {
     await renderLoaded(DUAL);
+    await openSource();
     expect(screen.queryByText(/drops the other format/i)).not.toBeInTheDocument();
 
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Rewritten' } });
@@ -1171,5 +1245,199 @@ describe('DraftComposer optional-recipient validation', () => {
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
+  });
+});
+
+// ── Body format switching ─────────────────────────────────────────────
+//
+// A draft with an HTML part opens on it, rendered: that body is the message
+// the recipient sees. The Text/HTML control picks which alternative is being
+// edited, so switching has to swap the body in the box — relabelling the
+// plain-text body as HTML is how a draft's real HTML part got overwritten
+// with its plain-text twin on the next save.
+
+describe('DraftComposer body format switching', () => {
+  const DUAL = { text_content: 'Plain body', html_content: '<p>Rich body</p>' };
+
+  function messageBox(): HTMLTextAreaElement {
+    return screen.getByLabelText('Message') as HTMLTextAreaElement;
+  }
+
+  it('opens a draft that has an HTML body on its rendered HTML', async () => {
+    await renderLoaded(DUAL);
+
+    expect(screen.getByRole('button', { name: 'HTML' })).toHaveAttribute('aria-pressed', 'true');
+    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    expect(frame.getAttribute('srcdoc')).toContain('Rich body');
+    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
+  });
+
+  it('opens a text-only draft in plain text', async () => {
+    await renderLoaded({ text_content: 'Only text', html_content: null });
+
+    expect(screen.getByRole('button', { name: 'Text' })).toHaveAttribute('aria-pressed', 'true');
+    expect(messageBox().value).toBe('Only text');
+  });
+
+  it('shows the plain-text alternative when the format switches to Text', async () => {
+    await renderLoaded(DUAL);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    expect(messageBox().value).toBe('Plain body');
+  });
+
+  it('shows the HTML source behind Edit HTML', async () => {
+    await renderLoaded(DUAL);
+
+    await openSource();
+
+    expect(messageBox().value).toBe('<p>Rich body</p>');
+  });
+
+  it('returns the HTML body, not the plain-text one, after a round trip', async () => {
+    await renderLoaded(DUAL);
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+
+    await openSource();
+
+    expect(messageBox().value).toBe('<p>Rich body</p>');
+  });
+
+  it('keeps an unsaved edit when the format is switched away and back', async () => {
+    await renderLoaded(DUAL);
+    await openSource();
+    await fireEvent.input(messageBox(), { target: { value: '<p>Half-written</p>' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await openSource();
+
+    expect(messageBox().value).toBe('<p>Half-written</p>');
+  });
+
+  it('carries the body over when the draft has no alternative in that format', async () => {
+    await renderLoaded({ text_content: 'Only text', html_content: null });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+    await openSource();
+
+    expect(messageBox().value).toBe('Only text');
+  });
+});
+
+// ── HTML preview ──────────────────────────────────────────────────────
+//
+// An HTML body is unreadable as source. The preview renders it through the
+// same sandboxed BodyFrame the reader uses, so the operator approves what the
+// recipient will actually see.
+
+describe('DraftComposer HTML preview', () => {
+  const DUAL = { text_content: 'Plain body', html_content: '<p>Rich body</p>' };
+
+  it('offers no preview while the body is plain text', async () => {
+    await renderLoaded({ text_content: 'Only text', html_content: null });
+
+    expect(screen.queryByRole('button', { name: /preview|edit html/i })).not.toBeInTheDocument();
+  });
+
+  it('renders the HTML body in a sandboxed frame', async () => {
+    await renderLoaded(DUAL);
+
+    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const sandbox = frame.getAttribute('sandbox') ?? '';
+    expect(sandbox).toContain('allow-same-origin');
+    expect(sandbox).not.toContain('allow-scripts');
+  });
+
+  it('previews the unsaved edit rather than the saved body', async () => {
+    await renderLoaded(DUAL);
+    await openSource();
+    await fireEvent.input(screen.getByLabelText('Message'), {
+      target: { value: '<p>Rewritten</p>' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
+
+    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    expect(frame.getAttribute('srcdoc')).toContain('Rewritten');
+  });
+
+  it('leaves the preview when the format switches to plain text', async () => {
+    await renderLoaded(DUAL);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Plain body');
+    expect(screen.queryByTitle('Message body')).not.toBeInTheDocument();
+  });
+
+  it('renders again when the format switches back to HTML', async () => {
+    await renderLoaded(DUAL);
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
+
+    expect(await screen.findByTitle('Message body')).toBeInTheDocument();
+  });
+});
+
+// ── Attribution park ──────────────────────────────────────────────────
+//
+// A bot-origin draft parked for attribution cannot be unstuck by approving it
+// again: the queue path re-runs the same declaration-free attempt, burns
+// another try, and re-parks. The banner has to say so rather than offering a
+// button that only spends attempts.
+
+describe('DraftComposer attribution park', () => {
+  function parked(attribution: Record<string, unknown>) {
+    return {
+      status: 'pending_review' as const,
+      metadata: { attribution: { park_reason: 'attribution_exhausted', ...attribution } }
+    };
+  }
+
+  it('does not offer Send again when no declaration is on record', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    expect(screen.queryByRole('button', { name: /send again/i })).not.toBeInTheDocument();
+  });
+
+  it('says what the attribution record actually holds', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).toMatch(/4 attempts/i);
+    expect(banner.textContent).toMatch(/no fact labels/i);
+  });
+
+  it('points at the surface that can declare', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).toContain('envelope draft send');
+    expect(banner.textContent).toContain('--attr');
+  });
+
+  it('never names the label that would pass', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    // The catalog is blind by design: the park record carries no required-label
+    // field, and coaching one here would turn declaring into lock-picking.
+    const banner = document.getElementById('draft-send-block') as HTMLElement;
+    expect(banner.textContent).not.toMatch(/agent_drafted|commitment_language|tyler_approved/);
+  });
+
+  it('still offers Send again when a declaration was recorded', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: ['agent_drafted'], attempts: 4 }));
+
+    expect(screen.getByRole('button', { name: /send again/i })).toBeInTheDocument();
+  });
+
+  it('still offers Send again on a park with no attribution record', async () => {
+    await renderLoaded({ status: 'pending_review', metadata: null });
+
+    expect(screen.getByRole('button', { name: /send again/i })).toBeInTheDocument();
   });
 });
