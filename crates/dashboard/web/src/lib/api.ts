@@ -497,6 +497,8 @@ export interface DraftSendBody {
   confirm: boolean;
   expected_revision: number;
   cooldown_seconds?: number;
+  /** Skip the outbox cooldown and transmit at once. Same send path, no wait. */
+  send_now?: boolean;
 }
 
 export interface DraftQueuedResponse {
@@ -507,6 +509,8 @@ export interface DraftQueuedResponse {
   cooldown_seconds: number;
   queued_reason_code: string;
   queued_reason: string;
+  /** True when the caller asked for immediate transmission. */
+  send_now?: boolean;
 }
 
 /**

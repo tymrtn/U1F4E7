@@ -86,11 +86,18 @@ pub struct DraftSendRequest {
     /// a concurrent edit returns 409 and nothing is queued.
     pub expected_revision: i64,
     /// Optional override for the outbox cooldown (seconds). Omitted → the shared
-    /// default cooldown. Negative values clamp to zero. There is intentionally no
-    /// immediate-SMTP dashboard bypass: the queued draft is transmitted later by
-    /// the shared scheduled-send sweep, after the Governor gate.
+    /// default cooldown. Negative values clamp to zero.
     #[serde(default)]
     pub cooldown_seconds: Option<i64>,
+    /// Send this message immediately instead of waiting out the outbox cooldown.
+    ///
+    /// This is NOT a transmit bypass. The draft is queued exactly as it always
+    /// is — zero cooldown — and then the shared scheduled-send sweep is run at
+    /// once, so the message travels the identical path (claim, attachments,
+    /// threading, Governor gate) that a cooldown send takes a minute later. The
+    /// only thing skipped is the waiting.
+    #[serde(default)]
+    pub send_now: bool,
 }
 
 /// Serialize a draft for the JSON API with attachment bytes stripped.
@@ -453,12 +460,19 @@ pub async fn send(
         return (StatusCode::CONFLICT, "draft already sent").into_response();
     }
 
-    // Do NOT transmit immediately. Queue into the outbox cooldown so the shared
-    // scheduled-send sweep performs the real SMTP send (with attachments,
-    // threading, and the Governor gate). This keeps the dashboard send path
-    // aligned with CLI/MCP/scheduled outbound semantics; there is no immediate
-    // dashboard SMTP bypass.
-    let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
+    // The dashboard never opens its own SMTP socket. Every send queues into the
+    // outbox and the shared scheduled-send sweep performs the real transmission
+    // (attachments, threading, Governor gate), keeping this path identical to
+    // CLI/MCP/scheduled outbound.
+    //
+    // `send_now` changes the WAIT, not the PATH: the cooldown is zero and the
+    // sweep is kicked immediately after the queue commits, so the operator who
+    // means "now" gets now instead of watching a countdown they did not ask for.
+    let cooldown = if req.send_now {
+        0
+    } else {
+        resolve_cooldown_seconds(req.cooldown_seconds)
+    };
     match queue_draft_for_outbox(&db, &draft.id, req.expected_revision, cooldown) {
         Ok((send_after, attested)) => {
             // The additive human-origin attribution block (tyler_approved derived;
@@ -481,14 +495,27 @@ pub async fn send(
                 .publish(crate::events::DashboardEvent::DraftQueued {
                     account_id: draft.account_id.clone(),
                     draft_id: draft.id.clone(),
-                    origin: "queue",
+                    origin: if req.send_now { "send_now" } else { "queue" },
                 });
+            // Release the DB lock before the sweep runs — it takes the same lock
+            // to claim the row, and holding it here would deadlock the send we
+            // just asked for.
+            drop(db);
+            if req.send_now {
+                let sweep_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::run_scheduled_send_sweep(&sweep_state).await {
+                        tracing::warn!("send-now sweep failed: {e}");
+                    }
+                });
+            }
             Json(json!({
                 "draft_id": draft.id,
                 "sent": false,
-                "status": "queued",
+                "status": if req.send_now { "sending" } else { "queued" },
                 "send_after": send_after,
                 "cooldown_seconds": cooldown,
+                "send_now": req.send_now,
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
                 "attribution": attribution,
@@ -1062,6 +1089,7 @@ mod tests {
                 confirm: true,
                 expected_revision: rev,
                 cooldown_seconds: Some(120),
+                send_now: false,
             }),
         )
         .await
@@ -1128,6 +1156,7 @@ mod tests {
                 // A long schedule, not a 60s undo window: hold has to work for
                 // a send parked hours out, which is the case discard ruins.
                 cooldown_seconds: Some(6 * 60 * 60),
+                send_now: false,
             }),
         )
         .await

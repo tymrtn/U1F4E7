@@ -42,6 +42,7 @@
   let { html, remoteImages = false, onRemoteBlocked }: Props = $props();
 
   let frameEl = $state<HTMLIFrameElement | null>(null);
+  let resizeObserver: ResizeObserver | null = null;
 
   /** Sanitize an HTML email string and wrap it in a safe document.
    *  Returns { srcdoc, remoteBlocked } — side-effects (callback) stay in $effect. */
@@ -201,18 +202,67 @@
     return false;
   }
 
-  /** Resize the iframe to fit its content after load. */
-  function onLoad() {
+  /**
+   * Measure the rendered document and size the frame to it.
+   *
+   * The frame is collapsed before measuring. `documentElement.scrollHeight`
+   * cannot report less than the frame's own viewport, so measuring while the
+   * frame is already tall returns the frame's height rather than the content's
+   * — and with a ResizeObserver attached, feeding that back in makes the frame
+   * grow on every pass (a 2,164px email measured 3,369px and climbing). Zero
+   * height first, read, then set: the reading is always the content.
+   */
+  function fitToContent() {
     if (!frameEl) return;
     try {
       const doc = frameEl.contentDocument;
       if (!doc?.documentElement) return;
+      // Don't observe our own measurement.
+      resizeObserver?.disconnect();
+      frameEl.style.height = '0px';
       const height = doc.documentElement.scrollHeight;
-      if (height > 0) frameEl.style.height = `${Math.min(height + 16, 6000)}px`;
+      if (height > 0) frameEl.style.height = `${Math.min(height + 16, 20000)}px`;
+      if (doc.body && resizeObserver) resizeObserver.observe(doc.body);
     } catch {
-      // Cross-origin or not yet ready — leave default height.
+      // Cross-origin or not yet ready — leave the fallback height.
     }
   }
+
+  /**
+   * Size the frame after load, and keep sizing it.
+   *
+   * A single measurement at load is wrong for almost every real email: images
+   * (remote ones especially) arrive after the document fires `load`, custom
+   * fonts reflow the text, and opening a collapsed quote changes the height
+   * long afterwards. Measuring once left the frame short and the message
+   * clipped, which the old fixed height then hid behind an inner scrollbar.
+   * Observe the content instead and follow it.
+   */
+  function onLoad() {
+    if (!frameEl) return;
+    const doc = frameEl.contentDocument;
+    if (!doc) return;
+
+    // Create the observer before the first measurement so `fitToContent` can
+    // suspend it around its own writes.
+    if (doc.body && typeof ResizeObserver !== 'undefined' && !resizeObserver) {
+      resizeObserver = new ResizeObserver(fitToContent);
+    }
+    fitToContent();
+
+    // Late-arriving images and fonts.
+    for (const img of Array.from(doc.images)) {
+      if (!img.complete) {
+        img.addEventListener('load', fitToContent, { once: true });
+        img.addEventListener('error', fitToContent, { once: true });
+      }
+    }
+
+  }
+
+  $effect(() => {
+    return () => resizeObserver?.disconnect();
+  });
 
   // Build the srcdoc as a derived value (pure computation — no side effects).
   let built = $derived(buildSrcdoc(html, remoteImages));
@@ -238,6 +288,9 @@
 <style>
   .body-frame {
     width: 100%;
+    /* A starting height only — `fitToContent` replaces it with the rendered
+       document height as soon as the frame loads, and again whenever the
+       content reflows. The frame never scrolls internally; the page does. */
     min-height: 8rem;
     height: 20rem;
     border: none;

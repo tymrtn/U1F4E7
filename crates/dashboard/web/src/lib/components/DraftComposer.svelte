@@ -37,6 +37,7 @@
   import MonoTag from './MonoTag.svelte';
   import RecipientField from './RecipientField.svelte';
   import Spinner from './Spinner.svelte';
+  import { getLiveStore } from '$lib/live.svelte';
   import {
     api,
     isEditableDraftStatus,
@@ -49,6 +50,9 @@
   } from '$lib/api';
 
   type BodyFormat = 'text' | 'html';
+
+  /** Mirrors the backend default in crates/transport (ENVELOPE_SEND_COOLDOWN_SECONDS). */
+  const DEFAULT_COOLDOWN_SECONDS = 60;
 
   interface Snapshot {
     to: string;
@@ -145,8 +149,12 @@
   // Approving an HTML body means seeing what the recipient will see, so the
   // preview renders it through the same sandboxed frame the reader uses.
   let previewing = $state(false);
-  let remoteImages = $state(false);
-  let remoteBlockedCount = $state(0);
+  // Remote images always load in the draft composer. Blocking them is an
+  // INBOUND privacy control — it stops a stranger's tracking pixel confirming
+  // you opened their mail. This is your own outgoing message: you are the
+  // sender, there is no read receipt to leak, and hiding the artwork means
+  // reviewing a layout your recipient will see and you will not.
+  const remoteImages = true;
   let showBcc = $state(false);
   let baseline = $state<Snapshot>({ to: '', cc: '', bcc: '', subject: '', body: '', format: 'text' });
 
@@ -208,7 +216,14 @@
   const persistedQueue = $derived(
     !!draft && draft.send_after != null && draft.status === 'draft'
   );
-  const isQueued = $derived(!!queued || persistedQueue);
+  // Server truth ONLY. This used to OR in the local `queued` POST response,
+  // which is set once and never cleared — so after the sweep parked or sent the
+  // draft, the browser went on rendering a countdown for a row that had neither
+  // `send_after` nor `draft` status. That stale flag also suppressed the stop
+  // alert below, which is how a Governor-blocked message displayed as "Queued —
+  // due now" with a Hold button, for hours, having never been transmitted.
+  // `queued` is now only a hint that a reload is owed (see `confirmSend`).
+  const isQueued = $derived(persistedQueue);
 
   /**
    * A parked or blocked draft must never look silent. Prefer the stored
@@ -241,14 +256,12 @@
   }
   const sendBlock = $derived.by((): SendBlock | null => {
     if (!draft) return null;
-    // A draft back in the outbox is no longer stopped. The queue endpoint
-    // promotes `pending_review` → `draft` server-side but returns no draft row,
-    // so after Send-again from this page the local `draft` still carries the
-    // pre-queue status and `metadata.send_block`; without this guard that
-    // history renders as a stop alert beside the fresh Queued banner. Stop and
-    // queued are mutually exclusive server-side too — every park clears
-    // `send_after` — so a reload agrees with this.
-    if (isQueued) return null;
+    // No suppression here. A stale stop reason used to be hidden behind
+    // `isQueued`, which hid the ONLY explanation the operator ever got for a
+    // refused send. The staleness is fixed at the source instead: queueing a
+    // draft clears `send_block` in the same transaction that records the
+    // approval (store::transfer_draft_authorship_to_human), so a reason that
+    // survives to here describes THIS draft's real, current state.
     if (draft.status !== 'pending_review' && draft.status !== 'blocked') return null;
     const stored = asSendBlock(draft.metadata?.send_block);
     if (stored) return stored;
@@ -326,6 +339,45 @@
   $effect(() => {
     if (!isQueued || dueAtMs == null || pastDue) return;
     const timer = setInterval(() => (nowMs = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  // ── Live server truth while a send is in flight ──────────────────────
+  //
+  // The sweep decides this draft's fate in another process: it may transmit it,
+  // park it for review, or defer it. Without a listener the browser keeps the
+  // last render forever — the failure the operator actually hit, where a
+  // Governor-blocked message sat on screen as "due now" long after the server
+  // had stopped it. Subscribe to the draft lifecycle events for THIS draft and
+  // re-read the row whenever the server says it moved.
+  $effect(() => {
+    if (!draft) return;
+    // The live channel is a browser capability, not a requirement. Without it
+    // the past-due poll below still reconciles state — the composer degrades to
+    // slower truth, never to stale truth.
+    if (typeof EventSource === 'undefined') return;
+    const watchedAccount = accountId;
+    const watchedDraft = draftId;
+    const live = getLiveStore();
+    const off = live.on(
+      ['draft_queued', 'draft_status_changed', 'send_status'],
+      (event) => {
+        if (event.draft_id !== watchedDraft) return;
+        if (event.account_id && event.account_id !== watchedAccount) return;
+        if (accountId !== watchedAccount || draftId !== watchedDraft) return;
+        void load();
+      }
+    );
+    return off;
+  });
+
+  // A past-due draft the sweep has not resolved yet is the one state that
+  // genuinely cannot be observed: no event fires while it waits its turn. Poll
+  // slowly so "due now" resolves on its own instead of freezing, and stop as
+  // soon as the row is no longer queued.
+  $effect(() => {
+    if (!isQueued || !pastDue) return;
+    const timer = setInterval(() => void load(), 5000);
     return () => clearInterval(timer);
   });
 
@@ -422,8 +474,6 @@
     accountLabel = '';
     loading = true;
     previewing = false;
-    remoteImages = false;
-    remoteBlockedCount = 0;
   }
 
   async function load() {
@@ -609,7 +659,7 @@
     confirmOpen = false;
   }
 
-  async function confirmSend() {
+  async function confirmSend(sendNow = false) {
     if (!draft || queueing || !canSend) return;
     // Pin the target: a route change mid-flight must not land this queue
     // result on, or attribute it to, whatever draft is on screen afterwards.
@@ -618,29 +668,63 @@
     const targetDraft = draftId;
 
     queueing = true;
+    sendNowPending = sendNow;
     conflict = false;
     actionError = null;
 
     try {
       const res = await api.sendDraft(targetAccount, targetDraft, {
         confirm: true,
-        expected_revision: draft.revision
+        expected_revision: draft.revision,
+        send_now: sendNow
       });
       if (generation !== loadGeneration) return;
       queued = res;
       confirmOpen = false;
+      // Re-read the row the server actually holds. Trusting the POST body is
+      // what produced a countdown that outlived the send it described: this
+      // response says what was ASKED for, `load()` says what IS.
+      await load();
     } catch (e) {
       if (generation !== loadGeneration) return;
       confirmOpen = false;
       handleActionError(e, 'Could not queue this draft.');
     } finally {
-      if (generation === loadGeneration) queueing = false;
+      if (generation === loadGeneration) {
+        queueing = false;
+        sendNowPending = false;
+      }
     }
   }
 
   // ── Hold (unqueue, keep the draft) ────────────────────────────────────
 
   const canHold = $derived(isQueued && !holding && identityMatches);
+
+  /**
+   * `Send now` is available wherever `Send` is, and additionally while a draft
+   * is still waiting out its cooldown — that wait is the single most common
+   * reason an operator wants immediacy, so refusing them there would defeat the
+   * control. It stays disabled once the sweep is already transmitting
+   * (`pastDue`), where the request would race a send in flight.
+   */
+  const canSendNow = $derived(
+    !!draft && !queueing && identityMatches && !dirty && recipientsValid && (
+      (sendable && isSendableDraftStatus(draft.status)) || (isQueued && !pastDue)
+    )
+  );
+
+  /** Which button is spinning, so only the pressed one shows a spinner. */
+  let sendNowPending = $state(false);
+
+  /** The cooldown named on the default Send button, so the wait is never a surprise. */
+  const cooldownLabel = $derived.by(() => {
+    const secs = queued?.cooldown_seconds ?? DEFAULT_COOLDOWN_SECONDS;
+    if (secs <= 0) return 'now';
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.round(secs / 60);
+    return mins === 1 ? '1 min' : `${mins} min`;
+  });
 
   /**
    * Pull a queued draft back out of the outbox and keep it. The endpoint clears
@@ -826,40 +910,47 @@
     {/if}
 
     {#if isQueued}
-      <div class="draft-banner is-queued" id="draft-queued" role="status">
-        <p class="draft-banner-title">Queued for sending</p>
-        {#if queuedAt}
-          <p class="draft-countdown" id="draft-countdown">
-            {#if countdown}
-              <!-- The banner is a role="status" live region, so an unmuted
-                   per-second value would be announced every tick. The number is
-                   read on demand instead; the send time beside it still is. -->
-              <span class="draft-countdown-value" aria-live="off">{countdown}</span>
+      <!-- One line of state, the actions beside it, the explanation available
+           but not shouted. The old banner spent five sentences describing a
+           wait, which is exactly the copy an operator skips — and skipping it
+           was free, because nothing in it was actionable. -->
+      <div class="draft-outbox" id="draft-queued" role="status">
+        <div class="draft-outbox-state">
+          <span class="draft-outbox-dot" class:is-imminent={pastDue}></span>
+          <span class="draft-outbox-headline" id="draft-countdown">
+            {#if pastDue}
+              Sending now
+            {:else if countdown}
+              Sends in <span class="draft-countdown-value" aria-live="off">{countdown}</span>
+            {:else}
+              Waiting in the outbox
             {/if}
-            <span class="draft-countdown-at">
-              {pastDue ? 'was due' : 'sends'}
-              {formatWhen(queuedAt)}
-            </span>
-          </p>
-        {/if}
-        <p>
-          Nothing has been transmitted yet — Envelope's scheduled sender picks this message up when
-          its time comes. The editor is locked while it waits, because an edit made here would ship
-          with it rather than pull it back.
-        </p>
-        <div class="draft-banner-action draft-queued-actions">
+          </span>
+          {#if queuedAt && !pastDue}
+            <span class="draft-outbox-at">{formatWhen(queuedAt)}</span>
+          {/if}
+        </div>
+        <div class="draft-outbox-actions">
+          {#if !pastDue}
+            <Button variant="primary" disabled={!canSendNow} onclick={() => confirmSend(true)}>
+              {#if queueing}<Spinner label="Sending" />{/if}
+              Send now
+            </Button>
+          {/if}
           <Button variant="ghost" disabled={!canHold} onclick={hold}>
             {#if holding}<Spinner label="Holding" />{/if}
             {holding ? 'Holding' : 'Hold as draft'}
           </Button>
-          <a class="draft-outbox-link" id="draft-outbox-link" href="/cockpit#scheduled-panel">
-            See every queued send
-          </a>
         </div>
-        <p class="draft-queued-note">
-          Holding takes this message out of the outbox and unlocks the editor. Your draft is kept —
-          throwing it away is a separate, deliberate action.
-          {#if queued}<MonoTag>{queued.queued_reason_code}</MonoTag>{/if}
+        <p class="draft-outbox-note">
+          {#if pastDue}
+            Envelope is transmitting this message. Nothing more to do here.
+          {:else}
+            Not transmitted yet. Holding returns it to an editable draft — it is never discarded.
+          {/if}
+          <a class="draft-outbox-link" id="draft-outbox-link" href="/cockpit#scheduled-panel">
+            All queued sends
+          </a>
         </p>
       </div>
     {/if}
@@ -971,11 +1062,7 @@
             {previewing ? 'Edit HTML' : 'Preview'}
           </button>
         {/if}
-        {#if previewing && remoteBlockedCount > 0 && !remoteImages}
-          <button type="button" class="draft-remote-btn" onclick={() => (remoteImages = true)}>
-            Load remote images ({remoteBlockedCount} blocked)
-          </button>
-        {/if}
+
         {#if bodyChanged && hasBothBodies}
           <p class="draft-format-note">
             This draft has both a plain-text and an HTML version. Saving replaces the body with
@@ -988,7 +1075,6 @@
           <BodyFrame
             html={bodyRaw}
             {remoteImages}
-            onRemoteBlocked={(count) => (remoteBlockedCount = count)}
           />
         </div>
       {:else}
@@ -1019,10 +1105,9 @@
         {:else if saved}
           <span class="is-saved">Changes saved.</span>
         {:else if isQueued}
-          <span class="is-saved">
-            {pastDue || !countdown ? 'Waiting in the outbox' : `Sends in ${countdown}`} — Hold to
-            unlock the editor.
-          </span>
+          <!-- The outbox strip above already carries the countdown and the Hold
+               control. Repeating it here is noise at the moment of decision. -->
+          <span class="is-saved">Editing is locked while this message is in the outbox.</span>
         {:else if sendable && !recipientsValid}
           <span class="is-warn">Add a valid recipient before sending.</span>
         {:else if !statusEditable && statusMeta}
@@ -1037,14 +1122,22 @@
           </Button>
         {/if}
         {#if sendable}
-          <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send</Button>
+          <!-- Two ways to send, both plainly labelled and neither hidden behind
+               a menu: an operator who means "now" should not have to hunt.
+               Both open the same confirmation, which is where the choice is
+               actually made — a first send is the one action with no undo
+               window, so it gets one look at From/To/Subject first. -->
+          <Button variant="ghost" disabled={!canSend} onclick={requestSend}>Send now</Button>
+          <Button variant="primary" disabled={!canSend} onclick={requestSend}>
+            Send in {cooldownLabel}
+          </Button>
         {/if}
       </div>
     </footer>
   {/if}
 </section>
 
-<Modal open={confirmOpen} title="Queue this draft for sending?" onclose={closeConfirm}>
+<Modal open={confirmOpen} title="Send this message?" onclose={closeConfirm}>
   <p class="draft-confirm-line">
     <strong>From</strong>
     {effectiveFrom}
@@ -1057,13 +1150,8 @@
     <strong>Subject</strong>
     {subjectRaw.trim() || '(no subject)'}
   </p>
-  <!-- "Hold" now names the unqueue control, so this copy says "waits" instead
-       — a confirmation that reads "Envelope holds this message" beside a Hold
-       button describes the opposite of what that button does. -->
   <p class="draft-confirm-note">
-    This message waits in the outbox for a cooldown, then Envelope sends it on your behalf. You are
-    approving this exact version — editing it afterwards withdraws that approval. The next screen
-    counts the wait down and can take the message back out of the outbox.
+    You are approving this exact version. Editing it afterwards withdraws that approval.
   </p>
   {#if queueing}
     <p class="draft-confirm-note is-locked">
@@ -1072,9 +1160,15 @@
   {/if}
   {#snippet footer()}
     <Button variant="ghost" disabled={queueing} onclick={closeConfirm}>Keep editing</Button>
-    <Button variant="primary" disabled={queueing} onclick={confirmSend}>
-      {#if queueing}<Spinner label="Queueing" />{/if}
-      Queue for sending
+    <!-- Both destinations are offered at the point of decision, so choosing
+         immediacy never costs a second trip through this dialog. -->
+    <Button variant="ghost" disabled={queueing} onclick={() => confirmSend(true)}>
+      {#if queueing && sendNowPending}<Spinner label="Sending" />{/if}
+      Send now
+    </Button>
+    <Button variant="primary" disabled={queueing} onclick={() => confirmSend(false)}>
+      {#if queueing && !sendNowPending}<Spinner label="Queueing" />{/if}
+      Send in {cooldownLabel}
     </Button>
   {/snippet}
 </Modal>
@@ -1183,14 +1277,6 @@
   .is-conflict .draft-banner-title {
     color: var(--env-warn);
   }
-  .is-queued {
-    border-color: var(--env-accent);
-    background: var(--env-accent-soft);
-    color: var(--env-accent);
-  }
-  .is-queued .draft-banner-title {
-    color: var(--env-accent);
-  }
   .is-stopped {
     border-color: var(--env-warn);
     background: var(--env-warn-soft);
@@ -1200,45 +1286,98 @@
     color: var(--env-warn);
   }
 
-  /* The countdown is the banner's headline fact — how long is left, not what
-     o'clock it is — so it carries the weight and the clock time trails it. */
-  .draft-banner .draft-countdown {
+  /* ── Outbox strip ──
+     One row: state on the left, the two decisions on the right, a single line
+     of consequence underneath. It replaces a five-sentence banner whose only
+     actionable content was one button. */
+  .draft-outbox {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 0.5rem 1rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--env-accent);
+    border-radius: 0.375rem;
+    background: var(--env-accent-soft);
+  }
+  .draft-outbox-state {
     display: flex;
     align-items: baseline;
     flex-wrap: wrap;
     gap: 0.5rem;
-    margin: 0.15rem 0 0.35rem;
+    min-width: 0;
+  }
+  .draft-outbox-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--env-accent);
+    flex: none;
+    align-self: center;
+  }
+  /* Once the sweep is transmitting, the dot stops being decoration and starts
+     meaning "in flight". */
+  .draft-outbox-dot.is-imminent {
+    animation: draft-outbox-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes draft-outbox-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .draft-outbox-dot.is-imminent {
+      animation: none;
+    }
+  }
+  .draft-outbox-headline {
+    color: var(--env-accent);
+    font-size: 0.9375rem;
+    font-weight: 600;
   }
   .draft-countdown-value {
-    color: var(--env-accent);
     font-family: var(--font-mono);
-    font-size: 1.375rem;
     font-variant-numeric: tabular-nums;
-    font-weight: 600;
-    line-height: 1.1;
   }
-  .draft-countdown-at {
+  .draft-outbox-at {
     color: var(--env-muted);
     font-family: var(--font-mono);
     font-size: 0.6875rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
-  .draft-queued-actions {
+  .draft-outbox-actions {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 0.75rem;
+    gap: 0.5rem;
+    justify-self: end;
+  }
+  .draft-outbox-note {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0;
+    color: var(--env-muted);
+    font-size: 0.75rem;
   }
   .draft-outbox-link {
     color: var(--env-accent);
     font-family: var(--font-mono);
     font-size: 0.6875rem;
   }
-  .draft-banner .draft-queued-note {
-    margin-top: 0.5rem;
-    color: var(--env-muted);
-    font-size: 0.75rem;
+  @media (max-width: 34rem) {
+    .draft-outbox {
+      grid-template-columns: 1fr;
+    }
+    .draft-outbox-actions {
+      justify-self: stretch;
+    }
   }
 
   /* ── Fields ── */
@@ -1321,7 +1460,11 @@
 
   /* ── Editor ── */
   .draft-editor {
-    flex: 1;
+    /* `flex: 1` let the column shrink this card to a fraction of the message it
+       contains: the rendered body then painted straight over the attachments
+       row below it. The card takes the height of its content and the page
+       scrolls — the textarea keeps a floor so an empty draft is still writable. */
+    flex: none;
     min-height: 18rem;
     display: flex;
     flex-direction: column;
@@ -1363,24 +1506,16 @@
     opacity: 0.55;
   }
   .draft-preview-toggle,
-  .draft-remote-btn {
-    min-height: 1.875rem;
-    padding: 0 0.6rem;
-    border: 1px solid var(--env-rule);
-    background: var(--env-surface);
-    color: var(--env-muted);
-    cursor: pointer;
-    font-family: var(--font-mono);
-    font-size: 0.6875rem;
-  }
   .draft-preview-toggle[aria-pressed='true'] {
     background: var(--env-ink);
     color: var(--env-surface);
   }
   .draft-preview {
-    flex: 1;
-    min-height: 16rem;
-    overflow-y: auto;
+    /* No inner scroller and no flex clamp. The message IS this page's content;
+       trapping a full HTML email in a 20rem well and asking the operator to
+       scroll it inside a page that also scrolls is two scrollbars for one
+       document. BodyFrame sizes its iframe to the rendered height, so the body
+       flows and the page is the only thing that scrolls. */
     background: var(--env-surface);
   }
   .draft-banner-remedy {

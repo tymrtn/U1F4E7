@@ -598,7 +598,7 @@ async fn run_unsnooze_sweep(state: &AppState) -> anyhow::Result<()> {
 
 // ── Background scheduled send sweep ─────────────────────────────────
 
-async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
+pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     let due = {
         let db = state.db.lock().await;
         db.list_drafts_due_for_send()

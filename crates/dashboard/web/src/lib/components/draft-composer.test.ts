@@ -73,6 +73,20 @@ function draftResponse(overrides: Partial<Draft> = {}) {
   return { draft: { ...BASE_DRAFT, ...overrides } };
 }
 
+/**
+ * Point the draft fetch at a NEW row for every load after the first.
+ *
+ * The composer re-reads the draft once a send commits, because the POST body
+ * describes what was requested and only the stored row describes what is. These
+ * tests therefore have to model both: the row before the send, and the queued
+ * row the server holds after it.
+ */
+function serverRowAfterSend(before: Partial<Draft>, after: Partial<Draft>) {
+  apiMock.draft
+    .mockResolvedValueOnce(draftResponse(before))
+    .mockResolvedValue(draftResponse(after));
+}
+
 /** Load the composer and wait for the draft to render. */
 async function renderLoaded(overrides: Partial<Draft> = {}) {
   apiMock.draft.mockResolvedValue(draftResponse(overrides));
@@ -336,7 +350,7 @@ describe('DraftComposer edit', () => {
 describe('DraftComposer send', () => {
   it('requires explicit confirmation before queueing', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
 
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
@@ -346,7 +360,7 @@ describe('DraftComposer send', () => {
     await renderLoaded({
       metadata: { from: 'SpainExpat Plus Ultra <plusultra@spainexpat.com>' }
     });
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
 
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('From').parentElement).toHaveTextContent(
@@ -356,30 +370,39 @@ describe('DraftComposer send', () => {
 
   it('queues with confirm=true and the reviewed revision once confirmed', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
 
     await waitFor(() =>
       expect(apiMock.sendDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT, {
         confirm: true,
-        expected_revision: 7
+        expected_revision: 7,
+        send_now: false
       })
     );
   });
 
   it('reports the queued outcome honestly — queued, not sent', async () => {
-    await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    const soon = new Date(Date.now() + 60_000).toISOString();
+    serverRowAfterSend({}, { send_after: soon });
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
 
     await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
     const banner = document.getElementById('draft-queued');
-    expect(banner?.textContent).toMatch(/queued for sending/i);
-    // Honest about what actually happened: queued into the outbox, not sent.
-    expect(banner?.textContent).toMatch(/nothing has been transmitted yet/i);
-    expect(banner?.textContent).not.toMatch(/\bsent\b/i);
+    // Honest about what actually happened: waiting in the outbox, not sent.
+    expect(banner?.textContent).toMatch(/sends in/i);
+    expect(banner?.textContent).toMatch(/not transmitted yet/i);
+    expect(banner?.textContent).not.toMatch(/\bwas sent\b/i);
   });
 
   it('badges the draft as Queued rather than Draft once it is in the outbox', async () => {
@@ -390,7 +413,7 @@ describe('DraftComposer send', () => {
 
   it('cancelling the confirmation queues nothing', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: /keep editing/i }));
 
@@ -402,7 +425,7 @@ describe('DraftComposer send', () => {
     await renderLoaded();
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Unsaved' } });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
     expect(screen.getByText(/save your changes/i)).toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
   });
@@ -412,9 +435,11 @@ describe('DraftComposer send', () => {
     apiMock.sendDraft.mockRejectedValueOnce(
       new EnvelopeApiError(409, 'http_409', 'draft modified concurrently', null)
     );
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
 
     await waitFor(() => expect(document.getElementById('draft-conflict')).toBeTruthy());
   });
@@ -430,7 +455,7 @@ describe('DraftComposer status guards', () => {
 
     expect(screen.getByLabelText('To')).toBeDisabled();
     expect(screen.getByLabelText('Message')).toBeDisabled();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^send in\b/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
   });
 
@@ -441,7 +466,7 @@ describe('DraftComposer status guards', () => {
 
     expect(screen.getByLabelText('To')).not.toBeDisabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^send in\b/i })).not.toBeInTheDocument();
   });
 
   it('renders a draft claimed by the send sweep read-only', async () => {
@@ -477,17 +502,18 @@ describe('DraftComposer queued state recovered on reload', () => {
     await renderLoaded({ send_after: QUEUED_AT });
 
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^send in\b/i })).not.toBeInTheDocument();
   });
 
   it('shows the queued banner and the scheduled time without a fresh send response', async () => {
-    await renderLoaded({ send_after: QUEUED_AT });
+    const pending = new Date(Date.now() + 3_600_000).toISOString();
+    await renderLoaded({ send_after: pending });
 
     const banner = document.getElementById('draft-queued');
     expect(banner).toBeTruthy();
-    expect(banner?.textContent).toMatch(/queued for sending/i);
+    expect(banner?.textContent).toMatch(/sending now|sends in|waiting in the outbox/i);
     // The resolved local time is rendered, not the raw ISO string.
-    expect(banner?.textContent).not.toContain(QUEUED_AT);
+    expect(banner?.textContent).not.toContain(pending);
     expect(banner?.textContent).toMatch(/\d/);
   });
 
@@ -503,7 +529,7 @@ describe('DraftComposer queued state recovered on reload', () => {
     await renderLoaded({ send_after: null });
 
     expect(screen.getByLabelText('To')).not.toBeDisabled();
-    expect(screen.getByRole('button', { name: /^send/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeInTheDocument();
   });
 });
 
@@ -548,7 +574,7 @@ describe('DraftComposer queued countdown', () => {
   it('reads due now once the send time has passed', async () => {
     await renderLoaded({ send_after: '2020-01-01T00:00:00Z' });
 
-    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/due now/i);
+    expect(document.getElementById('draft-countdown')?.textContent).toMatch(/sending now/i);
   });
 
   it('ticks the countdown down on its own and rolls over to due now', async () => {
@@ -557,16 +583,18 @@ describe('DraftComposer queued countdown', () => {
 
     // No reload, no user action: the banner updates itself.
     await waitFor(
-      () => expect(document.getElementById('draft-countdown')?.textContent).toMatch(/due now/i),
+      () => expect(document.getElementById('draft-countdown')?.textContent).toMatch(/sending now/i),
       { timeout: 6000 }
     );
   }, 10000);
 
   it('keeps the absolute send time as secondary text', async () => {
-    const at = '2026-07-30T10:02:00Z';
+    // A time still in the future: once a send is due the clock time is noise,
+    // and the strip says what is happening instead of restating a deadline.
+    const at = inSeconds(3600);
     await renderLoaded({ send_after: at });
 
-    const secondary = banner().querySelector('.draft-countdown-at');
+    const secondary = banner().querySelector('.draft-outbox-at');
     expect(secondary?.textContent).toMatch(/\d/);
     // Resolved for the reader, not the raw stored string.
     expect(secondary?.textContent).not.toContain(at);
@@ -642,10 +670,10 @@ describe('DraftComposer hold', () => {
     await fireEvent.click(holdButton());
 
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /^send/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^send in\b/i })).toBeInTheDocument()
     );
     // Held content is unchanged, so Send is live again and Save waits on an edit.
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeEnabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
   });
 
@@ -661,9 +689,14 @@ describe('DraftComposer hold', () => {
   });
 
   it('holds a draft queued by this page in the same session', async () => {
-    await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    serverRowAfterSend({}, { send_after: QUEUED_AT });
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
     await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
 
     await fireEvent.click(holdButton());
@@ -828,32 +861,82 @@ describe('DraftComposer never silently parks a send', () => {
   });
 
   it('drops the stop explanation once the draft is queued again from this page', async () => {
-    await renderLoaded({
-      status: 'pending_review',
-      send_after: null,
-      metadata: {
-        send_block: {
-          code: 'governor_blocked',
-          title: 'This send was stopped',
-          explanation: 'Envelope paused this message for review before sending. Nothing was transmitted.',
-          action: 'send'
+    // Queueing clears `send_block` in the same transaction that records the
+    // approval, so the row the composer re-reads carries no stop reason. The
+    // absence is a fact about the draft, not a rule about when to hide one:
+    // the composer no longer suppresses this alert under any condition, which
+    // is what previously buried a real Governor block behind a countdown.
+    serverRowAfterSend(
+      {
+        status: 'pending_review',
+        send_after: null,
+        metadata: {
+          send_block: {
+            code: 'governor_blocked',
+            title: 'This send was stopped',
+            explanation:
+              'Envelope paused this message for review before sending. Nothing was transmitted.',
+            action: 'send'
+          }
         }
+      },
+      {
+        status: 'draft',
+        send_after: new Date(Date.now() + 60_000).toISOString(),
+        metadata: {}
       }
-    });
+    );
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
     expect(document.getElementById('draft-send-block')).toBeTruthy();
 
     await fireEvent.click(screen.getByRole('button', { name: /send again/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
 
     await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
-    // The draft is back in the outbox. The queue endpoint returns no draft row,
-    // so the local copy still says pending_review + send_block — that history
-    // must not render as a second, contradictory state beside the countdown.
     expect(document.getElementById('draft-send-block')).toBeFalsy();
     expect(screen.queryByText(/this send was stopped/i)).not.toBeInTheDocument();
     expect(screen.queryByText('governor_blocked')).not.toBeInTheDocument();
     expect(screen.getByText('Queued')).toBeInTheDocument();
+  });
+
+  /// The inverse, and the failure this whole surface was rebuilt around: a
+  /// draft the server has STOPPED must say so even if the browser still holds a
+  /// send response from earlier in the session. The old code suppressed the
+  /// alert whenever it believed the draft was queued, so an operator whose
+  /// message had been refused watched a countdown instead of reading why.
+  it('shows a server stop even when this page queued the draft earlier', async () => {
+    serverRowAfterSend(
+      {},
+      {
+        status: 'pending_review',
+        send_after: null,
+        metadata: {
+          send_block: {
+            code: 'governor_blocked',
+            title: 'This send was stopped',
+            explanation: 'Envelope paused this message before sending. Nothing was transmitted.',
+            action: 'send'
+          }
+        }
+      }
+    );
+    render(DraftComposer);
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+
+    await waitFor(() => expect(document.getElementById('draft-send-block')).toBeTruthy());
+    expect(screen.getByText(/this send was stopped/i)).toBeInTheDocument();
+    // And no fictional countdown beside it.
+    expect(document.getElementById('draft-queued')).toBeFalsy();
   });
 });
 
@@ -863,20 +946,20 @@ describe('DraftComposer recipient guard', () => {
   it('keeps Send disabled when the stored recipient is empty', async () => {
     await renderLoaded({ to_addr: '' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
     expect(screen.getByText(/valid recipient/i)).toBeInTheDocument();
   });
 
   it('keeps Send disabled when the stored recipient is not a usable address', async () => {
     await renderLoaded({ to_addr: 'not-an-address' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
   });
 
   it('never opens the confirmation for a draft with no recipient', async () => {
     await renderLoaded({ to_addr: '' });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
@@ -885,13 +968,13 @@ describe('DraftComposer recipient guard', () => {
   it('accepts a comma-separated recipient list', async () => {
     await renderLoaded({ to_addr: 'a@example.com, b@example.com' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeEnabled();
   });
 
   it('accepts a display-name address', async () => {
     await renderLoaded({ to_addr: 'Ada Lovelace <ada@example.com>' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeEnabled();
   });
 
   it('re-disables Send when the recipient is edited down to nothing', async () => {
@@ -899,7 +982,7 @@ describe('DraftComposer recipient guard', () => {
     await setRecipients('To', '');
 
     expect(chips('To')).toEqual([]);
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
   });
 });
@@ -948,9 +1031,11 @@ describe('DraftComposer queue cancellation race', () => {
     let resolveSend!: (value: unknown) => void;
     apiMock.sendDraft.mockReturnValueOnce(new Promise((r) => (resolveSend = r)));
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /keep editing/i })).toBeDisabled()
     );
@@ -1011,9 +1096,11 @@ describe('DraftComposer queue cancellation race', () => {
     let rejectSend!: (reason: unknown) => void;
     apiMock.sendDraft.mockReturnValueOnce(new Promise((_r, reject) => (rejectSend = reject)));
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: /queue for sending/i }));
+    await fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /keep editing/i })).toBeDisabled()
     );
@@ -1086,7 +1173,7 @@ describe('DraftComposer route change', () => {
 
   it('closes an open send confirmation when the route changes', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
 
     apiMock.draft.mockResolvedValueOnce(draftResponse({ id: DRAFT_B, subject: 'Draft B' }));
@@ -1127,7 +1214,7 @@ describe('DraftComposer route change', () => {
     navigateTo(DRAFT_B);
     await waitFor(() => expect(apiMock.draft).toHaveBeenCalledWith(ACCOUNT, DRAFT_B));
 
-    expect(screen.queryByRole('button', { name: /^send/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^send in\b/i })).not.toBeInTheDocument();
     expect(apiMock.editDraft).not.toHaveBeenCalled();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();
   });
@@ -1216,32 +1303,32 @@ describe('DraftComposer optional-recipient validation', () => {
   it('blocks Send when Cc is present but malformed', async () => {
     await renderLoaded({ cc_addr: 'not-an-address' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
     expect(screen.getByText(/valid recipient/i)).toBeInTheDocument();
   });
 
   it('blocks Send when Bcc is present but malformed', async () => {
     await renderLoaded({ bcc_addr: 'nope@' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeDisabled();
   });
 
   it('allows Send when Cc and Bcc are empty', async () => {
     await renderLoaded({ cc_addr: null, bcc_addr: null });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeEnabled();
   });
 
   it('allows Send for valid multi-entry Cc and Bcc', async () => {
     await renderLoaded({ cc_addr: 'a@example.com, b@example.com', bcc_addr: 'c@example.com' });
 
-    expect(screen.getByRole('button', { name: /^send/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^send in\b/i })).toBeEnabled();
   });
 
   it('never opens the confirmation when Cc is malformed', async () => {
     await renderLoaded({ cc_addr: 'broken' });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^send in\b/i }));
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(apiMock.sendDraft).not.toHaveBeenCalled();

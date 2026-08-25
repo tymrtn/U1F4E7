@@ -1276,6 +1276,49 @@ impl Database {
     /// a post-commit reload could fail or race and let a handler report success
     /// off pre-attestation state. `blocked` is refused ([`DraftStatus::is_queueable`]
     /// is false): a Governor-denied row is never resurrected by human queueing.
+    /// Transfer authorship of a draft to the human who is sending it.
+    ///
+    /// Stamps `created_by` with the human surface and strips the two pieces of
+    /// per-attempt agent state that must never outlive a human's decision to
+    /// send: the bot `attribution` declaration (whose presence makes
+    /// `scheduled_origin` report `Bot`, forcing the Governor gate onto a human
+    /// send) and any `send_block` recorded by a PREVIOUS attempt (a stop reason
+    /// describes one attempt; carried forward it renders "nothing was
+    /// transmitted" over a message that did go out).
+    ///
+    /// CAS-guarded on the revision the human viewed, exactly like the
+    /// attestation it accompanies, so a concurrent edit rolls the whole queue
+    /// back rather than re-authoring content nobody read.
+    fn transfer_draft_authorship_to_human(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        approved_by: &str,
+    ) -> Result<()> {
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        let mut metadata = match draft.metadata {
+            Some(m) if m.is_object() => m,
+            _ => serde_json::json!({}),
+        };
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.remove("attribution");
+            obj.remove("send_block");
+        }
+        let serialized = serde_json::to_string(&metadata)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET created_by = ?1, metadata = ?2, updated_at = datetime('now')
+             WHERE id = ?3 AND revision = ?4
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![approved_by, serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        Ok(())
+    }
+
     pub fn queue_draft_with_human_approval(
         &self,
         id: &str,
@@ -1306,6 +1349,17 @@ impl Database {
         }
         self.update_draft_send_after(id, send_after)?;
         self.record_draft_human_approval(id, expected_revision, approved_by, approved_at)?;
+        // A human pressing Send AUTHORS this message. The draft may have been
+        // started by an agent, but the operator opened it, read it, possibly
+        // edited it, and chose to send — so provenance transfers to them and the
+        // agent's attribution declaration is dropped rather than carried along.
+        //
+        // This is what keeps operator-clicked mail out of the Governor gate:
+        // `scheduled_origin` reads `created_by`, and a lingering `cli`/`agent`
+        // marker (or a stale bot declaration) made the sweep demand a bot
+        // declaration for a send a human had already taken responsibility for,
+        // stranding it as `pending_review` with nothing transmitted.
+        self.transfer_draft_authorship_to_human(id, expected_revision, approved_by)?;
         // Read the attested row inside the transaction, then commit. The caller
         // receives exactly what was queued — no reload, no fallback.
         let attested = self
@@ -1406,6 +1460,128 @@ mod tests {
             .get("attribution")
             .cloned()
             .unwrap()
+    }
+
+    /// A human pressing Send in the dashboard AUTHORS the message. The draft may
+    /// have started as an agent draft, but the operator read it, edited it, and
+    /// took responsibility — so the queued row must carry human provenance and
+    /// must NOT carry the agent's stale attribution declaration. Leaving
+    /// `created_by = "cli"` is what routed operator-clicked mail back through
+    /// the Governor gate and stranded it as `pending_review`.
+    #[test]
+    fn human_queue_transfers_authorship_and_drops_the_agent_declaration() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        // The agent that drafted this took attribution responsibility for it.
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({
+                "origin": "bot",
+                "declared_attrs": ["has_pii"],
+                "protocol": "envelope.attribution.v1",
+            }),
+        )
+        .unwrap();
+
+        let queued = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2026-07-10T09:02:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+
+        assert_eq!(
+            queued.created_by.as_deref(),
+            Some("human:dashboard"),
+            "a human send re-authors the draft"
+        );
+        assert!(
+            queued
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("attribution"))
+                .is_none(),
+            "the agent's declaration must not survive a human send"
+        );
+        assert!(queued.human_approved());
+    }
+
+    /// A stop reason describes ONE send attempt. Queueing a fresh send must
+    /// clear it, or a later successful send still renders "This send was
+    /// stopped — nothing was transmitted" over a message that did go out.
+    #[test]
+    fn human_queue_clears_a_stale_send_block() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        db.park_for_review_with_block(
+            &draft.id,
+            &db.claim_draft_for_immediate_send(&draft.id, draft.revision)
+                .unwrap()
+                .unwrap(),
+            &serde_json::json!({
+                "code": "governor_blocked",
+                "title": "This send was stopped",
+                "explanation": "Nothing was transmitted.",
+                "action": "send"
+            }),
+        )
+        .unwrap();
+
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            parked
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("send_block"))
+                .is_some(),
+            "precondition: the park recorded a stop reason"
+        );
+
+        let queued = db
+            .queue_draft_with_human_approval(
+                &parked.id,
+                parked.revision,
+                "2026-07-10T09:02:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+
+        assert!(
+            queued
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("send_block"))
+                .is_none(),
+            "a new send attempt clears the previous stop reason"
+        );
     }
 
     #[test]
