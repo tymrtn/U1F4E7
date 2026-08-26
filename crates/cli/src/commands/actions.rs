@@ -16,16 +16,25 @@ pub fn run_tail(
     _backend: CredentialBackend,
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
-    let acct = resolve_account(&db, account)?;
-    let actions = match agent {
-        Some(agent_ref) => {
+    let actions = match (agent, account) {
+        // An agent's trail should not depend on which mailbox it acted in: with
+        // no --account, show everything attributed to it across accounts.
+        (Some(agent_ref), None) => {
+            let agent_id = resolve_agent_id(&db, agent_ref)?;
+            db.list_actions_for_agent_any_account(&agent_id, limit)
+                .context("failed to list actions")?
+        }
+        (Some(agent_ref), Some(_)) => {
+            let acct = resolve_account(&db, account)?;
             let agent_id = resolve_agent_id(&db, agent_ref)?;
             db.list_actions_for_agent(&acct.id, &agent_id, limit)
                 .context("failed to list actions")?
         }
-        None => db
-            .list_actions(&acct.id, limit)
-            .context("failed to list actions")?,
+        (None, _) => {
+            let acct = resolve_account(&db, account)?;
+            db.list_actions(&acct.id, limit)
+                .context("failed to list actions")?
+        }
     };
 
     if json {

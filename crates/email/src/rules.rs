@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 pub enum MatchExpr {
     /// Glob match on sender address. `*` matches any sequence, `?` matches one char.
     From(String),
+    /// Exact (case-insensitive) match on sender address — no glob interpretation.
+    /// Used wherever a sender string must be matched literally: a local-part
+    /// containing `*` or `?` (both valid, if unusual, email characters) must
+    /// never be reinterpreted as a wildcard.
+    FromExact(String),
     /// Glob match on recipient address.
     To(String),
     /// Glob match on subject line.
@@ -98,6 +103,44 @@ impl Action {
     }
 }
 
+/// Stable score dimension derived from a provider's spam-scoring headers.
+///
+/// Seeded from `X-Migadu-Spam-Score` (preferred) or `X-Spam-Score` (fallback)
+/// during rule test/preview/run. Existing rules match it via `score_above` /
+/// `score_below` like any other dimension. The name is part of the rule
+/// contract — keep it stable.
+pub const PROVIDER_SPAM_DIMENSION: &str = "provider_spam";
+
+/// Derive the `provider_spam` score from raw provider header values.
+///
+/// Prefers `X-Migadu-Spam-Score`, falling back to `X-Spam-Score`. Each value
+/// is parsed as a finite `f64`; a malformed, empty, or non-finite value
+/// (`NaN`, `±inf`) is ignored so a garbage header never fabricates a score. A
+/// present-but-malformed Migadu header still falls back to a valid generic
+/// value.
+pub fn provider_spam_from_headers(migadu: Option<&str>, generic: Option<&str>) -> Option<f64> {
+    parse_finite_score(migadu).or_else(|| parse_finite_score(generic))
+}
+
+fn parse_finite_score(raw: Option<&str>) -> Option<f64> {
+    let value: f64 = raw?.trim().parse().ok()?;
+    value.is_finite().then_some(value)
+}
+
+/// Merge a header-derived `provider_spam` score into a scores map without
+/// clobbering an explicitly persisted value.
+///
+/// An operator-set `provider_spam` score (from `message_scores`) always wins
+/// over the derived header signal; the derived value only fills the gap when
+/// no persisted score exists for the dimension.
+pub fn merge_provider_spam(scores: &mut HashMap<String, f64>, derived: Option<f64>) {
+    if let Some(value) = derived {
+        scores
+            .entry(PROVIDER_SPAM_DIMENSION.to_string())
+            .or_insert(value);
+    }
+}
+
 /// Context about a message for rule evaluation.
 ///
 /// Callers populate this from a `MessageSummary` + the tag/score store.
@@ -116,6 +159,9 @@ pub struct MessageContext {
 pub fn evaluate(expr: &MatchExpr, ctx: &MessageContext) -> bool {
     match expr {
         MatchExpr::From(pattern) => glob_match(pattern, &ctx.from_addr),
+        MatchExpr::FromExact(addr) => {
+            addr.trim().to_lowercase() == ctx.from_addr.trim().to_lowercase()
+        }
         MatchExpr::To(pattern) => glob_match(pattern, &ctx.to_addr),
         MatchExpr::Subject(pattern) => glob_match(pattern, &ctx.subject),
         MatchExpr::HasTag(tag) => ctx.tags.iter().any(|t| t == tag),
@@ -300,6 +346,22 @@ mod tests {
     }
 
     #[test]
+    fn match_from_exact_does_not_treat_glob_chars_as_wildcards() {
+        // A literal local-part of "*" must match only that exact address —
+        // never broaden into every sender at the domain.
+        let expr = MatchExpr::FromExact("*@example.com".to_string());
+        assert!(evaluate(&expr, &ctx("*@example.com", "", "")));
+        assert!(!evaluate(&expr, &ctx("anything@example.com", "", "")));
+        assert!(!evaluate(&expr, &ctx("evil@example.com", "", "")));
+    }
+
+    #[test]
+    fn match_from_exact_is_case_insensitive_and_trims() {
+        let expr = MatchExpr::FromExact("Alice@Example.com".to_string());
+        assert!(evaluate(&expr, &ctx(" alice@example.com ", "", "")));
+    }
+
+    #[test]
     fn match_subject() {
         let expr = MatchExpr::Subject("*invoice*".to_string());
         assert!(evaluate(&expr, &ctx("", "", "Your invoice for March")));
@@ -391,6 +453,15 @@ mod tests {
     }
 
     #[test]
+    fn from_exact_json_roundtrip() {
+        let expr = MatchExpr::FromExact("*@example.com".to_string());
+        let json = serde_json::to_string(&expr).unwrap();
+        assert_eq!(json, r#"{"from_exact":"*@example.com"}"#);
+        let parsed: MatchExpr = serde_json::from_str(&json).unwrap();
+        assert_eq!(expr, parsed);
+    }
+
+    #[test]
     fn action_json_roundtrip() {
         let actions = vec![
             Action::Move("Junk".to_string()),
@@ -466,6 +537,88 @@ mod tests {
                 .is_none()
         );
         assert!(Action::Delete.local_execution_skip_reason().is_none());
+    }
+
+    // ── provider_spam score derivation ──────────────────────────────
+
+    #[test]
+    fn provider_spam_prefers_migadu_header() {
+        assert_eq!(
+            provider_spam_from_headers(Some("3.5"), None),
+            Some(3.5),
+            "Migadu header alone should seed the score"
+        );
+    }
+
+    #[test]
+    fn provider_spam_falls_back_to_generic_header() {
+        assert_eq!(
+            provider_spam_from_headers(None, Some("5.1")),
+            Some(5.1),
+            "generic X-Spam-Score should be used when Migadu is absent"
+        );
+    }
+
+    #[test]
+    fn provider_spam_migadu_wins_over_generic() {
+        assert_eq!(
+            provider_spam_from_headers(Some("2.0"), Some("9.9")),
+            Some(2.0),
+            "Migadu must take precedence when both headers are present"
+        );
+    }
+
+    #[test]
+    fn provider_spam_malformed_migadu_falls_back_to_generic() {
+        assert_eq!(
+            provider_spam_from_headers(Some("not-a-number"), Some("4.2")),
+            Some(4.2),
+            "a malformed Migadu value must not block the generic fallback"
+        );
+    }
+
+    #[test]
+    fn provider_spam_ignores_malformed_and_non_finite() {
+        assert_eq!(
+            provider_spam_from_headers(Some("bogus"), Some("junk")),
+            None
+        );
+        assert_eq!(provider_spam_from_headers(Some("NaN"), None), None);
+        assert_eq!(provider_spam_from_headers(Some("inf"), None), None);
+        assert_eq!(provider_spam_from_headers(Some("-inf"), None), None);
+        assert_eq!(provider_spam_from_headers(None, None), None);
+        assert_eq!(provider_spam_from_headers(Some("  "), None), None);
+    }
+
+    #[test]
+    fn provider_spam_parses_negative_and_padded_values() {
+        assert_eq!(provider_spam_from_headers(Some(" -2.6 "), None), Some(-2.6));
+    }
+
+    #[test]
+    fn merge_provider_spam_seeds_when_absent() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        merge_provider_spam(&mut scores, Some(3.5));
+        assert_eq!(scores.get(PROVIDER_SPAM_DIMENSION), Some(&3.5));
+    }
+
+    #[test]
+    fn merge_provider_spam_does_not_clobber_persisted() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        scores.insert(PROVIDER_SPAM_DIMENSION.to_string(), 8.0);
+        merge_provider_spam(&mut scores, Some(3.5));
+        assert_eq!(
+            scores.get(PROVIDER_SPAM_DIMENSION),
+            Some(&8.0),
+            "an explicitly persisted provider_spam score must win"
+        );
+    }
+
+    #[test]
+    fn merge_provider_spam_none_is_noop() {
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        merge_provider_spam(&mut scores, None);
+        assert!(scores.is_empty());
     }
 
     // ── build_match_expr helper ─────────────────────────────────────

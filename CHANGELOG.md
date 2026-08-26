@@ -1,11 +1,202 @@
 # Changelog
 
+## 1.0.28-dev
+
+- Fix queued, scheduled, and draft-only sends dropping an explicit `--from`
+  send-as identity. The review composer, SMTP sweep, and Sent-copy resolver now
+  use the same persisted public sender as the immediate-send path.
+
 All notable changes to Envelope Email are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 1.0.27-dev
+
+- fix(dashboard,store): the Unified Inbox is actually unified. The index listing ordered by an unparseable RFC 2822 date string, so the cap silently degenerated to "highest UID wins" and one account owned the whole 50-row page, flipping between loads; a parsed `date_epoch` is now stored (with a Rust backfill for existing rows) and the page is the true newest across accounts. Keyset pagination replaces the hard cap (`next_cursor` + a Load more that appends, deduplicated). The index refresh no longer crawls accounts serially — one slow provider used to pin the pass beyond 240 seconds; it now fans out 6 at a time with a 10-second per-account budget, times out stragglers (evicting their connection), and the unreachable-accounts banner names the accounts instead of only counting them.
+
+- fix(dashboard): search is usable at multi-account scale. Gmail-style operators (`from:`, `to:`, `subject:`, `is:unread/read/starred`, `before:`/`after:` dates, quoted phrases) parse to real IMAP criteria client-side, with raw-IMAP queries passing through untouched; the fan-out is bounded (4 in flight) with a 10s per-account timeout, so a slow provider can no longer pin "Searching…" for minutes or saturate the server; unreachable accounts are named in a status line instead of dying in the console; results render incrementally, deduplicated by account/folder/uid; a stale run can never overwrite a newer query's results (the double-fire on submit is gone); and a scope select narrows the search to one account.
+
+- fix(dashboard): Drafts box rows open the per-account draft review page (`/accounts/<id>/drafts/<draft>`) instead of dead-ending in the reader with "Select a message to read it" — a draft row carries a local draft id, which the reader route cannot resolve.
+- fix(dashboard): Cockpit "Cancel send" on a scheduled send now HOLDS the queued draft (it leaves the outbox and stays in Drafts) instead of silently discarding it, matching the review page's own "your draft is kept" contract.
+- feat(dashboard): the composer asks before discarding typed content. Esc / × / backdrop on a composer with recipients, subject, body, or attachments opens a "Discard this draft?" confirm (Keep editing / Discard draft); an empty composer still closes immediately. Escape while the confirm is showing means keep editing.
+
+- feat(dashboard): Reply, Reply all, and Forward from the reader. The webmail reader had no way to answer mail — the only composer entry point was the global `c` shortcut. ReaderPane now opens the shared composer in the matching mode with the open message as parent; reply paths let the server derive recipients and threading headers, forward is a fresh message with a `Fwd:` subject, and the original is quoted into the body so the operator sees what they are answering.
+- feat(dashboard): Archive, Delete, and Star from the reader. Moves use the same canonical special-use targets and per-message endpoints as the bulk toolbar; Delete is reversible (move to Trash) everywhere except inside Trash, where it is a confirmed permanent delete; a failed operation stays on the message and says why. A new shared `mailbox-ops` signal tells the mounted list to re-fetch after a reader-side mutation, and the Trash heuristic now lives in `$lib/folder-kinds` for both surfaces.
+
+- fix(mcp,cli): the agent audit trail is now complete. Draft and send tool calls (`send`, `reply`, `send_draft`, `create_reply_draft`, `create_forward_draft`, `modify_draft`) are recorded for the acting agent with their outcome status and draft id, and every policy-denied tool call lands as a `denied` row — `envelope actions tail --agent <name>` used to come back empty after exactly these calls. `actions tail --agent <name>` with no `--account` now spans every account.
+
+- fix(cli): `envelope delete` now moves the message to the account's Trash (resolved through the same special-use detection the dashboard uses) instead of expunging it. `--permanent --confirm` deletes forever; `--permanent` alone is a dry run; a plain delete inside Trash is refused with the exact flags to use. JSON output carries `mode: trashed | dry_run | expunged` and `reversible`.
+
+### Added
+
+- A queued draft's review page now counts down. The banner leads with the time actually remaining — `45s`, `12m 30s`, `2h 05m`, `3d 4h` — ticking every second and rolling over to `due now` once the send time passes, with the wall-clock send time kept beside it as secondary text. Until now the page showed only a clock time, which made a `--at` schedule days out and the 60-second safety cooldown read identically.
+- Hold: a queued draft can be taken back out of the outbox without being destroyed. `send_after` is cleared, the row stays a `draft`, and the review composer unlocks so the message can be finished and re-queued later. The human-approval attestation is withdrawn along with the schedule, since it authorized the send that was just called off; re-queueing re-attests it. Available as a control on the queued banner, as `POST /api/accounts/{id}/drafts/{draftId}/hold`, and as `envelope scheduled hold <id>`.
+- The queued banner links to `/cockpit#scheduled-panel`, so the whole outbox is one click from any individual queued draft.
+
+### Changed
+
+- `envelope scheduled cancel` is unchanged and still discards the draft — it is now documented as the destructive verb, with `hold` as the one to reach for when the message is still wanted and only the timing is wrong.
+- Holding races the scheduled-send sweep honestly. The store guards on `status = 'draft'` inside the UPDATE, so once the sweep has claimed a row for transmission the hold matches nothing and returns 409 rather than appearing to stop a send already in flight. The dashboard surfaces that as "already started sending, or no longer queued" with a reload, never as the revision-conflict banner.
+
+### Added
+
+- Opening a message now shows where it sits. The list header reads `4 of 50` instead of a bare count while a message is open, the selected row scrolls into view when a deep link lands on something below the fold, and the left rail marks the account the message actually belongs to (`open here`) rather than only highlighting the smart mailbox you are browsing. The unified list merges every account, so until now nothing on screen said which mailbox you were reading from.
+- A reader link that lost its `?folder=` resolves the mailbox from the list instead of guessing INBOX. The unified list records the folder for every row it paints; the reader consults that when the query string says nothing. An explicit `?folder=` still wins, since only the URL can name a mailbox the list never loaded.
+- The draft review composer renders HTML mail. A draft carrying an HTML part now opens on it, rendered through the reader's sandboxed `BodyFrame` — same `srcdoc` iframe, same CSP, `allow-scripts` still absent — with remote images blocked until asked for and the markup behind an `Edit HTML` toggle. Review used to land on the plain-text alternative, which shows bare tracking URLs where the real message has buttons, and reaching the HTML only produced its source.
+
+### Fixed
+
+- fix(mcp): stdio transport emits newline-delimited JSON-RPC per MCP spec; Content-Length input still accepted. `envelope mcp` wrote LSP-style `Content-Length:` headers on stdout, which the MCP stdio transport never specified — the official Python SDK `stdio_client` choked on the header bytes (`Failed to parse JSONRPC message … '\r'`) and `list_tools` never returned; Claude Code and Codex use the same framing. The server now writes one compact JSON object per line, `\n`-terminated, and reads both framings on stdin, detected per message, so callers written against the old server keep working. Logging stays on stderr.
+- Re-queueing a stopped draft no longer leaves the stop alert on screen. After a Governor park, pressing Send again queued the draft correctly, but the review page kept rendering the red "This send was stopped" block beside the green countdown — two contradictory states for one message. The queue endpoint returns no draft row, so the page was still reading the pre-queue `pending_review` status and `metadata.send_block`; the stop explanation is now suppressed whenever the draft is queued, which is also what a reload shows.
+- Draft review now shows the effective send-as identity from `metadata.from`, with the transport account only as a fallback, and repeats that From identity in the final queue confirmation. The send path already preserved this header, but the dashboard displayed only the authenticating mailbox, making a correctly branded draft look unsafe to approve.
+
+- A draft parked for attribution no longer offers a button that cannot clear it. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop being the one unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — withholds `Send again` when re-approval provably cannot help, and points at `envelope draft send … --attr`, which is where declaring happens. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
+- The composer's Text/HTML control swaps the body along with the label. It set the format flag and left whatever was already in the box, so a draft carrying both alternatives — every agent-generated HTML message — opened in plain text and then showed that same plain text under an HTML heading. A format switch alone marks the draft dirty, so the next Save wrote the plain-text body into `html_content` and cleared `text_content`: a real HTML part replaced by its text twin, one click from the review screen. Each format now keeps its own buffer, so switching shows that format's body and switching back returns an unsaved edit rather than the server copy.
+- The unified inbox heals itself when its cache has been blanked. An account whose index row carries a `last_error` reports zero messages however many rows are actually indexed behind it, so a sidecar started without `ENVELOPE_MASTER_PASSPHRASE_FILE` — a GUI launch inherits no shell environment — could write a credential-store error into the SHARED index for every account and leave the dashboard showing "Inbox is empty" over a full index. The stale-refresh predicate only fired on `stale`/`expired`, never `unavailable`, so it never retried: one such incident sat for a day. An empty list with connected accounts now triggers one refresh to disprove itself, while the steady state of a couple of permanently-unreachable accounts still does not re-IMAP the fleet on every open.
+- The `hold` endpoint stripped no attachment bytes. `draft_json` landed before Hold existed, so the new handler serialized the raw store row and shipped every attachment's `data_base64` on each hold. It now routes through `draft_json` like every other draft response, and a guard test fails the build if any future handler serializes a raw draft.
+- The Governor gate is skipped only for sends a human actually authored. `1.0.14-dev` reduced the scheduled-send attribution rule to `require_declaration = !human_approved`, dropping the `scheduled_origin` provenance check, so an agent-drafted message skipped attribution scoring entirely the moment an operator clicked Approve. Origin is decided from durable provenance again: only a `human:*`-originated draft carrying a current revision-bound attestation lifts the bot-declaration requirement. Agent, `mcp`, `cli`, and unknown-provenance rows still require their declaration after human approval — approval supplements a bot's attribution responsibility, it never replaces it. Dashboard- and Tauri-composed mail is stamped `human:dashboard` by `compose.rs`, so operator-written sends still bypass the review park the countdown work was written to fix.
+
+- Drafts deep links now open the draft review composer instead of the read-only reader. A message link whose folder is a Drafts mailbox (`Drafts`, `[Gmail]/Drafts`, `INBOX.Drafts`, and the other spellings `classify_folder` recognizes) resolves through the local draft that carries that IMAP UID, so `envelope read`, `envelope draft list`, `envelope inbox`, `envelope search`, and the matching MCP tools emit `/accounts/{account}/drafts/{draft}` on both `review_url` and `message_url`. Historical `/accounts/{account}/messages/{uid}?folder=Drafts` links 308 to the same review path. Everything outside a Drafts folder keeps the canonical reader route `/mail/unified/{account}/{uid}?folder={folder}`.
+- Opening a Drafts UID in the dashboard no longer loads the message endpoint or marks the draft read. The reader hands off to the review composer before fetching anything; a Drafts UID with no local draft row renders a draft card explaining that there is no editable copy, rather than the SvelteKit 404 or a read-only message with no Send.
+
+### Compatibility
+
+- The `ui` object's keys and types are unchanged, so the agent contract schema id is unchanged. Only path *values* moved: a Drafts-folder `message_url` now carries the review path. A Drafts UID with no local draft still emits the reader URL.
+
+## [1.0.12] — 2026-08-18
+
+### Added
+
+- Draft attachments are visible and editable on the draft review page. Each attachment renders as a chip carrying its filename, media type, and size, with the panel summarising the count and total; clicking a chip downloads that file, and the `×` on it detaches the file from the draft. `Attach files` and drag-and-drop add more, up to 25 MB per message — the ceiling is checked in the browser before a file is read and again server-side against the draft's running total. Previously this surface rendered a bare sentence ("3 attachments stay on this draft"), naming nothing and offering no way to open, add, or remove anything.
+- New endpoints `POST /api/accounts/{id}/drafts/{draft_id}/attachments`, `DELETE /api/accounts/{id}/drafts/{draft_id}/attachments/{filename}`, and `GET /api/accounts/{id}/drafts/{draft_id}/attachments/{filename}`. Download streams from the bytes stored on the draft rather than from IMAP, because an unsent draft's files exist nowhere else; it sends `X-Content-Type-Options: nosniff` and inlines images only, so a mislabelled entry cannot render as active content on the dashboard's origin. Attaching and detaching are edits: both carry the `expected_revision` the operator was shown, bump the revision, and clear any human-approval attestation — a draft cannot pick up a file after approval and still ride that approval.
+- Uploaded filenames are reduced to one path segment (`../../etc/passwd` attaches as `passwd`), and a name that collides with an existing attachment is suffixed `name (2).ext`. Downloads address an attachment by name, so a duplicate name would otherwise make one of the two files unreachable.
+- Attaching a file no longer costs unsaved work. The review page adopts the server's new revision and attachment list without re-seeding the editor, so text typed but not yet saved survives an attach, and the following save carries the revision the attachment write produced rather than conflicting with it.
+
+### Fixed
+
+- Draft JSON no longer ships attachment bytes to the client. `GET /drafts`, `GET /drafts/{id}`, `by-imap-uid`, and the approve/edit/block responses all strip `data_base64` from each attachment entry, leaving filename, media type, and size. The review page was downloading every attachment in full on each load and rendering only a count — a draft carrying a 10 MB PDF moved 13 MB of base64 per fetch — and the field is one the store is explicit about never logging or echoing, which the CLI has honoured since its first attachment listing. Attachment bytes now leave the API through the download route alone.
+
+## [1.0.11] — 2026-08-15
+
+### Added
+
+- Recipient autocomplete on every dashboard compose surface. To, Cc, and Bcc are now keyboard-first token fields that suggest people you have already corresponded with — arrow keys to move, Enter or Tab to accept, comma to commit a typed address, Backspace to drop the last chip, Escape to dismiss. Pasting a whole recipient list commits one chip per address and leaves anything unfinished in the field rather than dropping it. Suggestions are ranked by textual match strength first (exact, then prefix, then substring) and then by how often and how recently you have exchanged mail with that address.
+- New read-only dashboard endpoint `GET /api/accounts/{id}/address-suggestions?q=…&limit=…`, returning at most 10 `{email, name}` rows for one account. It reads local address history only — no IMAP round-trip while typing — and carries no subjects, snippets, or bodies. A recipient learned from a Bcc line comes back as an ordinary row, with nothing marking it as one.
+- Address history is reconciled into the existing `contacts` table from three caches already on disk: the local thread cache (`thread_messages`, which on an established install is where years of correspondents actually live), the dashboard's recent-inbox index, and sent drafts. It is backfilled once per account at dashboard start, and kept fresh afterwards by `envelope thread` scans and unified-inbox refreshes. An install that predates this feature gets suggestions immediately from what is already cached — the From and To lines of every thread message, and the To/Cc/Bcc of every sent draft.
+- `thread_messages` now retains Cc and Bcc alongside From and To, so a Cc recipient is history worth suggesting. Rows cached before this release have no Cc/Bcc to recover; nothing backfills them, and they fill in as read-only scans revisit those folders.
+- Someone you have just written to is suggestible on the very next message you compose. A successful send folds that message's To, Cc, and Bcc recipients into the address history as part of the same durable transition that records the send, so the CLI, MCP, the dashboard, and the scheduled sweep all get it without waiting for a thread scan, an inbox refresh, or a restart. History follows SMTP acceptance: a draft still being written, a send that was refused, and a transition that lost its ownership lease all record nothing.
+- Reconciliation is bounded by a durable per-account watermark on `thread_messages.id`, advanced in the same transaction as the contact writes, so every pass after the first reads only the messages that arrived since. The two paths that change already-folded rows — an in-place header rewrite during a rescan, and the folder wipe a UIDVALIDITY change forces — mark the account for a rebuild instead, so neither leaves stale counts nor double-counts; a rescan that changes no address-bearing field costs nothing. Measured against a synthetic 145,000-row, 23-account database (`cargo test --release -p envelope-email-store --test address_history_scale -- --ignored`): first backfill around 5.5s across 41 chunks with no chunk over 250ms; a caught-up reconcile of all 23 accounts around 140ms, re-reading zero thread rows; one new message around 10ms. Typing reads `contacts` alone — under 3ms for the worst query against the largest account's 1,242 contacts.
+
+### Changed
+
+- Recipient list parsing across the dashboard now respects quoted display names, angle brackets, and quoted-pair escapes, so `"Doe, Jane" <jane@example.com>` is one recipient instead of two malformed ones and a display name carrying a literal quote no longer swallows the recipient after it. The store-side parser additionally drops RFC 5322 group labels.
+- Recipient validation on both sides now matches the SMTP edge: the composer and the address book use the same address shape `lettre::Mailboxes` enforces on every To, Cc, and Bcc value, so an address with consecutive dots, a malformed domain label, a quoted local part, an invisible Unicode space, or syntax left over after the angle address (`Ada <ada@example.com> trailing`) is rejected where it is typed rather than at send time. The narrower `lettre::Address` is deliberately not the reference — it accepts quoted local parts that no recipient header can actually carry. Size limits are measured in UTF-8 bytes, as the send edge measures them, so an accented local part is not counted short and waved through.
+- Recipient domains must be ASCII on both the composer and the suggestion side; punycode is the spelling to use for an internationalized domain. This is deliberately narrower than the send edge, which parses a Unicode domain and then puts it on the wire unrewritten, where delivery depends on the receiving server advertising SMTPUTF8. A Unicode local part has no equivalent ASCII spelling and stays accepted everywhere.
+- `envelope contacts add` now reconciles case-insensitively with the address history. Curating `Alice@Example.com` after a header taught the address book `alice@example.com` updates that contact rather than creating a second row, so the curated name, tags, and notes are what the dropdown offers, and the interaction count already earned for the address is carried over. So are the dates: `contacts add` has no timestamps to offer and passes none, which must not erase the first and last contact the history recorded — suggestions break ties on recency, so curating a contact by hand would otherwise have sunk it below every address still carrying a date. Looking a contact up, tagging one, and deleting one all match the address the same way.
+- `contacts` gains a `history_count` column (schema migration 13) holding the interaction count derived from local caches. It is kept strictly apart from the `message_count` that `envelope contacts add|import` owns: a reconcile writes only the derived column — never a contact's manual count, tags, or notes — and fills a blank name. Suggestions rank on whichever count is higher, which is what lets a rebuild lower or reset the derived signal without a stale copy of it surviving anywhere.
+- `contacts` also gains a `history_derived` column (same migration) recording who owns each row. A row the address history invented is removed again when its last cached source disappears, so an address that only ever existed in a header a later scan corrected leaves the dropdown instead of sitting in it at zero signal. Anything `envelope contacts` created or edited — added, imported, tagged, annotated, including a row that started out derived and was later curated — is manually managed and survives every rebuild, down to a bare address with no name and no counts. Contacts that predate the migration are manually managed, so an upgrade never deletes a row it cannot prove it invented.
+- `contacts` gains a `history_sent_count` column (schema migration 14) holding what the send edge recorded, separately from the count a reconcile derives. The separation is what keeps one message worth one interaction: when the Sent-folder copy of a message you already sent is cached and reconciled later, it lands on a count the send edge never touched, and the settled figure comes out exactly where it would have without the immediate write. Both figures are recomputed from a bounded window rather than incremented, so re-running either changes nothing. The column is additive and needs no re-derivation on upgrade.
+
+### Fixed
+
+- Removing an account now removes the address book derived from its mail. `contacts` and the per-account reconciliation boundary are deleted in the same transaction as the account row; previously they survived it, leaving every correspondent's name and address in the database under an account the user believed they had removed. Other accounts keep their own rows, including addresses they share with the removed one.
+- CLI/MCP `ui` deep links and dashboard Cockpit/rules message links no longer open the dashboard's 404 page. `message_url` now emits the canonical reader route `/mail/unified/{account}/{uid}?folder={folder}`, and the cockpit/rules links emit the global `/cockpit` and `/rules` routes. The v2 SPA never had `/accounts/{id}/messages/{uid}`, `/accounts/{id}/cockpit`, or `/accounts/{id}/rules` client routes, so those links resolved to the SPA shell and the SvelteKit router then rendered its own 404 inside an HTTP 200. Historical links keep working: the dashboard now answers all three legacy shapes with a 308 to the canonical route, preserving the `folder` query (INBOX when absent).
+- Dashboard message rows now carry their own mailbox in the link. Unified-inbox rows use each row's real `folder`, snoozed rows use `snoozed_folder`, and search hits are tagged with the folder the search ran against. IMAP UIDs are mailbox-scoped, so a folder-less link opened whatever message held that UID in INBOX.
+
+### Compatibility
+
+- The `ui` object's keys and types are unchanged (`dashboard_url`, `dashboard_path`, `cockpit_url`, `message_url`, `rules_url`, `review_url`), so the agent contract schema id is unchanged. Only the path *values* moved to the canonical routes. Draft `review_url` still points at `/accounts/{account}/drafts/{draft}`, which is a real SPA route. Consumers that parse an account id out of a `message_url` path should read it from the response body instead.
+
+## [1.0.10] — 2026-08-13
+
+### Fixed
+
+- Reply, forward, and new drafts with mixed CRLF/LF content no longer fail IMAP APPEND with "Message contains bare newlines". All composed RFC822 messages (draft create/reply/forward/modify and the client-appended Sent archive copy) are normalized to strict CRLF before APPEND. Root cause was mail-builder 0.3.2's quoted-printable body encoder emitting a bare LF for a `\n` that follows a CRLF pair — triggered whenever a quoted parent body kept CRLF endings while Envelope's glue joined with `\n`. Backup restore and migration APPENDs are deliberately untouched: they transfer fetched originals byte-for-byte. ([#87](https://github.com/tymrtn/U1F4E7/issues/87))
+
+## [1.0.9] — 2026-08-08
+
+### Added
+
+- The dashboard Unified Inbox now exposes a sticky, accessible selection toolbar for Archive, provider-aware Trash/Junk, Flag, Snooze, read/unread, custom Move, and exact-sender junk-rule creation. Multi-account operations retain failed selections and report partial results honestly; the 390px layout uses full-size touch targets without overflow.
+- Dashboard Snooze now has a real validated API path with presets and custom UTC times, backed by Envelope's existing `Snoozed` folder and return sweep.
+
+### Changed
+
+- Opening a message in the interactive dashboard intentionally marks it `\\Seen` after a successful `BODY.PEEK` load and immediately updates the mounted list row. CLI, MCP, quickstart, and evidence reads remain non-mutating.
+- Archive, Junk, and Trash actions use canonical semantic destinations resolved against each account's detected provider folders; Gmail, Outlook, and generic IMAP names are never assumed. Exact operator-selected custom folders remain literal.
+
+### Fixed
+
+- Read-state overrides are keyed by account, folder, and UID, preventing mailbox-scoped UID collisions between Inbox, Sent, Junk, and other folders.
+- Dashboard Delete now moves ordinary messages to provider Trash instead of permanently expunging them. Hard delete remains explicit and confirmed only from Trash.
+- Canonical move targets used by dashboard-created junk rules are resolved by both dashboard and CLI rule executors; unresolved targets fail without creating or moving into a misleading literal folder.
+
+## [1.0.8] — 2026-08-08
+
+### Changed
+
+- Normal Governor-allowed sends now queue for a **60-second** cooldown by default (down from 120s) before the outbox sweep transmits. Explicit confirmed immediate send (`send_now`/`--send-now` + `confirm_send_now`) still transmits now, honestly-declared review still parks the draft, and deny/invalid still stays unsent. Override precedence (`cooldown_seconds`, `ENVELOPE_SEND_COOLDOWN_SECONDS`) is unchanged, and the active `envelope.agent_contract.v2` schema was regenerated to advertise the 60-second default.
+- `short_body` is now derived from the **final body actually being sent** through one canonical policy at both the direct (CLI/MCP) and scheduled boundaries, covering every body shape: text (word count), HTML-only (visible-text word count, not markup tokens), dual-format (the text alternative is canonical), and empty/bodyless (zero words → short). A truthful `short_body` declaration on an HTML-only or bodyless message is now corroborated instead of left `host_verification_unavailable`.
+- Attribute provenance reconciled honestly for bot-originated sends: `agent_drafted` is now **declarable author-context** (the bot declares its own authorship; Envelope never infers it for a human CLI user). The weight-free public catalog projection reflects the updated per-key provenance; Governor weights, scores, and thresholds remain external and unchanged.
+
+### Fixed
+
+- Sent-folder proof is stored only in a dedicated, folder-qualified `metadata.sent_copy` object (`folder`, `uid` — explicit JSON `null` when unresolved — `lookup_status`, and `copy_source`) and is never written to the Drafts-folder `imap_uid` column. `mark_draft_sent` clears the stale Drafts UID along with `send_after` on the terminal `sent` state (provider Drafts cleanup still uses the pre-transition snapshot), so a Sent UID can never be conflated with a Drafts UID.
+- Immediate `draft send` and MCP `send_draft` now persist the resolved Sent-folder proof on the draft row, matching the scheduled sweep — direct and scheduled durable behavior no longer diverge. Ordering is preserved: SMTP accepted → terminal `sent` state → best-effort Sent lookup/append → durable proof annotation; a proof failure never retransmits.
+- The client-appended Sent archive copy now preserves the `Reply-To` header that SMTP transmitted, and keeps `Bcc` on the sender-private archive (normal sends still strip `Bcc` from the wire) so the sender retains the true recipient record. It already preserved Message-ID, To/Cc, subject, text/HTML, attachments, and threading headers.
+- Sent-copy resolution now matches the transmitted Message-ID **exactly and uniquely** — treating IMAP `SEARCH HEADER` hits as candidates and comparing their actual Message-ID headers after normalization — instead of taking an arbitrary substring hit; duplicate exact copies yield a stable `ambiguous` status with no UID. `copy_source` is now coherent with the observed outcome: a client append that fails and finds no exact copy is `unresolved` (never `not_attempted`), and a provider-side copy observed after a failed append is labeled `provider`.
+- Scheduled allowed sends resolve Sent-folder proof through the same source-aware resolver as the immediate CLI/MCP paths: after SMTP success the background sweep looks up the provider Sent copy by Message-ID and, when the provider does not auto-file, client-appends exactly one archive copy and records the truthful proof.
+- A scheduled send that the Governor routes to **review** is now parked `pending_review` with `send_after` cleared, so no surface can present a parked-for-review draft as queued. The dashboard draft page renders explicit *Pending review* (never "Queued for sending", a locked-until-it-sends composer, or a stale countdown); the composer no longer treats any `pending_review` row as queued.
+- `envelope draft show` now reports the true persisted draft status — distinguishing `sent`, `pending_review`, `queued` (a scheduled `draft` row), and ordinary `drafted` — instead of always emitting `drafted`.
+
+## [1.0.5] — 2026-08-04
+
+### Added
+
+- Envelope rules now derive a `provider_spam` score from `X-Migadu-Spam-Score` or `X-Spam-Score` during read-only header fetches, allowing sender-independent composite junk rules without downloading message bodies. Explicitly persisted scores retain precedence over provider headers.
+
+### Fixed
+
+- Rule test, preview, and run now canonicalize Message-ID keys consistently across CLI and dashboard paths, so persisted tag/score overrides are honored for both full-message and summary evaluation.
+- Dashboard rule execution now evaluates the same header-only summaries used by preview instead of re-fetching each full RFC822 message.
+
+## [1.0.4] — 2026-08-01
+
+### Fixed
+
+- The dashboard header now reports the running backend version from `/api/health` instead of displaying a hard-coded `v1.0.0`; if health is unavailable, the version badge is omitted rather than showing a false release.
+
+## [1.0.3] — 2026-08-01
+
+### Added
+
+- Generated draft review links now open a first-class dashboard composer for editing recipients, subject, and body, with revision-conflict protection, explicit human send confirmation, cooldown queueing, persisted queued/read-only states, and safe route-change handling.
+
+### Fixed
+
+- The Svelte dashboard now recognizes `/accounts/{account}/drafts/{draft}` instead of rendering its own 404 for valid draft URLs.
+- Draft review preserves both body alternatives for recipient- or subject-only edits, validates To/Cc/Bcc before send, and prevents in-flight edits or route changes from acting on the wrong draft.
+
+## [1.0.2] — 2026-07-31
+
+### Fixed
+
+- Existing drafts edited in the dashboard now replace the stored body representation set atomically. Editing the plain-text form clears a stale HTML alternate (and vice versa), preventing `multipart/alternative` delivery from showing recipients the pre-edit draft; recipient- or subject-only edits still preserve both body forms.
+
+## [1.0.1] — 2026-07-30
+
+### Fixed
+
+- **Draft review URLs honor the configured dashboard host consistently.** CLI
+  draft output now uses the canonical dashboard base URL resolver for top-level
+  `dashboard_url` and `review_url` fields, matching nested `ui` metadata instead
+  of falling back to `http://localhost:3141` when only persistent
+  `dashboard.base_url` is configured.
+
+### Fixed
+
+- Draft JSON no longer ships attachment bytes to the client. `GET /accounts/{id}/drafts`, `GET /accounts/{id}/drafts/{draft_id}`, `by-imap-uid`, and the approve/edit/block responses all strip `data_base64` from each attachment entry, leaving the filename, media type, and size a client needs to describe what is attached. Every draft fetch previously carried each attachment in full — a draft holding a 10 MB PDF moved roughly 13 MB of base64 per request — and `data_base64` is a field the store is explicit about never logging or echoing, which the CLI has honoured since its first attachment listing.
 
 ### Fixed
 

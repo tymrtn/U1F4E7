@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.28-dev"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 authors = ["Tyler Martin"]
@@ -26,7 +26,9 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `functions` registers the address-book ranking function so the suggestion
+# query can order by match strength before its candidate cap applies.
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

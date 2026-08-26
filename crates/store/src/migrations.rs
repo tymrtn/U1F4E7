@@ -739,6 +739,191 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // ── Migration 13: address history cache (compose autocomplete) ──
+        // `address_history_state` is the per-account reconciliation boundary:
+        // `last_thread_message_id` is how far up the monotonic
+        // `thread_messages.id` sequence the address history has been folded
+        // in, so a refresh never rescans the deep thread cache;
+        // `source_version` forces a rebuild when the derivation itself
+        // changes; and `dirty` forces one when the source rows change under
+        // the watermark (an in-place header rewrite, or the delete/reinsert a
+        // UIDVALIDITY reset performs). `contacts.history_count` is the derived
+        // half of the interaction signal, kept apart from the `message_count`
+        // that `envelope contacts import` and manual edits own.
+        //
+        // `contacts.history_derived` is who owns the row. A row the derivation
+        // invented is marked 1 and may be dropped again when its last source
+        // disappears — a header a rescan corrected, say. Anything `envelope
+        // contacts` created or edited is 0 and is never deleted by a rebuild,
+        // however little signal it carries. The default is 0, so every contact
+        // that predates this migration is treated as manually managed: an
+        // upgrade must not delete a row it cannot prove it invented.
+        //
+        // `thread_messages` also gains `cc_addresses`/`bcc_addresses`: the
+        // scan already parses those headers, and a Cc recipient is history
+        // worth suggesting. They are NULL on every row written before this
+        // migration — nothing backfills them, and they fill in as read-only
+        // scans revisit each folder.
+        //
+        // All additive; existing rows start at zero/NULL and the first
+        // reconcile folds their history in from the start.
+        M::up_with_hook("", |tx: &Transaction| {
+            let table_exists = |table: &str| -> bool {
+                tx.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .and_then(|mut s| s.query_row([table], |row| row.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0
+            };
+            let has_col = |table: &str, col: &str| -> bool {
+                tx.prepare(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                    > 0
+            };
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS address_history_state (
+                    account_id TEXT PRIMARY KEY,
+                    source_version INTEGER NOT NULL DEFAULT 0,
+                    last_thread_message_id INTEGER NOT NULL DEFAULT 0,
+                    reconciled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    dirty INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            if table_exists("contacts") {
+                if !has_col("contacts", "history_count") {
+                    tx.execute_batch(
+                        "ALTER TABLE contacts ADD COLUMN history_count INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                if !has_col("contacts", "history_derived") {
+                    tx.execute_batch(
+                        "ALTER TABLE contacts ADD COLUMN history_derived INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+            }
+            if table_exists("thread_messages") {
+                if !has_col("thread_messages", "cc_addresses") {
+                    tx.execute_batch("ALTER TABLE thread_messages ADD COLUMN cc_addresses TEXT;")?;
+                }
+                if !has_col("thread_messages", "bcc_addresses") {
+                    tx.execute_batch("ALTER TABLE thread_messages ADD COLUMN bcc_addresses TEXT;")?;
+                }
+            }
+            Ok(())
+        }),
+        // ── Migration 14: immediate post-send suggestibility ────────
+        // `contacts.history_sent_count` is the locally recorded sent-draft
+        // half of the derived signal, kept in its own column so the write
+        // that runs the instant a send is durable cannot stack with the
+        // reconcile's later accounting of the same message.
+        //
+        // A send transitions its draft to `sent` and folds that draft's
+        // recipients in immediately, so they are suggestible without waiting
+        // for a thread scan or a refresh. When the Sent-folder copy is later
+        // cached and a reconcile folds it in, that message reaches
+        // `history_count` through the ordinary thread/recount path — and
+        // because the immediate write never touched `history_count`, the
+        // count comes out exactly as it would have without it. The two
+        // columns are separate sources, never one running total.
+        //
+        // Both writes are recomputed floors rather than increments: the
+        // immediate edge recounts the same sent-draft window the reconcile
+        // reads, so running it twice for one send changes nothing. A rebuild
+        // resets this column alongside `history_count`, which is what lets a
+        // derived row whose last source is gone still be swept.
+        //
+        // Additive; existing rows start at zero and the next completed
+        // reconcile fills the column in. No source-version bump: the value is
+        // subsumed by `history_count` once a reconcile has run, so it changes
+        // no ranking and is not worth re-folding six figures of thread rows
+        // for.
+        M::up_with_hook("", |tx: &Transaction| {
+            let has_col = |table: &str, col: &str| -> bool {
+                tx.prepare(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                    > 0
+            };
+            let table_exists = tx
+                .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .and_then(|mut s| s.query_row(["contacts"], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                > 0;
+            if table_exists && !has_col("contacts", "history_sent_count") {
+                tx.execute_batch(
+                    "ALTER TABLE contacts ADD COLUMN history_sent_count INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            Ok(())
+        }),
+        // ── Unified-inbox date ordering + keyset pagination ──────────────
+        // `indexed_message_summaries.date` holds whatever the IMAP envelope
+        // carried — usually RFC 2822 ("Fri, 14 Aug 2026 …"), which SQLite's
+        // strftime cannot parse, so the unified listing's date ordering
+        // silently degenerated to "highest UID wins across accounts" and one
+        // account owned the whole capped page. Store a parsed epoch at write
+        // time and order/paginate on that; the hook backfills existing rows in
+        // Rust, where RFC 2822 is parseable.
+        M::up_with_hook("", |tx: &Transaction| {
+            // Fixture-seeded partial schemas (upgrade tests) may lack the
+            // table entirely; the fresh-DB path creates it with date_epoch on
+            // first use, so skipping is correct there.
+            let table_exists = tx
+                .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .and_then(|mut s| {
+                    s.query_row(["indexed_message_summaries"], |row| row.get::<_, i64>(0))
+                })
+                .unwrap_or(0)
+                > 0;
+            let has_col = tx
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('indexed_message_summaries')
+                     WHERE name = 'date_epoch'",
+                )
+                .and_then(|mut s| s.query_row([], |row| row.get::<_, i64>(0)))
+                .unwrap_or(0)
+                > 0;
+            if table_exists && !has_col {
+                tx.execute_batch(
+                    "ALTER TABLE indexed_message_summaries ADD COLUMN date_epoch INTEGER;
+                     CREATE INDEX IF NOT EXISTS idx_indexed_message_summaries_folder_epoch
+                         ON indexed_message_summaries(folder, date_epoch DESC, uid DESC);",
+                )?;
+                let rows: Vec<(String, String, i64, i64, Option<String>)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT account_id, folder, uidvalidity, uid, date
+                         FROM indexed_message_summaries WHERE date IS NOT NULL",
+                    )?;
+                    let collected = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    collected
+                };
+                for (account_id, folder, uidvalidity, uid, date) in rows {
+                    if let Some(epoch) = crate::message_index::parse_date_epoch(date.as_deref()) {
+                        tx.execute(
+                            "UPDATE indexed_message_summaries SET date_epoch = ?1
+                             WHERE account_id = ?2 AND folder = ?3 AND uidvalidity = ?4 AND uid = ?5",
+                            rusqlite::params![epoch, account_id, folder, uidvalidity, uid],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -836,6 +1021,136 @@ mod tests {
         assert!(
             token.is_none(),
             "legacy rows (even stranded `sending` ones) carry no lease"
+        );
+    }
+
+    /// Regression for migrations 13 and 14: an install that already has
+    /// contacts — counts and curation included — gains both derived columns at
+    /// zero and an empty reconciliation boundary, so the first reconcile folds
+    /// its history in from the start without disturbing what is already there.
+    /// Its cached thread rows gain empty Cc/Bcc columns: nothing backfills
+    /// those, they fill in as read-only scans revisit each folder.
+    #[test]
+    fn pre_address_history_contacts_upgrade_with_a_zero_derived_count() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE contacts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                name TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT,
+                last_seen TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(account_id, email)
+            );
+            INSERT INTO contacts (id, account_id, email, name, tags, notes, message_count)
+                VALUES ('c-legacy', 'acc', 'imported@example.net', 'Imported',
+                        '[\"vendor\"]', 'Net-30', 87);
+            CREATE TABLE thread_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                message_id TEXT,
+                in_reply_to TEXT,
+                reference_ids TEXT,
+                folder TEXT NOT NULL,
+                from_address TEXT,
+                to_addresses TEXT,
+                date TEXT,
+                subject TEXT,
+                is_outbound INTEGER NOT NULL DEFAULT 0,
+                snippet TEXT
+            );
+            INSERT INTO thread_messages (thread_id, uid, folder, from_address, to_addresses)
+                VALUES ('t-legacy', 1, 'INBOX', 'ada@example.net', 'me@example.net');
+            PRAGMA user_version = 12;
+            ",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let (message_count, history_count, history_sent_count, history_derived, tags, notes): (
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT message_count, history_count, history_sent_count, history_derived,
+                        tags, notes
+                 FROM contacts WHERE id = 'c-legacy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(message_count, 87, "an imported count survives the upgrade");
+        assert_eq!(history_count, 0, "nothing has been derived locally yet");
+        assert_eq!(
+            history_sent_count, 0,
+            "and nothing has been sent through this install yet either"
+        );
+        assert_eq!(
+            history_derived, 0,
+            "a contact that predates the derivation is manually managed, and a \
+             rebuild may never delete it"
+        );
+        assert_eq!(tags, r#"["vendor"]"#);
+        assert_eq!(notes.as_deref(), Some("Net-30"));
+
+        let boundaries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM address_history_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(boundaries, 0, "no account has been reconciled yet");
+
+        // The reconciliation boundary carries the invalidation flag the
+        // mutation paths set, defaulted off.
+        conn.execute(
+            "INSERT INTO address_history_state (account_id, source_version, last_thread_message_id)
+             VALUES ('acc', 1, 5)",
+            [],
+        )
+        .unwrap();
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT dirty FROM address_history_state WHERE account_id = 'acc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 0);
+
+        let (cc, bcc): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cc_addresses, bcc_addresses FROM thread_messages WHERE uid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (cc, bcc),
+            (None, None),
+            "an already-cached thread row has no Cc/Bcc to recover; a later \
+             read-only scan is what fills these in"
         );
     }
 

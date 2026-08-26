@@ -7,6 +7,23 @@ use crate::models::{Draft, DraftStatus};
 use rusqlite::params;
 use uuid::Uuid;
 
+/// Compare Message-IDs by their bare form: `<id@host>` and `id@host` name the
+/// same message, and both spellings are persisted by different call sites.
+fn bare_message_id(value: &str) -> &str {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+}
+
+/// Metadata key holding Message-IDs this draft previously had on the server.
+pub const SUPERSEDED_MESSAGE_IDS: &str = "superseded_message_ids";
+
+/// Upper bound on retained superseded identities, so an edit loop cannot grow
+/// the row without limit.
+pub const MAX_SUPERSEDED_MESSAGE_IDS: usize = 16;
+
 /// A held provider-sync lease: the opaque owner token plus the status to
 /// restore on release.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +141,37 @@ impl Database {
         Ok(draft)
     }
 
+    /// Find active local drafts carrying an exact canonical Message-ID.
+    ///
+    /// IMAP UIDs change whenever a draft is replaced, while Message-ID is the
+    /// stable identity Envelope persists for that logical draft. Callers must
+    /// still require exactly one result before repairing a UID mapping: two
+    /// local rows with the same Message-ID are ambiguous and must not be merged.
+    pub fn find_editable_drafts_by_message_id(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<Draft>> {
+        let wanted = crate::models::canonical_message_id(message_id);
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, status, to_addr, cc_addr, bcc_addr, reply_to, subject,
+                    text_content, html_content, in_reply_to, metadata, attachments, message_id,
+                    send_after, snoozed_until, created_at, updated_at, sent_at, created_by,
+                    imap_uid, revision
+             FROM drafts
+             WHERE account_id = ?1
+               AND status IN ('draft', 'pending_review', 'blocked')
+               AND trim(trim(message_id), '<>') = ?2
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, wanted], Self::map_draft)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_drafts(
         &self,
         account_id: &str,
@@ -191,6 +239,37 @@ impl Database {
         }
     }
 
+    /// Explain why a queue CAS ([`Self::queue_draft_for_send`]) matched zero
+    /// rows. Identical precedence to [`Self::classify_guarded_update_miss`],
+    /// except a `blocked` row is reported as [`StoreError::DraftNotEditable`]
+    /// rather than a concurrent-edit conflict: `blocked` is
+    /// [`DraftStatus::is_editable`] (a human may edit it) but NOT
+    /// [`DraftStatus::is_queueable`], so a denied row that a caller tried to
+    /// re-schedule gets a truthful "not queueable" refusal, never a resurrection.
+    fn classify_queue_miss(&self, id: &str) -> StoreError {
+        match self.get_draft(id) {
+            Ok(None) => StoreError::DraftNotFound(id.to_string()),
+            Ok(Some(current)) if !current.status.is_queueable() => {
+                StoreError::DraftNotEditable(current.status.as_str().to_string())
+            }
+            Ok(Some(_)) => StoreError::DraftModifiedConcurrently(id.to_string()),
+            Err(e) => e,
+        }
+    }
+
+    /// Edit a draft's recipients, subject, and body.
+    ///
+    /// `to_addr`/`subject` are per-field: `None` keeps the stored value.
+    /// `cc_addr`/`bcc_addr` are written as given (pass the existing value to
+    /// keep it).
+    ///
+    /// The two body fields move together as the draft's body representation
+    /// set. Supplying either `text_content` or `html_content` writes the
+    /// supplied pair exactly and CLEARS the omitted alternate; supplying
+    /// neither preserves both. A draft holding an edited text body beside a
+    /// pre-edit HTML body is transmitted as `multipart/alternative`, where
+    /// receiving clients prefer the HTML — so preserving the bodies per-field
+    /// would deliver the content the editor was used to change.
     pub fn update_draft_content(
         &self,
         id: &str,
@@ -254,6 +333,15 @@ impl Database {
         text_content: Option<&str>,
         html_content: Option<&str>,
     ) -> Result<Draft> {
+        // `?9` gates BOTH body columns as one unit: a supplied body replaces
+        // the pair exactly, and a recipient/subject-only edit (neither
+        // supplied) leaves the pair alone. Coalescing the columns
+        // independently left a text-only edit sitting beside the old HTML, and
+        // that dual-body row goes out as `multipart/alternative` — receiving
+        // clients prefer the HTML alternative, so the recipient read the
+        // pre-edit draft. Matches `apply_synced_draft_edit`, where the CLI
+        // edit path already writes the body pair as a replacement.
+        let body_edit = text_content.is_some() || html_content.is_some();
         // One atomic statement: the content change, the revision bump, the
         // approval invalidation, the editable-status guard, and (when bound,
         // ?8) the stale-view revision guard all land together or not at all —
@@ -266,8 +354,8 @@ impl Database {
                 cc_addr = ?2,
                 bcc_addr = ?3,
                 subject = COALESCE(?4, subject),
-                text_content = COALESCE(?5, text_content),
-                html_content = COALESCE(?6, html_content),
+                text_content = CASE WHEN ?9 THEN ?5 ELSE text_content END,
+                html_content = CASE WHEN ?9 THEN ?6 ELSE html_content END,
                 metadata = json_remove(metadata, '$.human_approval'),
                 revision = revision + 1,
                 updated_at = datetime('now')
@@ -282,7 +370,8 @@ impl Database {
                 text_content,
                 html_content,
                 id,
-                expected_revision
+                expected_revision,
+                body_edit
             ],
         )?;
         if rows == 0 {
@@ -300,9 +389,28 @@ impl Database {
     /// actor that did not acquire the claim (or lost it) cannot mark a draft
     /// sent, which closes the cross-path double-send (scheduled sweep vs
     /// CLI/MCP immediate send). The token is cleared on the terminal state.
+    ///
+    /// Being the one edge every send path crosses, this is also where the
+    /// draft's recipients enter the compose autocomplete's address history —
+    /// after SMTP acceptance, never before, and never on a transition the
+    /// caller did not own. See [`Database::record_sent_draft_recipients`].
     pub fn mark_draft_sent(&self, id: &str, token: &str, message_id: Option<&str>) -> Result<()> {
+        // On the terminal `sent` state, `send_after` and the Drafts-folder
+        // `imap_uid` are both cleared:
+        //  - `send_after`: a transmitted draft is no longer scheduled/due, so no
+        //    surface can infer it is still queued (real evidence: a scheduled
+        //    allowed send left `send_after` at the expired timestamp even after
+        //    the row flipped to `sent`). Immediate sends carry no `send_after`,
+        //    so clearing it there is a harmless no-op.
+        //  - `imap_uid` is the IMAP *Drafts*-folder UID; once sent, the provider
+        //    Drafts copy is being cleaned up (the send paths take the cleanup
+        //    identity from the pre-transition in-memory snapshot, not this row),
+        //    so the stored UID is stale. Clearing it keeps `imap_uid`
+        //    Drafts-folder-only and prevents Sent proof from ever being conflated
+        //    with a Drafts UID. Sent-folder proof lives in `metadata.sent_copy`.
         let rows = self.conn().execute(
             "UPDATE drafts SET status = 'sent', message_id = ?1, operation_token = NULL,
+             send_after = NULL, imap_uid = NULL,
              sent_at = datetime('now'), updated_at = datetime('now')
              WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
             params![message_id, id, token],
@@ -315,6 +423,21 @@ impl Database {
                     current.status.as_str()
                 )),
             });
+        }
+
+        // The send is durable from the statement above; everything past it is
+        // cache maintenance. A suggestion cache that could not be written is a
+        // stale dropdown until the next reconcile — reporting it as a send
+        // failure would be far worse, because the callers answer that by
+        // parking the draft as `delivery_uncertain` and telling an operator to
+        // go verify delivery of a message that was, in fact, delivered.
+        if let Err(e) = self.record_sent_draft_recipients(id) {
+            tracing::warn!(
+                draft_id = %id,
+                "draft was sent, but its recipients could not be folded into the \
+                 address history: {e} — they will appear in compose autocomplete \
+                 after the next reconcile"
+            );
         }
         Ok(())
     }
@@ -365,6 +488,40 @@ impl Database {
         Ok(())
     }
 
+    /// Replace the draft's `attachments` JSON array, bound to the revision the
+    /// caller was shown.
+    ///
+    /// The revision-guarded sibling of [`Self::update_draft_attachments`], for
+    /// interactive surfaces where the operator is looking at a rendered list of
+    /// attachments: adding or removing one is an edit to what will be sent, so
+    /// it has to lose a race with a concurrent change rather than rebuild the
+    /// array from a stale view. Same atomic statement, same editable-status
+    /// guard, same approval invalidation — plus `revision = ?3`.
+    pub fn update_draft_attachments_for_revision(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        attachments: &[serde_json::Value],
+    ) -> Result<Draft> {
+        let serialized = serde_json::to_string(attachments)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET attachments = ?1,
+                metadata = json_remove(metadata, '$.human_approval'),
+                revision = revision + 1,
+                updated_at = datetime('now')
+             WHERE id = ?2
+               AND status IN ('draft', 'pending_review', 'blocked')
+               AND revision = ?3",
+            params![serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+
+        self.get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+    }
+
     /// Set the `send_after` timestamp on a draft (for scheduled sending).
     pub fn update_draft_send_after(&self, id: &str, send_after: &str) -> Result<()> {
         // Editable-status guard in the same statement: rescheduling a claimed
@@ -378,6 +535,62 @@ impl Database {
             return Err(self.classify_guarded_update_miss(id));
         }
         Ok(())
+    }
+
+    /// Take a queued draft back out of the outbox WITHOUT discarding it.
+    ///
+    /// Clears `send_after` so [`Self::list_drafts_due_for_send`] can never
+    /// select the row again, and leaves it in `draft` status so the composer
+    /// unlocks and the operator can edit it and re-queue it later. This is the
+    /// non-destructive counterpart to [`Self::discard_draft`]: a hold loses the
+    /// schedule, never the message.
+    ///
+    /// One guarded UPDATE. The `status = 'draft'` guard is the race boundary
+    /// against the send sweep — once [`Self::claim_draft_for_sending`] has
+    /// flipped the row to `sending`, this matches nothing and reports
+    /// [`StoreError::DraftNotEditable`], so a transmission already in flight is
+    /// never yanked back. `send_after IS NOT NULL` keeps the verb honest: a
+    /// draft that was not queued reports [`StoreError::DraftNotScheduled`]
+    /// instead of a silent no-op success.
+    ///
+    /// The human-approval attestation is stripped alongside the schedule. That
+    /// approval authorized *this* send and the operator just withdrew it; a
+    /// later re-queue re-attests through
+    /// [`Self::queue_draft_with_human_approval`]. The revision is deliberately
+    /// NOT bumped — no content changed, so an editor holding
+    /// `expected_revision` stays valid and can save without a spurious 409.
+    ///
+    /// Returns the held row.
+    pub fn hold_scheduled_draft(&self, id: &str) -> Result<Draft> {
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                send_after = NULL,
+                metadata = json_remove(COALESCE(metadata, '{}'), '$.human_approval'),
+                updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'draft' AND send_after IS NOT NULL",
+            params![id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_hold_miss(id));
+        }
+        self.get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+    }
+
+    /// Explain why [`Self::hold_scheduled_draft`] matched zero rows, in
+    /// precedence order: missing row → [`StoreError::DraftNotFound`]; a row the
+    /// sweep claimed or that reached a terminal/parked state →
+    /// [`StoreError::DraftNotEditable`] (the status names which); otherwise the
+    /// row is a plain unqueued draft → [`StoreError::DraftNotScheduled`].
+    fn classify_hold_miss(&self, id: &str) -> StoreError {
+        match self.get_draft(id) {
+            Ok(None) => StoreError::DraftNotFound(id.to_string()),
+            Ok(Some(current)) if current.status != DraftStatus::Draft => {
+                StoreError::DraftNotEditable(current.status.as_str().to_string())
+            }
+            Ok(Some(_)) => StoreError::DraftNotScheduled(id.to_string()),
+            Err(e) => e,
+        }
     }
 
     /// Atomically claim a due scheduled draft for transmission.
@@ -540,31 +753,93 @@ impl Database {
 
     /// Finalize provider-sync bookkeeping (replacement UID, Message-ID,
     /// storage metadata) — permitted ONLY to the lease holder.
+    /// Record the outcome of a provider re-sync under the exclusive `syncing`
+    /// claim.
+    ///
+    /// `appended_message_id` is the Message-ID of the replacement APPEND. It is
+    /// load-bearing: the replacement copy on the server carries a NEW
+    /// Message-ID, and post-send cleanup locates the copy to delete by the
+    /// Message-ID on this row. Leaving the old value here pointed cleanup at an
+    /// identity the server no longer had, so it found nothing, skipped, and the
+    /// copy survived — once per edit (a rev-4 draft left three copies behind,
+    /// each under a different Message-ID).
+    ///
+    /// The replaced identity is retained in `superseded_message_ids` rather than
+    /// discarded. The replace path deletes the old copy before appending, but
+    /// that deletion can fail or be interrupted, and drafts edited before this
+    /// bookkeeping existed already have orphans on the server. Remembering the
+    /// old identities lets cleanup remove them later; each is still verified by
+    /// exact Message-ID header before anything is deleted.
     pub fn finalize_synced_draft_bookkeeping(
         &self,
         id: &str,
         token: &str,
         imap_uid: Option<u32>,
         storage_metadata: &serde_json::Value,
+        appended_message_id: Option<&str>,
     ) -> Result<()> {
         let current = self
             .get_draft(id)?
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        let previous_message_id = current.message_id.clone();
         let mut metadata = match current.metadata {
             Some(m) if m.is_object() => m,
             _ => serde_json::json!({}),
         };
+
+        // The identity actually being replaced, if this APPEND changed it.
+        //
+        // Compared bare: the row may hold `<id@host>` while the APPEND header is
+        // recorded as `id@host`, and treating that purely-syntactic difference
+        // as a new identity records a phantom supersede for a draft whose
+        // Message-ID never changed (the replace path normally reuses it).
+        let superseded = previous_message_id.filter(|prev| {
+            appended_message_id.is_some_and(|next| {
+                !next.is_empty() && bare_message_id(next) != bare_message_id(prev)
+            })
+        });
+        if let Some(prev) = superseded {
+            let mut ids: Vec<String> = metadata
+                .get(SUPERSEDED_MESSAGE_IDS)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ids.contains(&prev) {
+                ids.push(prev);
+            }
+            // Bounded: an edit loop must not grow this row without limit. The
+            // oldest identities are the likeliest to be already gone.
+            let overflow = ids.len().saturating_sub(MAX_SUPERSEDED_MESSAGE_IDS);
+            if overflow > 0 {
+                ids.drain(0..overflow);
+            }
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(SUPERSEDED_MESSAGE_IDS.to_string(), serde_json::json!(ids));
+            }
+        }
+
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("storage".to_string(), storage_metadata.clone());
         }
         let serialized = serde_json::to_string(&metadata)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET
-                imap_uid = COALESCE(?1, imap_uid),
+                imap_uid = ?1,
                 metadata = ?2,
+                message_id = COALESCE(?5, message_id),
                 updated_at = datetime('now')
              WHERE id = ?3 AND status = 'syncing' AND operation_token = ?4",
-            params![imap_uid.map(|u| u as i64), serialized, id, token],
+            params![
+                imap_uid.map(|u| u as i64),
+                serialized,
+                id,
+                token,
+                appended_message_id.filter(|m| !m.is_empty()),
+            ],
         )?;
         if rows == 0 {
             return Err(self.classify_guarded_update_miss(id));
@@ -599,6 +874,249 @@ impl Database {
                 operation_token = NULL, updated_at = datetime('now')
              WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
             params![id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Persist a bot's validated attribution declaration onto a queued/scheduled
+    /// draft, merged under the `attribution` metadata key.
+    ///
+    /// The block is bound to the row's authoritative `revision` (stamped from the
+    /// column in the same statement), so any later material edit — which bumps the
+    /// revision — makes it stale and the scheduled-send sweep treats it as no
+    /// declaration at all. All other metadata keys (reply threading, contextual
+    /// state, storage, human approval) are preserved via `json_set` rather than a
+    /// blob replace, and the revision is NOT bumped so the declaration stays
+    /// current for the sweep. The `attribution` value is caller-supplied
+    /// (`PersistedDeclaration::to_value`) and contains no score/weight/threshold.
+    ///
+    /// Editable-status guard: a claimed (`sending`/`syncing`) or terminal row
+    /// refuses atomically. The attribution wire key mirrors the transport crate's
+    /// `ATTRIBUTION_METADATA_KEY`.
+    pub fn set_draft_attribution(&self, id: &str, attribution: &serde_json::Value) -> Result<()> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![serialized, id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        Ok(())
+    }
+
+    /// Atomically queue a draft for scheduled sending in ONE compare-and-set:
+    /// validate the row is still at `expected_revision` and in a queueable
+    /// (editable) status, persist the already-validated attribution declaration
+    /// bound to that revision, set the `send_after` schedule, and transition the
+    /// row to the due `draft` status — all together or not at all.
+    ///
+    /// This is the single atomic replacement for the previous
+    /// `update_draft_send_after` + `set_draft_attribution` sequence, and it closes
+    /// three races that sequence allowed:
+    ///
+    /// - A concurrent material edit after the caller validated its declaration
+    ///   bumps the revision; the CAS then matches zero rows and refuses, so a
+    ///   stale declaration can never be stamped onto newer content.
+    /// - Scheduling and attribution persistence are one statement, so a failure
+    ///   can never strand a `send_after` with no declaration (or vice versa).
+    /// - A `pending_review` row is transitioned to `draft`, so a valid re-queue
+    ///   is actually visible to [`Self::list_drafts_due_for_send`] (which selects
+    ///   `status='draft'`) instead of being reported "scheduled" while remaining
+    ///   invisible to the sweep. A `blocked` (Governor-denied) row is deliberately
+    ///   NOT queueable (see [`DraftStatus::is_queueable`]): it refuses so a denied
+    ///   send can never be resurrected into a due draft.
+    ///
+    /// The revision is deliberately NOT bumped: the persisted declaration must
+    /// stay current for the sweep, which claims at this same revision. A stale
+    /// `expected_revision`, a claimed/terminal/blocked row, or a missing draft
+    /// returns the classified miss (`DraftModifiedConcurrently` /
+    /// `DraftNotEditable` / `DraftNotFound`) and nothing is scheduled or
+    /// persisted. The `attribution` value is caller-supplied
+    /// (`PersistedDeclaration::to_value`) and carries no score/weight/threshold.
+    pub fn queue_draft_for_send(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        send_after: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<()> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'draft',
+                send_after = ?1,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?2), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?3 AND revision = ?4
+               AND status IN ('draft', 'pending_review')",
+            params![send_after, serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_queue_miss(id));
+        }
+        Ok(())
+    }
+
+    /// Record a failed SMTP-time attribution attempt and leave the draft due for a
+    /// later sweep to retry. Under the owner `sending` lease: back to `draft`,
+    /// clear the token, merge the advanced attempt state under `attribution`
+    /// (revision re-stamped from the column, which is unchanged since the claim),
+    /// and DO NOT touch `send_after` (the draft stays due) or bump the revision.
+    /// A non-owner or non-`sending` row matches nothing and returns `false`.
+    pub fn defer_attribution_retry(
+        &self,
+        id: &str,
+        token: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'draft', operation_token = NULL,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+            params![serialized, id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Park a draft that exhausted its attribution correction attempts.
+    ///
+    /// Under the owner `sending` lease: move to `pending_review`, clear
+    /// `send_after` (disable automatic transmission scheduling — the due query
+    /// never selects it again, so there is no retry storm), clear the token, and
+    /// merge the terminal attempt state (with `park_reason`) under `attribution`.
+    /// The revision is NOT bumped, so the pending-review draft carries an honest
+    /// record of why it parked. A non-owner or non-`sending` row changes nothing.
+    pub fn park_attribution_exhausted(
+        &self,
+        id: &str,
+        token: &str,
+        attribution: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'pending_review', send_after = NULL, operation_token = NULL,
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.attribution',
+                    json_set(json(?1), '$.revision', revision)
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+            params![serialized, id, token],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Park a `sending` claim as `pending_review` after a durable Governor
+    /// **review** verdict (the scheduled send routed review, not allow).
+    ///
+    /// Under the owner `sending` lease, one atomic statement: move to
+    /// `pending_review`, clear `send_after` (so no surface — dashboard, CLI, or
+    /// the due query — can present the parked draft as still queued or show a
+    /// stale countdown), and clear the token. The reviewable body/attachment
+    /// snapshot, metadata (including the persisted declaration), and revision are
+    /// preserved untouched, so the human decision path (approve / edit / discard /
+    /// send) still works. Nothing is transmitted and no Sent copy is written. A
+    /// non-owner or non-`sending` row changes nothing and returns `false`.
+    ///
+    /// Distinct from [`Self::release_sending_draft`] into `pending_review`, which
+    /// left `send_after` intact — the exact defect that made a parked-for-review
+    /// draft read as "Queued for sending".
+    pub fn park_for_review(&self, id: &str, token: &str) -> Result<bool> {
+        self.park_for_review_with_block(id, token, &Self::default_send_block())
+    }
+
+    /// Same lease park as [`Self::park_for_review`], and persist a user-facing
+    /// `metadata.send_block` so no surface can show a silent stop. The payload
+    /// is caller-supplied (code/title/explanation/action only — never scores,
+    /// recipients, or body).
+    pub fn park_for_review_with_block(
+        &self,
+        id: &str,
+        token: &str,
+        block: &serde_json::Value,
+    ) -> Result<bool> {
+        let serialized = serde_json::to_string(block)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET status = 'pending_review', send_after = NULL,
+                operation_token = NULL,
+                metadata = json_set(COALESCE(metadata, '{}'), '$.send_block', json(?3)),
+                updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
+            params![id, token, serialized],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Operator-facing stop record when a caller parks without a richer reason.
+    /// A silent `pending_review` badge is not allowed.
+    pub fn default_send_block() -> serde_json::Value {
+        serde_json::json!({
+            "code": "send_stopped",
+            "title": "This send was stopped",
+            "explanation": "Envelope paused this message before it left. Nothing was transmitted.",
+            "action": "send"
+        })
+    }
+
+    /// Record the resolved Sent-folder copy proof on an already-`sent` draft.
+    ///
+    /// Best-effort bookkeeping run after [`Self::mark_draft_sent`]. The Sent-copy
+    /// proof is stored ONLY under the dedicated, folder-qualified
+    /// `metadata.sent_copy` object — `folder`, `uid` (explicit JSON `null` when
+    /// unresolved, never a retained stale value), `lookup_status`, and the stable
+    /// `copy_source` label (`provider` / `client_appended` / `unresolved` /
+    /// `not_attempted`). It never writes the Drafts-folder `imap_uid` column, so a
+    /// Sent UID is never presented as a Drafts UID. Arguments are primitives (not
+    /// a transport `SentMailProof`) so there is no store→email dependency cycle;
+    /// the caller passes the truthful `copy_source` from the source-aware
+    /// resolver, so a client-appended copy is never recorded as provider proof.
+    /// Guarded on the terminal `sent` status; a non-`sent`/missing row returns
+    /// `false`.
+    pub fn record_sent_copy_proof(
+        &self,
+        id: &str,
+        folder: Option<&str>,
+        uid: Option<u32>,
+        lookup_status: &str,
+        copy_source: &str,
+    ) -> Result<bool> {
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.sent_copy',
+                    json_object(
+                        'folder', ?1,
+                        'uid', ?2,
+                        'lookup_status', ?3,
+                        'copy_source', ?4
+                    )
+                ),
+                updated_at = datetime('now')
+             WHERE id = ?5 AND status = 'sent'",
+            params![folder, uid, lookup_status, copy_source, id],
         )?;
         Ok(rows == 1)
     }
@@ -653,6 +1171,35 @@ impl Database {
         if rows == 0 {
             return Err(self.classify_guarded_update_miss(id));
         }
+        Ok(())
+    }
+
+    /// Atomically make `imap_uid` identify exactly one active draft in an
+    /// account, clearing any stale active mapping before assigning the target.
+    /// Used only after the provider UID's Message-ID has been verified.
+    pub fn relink_editable_draft_imap_uid(
+        &self,
+        account_id: &str,
+        id: &str,
+        imap_uid: u32,
+    ) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        tx.execute(
+            "UPDATE drafts SET imap_uid = NULL, updated_at = datetime('now')
+             WHERE account_id = ?1 AND imap_uid = ?2 AND id <> ?3
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![account_id, imap_uid as i64, id],
+        )?;
+        let rows = tx.execute(
+            "UPDATE drafts SET imap_uid = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND account_id = ?3
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![imap_uid as i64, id, account_id],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -802,6 +1349,55 @@ impl Database {
     /// **viewed** — all in one transaction. If the final approval fails (e.g.
     /// a concurrent content edit), nothing persists: no partially queued,
     /// unapproved state.
+    ///
+    /// Returns the exact atomically-queued, attested [`Draft`] row (read inside
+    /// the same transaction before commit) so the caller never has to reload —
+    /// a post-commit reload could fail or race and let a handler report success
+    /// off pre-attestation state. `blocked` is refused ([`DraftStatus::is_queueable`]
+    /// is false): a Governor-denied row is never resurrected by human queueing.
+    /// Transfer authorship of a draft to the human who is sending it.
+    ///
+    /// Stamps `created_by` with the human surface and strips the two pieces of
+    /// per-attempt agent state that must never outlive a human's decision to
+    /// send: the bot `attribution` declaration (whose presence makes
+    /// `scheduled_origin` report `Bot`, forcing the Governor gate onto a human
+    /// send) and any `send_block` recorded by a PREVIOUS attempt (a stop reason
+    /// describes one attempt; carried forward it renders "nothing was
+    /// transmitted" over a message that did go out).
+    ///
+    /// CAS-guarded on the revision the human viewed, exactly like the
+    /// attestation it accompanies, so a concurrent edit rolls the whole queue
+    /// back rather than re-authoring content nobody read.
+    fn transfer_draft_authorship_to_human(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        approved_by: &str,
+    ) -> Result<()> {
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        let mut metadata = match draft.metadata {
+            Some(m) if m.is_object() => m,
+            _ => serde_json::json!({}),
+        };
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.remove("attribution");
+            obj.remove("send_block");
+        }
+        let serialized = serde_json::to_string(&metadata)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET created_by = ?1, metadata = ?2, updated_at = datetime('now')
+             WHERE id = ?3 AND revision = ?4
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![approved_by, serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        Ok(())
+    }
+
     pub fn queue_draft_with_human_approval(
         &self,
         id: &str,
@@ -809,7 +1405,7 @@ impl Database {
         send_after: &str,
         approved_by: &str,
         approved_at: &str,
-    ) -> Result<()> {
+    ) -> Result<Draft> {
         let tx = self.conn().unchecked_transaction()?;
         let current = self
             .get_draft(id)?
@@ -832,8 +1428,24 @@ impl Database {
         }
         self.update_draft_send_after(id, send_after)?;
         self.record_draft_human_approval(id, expected_revision, approved_by, approved_at)?;
+        // A human pressing Send AUTHORS this message. The draft may have been
+        // started by an agent, but the operator opened it, read it, possibly
+        // edited it, and chose to send — so provenance transfers to them and the
+        // agent's attribution declaration is dropped rather than carried along.
+        //
+        // This is what keeps operator-clicked mail out of the Governor gate:
+        // `scheduled_origin` reads `created_by`, and a lingering `cli`/`agent`
+        // marker (or a stale bot declaration) made the sweep demand a bot
+        // declaration for a send a human had already taken responsibility for,
+        // stranding it as `pending_review` with nothing transmitted.
+        self.transfer_draft_authorship_to_human(id, expected_revision, approved_by)?;
+        // Read the attested row inside the transaction, then commit. The caller
+        // receives exactly what was queued — no reload, no fallback.
+        let attested = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
         tx.commit()?;
-        Ok(())
+        Ok(attested)
     }
 
     /// Store the RFC822 Message-ID for a draft (set during IMAP APPEND).
@@ -916,6 +1528,928 @@ mod tests {
             )
             .unwrap();
         db
+    }
+
+    fn attribution_of(db: &Database, id: &str) -> serde_json::Value {
+        db.get_draft(id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .unwrap()
+            .get("attribution")
+            .cloned()
+            .unwrap()
+    }
+
+    /// A human pressing Send in the dashboard AUTHORS the message. The draft may
+    /// have started as an agent draft, but the operator read it, edited it, and
+    /// took responsibility — so the queued row must carry human provenance and
+    /// must NOT carry the agent's stale attribution declaration. Leaving
+    /// `created_by = "cli"` is what routed operator-clicked mail back through
+    /// the Governor gate and stranded it as `pending_review`.
+    #[test]
+    fn human_queue_transfers_authorship_and_drops_the_agent_declaration() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        // The agent that drafted this took attribution responsibility for it.
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({
+                "origin": "bot",
+                "declared_attrs": ["has_pii"],
+                "protocol": "envelope.attribution.v1",
+            }),
+        )
+        .unwrap();
+
+        let queued = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2026-07-10T09:02:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+
+        assert_eq!(
+            queued.created_by.as_deref(),
+            Some("human:dashboard"),
+            "a human send re-authors the draft"
+        );
+        assert!(
+            queued
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("attribution"))
+                .is_none(),
+            "the agent's declaration must not survive a human send"
+        );
+        assert!(queued.human_approved());
+    }
+
+    /// A stop reason describes ONE send attempt. Queueing a fresh send must
+    /// clear it, or a later successful send still renders "This send was
+    /// stopped — nothing was transmitted" over a message that did go out.
+    #[test]
+    fn human_queue_clears_a_stale_send_block() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
+            )
+            .unwrap();
+        db.park_for_review_with_block(
+            &draft.id,
+            &db.claim_draft_for_immediate_send(&draft.id, draft.revision)
+                .unwrap()
+                .unwrap(),
+            &serde_json::json!({
+                "code": "governor_blocked",
+                "title": "This send was stopped",
+                "explanation": "Nothing was transmitted.",
+                "action": "send"
+            }),
+        )
+        .unwrap();
+
+        let parked = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            parked
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("send_block"))
+                .is_some(),
+            "precondition: the park recorded a stop reason"
+        );
+
+        let queued = db
+            .queue_draft_with_human_approval(
+                &parked.id,
+                parked.revision,
+                "2026-07-10T09:02:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+
+        assert!(
+            queued
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("send_block"))
+                .is_none(),
+            "a new send attempt clears the previous stop reason"
+        );
+    }
+
+    /// The replacement APPEND gives the provider copy a NEW Message-ID. If the
+    /// row keeps the old one, post-send cleanup searches the Drafts folder for
+    /// an identity that is no longer there, finds nothing, and skips — leaving
+    /// the copy behind. Every edit then adds another orphan (a rev-4 draft left
+    /// three copies on the server, each with a different Message-ID).
+    #[test]
+    fn finalize_sync_records_the_replacement_message_id() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "original@mac.lan").unwrap();
+        let claim = db.claim_draft_for_sync(&draft.id, draft.revision).unwrap().unwrap();
+
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            Some(42),
+            &serde_json::json!({"imap_synced": true}),
+            Some("replacement@mac.lan"),
+        )
+        .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            after.message_id.as_deref(),
+            Some("replacement@mac.lan"),
+            "the row must name the copy that is actually on the server"
+        );
+    }
+
+    /// The replace path normally re-APPENDs under the SAME Message-ID, and the
+    /// row and the header disagree only on angle brackets. That is one identity,
+    /// not two: recording a supersede here would invent a stale copy that never
+    /// existed, on every single edit.
+    #[test]
+    fn finalize_sync_ignores_a_bracket_only_message_id_difference() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "<same@mac.lan>").unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let claim = db.claim_draft_for_sync(&draft.id, rev).unwrap().unwrap();
+
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            Some(9),
+            &serde_json::json!({"imap_synced": true}),
+            Some("same@mac.lan"),
+        )
+        .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            after.superseded_message_ids().is_empty(),
+            "an unchanged identity is not a superseded one"
+        );
+    }
+
+    /// Identities the server may still hold are remembered, so cleanup can
+    /// remove copies left by earlier revisions and by interrupted edits — not
+    /// only the newest one.
+    #[test]
+    fn finalize_sync_retains_the_superseded_message_id() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "first@mac.lan").unwrap();
+
+        for next in ["second@mac.lan", "third@mac.lan"] {
+            let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+            let claim = db.claim_draft_for_sync(&draft.id, rev).unwrap().unwrap();
+            db.finalize_synced_draft_bookkeeping(
+                &draft.id,
+                &claim.token,
+                None,
+                &serde_json::json!({"imap_synced": true}),
+                Some(next),
+            )
+            .unwrap();
+            db.release_syncing_draft(&draft.id, &claim.token, DraftStatus::Draft)
+                .unwrap();
+        }
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.message_id.as_deref(), Some("third@mac.lan"));
+        assert_eq!(
+            after.superseded_message_ids(),
+            vec!["first@mac.lan".to_string(), "second@mac.lan".to_string()],
+            "every identity the server may still hold is remembered"
+        );
+    }
+
+    #[test]
+    fn set_draft_attribution_merges_without_clobber_and_stamps_revision() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // Pre-existing reply/threading metadata that must survive.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({"draft_kind": "reply", "in_reply_to": "<parent@x>"}),
+        )
+        .unwrap();
+        let rev_before = db.get_draft(&draft.id).unwrap().unwrap().revision;
+
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({
+                "protocol": "envelope.attribution.v1",
+                "origin": "bot",
+                "declared_attrs": ["financial_content"],
+                "revision": 999,       // must be overridden by the column value
+                "attempts": 0,
+            }),
+        )
+        .unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        // Persisting attribution must NOT bump the revision (declaration stays current).
+        assert_eq!(reloaded.revision, rev_before);
+        let meta = reloaded.metadata.unwrap();
+        // Sibling keys preserved.
+        assert_eq!(meta["draft_kind"], "reply");
+        assert_eq!(meta["in_reply_to"], "<parent@x>");
+        // Attribution merged, revision stamped from the column (not the 999 passed).
+        assert_eq!(
+            meta["attribution"]["declared_attrs"][0],
+            "financial_content"
+        );
+        assert_eq!(meta["attribution"]["revision"], rev_before);
+    }
+
+    fn bot_attribution(declared: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "envelope.attribution.v1",
+            "origin": "bot",
+            "declared_attrs": declared,
+            "attempts": 0,
+        })
+    }
+
+    // ── Block 2: one atomic CAS for declaration + schedule + due status ──────
+
+    #[test]
+    fn queue_draft_for_send_binds_declaration_schedule_and_due_status_atomically() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let past = "2000-01-01T00:00:00Z";
+        db.queue_draft_for_send(
+            &draft.id,
+            rev,
+            past,
+            &bot_attribution(&["financial_content"]),
+        )
+        .unwrap();
+
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            reloaded.status,
+            DraftStatus::Draft,
+            "queued row is due-status"
+        );
+        assert_eq!(reloaded.send_after.as_deref(), Some(past));
+        assert_eq!(
+            reloaded.revision, rev,
+            "queueing must not bump the revision"
+        );
+        let attr = reloaded.metadata.unwrap()["attribution"].clone();
+        assert_eq!(attr["declared_attrs"][0], "financial_content");
+        assert_eq!(attr["revision"], rev, "declaration bound to this revision");
+        // Visible to the sweep's due query.
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(due.iter().any(|d| d.id == draft.id));
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_stale_revision_with_no_partial_write() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        // Caller's expected revision is stale (off by one).
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev + 1,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["financial_content"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftModifiedConcurrently(_)),
+            "stale revision must conflict, got {err:?}"
+        );
+        // Nothing partial: no schedule, no attribution.
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(reloaded.send_after.is_none(), "no send_after was written");
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none(),
+            "no attribution was written"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_no_clobber_when_content_edited_after_validation() {
+        // The declaration was validated against revision R. A concurrent material
+        // edit bumps to R+1 before queueing; queueing at R must refuse rather than
+        // bind the stale declaration to the edited content.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        let validated_rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.update_draft_content(
+            &draft.id,
+            Some("edited@test.com"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                validated_rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["financial_content"]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DraftModifiedConcurrently(_)));
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(reloaded.send_after.is_none());
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_transitions_pending_review_to_due() {
+        // A re-queued draft that was parked in pending_review must become due
+        // (status='draft') so the sweep can see it — never "scheduled" yet invisible.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+        // Before: a pending_review row is invisible to the due query even with a
+        // past send_after — proving the transition is required.
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        db.queue_draft_for_send(
+            &draft.id,
+            rev,
+            "2000-01-01T00:00:00Z",
+            &bot_attribution(&["informational"]),
+        )
+        .unwrap();
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Draft);
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(
+            due.iter().any(|d| d.id == draft.id),
+            "re-queued draft is now due"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_claimed_row() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let _token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+        // The row is now `sending`; queueing must refuse (not editable).
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["informational"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn queue_draft_for_send_refuses_blocked_row_with_no_partial_write() {
+        // A `blocked` row is Governor-denied. It is `is_editable` (a human may
+        // still edit it) but NOT `is_queueable`: a re-queue must refuse rather
+        // than resurrect a denied send into a due `draft`. The refusal is a
+        // truthful DraftNotEditable and nothing is scheduled or persisted.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::Blocked)
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let err = db
+            .queue_draft_for_send(
+                &draft.id,
+                rev,
+                "2000-01-01T00:00:00Z",
+                &bot_attribution(&["informational"]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(_)),
+            "blocked must refuse as not-editable, got {err:?}"
+        );
+        // Still blocked, still no schedule, still no attribution: no resurrection.
+        let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, DraftStatus::Blocked);
+        assert!(reloaded.send_after.is_none(), "no send_after was written");
+        assert!(
+            reloaded
+                .metadata
+                .and_then(|m| m.get("attribution").cloned())
+                .is_none(),
+            "no attribution was written onto a blocked row"
+        );
+        // The sweep's due query never sees it.
+        let due = db.list_drafts_due_for_send().unwrap();
+        assert!(!due.iter().any(|d| d.id == draft.id));
+    }
+
+    #[test]
+    fn material_revision_makes_persisted_attribution_stale() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({"protocol": "envelope.attribution.v1", "declared_attrs": ["informational"], "attempts": 0}),
+        )
+        .unwrap();
+        let stamped = attribution_of(&db, &draft.id)["revision"].as_i64().unwrap();
+
+        // A material edit (recipients) bumps the row revision; the persisted
+        // declaration's stamped revision no longer matches — it is stale.
+        db.update_draft_content(
+            &draft.id,
+            Some("new@test.com"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(after.revision > stamped, "material edit bumps revision");
+        // The block survives an edit that only strips human_approval, but its
+        // stamped revision is now stale relative to the row.
+        let block_rev = after.metadata.unwrap()["attribution"]["revision"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(block_rev, stamped);
+        assert_ne!(block_rev, after.revision, "declaration is stale after edit");
+    }
+
+    #[test]
+    fn defer_attribution_retry_returns_to_due_under_lease() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.update_draft_send_after(&draft.id, past).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        // Wrong token changes nothing.
+        assert!(
+            !db.defer_attribution_retry(
+                &draft.id,
+                "wrong-token",
+                &serde_json::json!({"attempts": 1})
+            )
+            .unwrap()
+        );
+
+        assert!(
+            db.defer_attribution_retry(
+                &draft.id,
+                &token,
+                &serde_json::json!({"protocol": "envelope.attribution.v1", "declared_attrs": [], "attempts": 1}),
+            )
+            .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Draft, "returned to due");
+        assert_eq!(
+            after.send_after.as_deref(),
+            Some(past),
+            "still due, not cleared"
+        );
+        assert_eq!(after.revision, rev, "attempt bump does not change revision");
+        assert_eq!(after.metadata.unwrap()["attribution"]["attempts"], 1);
+        // Still claimable by a later sweep at the same revision.
+        assert!(
+            db.claim_draft_for_sending(&draft.id, rev)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn park_attribution_exhausted_clears_scheduling_under_lease() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        assert!(
+            !db.park_attribution_exhausted(&draft.id, "wrong", &serde_json::json!({"attempts": 3}))
+                .unwrap()
+        );
+        assert!(
+            db.park_attribution_exhausted(
+                &draft.id,
+                &token,
+                &serde_json::json!({"attempts": 3, "park_reason": "attribution_exhausted"}),
+            )
+            .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert_eq!(after.send_after, None, "scheduling disabled");
+        assert_eq!(
+            after.metadata.unwrap()["attribution"]["park_reason"],
+            "attribution_exhausted"
+        );
+        // Never selected as due again — no retry storm.
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_draft_sent_clears_send_after_so_a_sent_draft_is_not_still_scheduled() {
+        // Real evidence: a scheduled allowed send left `send_after` at the expired
+        // timestamp after the row flipped to `sent`, so downstream surfaces could
+        // still infer it was queued. mark_draft_sent must neutralize it.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sent);
+        assert!(after.sent_at.is_some(), "sent_at must be set");
+        assert_eq!(after.message_id.as_deref(), Some("<mid@host>"));
+        assert_eq!(
+            after.send_after, None,
+            "a sent draft must no longer carry a scheduled send_after"
+        );
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn park_for_review_parks_pending_review_and_clears_send_after_under_lease() {
+        // Real evidence: a scheduled send that routed `review` was released to
+        // `pending_review` but kept its expired `send_after`, so the dashboard
+        // rendered it "Queued for sending" with a stale countdown. park_for_review
+        // must clear send_after atomically under the owner lease.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db.claim_draft_for_sending(&draft.id, rev).unwrap().unwrap();
+
+        // A non-owner cannot park it.
+        assert!(!db.park_for_review(&draft.id, "wrong-token").unwrap());
+        // The owner parks it for review.
+        assert!(db.park_for_review(&draft.id, &token).unwrap());
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert_eq!(
+            after.send_after, None,
+            "a review-parked draft must not look queued/due"
+        );
+        assert!(after.sent_at.is_none(), "review parking never sends");
+        let block = after.metadata.as_ref().unwrap()["send_block"].clone();
+        assert_eq!(block["code"], "send_stopped");
+        assert_eq!(block["title"], "This send was stopped");
+        assert!(
+            block["explanation"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was transmitted"),
+            "{block}"
+        );
+        // Never selected as due again.
+        assert!(db.list_drafts_due_for_send().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_draft_sent_clears_the_stale_drafts_imap_uid() {
+        // The `imap_uid` column is the IMAP *Drafts*-folder UID. Once the draft is
+        // sent it is stale (the provider Drafts copy is cleaned up from the
+        // pre-transition snapshot), so mark_draft_sent must clear it. This keeps
+        // the field Drafts-folder-only and prevents Sent proof being conflated
+        // with a Drafts UID.
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().imap_uid,
+            Some(4242)
+        );
+
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sent);
+        assert_eq!(
+            after.imap_uid, None,
+            "the stale Drafts-folder UID must clear on sent"
+        );
+    }
+
+    #[test]
+    fn record_sent_copy_proof_stores_folder_qualified_metadata_never_the_drafts_uid() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        // A pre-existing Drafts UID that mark_draft_sent will clear.
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        // A resolved provider copy: folder-qualified in metadata.sent_copy, and
+        // the Drafts `imap_uid` column stays cleared (never repurposed).
+        assert!(
+            db.record_sent_copy_proof(&draft.id, Some("Sent"), Some(77), "found", "provider")
+                .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            after.imap_uid, None,
+            "Sent UID must never be written to the Drafts imap_uid column"
+        );
+        let sent_copy = &after.metadata.unwrap()["sent_copy"];
+        assert_eq!(sent_copy["folder"], "Sent");
+        assert_eq!(sent_copy["uid"], 77);
+        assert_eq!(sent_copy["lookup_status"], "found");
+        assert_eq!(sent_copy["copy_source"], "provider");
+    }
+
+    #[test]
+    fn record_sent_copy_proof_unresolved_stores_explicit_null_uid() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 4242).unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let token = db
+            .claim_draft_for_immediate_send(&draft.id, rev)
+            .unwrap()
+            .unwrap();
+        db.mark_draft_sent(&draft.id, &token, Some("<mid@host>"))
+            .unwrap();
+
+        // Unresolved proof: uid is recorded as explicit JSON null, NOT retained
+        // from the stale Drafts UID.
+        assert!(
+            db.record_sent_copy_proof(&draft.id, None, None, "not_found", "unresolved")
+                .unwrap()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.imap_uid, None);
+        let sent_copy = &after.metadata.unwrap()["sent_copy"];
+        assert!(
+            sent_copy.get("uid").is_some() && sent_copy["uid"].is_null(),
+            "unresolved Sent UID must be explicit JSON null, got {sent_copy:?}"
+        );
+        assert_eq!(sent_copy["copy_source"], "unresolved");
+        assert_eq!(sent_copy["lookup_status"], "not_found");
     }
 
     #[test]
@@ -1187,6 +2721,140 @@ mod tests {
                 .map(|m| m.get("human_approval").is_none())
                 .unwrap_or(true),
             "set_draft_metadata must never persist an injected attestation"
+        );
+    }
+
+    /// Create a draft carrying BOTH body forms, as an agent-composed reply
+    /// with an HTML alternative does.
+    fn dual_body_draft(db: &Database) -> Draft {
+        db.create_draft(
+            "acc1",
+            "to@test.com",
+            Some("Subject"),
+            Some("OLD text body"),
+            Some("<p>OLD html body</p>"),
+            None,
+            None,
+            None,
+            Some("agent"),
+        )
+        .unwrap()
+    }
+
+    /// Regression: a body edit replaces the draft's body representation SET.
+    ///
+    /// The dashboard's plain-text editor POSTs `text_content` alone for a
+    /// draft that carries both a text and an HTML body. Coalescing each body
+    /// column independently kept the omitted HTML, so the row stayed dual-body
+    /// and the send snapshot went out as `multipart/alternative` — where
+    /// receiving clients prefer the HTML alternative and render the UNEDITED
+    /// draft. The edited body must be the only body that persists, and the only
+    /// body the due-send snapshot carries.
+    #[test]
+    fn text_edit_clears_the_stale_html_alternative() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(viewed.text_content.as_deref(), Some("OLD text body"));
+        assert_eq!(viewed.html_content.as_deref(), Some("<p>OLD html body</p>"));
+
+        // Exactly the edit the dashboard text editor performs: the edited text,
+        // no HTML field, guarded on the revision the human viewed.
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                None,
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                None,
+                Some("NEW text body"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(edited.text_content.as_deref(), Some("NEW text body"));
+        assert_eq!(
+            edited.html_content, None,
+            "the omitted HTML alternative must not survive a text-body edit — a \
+             dual-body row sends multipart/alternative and clients render the \
+             stale HTML"
+        );
+        assert_eq!(edited.revision, viewed.revision + 1);
+
+        // The due-send snapshot — the row the scheduled sweep reloads and hands
+        // to SMTP — carries the edited body only.
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let due = db.list_drafts_due_for_send().unwrap();
+        let queued = due
+            .iter()
+            .find(|d| d.id == draft.id)
+            .expect("edited draft should be due");
+        assert_eq!(queued.text_content.as_deref(), Some("NEW text body"));
+        assert_eq!(
+            queued.html_content, None,
+            "the transmission snapshot must not be dual-body after a text edit"
+        );
+    }
+
+    /// The mirror case: an HTML-body edit clears the omitted text alternative,
+    /// so the recipient's plain-text client cannot render the pre-edit body.
+    #[test]
+    fn html_edit_clears_the_stale_text_alternative() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                None,
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                None,
+                None,
+                Some("<p>NEW html body</p>"),
+            )
+            .unwrap();
+
+        assert_eq!(edited.html_content.as_deref(), Some("<p>NEW html body</p>"));
+        assert_eq!(
+            edited.text_content, None,
+            "the omitted text alternative must not survive an HTML-body edit"
+        );
+    }
+
+    /// A recipient- or subject-only edit supplies NO body: both existing body
+    /// forms are preserved untouched. Clearing a body the editor never showed
+    /// the human would silently drop content.
+    #[test]
+    fn recipient_or_subject_only_edit_preserves_both_body_forms() {
+        let db = setup();
+        let draft = dual_body_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &draft.id,
+                viewed.revision,
+                Some("someone-else@test.com"),
+                viewed.cc_addr.as_deref(),
+                viewed.bcc_addr.as_deref(),
+                Some("New subject"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(edited.to_addr, "someone-else@test.com");
+        assert_eq!(edited.subject.as_deref(), Some("New subject"));
+        assert_eq!(edited.text_content.as_deref(), Some("OLD text body"));
+        assert_eq!(
+            edited.html_content.as_deref(),
+            Some("<p>OLD html body</p>"),
+            "an edit that supplies no body must preserve both existing bodies"
         );
     }
 
@@ -1910,6 +3578,7 @@ mod tests {
                 "not-the-owner",
                 Some(1),
                 &serde_json::json!({}),
+                None,
             )
             .is_err()
         );
@@ -1919,6 +3588,7 @@ mod tests {
             &claim.token,
             Some(4242),
             &serde_json::json!({"imap_synced": true}),
+            None,
         )
         .unwrap();
         let finalized = db.get_draft(&draft.id).unwrap().unwrap();
@@ -1926,6 +3596,19 @@ mod tests {
         assert_eq!(
             finalized.metadata.as_ref().unwrap()["storage"]["imap_synced"],
             true
+        );
+        db.finalize_synced_draft_bookkeeping(
+            &draft.id,
+            &claim.token,
+            None,
+            &serde_json::json!({"imap_synced": true, "uid_lookup": "missed"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().imap_uid,
+            None,
+            "a missed replacement UID must clear the deleted old UID"
         );
 
         // Release restores the prior status (owner token required, cleared on
@@ -2378,6 +4061,54 @@ mod tests {
     }
 
     #[test]
+    fn find_editable_drafts_by_message_id_is_canonical_account_scoped_and_active_only() {
+        let db = setup();
+        let active = db
+            .create_draft(
+                "acc1",
+                "active@test.com",
+                Some("Active"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_draft_message_id(&active.id, "<stable@example.com>")
+            .unwrap();
+
+        let discarded = db
+            .create_draft(
+                "acc1",
+                "discarded@test.com",
+                Some("Discarded"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_draft_message_id(&discarded.id, "stable@example.com")
+            .unwrap();
+        db.discard_draft(&discarded.id).unwrap();
+
+        let matches = db
+            .find_editable_drafts_by_message_id("acc1", "  <stable@example.com>  ")
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, active.id);
+        assert!(
+            db.find_editable_drafts_by_message_id("other-account", "stable@example.com")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn count_active_drafts_excludes_sent_and_discarded() {
         let db = setup();
 
@@ -2532,6 +4263,118 @@ mod tests {
         assert_eq!(fetched.attachments[1]["data_base64"], "Zm9v");
     }
 
+    /// The revision-guarded variant is what interactive surfaces use: the
+    /// operator is looking at a rendered list, so a stale view must lose the
+    /// race instead of writing back an array rebuilt from what it last saw.
+    #[test]
+    fn update_draft_attachments_for_revision_enforces_the_caller_view() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let one = vec![serde_json::json!({
+            "filename": "one.txt",
+            "content_type": "text/plain",
+            "size": 1,
+            "data_base64": "YQ==",
+        })];
+        let updated = db
+            .update_draft_attachments_for_revision(&draft.id, draft.revision, &one)
+            .unwrap();
+        assert_eq!(updated.attachments.len(), 1);
+        assert_eq!(
+            updated.revision,
+            draft.revision + 1,
+            "an attachment change is an edit and bumps the revision"
+        );
+
+        // A second writer still holding the pre-update revision is refused, and
+        // its view of the array (empty) is not written back.
+        let err = db
+            .update_draft_attachments_for_revision(&draft.id, draft.revision, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DraftModifiedConcurrently(_)),
+            "stale revision must conflict, got {err:?}"
+        );
+        assert_eq!(
+            db.get_draft(&draft.id).unwrap().unwrap().attachments.len(),
+            1
+        );
+    }
+
+    /// Changing what will be attached invalidates the approval that was given
+    /// for the previous set — same contract as a body edit.
+    #[test]
+    fn update_draft_attachments_for_revision_drops_the_approval() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // `set_draft_metadata` strips `human_approval` by design — the
+        // attestation only exists via the atomic queue path, so that is what
+        // this test has to go through.
+        let approved = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2026-08-18T12:00:00Z",
+                "human:dashboard",
+                "2026-08-18T11:59:00Z",
+            )
+            .unwrap();
+        assert!(
+            approved
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("human_approval"))
+                .is_some(),
+            "the queue path must record the attestation this test then invalidates"
+        );
+
+        let updated = db
+            .update_draft_attachments_for_revision(
+                &approved.id,
+                approved.revision,
+                &[serde_json::json!({
+                    "filename": "late.txt",
+                    "content_type": "text/plain",
+                    "size": 1,
+                    "data_base64": "YQ==",
+                })],
+            )
+            .unwrap();
+        assert!(
+            updated
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("human_approval"))
+                .is_none(),
+            "attaching after approval must invalidate it"
+        );
+    }
+
     #[test]
     fn list_drafts_includes_imap_uid() {
         let db = setup();
@@ -2554,5 +4397,231 @@ mod tests {
         let drafts = db.list_drafts("acc1", Some("draft"), 100, 0).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].imap_uid, Some(99));
+    }
+
+    // ── Hold: unqueue without discarding ──────────────────────────────
+    //
+    // Cancelling a scheduled send used to mean discarding the draft, so an
+    // operator who only wanted to stop the clock and finish the message later
+    // had to lose it. Hold is the non-destructive verb: the schedule goes, the
+    // draft stays.
+
+    /// Queue a fresh draft `send_after` seconds-from-nothing (a literal
+    /// timestamp) and return it.
+    fn queued_draft(db: &Database, send_after: &str) -> Draft {
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, send_after).unwrap();
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn hold_clears_send_after_and_keeps_an_editable_draft() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert!(held.send_after.is_none(), "the schedule must be cleared");
+        assert_eq!(
+            held.status,
+            DraftStatus::Draft,
+            "hold must not discard or park the draft"
+        );
+        assert!(held.status.is_editable());
+        // The message itself is untouched — that is the whole point of hold.
+        assert_eq!(held.to_addr, "to@test.com");
+        assert_eq!(held.subject.as_deref(), Some("Subject"));
+        assert_eq!(held.text_content.as_deref(), Some("Body"));
+        // No content changed, so an open editor's expected_revision stays good.
+        assert_eq!(held.revision, queued.revision);
+    }
+
+    #[test]
+    fn a_held_draft_is_no_longer_due_for_the_send_sweep() {
+        let db = setup();
+        // Already due: without the hold this is exactly what the sweep sends.
+        let queued = queued_draft(&db, "2000-01-01T00:00:00");
+        assert_eq!(db.list_drafts_due_for_send().unwrap().len(), 1);
+
+        db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert!(
+            db.list_drafts_due_for_send().unwrap().is_empty(),
+            "a held draft must be invisible to the scheduled-send sweep"
+        );
+    }
+
+    #[test]
+    fn hold_withdraws_the_human_approval_attestation() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let attested = db
+            .queue_draft_with_human_approval(
+                &draft.id,
+                draft.revision,
+                "2030-01-01T00:00:00",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+        assert!(attested.human_approved());
+
+        let held = db.hold_scheduled_draft(&draft.id).unwrap();
+
+        assert!(
+            !held.human_approved(),
+            "the approval authorized this send; holding withdraws it"
+        );
+        assert!(
+            held.metadata
+                .as_ref()
+                .is_none_or(|m| m.get("human_approval").is_none())
+        );
+    }
+
+    #[test]
+    fn hold_preserves_unrelated_draft_metadata() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        db.conn()
+            .execute(
+                "UPDATE drafts SET metadata = json('{\"reply_to_uid\": 42}') WHERE id = ?1",
+                params![queued.id],
+            )
+            .unwrap();
+
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        assert_eq!(held.metadata.as_ref().unwrap()["reply_to_uid"], 42);
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_the_send_sweep_already_claimed() {
+        let db = setup();
+        let queued = queued_draft(&db, "2000-01-01T00:00:00");
+        let token = db
+            .claim_draft_for_sending(&queued.id, queued.revision)
+            .unwrap();
+        assert!(token.is_some(), "the sweep must win the claim first");
+
+        let err = db.hold_scheduled_draft(&queued.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(ref s) if s == "sending"),
+            "a send already in flight must not be yanked back: {err}"
+        );
+        // The claim is intact — hold changed nothing.
+        let after = db.get_draft(&queued.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::Sending);
+        assert_eq!(after.send_after.as_deref(), Some("2000-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn hold_refuses_a_draft_that_was_never_queued() {
+        let db = setup();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "to@test.com",
+                Some("Subject"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+
+        let err = db.hold_scheduled_draft(&draft.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotScheduled(_)),
+            "an unqueued draft must not report a schedule was cleared: {err}"
+        );
+    }
+
+    #[test]
+    fn hold_refuses_a_missing_draft() {
+        let db = setup();
+        let err = db.hold_scheduled_draft("no-such-draft").unwrap_err();
+        assert!(matches!(err, StoreError::DraftNotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn hold_refuses_a_discarded_draft() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        assert!(db.discard_draft(&queued.id).unwrap());
+
+        let err = db.hold_scheduled_draft(&queued.id).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::DraftNotEditable(ref s) if s == "discarded"),
+            "{err}"
+        );
+    }
+
+    /// Hold is reversible: the operator edits the held draft and queues it
+    /// again, which re-attests the approval the hold withdrew.
+    #[test]
+    fn a_held_draft_can_be_edited_and_re_queued() {
+        let db = setup();
+        let queued = queued_draft(&db, "2030-01-01T00:00:00");
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+
+        let edited = db
+            .update_draft_content_for_revision(
+                &held.id,
+                held.revision,
+                None,
+                None,
+                None,
+                Some("Second thoughts"),
+                Some("Rewritten body"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(edited.subject.as_deref(), Some("Second thoughts"));
+        assert!(
+            edited.send_after.is_none(),
+            "editing a held draft must not resurrect the schedule"
+        );
+
+        let requeued = db
+            .queue_draft_with_human_approval(
+                &edited.id,
+                edited.revision,
+                "2030-06-01T00:00:00",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(requeued.send_after.as_deref(), Some("2030-06-01T00:00:00"));
+        assert!(requeued.human_approved());
     }
 }

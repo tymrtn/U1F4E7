@@ -238,6 +238,8 @@ Envelope auto-discovers IMAP/SMTP from your email domain via DNS. Tested with:
 
 `envelope mcp` starts a Model Context Protocol server over stdio — drop-in email for Claude Code, Cursor, Zed, or any MCP runtime.
 
+Framing follows the MCP stdio spec: one newline-delimited JSON-RPC message per line on stdout, nothing else on that stream (logs go to stderr). On stdin the server accepts newline-delimited JSON and, for callers written against versions before 1.0.23, the legacy `Content-Length:` framing — detected per message.
+
 ```bash
 # Print a ready-to-paste config snippet
 envelope mcp --config
@@ -377,7 +379,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope contract [--surface <name>]` | Export the versioned agent JSON/MCP contract |
 | `envelope mcp [--config]` | MCP server (stdio) for Claude Code, Cursor, Zed |
 | `envelope send --at "monday 9am"` | Scheduled send with flexible datetime |
-| `envelope scheduled list/cancel` | Manage scheduled messages |
+| `envelope scheduled list/hold/cancel` | Manage scheduled messages (`hold` unqueues and keeps the draft; `cancel` discards it) |
 | `envelope contacts add/list/show/tag/import` | Contact store with rules integration |
 | `envelope serve` | Localhost dashboard |
 

@@ -1,6 +1,8 @@
 <script lang="ts">
   import Drawer from './Drawer.svelte';
+  import Modal from './Modal.svelte';
   import Button from './Button.svelte';
+  import RecipientField from './RecipientField.svelte';
   import Spinner from './Spinner.svelte';
   import {
     api,
@@ -10,6 +12,7 @@
     type ComposeResponse
   } from '$lib/api';
   import { getComposerStore, type ComposerMode } from '$lib/composer.svelte';
+  import { addrKey, optionalAddrsValid, parseAddrs, serializeAddrs, validateAddrs } from '$lib/addresses';
 
   type PendingAttachment = ComposeAttachment & { size: number };
 
@@ -36,30 +39,60 @@
   let readingAttachments = $state(false);
   let sendError = $state<{ code: string; message: string } | null>(null);
   let openSession = $state('');
-
-  function normalizedAddress(addr: string): string {
-    const angle = addr.match(/<([^>]+)>/);
-    return (angle?.[1] ?? addr).trim();
+  // Discard protection: Esc / × / backdrop on a composer with content asks
+  // first. There is no autosave yet, so a stray Escape would otherwise throw
+  // typed work away with zero network calls.
+  let discardConfirmOpen = $state(false);
+  const isDirty = $derived(
+    toRaw.trim().length > 0 ||
+      ccRaw.trim().length > 0 ||
+      bccRaw.trim().length > 0 ||
+      subject.trim().length > 0 ||
+      body.trim().length > 0 ||
+      attachments.length > 0
+  );
+  function requestClose() {
+    if (sending) return;
+    // Escape while the confirm is showing means "keep editing".
+    if (discardConfirmOpen) {
+      discardConfirmOpen = false;
+      return;
+    }
+    if (isDirty) {
+      // Next tick, not synchronously: the Modal's own window Escape listener
+      // evaluates `open` at event time, so opening it during this same keydown
+      // would let the very same Escape close it again before it ever painted.
+      setTimeout(() => {
+        discardConfirmOpen = true;
+      }, 0);
+      return;
+    }
+    composer.close();
   }
-
-  function isValidEmail(addr: string): boolean {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedAddress(addr));
-  }
-
-  function parseAddrs(raw: string): string[] {
-    return raw.split(',').map((value) => value.trim()).filter(Boolean);
-  }
-
-  function validateAddrs(raw: string): boolean {
-    const addrs = parseAddrs(raw);
-    return addrs.length > 0 && addrs.every(isValidEmail);
+  function discardDraft() {
+    discardConfirmOpen = false;
+    composer.close();
   }
 
   const isFreshMessage = $derived(composer.mode === 'compose' || composer.mode === 'forward');
-  const toValid = $derived(toRaw.trim() === '' ? true : validateAddrs(toRaw));
+  const toValid = $derived(optionalAddrsValid(toRaw));
   const recipientReady = $derived(isFreshMessage ? validateAddrs(toRaw) : true);
+  // Cc/Bcc are optional, but anything actually typed has to be a usable
+  // address — otherwise a malformed Cc rides along on an otherwise valid send
+  // and only fails at SMTP time. Only shown (and only populated) on fresh
+  // messages; reply mode clears them.
+  const ccValid = $derived(optionalAddrsValid(ccRaw));
+  const bccValid = $derived(optionalAddrsValid(bccRaw));
+  const optionalRecipientsReady = $derived(!isFreshMessage || (ccValid && bccValid));
   const subjectReady = $derived(isFreshMessage ? subject.trim().length > 0 : true);
   const deliveryReady = $derived(fromAccountId.length > 0);
+
+  // Each recipient field must not offer an address the other two already hold.
+  const usedAddrs = $derived({
+    to: parseAddrs(toRaw).map(addrKey),
+    cc: parseAddrs(ccRaw).map(addrKey),
+    bcc: parseAddrs(bccRaw).map(addrKey)
+  });
 
   const selectedAccount = $derived(accounts.find((account) => account.id === fromAccountId));
   const accountContext = $derived.by(() => {
@@ -84,6 +117,7 @@
       !readingAttachments &&
       deliveryReady &&
       recipientReady &&
+      optionalRecipientsReady &&
       subjectReady
   );
 
@@ -99,7 +133,9 @@
     openSession = session;
 
     fromAccountId = ctx.accountId || (accounts[0]?.id ?? '');
-    toRaw = isFreshMessage ? (ctx.to ?? '') : '';
+    // Normalized on the way in so the recipient field's own re-serialization is
+    // a no-op rather than an immediate change to the prefilled value.
+    toRaw = isFreshMessage ? serializeAddrs(ctx.to ?? '') : '';
     subject = isFreshMessage ? (ctx.subject ?? '') : '';
     body = ctx.bodyPrefix ?? '';
     ccRaw = '';
@@ -108,6 +144,7 @@
     bodyFormat = 'text';
     attachments = [];
     sendError = null;
+    discardConfirmOpen = false;
   });
 
   function attachmentPayloads(): ComposeAttachment[] {
@@ -221,7 +258,7 @@
   subtitle={accountContext}
   size="wide"
   actions={headerActions}
-  onclose={() => composer.close()}
+  onclose={requestClose}
 >
   <form id="composer-form" class="composer-form" onsubmit={(event) => { event.preventDefault(); send(); }}>
     <div class="composer-scroll">
@@ -239,50 +276,46 @@
         </div>
 
         {#if isFreshMessage}
-          <div class="composer-field-row" class:is-invalid={!toValid && toRaw.trim() !== ''}>
-            <label for="composer-to">To</label>
-            <input
-              id="composer-to"
-              type="text"
-              inputmode="email"
-              placeholder="recipient@example.com"
-              autocomplete="off"
-              spellcheck="false"
-              bind:value={toRaw}
-              disabled={sending}
-              aria-invalid={!toValid && toRaw.trim() !== ''}
-            />
-          </div>
+          <RecipientField
+            id="composer-to"
+            label="To"
+            bind:value={toRaw}
+            accountId={fromAccountId}
+            disabled={sending}
+            exclude={[...usedAddrs.cc, ...usedAddrs.bcc]}
+            placeholder="recipient@example.com"
+            invalid={!toValid && toRaw.trim() !== ''}
+          />
           {#if !toValid && toRaw.trim() !== ''}
             <p class="composer-validation-note">Enter valid email addresses separated by commas.</p>
           {/if}
-          <div class="composer-field-row">
-            <label for="composer-cc">Cc</label>
-            <input
-              id="composer-cc"
-              type="text"
-              inputmode="email"
-              placeholder="Optional"
-              autocomplete="off"
-              spellcheck="false"
-              bind:value={ccRaw}
-              disabled={sending}
-            />
-          </div>
+          <RecipientField
+            id="composer-cc"
+            label="Cc"
+            bind:value={ccRaw}
+            accountId={fromAccountId}
+            disabled={sending}
+            exclude={[...usedAddrs.to, ...usedAddrs.bcc]}
+            placeholder="Optional"
+            invalid={!ccValid}
+          />
+          {#if !ccValid}
+            <p class="composer-validation-note">Enter valid Cc addresses separated by commas.</p>
+          {/if}
           {#if showBcc}
-            <div class="composer-field-row">
-              <label for="composer-bcc">Bcc</label>
-              <input
-                id="composer-bcc"
-                type="text"
-                inputmode="email"
-                placeholder="Optional"
-                autocomplete="off"
-                spellcheck="false"
-                bind:value={bccRaw}
-                disabled={sending}
-              />
-            </div>
+            <RecipientField
+              id="composer-bcc"
+              label="Bcc"
+              bind:value={bccRaw}
+              accountId={fromAccountId}
+              disabled={sending}
+              exclude={[...usedAddrs.to, ...usedAddrs.cc]}
+              placeholder="Optional"
+              invalid={!bccValid}
+            />
+            {#if !bccValid}
+              <p class="composer-validation-note">Enter valid Bcc addresses separated by commas.</p>
+            {/if}
           {/if}
           <div class="composer-field-row">
             <label for="composer-subject">Subject</label>
@@ -367,6 +400,18 @@
   </form>
 </Drawer>
 
+<Modal
+  open={discardConfirmOpen}
+  title="Discard this draft?"
+  onclose={() => (discardConfirmOpen = false)}
+>
+  <p class="discard-warn">Nothing has been saved yet — closing now throws away what you typed.</p>
+  {#snippet footer()}
+    <button type="button" class="modal-keep" onclick={() => (discardConfirmOpen = false)}>Keep editing</button>
+    <button type="button" class="modal-discard" onclick={discardDraft}>Discard draft</button>
+  {/snippet}
+</Modal>
+
 <style>
   .composer-form {
     height: 100%;
@@ -431,9 +476,6 @@
   }
   .composer-field-row:focus-within {
     box-shadow: inset 2px 0 0 var(--env-accent);
-  }
-  .composer-field-row.is-invalid {
-    box-shadow: inset 2px 0 0 var(--env-warn);
   }
   .composer-validation-note {
     margin: 0 -0.875rem;
@@ -636,5 +678,20 @@
     }
     .composer-review { grid-template-columns: 1fr; }
     #composer-body { min-height: 18rem; padding: 0.875rem; }
+  }
+  .discard-warn { margin: 0; font-size: 0.875rem; }
+  .modal-keep,
+  .modal-discard {
+    font: inherit;
+    padding: 0.4rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--env-rule);
+    background: transparent;
+    cursor: pointer;
+  }
+  .modal-discard {
+    color: #fff;
+    background: var(--env-danger, #b42318);
+    border-color: var(--env-danger, #b42318);
   }
 </style>

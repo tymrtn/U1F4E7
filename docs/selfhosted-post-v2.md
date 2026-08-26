@@ -77,7 +77,7 @@ That `accounts add` step does DNS auto-discovery (SRV records → MX → common 
 
 ### Send safety
 
-Outbound mail doesn't go straight out. A send queues into an outbox with a cooldown (default 120s) and transmits later via a scheduled-send sweep, gated by attribution scoring. Immediate transmission requires explicit `--send-now --confirm-send-now`. Agent contexts (MCP) default to `draft-only` regardless of what the account's own CLI default is.
+Outbound mail doesn't go straight out. A send queues into an outbox with a cooldown (default 60s) and transmits later via a scheduled-send sweep, gated by attribution scoring. Immediate transmission requires explicit `--send-now --confirm-send-now`. Agent contexts (MCP) default to `draft-only` regardless of what the account's own CLI default is.
 
 ### Features
 

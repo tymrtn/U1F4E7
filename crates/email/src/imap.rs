@@ -157,7 +157,15 @@ pub struct PeekHeaderSummary {
 
 pub const QUICKSTART_PEEK_FETCH_DESCRIPTOR: &str =
     "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])";
-pub const FETCH_SUMMARY_DESCRIPTOR: &str = "(UID FLAGS ENVELOPE RFC822.SIZE)";
+/// Batch summary FETCH: envelope metadata plus the provider spam-scoring
+/// headers, requested via `BODY.PEEK[HEADER.FIELDS (...)]`.
+///
+/// `BODY.PEEK` (not `BODY[]`) means the fetch never sets `\Seen`, and only the
+/// two named header fields are transferred — no message bodies. This keeps
+/// rule preview/run header-only and read-only. `message_summary_from_fetch`
+/// derives `provider_spam` from these fields.
+pub const FETCH_SUMMARY_DESCRIPTOR: &str =
+    "(UID FLAGS ENVELOPE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)])";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectedMailbox {
@@ -555,6 +563,11 @@ fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummar
         (String::new(), String::new(), String::new(), None, None)
     };
 
+    // Derive the provider spam score from the peeked header fields requested by
+    // `FETCH_SUMMARY_DESCRIPTOR`. `Fetch::header()` carries the
+    // `BODY[HEADER.FIELDS (...)]` section bytes.
+    let provider_spam = fetch.header().and_then(provider_spam_from_header_bytes);
+
     MessageSummary {
         uid,
         message_id,
@@ -564,6 +577,7 @@ fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummar
         date,
         flags,
         size,
+        provider_spam,
     }
 }
 
@@ -788,8 +802,11 @@ pub async fn fetch_message(
     let text_body = parsed.body_text(0).map(|t| t.to_string());
     let html_body = parsed.body_html(0).map(|h| h.to_string());
     let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-    let references = parsed.references().as_text().map(|s| s.to_string());
+    let references = crate::threading::references_header(&parsed);
     let message_id = parsed.message_id().map(|s| s.to_string());
+    // Read the provider spam-scoring headers straight from the raw RFC822 so a
+    // single code path handles both this full fetch and the summary FETCH.
+    let provider_spam = provider_spam_from_header_bytes(body);
 
     let attachments: Vec<AttachmentMeta> = parsed
         .attachments()
@@ -825,6 +842,7 @@ pub async fn fetch_message(
         references,
         flags,
         attachments,
+        provider_spam,
     }))
 }
 
@@ -1134,6 +1152,59 @@ pub fn parse_message_id_from_header_section(section: &[u8]) -> Option<String> {
         .and_then(|m| m.message_id().map(str::to_string))
 }
 
+/// Extract the first value of header `name` from a raw RFC822 header block,
+/// unfolding folded continuation lines. Case-insensitive on the field name;
+/// scanning stops at the blank line that ends the header block, so passing a
+/// full message body only reads its top-level headers.
+///
+/// Central helper so the full-message and summary FETCH paths read the same
+/// headers the same way.
+pub fn header_value_from_bytes(section: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(section);
+    // `Some(value)` while accumulating the target header's (possibly folded)
+    // value; stays `None` until the first matching header line is seen.
+    let mut capturing: Option<String> = None;
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            break; // end of the header block
+        }
+        if line.starts_with([' ', '\t']) {
+            // Folded continuation — only meaningful while reading the target.
+            if let Some(value) = capturing.as_mut() {
+                if !value.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        // A new header line begins. If we were already reading the target, its
+        // folded value is now complete — first match wins.
+        if capturing.is_some() {
+            break;
+        }
+        match line.split_once(':') {
+            Some((field, value)) if field.trim().eq_ignore_ascii_case(name) => {
+                capturing = Some(value.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    capturing.map(|value| value.trim().to_string())
+}
+
+/// Derive the `provider_spam` score from a raw header block (a
+/// `BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)]` section or a
+/// full RFC822 message). Prefers `X-Migadu-Spam-Score`, falling back to
+/// `X-Spam-Score`; returns `None` when neither carries a finite number.
+pub fn provider_spam_from_header_bytes(section: &[u8]) -> Option<f64> {
+    let migadu = header_value_from_bytes(section, "X-Migadu-Spam-Score");
+    let generic = header_value_from_bytes(section, "X-Spam-Score");
+    crate::rules::provider_spam_from_headers(migadu.as_deref(), generic.as_deref())
+}
+
 fn validate_uid_set(uid_set: &str) -> Result<(), ImapError> {
     if uid_set.is_empty()
         || !uid_set
@@ -1190,6 +1261,64 @@ pub async fn find_unique_uid_by_exact_message_id(
     folder: &str,
     message_id: &str,
 ) -> Result<Option<u32>, ImapError> {
+    Ok(
+        match find_exact_message_id_match(client, folder, message_id).await? {
+            ExactMessageIdMatch::Unique(uid) => Some(uid),
+            ExactMessageIdMatch::None | ExactMessageIdMatch::Ambiguous => None,
+        },
+    )
+}
+
+/// Classification of an exact Message-ID lookup, distinguishing "no exact match"
+/// from "more than one exact match" so callers can report an explicit, stable
+/// ambiguous status instead of collapsing both to `None` and inventing a UID.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ExactMessageIdMatch {
+    /// Exactly one candidate's Message-ID matched exactly (its UID).
+    Unique(u32),
+    /// No candidate matched exactly.
+    None,
+    /// More than one candidate matched exactly (duplicate Message-IDs) — no
+    /// arbitrary UID is returned.
+    Ambiguous,
+}
+
+/// Resolve a Message-ID to a single UID by exact header match, distinguishing
+/// zero / unique / ambiguous outcomes.
+///
+/// IMAP `SEARCH HEADER` is a substring match returning an arbitrary hit order,
+/// so its results are treated only as *candidates*: this fetches every
+/// candidate's actual Message-ID header (`BODY.PEEK`, no flag changes), compares
+/// exactly after normalization, and returns [`ExactMessageIdMatch::Unique`] only
+/// when exactly one candidate matches. Multiple exact matches yield
+/// [`ExactMessageIdMatch::Ambiguous`] (never an arbitrary UID). Bounded: it
+/// fetches only Message-ID headers of the search hits and never marks anything
+/// read.
+pub async fn find_exact_message_id_match(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+) -> Result<ExactMessageIdMatch, ImapError> {
+    let exact_uids = find_uids_by_exact_message_id(client, folder, message_id).await?;
+    Ok(match exact_uids.as_slice() {
+        [] => ExactMessageIdMatch::None,
+        [uid] => ExactMessageIdMatch::Unique(*uid),
+        _ => ExactMessageIdMatch::Ambiguous,
+    })
+}
+
+/// Return every UID whose Message-ID header exactly matches `message_id`.
+///
+/// This keeps IMAP's substring-based SEARCH result out of destructive code:
+/// every candidate header is fetched with BODY.PEEK and compared after strict
+/// Message-ID normalization. Replacement cleanup may then remove all verified
+/// copies of one logical draft, including duplicates left by an interrupted
+/// earlier edit, without touching a merely similar Message-ID.
+pub async fn find_uids_by_exact_message_id(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+) -> Result<Vec<u32>, ImapError> {
     validate_imap_input(folder)?;
 
     client
@@ -1207,7 +1336,7 @@ pub async fn find_unique_uid_by_exact_message_id(
 
     let mut candidate_uids: Vec<u32> = uid_set.into_iter().collect();
     if candidate_uids.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     candidate_uids.sort_unstable();
     let uid_set_arg = candidate_uids
@@ -1217,9 +1346,19 @@ pub async fn find_unique_uid_by_exact_message_id(
         .join(",");
 
     let headers = fetch_message_headers_selected_uid_set(client, folder, &uid_set_arg).await?;
-    let candidates: Vec<(u32, Option<String>)> =
-        headers.into_iter().map(|h| (h.uid, h.message_id)).collect();
-    Ok(select_unique_exact_message_id(&candidates, message_id))
+    let Some(wanted) = normalize_message_id(message_id) else {
+        return Ok(Vec::new());
+    };
+    let mut exact_uids: Vec<u32> = headers
+        .into_iter()
+        .filter_map(|header| {
+            let candidate = normalize_message_id(header.message_id.as_deref()?)?;
+            (candidate == wanted).then_some(header.uid)
+        })
+        .collect();
+    exact_uids.sort_unstable();
+    exact_uids.dedup();
+    Ok(exact_uids)
 }
 
 /// Pure candidate selection for [`find_unique_uid_by_exact_message_id`]:
@@ -1231,16 +1370,35 @@ pub fn select_unique_exact_message_id(
     candidates: &[(u32, Option<String>)],
     wanted: &str,
 ) -> Option<u32> {
-    let wanted = normalize_message_id(wanted)?;
+    match classify_exact_message_id_match(candidates, wanted) {
+        ExactMessageIdMatch::Unique(uid) => Some(uid),
+        ExactMessageIdMatch::None | ExactMessageIdMatch::Ambiguous => None,
+    }
+}
+
+/// Pure classification of exact Message-ID candidates: among `(uid, Message-ID
+/// header)` candidates from a substring search, distinguish no exact match, a
+/// single exact match, and multiple exact matches (duplicate Message-IDs) after
+/// normalization. Backs [`find_exact_message_id_match`].
+pub fn classify_exact_message_id_match(
+    candidates: &[(u32, Option<String>)],
+    wanted: &str,
+) -> ExactMessageIdMatch {
+    let Some(wanted) = normalize_message_id(wanted) else {
+        return ExactMessageIdMatch::None;
+    };
     let mut exact = candidates.iter().filter_map(|(uid, header)| {
         let candidate = normalize_message_id(header.as_deref()?)?;
         (candidate == wanted).then_some(*uid)
     });
-    let unique = exact.next()?;
+    let Some(unique) = exact.next() else {
+        return ExactMessageIdMatch::None;
+    };
     if exact.next().is_some() {
-        return None;
+        ExactMessageIdMatch::Ambiguous
+    } else {
+        ExactMessageIdMatch::Unique(unique)
     }
-    Some(unique)
 }
 
 /// Normalize a Message-ID for exact comparison: trim surrounding whitespace
@@ -1470,6 +1628,9 @@ pub async fn search(
                     date,
                     flags,
                     size,
+                    // Search does not fetch spam-score headers; rules never run
+                    // against search results, so leave the signal absent.
+                    provider_spam: None,
                 });
             }
             Err(e) => return Err(ImapError::Protocol(format!("UID FETCH parse error: {e}"))),
@@ -1852,6 +2013,51 @@ mod tests {
     }
 
     #[test]
+    fn classify_exact_message_id_match_distinguishes_none_unique_ambiguous() {
+        // Unique: exactly one exact match among substring collisions.
+        let unique = vec![
+            (7, Some("<queued-1@martin.fm>".to_string())),
+            (11, Some("<queued-1@martin.fm.suffix>".to_string())),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&unique, "queued-1@martin.fm"),
+            ExactMessageIdMatch::Unique(7)
+        );
+
+        // None: only substring collisions, no exact match — distinct from ambiguity.
+        let none = vec![
+            (9, Some("<zzz-queued-1@martin.fm.evil>".to_string())),
+            (13, None),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&none, "queued-1@martin.fm"),
+            ExactMessageIdMatch::None
+        );
+        assert_eq!(
+            classify_exact_message_id_match(&[], "queued-1@martin.fm"),
+            ExactMessageIdMatch::None
+        );
+
+        // Ambiguous: duplicate exact Message-IDs — an explicit, stable status
+        // that never collapses to None or fabricates a UID.
+        let ambiguous = vec![
+            (7, Some("<dup@martin.fm>".to_string())),
+            (9, Some(" <DUP-not-equal@martin.fm> ".to_string())),
+            (12, Some("<dup@martin.fm>".to_string())),
+        ];
+        assert_eq!(
+            classify_exact_message_id_match(&ambiguous, "dup@martin.fm"),
+            ExactMessageIdMatch::Ambiguous
+        );
+
+        // Empty / bracket-only wanted normalizes away → None.
+        assert_eq!(
+            classify_exact_message_id_match(&unique, "   "),
+            ExactMessageIdMatch::None
+        );
+    }
+
+    #[test]
     fn zero_exact_matches_return_none() {
         let candidates = vec![(7, Some("<other@martin.fm>".to_string())), (9, None)];
         assert_eq!(
@@ -2115,10 +2321,49 @@ Subject: hi\r\n\r\nbody\r\n";
     }
 
     #[test]
-    fn summary_fetch_descriptor_is_envelope_only() {
-        assert_eq!(FETCH_SUMMARY_DESCRIPTOR, "(UID FLAGS ENVELOPE RFC822.SIZE)");
-        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY["));
+    fn summary_fetch_descriptor_is_header_only_and_read_only() {
+        assert_eq!(
+            FETCH_SUMMARY_DESCRIPTOR,
+            "(UID FLAGS ENVELOPE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (X-MIGADU-SPAM-SCORE X-SPAM-SCORE)])"
+        );
+        // Header fields only, fetched via PEEK — never a full/partial body, so
+        // the summary FETCH stays read-only (no `\Seen`) and body-free.
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("BODY.PEEK[HEADER.FIELDS ("));
+        assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY[]"));
         assert!(!FETCH_SUMMARY_DESCRIPTOR.contains("BODY.PEEK[]"));
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("X-MIGADU-SPAM-SCORE"));
+        assert!(FETCH_SUMMARY_DESCRIPTOR.contains("X-SPAM-SCORE"));
+    }
+
+    #[test]
+    fn provider_spam_from_migadu_header_section() {
+        let section = b"X-Migadu-Spam-Score: 3.5\r\nX-Spam-Score: 9.9\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), Some(3.5));
+    }
+
+    #[test]
+    fn provider_spam_falls_back_to_generic_header_section() {
+        let section = b"Subject: hi\r\nX-Spam-Score: 5.1\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), Some(5.1));
+    }
+
+    #[test]
+    fn provider_spam_header_section_ignores_malformed() {
+        let section = b"X-Migadu-Spam-Score: not-a-number\r\n\r\n";
+        assert_eq!(provider_spam_from_header_bytes(section), None);
+    }
+
+    #[test]
+    fn header_value_from_bytes_is_case_insensitive_and_unfolds() {
+        let section = b"x-migadu-spam-score: 2.0\r\nSubject: a\r\n  folded\r\n\r\n";
+        assert_eq!(
+            header_value_from_bytes(section, "X-Migadu-Spam-Score"),
+            Some("2.0".to_string())
+        );
+        assert_eq!(
+            header_value_from_bytes(section, "Subject"),
+            Some("a folded".to_string())
+        );
     }
 
     #[test]

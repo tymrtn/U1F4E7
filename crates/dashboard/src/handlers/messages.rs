@@ -9,7 +9,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use envelope_email_store::ThreadContext;
 use envelope_email_store::models::{
     Account, IndexedMessageInput, IndexedMessageSummary, Message, MessageSummary,
@@ -41,6 +41,10 @@ fn default_limit() -> u32 {
 pub struct UnifiedInboxQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Keyset cursor (all three or none): continue after this row.
+    pub before_epoch: Option<i64>,
+    pub before_uid: Option<u32>,
+    pub before_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +62,9 @@ pub struct UnifiedInboxMessage {
     pub thread_id: Option<String>,
     pub indexed_at: Option<String>,
     pub index_freshness: String,
+    /// Parsed message date (unix seconds) from the index; drives the keyset
+    /// pagination cursor. None when the header date was unreadable.
+    pub date_epoch: Option<i64>,
     #[serde(skip)]
     sort_index: usize,
 }
@@ -82,6 +89,7 @@ impl UnifiedInboxMessage {
             thread_id: indexed.thread_id,
             indexed_at: indexed.indexed_at,
             index_freshness: indexed.freshness,
+            date_epoch: indexed.date_epoch,
             sort_index,
         }
     }
@@ -209,6 +217,16 @@ pub struct UnifiedInboxResponse {
     pub unread_count: usize,
     pub freshness: UnifiedAccountFreshness,
     pub errors: Vec<UnifiedInboxError>,
+    /// Present when the page is full: pass these back as `before_*` query
+    /// params to continue exactly where this page ended.
+    pub next_cursor: Option<UnifiedNextCursor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnifiedNextCursor {
+    pub date_epoch: Option<i64>,
+    pub uid: u32,
+    pub account_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,11 +261,28 @@ pub async fn unified_inbox(
     };
 
     let folder = UNIFIED_INBOX_FOLDER.to_string();
-    let (messages, account_results) =
-        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit).await {
-            Ok(indexed) => indexed,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        };
+    let cursor = match (&q.before_epoch, q.before_uid, &q.before_account) {
+        (_, Some(uid), Some(account_id)) => {
+            Some(envelope_email_store::message_index::UnifiedPageCursor {
+                date_epoch: q.before_epoch,
+                uid,
+                account_id: account_id.clone(),
+            })
+        }
+        _ => None,
+    };
+    let (messages, account_results) = match load_indexed_unified_inbox(
+        &state,
+        &accounts,
+        &folder,
+        q.limit,
+        cursor.as_ref(),
+    )
+    .await
+    {
+        Ok(indexed) => indexed,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
 
     Json(build_unified_inbox_response(
         folder,
@@ -257,6 +292,117 @@ pub async fn unified_inbox(
     ))
     .into_response()
 }
+/// Run `f` for every account with bounded concurrency and a per-account
+/// timeout. The sweep found the refresh crawling 25 accounts serially — one
+/// slow provider pinned the whole pass past 240s. Order of results follows
+/// completion; every account appears exactly once.
+async fn refresh_accounts_bounded<F, Fut>(
+    accounts: Vec<Account>,
+    concurrency: usize,
+    per_account_timeout: std::time::Duration,
+    f: F,
+) -> Vec<(Account, Result<(), String>)>
+where
+    F: Fn(Account) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    use std::sync::Arc;
+    let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+        accounts,
+    )));
+    let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let workers = concurrency.max(1);
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        let f = f.clone();
+        set.spawn(async move {
+            loop {
+                let account = { queue.lock().await.pop_front() };
+                let Some(account) = account else { break };
+                let outcome =
+                    match tokio::time::timeout(per_account_timeout, f(account.clone())).await {
+                        Ok(res) => res,
+                        Err(_) => Err(format!(
+                            "timed out after {}s",
+                            per_account_timeout.as_secs()
+                        )),
+                    };
+                results.lock().await.push((account, outcome));
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+    Arc::try_unwrap(results)
+        .map(|m| m.into_inner())
+        .unwrap_or_default()
+}
+
+/// One account's index refresh: connect, EXAMINE, fetch summaries read-only,
+/// upsert into the local index. Returns the failure string on any step; the
+/// caller persists errors and builds the response uniformly.
+async fn refresh_one_account(
+    state: AppState,
+    account: Account,
+    folder: String,
+    limit: u32,
+) -> Result<(), String> {
+    let (client_arc, _creds) = state
+        .get_or_create_imap(&account.id)
+        .await
+        .map_err(|e| format!("IMAP: {e}"))?;
+    let mut client = client_arc.lock().await;
+    let uidvalidity =
+        match envelope_email_transport::imap::examine_folder_info(&mut client, &folder).await {
+            Ok(info) => info.uid_validity.unwrap_or(0) as u64,
+            Err(e) => {
+                state.evict_imap(&account.id).await;
+                return Err(format!("EXAMINE {folder}: {e}"));
+            }
+        };
+    match envelope_email_transport::imap::fetch_folder_summaries_read_only(
+        &mut client,
+        &folder,
+        limit,
+    )
+    .await
+    {
+        Ok(summaries) => {
+            let inputs: Vec<IndexedMessageInput> = summaries
+                .iter()
+                .map(|summary| IndexedMessageInput {
+                    uid: summary.uid,
+                    message_id: summary.message_id.clone(),
+                    from_addr: summary.from_addr.clone(),
+                    to_addr: summary.to_addr.clone(),
+                    subject: summary.subject.clone(),
+                    date: summary.date.clone(),
+                    flags: summary.flags.clone(),
+                    size: summary.size,
+                    snippet: None,
+                    thread_id: None,
+                })
+                .collect();
+            let write_result = {
+                let db = state.db.lock().await;
+                db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
+            };
+            match write_result {
+                Ok(()) => {
+                    crate::handlers::address_book::catch_up_account(&state, &account.id).await;
+                    Ok(())
+                }
+                Err(e) => Err(format!("index {folder}: {e}")),
+            }
+        }
+        Err(e) => {
+            state.evict_imap(&account.id).await;
+            Err(format!("fetch {folder}: {e}"))
+        }
+    }
+}
+
 pub async fn refresh_unified_inbox(
     State(state): State<AppState>,
     Query(q): Query<UnifiedInboxQuery>,
@@ -273,75 +419,44 @@ pub async fn refresh_unified_inbox(
     };
 
     let folder = UNIFIED_INBOX_FOLDER.to_string();
-    let mut refresh_failures = Vec::new();
 
-    for account in &accounts {
-        let (client_arc, _creds) = match state.get_or_create_imap(&account.id).await {
-            Ok(c) => c,
-            Err(e) => {
-                let error = format!("IMAP: {e}");
-                persist_refresh_error(&state, &account.id, &folder, &error).await;
-                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                continue;
-            }
-        };
-        let mut client = client_arc.lock().await;
-        let uidvalidity =
-            match envelope_email_transport::imap::examine_folder_info(&mut client, &folder).await {
-                Ok(info) => info.uid_validity.unwrap_or(0) as u64,
-                Err(e) => {
-                    state.evict_imap(&account.id).await;
-                    let error = format!("EXAMINE {folder}: {e}");
-                    persist_refresh_error(&state, &account.id, &folder, &error).await;
-                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                    continue;
-                }
-            };
+    // Bounded fan-out with a per-account budget: the old serial crawl let one
+    // slow provider pin the whole pass past 240s while the UI spun.
+    const REFRESH_CONCURRENCY: usize = 6;
+    const REFRESH_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        match envelope_email_transport::imap::fetch_folder_summaries_read_only(
-            &mut client,
-            &folder,
-            q.limit,
+    let outcomes = {
+        let state = state.clone();
+        let folder = folder.clone();
+        let limit = q.limit;
+        refresh_accounts_bounded(
+            accounts.clone(),
+            REFRESH_CONCURRENCY,
+            REFRESH_ACCOUNT_TIMEOUT,
+            move |account: Account| {
+                let state = state.clone();
+                let folder = folder.clone();
+                refresh_one_account(state, account, folder, limit)
+            },
         )
         .await
-        {
-            Ok(summaries) => {
-                let inputs: Vec<IndexedMessageInput> = summaries
-                    .iter()
-                    .map(|summary| IndexedMessageInput {
-                        uid: summary.uid,
-                        message_id: summary.message_id.clone(),
-                        from_addr: summary.from_addr.clone(),
-                        to_addr: summary.to_addr.clone(),
-                        subject: summary.subject.clone(),
-                        date: summary.date.clone(),
-                        flags: summary.flags.clone(),
-                        size: summary.size,
-                        snippet: None,
-                        thread_id: None,
-                    })
-                    .collect();
-                let write_result = {
-                    let db = state.db.lock().await;
-                    db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
-                };
-                if let Err(e) = write_result {
-                    let error = format!("index {folder}: {e}");
-                    persist_refresh_error(&state, &account.id, &folder, &error).await;
-                    refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
-                }
-            }
-            Err(e) => {
+    };
+
+    let mut refresh_failures = Vec::new();
+    for (account, outcome) in outcomes {
+        if let Err(error) = outcome {
+            // A timed-out future was dropped mid-IMAP; force a reconnect so the
+            // shared client cannot be left in a half-run command state.
+            if error.starts_with("timed out") {
                 state.evict_imap(&account.id).await;
-                let error = format!("fetch {folder}: {e}");
-                persist_refresh_error(&state, &account.id, &folder, &error).await;
-                refresh_failures.push(UnifiedInboxAccountResult::err(account, &folder, error));
             }
+            persist_refresh_error(&state, &account.id, &folder, &error).await;
+            refresh_failures.push(UnifiedInboxAccountResult::err(&account, &folder, error));
         }
     }
 
     let (mut messages, mut account_results) =
-        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit).await {
+        match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit, None).await {
             Ok(indexed) => indexed,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -424,10 +539,11 @@ async fn load_indexed_unified_inbox(
     accounts: &[Account],
     folder: &str,
     limit: u32,
+    cursor: Option<&envelope_email_store::message_index::UnifiedPageCursor>,
 ) -> Result<(Vec<UnifiedInboxMessage>, Vec<UnifiedInboxAccountResult>), String> {
     let db = state.db.lock().await;
     let indexed = db
-        .list_indexed_message_summaries(folder, limit)
+        .list_indexed_message_summaries_page(folder, limit, cursor)
         .map_err(|e| format!("db error: {e}"))?;
     let freshness = db
         .list_message_index_account_freshness(folder)
@@ -505,16 +621,27 @@ fn build_unified_inbox_response(
         })
         .collect();
 
+    let messages = merge_unified_messages(messages, limit);
+    let next_cursor = if messages.len() == limit as usize {
+        messages.last().map(|last| UnifiedNextCursor {
+            date_epoch: last.date_epoch,
+            uid: last.summary.uid,
+            account_id: last.account_id.clone(),
+        })
+    } else {
+        None
+    };
     UnifiedInboxResponse {
         scope: "unified_inbox",
         status,
         folder,
         limit,
-        messages: merge_unified_messages(messages, limit),
+        messages,
         accounts,
         unread_count,
         freshness,
         errors,
+        next_cursor,
     }
 }
 
@@ -828,7 +955,101 @@ pub async fn flags(
 pub struct MoveRequest {
     #[serde(default = "default_folder")]
     pub folder: String,
+    /// Destination. Either a literal folder name (operator-picked `Move…`) or a
+    /// canonical special-use sentinel (`\Archive`, `\Junk`, `\Trash`) that is
+    /// resolved to the account's real provider folder before any move. See
+    /// [`envelope_email_transport::folders::canonical_move_key`].
     pub to_folder: String,
+}
+
+/// Send-safe canonical folder resolution against the shared (mutex-guarded) DB.
+///
+/// Mirrors [`envelope_email_transport::folders::detect_folder`] — cache →
+/// provider-resolve-and-verify → candidate fallback → `None` — but reuses only
+/// the crate's PURE provider machinery (`detect_provider` / `resolve_folder` /
+/// `all_candidates_for`) so the DB guard is never held across the IMAP
+/// `list_folders` await. `Database` is `!Sync`, so a `&Database` held across an
+/// await would make the axum handler future `!Send`; every DB touch here is a
+/// short synchronous critical section. `Ok(None)` means the provider has no
+/// such special-use folder — callers must NOT fall back to a literal mailbox.
+pub(crate) async fn resolve_canonical_folder(
+    state: &AppState,
+    client: &mut envelope_email_transport::ImapClient,
+    account_id: &str,
+    canonical_type: &str,
+) -> Result<Option<String>, envelope_email_transport::errors::ImapError> {
+    use envelope_email_transport::provider::{self, ProviderType};
+
+    // 1. Cache hit — no socket, no await while the guard is held.
+    let cached = {
+        let db = state.db.lock().await;
+        db.get_detected_folders(account_id).ok().and_then(|rows| {
+            rows.into_iter()
+                .find(|(ftype, _)| ftype == canonical_type)
+                .map(|(_, name)| name)
+        })
+    };
+    if let Some(name) = cached {
+        return Ok(Some(name));
+    }
+
+    // 2. Stored provider type (sync read).
+    let stored = {
+        let db = state.db.lock().await;
+        db.get_provider_type(account_id).ok().flatten()
+    };
+    let mut provider = stored
+        .as_deref()
+        .map(ProviderType::from_str_value)
+        .unwrap_or(ProviderType::Unknown);
+
+    // 3. Folder inventory — the one IMAP round-trip, with NO DB guard held.
+    let folders = envelope_email_transport::imap::list_folders(client).await?;
+
+    // Detect + persist the provider when it was unknown.
+    if provider == ProviderType::Unknown {
+        provider = provider::detect_provider(&folders);
+        if provider != ProviderType::Unknown {
+            let db = state.db.lock().await;
+            let _ = db.set_provider_type(account_id, provider.as_str());
+        }
+    }
+
+    // 4. Provider-resolved name, verified to actually exist on the server.
+    if provider != ProviderType::Unknown {
+        let resolved = provider::resolve_folder(provider, canonical_type).to_string();
+        if folders.iter().any(|f| f == &resolved) {
+            let db = state.db.lock().await;
+            let _ = db.set_detected_folder(account_id, canonical_type, &resolved);
+            return Ok(Some(resolved));
+        }
+    }
+
+    // 5. Candidate fallback across every known provider variant for this type.
+    for candidate in provider::all_candidates_for(canonical_type) {
+        if folders.iter().any(|f| f == candidate) {
+            let db = state.db.lock().await;
+            let _ = db.set_detected_folder(account_id, canonical_type, candidate);
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Stable JSON failure for a canonical move target that resolved to no real
+/// provider folder. Returned BEFORE any mutation; carries only the requested
+/// target token (no recipients, bodies, or folder listings).
+fn move_target_unresolved(target: &str) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "code": "folder_not_resolved",
+            "reason": format!(
+                "no provider folder matched the canonical target {target}; pick a folder with Move… instead"
+            ),
+        }),
+    )
 }
 
 pub async fn mv(
@@ -844,17 +1065,38 @@ pub async fn mv(
     };
     let mut client = client_arc.lock().await;
 
-    match envelope_email_transport::imap::move_message(
-        &mut client,
-        uid,
-        &req.folder,
-        &req.to_folder,
-    )
-    .await
-    {
-        Ok(()) => {
-            Json(json!({ "ok": true, "uid": uid, "moved_to": req.to_folder })).into_response()
+    // Resolve a canonical sentinel (`\Archive`/`\Junk`/`\Trash`) to the account's
+    // actual provider folder; a literal `Move…` folder passes straight through.
+    // Unresolved canonical targets fail with a stable code and NEVER fall back to
+    // creating or moving into a literal `Archive`/`Junk`/`Trash`.
+    let to_folder = match envelope_email_transport::folders::canonical_move_key(&req.to_folder) {
+        Some(canonical_type) => {
+            match resolve_canonical_folder(&state, &mut client, &account_id, canonical_type).await {
+                Ok(Some(name)) => name,
+                Ok(None) => {
+                    let (status, body) = move_target_unresolved(&req.to_folder);
+                    return (status, Json(body)).into_response();
+                }
+                Err(e) => {
+                    state.evict_imap(&account_id).await;
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "code": "folder_resolution_failed",
+                            "reason": format!("could not resolve move target: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
+        None => req.to_folder.clone(),
+    };
+
+    match envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, &to_folder)
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true, "uid": uid, "moved_to": to_folder })).into_response(),
         Err(e) => {
             state.evict_imap(&account_id).await;
             (StatusCode::BAD_GATEWAY, format!("move: {e}")).into_response()
@@ -887,6 +1129,119 @@ pub async fn delete(
             state.evict_imap(&account_id).await;
             (StatusCode::BAD_GATEWAY, format!("delete: {e}")).into_response()
         }
+    }
+}
+
+/// The app-managed folder snoozed mail is parked in (matches `envelope snooze`).
+const SNOOZED_FOLDER: &str = "Snoozed";
+
+/// Normalize a client snooze target into UTC wall-clock (`%Y-%m-%dT%H:%M:%S`) —
+/// the exact shape `envelope snooze set` writes and the background unsnooze
+/// sweep compares against UTC now. Accepts an RFC3339 instant (`…Z`/offset) or a
+/// naive timestamp (treated as UTC). Rejects empty and non-future times.
+fn normalize_snooze_return_at(input: &str, now: NaiveDateTime) -> Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("return_at is required");
+    }
+    let naive = if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        dt.with_timezone(&Utc).naive_utc()
+    } else if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        ndt
+    } else if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M") {
+        ndt
+    } else {
+        return Err("return_at must be an ISO-8601 timestamp (YYYY-MM-DDTHH:MM:SS)");
+    };
+    if naive <= now {
+        return Err("return_at must be in the future");
+    }
+    Ok(naive.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+#[derive(Deserialize)]
+pub struct SnoozeRequest {
+    #[serde(default = "default_folder")]
+    pub folder: String,
+    pub return_at: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+/// POST /api/accounts/{id}/messages/{uid}/snooze
+/// Move a message to the Snoozed folder until `return_at`, and record it so the
+/// existing background sweep returns it to its origin folder. Reuses the same
+/// primitives as `envelope snooze set` (create-folder + move + `create_snoozed`).
+pub async fn snooze(
+    State(state): State<AppState>,
+    Path((account_id, uid)): Path<(String, u32)>,
+    Json(req): Json<SnoozeRequest>,
+) -> impl IntoResponse {
+    // Validate the target time BEFORE any IMAP work so bad input never touches
+    // the mailbox and returns a stable, machine-readable error.
+    let return_at = match normalize_snooze_return_at(&req.return_at, Utc::now().naive_utc()) {
+        Ok(v) => v,
+        Err(code) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "invalid_return_at", "error": code })),
+            )
+                .into_response();
+        }
+    };
+
+    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
+        }
+    };
+    let mut client = client_arc.lock().await;
+
+    // Ensure the Snoozed folder exists (idempotent; may already be present).
+    if let Err(e) = envelope_email_transport::imap::create_folder(&mut client, SNOOZED_FOLDER).await
+    {
+        tracing::warn!("snooze: could not ensure {SNOOZED_FOLDER} folder (may exist): {e}");
+    }
+
+    if let Err(e) =
+        envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, SNOOZED_FOLDER)
+            .await
+    {
+        state.evict_imap(&account_id).await;
+        return (StatusCode::BAD_GATEWAY, format!("snooze move: {e}")).into_response();
+    }
+    drop(client);
+
+    // Record so the sweep can return it. `account` is the path id — matching how
+    // the dashboard snoozed list/unsnooze query rows back.
+    let db = state.db.lock().await;
+    match db.create_snoozed(
+        &account_id,
+        uid,
+        &req.folder,
+        SNOOZED_FOLDER,
+        &return_at,
+        req.message_id.as_deref(),
+        req.subject.as_deref(),
+        Some("dashboard"),
+        None,
+        None,
+    ) {
+        Ok(_) => Json(json!({
+            "ok": true,
+            "uid": uid,
+            "return_at": return_at,
+            "snoozed_folder": SNOOZED_FOLDER
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "code": "snooze_record_failed", "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -953,8 +1308,73 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDateTime;
     use envelope_email_store::{CredentialBackend, Database};
     use serde_json::json;
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn move_target_unresolved_returns_stable_code_and_leaks_nothing() {
+        // A canonical move target that resolves to no real provider folder must
+        // fail with a stable machine code BEFORE any mutation, carrying only the
+        // requested target label — never a recipient, body, or folder listing.
+        let (status, body) = move_target_unresolved("\\Trash");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "folder_not_resolved");
+        let reason = body["reason"].as_str().unwrap();
+        assert!(reason.contains("\\Trash"));
+        // No leakage: the reason is a fixed template plus the target token only.
+        assert!(!reason.contains('@'));
+    }
+
+    #[test]
+    fn snooze_return_at_rfc3339_z_stored_as_utc_wallclock() {
+        // The sweep compares against UTC now; storage must be UTC wall-clock,
+        // no offset/Z, matching `envelope snooze set`.
+        let out =
+            normalize_snooze_return_at("2026-08-09T14:30:00Z", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out, "2026-08-09T14:30:00");
+    }
+
+    #[test]
+    fn snooze_return_at_offset_converted_to_utc() {
+        // 09:00-05:00 == 14:00 UTC.
+        let out =
+            normalize_snooze_return_at("2026-08-09T09:00:00-05:00", at("2026-08-08T12:00:00"))
+                .unwrap();
+        assert_eq!(out, "2026-08-09T14:00:00");
+    }
+
+    #[test]
+    fn snooze_return_at_naive_kept_as_utc() {
+        let out =
+            normalize_snooze_return_at("2026-08-09T09:00:00", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out, "2026-08-09T09:00:00");
+        // datetime-local without seconds is also accepted.
+        let out2 =
+            normalize_snooze_return_at("2026-08-09T09:00", at("2026-08-08T12:00:00")).unwrap();
+        assert_eq!(out2, "2026-08-09T09:00:00");
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_empty() {
+        assert!(normalize_snooze_return_at("   ", at("2026-08-08T12:00:00")).is_err());
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_past() {
+        assert!(
+            normalize_snooze_return_at("2026-08-07T09:00:00Z", at("2026-08-08T12:00:00")).is_err()
+        );
+    }
+
+    #[test]
+    fn snooze_return_at_rejects_garbage() {
+        assert!(normalize_snooze_return_at("next tuesday", at("2026-08-08T12:00:00")).is_err());
+    }
 
     fn summary(uid: u32, date: Option<&str>) -> MessageSummary {
         MessageSummary {
@@ -966,6 +1386,7 @@ mod tests {
             date: date.map(str::to_string),
             flags: Vec::new(),
             size: 100,
+            provider_spam: None,
         }
     }
 
@@ -988,6 +1409,7 @@ mod tests {
             thread_id: Some(format!("thread-{uid}")),
             indexed_at: Some("2026-05-12T12:00:00Z".to_string()),
             index_freshness: "fresh".to_string(),
+            date_epoch: None,
             sort_index,
         }
     }
@@ -1032,6 +1454,98 @@ mod tests {
             indexed_at: ok.then(|| "2026-05-12T12:00:00Z".to_string()),
             error: error.map(str::to_string),
         }
+    }
+
+    // ── pagination cursor (sweep blocker #4) ────────────────────────────
+
+    #[test]
+    fn full_page_carries_a_next_cursor_from_its_last_row() {
+        let mut m1 = unified("acct-a", 10, Some("Tue, 12 May 2026 12:00:00 +0000"), 0);
+        m1.date_epoch = Some(1_000_000);
+        let mut m2 = unified("acct-b", 3, Some("Tue, 12 May 2026 11:00:00 +0000"), 1);
+        m2.date_epoch = Some(999_000);
+        let res = build_unified_inbox_response(
+            "INBOX".to_string(),
+            2,
+            vec![m1, m2],
+            vec![
+                account_result("acct-a", true, None),
+                account_result("acct-b", true, None),
+            ],
+        );
+        let cursor = res.next_cursor.expect("full page implies more may exist");
+        assert_eq!(cursor.date_epoch, Some(999_000));
+        assert_eq!(cursor.uid, 3);
+        assert_eq!(cursor.account_id, "acct-b");
+    }
+
+    #[test]
+    fn short_page_has_no_next_cursor() {
+        let m1 = unified("acct-a", 10, Some("Tue, 12 May 2026 12:00:00 +0000"), 0);
+        let res = build_unified_inbox_response(
+            "INBOX".to_string(),
+            50,
+            vec![m1],
+            vec![account_result("acct-a", true, None)],
+        );
+        assert!(res.next_cursor.is_none());
+    }
+
+    // ── bounded refresh fan-out (sweep blocker #4: 240s serial hang) ────
+
+    #[tokio::test]
+    async fn bounded_refresh_times_out_slow_accounts_instead_of_hanging() {
+        let accounts: Vec<Account> = ["a", "b", "c"]
+            .iter()
+            .map(|id| Account {
+                id: (*id).to_string(),
+                name: String::new(),
+                username: format!("{id}@example.test"),
+                domain: String::new(),
+                smtp_host: String::new(),
+                smtp_port: 0,
+                imap_host: String::new(),
+                imap_port: 0,
+                smtp_username: None,
+                imap_username: None,
+                display_name: None,
+                signature_text: None,
+                signature_html: None,
+                created_at: String::new(),
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let results = refresh_accounts_bounded(
+            accounts,
+            2,
+            std::time::Duration::from_millis(300),
+            |account: Account| async move {
+                if account.id == "b" {
+                    // Slower than the per-account budget: must be cut off.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Ok::<(), String>(())
+            },
+        )
+        .await;
+
+        assert_eq!(results.len(), 3);
+        let by_id = |id: &str| results.iter().find(|(a, _)| a.id == id).unwrap();
+        assert!(by_id("a").1.is_ok());
+        assert!(by_id("c").1.is_ok());
+        let err = by_id("b").1.as_ref().unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "slow account reported as timed out, got: {err}"
+        );
+        // Even with one pathological account, the whole pass is bounded by the
+        // per-account budget, never a serial 25×-connect crawl.
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(2),
+            "elapsed {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1150,6 +1664,8 @@ mod tests {
             "INBOX",
             "sender@example.test",
             "me@example.test",
+            None,
+            None,
             "2026-05-12T12:00:00Z",
             "cached first paint",
             false,
@@ -1165,6 +1681,8 @@ mod tests {
             "Sent",
             "me@example.test",
             "sender@example.test",
+            None,
+            None,
             "2026-05-12T13:00:00Z",
             "Re: cached first paint",
             true,
@@ -1193,7 +1711,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10, None)
             .await
             .unwrap();
 
@@ -1247,7 +1765,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 10, None)
             .await
             .unwrap();
 
@@ -1294,7 +1812,7 @@ mod tests {
         let accounts = db.list_accounts().unwrap();
         let state = AppState::new(db, CredentialBackend::File);
 
-        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 0)
+        let (messages, accounts) = load_indexed_unified_inbox(&state, &accounts, "INBOX", 0, None)
             .await
             .unwrap();
 

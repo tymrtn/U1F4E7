@@ -65,7 +65,7 @@
   async function runDraftAction(
     actionBase: string,
     id: string,
-    action: 'approve' | 'discard',
+    action: 'approve' | 'discard' | 'hold',
     body?: unknown
   ) {
     setBusy(id, true);
@@ -95,10 +95,11 @@
     // cockpit does not embed a composer; it hands off to the draft deep link.
     window.location.href = `/accounts/${encodeURIComponent(d.account_id)}/drafts/${encodeURIComponent(d.id)}`;
   }
-  // Cancelling a scheduled send discards the queued draft via the existing
-  // per-account draft discard endpoint.
+  // Cancelling a scheduled send HOLDS the queued draft: it leaves the outbox
+  // and stays in Drafts. Throwing it away is a separate, deliberate action on
+  // the review page — the same contract that page states in its own copy.
   function onCancelScheduled(item: ScheduledItem) {
-    void runDraftAction(item.action_base, item.id, 'discard');
+    void runDraftAction(item.action_base, item.id, 'hold');
   }
 
   // ── Formatting helpers ────────────────────────────────────────────────

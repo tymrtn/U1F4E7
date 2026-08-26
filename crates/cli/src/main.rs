@@ -177,6 +177,13 @@ enum Commands {
         /// File attachment (repeatable — one --attach per file)
         #[arg(long = "attach")]
         attach: Vec<String>,
+        /// Required factual risk attribute: a bounded signal Governor uses to assess
+        /// this action's stakes and risk (repeatable, one --attr per true signal; e.g.
+        /// --attr informational, --attr financial_content). Attributes provide risk
+        /// context, not permission, and every send needs at least one. Discover the
+        /// full catalog with `envelope governor catalog --json`.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -195,7 +202,7 @@ enum Commands {
         /// Confirm that a subject beginning with Re: is intentionally a new message without reply threading
         #[arg(long)]
         confirm_new_re_subject: bool,
-        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        /// Override the actual-send cooldown before the outbox sweep may transmit (built-in default 60s; ENVELOPE_SEND_COOLDOWN_SECONDS also overrides)
         #[arg(long)]
         cooldown_seconds: Option<i64>,
         /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
@@ -237,13 +244,20 @@ enum Commands {
         account: Option<String>,
     },
 
-    /// Delete a message
+    /// Delete a message (moves it to Trash; --permanent --confirm deletes forever)
     Delete {
         /// Message UID
         uid: u32,
         /// IMAP folder
         #[arg(long, default_value = "INBOX")]
         folder: String,
+        /// Expunge instead of moving to Trash (irreversible; requires --confirm,
+        /// otherwise runs as a dry run)
+        #[arg(long)]
+        permanent: bool,
+        /// Confirm a --permanent delete
+        #[arg(long)]
+        confirm: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -302,6 +316,12 @@ enum Commands {
     Draft {
         #[command(subcommand)]
         subcommand: DraftCmd,
+    },
+
+    /// Governor attribution: discover the catalog agents declare against
+    Governor {
+        #[command(subcommand)]
+        subcommand: GovernorCmd,
     },
 
     /// Start the localhost dashboard
@@ -418,6 +438,15 @@ enum Commands {
         /// Actually execute the unsubscribe (default is dry-run)
         #[arg(long)]
         confirm: bool,
+        /// Required factual attribute: a bounded label TRUE of the unsubscribe
+        /// message (repeatable — one --attr per fact). A `mailto:` unsubscribe is a
+        /// real SMTP send and REQUIRES at least one valid key (e.g. --attr
+        /// informational); a missing/invalid declaration fails closed before
+        /// Governor/SMTP with attributes_required/attributes_invalid. Discover keys
+        /// with `envelope governor catalog --json`. HTTPS one-click unsubscribe (no
+        /// SMTP) does not use this.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
     },
 
     /// Poll for a verification/OTP code from a recent email
@@ -757,6 +786,13 @@ enum AttachmentCmd {
 }
 
 #[derive(Subcommand)]
+enum GovernorCmd {
+    /// Show the vendored Governor attribution catalog (weight-free projection).
+    /// Add `--json` for the machine-readable projection used by agents.
+    Catalog,
+}
+
+#[derive(Subcommand)]
 enum DraftCmd {
     /// Create a new draft (IMAP-first: appends to server Drafts folder)
     Create {
@@ -849,8 +885,11 @@ enum DraftCmd {
     },
     /// Edit a draft's authored body (preserves the quoted/forwarded block)
     Edit {
-        /// Draft ID (local UUID)
+        /// Draft ID (local UUID) or IMAP Drafts UID (numeric)
         id: String,
+        /// Override the From header (sender identity). SMTP auth still uses --account credentials.
+        #[arg(long)]
+        from: Option<String>,
         /// New authored body (plain text)
         #[arg(long)]
         body: Option<String>,
@@ -903,7 +942,12 @@ enum DraftCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
-        /// Override the default actual-send cooldown (seconds) before the outbox sweep may transmit
+        /// Required factual attribute: a bounded label TRUE of this draft
+        /// (repeatable — one --attr per fact). Discover the catalog with
+        /// `envelope governor catalog --json`.
+        #[arg(long = "attr")]
+        attr: Vec<String>,
+        /// Override the actual-send cooldown before the outbox sweep may transmit (built-in default 60s; ENVELOPE_SEND_COOLDOWN_SECONDS also overrides)
         #[arg(long)]
         cooldown_seconds: Option<i64>,
         /// Emergency bypass: transmit immediately instead of queueing into the outbox cooldown.
@@ -1173,7 +1217,16 @@ enum ScheduledCmd {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Cancel a scheduled message
+    /// Take a scheduled message back out of the outbox, keeping the draft
+    Hold {
+        /// Draft ID
+        id: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Cancel a scheduled message by discarding the draft (destructive — use
+    /// `hold` to unqueue and keep it)
     Cancel {
         /// Draft ID
         id: String,
@@ -1213,6 +1266,11 @@ enum ThreadCmd {
         /// Maximum messages to scan
         #[arg(long, default_value = "200")]
         limit: u32,
+        /// Re-read each folder from the start instead of resuming after the
+        /// last build. Repairs threading headers on already-indexed messages;
+        /// slower, since it refetches up to --limit messages per folder.
+        #[arg(long)]
+        rebuild: bool,
     },
 }
 
@@ -1960,6 +2018,7 @@ fn main() {
             bcc,
             reply_to,
             attach,
+            attr,
             account,
             at,
             send_mode,
@@ -1979,6 +2038,7 @@ fn main() {
             bcc.as_deref(),
             reply_to.as_deref(),
             &attach,
+            &attr,
             account.as_deref(),
             cli.json,
             backend,
@@ -2023,8 +2083,18 @@ fn main() {
         Commands::Delete {
             uid,
             folder,
+            permanent,
+            confirm,
             account,
-        } => commands::messages::run_delete(uid, &folder, account.as_deref(), cli.json, backend),
+        } => commands::messages::run_delete(
+            uid,
+            &folder,
+            permanent,
+            confirm,
+            account.as_deref(),
+            cli.json,
+            backend,
+        ),
 
         Commands::Flag { subcommand } => match subcommand {
             FlagCmd::Add {
@@ -2158,6 +2228,7 @@ fn main() {
             ),
             DraftCmd::Edit {
                 id,
+                from,
                 body,
                 html,
                 to,
@@ -2174,6 +2245,7 @@ fn main() {
                 account.as_deref(),
                 cli.json,
                 backend,
+                from.as_deref(),
                 body.as_deref(),
                 html.as_deref(),
                 to.as_deref(),
@@ -2189,12 +2261,14 @@ fn main() {
             DraftCmd::Send {
                 id,
                 account,
+                attr,
                 cooldown_seconds,
                 send_now,
                 confirm_send_now,
             } => commands::drafts::run_send(
                 &id,
                 account.as_deref(),
+                &attr,
                 cli.json,
                 backend,
                 cooldown_seconds,
@@ -2204,6 +2278,10 @@ fn main() {
             DraftCmd::Discard { id, account } => {
                 commands::drafts::run_discard(&id, cli.json, account.as_deref(), backend)
             }
+        },
+
+        Commands::Governor { subcommand } => match subcommand {
+            GovernorCmd::Catalog => commands::governor::run_catalog(cli.json),
         },
 
         Commands::Serve {
@@ -2365,6 +2443,9 @@ fn main() {
             ScheduledCmd::List { account } => {
                 commands::scheduled::run_list(account.as_deref(), cli.json, backend)
             }
+            ScheduledCmd::Hold { id, account } => {
+                commands::scheduled::run_hold(&id, account.as_deref(), cli.json)
+            }
             ScheduledCmd::Cancel { id, account } => {
                 commands::scheduled::run_cancel(&id, account.as_deref(), cli.json)
             }
@@ -2379,9 +2460,11 @@ fn main() {
             ThreadCmd::List { account, limit } => {
                 commands::thread::run_list(account.as_deref(), limit, cli.json, backend)
             }
-            ThreadCmd::Build { account, limit } => {
-                commands::thread::run_build(account.as_deref(), limit, cli.json, backend)
-            }
+            ThreadCmd::Build {
+                account,
+                limit,
+                rebuild,
+            } => commands::thread::run_build(account.as_deref(), limit, rebuild, cli.json, backend),
         },
 
         Commands::Tag { subcommand } => match subcommand {
@@ -2553,11 +2636,13 @@ fn main() {
             folder,
             account,
             confirm,
+            attr,
         } => commands::unsubscribe_cmd::run(
             uid,
             &folder,
             account.as_deref(),
             confirm,
+            &attr,
             cli.json,
             backend,
         ),
@@ -2764,7 +2849,7 @@ mod tests {
         ));
 
         let contract = commands::contract::agent_contract();
-        assert_eq!(contract["schema"], "envelope.agent_contract.v1");
+        assert_eq!(contract["schema"], "envelope.agent_contract.v2");
         let surfaces = contract["surfaces"].as_array().expect("surfaces array");
         for required in [
             "inbox", "read", "search", "thread", "draft", "send", "watch", "otp", "rules",

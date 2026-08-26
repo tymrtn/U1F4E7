@@ -3,13 +3,22 @@
 
 //! Versioned agent-facing JSON contract for Envelope CLI and MCP surfaces.
 //!
-//! Existing command JSON output remains unchanged. Breaking contract changes
-//! should create a new `envelope.agent_contract.vN` schema.
+//! v2 is a breaking change to the outbound-send surfaces (send / reply /
+//! send_draft / unsubscribe) — see `compatibility.output_contract`. Read-only and
+//! non-send surfaces keep their v1 JSON. Any further breaking contract change
+//! must create a new `envelope.agent_contract.vN` schema.
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-pub const AGENT_CONTRACT_SCHEMA: &str = "envelope.agent_contract.v1";
+pub const AGENT_CONTRACT_SCHEMA: &str = "envelope.agent_contract.v2";
+
+/// The prior contract id, retained as historical compatibility documentation
+/// (`docs/schemas/envelope.agent_contract.v1.json`). v2 is a breaking change:
+/// send/reply/send_draft gained an `attributes` input and the attribution
+/// protocol, and the agent-facing Governor block no longer carries a numeric
+/// score.
+pub const AGENT_CONTRACT_SCHEMA_V1: &str = "envelope.agent_contract.v1";
 
 /// Default summary count returned by read-only agent list/search surfaces.
 pub const DEFAULT_AGENT_LIST_LIMIT: u32 = 25;
@@ -35,13 +44,26 @@ pub fn agent_contract() -> Value {
         "schema": AGENT_CONTRACT_SCHEMA,
         "compatibility": {
             "breaking_change_policy": "Field removals, required-field additions, type changes, and semantic renames require a new schema id. New optional fields are backward-compatible.",
-            "output_contract": "Existing CLI --json output is not changed by this contract export.",
-            "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval."
+            "output_contract": "v2 is a BREAKING change to the outbound-send surfaces: send / reply / send_draft now REQUIRE a non-empty `attributes` input, the agent-facing Governor block narrowed to {decision, state, mode, review_ticket_id} (score/allowed/block_code/block_reason removed), successful results gained an additive `attribution` block, a scheduled `envelope send --at` result carries {scheduled, send_at}, and `envelope unsubscribe --confirm` is attribution-gated and exits nonzero on a confirmed failure. Read-only and non-send surfaces (accounts, inbox, read, search, drafts list, rules, etc.) keep their v1 JSON shapes. Every other change is an additive optional field.",
+            "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval.",
+            "previous_schema": AGENT_CONTRACT_SCHEMA_V1,
+            "v2_changes": [
+                "Attribution protocol (envelope.attribution.v1): send/reply/send_draft REQUIRE a non-empty `attributes` array of factual catalog keys (enforced at the handler boundary, including draft-only outcomes). A bot-originated send with no declared attribute is rejected with attributes_required BEFORE Governor scoring even when host facts are derivable — host-derived facts never substitute for the bot's declaration. Unknown/attestation-only/contradicting/host-unverifiable/impossible declarations are rejected with attributes_invalid. Both are top-level `invalid`-status codes. A declared host-derived key counts only when Envelope independently observes it true (declaration + host corroboration); observed-false is conflicts_with_host_observation and unobservable is host_verification_unavailable.",
+                "The agent-facing Governor block narrows to {decision, state, mode, review_ticket_id}; the numeric score, allowed, block_code, and block_reason fields were removed from agent-facing and durable Envelope payloads (deliberate anti-oracle security fix).",
+                "New read-only tool governor_catalog (always authorized) publishes the weight-free catalog projection agents declare against.",
+                "send_draft reports its true MCP surface and returns the structured attribution/Governor recovery payload instead of a plain-string error.",
+                "A bot-originated queued/scheduled send persists its validated declaration into the draft metadata; the scheduled-send sweep re-derives host facts and gates on declared ∪ derived, failing closed for an undeclared bot draft (host facts never substitute). A material draft revision invalidates the persisted declaration and resets attempt state.",
+                "Bounded attribution retry: a bot draft that fails attribution at scheduled-send time retries up to a documented bound (3), then parks pending_review with send_after cleared and park_reason=attribution_exhausted (no retry storm). Direct/stateless sends never claim a draft was parked.",
+                "SUCCESSFUL outbound results (immediate send and queued/scheduled acceptance) gained an additive sanitized `attribution` block (protocol, catalog/version, attribution_state, the attribute sets, and Governor decision/route where applicable; never a score/weight/threshold/body/raw recipient/secret). New optional field, backward-compatible.",
+                "The `mailto:` compliance unsubscribe is a real SMTP surface and is now attribution-gated: `envelope unsubscribe` accepts repeatable --attr keys and requires a non-empty valid declaration before Governor/SMTP (a missing/invalid declaration fails closed with the canonical attribution error). HTTPS one-click unsubscribe is not an SMTP send and is unaffected.",
+                "Attribution fails closed in warn mode too: warn only softens a Governor VERDICT on an already-attributed send; it never waives the attribution precondition, so a bot-originated send with a missing/invalid declaration is refused in warn exactly as in required.",
+                "v1 (envelope.agent_contract.v1) is retained as historical documentation at docs/schemas/envelope.agent_contract.v1.json; generic {code, reason} error handling is unaffected."
+            ]
         },
         "consumers": ["cli", "mcp", "hermes", "codex"],
         "outbound_safety": {
             "actual_send_cooldown": {
-                "default_seconds": 120,
+                "default_seconds": 60,
                 "env": "ENVELOPE_SEND_COOLDOWN_SECONDS",
                 "behavior": "Allowed sends (CLI send, MCP send/reply allowed modes, draft send / send_draft) queue into the outbox with a future send_after by default; real SMTP only happens later when the scheduled-send sweep finds them due. Queued responses include queued_reason_code=safety_cooldown and a human-readable queued_reason so agents know the delay is intentional safety time to report and correct issues.",
                 "bypass": "Immediate transmission requires an explicit, confirmed bypass: send_now (or cooldown_seconds=0) together with confirm_send_now.",
@@ -51,11 +73,37 @@ pub fn agent_contract() -> Value {
                 "modes": ["required", "warn", "off"],
                 "default": "required",
                 "env": {"mode": "ENVELOPE_GOVERNOR_MODE", "bin": "ENVELOPE_GOVERNOR_BIN"},
-                "behavior": "Before any real SMTP send (immediate bypass and scheduled-send sweep), the actual Governor decision engine is consulted using blind attribution: Envelope declares the contextual attribute keys the send exhibits and Governor opaquely scores/routes them against the 'envelope' catalog (allow/review/deny). Envelope never reproduces Governor's weights or thresholds. The scheduled-send sweep re-derives the final attributes from the persisted draft just before SMTP; durable review/deny verdicts park the draft as pending_review (no retry storm) while transient gate failures leave it queued. In required mode it fails closed: missing/error/deny/review all block the send; only an explicit allow permits SMTP. warn records but never blocks; off skips the gate.",
+                "behavior": "Before any real SMTP send (immediate bypass, scheduled-send sweep, and the `mailto:` compliance unsubscribe), the actual Governor decision engine is consulted using blind attribution: Envelope declares the contextual attribute keys the send exhibits and Governor opaquely scores/routes them against the 'envelope' catalog (allow/review/deny). Envelope never reproduces Governor's weights or thresholds. The scheduled-send sweep re-derives the final host facts from the persisted draft AND loads the declaration the bot validated at queue time, resolves declared ∪ derived, and calls Governor only when attribution is valid; a bot-originated draft with no valid current declaration fails closed there even when the derived set is rich (host facts never substitute). Durable review/deny verdicts park the draft as pending_review (no retry storm) while transient gate failures leave it queued. In required mode the Governor verdict fails closed: missing/error/deny/review all block the send; only an explicit allow permits SMTP. In warn mode a Governor verdict is recorded but does not block — BUT the attribution precondition still fails closed (see attribution.rule): a missing/invalid declaration on a bot-originated send is refused in warn exactly as in required. off skips the gate and the attribution requirement.",
                 "block_status": "blocked",
                 "block_code": "governor_blocked",
                 "unavailable_code": "governor_unavailable",
-                "redaction": "Blind attribution: Governor receives only the declared envelope-catalog attribute keys plus a content-free justification (surface + draft id) — never recipient addresses, subject text, bodies, attachment bytes, or secrets. Envelope's own send-policy audit event additionally records sanitized metadata (account id/domain, subject hash, recipient count/domains/classes, surface, draft id, attachment count/sizes/types, reply flag) alongside the declared attribute keys and catalog."
+                "route": "governor_blocked additionally carries route ∈ {review, deny}: review parks the draft pending_review for human approval; deny must not be retried unchanged.",
+                "governor_block_fields": ["decision", "state", "mode", "review_ticket_id"],
+                "no_score": "The agent-facing Governor block and every durable Envelope audit/event payload contain NO numeric score, weight, threshold, or breakdown.",
+                "redaction": "Blind attribution: Governor receives only the validated envelope-catalog attribute keys plus a content-free justification (surface + draft id) — never recipient addresses, subject text, bodies, attachment bytes, or secrets. Envelope's own send-policy audit event additionally records sanitized metadata (account id/domain, subject hash, recipient count/domains/classes, surface, draft id, attachment count/sizes/types, reply flag) alongside the declared/derived/governor attribute sets and catalog.",
+                "attribution": {
+                    "protocol": "envelope.attribution.v1",
+                    "catalog": "envelope",
+                    "rule": "Every bot-originated governed send MUST contain at least one factual declared attribute; host-derived facts never substitute. The attribution precondition fails closed in required and warn modes ALIKE — warn softens only a Governor verdict on an already-attributed send, never the attribution requirement, so a missing/invalid declaration is refused in warn exactly as in required. Only off disables the gate and the requirement. Human approval SUPPLEMENTS a bot send (it adds the tyler_approved attestation to the derived set) but never erases the bot's declaration responsibility.",
+                    "sets": ["declared_attrs", "derived_attrs", "governor_attrs", "rejected_attrs", "accepted_redundant"],
+                    "codes": {
+                        "top_level": ["attributes_required", "attributes_invalid"],
+                        "per_key": ["unknown_attribute", "attestation_required", "conflicts_with_host_observation", "host_verification_unavailable", "conflicting_attributes"]
+                    },
+                    "declaration": {
+                        "mcp": "attributes: [\"<key>\", …] on send / reply / send_draft (declarable author-context keys plus host-derived keys; a declared host-derived key counts only when Envelope independently observes it true. Attestation keys are unrepresentable)",
+                        "cli": "--attr <key> (repeatable) on `envelope send`, `envelope draft send`, and `envelope unsubscribe` (the mailto compliance send)"
+                    },
+                    "recovery": "attributes_required/attributes_invalid responses are {status:invalid, error:{code, reason, attributes, help, recovery}}. error.reason is recovery-complete prose (survives a double-encode). error.attributes echoes the caller's INPUT: {declared, rejected} — rejected keys carry their per-key code and did_you_mean. error.help is self-contained `--help`-quality guidance: {what_are_attributes, syntax{cli, mcp}, examples[{key, description, when}], list_attributes{mcp_tool, cli, skill}, rules}. error.recovery stays compact: {next_action, retry{idempotent, note}}. They occur before any side effect and are idempotent to retry. A direct/stateless send that fails created no draft, so it never claims a draft was parked. Genuine Governor review/deny/unavailable errors are NOT given attribute help.",
+                    "persisted_declaration": "A bot-originated send that queues/schedules persists its validated declaration (declared_attrs + protocol/catalog version, bounded attempt state) into the draft metadata under the `attribution` key, bound to the draft revision. Any material draft revision (recipients, subject/body, attachment set, or reply context) bumps the revision and invalidates the persisted declaration and resets attempt state; the sweep then treats the draft as undeclared and fails it closed. At the sweep, origin is decided from durable provenance (a current persisted bot declaration, or the draft's created_by): a bot-originated draft ALWAYS requires a valid current declaration even after a human approves it (approval adds tyler_approved on top; it never substitutes for the declaration). Only a genuinely human-originated (created_by human:*) draft that is also currently human-attested proceeds on its revision-bound human attestation without a bot declaration; unknown-provenance/unattested drafts fail closed as bot.",
+                    "retry_exhaustion": "When a bot-originated queued draft fails attribution at scheduled-send time, Envelope counts persisted per-draft attempts; below the bound (3) the draft stays due for correction, and at the bound it is parked pending_review with send_after cleared (automatic transmission disabled — no retry storm) and park_reason=attribution_exhausted recorded in the draft's attribution metadata. A valid attribution or a material draft revision resets the counter.",
+                    "success_block": "A SUCCESSFUL outbound result (immediate send, and queued/scheduled acceptance) carries an additive sanitized `attribution` block: protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object {decision, route} (null on queued/scheduled acceptance, where governor_decision_pending marks that the real decision runs at the sweep). It never contains a score, weight, threshold, body, raw recipient, secret, or attachment byte.",
+                    "catalog_discovery": {
+                        "mcp_tool": "governor_catalog",
+                        "cli": "envelope governor catalog --json",
+                        "skill": "envelope-governor-attribution"
+                    }
+                }
             }
         },
         "trust_model": {
@@ -109,6 +157,8 @@ pub fn agent_contract() -> Value {
                 "watch_status": "watch.read",
                 "snooze": "snooze"
             },
+            "always_allowed_readonly_tools": ["governor_catalog"],
+            "always_allowed_note": "governor_catalog is a read-only discovery tool authorized for every agent even under a deny-by-default policy (it exposes public catalog names/descriptions only, no mailbox access), so a restricted agent can always learn how to comply. This never widens any other policy action.",
             "bulk_two_action_gate": "The bulk tool requires BOTH the coarse `bulk` action AND the underlying single action the op maps to: move/copy require `move`, flag_add/flag_remove require `flag`, delete requires `delete`, tag requires `tag`. Missing either denies with the standard {agent_policy_denied_action|account|folder} codes.",
             "bulk_delete_confirmation": "In the MCP context a bulk `delete` op requires explicit `confirm: true` in the tool input; without it the call is coerced to a dry run (no mutations) and the result carries a `note` explaining the coercion. This mirrors the CLI `--confirm` default and prevents an unconfirmed destructive bulk delete.",
             "rules_run_dry_run_default": "The rules_run tool defaults `dry_run` to true; a preview is returned unless the caller passes `dry_run: false`. A real (mutating) run additionally requires the `rules.run` policy action, while rules_preview needs only `rules.read`.",
@@ -225,27 +275,31 @@ fn surfaces() -> Value {
         send_input_schema(),
         object(
             json!({
-                "status": string("queued (default cooldown), sent, scheduled, drafted, denied, or blocked"),
+                "status": string("queued (default cooldown), sent, scheduled, drafted, denied, blocked, or invalid"),
+                "scheduled": json!({"type": "boolean", "description": "true on an `envelope send --at <time>` scheduled acceptance; the paired field is send_at (not send_after)"}),
+                "send_at": string("ISO8601 time an `envelope send --at` scheduled draft becomes due for the outbox sweep (scheduled-path field; the cooldown path uses send_after)"),
                 "sent": json!({"type": "boolean", "description": "MCP send/reply result flag when available"}),
                 "send_mode": string("Applied send safety mode when policy was evaluated"),
                 "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary"}),
                 "send_after": string("ISO8601 time the queued/scheduled send becomes due for the outbox sweep"),
-                "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 120)"}),
+                "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 60)"}),
                 "queued_reason_code": string("Stable reason code for queued sends; safety_cooldown means Envelope intentionally delayed SMTP for review/correction time"),
                 "queued_reason": string("Human-readable explanation that the message is queued in the outbox for the safety cooldown so agents/operators can report and correct issues before SMTP transmission"),
-                "message_id": string("SMTP Message-ID when sent immediately"),
+                "message_id": json!({"type": ["string", "null"], "description": "SMTP Message-ID when sent immediately; null/absent on a queued, scheduled, or draft-only outcome"}),
                 "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
-                "sent_folder": string("Sent folder containing the sent message when resolved"),
+                "sent_folder": json!({"type": ["string", "null"], "description": "Sent folder containing the sent message when resolved; null when unresolved"}),
                 "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
-                "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+                "sent_message_url": json!({"type": ["string", "null"], "description": "Dashboard URL for the sent message when resolved; null when unresolved"}),
                 "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof."}),
                 "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a client-side Sent-folder archive copy after SMTP because the provider does not auto-save submissions. This is mailbox hygiene, not independent delivery proof."}),
                 "sent_mail_append_skipped_reason": json!({"type": ["string", "null"], "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed"}),
                 "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
                 "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. This is mailbox hygiene only — not independent delivery or legal proof."}),
+                "attribution": json!({"type": ["object", "null"], "description": "Additive sanitized attribution block on a SUCCESSFUL result (immediate send, or queued/scheduled acceptance): protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object ({decision, route}) — null on queued/scheduled acceptance where governor_decision_pending marks the deferral to the scheduled-send sweep. Never a score, weight, threshold, body, raw recipient, secret, or attachment byte."}),
                 "draft_id": string("Local draft id when scheduled or draft-only"),
                 "to": string("Recipient address"),
-                "subject": string("Subject")
+                "subject": string("Subject"),
+                "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view)"})
             }),
             json!([]),
         ),
@@ -457,11 +511,15 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send",
-            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. By default an allowed send QUEUES into the outbox with a cooldown (default 120s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         (
             "reply",
-            "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix.",
+            "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
+        ),
+        (
+            "governor_catalog",
+            "Read-only discovery of the Governor attribution catalog agents declare against: key, description, category, provenance (declarable/host_derived/requires_attestation), and declaration guidance. No weights, thresholds, or scores; no mailbox access; always authorized even under a deny-by-default policy. Use it to learn which `attributes` to declare on send/reply/send_draft.",
         ),
         (
             "create_reply_draft",
@@ -481,7 +539,7 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send_draft",
-            "Send a draft by draft id. Requires explicit confirmation in agent contexts. By default it QUEUES the draft into the outbox with a cooldown (default 120s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
+            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it; immediate transmission requires send_now + confirm_send_now.",
         ),
         ("move_message", "Move a message to another IMAP folder."),
         (
@@ -560,12 +618,12 @@ fn sent_copy_output_schema() -> Value {
     object(
         json!({
             "sent": json!({"type": "boolean", "description": "true when the message was transmitted immediately"}),
-            "message_id": string("SMTP Message-ID when sent immediately"),
+            "message_id": json!({"type": ["string", "null"], "description": "SMTP Message-ID when sent immediately; null/absent on a queued or draft-only outcome"}),
             "sent_mail_appended": json!({"type": "boolean", "description": "Whether Envelope appended a client-side Sent-folder archive copy"}),
             "sent_mail_append_skipped_reason": json!({"type": ["string", "null"], "description": "Reason no Sent copy was appended, e.g. provider_auto_saves_sent, no_imap, sent_folder_not_found, append_failed"}),
-            "sent_folder": string("Sent folder containing the sent message when resolved"),
+            "sent_folder": json!({"type": ["string", "null"], "description": "Sent folder containing the sent message when resolved; null when unresolved"}),
             "sent_uid": json!({"type": ["integer", "null"], "description": "Sent-folder IMAP UID when resolved"}),
-            "sent_message_url": string("Dashboard URL for the sent message when resolved"),
+            "sent_message_url": json!({"type": ["string", "null"], "description": "Dashboard URL for the sent message when resolved; null when unresolved"}),
             "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof."}),
             "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
             "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. Mailbox hygiene only — not independent delivery or legal proof."}),
@@ -580,7 +638,8 @@ fn sent_copy_output_schema() -> Value {
             "queued_reason_code": string("Stable queued-send reason code"),
             "send_mode": string("Applied send safety mode when policy was evaluated"),
             "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason})"}),
-            "in_reply_to": string("In-Reply-To header of the sent message when present"),
+            "attribution": json!({"type": ["object", "null"], "description": "Additive sanitized attribution block on a SUCCESSFUL result (immediate send, or queued/scheduled acceptance). Contains protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object ({decision, route}) — null on queued/scheduled acceptance, where the real Governor decision runs later at the scheduled-send sweep (governor_decision_pending is then present). Never a score, weight, threshold, body, raw recipient, secret, or attachment byte."}),
+            "in_reply_to": json!({"type": ["string", "null"], "description": "In-Reply-To header of the sent/queued reply; null when the parent had no Message-ID"}),
             "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
             "ui": json!({"type": "object", "description": "Dashboard navigation links"}),
             "parent_ui": json!({"type": "object", "description": "Dashboard links for the parent message when replying"}),
@@ -599,16 +658,20 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "uid": integer("UID of message to reply to"),
                     "body": string("Reply text body"),
                     "html": string("Reply HTML body"),
+                    "attributes": attributes_schema(),
                     "reply_all": json!({"type": "boolean", "description": "Reply to all recipients", "default": false}),
                     "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "draft-only", "description": "MCP reply safety mode"}),
                     "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
+                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+                    "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
+                    "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
                     "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send"})),
                     "attach": array_of(string("File attachment path to snapshot or send")),
                     "attachments": array_of(string("File attachment path alias for attach")),
                     "folder": string_default("IMAP folder of original message", "INBOX"),
                     "account": string("Account ID or email address")
                 }),
-                json!(["uid", "body"]),
+                json!(["uid", "body", "attributes"]),
             ),
             sent_copy_output_schema(),
         ),
@@ -687,15 +750,29 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
             object(
                 json!({
                     "draft_id": string("Local draft id"),
+                    "attributes": attributes_schema(),
                     "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP", "default": false}),
-                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+                    "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
                     "account": string("Account ID or email address")
                 }),
-                json!(["draft_id"]),
+                json!(["draft_id", "attributes"]),
             ),
             sent_copy_output_schema(),
+        ),
+        (
+            "governor_catalog",
+            object(
+                json!({
+                    "catalog": string_default("Governor catalog to project (only 'envelope' is vendored)", "envelope")
+                }),
+                json!([]),
+            ),
+            json!({
+                "type": "object",
+                "description": "Vendored weight-free Envelope catalog projection: protocol, catalog_version, attributes[{key, category, provenance, description, note?}], declaration guidance, and honesty rules. Never contains a weight, threshold, or score."
+            }),
         ),
         (
             "move_message",
@@ -921,6 +998,140 @@ fn surface_entry(
     })
 }
 
+/// The `attributes` input schema, shared by send/reply/send_draft. The item enum
+/// is the **agent-submittable** key set (declarable ∪ host-derived), derived from
+/// the vendored catalog + provenance table so it can never drift by hand — a
+/// declared host-derived key counts only when Envelope independently observes it
+/// true, but runtime accepts it for submission, so the schema advertises it.
+/// Attestation-only keys (`tyler_approved`, `authorized_campaign`) are excluded —
+/// they are never bot-declarable. `minItems: 1` mirrors the runtime rule that a
+/// bot-originated send REQUIRES at least one factual declared attribute.
+fn attributes_schema() -> Value {
+    let enum_vals: Vec<Value> =
+        envelope_email_transport::governor_catalog::agent_submittable_keys()
+            .into_iter()
+            .map(Value::String)
+            .collect();
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "string", "enum": enum_vals },
+        "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery."
+    })
+}
+
+/// Outbound-send response BODY builders — the single source of truth for the
+/// success / queued / scheduled / draft-only response shapes emitted by
+/// `envelope send`, `envelope draft send`, and the MCP `send_draft` tool. The
+/// handlers build their JSON through these functions and the contract response
+/// tests validate the SAME functions against the published output schema, so the
+/// schema and the emitted JSON can never drift independently.
+pub(crate) mod send_body {
+    use serde_json::{Value, json};
+
+    /// `envelope send` draft-only downgrade (send-policy ceiling). Echoes the
+    /// resolved recipient/subject for the operator.
+    pub(crate) fn cli_drafted(
+        send_mode: Value,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        attachments: Value,
+        ui: Value,
+    ) -> Value {
+        json!({
+            "status": "drafted",
+            "send_mode": send_mode,
+            "draft_id": draft_id,
+            "to": to,
+            "subject": subject,
+            "attachments": attachments,
+            "ui": ui,
+        })
+    }
+
+    /// `envelope send` default-cooldown queued acceptance.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cli_queued(
+        send_mode: Value,
+        draft_id: &str,
+        send_after: &str,
+        cooldown_seconds: i64,
+        queued_reason_code: &str,
+        queued_reason: &str,
+        attachments: Value,
+        attribution: Value,
+        ui: Value,
+    ) -> Value {
+        json!({
+            "status": "queued",
+            "send_mode": send_mode,
+            "draft_id": draft_id,
+            "send_after": send_after,
+            "cooldown_seconds": cooldown_seconds,
+            "queued_reason_code": queued_reason_code,
+            "queued_reason": queued_reason,
+            "attachments": attachments,
+            "attribution": attribution,
+            "ui": ui,
+        })
+    }
+
+    /// `envelope send --at <time>` scheduled acceptance. Note the distinct
+    /// `scheduled` / `send_at` keys (the cooldown path uses `status`/`send_after`).
+    pub(crate) fn cli_scheduled_at(
+        draft_id: &str,
+        send_at: &str,
+        attachments: Value,
+        attribution: Value,
+        ui: Value,
+    ) -> Value {
+        json!({
+            "scheduled": true,
+            "send_at": send_at,
+            "draft_id": draft_id,
+            "attachments": attachments,
+            "attribution": attribution,
+            "ui": ui,
+        })
+    }
+
+    /// `envelope draft send` / MCP `send_draft` queued (scheduled) acceptance.
+    /// `include_sent` adds the MCP `sent:false` flag; the CLI body omits it.
+    pub(crate) fn draft_scheduled(
+        include_sent: bool,
+        draft_id: &str,
+        send_after: &str,
+        cooldown_seconds: i64,
+        attribution: Value,
+        ui: Value,
+    ) -> Value {
+        let mut body = json!({
+            "status": "scheduled",
+            "draft_id": draft_id,
+            "send_after": send_after,
+            "cooldown_seconds": cooldown_seconds,
+            "attribution": attribution,
+            "ui": ui,
+        });
+        if include_sent && let Value::Object(map) = &mut body {
+            map.insert("sent".to_string(), Value::Bool(false));
+        }
+        body
+    }
+
+    /// MCP `send_draft` draft-only downgrade (send-mode ceiling).
+    pub(crate) fn mcp_drafted(send_mode: Value, draft_id: &str, ui: Value) -> Value {
+        json!({
+            "sent": false,
+            "status": "drafted",
+            "send_mode": send_mode,
+            "draft_id": draft_id,
+            "ui": ui,
+        })
+    }
+}
+
 fn send_input_schema() -> Value {
     object(
         json!({
@@ -932,17 +1143,18 @@ fn send_input_schema() -> Value {
             "bcc": string("BCC recipients"),
             "reply_to": string("Reply-To address"),
             "from": string("Override sender identity"),
+            "attributes": attributes_schema(),
             "attach": array_of(string("File attachment path to snapshot or send")),
             "attachments": array_of(string("File attachment path alias for attach")),
             "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "autonomous-send", "description": "CLI send safety mode; MCP defaults this field to draft-only"}),
             "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
             "allow_recipient": array_of(string("Allowed email address or domain for allowlisted-send")),
-            "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 120; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
+            "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
             "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
             "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
             "account": string("Account ID or email address")
         }),
-        json!(["to", "subject"]),
+        json!(["to", "subject", "attributes"]),
     )
 }
 
@@ -1078,10 +1290,7 @@ mod tests {
     fn contract_advertises_cooldown_and_governor() {
         let contract = agent_contract();
         let safety = &contract["outbound_safety"];
-        assert_eq!(
-            safety["actual_send_cooldown"]["default_seconds"],
-            json!(120)
-        );
+        assert_eq!(safety["actual_send_cooldown"]["default_seconds"], json!(60));
         assert_eq!(
             safety["actual_send_cooldown"]["denial_code"],
             json!("immediate_send_requires_confirmation")
@@ -1107,6 +1316,19 @@ mod tests {
         assert_eq!(out["queued_reason"]["type"], "string");
         assert_eq!(out["sent_mail_appended"]["type"], "boolean");
         assert!(out["sent_mail_append_skipped_reason"].is_object());
+        // The additive success attribution block is advertised on every send
+        // surface (send, reply, send_draft) so advertised JSON matches the actual
+        // successful variants.
+        assert!(
+            out["attribution"].is_object(),
+            "send output must advertise the attribution block"
+        );
+        let reply_out = &mcp_only_inputs()
+            .into_iter()
+            .find(|(name, _, _)| *name == "reply")
+            .expect("reply surface")
+            .2["properties"];
+        assert!(reply_out["attribution"].is_object());
 
         // send_draft tool advertises the bypass controls too.
         let tools = mcp_tool_list();
@@ -1118,5 +1340,390 @@ mod tests {
         let sd_props = &send_draft["inputSchema"]["properties"];
         assert!(sd_props["send_now"].is_object());
         assert!(sd_props["confirm_send_now"].is_object());
+    }
+
+    // ── Block 6: schema/handler parity — validate real response variants ─────
+
+    /// The JSON type name of a value, mapped to JSON Schema `type` tokens.
+    fn json_type(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+
+    /// Whether `schema_type` (a string or array-of-strings JSON Schema `type`)
+    /// admits `actual`. `integer` also satisfies a `number` schema.
+    fn type_admits(schema_type: &Value, actual: &str) -> bool {
+        let admits_one = |t: &str| t == actual || (t == "number" && actual == "integer");
+        match schema_type {
+            Value::String(t) => admits_one(t),
+            Value::Array(ts) => ts.iter().filter_map(|t| t.as_str()).any(admits_one),
+            // A property with no declared `type` admits anything.
+            Value::Null => true,
+            _ => false,
+        }
+    }
+
+    /// Structurally validate `value` (an object) against an `object` schema:
+    /// additionalProperties:false (no undeclared keys), every `required` key
+    /// present, and every present value's JSON type admitted by its property
+    /// `type` (including null). Returns the list of violations (empty = valid).
+    fn schema_violations(schema: &Value, value: &Value) -> Vec<String> {
+        let mut errs = Vec::new();
+        let props = &schema["properties"];
+        let obj = value
+            .as_object()
+            .expect("response variant must be an object");
+        for (key, val) in obj {
+            match props.get(key) {
+                None => errs.push(format!(
+                    "undeclared key `{key}` (additionalProperties:false)"
+                )),
+                Some(prop) => {
+                    let actual = json_type(val);
+                    if !type_admits(&prop["type"], actual) {
+                        errs.push(format!(
+                            "key `{key}` is {actual} but schema type is {}",
+                            prop["type"]
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(required) = schema["required"].as_array() {
+            for r in required.iter().filter_map(|r| r.as_str()) {
+                if !obj.contains_key(r) {
+                    errs.push(format!("missing required key `{r}`"));
+                }
+            }
+        }
+        errs
+    }
+
+    fn send_output_schema() -> Value {
+        surface("send").expect("send surface")["output_schema"].clone()
+    }
+
+    // ── Real builder/handler outputs, validated against the published schema ──
+    //
+    // These variants are NOT handwritten: the success/queued/scheduled/drafted
+    // envelopes come from the `send_body` builders the handlers actually emit
+    // through, and the refusal/attribution values come from the real
+    // `GovernorOutcome` / `success_attribution_block` builders. So if a handler
+    // gains or renames a response field (via the shared builder), this test uses
+    // the new value and fails against a schema that has not kept up — the schema
+    // cannot silently drift from runtime.
+
+    use envelope_email_transport::attribution::{AttributedSendContext, resolve};
+    use envelope_email_transport::attribution_persist::success_attribution_block;
+    use envelope_email_transport::outbound::{
+        GovernorConfig, GovernorMode, GovernorRequest, GovernorVerdict, SendSurface,
+        decide_from_verdict, gate_with_attribution,
+    };
+
+    fn sample_ctx() -> AttributedSendContext {
+        AttributedSendContext {
+            account_domain: Some("martin.fm".into()),
+            recipient_domains: vec!["acme.example".into()],
+            recipient_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn send_req(declared: &[&str]) -> GovernorRequest {
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        GovernorRequest::from_context_with_declared(
+            "acc1",
+            "Subject",
+            SendSurface::Cli,
+            Some("d1"),
+            &[],
+            &sample_ctx(),
+            &declared,
+            true,
+        )
+    }
+
+    fn required_cfg() -> GovernorConfig {
+        GovernorConfig {
+            mode: GovernorMode::Required,
+            bin: "/nonexistent/governor-binary-xyz".to_string(),
+        }
+    }
+
+    fn deferred_attribution() -> Value {
+        let res = resolve(&["informational".to_string()], &sample_ctx(), true);
+        success_attribution_block(&res, None, None, true)
+    }
+
+    #[test]
+    fn send_output_schema_admits_every_real_builder_variant() {
+        let schema = send_output_schema();
+        let attachments =
+            json!([{"filename": "a.pdf", "content_type": "application/pdf", "size": 3}]);
+        let ui = json!({ "draft": "/x" });
+
+        // Envelope success variants, built through the SAME `send_body` builders
+        // the handlers emit — including the CLI `--at` scheduled shape
+        // ({scheduled, send_at}) the old handwritten fixtures missed.
+        let mut variants = vec![
+            send_body::cli_drafted(
+                json!("draft-only"),
+                "d1",
+                "to@example.test",
+                "Subject",
+                attachments.clone(),
+                ui.clone(),
+            ),
+            send_body::cli_queued(
+                json!("autonomous-send"),
+                "d1",
+                "2026-08-08T00:02:00Z",
+                60,
+                envelope_email_transport::outbound::OUTBOX_COOLDOWN_REASON_CODE,
+                envelope_email_transport::outbound::OUTBOX_COOLDOWN_REASON,
+                attachments.clone(),
+                deferred_attribution(),
+                ui.clone(),
+            ),
+            send_body::cli_scheduled_at(
+                "d1",
+                "2026-08-09T09:00:00Z",
+                attachments.clone(),
+                deferred_attribution(),
+                ui.clone(),
+            ),
+        ];
+
+        // Real refusal responses (attribution required/invalid/unverifiable,
+        // Governor review/deny/unavailable), each the exact `{status, error}` a
+        // handler returns, wrapped with the `ui` the CLI adds.
+        for outcome in [
+            gate_with_attribution(&required_cfg(), &send_req(&[])), // attributes_required
+            gate_with_attribution(&required_cfg(), &send_req(&["not_a_real_key"])), // attributes_invalid
+            gate_with_attribution(&required_cfg(), &send_req(&["known_contact"])), // host_verification_unavailable
+            gate_with_attribution(&required_cfg(), &send_req(&["informational"])), // governor_unavailable
+            decide_from_verdict(
+                GovernorMode::Required,
+                GovernorVerdict {
+                    decision: "review".into(),
+                    state: Some("review".into()),
+                    review_ticket_id: Some("t1".into()),
+                },
+            ),
+            decide_from_verdict(
+                GovernorMode::Required,
+                GovernorVerdict {
+                    decision: "deny".into(),
+                    state: Some("deny".into()),
+                    review_ticket_id: None,
+                },
+            ),
+        ] {
+            let mut resp = outcome.response_json();
+            if let Value::Object(map) = &mut resp {
+                map.insert("ui".into(), ui.clone());
+            }
+            variants.push(resp);
+        }
+
+        for v in variants {
+            let errs = schema_violations(&schema, &v);
+            assert!(
+                errs.is_empty(),
+                "send variant {v} violated schema: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sent_copy_schema_admits_real_send_draft_and_reply_builder_variants() {
+        let schema = sent_copy_output_schema();
+        let ui = json!({ "draft": "/x" });
+
+        let mut variants = vec![
+            // MCP send_draft / reply queued (scheduled) acceptance — `sent:false`.
+            send_body::draft_scheduled(
+                true,
+                "d1",
+                "2026-08-08T00:02:00Z",
+                60,
+                deferred_attribution(),
+                ui.clone(),
+            ),
+            // CLI `draft send` queued acceptance — no `sent` flag.
+            send_body::draft_scheduled(
+                false,
+                "d1",
+                "2026-08-08T00:02:00Z",
+                60,
+                deferred_attribution(),
+                ui.clone(),
+            ),
+            // MCP send_draft draft-only ceiling outcome.
+            send_body::mcp_drafted(json!("draft-only"), "d1", ui.clone()),
+        ];
+
+        // Real refusal responses returned by send_draft/reply verbatim.
+        for outcome in [
+            gate_with_attribution(&required_cfg(), &send_req(&[])),
+            gate_with_attribution(&required_cfg(), &send_req(&["not_a_real_key"])),
+        ] {
+            variants.push(outcome.response_json());
+        }
+
+        for v in variants {
+            let errs = schema_violations(&schema, &v);
+            assert!(
+                errs.is_empty(),
+                "sent_copy variant {v} violated schema: {errs:?}"
+            );
+        }
+    }
+
+    /// The refusal builders emit the exact stable codes the schema documents,
+    /// including the host-verification-unavailable per-key code and the
+    /// top-level attribution codes — real values, not asserted from a fixture.
+    #[test]
+    fn real_refusal_outcomes_carry_the_documented_stable_codes() {
+        // attributes_required (no declaration).
+        let req = gate_with_attribution(&required_cfg(), &send_req(&[]));
+        assert_eq!(req.status_str(), "invalid");
+        assert_eq!(req.block_code.as_deref(), Some("attributes_required"));
+
+        // attributes_invalid with a host-derived key Envelope cannot observe →
+        // the per-key host_verification_unavailable code (added to the contract).
+        let unverifiable = gate_with_attribution(&required_cfg(), &send_req(&["known_contact"]));
+        assert_eq!(
+            unverifiable.block_code.as_deref(),
+            Some("attributes_invalid")
+        );
+        let per_key: Vec<String> = unverifiable
+            .resolution
+            .as_ref()
+            .unwrap()
+            .rejected_attrs
+            .iter()
+            .map(|r| r.code.clone())
+            .collect();
+        assert!(
+            per_key.iter().any(|c| c == "host_verification_unavailable"),
+            "expected host_verification_unavailable, got {per_key:?}"
+        );
+    }
+
+    /// The `attributes` input schema advertises exactly the runtime-submittable
+    /// keys: `minItems: 1`, every declarable + host-derived key present, and the
+    /// two attestation-only keys excluded.
+    #[test]
+    fn attributes_schema_matches_runtime_submittable_keys() {
+        let schema = attributes_schema();
+        assert_eq!(schema["minItems"], json!(1), "a declaration is required");
+        let enum_vals: Vec<String> = schema["items"]["enum"]
+            .as_array()
+            .expect("enum")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        // Every submittable runtime key is advertised.
+        for key in envelope_email_transport::governor_catalog::agent_submittable_keys() {
+            assert!(enum_vals.contains(&key), "missing submittable key `{key}`");
+        }
+        // A host-derived key is advertised (the old schema listed only the six
+        // author-context keys).
+        assert!(
+            enum_vals.iter().any(|k| k == "has_attachment"),
+            "host-derived keys must be submittable"
+        );
+        // Attestation-only keys are never submittable.
+        for key in ["tyler_approved", "authorized_campaign"] {
+            assert!(
+                !enum_vals.iter().any(|k| k == key),
+                "attestation key `{key}` must be unrepresentable"
+            );
+        }
+    }
+
+    #[test]
+    fn actual_send_tools_require_a_nonempty_attributes_declaration() {
+        // v2: send/reply/send_draft advertise `attributes` as required, and the
+        // reply schema declares the bypass params it actually reads.
+        let send = surface("send").expect("send surface");
+        let send_required: Vec<&str> = send["input_schema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            send_required.contains(&"attributes"),
+            "send requires attributes"
+        );
+
+        let reply = mcp_only_inputs()
+            .into_iter()
+            .find(|(n, _, _)| *n == "reply")
+            .expect("reply");
+        let reply_props = &reply.1["properties"];
+        for p in ["cooldown_seconds", "send_now", "confirm_send_now"] {
+            assert!(
+                reply_props[p].is_object(),
+                "reply schema must declare `{p}` (the handler reads it)"
+            );
+        }
+        let reply_required: Vec<&str> = reply.1["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            reply_required.contains(&"attributes"),
+            "reply requires attributes"
+        );
+
+        let send_draft = mcp_only_inputs()
+            .into_iter()
+            .find(|(n, _, _)| *n == "send_draft")
+            .expect("send_draft");
+        let sd_required: Vec<&str> = send_draft.1["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            sd_required.contains(&"attributes"),
+            "send_draft requires attributes"
+        );
+    }
+
+    #[test]
+    fn no_undeclared_attrs_alias_in_any_input_schema() {
+        // The undeclared `attrs` alias is gone: only `attributes` is a parameter.
+        for name in ["send", "reply", "send_draft"] {
+            let s = surface(name).unwrap_or_else(|| {
+                mcp_only_inputs()
+                    .into_iter()
+                    .find(|(n, _, _)| *n == name)
+                    .map(|(_, input, _)| json!({ "input_schema": input }))
+                    .expect("surface")
+            });
+            let props = &s["input_schema"]["properties"];
+            assert!(
+                props.get("attrs").is_none(),
+                "{name} must not declare `attrs`"
+            );
+            assert!(
+                props["attributes"].is_object(),
+                "{name} declares `attributes`"
+            );
+        }
     }
 }

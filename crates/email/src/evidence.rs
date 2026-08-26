@@ -1198,7 +1198,11 @@ pub fn message_record_from_rfc822(input: EvidenceMessageInput<'_>) -> EvidenceMe
     });
     let references = parsed
         .as_ref()
-        .and_then(|message| message.references().as_text().map(extract_message_ids))
+        .and_then(|message| {
+            crate::threading::references_header(message)
+                .as_deref()
+                .map(extract_message_ids)
+        })
         .unwrap_or_default();
     let rfc822_date = parsed
         .as_ref()
@@ -1258,7 +1262,11 @@ pub fn header_thread_message_from_rfc822(uid: u32, rfc822: &[u8]) -> HeaderThrea
         }),
         references: parsed
             .as_ref()
-            .and_then(|message| message.references().as_text().map(extract_message_ids))
+            .and_then(|message| {
+                crate::threading::references_header(message)
+                    .as_deref()
+                    .map(extract_message_ids)
+            })
             .unwrap_or_default(),
         subject: parsed
             .as_ref()

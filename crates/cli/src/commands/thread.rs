@@ -28,7 +28,7 @@ pub async fn run_show(
         None => {
             // Thread not found — try building threads first
             eprintln!("Thread data not found for UID {uid}. Building threads...");
-            envelope_email_transport::threading::build_threads(&creds, &db, 200)
+            envelope_email_transport::threading::build_threads(&creds, &db, 200, false)
                 .await
                 .context("failed to build threads")?;
 
@@ -196,19 +196,25 @@ pub async fn run_list(
 pub async fn run_build(
     account: Option<&str>,
     limit: u32,
+    rebuild: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
 
     if !json {
+        let mode = if rebuild {
+            "re-reading from the start of each folder"
+        } else {
+            "scanning only what arrived since the last build"
+        };
         eprintln!(
-            "Building threads for {} (scanning up to {limit} messages per folder)...",
+            "Building threads for {} ({mode}, up to {limit} messages per folder)...",
             creds.account.username,
         );
     }
 
-    let result = envelope_email_transport::threading::build_threads(&creds, &db, limit)
+    let result = envelope_email_transport::threading::build_threads(&creds, &db, limit, rebuild)
         .await
         .context("failed to build threads")?;
 

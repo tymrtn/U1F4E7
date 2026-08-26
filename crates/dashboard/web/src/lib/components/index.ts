@@ -9,6 +9,7 @@ export { default as Toast } from './Toast.svelte';
 export { default as Rail } from './Rail.svelte';
 export { default as AccountDrawer } from './AccountDrawer.svelte';
 export { default as ComposerDrawer } from './ComposerDrawer.svelte';
+export { default as DraftComposer } from './DraftComposer.svelte';
 export { default as UndoToast } from './UndoToast.svelte';
 export { default as AgentCard } from './AgentCard.svelte';
 export { default as ApprovalRow } from './ApprovalRow.svelte';

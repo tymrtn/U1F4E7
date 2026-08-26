@@ -97,6 +97,28 @@ impl Draft {
     /// human acted on. Agent-created state alone (a `created_by` of
     /// `agent`/`mcp`, agent-written threading metadata, etc.) never satisfies
     /// this — approval requires the explicit attestation object.
+    /// Message-IDs this draft previously carried on the provider, oldest first.
+    ///
+    /// Each edit re-APPENDs the draft under a new Message-ID. The replace path
+    /// deletes the old copy first, but that deletion can fail or be interrupted,
+    /// and drafts edited before this was tracked already have orphans on the
+    /// server. Post-send cleanup uses these to remove copies the current
+    /// identity would miss — every one still header-verified before deletion.
+    pub fn superseded_message_ids(&self) -> Vec<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(crate::drafts::SUPERSEDED_MESSAGE_IDS))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn human_approved(&self) -> bool {
         let Some(attestation) = self.metadata.as_ref().and_then(|m| m.get("human_approval")) else {
             return false;
@@ -167,6 +189,17 @@ impl DraftStatus {
 
     pub fn is_editable(&self) -> bool {
         matches!(self, Self::Draft | Self::PendingReview | Self::Blocked)
+    }
+
+    /// Whether a row in this status may be (re-)queued for send by the atomic
+    /// queue CAS. Only `draft` and the deliberately supported `pending_review`
+    /// recovery path are queueable. `blocked` is intentionally excluded even
+    /// though it is [`Self::is_editable`]: a Governor-denied row must never be
+    /// resurrected into a due `draft` by a re-queue — deny "must not be retried
+    /// unchanged". A blocked draft first needs a material edit (which clears the
+    /// block via the human review surfaces), not a silent re-schedule.
+    pub fn is_queueable(&self) -> bool {
+        matches!(self, Self::Draft | Self::PendingReview)
     }
 }
 
@@ -251,6 +284,22 @@ pub struct StoredLicense {
     pub activated_at: String,
 }
 
+/// Canonical form of a Message-ID for use as a tag/score lookup key.
+///
+/// IMAP `ENVELOPE` returns the Message-ID wrapped in angle brackets
+/// (`<id@host>`), while the full-message path (`mail_parser`) and the persisted
+/// `message_scores` / `tags` rows store the bare id. Strip one surrounding pair
+/// of angle brackets and trim so summary, full-message, and persistence keys
+/// all agree. A value with no surrounding brackets is returned trimmed and
+/// unchanged.
+pub fn canonical_message_id(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    match trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        Some(inner) => inner.trim(),
+        None => trimmed,
+    }
+}
+
 /// Summary of an IMAP message (envelope data, no body).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSummary {
@@ -262,6 +311,12 @@ pub struct MessageSummary {
     pub date: Option<String>,
     pub flags: Vec<String>,
     pub size: u32,
+    /// Provider spam score derived from the summary FETCH's header fields
+    /// (`X-Migadu-Spam-Score` / `X-Spam-Score`). Internal rule-engine signal
+    /// only: `#[serde(skip)]` keeps it out of `envelope search` / `inbox`
+    /// JSON and the flattened dashboard read model.
+    #[serde(skip)]
+    pub provider_spam: Option<f64>,
 }
 
 /// Input for updating the local dashboard message-summary read model.
@@ -293,6 +348,9 @@ pub struct IndexedMessageSummary {
     pub thread_id: Option<String>,
     pub indexed_at: Option<String>,
     pub freshness: String,
+    /// Parsed message date as unix seconds; None when the header date was
+    /// absent or unreadable. The unified cap and keyset cursor order on this.
+    pub date_epoch: Option<i64>,
 }
 
 /// Per-account cached summary freshness shown by aggregate dashboard surfaces.
@@ -330,6 +388,12 @@ pub struct Message {
     pub references: Option<String>,
     pub flags: Vec<String>,
     pub attachments: Vec<AttachmentMeta>,
+    /// Provider spam score derived from the fetched message headers
+    /// (`X-Migadu-Spam-Score` / `X-Spam-Score`). Internal rule-engine signal
+    /// only: `#[serde(skip)]` keeps it out of the message JSON emitted by
+    /// `envelope read` and dashboard message views.
+    #[serde(skip)]
+    pub provider_spam: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +460,13 @@ pub struct ThreadMessage {
     pub from_address: Option<String>,
     /// Comma-separated list of recipient addresses.
     pub to_addresses: Option<String>,
+    /// Comma-separated `Cc` recipients, when the scan saw the header.
+    /// `None` on rows cached before Envelope retained Cc.
+    pub cc_addresses: Option<String>,
+    /// Comma-separated `Bcc` recipients, when the scan saw the header — only
+    /// the sender's own copy of an outbound message carries one. `None` on
+    /// rows cached before Envelope retained Bcc.
+    pub bcc_addresses: Option<String>,
     /// ISO 8601 datetime of the message's `Date:` header.
     pub date: Option<String>,
     /// Subject as it appeared on this specific message (before normalization).
@@ -624,6 +695,7 @@ mod tests {
             references: None,
             flags: vec!["Seen".to_string()],
             attachments: vec![],
+            provider_spam: None,
         };
 
         let serialized = serde_json::to_string(&msg).expect("serialize");
@@ -631,5 +703,65 @@ mod tests {
         let reparsed: Message = serde_json::from_str(&serialized).expect("strict parse");
         assert_eq!(reparsed.text_body, msg.text_body);
         assert_eq!(reparsed.to_addrs, msg.to_addrs);
+    }
+
+    #[test]
+    fn canonical_message_id_strips_surrounding_brackets() {
+        // Bracketed IMAP ENVELOPE form normalizes to the bare persisted form.
+        assert_eq!(canonical_message_id("<id@host>"), "id@host");
+        assert_eq!(canonical_message_id("  <id@host>  "), "id@host");
+        assert_eq!(canonical_message_id("< id@host >"), "id@host");
+        // Already-bare id is unchanged (mail_parser / persistence form).
+        assert_eq!(canonical_message_id("id@host"), "id@host");
+        // Malformed / one-sided brackets are left as-is (still won't match, but
+        // never silently mangled).
+        assert_eq!(canonical_message_id("<id@host"), "<id@host");
+        assert_eq!(canonical_message_id(""), "");
+    }
+
+    /// The internal `provider_spam` rule-engine signal must never leak into the
+    /// public JSON emitted by `envelope search` / `inbox` / `read`.
+    #[test]
+    fn provider_spam_is_never_serialized() {
+        let summary = MessageSummary {
+            uid: 1,
+            message_id: Some("<m@example.com>".to_string()),
+            from_addr: "a@example.com".to_string(),
+            to_addr: "b@example.com".to_string(),
+            subject: "hi".to_string(),
+            date: None,
+            flags: vec![],
+            size: 10,
+            provider_spam: Some(7.5),
+        };
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(
+            !json.contains("provider_spam"),
+            "MessageSummary JSON must not expose provider_spam: {json}"
+        );
+
+        let msg = Message {
+            uid: 1,
+            message_id: None,
+            from_addr: "a@example.com".to_string(),
+            to_addr: "b@example.com".to_string(),
+            cc_addr: None,
+            to_addrs: vec![],
+            cc_addrs: vec![],
+            subject: "hi".to_string(),
+            date: None,
+            text_body: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            flags: vec![],
+            attachments: vec![],
+            provider_spam: Some(7.5),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize message");
+        assert!(
+            !json.contains("provider_spam"),
+            "Message JSON must not expose provider_spam: {json}"
+        );
     }
 }

@@ -103,7 +103,7 @@ pub async fn send(
 
     let attachment_snapshots = attachment_snapshots(&req.attachments, &attachments);
     let (cooldown, send_at) = cooldown_send_after();
-    let draft = {
+    let (draft, attribution) = {
         let db = state.db.lock().await;
         let draft = match db.create_draft(
             &creds.account.id,
@@ -139,16 +139,26 @@ pub async fn send(
                 return (StatusCode::BAD_GATEWAY, format!("queue reload: {e}")).into_response();
             }
         };
-        if let Err(e) = db.queue_draft_with_human_approval(
+        // The atomic queue returns the exact attested row — no reload, no
+        // fallback to pre-attestation state. If it cannot be obtained the queue
+        // failed, so fail the request rather than report success off stale state.
+        let attested = match db.queue_draft_with_human_approval(
             &current.id,
             current.revision,
             &send_at,
             "human:dashboard",
             &crate::timefmt::utc_now_string(),
         ) {
-            return (StatusCode::BAD_GATEWAY, format!("queue approval: {e}")).into_response();
-        }
-        draft
+            Ok(attested) => attested,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("queue approval: {e}")).into_response();
+            }
+        };
+        // The additive human-origin attribution block (tyler_approved derived; no
+        // fabricated bot declaration) is built from the attested row, deriving
+        // attachment facts and the account domain exactly as the sweep will.
+        let attribution = crate::human_queue_attribution_block(&attested, &creds.account.username);
+        (draft, attribution)
     };
 
     state
@@ -165,6 +175,7 @@ pub async fn send(
         "draft_id": draft.id,
         "send_after": send_at,
         "cooldown_seconds": cooldown,
+        "attribution": attribution,
     }))
     .into_response()
 }
@@ -238,7 +249,7 @@ pub async fn reply(
 
     let attachment_snapshots = attachment_snapshots(&req.attachments, &attachments);
     let (cooldown, send_at) = cooldown_send_after();
-    let draft = {
+    let (draft, attribution) = {
         let db = state.db.lock().await;
         let draft = match db.create_draft(
             &creds.account.id,
@@ -293,20 +304,26 @@ pub async fn reply(
                     .into_response();
             }
         };
-        if let Err(e) = db.queue_draft_with_human_approval(
+        // The atomic queue returns the exact attested row — no reload, no
+        // fallback to pre-attestation state.
+        let attested = match db.queue_draft_with_human_approval(
             &current.id,
             current.revision,
             &send_at,
             "human:dashboard",
             &crate::timefmt::utc_now_string(),
         ) {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("queue reply approval: {e}"),
-            )
-                .into_response();
-        }
-        draft
+            Ok(attested) => attested,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("queue reply approval: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        let attribution = crate::human_queue_attribution_block(&attested, &creds.account.username);
+        (draft, attribution)
     };
 
     state
@@ -325,6 +342,7 @@ pub async fn reply(
         "cooldown_seconds": cooldown,
         "in_reply_to": headers.in_reply_to,
         "references": headers.references,
+        "attribution": attribution,
     }))
     .into_response()
 }

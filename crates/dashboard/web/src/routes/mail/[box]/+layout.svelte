@@ -14,13 +14,19 @@
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
+  import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
+  import { folderHints } from '$lib/folder-hints.svelte';
   import { SelectionStore } from '$lib/selection.svelte';
+  import { readState } from '$lib/read-state.svelte';
   import { getLiveStore } from '$lib/live.svelte';
   import { getComposerStore } from '$lib/composer.svelte';
+  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+  import { parseSearchQuery } from '$lib/search-query';
   import {
     api,
     EnvelopeApiError,
     type UnifiedInboxMessage,
+    type UnifiedNextCursor,
     type UnifiedInboxError,
     type Draft,
     type SnoozedItem,
@@ -37,6 +43,20 @@
   const selectedAccount = $derived(page.params.account ?? null);
 
   const selection = new SelectionStore();
+
+  // ── Mailbox-ops signal ────────────────────────────────────────────
+  // The reader (nested route, no prop channel) announces archive / trash /
+  // delete / star through this shared store. Re-run the same refresh
+  // BulkToolbar triggers via `onoperated`, so the moved row disappears from the
+  // mounted list. Version-compare so a route change alone never re-fetches.
+  const mailboxOps = getMailboxOpsStore();
+  let seenOpsVersion = 0;
+  $effect(() => {
+    const v = mailboxOps.version;
+    if (v === seenOpsVersion) return;
+    seenOpsVersion = v;
+    void handleOperated();
+  });
 
   // ── SSE live store ────────────────────────────────────────────────
   // Started once on mount (onMount guard prevents SSR). When the stream is
@@ -55,6 +75,8 @@
   let undoToast = $state<{ res: ComposeResponse; accountId: string } | null>(null);
 
   let unifiedMessages = $state<UnifiedInboxMessage[]>([]);
+  let unifiedNextCursor = $state<UnifiedNextCursor | null>(null);
+  let unifiedLoadingMore = $state(false);
   let drafts = $state<Draft[]>([]);
   let snoozed = $state<SnoozedItem[]>([]);
   let listErrors = $state<UnifiedInboxError[]>([]);
@@ -63,26 +85,144 @@
   let loadedBox = $state<string | null>(null);
   let folders = $state<FolderStats[]>([]);
 
+  /** A search hit tagged with the account and folder it was actually found in
+   *  — the per-account search endpoint returns neither, so both are attached
+   *  here as results are merged. Bulk actions and navigation both need the real
+   *  identity, never a placeholder. */
+  type SearchHit = SearchMessageSummary & { account_id: string; folder: string };
+
+  /** The mailbox `runSearch` searches. Tagged onto every hit so links and bulk
+   *  dispatch name the folder the UIDs are actually scoped to, rather than
+   *  assuming INBOX at each use site. */
+  const SEARCH_FOLDER = 'INBOX';
+
+  /** BulkToolbar's `messageIndex` entry shape — the message's real identity
+   *  (account/uid) plus the context junk-rules/snooze need. */
+  type MsgIndexEntry = {
+    accountId: string;
+    uid: number;
+    from: string;
+    folder: string;
+    message_id: string | null;
+    subject: string | null;
+  };
+
   const searchQuery = $derived(page.url.searchParams.get('q') ?? '');
-  let searchResults = $state<SearchMessageSummary[]>([]);
+  let searchResults = $state<SearchHit[]>([]);
   let searching = $state(false);
   let searchError = $state<string | null>(null);
+  /** Accounts that failed or timed out in the current search run (usernames). */
+  let searchFailures = $state<string[]>([]);
+  /** 'all' or a single account id — narrows the fan-out. */
+  let searchScope = $state<string>('all');
+  let searchGen = 0;
+  let searchAbort: AbortController | null = null;
   const isSearching = $derived(searchQuery.length > 0);
 
   let starOverrides = $state<Map<string, boolean>>(new Map());
+  let unifiedLoadGen = 0;
+  let unifiedRefreshInFlight = false;
+
+  // ── Where the open message sits in the list ───────────────────────
+  // The unified list is a flat merge of every account, so "which one am I
+  // reading, and where is it?" is not answerable from the reader alone. This
+  // drives both the "4 of 50" readout and the scroll-into-view below; it is
+  // null when the deep link names a message older than the loaded page.
+  const selectedPosition = $derived(
+    box?.slug === 'unified' && !isSearching
+      ? positionOf(unifiedMessages, selectedAccount, selectedUid)
+      : null
+  );
+
+  // Bring the open message into view when a deep link lands on a row that is
+  // scrolled out of sight. Keyed on the row's identity, so re-running the
+  // effect for an unrelated list update does not yank the viewport around.
+  let lastScrolledKey: string | null = null;
+  $effect(() => {
+    const key =
+      selectedAccount !== null && selectedUid !== null
+        ? `${selectedAccount}:${selectedUid}`
+        : null;
+    if (!key || selectedPosition === null) {
+      if (key === null) lastScrolledKey = null;
+      return;
+    }
+    if (key === lastScrolledKey) return;
+    const row = document.querySelector(
+      `#unified-msg-list [data-msg-key="${CSS.escape(key)}"]`
+    );
+    if (!row) return;
+    lastScrolledKey = key;
+    row.scrollIntoView({ block: 'nearest' });
+  });
+
+  function applyUnified(res: {
+    messages: UnifiedInboxMessage[];
+    errors?: UnifiedInboxError[];
+    next_cursor?: UnifiedNextCursor | null;
+  }) {
+    unifiedMessages = res.messages;
+    unifiedNextCursor = res.next_cursor ?? null;
+    listErrors = res.errors ?? [];
+    // Record the mailbox each row came from, so a reader link that lost its
+    // `?folder=` can still resolve one instead of guessing INBOX.
+    folderHints.remember(res.messages);
+  }
+
+  /** Fetch the next unified page with the keyset cursor and append it.
+   *  Deduped by account:uid so an overlap between pages can never render a
+   *  message twice; order is preserved (the server continues the same total
+   *  order the current tail ends on). */
+  async function loadMoreUnified() {
+    const cursor = unifiedNextCursor;
+    if (!cursor || unifiedLoadingMore) return;
+    unifiedLoadingMore = true;
+    try {
+      const res = await api.unifiedInbox(50, cursor);
+      const seen = new Set(unifiedMessages.map((m) => `${m.account_id}:${m.uid}`));
+      const fresh = res.messages.filter((m) => !seen.has(`${m.account_id}:${m.uid}`));
+      unifiedMessages = [...unifiedMessages, ...fresh];
+      unifiedNextCursor = res.next_cursor ?? null;
+      folderHints.remember(fresh);
+    } catch {
+      // Keep the loaded rows; the button stays for a retry.
+    } finally {
+      unifiedLoadingMore = false;
+    }
+  }
+
+  async function refreshStaleUnified(gen: number) {
+    if (unifiedRefreshInFlight) return;
+    unifiedRefreshInFlight = true;
+    try {
+      const refreshed = await api.refreshUnifiedInbox(50);
+      if (gen !== unifiedLoadGen) return;
+      applyUnified(refreshed);
+    } catch {
+      // Keep the painted cache. A failed refresh must not blank the list.
+    } finally {
+      unifiedRefreshInFlight = false;
+    }
+  }
 
   async function loadUnified() {
-    loading = true;
+    const gen = ++unifiedLoadGen;
+    loading = unifiedMessages.length === 0;
     error = null;
     try {
       const res = await api.unifiedInbox(50);
-      unifiedMessages = res.messages;
-      listErrors = res.errors ?? [];
+      if (gen !== unifiedLoadGen) return;
+      applyUnified(res);
+      loading = false;
+      if (unifiedNeedsRefresh(res)) {
+        await refreshStaleUnified(gen);
+      }
     } catch (e) {
+      if (gen !== unifiedLoadGen) return;
       const err = e as EnvelopeApiError;
       error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load messages.' };
     } finally {
-      loading = false;
+      if (gen === unifiedLoadGen) loading = false;
     }
   }
 
@@ -166,36 +306,103 @@
 
   $effect(() => {
     const q = searchQuery;
+    const scope = searchScope;
+    // A search query change swaps the result set under any selection —
+    // stale hidden selections from the prior list/query must never persist
+    // to act against messages the operator can no longer see.
+    selection.clear();
     if (!q) {
+      searchAbort?.abort();
+      searchGen += 1;
+      searching = false;
       searchResults = [];
       searchError = null;
+      searchFailures = [];
       return;
     }
-    runSearch(q);
+    runSearch(q, scope);
   });
 
-  async function runSearch(q: string) {
+  /** Per-account IMAP search timeout. An account that cannot answer within
+   *  this window is reported as unreachable instead of pinning the spinner —
+   *  the sweep found "Searching…" running 90–150s against slow providers. */
+  const SEARCH_ACCOUNT_TIMEOUT_MS = 10_000;
+  /** In-flight per-account searches at once. 25 simultaneous IMAP SELECTs
+   *  saturated the server (post-search navigation timed out); a small pool
+   *  keeps the box responsive while the fan-out drains. */
+  const SEARCH_CONCURRENCY = 4;
+
+  async function runSearch(q: string, scope: string) {
+    const gen = ++searchGen;
+    searchAbort?.abort();
+    const abort = new AbortController();
+    searchAbort = abort;
+
     searching = true;
     searchError = null;
+    searchFailures = [];
+    searchResults = [];
+
+    const { imap } = parseSearchQuery(q);
+    if (!imap) {
+      searching = false;
+      return;
+    }
+
     try {
       const { accounts } = await api.listAccounts();
-      const merged: SearchMessageSummary[] = [];
-      await Promise.all(
-        accounts.map(async (acct) => {
-          try {
-            const res = await api.searchMessages(acct.id, q);
-            merged.push(...res.messages);
-          } catch {
-            // partial ok
-          }
-        })
-      );
-      searchResults = merged;
+      if (gen !== searchGen) return;
+      const targets = scope === 'all' ? accounts : accounts.filter((a) => a.id === scope);
+
+      const seen = new Set<string>();
+      const failures: string[] = [];
+
+      const searchOne = async (acct: Account) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const res = await Promise.race([
+            api.searchMessages(acct.id, imap, SEARCH_FOLDER, 50, { signal: abort.signal }),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                reject(new Error('timed out'));
+              }, SEARCH_ACCOUNT_TIMEOUT_MS);
+            })
+          ]);
+          if (gen !== searchGen) return;
+          // Results render as each account lands; identity-keyed dedupe means a
+          // hit can never appear twice no matter how responses interleave.
+          const fresh = res.messages
+            .map((m) => ({ ...m, account_id: acct.id, folder: SEARCH_FOLDER }))
+            .filter((m) => {
+              const key = `${m.account_id}:${m.folder}:${m.uid}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          if (fresh.length > 0) searchResults = [...searchResults, ...fresh];
+        } catch {
+          if (gen === searchGen) failures.push(acct.username || acct.name || acct.id);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
+      const queue = [...targets];
+      const workers = Array.from({ length: Math.min(SEARCH_CONCURRENCY, queue.length) }, async () => {
+        while (queue.length > 0 && gen === searchGen) {
+          const acct = queue.shift()!;
+          await searchOne(acct);
+        }
+      });
+      await Promise.all(workers);
+      if (gen !== searchGen) return;
+      searchFailures = failures;
     } catch (e) {
+      if (gen !== searchGen) return;
       const err = e as EnvelopeApiError;
       searchError = err.message ?? 'Search failed.';
     } finally {
-      searching = false;
+      if (gen === searchGen) searching = false;
     }
   }
 
@@ -231,12 +438,72 @@
     unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
   );
   const orderedSearchKeys = $derived(
-    searchResults.map((m, i) => `search:${i}:${m.uid}`)
+    searchResults.map((m) => `search:${m.account_id}:${m.uid}`)
   );
 
   const currentFolder = $derived(
     page.params.box === 'unified' ? 'INBOX' : 'INBOX'
   );
+  // Retry payloads are valid only inside the mailbox/search context that
+  // created them. Loading within the same context keeps the component mounted;
+  // changing mailbox or query remounts it and drops stale toasts/caches.
+  const toolbarContextKey = $derived(`${page.params.box ?? 'unified'}\0${searchQuery}`);
+
+  // Per-message context the toolbar needs for truthful junk-rules (exact
+  // sender), snooze (message-id/subject for the round-trip), and per-item folder
+  // dispatch. The unified inbox carries each row's real source folder, so use it
+  // rather than assuming the route folder — a unified surface can span mailboxes.
+  const unifiedMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const m of unifiedMessages) {
+      idx[`${m.account_id}:${m.uid}`] = {
+        accountId: m.account_id,
+        uid: m.uid,
+        from: m.from_addr ?? '',
+        folder: m.folder ?? 'INBOX',
+        message_id: m.message_id ?? null,
+        subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
+  /** Search hits carry their own real account and the folder the search ran
+   *  against (both tagged in `runSearch`): search fans out across every account
+   *  while staying inside `SEARCH_FOLDER`, so bulk actions must dispatch against
+   *  each hit's actual identity. */
+  const searchMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const m of searchResults) {
+      idx[`search:${m.account_id}:${m.uid}`] = {
+        accountId: m.account_id,
+        uid: m.uid,
+        from: m.from_addr ?? '',
+        folder: m.folder,
+        message_id: m.message_id ?? null,
+        subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
+  /** A snoozed message physically resides in `snoozed_folder` until the sweep
+   *  returns it — bulk actions (archive/flag/move/etc.) must target that real
+   *  current location, not `original_folder` (where it isn't right now). */
+  const snoozedMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const s of snoozed) {
+      idx[`snoozed:${s.account_id}:${s.uid}`] = {
+        accountId: s.account_id,
+        uid: s.uid,
+        from: s.from_addr ?? '',
+        folder: s.snoozed_folder,
+        message_id: s.message_id ?? null,
+        subject: s.subject ?? null,
+      };
+    }
+    return idx;
+  });
 
   async function handleOperated() {
     const slug = page.params.box ?? 'unified';
@@ -342,7 +609,7 @@
 <svelte:window onkeydown={handleGlobalKey} />
 
 <div class="mail-shell" class:is-reading={selectedUid !== null}>
-  <Rail />
+  <Rail activeAccountId={selectedAccount} />
 
   <section id="msg-list-pane" class="list" aria-label="Message list">
     <header class="pane-head">
@@ -350,13 +617,26 @@
       <div class="pane-head-right">
         {#if box?.wired}
           <span class="pane-count">
-            <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+            {#if selectedPosition}
+              <MonoTag>{selectedPosition.position} of {selectedPosition.total}</MonoTag>
+            {:else}
+              <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+            {/if}
           </span>
           <SearchBar
-            hint="Search {box.label}…"
-            onsubmit={(q) => runSearch(q)}
-            onreset={() => { searchResults = []; searchError = null; }}
+            hint="Search {box.label}… (from: to: subject: is:unread before:)"
+            onreset={() => { searchResults = []; searchError = null; searchFailures = []; }}
           />
+          <select
+            class="search-scope"
+            aria-label="Search scope"
+            bind:value={searchScope}
+          >
+            <option value="all">All accounts</option>
+            {#each allAccounts as acct (acct.id)}
+              <option value={acct.id}>{acct.username || acct.name}</option>
+            {/each}
+          </select>
         {/if}
         <button
           id="compose-btn"
@@ -383,13 +663,26 @@
       {/if}
     </div>
 
-    {#if box?.wired && !loading}
-      <BulkToolbar
-        {selection}
-        folder={currentFolder}
-        {folders}
-        onoperated={handleOperated}
-      />
+    <!-- Drafts have no real IMAP identity (no account/folder/UID — they live
+         in the drafts store, not a mailbox), so mailbox bulk actions (move,
+         flag, junk, delete…) are never exposed there. Search and snoozed DO
+         have a real identity (via searchMessageIndex/snoozedMessageIndex
+         below) and get the toolbar like the unified inbox. -->
+    {#if box?.wired && box.slug !== 'drafts'}
+      {#key toolbarContextKey}
+        <BulkToolbar
+          {selection}
+          folder={currentFolder}
+          {folders}
+          messageIndex={isSearching
+            ? searchMessageIndex
+            : box.slug === 'snoozed'
+              ? snoozedMessageIndex
+              : unifiedMessageIndex}
+          onoperated={handleOperated}
+          {loading}
+        />
+      {/key}
     {/if}
 
     {#if !box}
@@ -419,32 +712,37 @@
       </div>
 
     {:else if isSearching}
-      {#if searching}
+      {#if searchFailures.length > 0}
+        <p class="search-failures" role="status">
+          {searchFailures.length} account{searchFailures.length === 1 ? '' : 's'} didn't respond: {searchFailures.join(', ')}
+        </p>
+      {/if}
+      {#if searching && searchResults.length === 0}
         <div class="list-loading"><Spinner label="Searching" /> <span>Searching…</span></div>
       {:else if searchError}
         <div class="list-error" role="alert">
           <p class="list-error-msg">Search failed.</p>
           <p class="list-error-detail">{searchError}</p>
         </div>
-      {:else if searchResults.length === 0}
+      {:else if searchResults.length === 0 && !searching}
         <EmptyState title="No results" hint="No messages matched your search." />
       {:else}
         <ul id="search-results-list" class="msg-list">
-          {#each searchResults as m, i (`search:${i}:${m.uid}`)}
-            {@const key = `search:${i}:${m.uid}`}
+          {#each searchResults as m (`search:${m.account_id}:${m.uid}`)}
+            {@const key = `search:${m.account_id}:${m.uid}`}
             <li>
               <MessageRow
                 message={{
                   key,
                   uid: m.uid,
-                  accountId: '',
+                  accountId: m.account_id,
                   subject: m.subject,
                   from: m.from_addr,
                   date: m.date,
                   snippet: null,
-                  unread: m.unread,
-                  starred: isStarred(m.uid, '', m.flags),
-                  href: `${base}/mail/${page.params.box}/search/${m.uid}`,
+                  unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
+                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedSearchKeys}
@@ -457,7 +755,7 @@
     {:else if box.slug === 'unified'}
       {#if listErrors.length > 0}
         <p class="list-partial" role="status">
-          {listErrors.length} account(s) couldn't be reached; showing what loaded.
+          {listErrors.length} account{listErrors.length === 1 ? '' : 's'} couldn't be reached: {listErrors.map((e) => e.account_username).join(', ')} — showing what loaded.
         </p>
       {/if}
       {#if unifiedMessages.length === 0}
@@ -480,10 +778,10 @@
                   from: senderLabel(m),
                   date: m.date,
                   snippet: m.snippet,
-                  unread: m.unread,
+                  unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
                   accountChip: m.account_display_name || m.account_username,
-                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}`,
+                  href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedUnifiedKeys}
@@ -493,6 +791,18 @@
             </li>
           {/each}
         </ul>
+        {#if unifiedNextCursor}
+          <div class="load-more-row">
+            <button
+              class="load-more-btn"
+              type="button"
+              disabled={unifiedLoadingMore}
+              onclick={loadMoreUnified}
+            >
+              {unifiedLoadingMore ? 'Loading…' : 'Load more'}
+            </button>
+          </div>
+        {/if}
       {/if}
 
     {:else if box.slug === 'drafts'}
@@ -515,7 +825,7 @@
                   unread: false,
                   starred: false,
                   accountChip: d.account_id,
-                  href: `${base}/mail/drafts/${encodeURIComponent(d.account_id)}/${d.id}`,
+                  href: `${base}/accounts/${encodeURIComponent(d.account_id)}/drafts/${encodeURIComponent(d.id)}`,
                 }}
                 {selection}
                 orderedKeys={drafts.map((x) => `draft:${x.account_id}:${x.id}`)}
@@ -542,10 +852,10 @@
                   from: s.from_addr ?? s.account_id,
                   date: s.snooze_until,
                   snippet: null,
-                  unread: false,
+                  unread: readState.isUnread(s.account_id, s.snoozed_folder, s.uid, false),
                   starred: false,
                   accountChip: s.account_id,
-                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}`,
+                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}?folder=${encodeURIComponent(s.snoozed_folder)}`,
                 }}
                 {selection}
                 orderedKeys={snoozed.map((x) => `snoozed:${x.account_id}:${x.uid}`)}
@@ -772,5 +1082,40 @@
     .pane-head-right {
       justify-content: stretch;
     }
+  }
+  .search-scope {
+    flex-shrink: 0;
+    max-width: 11rem;
+    font: inherit;
+    font-size: 0.8125rem;
+    color: var(--env-ink);
+    background: var(--env-surface);
+    border: 1px solid var(--env-rule);
+    border-radius: var(--radius-sm, 3px);
+    padding: 0.3rem 0.4rem;
+  }
+  .search-failures {
+    margin: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--env-muted);
+  }
+  .load-more-row {
+    display: flex;
+    justify-content: center;
+    padding: 0.6rem 0 1rem;
+  }
+  .load-more-btn {
+    font: inherit;
+    font-size: 0.8125rem;
+    color: var(--env-ink);
+    background: var(--env-surface);
+    border: 1px solid var(--env-rule);
+    border-radius: var(--radius-sm, 3px);
+    padding: 0.35rem 1.1rem;
+    cursor: pointer;
+  }
+  .load-more-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 </style>

@@ -61,6 +61,53 @@ impl Database {
         })
     }
 
+    /// Record a tool call that policy REFUSED, attributed to the agent. The
+    /// audit trail must show what an agent tried and was stopped from doing,
+    /// not only what it did: a denied send is the whole point of the per-agent
+    /// clamp story.
+    pub fn log_denied_action_with_agent(
+        &self,
+        account_id: &str,
+        action_type: &str,
+        reason: &str,
+        agent_id: Option<&str>,
+    ) -> Result<ActionLog> {
+        self.insert_action_log(ActionLogInsert {
+            account_id,
+            action_type,
+            confidence: 1.0,
+            justification: reason,
+            action_taken: "{}",
+            message_id: None,
+            draft_id: None,
+            event_id: None,
+            action_status: "denied",
+            agent_id,
+        })
+    }
+
+    /// Every action attributed to `agent_id` across all accounts, newest first —
+    /// the shape `envelope actions tail --agent <name>` needs when no account is
+    /// given: an agent's trail should not depend on which mailbox it acted in.
+    pub fn list_actions_for_agent_any_account(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ActionLog>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, action_type, confidence, justification, action_taken,
+                    message_id, draft_id, event_id, action_status, created_at
+             FROM action_log
+             WHERE agent_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let actions = stmt
+            .query_map(params![agent_id, limit], map_action_log)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(actions)
+    }
+
     /// Log an action linked to an event, returning the existing record on duplicate.
     pub fn log_action_for_event(&self, input: EventActionLogInput<'_>) -> Result<ActionLog> {
         self.log_action_for_event_with_agent(input, None)
@@ -436,5 +483,75 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert!(first.action_taken.contains("\"actor\":\"agent-a\""));
         assert_eq!(first.action_taken, second.action_taken);
+    }
+
+    // ── audit trail completeness (sweep blocker #6) ─────────────────────
+
+    #[test]
+    fn denied_tool_calls_land_in_the_action_log_with_denied_status() {
+        let db = Database::open_memory().unwrap();
+        let row = db
+            .log_denied_action_with_agent(
+                "acc-1",
+                "send",
+                "agent_policy_denied_action: send",
+                Some("agent-9"),
+            )
+            .unwrap();
+        assert_eq!(row.action_status, "denied");
+        assert_eq!(row.action_type, "send");
+        let listed = db.list_actions_for_agent("acc-1", "agent-9", 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].action_status, "denied");
+    }
+
+    #[test]
+    fn agent_tail_without_an_account_spans_every_account() {
+        let db = Database::open_memory().unwrap();
+        db.log_action_with_agent(
+            "acc-1",
+            "create_reply_draft",
+            1.0,
+            "mcp",
+            "{}",
+            None,
+            None,
+            Some("agent-9"),
+        )
+        .unwrap();
+        db.log_action_with_agent(
+            "acc-2",
+            "send",
+            1.0,
+            "mcp",
+            "{}",
+            None,
+            None,
+            Some("agent-9"),
+        )
+        .unwrap();
+        db.log_action_with_agent(
+            "acc-2",
+            "send",
+            1.0,
+            "mcp",
+            "{}",
+            None,
+            None,
+            Some("agent-other"),
+        )
+        .unwrap();
+        let all = db
+            .list_actions_for_agent_any_account("agent-9", 10)
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "both accounts' rows for agent-9, nobody else's"
+        );
+        assert!(
+            all.iter()
+                .all(|a| a.account_id == "acc-1" || a.account_id == "acc-2")
+        );
     }
 }

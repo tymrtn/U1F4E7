@@ -134,6 +134,7 @@ mod tests {
             references: None,
             flags: vec![],
             attachments: vec![],
+            provider_spam: None,
         }
     }
 

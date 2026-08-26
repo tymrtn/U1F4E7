@@ -23,14 +23,19 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::attribution::{AttributedSendContext, collect_recipient_domains};
+use crate::attribution::{
+    AttributedSendContext, AttributionResolution, AttributionState, collect_recipient_domains,
+    resolve,
+};
+use crate::attribution_suggest::{self, Suggestion};
+use crate::governor_catalog::HONESTY_RULES;
 
 /// Governor catalog Envelope declares its send attributes against. Governor
 /// scores these keys blindly; Envelope never reproduces the catalog's weights.
 pub const GOVERNOR_CATALOG: &str = "envelope";
 
 /// Default actual-send cooldown, in seconds, when nothing overrides it.
-pub const DEFAULT_COOLDOWN_SECONDS: i64 = 120;
+pub const DEFAULT_COOLDOWN_SECONDS: i64 = 60;
 
 /// Stable reason code included when an allowed send is queued instead of
 /// transmitted immediately.
@@ -213,8 +218,21 @@ pub struct GovernorRequest {
     pub attachment_total_bytes: u64,
     pub attachment_types: Vec<String>,
     pub is_reply: bool,
-    /// Canonical Governor envelope-catalog attribute keys this send exhibits.
+    /// Host-**derived** Governor envelope-catalog attribute keys this send
+    /// exhibits (structural/store facts). This is the derived set only; the
+    /// bot's declarations live in [`Self::declared_attrs`] and the validated
+    /// union actually submitted lives in [`Self::resolution`].
     pub attributes: Vec<String>,
+    /// The raw attribute keys the bot **declared** (verbatim, deduped). Empty on
+    /// legacy construction paths.
+    pub declared_attrs: Vec<String>,
+    /// Whether this surface requires at least one factual bot declaration (host
+    /// facts never substitute). `true` for bot-originated actual-send surfaces.
+    pub require_declaration: bool,
+    /// The resolved attribution (declared/derived/governor + rejections + state).
+    /// `None` on legacy paths that predate the attribution protocol; when set,
+    /// [`gate_with_attribution`] enforces it before spawning Governor.
+    pub resolution: Option<AttributionResolution>,
     /// Optional per-agent identity, carried as **audit metadata only**. This is
     /// never added to [`Self::attributes`] and never influences Governor scoring
     /// or any allow/deny decision. Defaults to `None` on every construction path
@@ -316,8 +334,66 @@ impl GovernorRequest {
             attachment_types: types,
             is_reply: ctx.is_reply,
             attributes,
+            declared_attrs: Vec::new(),
+            require_declaration: false,
+            resolution: None,
             agent_id: None,
         }
+    }
+
+    /// Construct a request and resolve the bot's `declared` attributes against
+    /// the derived facts in one step. This is the attribution-protocol path every
+    /// bot-originated actual-send surface uses: it stores the full
+    /// [`AttributionResolution`] so [`gate_with_attribution`] can refuse an
+    /// invalid or unattributed request **before** Governor is spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_context_with_declared(
+        account_id: &str,
+        subject: &str,
+        surface: SendSurface,
+        draft_id: Option<&str>,
+        attachment_sizes: &[(String, u64)],
+        ctx: &AttributedSendContext,
+        declared: &[String],
+        require_declaration: bool,
+    ) -> Self {
+        let mut req = Self::from_context(
+            account_id,
+            subject,
+            surface,
+            draft_id,
+            attachment_sizes,
+            ctx,
+        );
+        let resolution = resolve(declared, ctx, require_declaration);
+        req.declared_attrs = resolution.declared_attrs.clone();
+        req.require_declaration = require_declaration;
+        req.resolution = Some(resolution);
+        req
+    }
+
+    /// A sanitized, content-free one-line description of the action, for the
+    /// recovery `reason`. Contains no address, subject, or body — only shape.
+    pub fn action_echo(&self) -> String {
+        let kind = if self.is_reply {
+            "reply"
+        } else {
+            "new message"
+        };
+        let classes = if self.recipient_classes.is_empty() {
+            "external".to_string()
+        } else {
+            self.recipient_classes.join("+")
+        };
+        let attach = match self.attachment_count {
+            0 => "no attachments".to_string(),
+            1 => "one attachment".to_string(),
+            n => format!("{n} attachments"),
+        };
+        format!(
+            "{kind} to {} {classes} recipient(s), {attach}",
+            self.recipient_count
+        )
     }
 
     /// Attach a per-agent identity as **audit metadata only**.
@@ -338,6 +414,8 @@ impl GovernorRequest {
             "surface": self.surface.as_str(),
             "catalog": GOVERNOR_CATALOG,
             "attributes": self.attributes,
+            "declared_attrs": self.declared_attrs,
+            "require_declaration": self.require_declaration,
             "recipient_count": self.recipient_count,
             "recipient_domains": self.recipient_domains,
             "recipient_classes": self.recipient_classes,
@@ -371,62 +449,529 @@ impl GovernorRequest {
     }
 }
 
-/// Parsed, sanitized outcome of a Governor gate evaluation.
+/// Parsed, sanitized outcome of a gate evaluation.
+///
+/// **No numeric score, weight, or threshold is ever stored or serialized here.**
+/// The Governor route/state is the entire agent-facing and durable contract.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GovernorOutcome {
     /// Whether SMTP is permitted to proceed.
     pub allowed: bool,
     pub mode: GovernorMode,
     /// Raw Governor decision string (`allow`/`deny`/`review`) or a gate-internal
-    /// status (`disabled`/`unavailable`/`unparseable`).
+    /// status (`disabled`/`unavailable`/`unparseable`), or `attributes_required`
+    /// / `attributes_invalid` for a pre-spawn attribute-declaration refusal.
     pub decision: String,
     pub state: Option<String>,
-    pub score: Option<f64>,
     pub review_ticket_id: Option<String>,
     /// Stable denial code when the send is blocked (None when allowed).
     pub block_code: Option<String>,
     pub block_reason: Option<String>,
+    /// `review` or `deny` for a `governor_blocked` outcome (the next-actor signal).
+    pub route: Option<String>,
+    /// The resolved attribution sets/rejections, when the attribution protocol ran.
+    pub resolution: Option<AttributionResolution>,
+    /// Deterministic recovery suggestions (attribution failures / review).
+    pub suggestions: Vec<Suggestion>,
+    /// Originating surface, for surface-specific recovery instructions.
+    pub surface: Option<SendSurface>,
+    /// Sanitized one-line action echo for the recovery `reason`.
+    pub action_echo: Option<String>,
+    /// Whether a real draft was **atomically parked** for human review as part of
+    /// this outcome. Set true ONLY by a caller that successfully performed the
+    /// park transition (see [`Self::with_parked`]). Stateless immediate sends
+    /// leave it `false`, so recovery never claims a nonexistent draft was parked.
+    pub parked: bool,
+    /// The parked draft's id, present only when [`Self::parked`] is true — the
+    /// durable review handle. Never inferred from `draft_id` or the decision.
+    pub parked_draft_id: Option<String>,
 }
 
 impl GovernorOutcome {
-    /// Sanitized JSON for both audit events and agent-facing denial payloads.
+    /// A gate outcome with the attribution-protocol fields defaulted empty. Used
+    /// by the legacy (non-attributed) construction paths.
+    fn bare(
+        allowed: bool,
+        mode: GovernorMode,
+        decision: &str,
+        state: Option<String>,
+        review_ticket_id: Option<String>,
+        block_code: Option<String>,
+        block_reason: Option<String>,
+        route: Option<String>,
+    ) -> Self {
+        Self {
+            allowed,
+            mode,
+            decision: decision.to_string(),
+            state,
+            review_ticket_id,
+            block_code,
+            block_reason,
+            route,
+            resolution: None,
+            suggestions: Vec::new(),
+            surface: None,
+            action_echo: None,
+            parked: false,
+            parked_draft_id: None,
+        }
+    }
+
+    /// Record that a real draft was atomically parked for human review as part of
+    /// this outcome. Only a caller that actually performed the park transition may
+    /// call this — it is what turns the recovery's review branch from "nothing was
+    /// parked" into a truthful parked-draft review handle.
+    pub fn with_parked(mut self, draft_id: &str) -> Self {
+        self.parked = true;
+        self.parked_draft_id = Some(draft_id.to_string());
+        self
+    }
+
+    /// A human clicked Send on the dashboard. Governor does not score or block
+    /// that transmission — the click is the send. Used by the scheduled sweep
+    /// when the claimed row still carries a current `human_approval`.
+    pub fn human_dashboard_send() -> Self {
+        let mut outcome = Self::bare(
+            true,
+            GovernorMode::Off,
+            "human_dashboard",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        outcome.surface = Some(SendSurface::Scheduled);
+        outcome
+    }
+
+    /// Sanitized JSON for **durable operator-facing** audit/event rows. Records
+    /// the route/state and the three attribution sets + state + count — never a
+    /// score, weight, threshold, or breakdown.
     pub fn audit_json(&self) -> Value {
-        json!({
+        let mut obj = json!({
             "allowed": self.allowed,
             "mode": self.mode.as_str(),
             "decision": self.decision,
             "state": self.state,
-            "score": self.score,
             "review_ticket_id": self.review_ticket_id,
             "block_code": self.block_code,
             "block_reason": self.block_reason,
+            "route": self.route,
+        });
+        if let (Value::Object(map), Some(res)) = (&mut obj, &self.resolution) {
+            map.insert("attribution".into(), res.to_json());
+            map.insert(
+                "attribution_state".into(),
+                Value::String(res.state.as_str().to_string()),
+            );
+            map.insert("attribute_count".into(), json!(res.governor_attrs.len()));
+        }
+        obj
+    }
+
+    /// Whether this is a pre-spawn attribute-declaration refusal (a missing/invalid
+    /// `attributes` INPUT), not a Governor verdict.
+    pub fn is_attribution_failure(&self) -> bool {
+        matches!(
+            self.block_code.as_deref(),
+            Some("attributes_required") | Some("attributes_invalid")
+        )
+    }
+
+    /// Top-level response status: `invalid` for attribution refusals, `blocked`
+    /// for Governor/gate blocks.
+    pub fn status_str(&self) -> &'static str {
+        if self.is_attribution_failure() {
+            "invalid"
+        } else {
+            "blocked"
+        }
+    }
+
+    /// The additive attribution block for a **successful** (allowed) response.
+    pub fn attribution_block(&self) -> Option<Value> {
+        self.resolution.as_ref().map(AttributionResolution::to_json)
+    }
+
+    /// The additive `attribution` block for a **successful** outbound result: the
+    /// resolved sets/rejections/state plus the Governor decision/route that
+    /// permitted this send. `None` on legacy paths that never resolved
+    /// attribution. Never carries a score, weight, threshold, body, raw
+    /// recipient, secret, or attachment byte.
+    pub fn success_attribution(&self) -> Option<Value> {
+        self.resolution.as_ref().map(|res| {
+            crate::attribution_persist::success_attribution_block(
+                res,
+                Some(self.decision.as_str()),
+                self.route.as_deref(),
+                false,
+            )
         })
     }
 
-    /// Stable agent-facing denial body (`{code, reason}`) when blocked.
-    pub fn denial_json(&self) -> Value {
+    /// The narrowed agent-facing Governor block — `{decision, state, mode,
+    /// review_ticket_id}` only. `score`, `allowed`, `block_code`, `block_reason`
+    /// are intentionally absent (redundant or leaking).
+    fn governor_block(&self) -> Value {
         json!({
-            "code": self.block_code.clone().unwrap_or_else(|| "governor_blocked".to_string()),
-            "reason": self
-                .block_reason
-                .clone()
-                .unwrap_or_else(|| "governor did not permit this send".to_string()),
-            "governor": self.audit_json(),
+            "decision": self.decision,
+            "state": self.state,
+            "mode": self.mode.as_str(),
+            "review_ticket_id": self.review_ticket_id,
         })
+    }
+
+    /// The full canonical error object.
+    ///
+    /// A missing/invalid-attribute refusal (`attributes_required`/
+    /// `attributes_invalid`) returns `{code, reason, attributes, help, recovery}`:
+    /// the caller's declared/rejected INPUT plus self-contained `--help`-quality
+    /// guidance. A genuine Governor block (`governor_blocked`/`governor_unavailable`)
+    /// returns `{code, reason, [route], [governor], [attribution], recovery}` and is
+    /// never handed irrelevant attribute help. Never contains a score.
+    pub fn error_json(&self) -> Value {
+        let code = self
+            .block_code
+            .clone()
+            .unwrap_or_else(|| "governor_blocked".to_string());
+        let mut obj = json!({
+            "code": code,
+            "reason": self.reason_string(),
+            "recovery": self.recovery_json(),
+        });
+        if let Value::Object(map) = &mut obj {
+            if self.is_attribution_failure() {
+                // Missing/invalid INPUT: echo the declared/rejected attribute sets
+                // and attach the recovery-complete `--help` guidance. The internal
+                // three-set `attribution` resolution is intentionally NOT exposed
+                // here — the caller needs the input to fix, not protocol internals.
+                map.insert("attributes".into(), self.attributes_block());
+                map.insert("help".into(), self.help_json());
+            } else {
+                if let Some(route) = &self.route {
+                    map.insert("route".into(), Value::String(route.clone()));
+                }
+                // The narrowed Governor block only accompanies a genuine gate block.
+                if self.block_code.as_deref() == Some("governor_blocked") {
+                    map.insert("governor".into(), self.governor_block());
+                }
+                if let Some(attr) = self.attribution_block() {
+                    map.insert("attribution".into(), attr);
+                }
+            }
+        }
+        obj
+    }
+
+    /// The public `attributes` INPUT block for a missing/invalid-declaration
+    /// refusal: the keys the caller declared and any that were rejected (each with
+    /// its stable per-key reason code and nearest-key `did_you_mean`). Distinct
+    /// from the internal three-set `attribution` resolution echoed on a *successful*
+    /// send — this is the input the caller must supply or correct.
+    fn attributes_block(&self) -> Value {
+        match &self.resolution {
+            Some(res) => json!({
+                "declared": res.declared_attrs,
+                "rejected": res.rejected_attrs.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+            }),
+            None => json!({ "declared": [], "rejected": [] }),
+        }
+    }
+
+    /// The self-contained, `--help`-quality guidance attached to every
+    /// missing/invalid-attribute refusal: what attributes are, both declaration
+    /// syntaxes, concrete contextual examples, where to list the full catalog, and
+    /// the honesty rules. Never contains a score, weight, threshold, body, raw
+    /// recipient, or secret.
+    fn help_json(&self) -> Value {
+        let examples: Vec<Value> = self
+            .suggestions
+            .iter()
+            .map(suggestion_example_json)
+            .collect();
+        json!({
+            "what_are_attributes":
+                "Attributes are bounded, factual signals Governor uses to assess the stakes and risk \
+                 of THIS action. A signal may describe relevant context such as the relationship, \
+                 message structure, content, authorization state, or consequences (for example \
+                 `informational`, `financial_content`, or `reply_to_thread`). Envelope derives facts \
+                 it can observe; declare every other catalog key you know is honestly true and omit \
+                 the rest. Attributes do not request or guarantee permission, and they never expose \
+                 Governor scoring.",
+            "syntax": {
+                "cli": "--attr <key> (repeatable, one per fact); e.g. `envelope send --to you@example.com --subject Hi --body \"…\" --attr informational`",
+                "mcp": {
+                    "field": "attributes",
+                    "example": ["informational"],
+                    "on": "send / reply / send_draft"
+                }
+            },
+            "examples": examples,
+            "list_attributes": {
+                "mcp_tool": "governor_catalog",
+                "cli": "envelope governor catalog --json",
+                "skill": "envelope-governor-attribution"
+            },
+            "rules": HONESTY_RULES,
+        })
+    }
+
+    /// The full canonical response `{status, error}` a blocked/invalid send
+    /// returns to the agent across CLI `--json` and MCP.
+    pub fn response_json(&self) -> Value {
+        json!({ "status": self.status_str(), "error": self.error_json() })
+    }
+
+    /// Back-compatible alias: the error object for callers that wrap it in their
+    /// own `{status, error}` envelope.
+    pub fn denial_json(&self) -> Value {
+        self.error_json()
+    }
+
+    /// Surface-specific description of exactly how to retry.
+    fn retry_change(&self) -> &'static str {
+        match self.surface {
+            Some(SendSurface::Cli) => "re-run with a repeatable `--attr <key>` per factual key",
+            _ => "retry with `attributes`: [<factual catalog keys>]",
+        }
+    }
+
+    /// The exact, surface-appropriate retry shape (machine-friendly): a shell
+    /// command fragment on the CLI, the JSON field on MCP.
+    fn retry_example(&self) -> Value {
+        match self.surface {
+            Some(SendSurface::Cli) => json!("envelope send … --attr informational"),
+            _ => json!({ "attributes": ["informational"] }),
+        }
+    }
+
+    /// The recovery-complete `reason` string (§5.1 order): what failed, the
+    /// sanitized action, exactly what to do next (parameter + ≥1 concrete key),
+    /// where the catalog is, and what happens after.
+    pub fn reason_string(&self) -> String {
+        let echo = self
+            .action_echo
+            .clone()
+            .unwrap_or_else(|| "this send".into());
+        let param = match self.surface {
+            Some(SendSurface::Cli) => {
+                "re-run `envelope send` with `--attr informational` (a status/FYI note) or `--attr financial_content` (if it discusses money) — one `--attr <key>` per fact true of this message"
+            }
+            _ => {
+                "retry the same send/reply/send_draft call with an `attributes` array — e.g. `informational` for a status/FYI note, or `financial_content` if it discusses money"
+            }
+        };
+        let catalog = "Full catalog: the `governor_catalog` tool, `envelope governor catalog --json`, or the envelope-governor-attribution skill.";
+        match self.block_code.as_deref() {
+            Some("attributes_required") => format!(
+                "This send is missing its required `attributes`: every send must declare at least one factual attribute, and none were provided. This attempt: {echo}. {param}. {catalog} On success the send queues in the outbox for the safety cooldown; if honestly-declared facts route to review, the draft parks for human approval."
+            ),
+            Some("attributes_invalid") => {
+                let rejected = self
+                    .resolution
+                    .as_ref()
+                    .map(|r| r.rejected_attrs.as_slice())
+                    .unwrap_or(&[]);
+                let total = self
+                    .resolution
+                    .as_ref()
+                    .map(|r| r.declared_attrs.len())
+                    .unwrap_or(rejected.len());
+                let clauses: Vec<String> = rejected.iter().map(reject_clause).collect();
+                format!(
+                    "{} of {} declared attribute(s) were rejected: {}. Correct or remove the rejected keys ({}) and keep the valid ones. {catalog}",
+                    rejected.len(),
+                    total,
+                    clauses.join("; "),
+                    self.retry_change(),
+                )
+            }
+            Some("governor_unavailable") => format!(
+                "The Governor gate is unavailable: {}. This is an operator/infrastructure issue, not an attribution problem — notify the operator and do not spend retries; no attributes will change it.",
+                self.block_reason
+                    .as_deref()
+                    .unwrap_or("gate could not be evaluated")
+            ),
+            _ => {
+                // governor_blocked (review or deny)
+                if self.route.as_deref() == Some("deny") {
+                    format!(
+                        "Governor routed this send to deny: {echo}. Do not retry unchanged — only new true facts or a human decision change the outcome."
+                    )
+                } else if self.parked {
+                    // A real draft was atomically parked — claim it, with its id.
+                    let handle = self
+                        .parked_draft_id
+                        .as_deref()
+                        .map(|id| format!("draft {id}"))
+                        .unwrap_or_else(|| "the draft".to_string());
+                    format!(
+                        "Governor routed this send to review: {echo}. {handle} is parked pending_review. A human can approve it in the dashboard (Drafts → pending review); approval re-queues it. If a declared fact was wrong, correct the draft — an edit resets attribution."
+                    )
+                } else {
+                    // Stateless/immediate review: no draft exists to park.
+                    format!(
+                        "Governor routed this send to review: {echo}. Nothing was sent, created, or parked. To obtain human review, re-submit as a normal queued send (omit the immediate-send bypass) — a queued send that routes to review parks as a draft for approval — or save it draft-only. Correcting a wrong declared fact also changes the outcome."
+                    )
+                }
+            }
+        }
+    }
+
+    /// The machine-readable `recovery` block.
+    ///
+    /// For a missing/invalid-attribute refusal this stays compact and
+    /// machine-friendly — `next_action` (with the exact retry shape) plus an
+    /// idempotency-affirming `retry` note. Definitions, examples, catalog pointers,
+    /// and rules live in the `help` block, never buried only here.
+    pub fn recovery_json(&self) -> Value {
+        let surface = self
+            .surface
+            .map(SendSurface::as_str)
+            .unwrap_or("mcp")
+            .to_string();
+        match self.block_code.as_deref() {
+            Some("attributes_required") | Some("attributes_invalid") => json!({
+                "next_action": {
+                    "surface": surface,
+                    "change": self.retry_change(),
+                    "example": self.retry_example()
+                },
+                "retry": {
+                    "idempotent": true,
+                    "note": "nothing was sent or created; retry the corrected request"
+                }
+            }),
+            Some("governor_unavailable") => json!({
+                "next_action": { "surface": "operator", "action": "notify_operator" },
+                "retry": {
+                    "idempotent": false,
+                    "note": "gate infrastructure failure; retries will not help until the operator restores Governor"
+                }
+            }),
+            _ if self.route.as_deref() == Some("deny") => json!({
+                "next_action": { "surface": surface, "change": "do not retry unchanged" },
+                "suggested_attrs": [],
+                "retry": {
+                    "idempotent": false,
+                    "note": "only new true facts or a human decision change a deny"
+                }
+            }),
+            _ if self.parked => {
+                // A real draft was atomically parked: the review handle is genuine.
+                let mut next = json!({
+                    "surface": "dashboard",
+                    "action": "human_approval",
+                    "path": "/drafts?status=pending_review",
+                    "then": "a human approves the parked draft and the sweep re-evaluates it"
+                });
+                if let (Value::Object(map), Some(id)) = (&mut next, &self.parked_draft_id) {
+                    map.insert("draft_id".into(), Value::String(id.clone()));
+                }
+                json!({
+                    "next_action": next,
+                    "suggested_attrs": self.suggestions.iter().map(Suggestion::to_json).collect::<Vec<_>>(),
+                    "retry": {
+                        "idempotent": false,
+                        "note": "resubmitting identical facts returns the same route; only new true facts or human approval change the outcome"
+                    }
+                })
+            }
+            _ => json!({
+                // Stateless/immediate review: no draft was created or parked, so
+                // there is nothing to approve and no review handle to link.
+                "next_action": {
+                    "surface": surface,
+                    "action": "queue_for_review",
+                    "change": "re-submit as a normal queued send (omit the immediate-send bypass) so a review routes to a parked draft, or save it draft-only for human approval"
+                },
+                "suggested_attrs": self.suggestions.iter().map(Suggestion::to_json).collect::<Vec<_>>(),
+                "retry": {
+                    "idempotent": true,
+                    "note": "no draft was created and nothing was sent or parked; re-submit as a queued send for human review"
+                }
+            }),
+        }
     }
 }
 
-/// Decision fields parsed from Governor's `shell --json` output.
+/// Render one deterministic suggestion as a `--help` example, keeping its key, a
+/// plain-language description (from the vendored catalog), when-to-use language,
+/// and provenance — never a bare key. This is what makes a missing-attribute
+/// error usable without a second discovery round-trip.
+fn suggestion_example_json(s: &Suggestion) -> Value {
+    let when = s
+        .declare_if
+        .clone()
+        .or_else(|| s.note.clone())
+        .unwrap_or_else(|| "declare when this fact is true of the message".to_string());
+    let mut obj = json!({
+        "key": s.key,
+        "description": crate::governor_catalog::description_of(&s.key).unwrap_or(""),
+        "when": when,
+        "provenance": s.provenance,
+    });
+    if let (Value::Object(map), Some(note)) = (&mut obj, &s.note) {
+        map.insert("note".into(), Value::String(note.clone()));
+    }
+    obj
+}
+
+/// One human-readable clause for a rejected declaration (used in `reason`).
+fn reject_clause(r: &crate::attribution::RejectedAttr) -> String {
+    match r.code.as_str() {
+        "unknown_attribute" => {
+            let dym = r
+                .did_you_mean
+                .first()
+                .map(|k| format!(" (did you mean `{k}`?)"))
+                .unwrap_or_default();
+            format!("`{}` is not in catalog envelope{dym}", r.key)
+        }
+        "attestation_required" => {
+            format!(
+                "`{}` is attestation-only and can never be agent-declared",
+                r.key
+            )
+        }
+        "conflicts_with_host_observation" => format!(
+            "`{}` contradicts the host observation ({})",
+            r.key,
+            r.detail.as_deref().unwrap_or("host-observed fact")
+        ),
+        "host_verification_unavailable" => format!(
+            "`{}` could not be verified by the host ({})",
+            r.key,
+            r.detail.as_deref().unwrap_or(
+                "declare a fact Envelope can corroborate or an author-context attribute"
+            )
+        ),
+        "conflicting_attributes" => format!(
+            "`{}` is an impossible combination ({})",
+            r.key,
+            r.detail.as_deref().unwrap_or("mutually exclusive")
+        ),
+        other => format!("`{}` was rejected ({other})", r.key),
+    }
+}
+
+/// Decision fields parsed from Governor's `score --json` output.
+///
+/// The numeric `score` Governor may emit is **not** parsed or retained — the
+/// route/state is the entire Envelope-side contract, and no score reaches any
+/// Envelope payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GovernorVerdict {
     pub decision: String,
     pub state: Option<String>,
-    pub score: Option<f64>,
     pub review_ticket_id: Option<String>,
 }
 
 /// Parse Governor's JSON output into a verdict. Returns `None` if the output is
-/// not parseable JSON with a `decision` field.
+/// not parseable JSON with a `decision` field. Any `score` field present in the
+/// output is deliberately ignored.
 pub fn parse_governor_verdict(stdout: &str) -> Option<GovernorVerdict> {
     let value: Value = serde_json::from_str(stdout.trim()).ok()?;
     let decision = value.get("decision")?.as_str()?.to_ascii_lowercase();
@@ -434,7 +979,6 @@ pub fn parse_governor_verdict(stdout: &str) -> Option<GovernorVerdict> {
         .get("state")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let score = value.get("score").and_then(|v| v.as_f64());
     let review_ticket_id = value
         .get("review_ticket")
         .and_then(|v| v.get("id"))
@@ -443,64 +987,74 @@ pub fn parse_governor_verdict(stdout: &str) -> Option<GovernorVerdict> {
     Some(GovernorVerdict {
         decision,
         state,
-        score,
         review_ticket_id,
     })
+}
+
+/// The route (`review`/`deny`) implied by a non-allow decision.
+fn route_for(decision: &str) -> Option<String> {
+    match decision {
+        "review" | "review_required" => Some("review".to_string()),
+        "deny" | "denied" | "block" | "blocked" => Some("deny".to_string()),
+        _ => None,
+    }
 }
 
 /// Apply a parsed verdict against the gate mode to produce the final outcome.
 pub fn decide_from_verdict(mode: GovernorMode, verdict: GovernorVerdict) -> GovernorOutcome {
     let permitted = matches!(verdict.decision.as_str(), "allow" | "allowed");
     let allowed = permitted || mode == GovernorMode::Warn;
-    let (block_code, block_reason) = if permitted {
-        (None, None)
+    let block_reason = if permitted {
+        None
     } else {
-        (
-            Some("governor_blocked".to_string()),
-            Some(format!(
-                "governor decision '{}'{} did not permit this send",
-                verdict.decision,
-                verdict
-                    .state
-                    .as_deref()
-                    .map(|s| format!(" (state '{s}')"))
-                    .unwrap_or_default()
-            )),
-        )
+        Some(format!(
+            "governor decision '{}'{} did not permit this send",
+            verdict.decision,
+            verdict
+                .state
+                .as_deref()
+                .map(|s| format!(" (state '{s}')"))
+                .unwrap_or_default()
+        ))
     };
-    GovernorOutcome {
+    let route = route_for(&verdict.decision);
+    GovernorOutcome::bare(
         allowed,
         mode,
-        decision: verdict.decision,
-        state: verdict.state,
-        score: verdict.score,
-        review_ticket_id: verdict.review_ticket_id,
+        &verdict.decision,
+        verdict.state,
+        verdict.review_ticket_id,
         // In warn mode we never block even on a non-allow verdict.
-        block_code: if allowed { None } else { block_code },
-        block_reason: if allowed { None } else { block_reason },
-    }
+        if allowed {
+            None
+        } else {
+            Some("governor_blocked".to_string())
+        },
+        if allowed { None } else { block_reason },
+        route,
+    )
 }
 
 fn fail_outcome(mode: GovernorMode, decision: &str, reason: &str) -> GovernorOutcome {
     let allowed = mode == GovernorMode::Warn;
-    GovernorOutcome {
+    GovernorOutcome::bare(
         allowed,
         mode,
-        decision: decision.to_string(),
-        state: None,
-        score: None,
-        review_ticket_id: None,
-        block_code: if allowed {
+        decision,
+        None,
+        None,
+        if allowed {
             None
         } else {
             Some("governor_unavailable".to_string())
         },
-        block_reason: if allowed {
+        if allowed {
             None
         } else {
             Some(reason.to_string())
         },
-    }
+        None,
+    )
 }
 
 /// Run the Governor gate for an actual-send attempt using **blind attribution**.
@@ -515,31 +1069,129 @@ fn fail_outcome(mode: GovernorMode, decision: &str, reason: &str) -> GovernorOut
 /// verdict is recorded but never blocks. In `off` mode the gate is skipped.
 pub fn gate(config: &GovernorConfig, req: &GovernorRequest) -> GovernorOutcome {
     if config.mode == GovernorMode::Off {
-        return GovernorOutcome {
-            allowed: true,
-            mode: GovernorMode::Off,
-            decision: "disabled".to_string(),
-            state: None,
-            score: None,
-            review_ticket_id: None,
-            block_code: None,
-            block_reason: None,
-        };
+        return off_outcome();
+    }
+    spawn_and_interpret(config, &req.attributes, &req.justification())
+}
+
+/// The gate with the full attribution protocol: it refuses an empty/invalid
+/// declared+derived set **before** Governor is ever spawned, and only submits a
+/// validated, non-empty union for scoring.
+///
+/// This is the entry point every bot-originated actual-send surface uses. It
+/// requires `req.resolution` to be set (via
+/// [`GovernorRequest::from_context_with_declared`]); without it, it falls back to
+/// the legacy raw [`gate`].
+pub fn gate_with_attribution(config: &GovernorConfig, req: &GovernorRequest) -> GovernorOutcome {
+    if config.mode == GovernorMode::Off {
+        // Off explicitly disables both the gate and the attribution requirement.
+        let mut o = off_outcome();
+        o.surface = Some(req.surface);
+        o.resolution = req.resolution.clone();
+        return o;
+    }
+    let Some(resolution) = req.resolution.clone() else {
+        return gate(config, req);
+    };
+
+    if resolution.state != AttributionState::Attributed {
+        // Governor is NEVER invoked for an unattributed or invalid request.
+        return attribution_failure_outcome(config.mode, req, resolution);
     }
 
-    // `governor score --catalog envelope --attr <k> ... --json`: pure blind
-    // attribution over the declared keys. The `--just` string is logged by
-    // Governor but never scored, and carries only the surface + draft id (no PII).
+    let mut outcome = spawn_and_interpret(config, &resolution.governor_attrs, &req.justification());
+    outcome.surface = Some(req.surface);
+    outcome.action_echo = Some(req.action_echo());
+    outcome.resolution = Some(resolution);
+    if outcome.block_code.as_deref() == Some("governor_blocked") {
+        outcome.suggestions = suggestions_for(req, outcome.route.as_deref() == Some("review"));
+    }
+    outcome
+}
+
+/// The allowed, gate-skipped outcome for `off` mode.
+fn off_outcome() -> GovernorOutcome {
+    GovernorOutcome::bare(
+        true,
+        GovernorMode::Off,
+        "disabled",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Build a pre-spawn attribution refusal outcome. Governor is not invoked.
+///
+/// Attribution is Envelope's own protocol precondition, distinct from Governor
+/// scoring. It fails closed in **every enforcing mode** — `warn` softens a
+/// Governor *verdict* on an already-attributed request, but it never waives the
+/// attribution precondition: a missing/invalid declaration on a bot-originated
+/// action always blocks (`allowed == false`), never reaching Governor or SMTP.
+fn attribution_failure_outcome(
+    mode: GovernorMode,
+    req: &GovernorRequest,
+    resolution: AttributionResolution,
+) -> GovernorOutcome {
+    let code = resolution.failure_code().unwrap_or("attributes_required");
+    let mut o = GovernorOutcome::bare(
+        false,
+        mode,
+        code,
+        None,
+        None,
+        Some(code.to_string()),
+        Some(format!("attribution refused: {code}")),
+        None,
+    );
+    o.surface = Some(req.surface);
+    o.action_echo = Some(req.action_echo());
+    o.suggestions = suggestions_for(req, false);
+    o.resolution = Some(resolution);
+    o
+}
+
+/// Deterministic suggestions for this request's context (reconstructs a minimal
+/// sanitized context from the sanitized request fields — no content needed).
+fn suggestions_for(req: &GovernorRequest, route_is_review: bool) -> Vec<Suggestion> {
+    let sctx = AttributedSendContext {
+        account_domain: req.account_domain.clone(),
+        recipient_domains: req.recipient_domains.clone(),
+        recipient_count: req.recipient_count,
+        attachment_count: req.attachment_count,
+        is_reply: req.is_reply,
+        ..Default::default()
+    };
+    let rejected = req
+        .resolution
+        .as_ref()
+        .map(|r| r.rejected_attrs.clone())
+        .unwrap_or_default();
+    let has_attestation = req.attributes.iter().any(|a| a == "tyler_approved");
+    attribution_suggest::suggest(&sctx, &rejected, route_is_review, has_attestation)
+}
+
+/// Spawn `governor score --catalog envelope --attr <k> ... --json` over the
+/// given validated attribute set: pure blind attribution. The `--just` string is
+/// logged by Governor but never scored, and carries only the surface + draft id
+/// (no PII). Fails closed on spawn/exit/parse error per mode.
+fn spawn_and_interpret(
+    config: &GovernorConfig,
+    attrs: &[String],
+    justification: &str,
+) -> GovernorOutcome {
     let mut command = std::process::Command::new(&config.bin);
     command
         .arg("score")
         .arg("--catalog")
         .arg(GOVERNOR_CATALOG)
         .arg("--json");
-    for attr in &req.attributes {
+    for attr in attrs {
         command.arg("--attr").arg(attr);
     }
-    command.arg("--just").arg(req.justification());
+    command.arg("--just").arg(justification);
 
     match command.output() {
         Ok(out) => {
@@ -668,7 +1320,9 @@ mod tests {
     }
 
     #[test]
-    fn default_cooldown_is_120_seconds() {
+    fn default_cooldown_is_60_seconds() {
+        // The built-in default cooldown for a normal Governor-allowed send is 60s.
+        assert_eq!(DEFAULT_COOLDOWN_SECONDS, 60);
         // Explicit override wins.
         assert_eq!(resolve_cooldown_seconds(Some(45)), 45);
         // Negative override clamps to zero.
@@ -876,7 +1530,6 @@ mod tests {
             GovernorVerdict {
                 decision: "allow".to_string(),
                 state: Some("allowed".to_string()),
-                score: Some(0.9),
                 review_ticket_id: None,
             },
         );
@@ -892,7 +1545,6 @@ mod tests {
                 GovernorVerdict {
                     decision: decision.to_string(),
                     state: Some("review_required".to_string()),
-                    score: Some(-0.1),
                     review_ticket_id: Some("review-1".to_string()),
                 },
             );
@@ -908,7 +1560,6 @@ mod tests {
             GovernorVerdict {
                 decision: "deny".to_string(),
                 state: None,
-                score: None,
                 review_ticket_id: None,
             },
         );
@@ -949,8 +1600,351 @@ mod tests {
         assert_eq!(outcome.decision, "disabled");
     }
 
+    fn attributed_req(declared: &[&str], require: bool) -> GovernorRequest {
+        let ctx = AttributedSendContext {
+            account_domain: Some("martin.fm".into()),
+            recipient_domains: vec!["acme.example".into()],
+            recipient_count: 1,
+            attachment_count: 1,
+            sensitive_attachment: true,
+            ..Default::default()
+        };
+        let decl: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        GovernorRequest::from_context_with_declared(
+            "acct-1",
+            "Subj",
+            SendSurface::Mcp,
+            Some("d-1"),
+            &[("application/pdf".into(), 10)],
+            &ctx,
+            &decl,
+            require,
+        )
+    }
+
+    fn nonexistent_required() -> GovernorConfig {
+        GovernorConfig {
+            mode: GovernorMode::Required,
+            bin: "/nonexistent/governor-binary-xyz".to_string(),
+        }
+    }
+
     #[test]
-    fn parse_verdict_extracts_decision_state_score_ticket() {
+    fn empty_declaration_refused_before_governor_is_spawned() {
+        // A rich derived context (attachment, external recipient) but zero
+        // declarations must be attributes_required, and Governor must NOT be
+        // spawned (a missing binary would otherwise yield governor_unavailable).
+        let req = attributed_req(&[], true);
+        let outcome = gate_with_attribution(&nonexistent_required(), &req);
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_ne!(
+            outcome.decision, "unavailable",
+            "Governor must never be spawned for an unattributed request"
+        );
+        assert_eq!(outcome.status_str(), "invalid");
+
+        // The reason string ALONE is recovery-complete (J8): it names the
+        // parameter, a concrete key, and the catalog tool.
+        let reason = outcome.reason_string();
+        assert!(
+            reason.contains("attributes"),
+            "names the parameter: {reason}"
+        );
+        assert!(
+            reason.contains("financial_content") || reason.contains("informational"),
+            "names a concrete key: {reason}"
+        );
+        assert!(
+            reason.contains("governor_catalog"),
+            "names the catalog: {reason}"
+        );
+
+        // Suggestions include at least one risk key.
+        assert!(
+            outcome
+                .suggestions
+                .iter()
+                .any(|s| crate::attribution_suggest::is_risk_key(&s.key)),
+            "must include a risk key"
+        );
+    }
+
+    #[test]
+    fn typo_declaration_refused_before_spawn_with_did_you_mean() {
+        let req = attributed_req(&["informationl"], true);
+        let outcome = gate_with_attribution(&nonexistent_required(), &req);
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_invalid"));
+        assert_ne!(outcome.decision, "unavailable");
+        let payload = outcome.response_json().to_string();
+        assert!(payload.contains("did_you_mean"));
+        assert!(payload.contains("informational"));
+    }
+
+    #[test]
+    fn attributes_required_error_is_help_complete() {
+        // The missing-INPUT refusal must be self-contained `--help`-quality: the
+        // caller learns what attributes are, both declaration syntaxes, concrete
+        // contextual examples, where to list the catalog, and the honesty rules —
+        // without a second round-trip.
+        let req = attributed_req(&[], true);
+        let outcome = gate_with_attribution(&nonexistent_required(), &req);
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+
+        let resp = outcome.response_json();
+        assert_eq!(resp["status"], "invalid");
+        let err = &resp["error"];
+        assert_eq!(err["code"], "attributes_required");
+
+        // reason is recovery-complete on its own (survives a double-encode).
+        let reason = err["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("attribute"),
+            "reason names the input: {reason}"
+        );
+        assert!(
+            reason.contains("governor_catalog"),
+            "reason points to catalog: {reason}"
+        );
+
+        // `attributes` echoes the declared/rejected INPUT sets (not the internal
+        // three-set resolution).
+        assert!(err["attributes"]["declared"].is_array());
+        assert!(err["attributes"]["rejected"].is_array());
+
+        // help: plain-language definition.
+        let help = &err["help"];
+        assert!(
+            help["what_are_attributes"].as_str().unwrap().len() > 60,
+            "definition must be plain language"
+        );
+        // help.syntax: BOTH exact surfaces.
+        assert!(help["syntax"]["cli"].as_str().unwrap().contains("--attr"));
+        assert_eq!(help["syntax"]["mcp"]["field"], "attributes");
+        assert!(
+            help["syntax"]["mcp"]["example"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "informational")
+        );
+        // help.examples: >=1 contextual suggestion, each with key/description/when.
+        let examples = help["examples"].as_array().unwrap();
+        assert!(
+            !examples.is_empty(),
+            "missing-attribute errors must always include contextual examples"
+        );
+        for ex in examples {
+            assert!(ex["key"].is_string(), "example has a key");
+            assert!(
+                ex["description"].is_string(),
+                "example retains a description"
+            );
+            assert!(
+                ex["when"].is_string(),
+                "example retains when-to-use language"
+            );
+        }
+        // help.list_attributes: all three discovery pointers.
+        assert_eq!(help["list_attributes"]["mcp_tool"], "governor_catalog");
+        assert_eq!(
+            help["list_attributes"]["cli"],
+            "envelope governor catalog --json"
+        );
+        assert_eq!(
+            help["list_attributes"]["skill"],
+            "envelope-governor-attribution"
+        );
+        // help.rules: honesty/all-or-nothing rules in plain language.
+        assert!(help["rules"].as_array().unwrap().len() >= 3);
+
+        // recovery stays compact + machine-friendly: next_action + retry only.
+        let recovery = &err["recovery"];
+        assert!(recovery["next_action"].is_object());
+        assert_eq!(recovery["retry"]["idempotent"], true);
+        let retry_note = recovery["retry"]["note"].as_str().unwrap();
+        assert!(
+            retry_note.contains("nothing was sent") || retry_note.contains("no draft"),
+            "retry note states nothing was created/sent: {retry_note}"
+        );
+        assert!(
+            recovery.get("suggested_attrs").is_none()
+                && recovery.get("catalog").is_none()
+                && recovery.get("rules").is_none(),
+            "definitions/catalog/examples belong in help, not buried in recovery"
+        );
+
+        // No leakage of scoring internals anywhere in the payload, and no message
+        // content: the fixture's subject `Subj` must never surface (only the
+        // sanitized recipient counts/domains may). The CLI syntax example uses a
+        // documentation placeholder address, so a raw-recipient check targets the
+        // fixture's own content, not the static help text.
+        let text = resp.to_string();
+        for banned in ["score", "weight", "threshold", "Subj"] {
+            assert!(!text.contains(banned), "help payload leaked `{banned}`");
+        }
+    }
+
+    #[test]
+    fn attributes_invalid_error_lists_rejected_keys() {
+        let req = attributed_req(&["informationl"], true); // typo
+        let outcome = gate_with_attribution(&nonexistent_required(), &req);
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_invalid"));
+
+        let resp = outcome.response_json();
+        let err = &resp["error"];
+        assert_eq!(err["code"], "attributes_invalid");
+
+        // The rejected key + its per-key reason + nearest suggestion are in an
+        // obvious `attributes.rejected` structure.
+        let rejected = err["attributes"]["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["key"], "informationl");
+        assert_eq!(rejected[0]["code"], "unknown_attribute");
+        assert!(
+            rejected[0]["did_you_mean"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "informational")
+        );
+        // declared echoes exactly what the caller submitted.
+        assert!(
+            err["attributes"]["declared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "informationl")
+        );
+        // Same help affordances as the required case.
+        assert!(!err["help"]["examples"].as_array().unwrap().is_empty());
+        // reason tells the caller to correct/remove the rejected key.
+        let reason = err["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("informationl"),
+            "reason names rejected key: {reason}"
+        );
+    }
+
+    #[test]
+    fn governor_block_error_omits_attribute_help() {
+        // A genuine Governor deny is not a missing-input error — it must NOT be
+        // handed irrelevant attribute help or an `attributes` input block.
+        let denied = decide_from_verdict(
+            GovernorMode::Required,
+            GovernorVerdict {
+                decision: "deny".to_string(),
+                state: None,
+                review_ticket_id: None,
+            },
+        );
+        let resp = denied.response_json();
+        assert_eq!(resp["status"], "blocked");
+        assert!(
+            resp["error"].get("help").is_none(),
+            "governor deny must not receive attribute help"
+        );
+        assert!(
+            resp["error"].get("attributes").is_none(),
+            "governor deny is not a missing-input error"
+        );
+    }
+
+    #[test]
+    fn attested_request_spawns_and_fails_closed_when_unavailable() {
+        // A validly-declared request reaches Governor; a missing binary is a
+        // governor_unavailable (operator) failure — distinct from every
+        // attribution_* shape. (J11)
+        let req = attributed_req(&["financial_content"], true);
+        let outcome = gate_with_attribution(&nonexistent_required(), &req);
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.block_code.as_deref(), Some("governor_unavailable"));
+        assert!(!outcome.is_attribution_failure());
+        // An infrastructure failure is not a missing-input error: no attribute help.
+        let resp = outcome.response_json();
+        assert!(resp["error"].get("help").is_none());
+        assert!(resp["error"].get("attributes").is_none());
+    }
+
+    #[test]
+    fn no_score_appears_in_any_attribution_payload() {
+        for declared in [vec![], vec!["informationl"], vec!["financial_content"]] {
+            let req = attributed_req(&declared, true);
+            let outcome = gate_with_attribution(&nonexistent_required(), &req);
+            let payload = outcome.response_json().to_string();
+            let audit = outcome.audit_json().to_string();
+            assert!(!payload.contains("\"score\""), "agent payload leaked score");
+            assert!(!audit.contains("\"score\""), "audit payload leaked score");
+        }
+    }
+
+    #[test]
+    fn warn_mode_fails_closed_on_attribution_failure() {
+        // Warn mode NEVER waives the attribution precondition: a bot-originated
+        // request with no declaration is blocked with attributes_required, and
+        // Governor is never spawned — identical to required mode for this refusal.
+        let config = GovernorConfig {
+            mode: GovernorMode::Warn,
+            bin: "/nonexistent/governor-binary-xyz".to_string(),
+        };
+        let req = attributed_req(&[], true);
+        let outcome = gate_with_attribution(&config, &req);
+        assert!(
+            !outcome.allowed,
+            "warn must fail closed on a missing declaration"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_ne!(
+            outcome.decision, "unavailable",
+            "Governor must never be spawned for an unattributed request, even in warn"
+        );
+        assert_eq!(outcome.status_str(), "invalid");
+    }
+
+    #[test]
+    fn warn_mode_fails_closed_on_invalid_declaration() {
+        let config = GovernorConfig {
+            mode: GovernorMode::Warn,
+            bin: "/nonexistent/governor-binary-xyz".to_string(),
+        };
+        let req = attributed_req(&["informationl"], true); // typo → invalid
+        let outcome = gate_with_attribution(&config, &req);
+        assert!(
+            !outcome.allowed,
+            "warn must fail closed on an invalid declaration"
+        );
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_invalid"));
+        assert_ne!(outcome.decision, "unavailable");
+    }
+
+    #[test]
+    fn warn_mode_softens_governor_verdict_on_attributed_request() {
+        // The carve-out warn IS allowed to keep: a VALID attributed request whose
+        // Governor verdict is deny/review/unavailable proceeds (record but never
+        // block). Attribution passed first; only the Governor verdict is softened.
+        let denied = decide_from_verdict(
+            GovernorMode::Warn,
+            GovernorVerdict {
+                decision: "deny".to_string(),
+                state: None,
+                review_ticket_id: None,
+            },
+        );
+        assert!(
+            denied.allowed,
+            "warn softens a Governor deny on a valid request"
+        );
+
+        let unavailable = fail_outcome(GovernorMode::Warn, "unavailable", "gate down");
+        assert!(
+            unavailable.allowed,
+            "warn softens a governor_unavailable on a valid request"
+        );
+    }
+
+    #[test]
+    fn parse_verdict_extracts_decision_state_ticket_and_ignores_score() {
         let stdout = r#"{
             "decision": "review",
             "state": "review_required",
@@ -960,13 +1954,82 @@ mod tests {
         let v = parse_governor_verdict(stdout).unwrap();
         assert_eq!(v.decision, "review");
         assert_eq!(v.state.as_deref(), Some("review_required"));
-        assert_eq!(v.score, Some(-0.04));
         assert_eq!(v.review_ticket_id.as_deref(), Some("review-123"));
+        // The score in the output is deliberately not retained anywhere: no
+        // `"score"` key appears in any durable or agent-facing payload.
+        let outcome = decide_from_verdict(GovernorMode::Required, v);
+        assert!(!outcome.audit_json().to_string().contains("\"score\""));
+        assert!(!outcome.error_json().to_string().contains("\"score\""));
+        assert!(!outcome.response_json().to_string().contains("\"score\""));
     }
 
     #[test]
     fn parse_verdict_rejects_non_json() {
         assert!(parse_governor_verdict("not json").is_none());
         assert!(parse_governor_verdict("{}").is_none());
+    }
+
+    // ── Block 4: truthful parking ───────────────────────────────────────────
+
+    fn review_outcome(surface: SendSurface) -> GovernorOutcome {
+        let mut o = decide_from_verdict(
+            GovernorMode::Required,
+            GovernorVerdict {
+                decision: "review".to_string(),
+                state: Some("review_required".to_string()),
+                review_ticket_id: None,
+            },
+        );
+        o.surface = Some(surface);
+        o.action_echo = Some("new message to 1 external recipient(s), no attachments".to_string());
+        o
+    }
+
+    #[test]
+    fn stateless_review_never_claims_a_draft_was_parked() {
+        // A stateless immediate send (no draft created) routed to review must not
+        // claim the draft is parked, nor link a nonexistent pending_review draft.
+        let o = review_outcome(SendSurface::Mcp);
+        assert!(!o.parked, "no atomic park happened");
+        let reason = o.reason_string();
+        assert!(
+            !reason.contains("is parked") && !reason.contains("pending_review"),
+            "stateless review must not claim the draft is parked: {reason}"
+        );
+        assert!(
+            reason.contains("Nothing was sent, created, or parked"),
+            "must state nothing was created: {reason}"
+        );
+        let recovery = o.recovery_json();
+        let recovery_s = recovery.to_string();
+        assert!(
+            !recovery_s.contains("pending_review"),
+            "recovery must not link a nonexistent parked draft: {recovery_s}"
+        );
+        // The recovery is explicitly idempotent: nothing to clean up.
+        assert_eq!(recovery["retry"]["idempotent"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn parked_review_reports_the_real_draft_handle() {
+        // Only after a successful atomic park does the outcome claim parking, with
+        // the real draft id and the dashboard review path.
+        let o = review_outcome(SendSurface::Scheduled).with_parked("draft-42");
+        assert!(o.parked);
+        let reason = o.reason_string();
+        assert!(
+            reason.contains("parked"),
+            "parked review claims parking: {reason}"
+        );
+        assert!(
+            reason.contains("draft-42"),
+            "names the real draft: {reason}"
+        );
+        let recovery = o.recovery_json();
+        assert_eq!(
+            recovery["next_action"]["path"],
+            "/drafts?status=pending_review"
+        );
+        assert_eq!(recovery["next_action"]["draft_id"], "draft-42");
     }
 }
