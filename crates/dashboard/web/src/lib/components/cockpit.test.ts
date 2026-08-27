@@ -5,16 +5,39 @@
 //  ApprovalRow          — Approve fires the callback with the draft
 //  GovernorVerdictBadge — verdict → Badge variant (allow/review/block)
 //  WatchPanel           — watch + route health rendering, dead-letter badge
+//  cockpit page         — Approve is described as review-only, not a send
 //  cockpitApi.draftAction — POSTs to the exact per-account draft endpoint
 
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// vi.mock is hoisted above imports; the cockpit-api spy set lives in vi.hoisted().
+const { cockpitMock } = vi.hoisted(() => ({
+  cockpitMock: {
+    agents: vi.fn(),
+    scheduled: vi.fn(),
+    watches: vi.fn(),
+    draftAction: vi.fn()
+  }
+}));
+
+vi.mock('$lib/cockpit-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/cockpit-api')>();
+  return { ...actual, cockpitApi: cockpitMock };
+});
 
 import AgentCard from './AgentCard.svelte';
 import ApprovalRow from './ApprovalRow.svelte';
 import GovernorVerdictBadge from './GovernorVerdictBadge.svelte';
 import WatchPanel from './WatchPanel.svelte';
-import { cockpitApi, type AgentCard as AgentCardT, type ApprovalDraft, type WatchesResponse } from '$lib/cockpit-api';
+import CockpitPage from '../../routes/cockpit/+page.svelte';
+import {
+  type AgentCard as AgentCardT,
+  type AgentsResponse,
+  type ApprovalDraft,
+  type ScheduledResponse,
+  type WatchesResponse
+} from '$lib/cockpit-api';
 import { resetCsrf } from '$lib/api';
 
 const age = (iso: string | null) => (iso ? 'recently' : 'never');
@@ -141,11 +164,55 @@ describe('WatchPanel', () => {
   });
 });
 
+describe('cockpit approval queue', () => {
+  const approvalQueue: AgentsResponse = {
+    agents: [agentFixture],
+    summary: { agents: 1, active_agents: 1, awaiting_approval: 1 },
+    approval_queue: [{ source: 'mcp', count: 1, drafts: [draftFixture] }]
+  };
+  const noScheduled: ScheduledResponse = {
+    account_status: 'all',
+    scheduled: [],
+    summary: { scheduled: 0, due: 0 },
+    generated_at: '2026-08-24T09:00:00Z'
+  };
+  const noWatches: WatchesResponse = {
+    watches: [],
+    routes: [],
+    summary: { watches: 0, routes: 0, dead_letter: 0 }
+  };
+
+  beforeEach(() => {
+    cockpitMock.agents.mockResolvedValue(approvalQueue);
+    cockpitMock.scheduled.mockResolvedValue(noScheduled);
+    cockpitMock.watches.mockResolvedValue(noWatches);
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('says plainly that Approve neither sends nor exempts a later agent send', async () => {
+    render(CockpitPage);
+
+    // The queue's Approve button is the control this copy governs.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy());
+    const note = document.getElementById('approval-note');
+    expect(note).toBeTruthy();
+    // Approving is a review decision, and the operator has to be able to read
+    // that off the screen: it does not transmit, it does not remove Governor
+    // from an agent's later send, and the send action has its own name.
+    expect(note).toHaveTextContent(/does not send/i);
+    expect(note).toHaveTextContent(/governor/i);
+    expect(note).toHaveTextContent(/human-only send/i);
+  });
+});
+
 describe('cockpitApi.draftAction', () => {
   beforeEach(() => resetCsrf());
   afterEach(() => vi.restoreAllMocks());
 
   it('POSTs the approve action to the exact per-account draft endpoint', async () => {
+    const { cockpitApi } = await vi.importActual<typeof import('$lib/cockpit-api')>(
+      '$lib/cockpit-api'
+    );
     const calls: Array<{ url: string; method?: string }> = [];
     const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url: String(url), method: init?.method });

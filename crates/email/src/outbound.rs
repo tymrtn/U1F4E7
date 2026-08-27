@@ -528,9 +528,11 @@ impl GovernorOutcome {
         self
     }
 
-    /// A human clicked Send on the dashboard. Governor does not score or block
-    /// that transmission — the click is the send. Used by the scheduled sweep
-    /// when the claimed row still carries a current `human_approval`.
+    /// A human clicked **Human-only Send** on the dashboard. Governor does not
+    /// score or block that transmission — the click is the send. Used by the
+    /// scheduled sweep only when the due row still carries the current, revision-
+    /// bound `human_send` authorization that dashboard click minted; an agent
+    /// re-queue (CLI/MCP) clears it and the send is governed again.
     pub fn human_dashboard_send() -> Self {
         let mut outcome = Self::bare(
             true,

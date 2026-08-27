@@ -1588,6 +1588,12 @@ pub(crate) fn human_queue_attribution_block(
         persisted.as_ref(),
         draft.revision,
     );
+    // A send the operator queued through Human-only Send is transmitted without a
+    // bot declaration ([`run_governor_gate`]). The advertised block resolves under
+    // the same rule so it can never announce `attributes_required` for a message
+    // that will actually go out. Any bot declaration on the row is still reported
+    // as-is — the requirement is lifted, nothing is fabricated.
+    let require = require && !dashboard_human_send_authorized(draft);
     let account_domain = account_domain_from_username(account_username);
     let attachments = draft_attachment_stubs(draft);
     let ctx = scheduled_send_context(draft, account_domain, &attachments);
@@ -1632,6 +1638,40 @@ fn draft_attachment_stubs(
         .collect()
 }
 
+/// The surface label the dashboard's **Human-only Send** routes stamp on the
+/// send authorization they mint (`handlers::drafts::send`, `handlers::compose`).
+pub(crate) const DASHBOARD_SEND_SURFACE: &str = "human:dashboard";
+
+/// True when this draft's pending send is one Tyler queued himself by clicking
+/// **Human-only Send** on the dashboard.
+///
+/// Two facts have to hold at once, and neither is sufficient alone:
+///
+/// 1. The dashboard's own send route minted the authorization
+///    (`queued_by = human:dashboard`). `Database::queue_draft_with_human_send`
+///    is its only writer and writes it *as* the queue transition, so it always
+///    describes a specific send a human started — not a review decision, and not
+///    a send some other path queued afterwards. `Database::queue_draft_for_send`
+///    (CLI `draft send`, MCP `send_draft`) strips it, so an agent re-queue takes
+///    the pending send back into governed territory.
+/// 2. It is still current: [`envelope_email_store::Draft::human_send_surface`]
+///    is fail-closed on shape, a strict RFC 3339 timestamp, and binding to the
+///    draft's *current* revision, and every content/attachment/metadata write —
+///    plus Hold — strips the key outright.
+///
+/// The review attestation is required alongside it, so the row Tyler sent is
+/// also a row he is recorded as having approved. Generic **Approve** records
+/// only that attestation and never reaches this predicate: approving a draft is
+/// not sending it.
+///
+/// Public because it is the whole definition of the sweep's one Governor
+/// exception: any surface that queues a send (CLI `draft send`, MCP
+/// `send_draft`) can — and does — assert that the row it produced does not
+/// satisfy it.
+pub fn dashboard_human_send_authorized(draft: &envelope_email_store::Draft) -> bool {
+    draft.human_send_surface() == Some(DASHBOARD_SEND_SURFACE) && draft.human_approved()
+}
+
 /// Run the Governor gate for a due scheduled draft and record a sanitized audit
 /// event. Returns the outcome; the sweep must refuse SMTP unless allowed.
 ///
@@ -1656,17 +1696,25 @@ async fn run_governor_gate(
         GovernorConfig, GovernorRequest, SendSurface, gate_with_attribution,
     };
 
-    // A human-ORIGINATED send that is currently human-attested is a human send:
-    // Governor does not score, review, or park it — that is what stranded
-    // operator-clicked mail as `pending_review` for days.
+    // A pending send that Tyler queued himself through the dashboard's
+    // Human-only Send route IS the send. Governor does not score, review, or park
+    // it — that is what stranded operator-clicked mail as `pending_review` for
+    // days.
     //
-    // `require_declaration` is the single source of that decision
-    // (`scheduled_attribution_inputs`): it is false only when `scheduled_origin`
-    // says `Human` AND the row carries a current attestation. Gating on the
-    // attestation alone would let an agent-drafted body skip the gate the moment
-    // an operator clicked Approve — approval supplements a bot's declaration, it
-    // never replaces it.
-    if !require_declaration && draft.human_approved() {
+    // The authorization is the click, not the authorship: who typed the words
+    // (agent, MCP, CLI, or Tyler) does not change the fact that a human read this
+    // exact revision and chose to transmit it. Keying this on `require_declaration`
+    // instead — which is false only for a `human:*`-authored row — is what made an
+    // agent-drafted body unsendable from the dashboard.
+    //
+    // The exception is bound to the transition, not to approval: only the
+    // dashboard send route mints the authorization, only as the queue transition
+    // itself, and only for the revision the operator saw. An agent re-queue
+    // (CLI `draft send`, MCP `send_draft`) strips it, an edit or Hold withdraws
+    // it, and a generic Approve never creates one. Everything without it — bot,
+    // CLI, MCP, scheduled, approved-but-agent-queued — falls through to the full
+    // fail-closed gate below, declaration requirement intact.
+    if dashboard_human_send_authorized(draft) {
         let outcome = envelope_email_transport::outbound::GovernorOutcome::human_dashboard_send();
         let event = envelope_email_store::Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -2383,13 +2431,19 @@ mod tests {
 
     #[test]
     fn scheduled_bot_draft_human_approved_without_declaration_fails_closed() {
-        // THE mandatory-declaration invariant: a bot-originated draft
-        // (created_by=agent) that a human later approved in the dashboard still
-        // requires the bot's factual declaration. Human approval SUPPLEMENTS
-        // (adds tyler_approved) — it never erases the bot's attribution
-        // responsibility. With no persisted bot declaration, the sweep must fail
-        // closed with attributes_required BEFORE Governor is spawned; host facts
-        // and the human attestation never substitute for the missing declaration.
+        // THE mandatory-declaration invariant at the attribution layer: for a
+        // bot-originated draft (created_by=agent), a human approval SUPPLEMENTS
+        // the bot's factual declaration (adding tyler_approved) — it never erases
+        // the bot's attribution responsibility. With no persisted declaration the
+        // resolution fails closed with attributes_required BEFORE Governor is
+        // spawned; host facts never substitute for the missing declaration.
+        //
+        // This is the layer, not the dashboard send path: a current dashboard
+        // Human-only Send attestation short-circuits `run_governor_gate` before it
+        // ever resolves attribution (see
+        // `dashboard_human_send_on_an_agent_drafted_body_skips_the_governor`).
+        // Everything reaching this resolution — CLI, MCP, scheduled, unattested
+        // dashboard rows — still owes its declaration.
         let db = sweep_test_db();
         let draft = db
             .create_draft(
@@ -2423,14 +2477,12 @@ mod tests {
         );
     }
 
-    /// The other half of the gate-skip rule, and the reason `run_governor_gate`
-    /// keys on `require_declaration` rather than the attestation alone: a draft
-    /// the operator actually composed on the dashboard (or the Tauri shell, which
+    /// A draft the operator composed on the dashboard (or the Tauri shell, which
     /// posts to the same API and is stamped `human:dashboard` by `compose.rs`) and
-    /// then attested IS a human send. It needs no bot declaration, so the gate is
-    /// skipped and the send is never parked as `pending_review`.
+    /// then attested needs no bot declaration at the attribution layer either, so
+    /// it resolves without one even before the gate's Human-only Send skip.
     #[test]
-    fn scheduled_human_originated_attested_draft_skips_the_gate() {
+    fn scheduled_attribution_inputs_lift_the_declaration_only_for_human_origin() {
         use envelope_email_transport::attribution_persist::scheduled_attribution_inputs;
 
         let db = sweep_test_db();
@@ -2463,11 +2515,10 @@ mod tests {
             !require,
             "a human-composed, human-attested draft needs no bot declaration"
         );
-        // `run_governor_gate` skips on exactly `!require_declaration &&
-        // human_approved`, so this row takes the human-send path.
-        assert!(!require && fetched.human_approved());
-
-        // Contrast: the same attestation on an agent-drafted row does NOT skip.
+        // Contrast: the same attestation on an agent-drafted row still owes its
+        // declaration at THIS layer. The gate's Human-only Send skip is a separate
+        // rule that runs first — see
+        // `dashboard_human_send_on_an_agent_drafted_body_skips_the_governor`.
         let bot = db
             .create_draft(
                 "acc1",
@@ -2495,6 +2546,361 @@ mod tests {
             bot_require,
             "an agent-drafted row still requires its declaration after human approval"
         );
+    }
+
+    fn sweep_state() -> AppState {
+        AppState::new(sweep_test_db(), CredentialBackend::File)
+    }
+
+    /// Credentials shaped for the gate, which reads only the account username
+    /// (for the mail domain). No credential store is touched.
+    async fn sweep_creds(state: &AppState) -> envelope_email_store::models::AccountWithCredentials {
+        let db = state.db.lock().await;
+        let account = db.get_account("acc1").unwrap().unwrap();
+        envelope_email_store::models::AccountWithCredentials {
+            account,
+            password: "unused".to_string(),
+            smtp_password: None,
+            imap_password: None,
+        }
+    }
+
+    /// Drive the REAL [`run_governor_gate`] the sweep calls, with the sweep's own
+    /// attribution inputs, and return the outcome plus every policy event type it
+    /// recorded. The event list is what proves whether Governor decided the send:
+    /// the human path records `send.human_dashboard`, the governed path records a
+    /// `send_governor.*` decision.
+    async fn gate_with_events(
+        state: &AppState,
+        draft: &envelope_email_store::Draft,
+    ) -> (
+        envelope_email_transport::outbound::GovernorOutcome,
+        Vec<String>,
+    ) {
+        use envelope_email_transport::attribution_persist::{
+            PersistedDeclaration, scheduled_attribution_inputs,
+        };
+        let creds = sweep_creds(state).await;
+        let persisted = PersistedDeclaration::from_metadata(draft.metadata.as_ref());
+        let (declared, require) = scheduled_attribution_inputs(
+            draft.created_by.as_deref(),
+            draft.human_approved(),
+            persisted.as_ref(),
+            draft.revision,
+        );
+        let outcome = run_governor_gate(
+            state,
+            draft,
+            &creds,
+            draft.subject.as_deref().unwrap_or(""),
+            &[],
+            &declared,
+            require,
+        )
+        .await;
+        let events = {
+            let db = state.db.lock().await;
+            db.list_events(Some("acc1"), 50)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_type)
+                .collect()
+        };
+        (outcome, events)
+    }
+
+    fn governor_decided(events: &[String]) -> bool {
+        events.iter().any(|t| t.starts_with("send_governor."))
+    }
+
+    fn human_send_recorded(events: &[String]) -> bool {
+        events.iter().any(|t| t == "send.human_dashboard")
+    }
+
+    /// Seed an unqueued, unattested draft with the given `created_by`.
+    async fn seed_gate_draft(state: &AppState, created_by: &str) -> envelope_email_store::Draft {
+        let db = state.db.lock().await;
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some("Service dog request"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some(created_by),
+            )
+            .unwrap();
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    async fn reload_draft(state: &AppState, draft_id: &str) -> envelope_email_store::Draft {
+        let db = state.db.lock().await;
+        db.get_draft(draft_id).unwrap().unwrap()
+    }
+
+    /// Click **Human-only Send** through the REAL dashboard route
+    /// ([`handlers::drafts::send`]) on the revision the operator is looking at,
+    /// and return the queued row. Nothing about the send authorization is
+    /// hand-written here: whatever provenance the sweep later honors has to be
+    /// something this handler actually minted.
+    async fn dashboard_human_send(state: &AppState, draft_id: &str) -> envelope_email_store::Draft {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let revision = reload_draft(state, draft_id).await.revision;
+        let response = handlers::drafts::send(
+            State(state.clone()),
+            Path(("acc1".to_string(), draft_id.to_string())),
+            axum::Json(handlers::drafts::DraftSendRequest {
+                confirm: true,
+                expected_revision: revision,
+                cooldown_seconds: None,
+                send_now: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "Human-only Send should have queued the draft"
+        );
+        reload_draft(state, draft_id).await
+    }
+
+    /// Click **Approve** through the REAL dashboard route
+    /// ([`handlers::drafts::approve`]): a review decision on that revision, with
+    /// no send and no queue transition.
+    async fn dashboard_approve(state: &AppState, draft_id: &str) -> envelope_email_store::Draft {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let revision = reload_draft(state, draft_id).await.revision;
+        let response = handlers::drafts::approve(
+            State(state.clone()),
+            Path(("acc1".to_string(), draft_id.to_string())),
+            axum::Json(handlers::drafts::DraftApproveRequest {
+                expected_revision: revision,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "approve");
+        let approved = reload_draft(state, draft_id).await;
+        assert!(
+            approved.human_approved(),
+            "Approve records the review attestation"
+        );
+        assert!(
+            approved.send_after.is_none(),
+            "Approve must not queue a send"
+        );
+        approved
+    }
+
+    /// Queue a draft exactly the way an agent does — the store primitive both
+    /// CLI `draft send` and MCP `send_draft` reach through
+    /// (`commands::drafts::queue_bot_draft_for_send`), with the same persisted
+    /// bot declaration bound to the same revision.
+    async fn agent_queue_for_send(state: &AppState, draft_id: &str) -> envelope_email_store::Draft {
+        use envelope_email_transport::attribution_persist::PersistedDeclaration;
+        let db = state.db.lock().await;
+        let rev = db.get_draft(draft_id).unwrap().unwrap().revision;
+        let attribution =
+            PersistedDeclaration::new_bot(&["recipient_requested".to_string()], rev).to_value();
+        db.queue_draft_for_send(draft_id, rev, "2000-01-01T00:00:00Z", &attribution)
+            .unwrap();
+        db.get_draft(draft_id).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_approval_never_authorizes_a_later_agent_send() {
+        // Generic dashboard Approve reviews a draft; it does not send it and it
+        // does not hand the agent an ungoverned send. An agent that queues the
+        // approved row afterwards (CLI `draft send` / MCP `send_draft`) is still
+        // fully governed — otherwise "approve this draft" would silently mean
+        // "and let the bot transmit it unscored whenever it likes".
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        dashboard_approve(&state, &draft.id).await;
+
+        let queued = agent_queue_for_send(&state, &draft.id).await;
+
+        let (outcome, events) = gate_with_events(&state, &queued).await;
+
+        assert_ne!(
+            outcome.decision, "human_dashboard",
+            "an agent-queued send is never a human send, approved or not"
+        );
+        assert!(governor_decided(&events), "the gate ran: {events:?}");
+        assert!(!human_send_recorded(&events), "{events:?}");
+
+        // And it reaches SMTP only if Governor allows: against a pinned
+        // required-mode config (rather than the host's Governor environment) the
+        // send is refused outright.
+        assert!(
+            !scheduled_gate_outcome(&queued).allowed,
+            "no SMTP without a Governor allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_human_send_on_an_agent_drafted_body_skips_the_governor() {
+        // THE live incident: an agent wrote the body, Tyler clicked Human-only
+        // Send on the dashboard. That click IS the send — Governor does not
+        // re-score it, does not park it as `pending_review`, and records no
+        // Governor decision. The click is the authorization, whatever wrote the
+        // words.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        let queued = dashboard_human_send(&state, &draft.id).await;
+        assert!(
+            queued.send_after.is_some(),
+            "the click queues through the outbox cooldown rather than sending inline"
+        );
+        assert_eq!(
+            queued.status,
+            envelope_email_store::models::DraftStatus::Draft,
+            "the sweep, not the handler, transmits it"
+        );
+
+        let (outcome, events) = gate_with_events(&state, &queued).await;
+
+        assert_eq!(
+            outcome,
+            envelope_email_transport::outbound::GovernorOutcome::human_dashboard_send(),
+            "a dashboard Human-only Send is a human send, not a scored one"
+        );
+        assert!(outcome.allowed);
+        assert!(
+            human_send_recorded(&events),
+            "the human send must be audited: {events:?}"
+        );
+        assert!(
+            !governor_decided(&events),
+            "Governor must not decide a dashboard Human-only Send: {events:?}"
+        );
+
+        // Hold is untouched by the send authorization: it takes the queued
+        // message back out of the outbox and leaves it editable.
+        let held = {
+            let db = state.db.lock().await;
+            db.hold_scheduled_draft(&queued.id).unwrap()
+        };
+        assert!(held.send_after.is_none(), "Hold cleared the schedule");
+        assert_eq!(
+            held.status,
+            envelope_email_store::models::DraftStatus::Draft
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_draft_without_a_dashboard_send_stays_governed() {
+        // The bot/CLI/MCP/scheduled path is untouched: with no dashboard
+        // Human-only Send behind it the gate runs, records a Governor decision,
+        // and the factual-declaration requirement still holds.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        assert!(!draft.human_approved());
+
+        let (outcome, events) = gate_with_events(&state, &draft).await;
+
+        assert_ne!(
+            outcome.decision, "human_dashboard",
+            "an unattested agent draft must never take the human-send path"
+        );
+        assert!(governor_decided(&events), "the gate ran: {events:?}");
+        assert!(!human_send_recorded(&events), "{events:?}");
+
+        // The attribution requirement, proven deterministically against a pinned
+        // required-mode config rather than the host's Governor environment.
+        let refused = scheduled_gate_outcome(&draft);
+        assert!(!refused.allowed);
+        assert!(refused.is_attribution_failure());
+        assert_eq!(refused.block_code.as_deref(), Some("attributes_required"));
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_click_invalidates_the_send_authorization_and_re_governs() {
+        // The send authorization is revision-bound: editing the body after
+        // clicking Human-only Send bumps the revision and strips it, so the next
+        // send is governed again. A stale click is never a skip.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        let queued = dashboard_human_send(&state, &draft.id).await;
+        let edited = {
+            let db = state.db.lock().await;
+            db.update_draft_content(
+                &queued.id,
+                None,
+                None,
+                None,
+                None,
+                Some("edited body"),
+                None,
+            )
+            .unwrap();
+            db.get_draft(&queued.id).unwrap().unwrap()
+        };
+        assert_ne!(edited.revision, queued.revision);
+
+        let (outcome, events) = gate_with_events(&state, &edited).await;
+
+        assert_ne!(
+            outcome.decision, "human_dashboard",
+            "an edited draft is not the version the human sent"
+        );
+        assert!(governor_decided(&events), "{events:?}");
+        assert!(!human_send_recorded(&events), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn hold_then_agent_requeue_is_governed_until_the_operator_clicks_again() {
+        // Hold withdraws the send: it takes the message out of the outbox, so the
+        // authorization that queued it dies with the schedule. An agent that
+        // re-queues the held draft gets a fully governed send, and only another
+        // Human-only Send restores the human path.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        dashboard_human_send(&state, &draft.id).await;
+        {
+            let db = state.db.lock().await;
+            db.hold_scheduled_draft(&draft.id).unwrap();
+        }
+
+        let requeued = agent_queue_for_send(&state, &draft.id).await;
+        let (outcome, events) = gate_with_events(&state, &requeued).await;
+        assert_ne!(
+            outcome.decision, "human_dashboard",
+            "a held-then-agent-requeued send is the agent's send"
+        );
+        assert!(governor_decided(&events), "{events:?}");
+        assert!(!human_send_recorded(&events), "{events:?}");
+
+        // The operator clicking again re-authorizes it.
+        let reclicked = dashboard_human_send(&state, &draft.id).await;
+        let (outcome, events) = gate_with_events(&state, &reclicked).await;
+        assert_eq!(outcome.decision, "human_dashboard");
+        assert!(human_send_recorded(&events), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn human_composed_dashboard_send_still_skips_the_gate() {
+        // Unchanged behavior for the draft the operator composed AND sent from
+        // the dashboard — the case that already worked.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "human:dashboard").await;
+        let queued = dashboard_human_send(&state, &draft.id).await;
+
+        let (outcome, events) = gate_with_events(&state, &queued).await;
+
+        assert_eq!(
+            outcome,
+            envelope_email_transport::outbound::GovernorOutcome::human_dashboard_send()
+        );
+        assert!(human_send_recorded(&events), "{events:?}");
+        assert!(!governor_decided(&events), "{events:?}");
     }
 
     #[test]
@@ -2861,6 +3267,35 @@ mod tests {
         for banned in ["\"score\"", "weight", "threshold"] {
             assert!(!text.contains(banned), "block leaked {banned}");
         }
+    }
+
+    #[tokio::test]
+    async fn human_queue_attribution_block_matches_the_gate_for_an_agent_drafted_body() {
+        // The advertised block and the sweep must agree. A dashboard Human-only
+        // Send on an agent-written body IS a human send, so the queue response
+        // must not advertise `attributes_required` for a message the sweep will
+        // transmit — that self-contradiction is what the caller reads.
+        let state = sweep_state();
+        let draft = seed_gate_draft(&state, "agent").await;
+        let queued = dashboard_human_send(&state, &draft.id).await;
+
+        let block = human_queue_attribution_block(&queued, "agent@example.com");
+        assert_eq!(
+            block["attribution_state"], "attributed",
+            "the sweep will send this; the block must not claim otherwise: {block}"
+        );
+        assert!(
+            block["derived_attrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "tyler_approved"),
+            "the human attestation is the authorization: {block}"
+        );
+        assert!(
+            block["declared_attrs"].as_array().unwrap().is_empty(),
+            "no bot declaration fabricated: {block}"
+        );
     }
 
     /// An attachment-bearing human-queued draft must advertise the real
@@ -3537,7 +3972,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            db.queue_draft_with_human_approval(
+            db.queue_draft_with_human_send(
                 &draft.id,
                 parked.revision,
                 "2026-07-10T09:02:00Z",

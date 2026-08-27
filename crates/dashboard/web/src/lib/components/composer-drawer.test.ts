@@ -33,7 +33,7 @@ async function renderCompose() {
   await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
 }
 
-const sendButton = () => screen.getByRole('button', { name: /^send$/i });
+const sendButton = () => screen.getByRole('button', { name: /^human-only send$/i });
 
 beforeEach(() => {
   __resetComposerStore();
@@ -41,6 +41,18 @@ beforeEach(() => {
 
 afterEach(() => {
   __resetComposerStore();
+});
+
+describe('ComposerDrawer names the send action Human-only Send', () => {
+  it('explains what the operator is authorizing', async () => {
+    await renderCompose();
+
+    const note = document.getElementById('composer-human-send-note');
+    expect(note).toBeTruthy();
+    expect(note).toHaveTextContent(/your explicit send/i);
+    expect(note).toHaveTextContent(/cooldown/i);
+    expect(note).toHaveTextContent(/governor/i);
+  });
 });
 
 describe('ComposerDrawer recipient gating', () => {

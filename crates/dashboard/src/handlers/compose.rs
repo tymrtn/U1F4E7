@@ -126,10 +126,11 @@ pub async fn send(
         {
             return (StatusCode::BAD_GATEWAY, format!("queue attachments: {e}")).into_response();
         }
-        // A dashboard compose is human-authored and human-sent: schedule and
-        // record the approval attestation in one atomic store transaction,
-        // bound to the final revision written above. `tyler_approved` is an
-        // input attribute for Governor's blind scoring, never a bypass.
+        // A dashboard compose is human-authored and human-sent: schedule, record
+        // the approval attestation, and record the `human_send` authorization in
+        // one atomic store transaction, bound to the final revision written
+        // above. The authorization covers this queued send and nothing else — an
+        // edit, a Hold, or an agent re-queue withdraws it.
         let current = match db.get_draft(&draft.id) {
             Ok(Some(d)) => d,
             Ok(None) => {
@@ -142,7 +143,7 @@ pub async fn send(
         // The atomic queue returns the exact attested row — no reload, no
         // fallback to pre-attestation state. If it cannot be obtained the queue
         // failed, so fail the request rather than report success off stale state.
-        let attested = match db.queue_draft_with_human_approval(
+        let attested = match db.queue_draft_with_human_send(
             &current.id,
             current.revision,
             &send_at,
@@ -292,8 +293,9 @@ pub async fn reply(
             )
                 .into_response();
         }
-        // Schedule + approval attestation as one atomic store transaction,
-        // bound to the final revision written above (metadata + attachments).
+        // Schedule + approval attestation + human send authorization as one
+        // atomic store transaction, bound to the final revision written above
+        // (metadata + attachments).
         let current = match db.get_draft(&draft.id) {
             Ok(Some(d)) => d,
             Ok(None) => {
@@ -306,7 +308,7 @@ pub async fn reply(
         };
         // The atomic queue returns the exact attested row — no reload, no
         // fallback to pre-attestation state.
-        let attested = match db.queue_draft_with_human_approval(
+        let attested = match db.queue_draft_with_human_send(
             &current.id,
             current.revision,
             &send_at,

@@ -356,7 +356,7 @@ impl Database {
                 subject = COALESCE(?4, subject),
                 text_content = CASE WHEN ?9 THEN ?5 ELSE text_content END,
                 html_content = CASE WHEN ?9 THEN ?6 ELSE html_content END,
-                metadata = json_remove(metadata, '$.human_approval'),
+                metadata = json_remove(metadata, '$.human_approval', '$.human_send'),
                 revision = revision + 1,
                 updated_at = datetime('now')
              WHERE id = ?7
@@ -469,14 +469,15 @@ impl Database {
         attachments: &[serde_json::Value],
     ) -> Result<()> {
         let serialized = serde_json::to_string(attachments)?;
-        // Changing what will be attached changes what was approved: one atomic
-        // statement bumps the revision and drops the approval attestation
-        // together with the attachment change — and refuses claimed/terminal
-        // rows (`sending`/`sent`/`discarded`) in the same predicate, so a
-        // claimed transmission snapshot can never mutate under the sweep.
+        // Changing what will be attached changes what was approved and what was
+        // sent: one atomic statement bumps the revision and drops both the
+        // approval attestation and the human send authorization together with the
+        // attachment change — and refuses claimed/terminal rows
+        // (`sending`/`sent`/`discarded`) in the same predicate, so a claimed
+        // transmission snapshot can never mutate under the sweep.
         let rows = self.conn().execute(
             "UPDATE drafts SET attachments = ?1,
-                metadata = json_remove(metadata, '$.human_approval'),
+                metadata = json_remove(metadata, '$.human_approval', '$.human_send'),
                 revision = revision + 1,
                 updated_at = datetime('now')
              WHERE id = ?2 AND status IN ('draft', 'pending_review', 'blocked')",
@@ -496,7 +497,7 @@ impl Database {
     /// attachments: adding or removing one is an edit to what will be sent, so
     /// it has to lose a race with a concurrent change rather than rebuild the
     /// array from a stale view. Same atomic statement, same editable-status
-    /// guard, same approval invalidation — plus `revision = ?3`.
+    /// guard, same approval/send-authorization invalidation — plus `revision = ?3`.
     pub fn update_draft_attachments_for_revision(
         &self,
         id: &str,
@@ -506,7 +507,7 @@ impl Database {
         let serialized = serde_json::to_string(attachments)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET attachments = ?1,
-                metadata = json_remove(metadata, '$.human_approval'),
+                metadata = json_remove(metadata, '$.human_approval', '$.human_send'),
                 revision = revision + 1,
                 updated_at = datetime('now')
              WHERE id = ?2
@@ -553,19 +554,21 @@ impl Database {
     /// draft that was not queued reports [`StoreError::DraftNotScheduled`]
     /// instead of a silent no-op success.
     ///
-    /// The human-approval attestation is stripped alongside the schedule. That
-    /// approval authorized *this* send and the operator just withdrew it; a
-    /// later re-queue re-attests through
-    /// [`Self::queue_draft_with_human_approval`]. The revision is deliberately
-    /// NOT bumped — no content changed, so an editor holding
-    /// `expected_revision` stays valid and can save without a spurious 409.
+    /// The human-approval attestation and the human send authorization are both
+    /// stripped alongside the schedule. They authorized *this* send and the
+    /// operator just withdrew it; a later re-queue re-attests through
+    /// [`Self::queue_draft_with_human_send`], and an agent re-queue in between
+    /// therefore finds nothing to inherit. The revision is deliberately NOT
+    /// bumped — no content changed, so an editor holding `expected_revision`
+    /// stays valid and can save without a spurious 409.
     ///
     /// Returns the held row.
     pub fn hold_scheduled_draft(&self, id: &str) -> Result<Draft> {
         let rows = self.conn().execute(
             "UPDATE drafts SET
                 send_after = NULL,
-                metadata = json_remove(COALESCE(metadata, '{}'), '$.human_approval'),
+                metadata = json_remove(
+                    COALESCE(metadata, '{}'), '$.human_approval', '$.human_send'),
                 updated_at = datetime('now')
              WHERE id = ?1 AND status = 'draft' AND send_after IS NOT NULL",
             params![id],
@@ -722,6 +725,7 @@ impl Database {
         let mut sanitized = metadata.clone();
         if let Some(obj) = sanitized.as_object_mut() {
             obj.remove("human_approval");
+            obj.remove("human_send");
         }
         let serialized_meta = serde_json::to_string(&sanitized)?;
         let serialized_attachments = serde_json::to_string(attachments)?;
@@ -942,6 +946,16 @@ impl Database {
     /// `DraftNotEditable` / `DraftNotFound`) and nothing is scheduled or
     /// persisted. The `attribution` value is caller-supplied
     /// (`PersistedDeclaration::to_value`) and carries no score/weight/threshold.
+    ///
+    /// This is the AGENT queue transition (CLI `draft send`, MCP `send_draft`),
+    /// so the same statement strips any `human_send` authorization left by an
+    /// earlier dashboard **Human-only Send**. The pending send now belongs to the
+    /// agent — it is the agent's declaration the sweep will judge, and the human
+    /// never authorized *this* transmission. Without the strip, a human's click
+    /// (or a click the agent could provoke) would carry an agent-queued send past
+    /// the Governor gate. The `human_approval` review attestation is deliberately
+    /// left alone: a human really did approve this revision, and that fact is a
+    /// declared attribute for scoring, never a bypass.
     pub fn queue_draft_for_send(
         &self,
         id: &str,
@@ -954,10 +968,13 @@ impl Database {
             "UPDATE drafts SET
                 status = 'draft',
                 send_after = ?1,
-                metadata = json_set(
-                    COALESCE(metadata, '{}'),
-                    '$.attribution',
-                    json_set(json(?2), '$.revision', revision)
+                metadata = json_remove(
+                    json_set(
+                        COALESCE(metadata, '{}'),
+                        '$.attribution',
+                        json_set(json(?2), '$.revision', revision)
+                    ),
+                    '$.human_send'
                 ),
                 updated_at = datetime('now')
              WHERE id = ?3 AND revision = ?4
@@ -1230,16 +1247,19 @@ impl Database {
     /// preview metadata) so the full draft can be reconstructed and sent later
     /// without the original message in context.
     ///
-    /// Any `human_approval` key in the incoming value is stripped: a metadata
-    /// write is a draft-revision change (the revision counter is bumped in the
-    /// same statement), and approval is bound to the approved revision.
+    /// Any `human_approval` or `human_send` key in the incoming value is
+    /// stripped: a metadata write is a draft-revision change (the revision
+    /// counter is bumped in the same statement), and both the approval and the
+    /// human send authorization are bound to the revision the human acted on.
     /// Callers (including agent/MCP paths doing read-modify-write) can neither
-    /// inject an attestation nor carry one forward through this path — only
-    /// [`Self::record_draft_human_approval`] writes that key.
+    /// inject either record nor carry one forward through this path — only
+    /// [`Self::record_draft_human_approval`] and
+    /// [`Self::queue_draft_with_human_send`] write those keys.
     pub fn set_draft_metadata(&self, id: &str, metadata: &serde_json::Value) -> Result<()> {
         let mut sanitized = metadata.clone();
         if let Some(obj) = sanitized.as_object_mut() {
             obj.remove("human_approval");
+            obj.remove("human_send");
         }
         let serialized = serde_json::to_string(&sanitized)?;
         // Status guard in the same statement: metadata (threading, contextual
@@ -1320,12 +1340,66 @@ impl Database {
         Ok(())
     }
 
+    /// Record the revision-bound human **send** authorization, compare-and-set
+    /// against the revision the human acted on.
+    ///
+    /// Private by design, and called only from
+    /// [`Self::queue_draft_with_human_send`] inside that method's transaction:
+    /// the authorization exists only as part of a queue transition a human
+    /// surface performed, never as free-standing state some later path could
+    /// pick up. `queued_by` is the human surface label (`human:*`), `queued_at`
+    /// an RFC 3339 UTC timestamp — never an address, token, or secret.
+    ///
+    /// The CAS clause is the guard: a concurrent content-relevant edit, a sweep
+    /// claim, or a terminal transition between the caller's read and this write
+    /// matches zero rows, so no send is ever authorized against content the
+    /// human did not see.
+    fn record_draft_human_send(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        queued_by: &str,
+        queued_at: &str,
+    ) -> Result<()> {
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        if draft.revision != expected_revision {
+            return Err(StoreError::DraftModifiedConcurrently(id.to_string()));
+        }
+        let mut metadata = match draft.metadata {
+            Some(m) if m.is_object() => m,
+            _ => serde_json::json!({}),
+        };
+        metadata["human_send"] = serde_json::json!({
+            "queued_by": queued_by,
+            "queued_at": queued_at,
+            "revision": expected_revision,
+        });
+        let serialized = serde_json::to_string(&metadata)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET metadata = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND revision = ?3
+               AND status IN ('draft', 'pending_review', 'blocked')",
+            params![serialized, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_guarded_update_miss(id));
+        }
+        Ok(())
+    }
+
     /// Atomically approve a draft revision from a human surface: promote it to
     /// sweep-eligible `draft` status and record the revision-bound attestation
     /// in one transaction. `expected_revision` is the revision the human
     /// **viewed** (carried by the browser request, never re-read server-side)
     /// — if the content changed since, the whole operation (including the
     /// status flip) rolls back with [`StoreError::DraftModifiedConcurrently`].
+    ///
+    /// Review only: it sets no `send_after` and writes no `human_send`
+    /// authorization, so approving a draft neither sends it nor lets a later
+    /// agent send skip the Governor gate. Sending from a human surface is
+    /// [`Self::queue_draft_with_human_send`].
     pub fn approve_draft_revision(
         &self,
         id: &str,
@@ -1341,64 +1415,32 @@ impl Database {
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
     }
 
-    /// Atomically queue a human-approved send into the outbox: validate the
+    /// Atomically queue a **human-sent** draft into the outbox: validate the
     /// draft is queueable (`draft` stays, `pending_review` is promoted;
     /// sending/blocked/discarded/sent refuse — those are in-flight, explicit
-    /// operator decisions, or terminal states), set `send_after`, and record
-    /// the attestation bound to `expected_revision` — the revision the human
-    /// **viewed** — all in one transaction. If the final approval fails (e.g.
-    /// a concurrent content edit), nothing persists: no partially queued,
-    /// unapproved state.
+    /// operator decisions, or terminal states), set `send_after`, record the
+    /// review attestation, and record the human send authorization — all bound
+    /// to `expected_revision`, the revision the human **viewed**, and all in one
+    /// transaction. If any step fails (e.g. a concurrent content edit), nothing
+    /// persists: no partially queued state, and no authorization for a send that
+    /// was never queued.
     ///
-    /// Returns the exact atomically-queued, attested [`Draft`] row (read inside
+    /// This is the ONLY writer of the `human_send` authorization
+    /// ([`Draft::human_send_surface`]), and it writes it only *as* the queue
+    /// transition. That is what makes the authorization mean "this human queued
+    /// this exact revision from this surface" rather than the much weaker "some
+    /// human approved this content at some point" — the distinction the sweep's
+    /// Human-only Send gate exception depends on. Callers must pass a
+    /// `human:`-prefixed surface for their own send action; an agent-facing
+    /// re-queue belongs on [`Self::queue_draft_for_send`], which strips the
+    /// authorization instead.
+    ///
+    /// Returns the exact atomically-queued, authorized [`Draft`] row (read inside
     /// the same transaction before commit) so the caller never has to reload —
     /// a post-commit reload could fail or race and let a handler report success
     /// off pre-attestation state. `blocked` is refused ([`DraftStatus::is_queueable`]
     /// is false): a Governor-denied row is never resurrected by human queueing.
-    /// Transfer authorship of a draft to the human who is sending it.
-    ///
-    /// Stamps `created_by` with the human surface and strips the two pieces of
-    /// per-attempt agent state that must never outlive a human's decision to
-    /// send: the bot `attribution` declaration (whose presence makes
-    /// `scheduled_origin` report `Bot`, forcing the Governor gate onto a human
-    /// send) and any `send_block` recorded by a PREVIOUS attempt (a stop reason
-    /// describes one attempt; carried forward it renders "nothing was
-    /// transmitted" over a message that did go out).
-    ///
-    /// CAS-guarded on the revision the human viewed, exactly like the
-    /// attestation it accompanies, so a concurrent edit rolls the whole queue
-    /// back rather than re-authoring content nobody read.
-    fn transfer_draft_authorship_to_human(
-        &self,
-        id: &str,
-        expected_revision: i64,
-        approved_by: &str,
-    ) -> Result<()> {
-        let draft = self
-            .get_draft(id)?
-            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
-        let mut metadata = match draft.metadata {
-            Some(m) if m.is_object() => m,
-            _ => serde_json::json!({}),
-        };
-        if let Some(obj) = metadata.as_object_mut() {
-            obj.remove("attribution");
-            obj.remove("send_block");
-        }
-        let serialized = serde_json::to_string(&metadata)?;
-        let rows = self.conn().execute(
-            "UPDATE drafts SET created_by = ?1, metadata = ?2, updated_at = datetime('now')
-             WHERE id = ?3 AND revision = ?4
-               AND status IN ('draft', 'pending_review', 'blocked')",
-            params![approved_by, serialized, id, expected_revision],
-        )?;
-        if rows == 0 {
-            return Err(self.classify_guarded_update_miss(id));
-        }
-        Ok(())
-    }
-
-    pub fn queue_draft_with_human_approval(
+    pub fn queue_draft_with_human_send(
         &self,
         id: &str,
         expected_revision: i64,
@@ -1428,17 +1470,7 @@ impl Database {
         }
         self.update_draft_send_after(id, send_after)?;
         self.record_draft_human_approval(id, expected_revision, approved_by, approved_at)?;
-        // A human pressing Send AUTHORS this message. The draft may have been
-        // started by an agent, but the operator opened it, read it, possibly
-        // edited it, and chose to send — so provenance transfers to them and the
-        // agent's attribution declaration is dropped rather than carried along.
-        //
-        // This is what keeps operator-clicked mail out of the Governor gate:
-        // `scheduled_origin` reads `created_by`, and a lingering `cli`/`agent`
-        // marker (or a stale bot declaration) made the sweep demand a bot
-        // declaration for a send a human had already taken responsibility for,
-        // stranding it as `pending_review` with nothing transmitted.
-        self.transfer_draft_authorship_to_human(id, expected_revision, approved_by)?;
+        self.record_draft_human_send(id, expected_revision, approved_by, approved_at)?;
         // Read the attested row inside the transaction, then commit. The caller
         // receives exactly what was queued — no reload, no fallback.
         let attested = self
@@ -1539,128 +1571,6 @@ mod tests {
             .get("attribution")
             .cloned()
             .unwrap()
-    }
-
-    /// A human pressing Send in the dashboard AUTHORS the message. The draft may
-    /// have started as an agent draft, but the operator read it, edited it, and
-    /// took responsibility — so the queued row must carry human provenance and
-    /// must NOT carry the agent's stale attribution declaration. Leaving
-    /// `created_by = "cli"` is what routed operator-clicked mail back through
-    /// the Governor gate and stranded it as `pending_review`.
-    #[test]
-    fn human_queue_transfers_authorship_and_drops_the_agent_declaration() {
-        let db = setup();
-        let draft = db
-            .create_draft(
-                "acc1",
-                "to@test.com",
-                Some("Subject"),
-                Some("Body"),
-                None,
-                None,
-                None,
-                None,
-                Some("cli"),
-            )
-            .unwrap();
-        // The agent that drafted this took attribution responsibility for it.
-        db.set_draft_attribution(
-            &draft.id,
-            &serde_json::json!({
-                "origin": "bot",
-                "declared_attrs": ["has_pii"],
-                "protocol": "envelope.attribution.v1",
-            }),
-        )
-        .unwrap();
-
-        let queued = db
-            .queue_draft_with_human_approval(
-                &draft.id,
-                draft.revision,
-                "2026-07-10T09:02:00Z",
-                "human:dashboard",
-                "2026-07-10T09:00:00Z",
-            )
-            .unwrap();
-
-        assert_eq!(
-            queued.created_by.as_deref(),
-            Some("human:dashboard"),
-            "a human send re-authors the draft"
-        );
-        assert!(
-            queued
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("attribution"))
-                .is_none(),
-            "the agent's declaration must not survive a human send"
-        );
-        assert!(queued.human_approved());
-    }
-
-    /// A stop reason describes ONE send attempt. Queueing a fresh send must
-    /// clear it, or a later successful send still renders "This send was
-    /// stopped — nothing was transmitted" over a message that did go out.
-    #[test]
-    fn human_queue_clears_a_stale_send_block() {
-        let db = setup();
-        let draft = db
-            .create_draft(
-                "acc1",
-                "to@test.com",
-                Some("Subject"),
-                Some("Body"),
-                None,
-                None,
-                None,
-                None,
-                Some("cli"),
-            )
-            .unwrap();
-        db.park_for_review_with_block(
-            &draft.id,
-            &db.claim_draft_for_immediate_send(&draft.id, draft.revision)
-                .unwrap()
-                .unwrap(),
-            &serde_json::json!({
-                "code": "governor_blocked",
-                "title": "This send was stopped",
-                "explanation": "Nothing was transmitted.",
-                "action": "send"
-            }),
-        )
-        .unwrap();
-
-        let parked = db.get_draft(&draft.id).unwrap().unwrap();
-        assert!(
-            parked
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("send_block"))
-                .is_some(),
-            "precondition: the park recorded a stop reason"
-        );
-
-        let queued = db
-            .queue_draft_with_human_approval(
-                &parked.id,
-                parked.revision,
-                "2026-07-10T09:02:00Z",
-                "human:dashboard",
-                "2026-07-10T09:00:00Z",
-            )
-            .unwrap();
-
-        assert!(
-            queued
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("send_block"))
-                .is_none(),
-            "a new send attempt clears the previous stop reason"
-        );
     }
 
     /// The replacement APPEND gives the provider copy a NEW Message-ID. If the
@@ -2724,6 +2634,316 @@ mod tests {
         );
     }
 
+    /// An agent-authored draft, the shape the dashboard send routes act on.
+    fn agent_draft(db: &Database) -> Draft {
+        db.create_draft(
+            "acc1",
+            "to@test.com",
+            Some("Subject"),
+            Some("Body"),
+            None,
+            None,
+            None,
+            None,
+            Some("agent"),
+        )
+        .unwrap()
+    }
+
+    fn queued_by_human(db: &Database, id: &str) -> Draft {
+        let revision = db.get_draft(id).unwrap().unwrap().revision;
+        db.queue_draft_with_human_send(
+            id,
+            revision,
+            "2030-01-01T00:00:00Z",
+            "human:dashboard",
+            "2026-07-10T09:00:00Z",
+        )
+        .unwrap()
+    }
+
+    /// The persisted declaration an agent binds when it queues
+    /// (`PersistedDeclaration::new_bot(...).to_value()` in the CLI/MCP send
+    /// paths); shaped by hand here so the store crate stays dependency-free.
+    fn agent_declaration(revision: i64) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "envelope.attribution.v1",
+            "declared_attrs": ["recipient_requested"],
+            "revision": revision,
+        })
+    }
+
+    #[test]
+    fn human_send_records_a_revision_bound_authorization_with_the_queue() {
+        // The authorization exists only as part of the queue transition a human
+        // performed: same call, same revision, same transaction.
+        let db = setup();
+        let draft = agent_draft(&db);
+        let before = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(before.human_send_surface(), None);
+
+        let queued = queued_by_human(&db, &draft.id);
+
+        assert_eq!(queued.human_send_surface(), Some("human:dashboard"));
+        assert!(
+            queued.human_approved(),
+            "the human who sent it also reviewed it"
+        );
+        assert_eq!(queued.send_after.as_deref(), Some("2030-01-01T00:00:00Z"));
+        let meta = queued.metadata.as_ref().unwrap();
+        assert_eq!(meta["human_send"]["queued_by"], "human:dashboard");
+        assert_eq!(meta["human_send"]["queued_at"], "2026-07-10T09:00:00Z");
+        assert_eq!(meta["human_send"]["revision"], before.revision);
+    }
+
+    #[test]
+    fn approving_a_draft_never_authorizes_a_send() {
+        // Approve is a review decision. It records the attestation and leaves the
+        // draft unqueued and unauthorized, so no later path can read it as a
+        // human's send.
+        let db = setup();
+        let draft = agent_draft(&db);
+        let revision = db.get_draft(&draft.id).unwrap().unwrap().revision;
+
+        let approved = db
+            .approve_draft_revision(
+                &draft.id,
+                revision,
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap();
+
+        assert!(approved.human_approved());
+        assert_eq!(
+            approved.human_send_surface(),
+            None,
+            "approval is not a send authorization"
+        );
+        assert!(approved.send_after.is_none(), "approval queues nothing");
+    }
+
+    #[test]
+    fn an_agent_requeue_supersedes_the_human_send_authorization() {
+        // The agent queue transition (CLI `draft send`, MCP `send_draft`) takes
+        // ownership of the pending send: the human authorized a different
+        // transmission, and this one is the agent's to declare for.
+        let db = setup();
+        let draft = agent_draft(&db);
+        let queued = queued_by_human(&db, &draft.id);
+        assert!(queued.human_send_surface().is_some());
+
+        db.queue_draft_for_send(
+            &draft.id,
+            queued.revision,
+            "2030-02-02T00:00:00Z",
+            &agent_declaration(queued.revision),
+        )
+        .unwrap();
+
+        let requeued = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(
+            requeued.human_send_surface(),
+            None,
+            "an agent-queued send is never a human send"
+        );
+        assert!(
+            requeued.human_approved(),
+            "the review attestation survives — it is a declared attribute for \
+             scoring, and the human really did approve this revision"
+        );
+        assert_eq!(requeued.send_after.as_deref(), Some("2030-02-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn withdrawing_or_changing_the_send_invalidates_the_authorization() {
+        // Everything that changes what would be transmitted, or takes the
+        // transmission back, withdraws the human's authorization for it.
+        let db = setup();
+        let draft = agent_draft(&db);
+
+        // Hold takes the message out of the outbox.
+        queued_by_human(&db, &draft.id);
+        let held = db.hold_scheduled_draft(&draft.id).unwrap();
+        assert_eq!(held.human_send_surface(), None, "Hold withdraws the send");
+        assert!(held.send_after.is_none());
+
+        // A content edit.
+        queued_by_human(&db, &draft.id);
+        db.update_draft_content(&draft.id, None, None, None, None, Some("changed"), None)
+            .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id)
+                .unwrap()
+                .unwrap()
+                .human_send_surface(),
+            None,
+            "an edit is not the version the human sent"
+        );
+
+        // An attachment change.
+        queued_by_human(&db, &draft.id);
+        db.update_draft_attachments(
+            &draft.id,
+            &[serde_json::json!({
+                "filename": "new.pdf", "content_type": "application/pdf", "size": 3,
+                "data_base64": "Zm9v",
+            })],
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id)
+                .unwrap()
+                .unwrap()
+                .human_send_surface(),
+            None,
+            "changing the attachments changes what was sent"
+        );
+
+        // A revision-guarded attachment change from an interactive surface.
+        let queued = queued_by_human(&db, &draft.id);
+        db.update_draft_attachments_for_revision(&draft.id, queued.revision, &[])
+            .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id)
+                .unwrap()
+                .unwrap()
+                .human_send_surface(),
+            None
+        );
+
+        // A metadata rewrite, including a read-modify-write that tries to carry
+        // the authorization forward.
+        let queued = queued_by_human(&db, &draft.id);
+        let carried = queued.metadata.clone().unwrap();
+        assert!(carried.get("human_send").is_some());
+        db.set_draft_metadata(&draft.id, &carried).unwrap();
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.human_send_surface(), None);
+        assert!(
+            after
+                .metadata
+                .as_ref()
+                .is_none_or(|m| m.get("human_send").is_none()),
+            "set_draft_metadata must never persist a carried-forward authorization"
+        );
+
+        // Direct injection through the public metadata path is stripped too.
+        db.set_draft_metadata(
+            &draft.id,
+            &serde_json::json!({
+                "human_send": {
+                    "queued_by": "human:dashboard",
+                    "queued_at": "2026-07-10T09:00:00Z",
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_draft(&draft.id)
+                .unwrap()
+                .unwrap()
+                .human_send_surface(),
+            None,
+            "an agent cannot inject a send authorization"
+        );
+    }
+
+    #[test]
+    fn human_send_surface_is_fail_closed_on_malformed_authorizations() {
+        let db = setup();
+        let draft = agent_draft(&db);
+        let revision = db.get_draft(&draft.id).unwrap().unwrap().revision;
+
+        // Written via raw SQL (bypassing the stripping public paths) so each
+        // crafted authorization is tested with everything else valid.
+        let craft = |authorization: serde_json::Value| {
+            db.conn()
+                .execute(
+                    "UPDATE drafts SET metadata = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        serde_json::json!({ "human_send": authorization }).to_string(),
+                        draft.id
+                    ],
+                )
+                .unwrap();
+            db.get_draft(&draft.id)
+                .unwrap()
+                .unwrap()
+                .human_send_surface()
+                .is_some()
+        };
+
+        for (why, authorization) in [
+            (
+                "a non-human surface label",
+                serde_json::json!({
+                    "queued_by": "agent:mcp",
+                    "queued_at": "2026-07-10T09:00:00Z",
+                    "revision": revision,
+                }),
+            ),
+            (
+                "a missing timestamp",
+                serde_json::json!({ "queued_by": "human:dashboard", "revision": revision }),
+            ),
+            (
+                "a naive (offset-free) timestamp",
+                serde_json::json!({
+                    "queued_by": "human:dashboard",
+                    "queued_at": "2026-07-10T09:00:00",
+                    "revision": revision,
+                }),
+            ),
+            (
+                "a stale revision",
+                serde_json::json!({
+                    "queued_by": "human:dashboard",
+                    "queued_at": "2026-07-10T09:00:00Z",
+                    "revision": revision - 1,
+                }),
+            ),
+            (
+                "no revision binding at all",
+                serde_json::json!({
+                    "queued_by": "human:dashboard",
+                    "queued_at": "2026-07-10T09:00:00Z",
+                }),
+            ),
+        ] {
+            assert!(!craft(authorization), "{why} must fail closed");
+        }
+    }
+
+    #[test]
+    fn human_send_refuses_a_revision_the_human_did_not_see() {
+        // The CAS is the whole guarantee: a draft edited since the operator
+        // loaded it is not queued and not authorized.
+        let db = setup();
+        let draft = agent_draft(&db);
+        let viewed = db.get_draft(&draft.id).unwrap().unwrap();
+        db.update_draft_content(&draft.id, None, None, None, None, Some("edited"), None)
+            .unwrap();
+
+        let err = db
+            .queue_draft_with_human_send(
+                &draft.id,
+                viewed.revision,
+                "2030-01-01T00:00:00Z",
+                "human:dashboard",
+                "2026-07-10T09:00:00Z",
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::DraftModifiedConcurrently(_)));
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.human_send_surface(), None);
+        assert!(
+            after.send_after.is_none(),
+            "nothing partially queued survives the refusal"
+        );
+    }
+
     /// Create a draft carrying BOTH body forms, as an agent-composed reply
     /// with an HTML alternative does.
     fn dual_body_draft(db: &Database) -> Draft {
@@ -2994,7 +3214,7 @@ mod tests {
             .unwrap();
 
         let err = db
-            .queue_draft_with_human_approval(
+            .queue_draft_with_human_send(
                 &draft.id,
                 human_view.revision,
                 "2026-07-10T09:02:00Z",
@@ -3039,7 +3259,7 @@ mod tests {
             .unwrap();
         let human_view = db.get_draft(&draft.id).unwrap().unwrap();
 
-        db.queue_draft_with_human_approval(
+        db.queue_draft_with_human_send(
             &draft.id,
             human_view.revision,
             "2026-07-10T09:02:00Z",
@@ -3058,7 +3278,7 @@ mod tests {
             .unwrap();
         let blocked = db.get_draft(&draft.id).unwrap().unwrap();
         assert!(matches!(
-            db.queue_draft_with_human_approval(
+            db.queue_draft_with_human_send(
                 &blocked.id,
                 blocked.revision,
                 "2026-07-10T09:05:00Z",
@@ -3164,7 +3384,7 @@ mod tests {
         assert!(!claimed.status.is_editable());
         assert!(!db.discard_draft(&draft.id).unwrap());
         assert!(matches!(
-            db.queue_draft_with_human_approval(
+            db.queue_draft_with_human_send(
                 &draft.id,
                 claimed.revision,
                 "2026-07-10T09:02:00Z",
@@ -3329,7 +3549,7 @@ mod tests {
             StoreError::DraftNotEditable(_)
         ));
         assert!(matches!(
-            db.queue_draft_with_human_approval(
+            db.queue_draft_with_human_send(
                 &draft.id,
                 claimed.revision,
                 "2026-07-10T09:02:00Z",
@@ -3694,7 +3914,7 @@ mod tests {
         ));
         // …nor can the dashboard/CLI queue, edit, re-schedule, or attest it.
         assert!(matches!(
-            db.queue_draft_with_human_approval(
+            db.queue_draft_with_human_send(
                 &draft.id,
                 parked.revision,
                 "2026-07-10T09:02:00Z",
@@ -4336,7 +4556,7 @@ mod tests {
         // attestation only exists via the atomic queue path, so that is what
         // this test has to go through.
         let approved = db
-            .queue_draft_with_human_approval(
+            .queue_draft_with_human_send(
                 &draft.id,
                 draft.revision,
                 "2026-08-18T12:00:00Z",
@@ -4480,7 +4700,7 @@ mod tests {
             )
             .unwrap();
         let attested = db
-            .queue_draft_with_human_approval(
+            .queue_draft_with_human_send(
                 &draft.id,
                 draft.revision,
                 "2030-01-01T00:00:00",
@@ -4613,7 +4833,7 @@ mod tests {
         );
 
         let requeued = db
-            .queue_draft_with_human_approval(
+            .queue_draft_with_human_send(
                 &edited.id,
                 edited.revision,
                 "2030-06-01T00:00:00",

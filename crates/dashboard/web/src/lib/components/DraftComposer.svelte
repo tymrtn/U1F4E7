@@ -235,9 +235,7 @@
     title: string;
     explanation: string;
     action?: string;
-    /** Whether approving again could plausibly clear the block. */
-    retryable: boolean;
-    /** Where the block CAN be cleared, when it cannot be cleared here. */
+    /** Where the agent-path block can also be cleared, when the CLI carries it. */
     remedy?: string;
   };
   function asSendBlock(value: unknown): SendBlock | null {
@@ -250,18 +248,16 @@
       code: typeof o.code === 'string' && o.code ? o.code : 'send_stopped',
       title: title || 'This send was stopped',
       explanation: explanation || 'Nothing was transmitted.',
-      action: typeof o.action === 'string' ? o.action : undefined,
-      retryable: true
+      action: typeof o.action === 'string' ? o.action : undefined
     };
   }
   const sendBlock = $derived.by((): SendBlock | null => {
     if (!draft) return null;
-    // No suppression here. A stale stop reason used to be hidden behind
-    // `isQueued`, which hid the ONLY explanation the operator ever got for a
-    // refused send. The staleness is fixed at the source instead: queueing a
-    // draft clears `send_block` in the same transaction that records the
-    // approval (store::transfer_draft_authorship_to_human), so a reason that
-    // survives to here describes THIS draft's real, current state.
+    // The status guard is what keeps stale reasons off screen: a queued or
+    // sent draft renders no block even though `send_block` metadata may
+    // survive a human-authorized queue, and every fresh park rewrites the
+    // reason. A block that renders here therefore describes THIS draft's
+    // current parked/blocked state.
     if (draft.status !== 'pending_review' && draft.status !== 'blocked') return null;
     const stored = asSendBlock(draft.metadata?.send_block);
     if (stored) return stored;
@@ -274,11 +270,11 @@
       const record = attribution as Record<string, unknown>;
       const declared = Array.isArray(record.declared_attrs) ? record.declared_attrs : [];
       const attempts = typeof record.attempts === 'number' ? record.attempts : 0;
-      // Approving again re-runs the identical declaration-free attempt: it
-      // spends another try and parks on the same reason. Say that instead of
-      // offering the button. Which label would pass is deliberately NOT shown —
-      // the park record carries no such field, and coaching one would turn a
-      // blind declaration into lock-picking.
+      // Which label would pass is deliberately NOT shown — the park record
+      // carries no such field, and coaching one would turn a blind
+      // declaration into lock-picking. Human-only Send stays offered: it
+      // queues this exact revision on the operator's own authorization, so
+      // it does not re-run the exhausted agent attempt.
       const stuck = record.origin === 'bot' && declared.length === 0;
       return {
         code: 'attribution_exhausted',
@@ -286,10 +282,9 @@
         explanation: stuck
           ? `Envelope paused this message because the send is bot-attributed and carries no fact labels. ` +
             `${attempts} attempts were spent and no fact labels were declared for this revision. ` +
-            `Approving it here repeats the same attempt, so that button is withheld.`
+            `Approving it again repeats the same governed attempt; Human-only Send transmits it on your own authorization.`
           : 'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
         action: stuck ? undefined : 'send',
-        retryable: !stuck,
         remedy: stuck
           ? `Declaring is the sending agent's job, and only the CLI can carry it: envelope draft send ${draft.id} --attr <label>`
           : undefined
@@ -300,8 +295,7 @@
         code: 'blocked',
         title: 'This send was stopped',
         explanation: STATUS_META.blocked.note,
-        action: 'edit',
-        retryable: true
+        action: 'edit'
       };
     }
     return {
@@ -309,8 +303,7 @@
       title: 'This send was stopped',
       explanation:
         'Envelope paused this message before it left. Nothing was transmitted. Envelope did not record a more specific reason on this draft.',
-      action: 'send',
-      retryable: true
+      action: 'send'
     };
   });
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);
@@ -964,8 +957,10 @@
           <p class="draft-banner-remedy">{sendBlock.remedy}</p>
         {/if}
         <div class="draft-banner-action">
-          {#if sendable && sendBlock.retryable}
-            <Button variant="primary" disabled={!canSend} onclick={requestSend}>Send again</Button>
+          {#if sendable}
+            <Button variant="primary" disabled={!canSend} onclick={requestSend}>
+              Human-only Send again
+            </Button>
           {/if}
         </div>
       </div>
@@ -1096,6 +1091,15 @@
       onconflict={() => (conflict = true)}
     />
 
+    {#if sendable}
+      <p class="draft-banner draft-send-note" id="draft-human-send-note">
+        <strong>Human-only Send</strong> is your explicit send of this exact version. It still waits
+        out the outbox cooldown, Hold still takes it back, and Envelope still files the Sent copy as
+        proof. Governor does not score a message you send this way. That covers this send alone —
+        editing the draft, holding it, or an agent queueing it again withdraws it.
+      </p>
+    {/if}
+
     <footer class="draft-actions">
       <div class="draft-actions-status">
         {#if dirty && !recipientPresent}
@@ -1127,9 +1131,11 @@
                Both open the same confirmation, which is where the choice is
                actually made — a first send is the one action with no undo
                window, so it gets one look at From/To/Subject first. -->
-          <Button variant="ghost" disabled={!canSend} onclick={requestSend}>Send now</Button>
+          <Button variant="ghost" disabled={!canSend} onclick={requestSend}>
+            Human-only Send now
+          </Button>
           <Button variant="primary" disabled={!canSend} onclick={requestSend}>
-            Send in {cooldownLabel}
+            Human-only Send in {cooldownLabel}
           </Button>
         {/if}
       </div>
@@ -1137,7 +1143,7 @@
   {/if}
 </section>
 
-<Modal open={confirmOpen} title="Send this message?" onclose={closeConfirm}>
+<Modal open={confirmOpen} title="Human-only Send this draft?" onclose={closeConfirm}>
   <p class="draft-confirm-line">
     <strong>From</strong>
     {effectiveFrom}
@@ -1152,6 +1158,10 @@
   </p>
   <p class="draft-confirm-note">
     You are approving this exact version. Editing it afterwards withdraws that approval.
+  </p>
+  <p class="draft-confirm-note">
+    This click is the send. Governor scores what agents send on their own; it does not score this
+    one.
   </p>
   {#if queueing}
     <p class="draft-confirm-note is-locked">
@@ -1262,6 +1272,15 @@
   }
   .draft-banner-action {
     margin-top: 0.5rem;
+  }
+  /* Sits directly above the send controls, so it reads as the label's
+     explanation rather than another status banner. */
+  .draft-send-note {
+    border-bottom: 0;
+    font-size: 0.75rem;
+  }
+  .draft-send-note strong {
+    color: var(--env-ink);
   }
   .is-note {
     border-color: var(--env-pending);

@@ -233,7 +233,7 @@ describe('ComposerDrawer — send flow', () => {
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body text' } });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(apiMock.compose).toHaveBeenCalledWith(
       'acct-ok',
@@ -293,7 +293,7 @@ describe('ComposerDrawer — send flow', () => {
 
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Quarterly' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body text' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() =>
       expect(apiMock.compose).toHaveBeenCalledWith(
@@ -345,7 +345,7 @@ describe('ComposerDrawer — send flow', () => {
     // Typed, never committed with Enter or a comma — it still has to ship.
     await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'first-contact@example.org' } });
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() =>
       expect(apiMock.compose).toHaveBeenCalledWith(
@@ -370,7 +370,7 @@ describe('ComposerDrawer — send flow', () => {
 
     await waitFor(() => screen.getByLabelText('Message'));
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'My reply' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(apiMock.composeReply).toHaveBeenCalledWith(
       'acct-ok',
@@ -391,7 +391,7 @@ describe('ComposerDrawer — send flow', () => {
     await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'alice@example.com' } });
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText('smtp_failed')).toBeInTheDocument();

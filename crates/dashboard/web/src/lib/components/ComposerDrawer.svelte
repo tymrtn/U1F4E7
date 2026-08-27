@@ -247,7 +247,7 @@
 {#snippet headerActions()}
   <Button variant="primary" type="submit" form="composer-form" disabled={!canSend}>
     {#if sending}<Spinner label="Queueing" />{/if}
-    {sending ? 'Queueing' : 'Send'}
+    {sending ? 'Queueing' : 'Human-only Send'}
   </Button>
 {/snippet}
 
@@ -344,6 +344,10 @@
           <span>Delivery</span>
           <strong class:is-ready={deliveryReady} class:is-error={!deliveryReady}>{deliveryReady ? 'Account ready' : 'Select account'}</strong>
         </div>
+        <p class="composer-send-note" id="composer-human-send-note">
+          <strong>Human-only Send</strong> is your explicit send. It waits out the outbox cooldown and
+          files a Sent copy as proof, and Governor does not score it.
+        </p>
       </section>
 
       <section class="composer-editor" aria-label="Message editor">
@@ -506,6 +510,20 @@
     gap: 1px;
     border: 1px solid var(--env-rule);
     background: var(--env-rule);
+  }
+  /* Spans the whole review strip so it reads as one line under the checks
+     rather than a fourth column. */
+  .composer-send-note {
+    grid-column: 1 / -1;
+    margin: 0;
+    padding: 0.55rem 0.75rem;
+    background: var(--env-surface);
+    color: var(--env-muted);
+    font-size: 0.75rem;
+    line-height: 1.5;
+  }
+  .composer-send-note strong {
+    color: var(--env-ink);
   }
   .composer-check {
     min-height: 2.75rem;
