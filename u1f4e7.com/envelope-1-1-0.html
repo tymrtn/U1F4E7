@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Envelope 1.1.0 — public release</title>
+  <meta name="description" content="Envelope 1.1.0 makes mailbox operations calmer: a truly unified inbox, reliable draft review, human-owned sends, and standards-compliant MCP transport.">
+  <link rel="canonical" href="https://u1f4e7.com/envelope-1-1-0.html">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
+  <meta name="theme-color" content="#0b1020">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Envelope">
+  <meta property="og:url" content="https://u1f4e7.com/envelope-1-1-0.html">
+  <meta property="og:title" content="Envelope 1.1.0 — human control, less mailbox friction">
+  <meta property="og:description" content="A calmer operator release for mailbox-native agents: real unified inboxes, reliable draft review, Human-only Send, and MCP that speaks the standard transport.">
+  <meta property="og:image" content="https://u1f4e7.com/og-card.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Envelope 1.1.0 — human control, less mailbox friction">
+  <meta name="twitter:description" content="A calmer operator release for mailbox-native agents: real unified inboxes, reliable draft review, Human-only Send, and MCP that speaks the standard transport.">
+  <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="index.html#top">✉️ Envelope</a>
+      <nav>
+        <a href="index.html#use-cases">Use cases</a>
+        <a href="index.html#workflows">What it does</a>
+        <a href="index.html#control">Human control</a>
+        <a href="index.html#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7">Repo</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <p class="eyebrow">Released August 2026</p>
+          <h1>Envelope 1.1.0: fewer dead ends between an agent draft and a human decision.</h1>
+          <p class="lede">This is the public release of the operator work we have been dogfooding: a real unified inbox, a draft review experience that tells the truth, and one clear human boundary for the email you decide to send yourself.</p>
+          <div class="cta-row">
+            <a class="button" href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.1.0">Download 1.1.0</a>
+            <a class="button button-secondary" href="https://github.com/tymrtn/U1F4E7">View the repo</a>
+          </div>
+        </div>
+        <aside class="callout code-panel"><pre><code># Verify the installed runtime
+envelope --version
+
+# Connect the mailbox you already use
+envelope accounts add --email you@example.com
+
+# Give Claude Code, Codex, or Hermes
+# an MCP mailbox surface
+envelope mcp --config</code></pre></aside>
+      </div>
+    </section>
+
+    <section class="section section-dark">
+      <div class="wrap">
+        <p class="eyebrow">What changed</p>
+        <h2>More truthful control. Less operational drag.</h2>
+        <div class="cards two-up-features">
+          <article class="card feature-card">
+            <h3>Human-only Send</h3>
+            <p>When you read a draft and decide to send that exact version in the dashboard, it is your send. Envelope records that action against the revision you saw and sends it as a human action. A generic approval does not create an agent bypass; edits, Hold, and agent re-queues clear the authorization.</p>
+          </article>
+          <article class="card feature-card">
+            <h3>A genuinely unified inbox</h3>
+            <p>Messages now sort by real mail date across accounts, not by whichever account happened to have the highest local identifier. Pagination stays stable, slow accounts time out without freezing the page, and the dashboard tells you which account could not be reached.</p>
+          </article>
+          <article class="card feature-card">
+            <h3>Drafts that survive real work</h3>
+            <p>Draft review keeps the effective sender identity, tracks replacement provider drafts after edits, renders HTML safely, and gives you Hold instead of a destructive cancel when you need more time.</p>
+          </article>
+          <article class="card feature-card">
+            <h3>MCP that speaks MCP</h3>
+            <p>The stdio server now emits newline-delimited JSON-RPC, while still accepting older Content-Length input. Claude Code and Codex can use the mailbox surface without a framing workaround.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap two-col">
+        <div>
+          <p class="eyebrow">The point</p>
+          <h2>Agents prepare. People decide.</h2>
+          <p>Envelope is not another hosted inbox or a machine that quietly takes over correspondence. It turns the mailbox you already own into reliable infrastructure for agents, while preserving the operator’s control over real relationship actions.</p>
+          <p>The release also brings reader reply/forward actions, reversible Trash behavior, multi-account search, sender identity preservation, clearer audit records, and stronger Sent-folder proof.</p>
+        </div>
+        <div class="card accent-card">
+          <h3>Get 1.1.0</h3>
+          <ul class="checklist">
+            <li>macOS Apple Silicon and Intel archives</li>
+            <li>Linux x86_64 and ARM64 archives</li>
+            <li>SHA-256 checksums for every archive</li>
+            <li>Release notes and source on GitHub</li>
+          </ul>
+          <p style="margin-top:1rem"><a class="button" href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.1.0">Open the 1.1.0 release →</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope — BYO email for agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing">Licensing</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
