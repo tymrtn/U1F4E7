@@ -1,6 +1,21 @@
 [build]
 publish = "."
 
+# The homepage is the distribution surface for new Envelope releases. Keep the
+# browser and Netlify Edge revalidating it so a release-page link cannot sit
+# behind an old root document after a production deploy.
+[[headers]]
+for = "/"
+  [headers.values]
+  Cache-Control = "public, max-age=0, must-revalidate"
+  Netlify-CDN-Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+for = "/index.html"
+  [headers.values]
+  Cache-Control = "public, max-age=0, must-revalidate"
+  Netlify-CDN-Cache-Control = "public, max-age=0, must-revalidate"
+
 [[headers]]
 for = "/*"
   [headers.values]
