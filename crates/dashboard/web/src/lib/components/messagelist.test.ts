@@ -23,6 +23,7 @@ const { apiMock } = vi.hoisted(() => ({
     snoozed: vi.fn(),
     drafts: vi.fn(),
     folders: vi.fn(),
+    folderMessages: vi.fn(),
     messageFlags: vi.fn(),
     messageMove: vi.fn(),
     messageDelete: vi.fn(),
@@ -970,6 +971,61 @@ describe('Box-specific wired boxes', () => {
 
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('No drafts')).toBeInTheDocument());
+  });
+
+  it('sent: loads each account Sent folder and renders the merged list', async () => {
+    pageState.params = { box: 'sent' };
+    pageState.url = new URL('http://localhost/v2/mail/sent') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct-ok', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    apiMock.folders.mockResolvedValue({
+      folders: [
+        { folder: 'INBOX', exists: 5, recent: 0, unseen: 1 },
+        { folder: 'Sent', exists: 2, recent: 0, unseen: 0 }
+      ],
+      snoozed_virtual: { folder: 'Snoozed', exists: 0, recent: 0, unseen: null, virtual: true }
+    });
+    apiMock.folderMessages.mockResolvedValue({
+      messages: [{
+        uid: 41, message_id: '<sent@x>', from_addr: 'work@example.com',
+        to_addr: 'bob@example.com', subject: 'Sent message subject',
+        date: '2026-07-09T10:00:00Z', flags: ['\\Seen'], size: 10, unread: false
+      }]
+    });
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Sent message subject')).toBeInTheDocument());
+    // Loaded from the account's real Sent folder, never a hardcoded name guess.
+    expect(apiMock.folderMessages).toHaveBeenCalledWith('acct-ok', 'Sent');
+    // The unwired placeholder must be gone.
+    expect(screen.queryByText(/doesn't load its own list/)).not.toBeInTheDocument();
+  });
+
+  it('sent: renders empty state (not the unwired placeholder) when Sent is empty', async () => {
+    pageState.params = { box: 'sent' };
+    pageState.url = new URL('http://localhost/v2/mail/sent') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct-ok', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    apiMock.folders.mockResolvedValue({
+      folders: [{ folder: 'INBOX.Sent', exists: 0, recent: 0, unseen: 0 }],
+      snoozed_virtual: { folder: 'Snoozed', exists: 0, recent: 0, unseen: null, virtual: true }
+    });
+    apiMock.folderMessages.mockResolvedValue({ messages: [] });
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('No sent messages')).toBeInTheDocument());
+    expect(apiMock.folderMessages).toHaveBeenCalledWith('acct-ok', 'INBOX.Sent');
+    expect(screen.queryByText(/doesn't load its own list/)).not.toBeInTheDocument();
   });
 });
 

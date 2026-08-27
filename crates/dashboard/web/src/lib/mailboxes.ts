@@ -1,7 +1,7 @@
 // Smart-mailbox catalog for the v2 rail. Each box is a client route under
-// /v2/mail/<slug>; only Unified Inbox currently has a wired message list —
-// the others render an honest "not yet wired" empty state (no fake data),
-// per the dashboard "surface explicit follow-up states" invariant.
+// /v2/mail/<slug>; an unwired box renders an honest "not yet wired" empty
+// state (no fake data), per the dashboard "surface explicit follow-up
+// states" invariant.
 
 export interface Mailbox {
   slug: string;
@@ -15,7 +15,7 @@ export const MAILBOXES: Mailbox[] = [
   { slug: 'needs-attention', label: 'Needs Attention', wired: false },
   { slug: 'snoozed', label: 'Snoozed', wired: true },
   { slug: 'drafts', label: 'Drafts', wired: true },
-  { slug: 'sent', label: 'Sent', wired: false }
+  { slug: 'sent', label: 'Sent', wired: true }
 ];
 
 export function mailboxBySlug(slug: string): Mailbox | undefined {
@@ -41,4 +41,30 @@ const DRAFTS_FOLDERS = new Set([
 export function isDraftsFolder(name: string | null | undefined): boolean {
   if (!name) return false;
   return DRAFTS_FOLDERS.has(name.toLowerCase());
+}
+
+/**
+ * IMAP folder names that `provider::classify_folder` returns `"sent"` for.
+ * Kept in sync by hand with crates/email/src/provider.rs — the Sent smart
+ * mailbox resolves each account's real Sent folder through this set, so a
+ * name missing here silently drops that account from the Sent list.
+ */
+const SENT_FOLDERS = new Set([
+  'sent',
+  'sent mail',
+  'sent messages',
+  'sent items',
+  '[gmail]/sent mail',
+  'inbox.sent',
+  'inbox.sent messages',
+  'inbox/sent',
+  'inbox/sent mail',
+  'inbox/sent messages',
+  'inbox/sent items'
+]);
+
+/** True when `name` is a Sent mailbox, matching the backend classification. */
+export function isSentFolder(name: string | null | undefined): boolean {
+  if (!name) return false;
+  return SENT_FOLDERS.has(name.toLowerCase());
 }

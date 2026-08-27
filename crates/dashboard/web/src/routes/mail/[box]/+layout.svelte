@@ -13,7 +13,7 @@
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
-  import { mailboxBySlug } from '$lib/mailboxes';
+  import { mailboxBySlug, isSentFolder } from '$lib/mailboxes';
   import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
   import { folderHints } from '$lib/folder-hints.svelte';
   import { SelectionStore } from '$lib/selection.svelte';
@@ -31,6 +31,7 @@
     type Draft,
     type SnoozedItem,
     type SearchMessageSummary,
+    type MessageSummary,
     type FolderStats,
     type ComposeResponse,
     type Account,
@@ -79,6 +80,7 @@
   let unifiedLoadingMore = $state(false);
   let drafts = $state<Draft[]>([]);
   let snoozed = $state<SnoozedItem[]>([]);
+  let sentMessages = $state<SentHit[]>([]);
   let listErrors = $state<UnifiedInboxError[]>([]);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
@@ -90,6 +92,12 @@
    *  here as results are merged. Bulk actions and navigation both need the real
    *  identity, never a placeholder. */
   type SearchHit = SearchMessageSummary & { account_id: string; folder: string };
+
+  /** A Sent-folder row tagged with the account it came from and the account's
+   *  real Sent folder name (folder names differ per provider — [Gmail]/Sent
+   *  Mail, INBOX.Sent, …), so reader links and bulk actions dispatch against
+   *  the true identity. `unread` rides along from the list endpoint. */
+  type SentHit = MessageSummary & { unread?: boolean; account_id: string; folder: string };
 
   /** The mailbox `runSearch` searches. Tagged onto every hit so links and bulk
    *  dispatch name the folder the UIDs are actually scoped to, rather than
@@ -276,6 +284,39 @@
     }
   }
 
+  async function loadSent() {
+    loading = true;
+    error = null;
+    try {
+      const { accounts } = await api.listAccounts();
+      const allSent: SentHit[] = [];
+      await Promise.all(
+        accounts.map(async (acct) => {
+          try {
+            const { folders } = await api.folders(acct.id);
+            const sentFolder = (folders ?? []).find((f) => isSentFolder(f.folder))?.folder;
+            if (!sentFolder) return;
+            const res = await api.folderMessages(acct.id, sentFolder);
+            allSent.push(
+              ...res.messages.map((m) => ({ ...m, account_id: acct.id, folder: sentFolder }))
+            );
+          } catch {
+            // best-effort
+          }
+        })
+      );
+      allSent.sort(
+        (a, b) => (Date.parse(b.date ?? '') || 0) - (Date.parse(a.date ?? '') || 0)
+      );
+      sentMessages = allSent;
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load sent messages.' };
+    } finally {
+      loading = false;
+    }
+  }
+
   async function loadFolders() {
     try {
       const { accounts } = await api.listAccounts();
@@ -300,6 +341,8 @@
         loadDrafts();
       } else if (slug === 'snoozed') {
         loadSnoozed();
+      } else if (slug === 'sent') {
+        loadSent();
       }
     }
   });
@@ -434,6 +477,12 @@
     return m.from_addr || m.account_username;
   }
 
+  /** Folder-list rows carry only an account id; chip the human identity the
+   *  way the unified list does (display name, then username). */
+  const accountChipById = $derived(
+    new Map(allAccounts.map((a) => [a.id, a.display_name || a.username || a.name]))
+  );
+
   const orderedUnifiedKeys = $derived(
     unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
   );
@@ -487,6 +536,24 @@
     return idx;
   });
 
+  /** Sent rows carry the account and real Sent folder tagged in `loadSent`,
+   *  so bulk actions (move/flag/delete…) dispatch against each row's actual
+   *  mailbox rather than a hardcoded folder name. */
+  const sentMessageIndex = $derived.by(() => {
+    const idx: Record<string, MsgIndexEntry> = {};
+    for (const m of sentMessages) {
+      idx[`sent:${m.account_id}:${m.uid}`] = {
+        accountId: m.account_id,
+        uid: m.uid,
+        from: m.from_addr ?? '',
+        folder: m.folder,
+        message_id: m.message_id ?? null,
+        subject: m.subject ?? null,
+      };
+    }
+    return idx;
+  });
+
   /** A snoozed message physically resides in `snoozed_folder` until the sweep
    *  returns it — bulk actions (archive/flag/move/etc.) must target that real
    *  current location, not `original_folder` (where it isn't right now). */
@@ -510,6 +577,7 @@
     if (slug === 'unified') await loadUnified();
     else if (slug === 'drafts') await loadDrafts();
     else if (slug === 'snoozed') await loadSnoozed();
+    else if (slug === 'sent') await loadSent();
   }
 
   // ── Accounts load (for composer from-select) ──────────────────────
@@ -579,6 +647,7 @@
         if (slug === 'unified') loadUnified();
         else if (slug === 'drafts') loadDrafts();
         else if (slug === 'snoozed') loadSnoozed();
+        else if (slug === 'sent') loadSent();
       });
     }
 
@@ -620,7 +689,7 @@
             {#if selectedPosition}
               <MonoTag>{selectedPosition.position} of {selectedPosition.total}</MonoTag>
             {:else}
-              <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : snoozed.length)}</MonoTag>
+              <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : box.slug === 'sent' ? sentMessages.length : snoozed.length)}</MonoTag>
             {/if}
           </span>
           <SearchBar
@@ -678,7 +747,9 @@
             ? searchMessageIndex
             : box.slug === 'snoozed'
               ? snoozedMessageIndex
-              : unifiedMessageIndex}
+              : box.slug === 'sent'
+                ? sentMessageIndex
+                : unifiedMessageIndex}
           onoperated={handleOperated}
           {loading}
         />
@@ -708,6 +779,7 @@
           if (slug === 'unified') loadUnified();
           else if (slug === 'drafts') loadDrafts();
           else if (slug === 'snoozed') loadSnoozed();
+          else if (slug === 'sent') loadSent();
         }}>Retry</button>
       </div>
 
@@ -859,6 +931,36 @@
                 }}
                 {selection}
                 orderedKeys={snoozed.map((x) => `snoozed:${x.account_id}:${x.uid}`)}
+              />
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    {:else if box.slug === 'sent'}
+      {#if sentMessages.length === 0}
+        <EmptyState title="No sent messages" hint="Messages you send appear here, across all connected accounts." />
+      {:else}
+        <ul id="sent-msg-list" class="msg-list">
+          {#each sentMessages as m (`sent:${m.account_id}:${m.uid}`)}
+            {@const key = `sent:${m.account_id}:${m.uid}`}
+            <li>
+              <MessageRow
+                message={{
+                  key,
+                  uid: m.uid,
+                  accountId: m.account_id,
+                  subject: m.subject || '(no subject)',
+                  from: m.to_addr || m.from_addr,
+                  date: m.date,
+                  snippet: null,
+                  unread: false,
+                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  accountChip: accountChipById.get(m.account_id) ?? m.account_id,
+                  href: `${base}/mail/sent/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
+                }}
+                {selection}
+                orderedKeys={sentMessages.map((x) => `sent:${x.account_id}:${x.uid}`)}
               />
             </li>
           {/each}
