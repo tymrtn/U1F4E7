@@ -81,6 +81,7 @@
   class:is-active={active}
   class:is-unread={message.unread}
   role="row"
+  data-msg-key={message.key}
   aria-selected={isSelected}
   onkeydown={handleRowKeydown}
   onfocus={handleFocus}

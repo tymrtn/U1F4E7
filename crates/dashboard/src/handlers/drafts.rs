@@ -53,6 +53,11 @@ pub struct DraftEditRequest {
     pub cc_addr: Option<String>,
     pub bcc_addr: Option<String>,
     pub subject: Option<String>,
+    /// The two body fields are one unit — the draft's body representation set.
+    /// Sending either one replaces the body with exactly that pair and CLEARS
+    /// the omitted alternate; sending neither leaves both bodies untouched. A
+    /// single-format editor therefore cannot leave a stale alternate behind for
+    /// `multipart/alternative` delivery to surface instead of the edit.
     pub text_content: Option<String>,
     pub html_content: Option<String>,
 }
@@ -81,23 +86,31 @@ pub struct DraftSendRequest {
     /// a concurrent edit returns 409 and nothing is queued.
     pub expected_revision: i64,
     /// Optional override for the outbox cooldown (seconds). Omitted → the shared
-    /// default cooldown. Negative values clamp to zero. There is intentionally no
-    /// immediate-SMTP dashboard bypass: the queued draft is transmitted later by
-    /// the shared scheduled-send sweep, after the Governor gate.
+    /// default cooldown. Negative values clamp to zero.
     #[serde(default)]
     pub cooldown_seconds: Option<i64>,
+    /// Send this message immediately instead of waiting out the outbox cooldown.
+    ///
+    /// This is NOT a transmit bypass. The draft is queued exactly as it always
+    /// is — zero cooldown — and then the shared scheduled-send sweep is run at
+    /// once, so the message travels the identical path (claim, attachments,
+    /// threading, Governor gate) that a cooldown send takes a minute later. The
+    /// only thing skipped is the waiting.
+    #[serde(default)]
+    pub send_now: bool,
 }
 
 /// Serialize a draft for the JSON API with attachment bytes stripped.
 ///
-/// Draft attachment entries carry `data_base64` — the byte snapshot the send
-/// path transmits from. The store is explicit that the field is never logged
-/// or echoed, and the CLI has stripped it since its first attachment listing
+/// Draft attachment entries carry `data_base64` — the snapshot the send sweep
+/// transmits from. The store is explicit that the field is never logged or
+/// echoed, and the CLI has stripped it since its first attachment listing
 /// (`cli::commands::attachments::attachment_summary`). Serializing the raw row
 /// put it on the wire anyway: every draft fetch shipped every attachment in
-/// full to the client, which needs only the filename, media type, and size to
-/// describe what is attached.
-fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
+/// full to the browser, which then rendered a count. Callers that want the
+/// bytes ask for one file by name at
+/// `GET /accounts/{id}/drafts/{draft_id}/attachments/{filename}`.
+pub(crate) fn draft_json(draft: &envelope_email_store::Draft) -> serde_json::Value {
     let mut value = serde_json::to_value(draft).unwrap_or_else(|_| json!({}));
     if let Some(attachments) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
         for entry in attachments.iter_mut() {
@@ -219,7 +232,10 @@ pub async fn show_by_imap_uid(
     .into_response()
 }
 
-fn resolve_account(db: &Database, account_id: &str) -> Result<Option<Account>, StoreError> {
+pub(crate) fn resolve_account(
+    db: &Database,
+    account_id: &str,
+) -> Result<Option<Account>, StoreError> {
     if let Some(account) = db.get_account(account_id)? {
         return Ok(Some(account));
     }
@@ -238,6 +254,11 @@ pub async fn approve(
     // request — never a server-side re-read of the latest row). A concurrent
     // content edit rolls the whole approval back (409) — the edited draft
     // never inherits `tyler_approved`.
+    //
+    // Review only. It queues nothing, so it sends nothing, and it writes no
+    // `human_send` authorization, so a later agent send of this draft (CLI
+    // `draft send`, MCP `send_draft`) is still fully Governor-gated. Sending
+    // from the dashboard is Human-only Send ([`send`]) — a separate click.
     match ensure_draft_account(&db, &account_id, &draft_id).and_then(|draft| {
         db.approve_draft_revision(
             &draft.id,
@@ -313,6 +334,44 @@ pub async fn discard(
     }
 }
 
+/// Take a queued draft back out of the outbox without discarding it.
+///
+/// The destructive counterpart lives at `/discard`. This one clears
+/// `send_after` and leaves the row in `draft` status, so the review composer
+/// unlocks and the operator can finish the message and re-queue it later —
+/// which is what "I need more time" actually means, and what discarding a
+/// queued draft could never give them.
+///
+/// Deliberately NOT revision-guarded. Hold only ever removes a pending send, so
+/// there is nothing a concurrent edit could make unsafe about it; refusing on a
+/// stale revision would strand an operator watching a countdown they cannot
+/// stop. The real race — the sweep having already claimed the row — is settled
+/// in the store by the `status = 'draft'` guard, which surfaces here as 409.
+pub async fn hold(
+    State(state): State<AppState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    match ensure_draft_account(&db, &account_id, &draft_id)
+        .and_then(|draft| db.hold_scheduled_draft(&draft.id))
+    {
+        Ok(draft) => {
+            // The status did not change (`draft` → `draft`), but the queue did:
+            // any surface showing this row as scheduled — the cockpit panel, an
+            // open second tab — has to drop the countdown.
+            state
+                .events
+                .publish(crate::events::DashboardEvent::DraftStatusChanged {
+                    account_id: draft.account_id.clone(),
+                    draft_id: draft.id.clone(),
+                    status: DraftStatus::Draft.as_str().to_string(),
+                });
+            Json(json!({ "draft": draft_json(&draft), "status": "held" })).into_response()
+        }
+        Err(e) => draft_error(e),
+    }
+}
+
 pub async fn block(
     State(state): State<AppState>,
     Path((account_id, draft_id)): Path<(String, String)>,
@@ -343,43 +402,48 @@ pub async fn block(
     }
 }
 
-/// Queue an approved draft into the Envelope outbox cooldown instead of
-/// transmitting it inline.
+/// Queue the operator's **Human-only Send** into the Envelope outbox cooldown
+/// instead of transmitting it inline.
 ///
 /// Setting `send_after` (and ensuring the draft stays in sweep-eligible `draft`
 /// status) hands the real send to the shared scheduled-send sweep
 /// (`run_scheduled_send_sweep`), which applies persisted attachment
-/// snapshots, reply threading headers, and the fail-closed Governor gate before
-/// any SMTP — exactly like CLI `draft send` and MCP `send_draft`. The draft is
-/// never marked sent here (that would drop it from the sweep and could strand it
-/// unsent) and never discarded.
+/// snapshots and reply threading headers before any SMTP — exactly like CLI
+/// `draft send` and MCP `send_draft`. The draft is never marked sent here (that
+/// would drop it from the sweep and could strand it unsent) and never discarded.
 ///
-/// Promotion, `send_after`, and the human-approval attestation are one atomic
-/// store transaction (`queue_draft_with_human_approval`), compare-and-set
-/// against `expected_revision` — the revision the human VIEWED, carried on the
-/// request rather than re-read server-side. A concurrent content edit rolls
-/// everything back: no partially queued, unapproved state, and the edited
-/// content never inherits `tyler_approved` (an input attribute for Governor's
-/// blind scoring, never a gate bypass).
+/// Promotion, `send_after`, the human-approval attestation, and the `human_send`
+/// authorization are one atomic store transaction
+/// (`queue_draft_with_human_send`), compare-and-set against `expected_revision`
+/// — the revision the human VIEWED, carried on the request rather than re-read
+/// server-side. A concurrent content edit rolls everything back: no partially
+/// queued state, and no authorization for a send that was not queued.
 ///
-/// Returns the resolved `send_after` timestamp.
+/// That authorization is what the sweep's Human-only Send exception reads
+/// (`dashboard_human_send_authorized`): this queue transition is the only thing
+/// that mints it, so the exception can only ever cover a send the operator
+/// started from here. Hold, an edit, and an agent re-queue each withdraw it, and
+/// approving a draft never creates one.
+///
+/// Returns the resolved `send_after` timestamp and the exact authorized [`Draft`]
+/// row the atomic queue produced (no post-commit reload).
 fn queue_draft_for_outbox(
     db: &Database,
     draft_id: &str,
     expected_revision: i64,
     cooldown_seconds: i64,
-) -> envelope_email_store::errors::Result<String> {
+) -> envelope_email_store::errors::Result<(String, envelope_email_store::Draft)> {
     let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cooldown_seconds))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    db.queue_draft_with_human_approval(
+    let attested = db.queue_draft_with_human_send(
         draft_id,
         expected_revision,
         &send_at,
         "human:dashboard",
         &crate::timefmt::utc_now_string(),
     )?;
-    Ok(send_at)
+    Ok((send_at, attested))
 }
 
 pub async fn send(
@@ -405,29 +469,65 @@ pub async fn send(
         return (StatusCode::CONFLICT, "draft already sent").into_response();
     }
 
-    // Do NOT transmit immediately. Queue into the outbox cooldown so the shared
-    // scheduled-send sweep performs the real SMTP send (with attachments,
-    // threading, and the Governor gate). This keeps the dashboard send path
-    // aligned with CLI/MCP/scheduled outbound semantics; there is no immediate
-    // dashboard SMTP bypass.
-    let cooldown = resolve_cooldown_seconds(req.cooldown_seconds);
+    // The dashboard never opens its own SMTP socket. Every send queues into the
+    // outbox and the shared scheduled-send sweep performs the real transmission
+    // (attachments, threading, Governor gate), keeping this path identical to
+    // CLI/MCP/scheduled outbound.
+    //
+    // `send_now` changes the WAIT, not the PATH: the cooldown is zero and the
+    // sweep is kicked immediately after the queue commits, so the operator who
+    // means "now" gets now instead of watching a countdown they did not ask for.
+    let cooldown = if req.send_now {
+        0
+    } else {
+        resolve_cooldown_seconds(req.cooldown_seconds)
+    };
     match queue_draft_for_outbox(&db, &draft.id, req.expected_revision, cooldown) {
-        Ok(send_after) => {
+        Ok((send_after, attested)) => {
+            // The additive human-origin attribution block (tyler_approved derived;
+            // no fabricated bot declaration) is built from the EXACT attested row
+            // the queue returned — no reload, no pre-attestation fallback — with
+            // the account domain derived from the username exactly as the sweep
+            // does. If the account cannot be loaded, fail rather than fabricate.
+            let account = match db.get_account(&draft.account_id) {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    return draft_error(envelope_email_store::StoreError::AccountNotFound(
+                        draft.account_id.clone(),
+                    ));
+                }
+                Err(e) => return draft_error(e),
+            };
+            let attribution = crate::human_queue_attribution_block(&attested, &account.username);
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftQueued {
                     account_id: draft.account_id.clone(),
                     draft_id: draft.id.clone(),
-                    origin: "queue",
+                    origin: if req.send_now { "send_now" } else { "queue" },
                 });
+            // Release the DB lock before the sweep runs — it takes the same lock
+            // to claim the row, and holding it here would deadlock the send we
+            // just asked for.
+            drop(db);
+            if req.send_now {
+                let sweep_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::run_scheduled_send_sweep(&sweep_state).await {
+                        tracing::warn!("send-now sweep failed: {e}");
+                    }
+                });
+            }
             Json(json!({
                 "draft_id": draft.id,
                 "sent": false,
-                "status": "queued",
+                "status": if req.send_now { "sending" } else { "queued" },
                 "send_after": send_after,
                 "cooldown_seconds": cooldown,
+                "send_now": req.send_now,
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
+                "attribution": attribution,
             }))
             .into_response()
         }
@@ -435,7 +535,7 @@ pub async fn send(
     }
 }
 
-fn ensure_draft_account(
+pub(crate) fn ensure_draft_account(
     db: &envelope_email_store::Database,
     account_id: &str,
     draft_id: &str,
@@ -455,7 +555,7 @@ fn ensure_draft_account(
     Ok(draft)
 }
 
-fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
+pub(crate) fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response {
     match e {
         envelope_email_store::StoreError::DraftNotFound(_) => {
             (StatusCode::NOT_FOUND, format!("{e}")).into_response()
@@ -464,6 +564,9 @@ fn draft_error(e: envelope_email_store::StoreError) -> axum::response::Response 
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
         envelope_email_store::StoreError::DraftModifiedConcurrently(_) => {
+            (StatusCode::CONFLICT, format!("{e}")).into_response()
+        }
+        envelope_email_store::StoreError::DraftNotScheduled(_) => {
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
@@ -546,6 +649,31 @@ mod tests {
         let listed = serde_json::to_string(&drafts_json(&[stored])).unwrap();
         assert!(!listed.contains("data_base64"), "list form: {listed}");
         assert!(listed.contains("packet.pdf"));
+    }
+
+    /// Every handler that returns a draft must route it through [`draft_json`].
+    /// `hold` did not: it was added after the stripping fix was written, so it
+    /// serialized the raw row and shipped `data_base64` on every hold. The
+    /// stripping helper only protects the responses that actually call it, so
+    /// guard the call sites rather than trusting each new handler to remember.
+    #[test]
+    fn every_draft_response_strips_attachment_bytes() {
+        let source = include_str!("drafts.rs");
+        let raw: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                (line.contains("\"draft\":") || line.contains("\"drafts\":"))
+                    && !line.contains("draft_json")
+                    && !line.contains("drafts_json")
+            })
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "these responses serialize a raw draft and leak data_base64 — \
+             wrap each in draft_json()/drafts_json(): {raw:?}"
+        );
     }
 
     #[test]
@@ -638,7 +766,28 @@ mod tests {
         .unwrap();
         let draft = db.get_draft(&draft.id).unwrap().unwrap();
 
-        let send_at = super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+        let (send_at, attested) =
+            super::queue_draft_for_outbox(&db, &draft.id, draft.revision, 120).unwrap();
+
+        // The queue returns the EXACT attested row (no reload): approved, promoted,
+        // and scheduled — the row the handler builds its success block from.
+        assert!(attested.human_approved(), "returned row is attested");
+        assert_eq!(attested.status, DraftStatus::Draft);
+        assert_eq!(attested.send_after.as_deref(), Some(send_at.as_str()));
+
+        // The attribution block built from that row carries the real attachment
+        // fact (derived from the persisted snapshot), agreeing with the sweep.
+        let block = crate::human_queue_attribution_block(&attested, "agent@example.com");
+        let derived: Vec<&str> = block["derived_attrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(
+            derived.contains(&"has_attachment"),
+            "attachment fact derived from the attested row: {block}"
+        );
 
         let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
         // Queued, not sent: sweep-eligible status and a future send_after, with no
@@ -692,6 +841,61 @@ mod tests {
             .filter(|d| d.id == reloaded.id)
             .collect();
         assert_eq!(due_later.len(), 1, "due draft must reach the sweep");
+    }
+
+    /// A failed queue transition (stale/edited revision) must surface as an
+    /// error — the handler then fails loud, never reports success off
+    /// pre-attestation state. There is no reload/fallback path anymore.
+    #[test]
+    fn queue_for_outbox_transition_failure_is_an_error_not_stale_success() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hello"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let stale_rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        // A concurrent edit bumps the revision after the human viewed `stale_rev`.
+        db.update_draft_content(
+            &draft.id,
+            Some("attacker@evil.example"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let err = super::queue_draft_for_outbox(&db, &draft.id, stale_rev, 120)
+            .expect_err("a stale-revision queue must fail rather than fall back");
+        assert!(
+            matches!(
+                err,
+                envelope_email_store::StoreError::DraftModifiedConcurrently(_)
+            ),
+            "{err:?}"
+        );
+
+        // Nothing was queued or approved off the stale revision.
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            !after.human_approved(),
+            "no attestation persisted on a failed transition"
+        );
+        assert!(
+            after.send_after.is_none(),
+            "no schedule persisted on a failed transition"
+        );
     }
 
     /// Queueing must promote a pending-review draft to sweep-eligible `draft`
@@ -764,8 +968,14 @@ mod tests {
             approved_at.ends_with('Z'),
             "attestation timestamp is canonical RFC 3339 UTC, got {approved_at}"
         );
-        // Sanitized: no recipient address anywhere in the attestation.
+        // The send authorization the sweep's Human-only Send exception reads,
+        // minted by this queue transition and bound to the queued revision.
+        assert_eq!(reloaded.human_send_surface(), Some("human:dashboard"));
+        let authorization = &reloaded.metadata.as_ref().unwrap()["human_send"];
+        assert_eq!(authorization["revision"], draft.revision);
+        // Sanitized: no recipient address anywhere in either record.
         assert!(!attestation.to_string().contains("buyer@example.com"));
+        assert!(!authorization.to_string().contains("buyer@example.com"));
         // Canonical UTC queue timestamp.
         assert!(reloaded.send_after.unwrap().ends_with('Z'));
     }
@@ -812,10 +1022,18 @@ mod tests {
             !edited.human_approved(),
             "post-approval edit must clear the human-approval attestation"
         );
+        assert_eq!(
+            edited.human_send_surface(),
+            None,
+            "post-send edit must clear the send authorization too"
+        );
 
-        // Re-queueing (a fresh human send) approves the new revision.
+        // Re-queueing (a fresh human send) approves and authorizes the new
+        // revision.
         super::queue_draft_for_outbox(&db, &edited.id, edited.revision, 120).unwrap();
-        assert!(db.get_draft(&draft.id).unwrap().unwrap().human_approved());
+        let requeued = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(requeued.human_approved());
+        assert_eq!(requeued.human_send_surface(), Some("human:dashboard"));
     }
 
     /// Queueing must not override explicit blocked/discarded terminal operator
@@ -855,6 +1073,266 @@ mod tests {
         assert_eq!(
             db.get_draft(&draft.id).unwrap().unwrap().status,
             DraftStatus::Discarded
+        );
+    }
+
+    /// Block 7: the dashboard draft-send handler RESPONSE carries the same
+    /// sanitized additive `attribution` block as CLI/MCP, reflecting the durable
+    /// human attestation (tyler_approved) — never a fabricated bot declaration.
+    #[tokio::test]
+    async fn dashboard_send_response_carries_human_attribution_block() {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+
+        let resp = super::send(
+            AxumState(state),
+            AxumPath(("acc1".to_string(), draft.id.clone())),
+            axum::Json(super::DraftSendRequest {
+                confirm: true,
+                expected_revision: rev,
+                cooldown_seconds: Some(120),
+                send_now: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "queued");
+        let attr = &v["attribution"];
+        assert_eq!(attr["attribution_state"], "attributed");
+        assert!(
+            attr["declared_attrs"].as_array().unwrap().is_empty(),
+            "no fabricated bot declaration in the dashboard response"
+        );
+        assert!(
+            attr["derived_attrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "tyler_approved"),
+            "response advertises the durable human attestation: {v}"
+        );
+        assert_eq!(attr["governor"], serde_json::Value::Null);
+        assert!(!v.to_string().contains("\"score\""), "no score leaked");
+    }
+
+    // ── Hold: unqueue without discarding ──────────────────────────────
+
+    /// Queue a fresh draft through the real dashboard send path and hand back
+    /// the state plus the draft id, so hold is exercised against a draft that
+    /// was genuinely queued (attestation and all), not a hand-built row.
+    async fn queued_through_dashboard_send() -> (crate::AppState, String) {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("human:dashboard"),
+            )
+            .unwrap();
+        let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+        let resp = super::send(
+            AxumState(state.clone()),
+            AxumPath(("acc1".to_string(), draft.id.clone())),
+            axum::Json(super::DraftSendRequest {
+                confirm: true,
+                expected_revision: rev,
+                // A long schedule, not a 60s undo window: hold has to work for
+                // a send parked hours out, which is the case discard ruins.
+                cooldown_seconds: Some(6 * 60 * 60),
+                send_now: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        (state, draft.id)
+    }
+
+    async fn hold_response(
+        state: &crate::AppState,
+        account: &str,
+        draft_id: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use axum::extract::{Path as AxumPath, State as AxumState};
+        use axum::response::IntoResponse;
+
+        let resp = super::hold(
+            AxumState(state.clone()),
+            AxumPath((account.to_string(), draft_id.to_string())),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The core promise: hold returns an editable draft, not a discarded one.
+    #[tokio::test]
+    async fn hold_clears_the_schedule_and_returns_an_editable_draft() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+
+        let (status, body) = hold_response(&state, "acc1", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "held");
+        assert_eq!(v["draft"]["status"], "draft");
+        assert_eq!(v["draft"]["send_after"], serde_json::Value::Null);
+        // The message survives — that is the whole difference from discard.
+        assert_eq!(v["draft"]["subject"], "Hi");
+        assert_eq!(v["draft"]["text_content"], "Body");
+
+        let db = state.db.lock().await;
+        let held = db.get_draft(&draft_id).unwrap().unwrap();
+        assert_eq!(held.status, DraftStatus::Draft);
+        assert!(held.send_after.is_none());
+        assert!(
+            db.list_drafts_due_for_send().unwrap().is_empty(),
+            "a held draft must be out of the sweep's reach"
+        );
+    }
+
+    /// Hold is account-scoped exactly like every other operator primitive: a
+    /// caller naming the wrong account cannot unqueue someone else's draft.
+    #[tokio::test]
+    async fn hold_is_account_scoped() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+        {
+            let db = state.db.lock().await;
+            seed_account(&db, "acc2", "other@example.com");
+        }
+
+        let (status, _) = hold_response(&state, "acc2", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let db = state.db.lock().await;
+        assert!(
+            db.get_draft(&draft_id)
+                .unwrap()
+                .unwrap()
+                .send_after
+                .is_some(),
+            "a cross-account hold must not touch the schedule"
+        );
+    }
+
+    /// Once the sweep owns the row there is nothing to hold — report the
+    /// conflict rather than pretending the send was stopped.
+    #[tokio::test]
+    async fn hold_conflicts_once_the_sweep_has_claimed_the_draft() {
+        let (state, draft_id) = queued_through_dashboard_send().await;
+        {
+            let db = state.db.lock().await;
+            // Bring the schedule due, then let the sweep claim it.
+            db.update_draft_send_after(&draft_id, "2000-01-01T00:00:00")
+                .unwrap();
+            let rev = db.get_draft(&draft_id).unwrap().unwrap().revision;
+            assert!(
+                db.claim_draft_for_sending(&draft_id, rev)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let (status, _) = hold_response(&state, "acc1", &draft_id).await;
+
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        let db = state.db.lock().await;
+        assert_eq!(
+            db.get_draft(&draft_id).unwrap().unwrap().status,
+            DraftStatus::Sending
+        );
+    }
+
+    /// A draft that was never queued gets a truthful refusal, not a no-op 200
+    /// that claims a schedule was cleared.
+    #[tokio::test]
+    async fn hold_conflicts_on_a_draft_that_was_never_queued() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "agent@example.com");
+        let draft = db
+            .create_draft(
+                "acc1",
+                "buyer@example.com",
+                Some("Hi"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let state = crate::AppState::new(
+            db,
+            envelope_email_store::credential_store::CredentialBackend::File,
+        );
+
+        let (status, _) = hold_response(&state, "acc1", &draft.id).await;
+
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    /// Hold must never be a quiet discard. Guards the handler source against a
+    /// regression that swaps the store primitive for the destructive one.
+    #[test]
+    fn hold_handler_never_discards() {
+        let source = include_str!("drafts.rs");
+        let hold_fn = source
+            .split("pub async fn hold(")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub async fn ").next())
+            .expect("hold handler must exist");
+        assert!(
+            hold_fn.contains("hold_scheduled_draft"),
+            "hold must go through the non-destructive store primitive"
+        );
+        assert!(
+            !hold_fn.contains("discard_draft"),
+            "hold must never discard the draft it unqueues"
         );
     }
 

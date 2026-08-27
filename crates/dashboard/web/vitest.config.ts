@@ -15,7 +15,7 @@ export default defineConfig({
     alias: {
       $lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
       '$app/paths': fileURLToPath(new URL('./src/test-stubs/app-paths.ts', import.meta.url)),
-      '$app/state': fileURLToPath(new URL('./src/test-stubs/app-state.ts', import.meta.url)),
+      '$app/state': fileURLToPath(new URL('./src/test-stubs/app-state.svelte.ts', import.meta.url)),
       '$app/navigation': fileURLToPath(
         new URL('./src/test-stubs/app-navigation.ts', import.meta.url)
       )

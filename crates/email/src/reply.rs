@@ -148,6 +148,30 @@ fn prefix_subject(subject: &str) -> String {
 ///
 /// `<abc@host>` → `abc@host`.
 /// Idempotent: passing an already-stripped ID returns it unchanged.
+/// Guarantee a reply's `References` chain terminates at its parent.
+///
+/// RFC 5322 §3.6.4: a reply's `References` is the parent's chain with the
+/// parent's own Message-ID appended. Drafts that recorded only `In-Reply-To` —
+/// IMAP-synced replies, or replies to a parent that carried no `References`
+/// itself — produced an empty chain, so the message went out with no
+/// `References` header at all and clients that thread on it stranded the reply.
+///
+/// Returns bracket-free ids; the SMTP builder re-wraps them.
+pub fn ensure_references_chain(references: &[String], in_reply_to: Option<&str>) -> Vec<String> {
+    let mut chain: Vec<String> = references
+        .iter()
+        .map(|r| strip_brackets(r))
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    if let Some(parent) = in_reply_to.map(strip_brackets).filter(|p| !p.is_empty())
+        && !chain.contains(&parent)
+    {
+        chain.push(parent);
+    }
+    chain
+}
+
 fn strip_brackets(s: &str) -> String {
     s.trim()
         .trim_start_matches('<')
@@ -198,6 +222,7 @@ mod tests {
             references: references.map(|s| s.to_string()),
             flags: vec![],
             attachments: Vec::<AttachmentMeta>::new(),
+            provider_spam: None,
         }
     }
 
@@ -376,6 +401,37 @@ mod tests {
     }
 
     // ── helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn references_chain_always_reaches_the_parent() {
+        // The live failure: In-Reply-To known, References empty → no header.
+        assert_eq!(
+            ensure_references_chain(&[], Some("<parent@host>")),
+            vec!["parent@host"]
+        );
+
+        // Existing chain gets the parent appended, brackets normalized away.
+        assert_eq!(
+            ensure_references_chain(
+                &["<root@host>".to_string(), "mid@host".to_string()],
+                Some("parent@host")
+            ),
+            vec!["root@host", "mid@host", "parent@host"]
+        );
+
+        // Idempotent: a chain already ending at the parent is left alone.
+        assert_eq!(
+            ensure_references_chain(
+                &["root@host".to_string(), "parent@host".to_string()],
+                Some("<parent@host>")
+            ),
+            vec!["root@host", "parent@host"]
+        );
+
+        // A genuine new message stays unthreaded.
+        assert!(ensure_references_chain(&[], None).is_empty());
+        assert!(ensure_references_chain(&[], Some("  ")).is_empty());
+    }
 
     #[test]
     fn strip_brackets_idempotent() {

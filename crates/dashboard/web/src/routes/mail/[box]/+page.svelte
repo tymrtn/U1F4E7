@@ -6,5 +6,5 @@
 
 <EmptyState
   title="Open a message to read it"
-  hint="Select a message from the list. Reading here never marks messages as read."
+  hint="Select a message from the list. Opening a message marks it read."
 />

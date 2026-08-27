@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EnvelopeApiError, request, resetCsrf } from './api';
+import { EnvelopeApiError, api, request, resetCsrf } from './api';
 
 type FetchCall = [RequestInfo | URL, RequestInit?];
 
@@ -131,5 +131,108 @@ describe('request() CSRF handling', () => {
     if (!(err instanceof EnvelopeApiError)) throw new Error('expected EnvelopeApiError');
     expect(err.code).toBe('dashboard_auth_required');
     expect(err.status).toBe(401);
+  });
+
+  it('surfaces a backend reason as the actionable error message', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          code: 'folder_not_resolved',
+          reason: 'No provider Trash folder was detected; choose a folder with Move… instead.'
+        },
+        { status: 422 }
+      )
+    );
+
+    const err = await request('/accounts/acct/messages/7/move', { fetchImpl }).then(
+      () => {
+        throw new Error('expected request to fail');
+      },
+      (error: unknown) => error
+    );
+    expect(err).toBeInstanceOf(EnvelopeApiError);
+    if (!(err instanceof EnvelopeApiError)) throw new Error('expected EnvelopeApiError');
+    expect(err.code).toBe('folder_not_resolved');
+    expect(err.status).toBe(422);
+    expect(err.message).toContain('No provider Trash folder was detected');
+  });
+});
+
+describe('api.health()', () => {
+  it('GETs /api/health and returns the running version', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ status: 'ok', service: 'envelope-dashboard', version: '1.0.3' })
+    );
+
+    const health = await api.health({ fetchImpl });
+
+    expect(health.version).toBe('1.0.3');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchCalls(fetchImpl)[0]!;
+    expect(url).toBe('/api/health');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('propagates a failed health probe as EnvelopeApiError', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ code: 'boom' }, { status: 500 }));
+
+    await expect(api.health({ fetchImpl })).rejects.toBeInstanceOf(EnvelopeApiError);
+  });
+});
+
+describe('api.draftByImapUid()', () => {
+  it('GETs the by-imap-uid draft route and returns the local draft', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        draft: { id: 'draft-abc' },
+        dashboard_path: '/accounts/acct-a/drafts/draft-abc',
+        review_url: 'http://localhost:3141/accounts/acct-a/drafts/draft-abc'
+      })
+    );
+
+    const res = await api.draftByImapUid('acct a', 38311, { fetchImpl });
+
+    expect(res.draft.id).toBe('draft-abc');
+    const [url, init] = fetchCalls(fetchImpl)[0]!;
+    expect(url).toBe('/api/accounts/acct%20a/drafts/by-imap-uid/38311');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('propagates a missing local draft as a 404 EnvelopeApiError', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: 'draft not found' }, { status: 404 }));
+
+    await expect(api.draftByImapUid('acct-a', 999, { fetchImpl })).rejects.toMatchObject({
+      status: 404
+    });
+  });
+});
+
+describe('api.snoozeMessage()', () => {
+  it('POSTs /messages/{uid}/snooze with folder + return_at body', async () => {
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url).includes('/api/csrf')) return jsonResponse({ token: 'tok' });
+      return jsonResponse({ ok: true, uid: 42, return_at: '2026-08-09T09:00:00', snoozed_folder: 'Snoozed' });
+    });
+
+    const res = await api.snoozeMessage(
+      'acct-a',
+      42,
+      { folder: 'INBOX', return_at: '2026-08-09T09:00:00', message_id: '<m@x>', subject: 'Hi' },
+      { fetchImpl }
+    );
+
+    expect(res.snoozed_folder).toBe('Snoozed');
+    const call = fetchCalls(fetchImpl).find(([u]) => String(u).includes('/messages/42/snooze'));
+    expect(call).toBeTruthy();
+    const [url, init] = call!;
+    expect(url).toBe('/api/accounts/acct-a/messages/42/snooze');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('POST');
+    const body = JSON.parse(String(init?.body));
+    expect(body).toMatchObject({
+      folder: 'INBOX',
+      return_at: '2026-08-09T09:00:00',
+      message_id: '<m@x>',
+      subject: 'Hi'
+    });
   });
 });

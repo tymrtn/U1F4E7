@@ -8,7 +8,7 @@
 //  SSE wiring (layout) — refresh on new_mail, refresh on laggedTicks increment
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 
 // ── Module mocks ──────────────────────────────────────────────────────
 import { page as pageState } from '$app/state';
@@ -19,6 +19,7 @@ const { apiMock } = vi.hoisted(() => ({
     cockpit: vi.fn(),
     stats: vi.fn(),
     unifiedInbox: vi.fn(),
+    refreshUnifiedInbox: vi.fn(),
     compose: vi.fn(),
     composeReply: vi.fn(),
     discardDraft: vi.fn(),
@@ -27,6 +28,7 @@ const { apiMock } = vi.hoisted(() => ({
     folders: vi.fn(),
     messageFlags: vi.fn(),
     searchMessages: vi.fn(),
+    addressSuggestions: vi.fn(),
   }
 }));
 
@@ -47,6 +49,7 @@ import UndoToast from './components/UndoToast.svelte';
 import MailLayout from '../routes/mail/[box]/+layout.svelte';
 import { createRawSnippet } from 'svelte';
 import { resetCsrf } from '$lib/api';
+import { resetSuggestionCache } from '$lib/recipient-suggestions';
 
 const emptyChildren = createRawSnippet(() => ({ render: () => '<span></span>' }));
 
@@ -65,6 +68,13 @@ const ACCT = {
 beforeEach(() => {
   resetCsrf();
   __resetComposerStore();
+  resetSuggestionCache();
+  apiMock.addressSuggestions.mockResolvedValue({
+    account_id: 'acct-ok',
+    query: '',
+    limit: 8,
+    suggestions: []
+  });
   pageState.params = { box: 'unified' };
   pageState.url = new URL('http://localhost/v2/mail/unified') as typeof pageState.url;
   apiMock.listAccounts.mockResolvedValue({ accounts: [ACCT] });
@@ -73,6 +83,10 @@ beforeEach(() => {
   apiMock.unifiedInbox.mockResolvedValue({
     scope: 'unified_inbox', status: 'empty', folder: 'INBOX', limit: 50,
     unread_count: 0, freshness: 'empty', accounts: [], errors: [], messages: []
+  });
+  apiMock.refreshUnifiedInbox.mockResolvedValue({
+    scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+    unread_count: 0, freshness: 'fresh', accounts: [], errors: [], messages: []
   });
   apiMock.folders.mockResolvedValue({
     folders: [],
@@ -219,7 +233,7 @@ describe('ComposerDrawer — send flow', () => {
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body text' } });
 
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(apiMock.compose).toHaveBeenCalledWith(
       'acct-ok',
@@ -228,6 +242,117 @@ describe('ComposerDrawer — send flow', () => {
     await waitFor(() => expect(onsent).toHaveBeenCalledWith(composeRes, 'acct-ok'));
     // Drawer should close after successful send.
     await waitFor(() => expect(store.isOpen).toBe(false));
+  });
+
+  /**
+   * Options inside one field's suggestion listbox. Scoped by name because the
+   * From account picker is a <select> whose <option> elements carry the same
+   * ARIA role — an unscoped query would match those and pass without the
+   * dropdown ever opening.
+   */
+  function suggestionsFor(fieldLabel: string) {
+    return within(screen.getByRole('listbox', { name: `${fieldLabel} suggestions` }));
+  }
+
+  it('serializes autocompleted To/Cc/Bcc into the compose payload', async () => {
+    // Suggestions are account-scoped and the same set answers every prefix
+    // here; the point of the test is what reaches api.compose, not ranking.
+    apiMock.addressSuggestions.mockResolvedValue({
+      account_id: 'acct-ok',
+      query: 'a',
+      limit: 8,
+      suggestions: [
+        { email: 'ada@example.com', name: 'Ada Lovelace' },
+        { email: 'grace@example.com', name: null }
+      ]
+    });
+    apiMock.compose.mockResolvedValue({
+      ok: true, status: 'queued', draft_id: 'draft-3',
+      send_after: '2026-07-09T12:30:00', cooldown_seconds: 30
+    });
+
+    const store = getComposerStore();
+    store.open('compose', { accountId: 'acct-ok' });
+    render(ComposerDrawer, { accounts: [ACCT] });
+    await waitFor(() => screen.getByLabelText('To'));
+
+    // To: pick the first suggestion off the dropdown with the keyboard.
+    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'ada' } });
+    await waitFor(() => expect(suggestionsFor('To').getAllByRole('option')).toHaveLength(2));
+    await fireEvent.keyDown(screen.getByLabelText('To'), { key: 'Enter' });
+
+    // Cc: an address the address book has never seen, committed with a comma.
+    await fireEvent.input(screen.getByLabelText('Cc'), { target: { value: 'stranger@nowhere.test' } });
+    await fireEvent.keyDown(screen.getByLabelText('Cc'), { key: ',' });
+
+    // Bcc: revealed on demand, then filled from the dropdown with the mouse.
+    await fireEvent.click(screen.getByRole('button', { name: /^bcc$/i }));
+    await fireEvent.input(screen.getByLabelText('Bcc'), { target: { value: 'gr' } });
+    await waitFor(() => expect(suggestionsFor('Bcc').getAllByRole('option').length).toBeGreaterThan(0));
+    await fireEvent.mouseDown(suggestionsFor('Bcc').getByText('grace@example.com'));
+
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Quarterly' } });
+    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body text' } });
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
+
+    await waitFor(() =>
+      expect(apiMock.compose).toHaveBeenCalledWith(
+        'acct-ok',
+        expect.objectContaining({
+          to: 'Ada Lovelace <ada@example.com>',
+          cc: 'stranger@nowhere.test',
+          bcc: 'grace@example.com',
+          subject: 'Quarterly'
+        })
+      )
+    );
+  });
+
+  it('never offers an address that another recipient field already holds', async () => {
+    apiMock.addressSuggestions.mockResolvedValue({
+      account_id: 'acct-ok',
+      query: 'ada',
+      limit: 8,
+      suggestions: [{ email: 'ada@example.com', name: 'Ada Lovelace' }]
+    });
+
+    const store = getComposerStore();
+    store.open('compose', { accountId: 'acct-ok' });
+    render(ComposerDrawer, { accounts: [ACCT] });
+    await waitFor(() => screen.getByLabelText('To'));
+
+    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'ada' } });
+    await waitFor(() => expect(suggestionsFor('To').getAllByRole('option')).toHaveLength(1));
+    await fireEvent.keyDown(screen.getByLabelText('To'), { key: 'Enter' });
+
+    // Same prefix in Cc: the only match is spoken for, so nothing is offered.
+    await fireEvent.input(screen.getByLabelText('Cc'), { target: { value: 'ada' } });
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('No saved contacts'));
+    expect(suggestionsFor('Cc').queryAllByRole('option')).toHaveLength(0);
+  });
+
+  it('sends an address the address book has never seen', async () => {
+    apiMock.compose.mockResolvedValue({
+      ok: true, status: 'queued', draft_id: 'draft-4',
+      send_after: '2026-07-09T12:30:00', cooldown_seconds: 30
+    });
+
+    const store = getComposerStore();
+    store.open('compose', { accountId: 'acct-ok' });
+    render(ComposerDrawer, { accounts: [ACCT] });
+    await waitFor(() => screen.getByLabelText('To'));
+
+    // Typed, never committed with Enter or a comma — it still has to ship.
+    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'first-contact@example.org' } });
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
+
+    await waitFor(() =>
+      expect(apiMock.compose).toHaveBeenCalledWith(
+        'acct-ok',
+        expect.objectContaining({ to: 'first-contact@example.org' })
+      )
+    );
   });
 
   it('calls api.composeReply for reply mode', async () => {
@@ -245,7 +370,7 @@ describe('ComposerDrawer — send flow', () => {
 
     await waitFor(() => screen.getByLabelText('Message'));
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'My reply' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(apiMock.composeReply).toHaveBeenCalledWith(
       'acct-ok',
@@ -266,7 +391,7 @@ describe('ComposerDrawer — send flow', () => {
     await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'alice@example.com' } });
     await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
     await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Body' } });
-    await fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText('smtp_failed')).toBeInTheDocument();
@@ -347,6 +472,30 @@ describe('SSE wiring — layout refreshes unified on mount', () => {
     });
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledWith(50));
+    expect(apiMock.refreshUnifiedInbox).not.toHaveBeenCalled();
+  });
+
+  it('refreshes when an account cache is stale', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'partial', folder: 'INBOX', limit: 50,
+      unread_count: 1, freshness: 'partial',
+      accounts: [{ freshness: 'stale' }, { freshness: 'unavailable' }],
+      errors: [], messages: []
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.refreshUnifiedInbox).toHaveBeenCalledWith(50));
+  });
+
+  it('does not refresh a partial inbox whose reachable caches are fresh', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'partial', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'partial',
+      accounts: [{ freshness: 'fresh' }, { freshness: 'unavailable' }],
+      errors: [], messages: []
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledWith(50));
+    expect(apiMock.refreshUnifiedInbox).not.toHaveBeenCalled();
   });
 
   it('compose button is present in the list pane header', async () => {

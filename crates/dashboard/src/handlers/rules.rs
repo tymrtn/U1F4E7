@@ -353,25 +353,20 @@ pub async fn run_enabled(
     };
 
     let total = summaries.len();
-    let uids: Vec<u32> = summaries.iter().map(|s| s.uid).collect();
     let mut actions_taken = 0u32;
     let mut action_log: Vec<serde_json::Value> = Vec::new();
 
-    for &uid in &uids {
-        // Fetch full message for evaluation.
-        let msg = {
-            let mut client = client_arc.lock().await;
-            match envelope_email_transport::imap::fetch_message(&mut client, &folder, uid).await {
-                Ok(Some(m)) => m,
-                Ok(None) => continue, // moved/deleted earlier in the run
-                Err(_) => continue,   // treat as transient per-message failure
-            }
-        };
+    // Evaluate from the header-only summaries fetched above — matches the CLI
+    // `envelope rule run` (apply_core) path and keeps the batch run body-free:
+    // no per-UID full RFC822 fetch/parse. `execute_action` needs only
+    // uid/folder/ctx, so the full message is never required here.
+    for summary in &summaries {
+        let uid = summary.uid;
 
-        // Build message context from local tags/scores/contacts.
+        // Build message context from the summary + local tags/scores/contacts.
         let ctx = {
             let db = state.db.lock().await;
-            match build_message_context(&msg, &db, &account_id) {
+            match build_summary_context(summary, &db, &account_id) {
                 Ok(ctx) => ctx,
                 Err(_) => continue,
             }
@@ -395,6 +390,8 @@ pub async fn run_enabled(
             let action_result = {
                 let mut client = client_arc.lock().await;
                 execute_action(
+                    &state,
+                    &account_id,
                     &mut client,
                     &action,
                     uid,
@@ -770,6 +767,8 @@ pub async fn disable(
 }
 
 async fn execute_action(
+    state: &AppState,
+    account_id: &str,
     client: &mut envelope_email_transport::ImapClient,
     action: &Action,
     uid: u32,
@@ -782,10 +781,34 @@ async fn execute_action(
     }
     match action {
         Action::Move(dest) => {
-            envelope_email_transport::imap::move_message(client, uid, folder, dest)
+            // A canonical sentinel (`\Junk`/`\Archive`/`\Trash`) is a
+            // provider-aware SEMANTIC target: resolve it to this account's real
+            // folder before moving so an exact-sender junk rule reaches
+            // Gmail's Spam / Outlook's Junk Email / the detected special-use
+            // folder rather than a literal `\Junk`. A literal folder name passes
+            // through unchanged. An unresolved sentinel FAILS the move loudly —
+            // never a silent misfile into a literal `\Junk` mailbox.
+            let real = match envelope_email_transport::folders::canonical_move_key(dest) {
+                Some(canonical_type) => super::messages::resolve_canonical_folder(
+                    state,
+                    client,
+                    account_id,
+                    canonical_type,
+                )
                 .await
-                .with_context(|| format!("failed to move UID {uid} to {dest}"))?;
-            Ok(format!("moved to {dest}"))
+                .with_context(|| format!("failed to resolve move target {dest} for UID {uid}"))?
+                .with_context(|| {
+                    format!(
+                        "no provider folder for canonical move target {dest} (UID {uid}); \
+                         not moving into a literal {dest}"
+                    )
+                })?,
+                None => dest.clone(),
+            };
+            envelope_email_transport::imap::move_message(client, uid, folder, &real)
+                .await
+                .with_context(|| format!("failed to move UID {uid} to {real}"))?;
+            Ok(format!("moved to {real}"))
         }
         Action::Flag(flag) => {
             envelope_email_transport::imap::set_flag(client, folder, uid, flag)
@@ -850,7 +873,10 @@ fn build_message_context(
     db: &Database,
     account_id: &str,
 ) -> anyhow::Result<MessageContext> {
-    let message_id = msg.message_id.as_deref().unwrap_or("");
+    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
+    // arrive bracketed; persisted scores/tags use the bare id).
+    let message_id =
+        envelope_email_store::canonical_message_id(msg.message_id.as_deref().unwrap_or(""));
 
     let tags: Vec<String> = if message_id.is_empty() {
         Vec::new()
@@ -861,7 +887,7 @@ fn build_message_context(
             .collect()
     };
 
-    let scores: HashMap<String, f64> = if message_id.is_empty() {
+    let mut scores: HashMap<String, f64> = if message_id.is_empty() {
         HashMap::new()
     } else {
         db.get_scores(account_id, message_id)?
@@ -869,6 +895,8 @@ fn build_message_context(
             .map(|s| (s.dimension, s.value))
             .collect()
     };
+    // Seed the header-derived provider_spam signal; a persisted score wins.
+    rules::merge_provider_spam(&mut scores, msg.provider_spam);
 
     let contact_tags = db.get_contact_tags(account_id, &msg.from_addr)?;
 
@@ -887,7 +915,10 @@ fn build_summary_context(
     db: &Database,
     account_id: &str,
 ) -> anyhow::Result<MessageContext> {
-    let message_id = summary.message_id.as_deref().unwrap_or("");
+    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
+    // arrive bracketed; persisted scores/tags use the bare id).
+    let message_id =
+        envelope_email_store::canonical_message_id(summary.message_id.as_deref().unwrap_or(""));
 
     let tags: Vec<String> = if message_id.is_empty() {
         Vec::new()
@@ -898,7 +929,7 @@ fn build_summary_context(
             .collect()
     };
 
-    let scores: HashMap<String, f64> = if message_id.is_empty() {
+    let mut scores: HashMap<String, f64> = if message_id.is_empty() {
         HashMap::new()
     } else {
         db.get_scores(account_id, message_id)?
@@ -906,6 +937,8 @@ fn build_summary_context(
             .map(|s| (s.dimension, s.value))
             .collect()
     };
+    // Seed the header-derived provider_spam signal; a persisted score wins.
+    rules::merge_provider_spam(&mut scores, summary.provider_spam);
 
     let contact_tags = db.get_contact_tags(account_id, &summary.from_addr)?;
 
@@ -940,6 +973,53 @@ mod tests {
         }))
         .unwrap();
         assert!(confirmed.confirm);
+    }
+
+    #[test]
+    fn summary_context_seeds_provider_spam_and_uses_canonical_id() {
+        use super::{Database, MessageSummary, build_summary_context, rules};
+
+        fn summary(uid: u32, message_id: &str, provider_spam: Option<f64>) -> MessageSummary {
+            MessageSummary {
+                uid,
+                message_id: Some(message_id.to_string()),
+                from_addr: "s@example.com".to_string(),
+                to_addr: "me@example.com".to_string(),
+                subject: "x".to_string(),
+                date: None,
+                flags: vec![],
+                size: 10,
+                provider_spam,
+            }
+        }
+
+        let db = Database::open_memory().unwrap();
+
+        // The dashboard run/preview path builds context from the header-only
+        // summary — the derived provider_spam seeds the dimension with no
+        // full-message parse.
+        let derived = summary(1, "<derived@example.com>", Some(6.5));
+        let ctx = build_summary_context(&derived, &db, "acct").unwrap();
+        assert_eq!(ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION), Some(&6.5));
+
+        // A persisted score keyed on the bare id is found for a bracketed
+        // summary id and wins over the derived header value.
+        db.set_score(
+            "acct",
+            "pinned@example.com",
+            rules::PROVIDER_SPAM_DIMENSION,
+            2.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let pinned = summary(2, "<pinned@example.com>", Some(9.9));
+        let ctx = build_summary_context(&pinned, &db, "acct").unwrap();
+        assert_eq!(
+            ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
+            Some(&2.0),
+            "dashboard summary evaluation must find the persisted bare-id score and let it win"
+        );
     }
 
     #[test]

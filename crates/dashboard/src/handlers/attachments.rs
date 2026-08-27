@@ -23,7 +23,7 @@ fn default_folder() -> String {
     "INBOX".to_string()
 }
 
-fn is_image_media_type(content_type: &str) -> bool {
+pub(crate) fn is_image_media_type(content_type: &str) -> bool {
     content_type
         .split(';')
         .next()
@@ -33,7 +33,7 @@ fn is_image_media_type(content_type: &str) -> bool {
         .starts_with("image/")
 }
 
-fn attachment_disposition(filename: &str, inline: bool, content_type: &str) -> String {
+pub(crate) fn attachment_disposition(filename: &str, inline: bool, content_type: &str) -> String {
     let disposition = if inline && is_image_media_type(content_type) {
         "inline"
     } else {

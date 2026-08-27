@@ -65,7 +65,7 @@
   async function runDraftAction(
     actionBase: string,
     id: string,
-    action: 'approve' | 'discard',
+    action: 'approve' | 'discard' | 'hold',
     body?: unknown
   ) {
     setBusy(id, true);
@@ -95,10 +95,11 @@
     // cockpit does not embed a composer; it hands off to the draft deep link.
     window.location.href = `/accounts/${encodeURIComponent(d.account_id)}/drafts/${encodeURIComponent(d.id)}`;
   }
-  // Cancelling a scheduled send discards the queued draft via the existing
-  // per-account draft discard endpoint.
+  // Cancelling a scheduled send HOLDS the queued draft: it leaves the outbox
+  // and stays in Drafts. Throwing it away is a separate, deliberate action on
+  // the review page — the same contract that page states in its own copy.
   function onCancelScheduled(item: ScheduledItem) {
-    void runDraftAction(item.action_base, item.id, 'discard');
+    void runDraftAction(item.action_base, item.id, 'hold');
   }
 
   // ── Formatting helpers ────────────────────────────────────────────────
@@ -180,6 +181,12 @@
             hint="Agent drafts land here for a human to approve, edit, or discard."
           />
         {:else}
+          <p class="approval-note" id="approval-note">
+            Approve records that you reviewed this version. It does not send the draft, and it does
+            not exempt a later agent send from Governor — an agent that sends an approved draft is
+            scored exactly as it would be otherwise. To send one yourself, open it and use
+            <strong>Human-only Send</strong>.
+          </p>
           {#each agents.approval_queue as group (group.source)}
             <div class="approval-group">
               <h3 class="approval-group-title">{group.source} · {group.count}</h3>
@@ -324,6 +331,15 @@
   }
   .approval-group + .approval-group {
     margin-top: 1rem;
+  }
+  .approval-note {
+    margin: 0 0 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--env-muted);
+  }
+  .approval-note strong {
+    color: var(--env-ink);
   }
   .approval-group-title {
     margin: 0 0 0.5rem;

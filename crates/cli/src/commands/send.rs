@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::SmtpSender;
+use envelope_email_transport::attribution_persist::success_attribution_block;
 use envelope_email_transport::outbound::{
     IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
     SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
@@ -17,10 +18,40 @@ use std::str::FromStr;
 use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::common::setup_credentials;
 use super::datetime::parse_send_at;
-use super::drafts::{resolve_sent_copy_after_send, sent_mail_proof_json};
-use super::governor_gate::{account_domain, gate_and_record, governor_request};
+use super::drafts::{
+    SentMailProofUi, persist_from_override, resolve_sent_copy_after_send,
+    sent_copy_convenience_objects, sent_mail_proof_json, validate_from_override,
+};
+use super::governor_gate::{
+    account_domain, gate_and_record, governor_request, precheck_attribution,
+};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
+
+/// Build lightweight attachment metadata (filename + content type, no bytes) for
+/// the attribution precheck. The full bytes are only read later on an actual
+/// transmit; attribution needs only the count and filename classification.
+fn attachment_metadata(attach_paths: &[String]) -> Vec<Attachment> {
+    attach_paths
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let filename = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("attachment")
+                .to_string();
+            let content_type = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
+            Attachment {
+                filename,
+                content_type,
+                data: Vec::new(),
+            }
+        })
+        .collect()
+}
 
 /// Send an email immediately, or schedule it for later with `--at`.
 #[tokio::main]
@@ -34,6 +65,7 @@ pub async fn run(
     bcc: Option<&str>,
     reply_to: Option<&str>,
     attach_paths: &[String],
+    attr: &[String],
     account: Option<&str>,
     json: bool,
     backend: CredentialBackend,
@@ -49,6 +81,7 @@ pub async fn run(
     check_new_re_subject_guard(Some(subject), false, confirm_new_re_subject, json)?;
 
     let (db, creds) = setup_credentials(account, backend)?;
+    let from = validate_from_override(from)?;
     let mode = SendMode::from_str(send_mode).map_err(|e| anyhow::anyhow!(e))?;
     let policy_input = SendPolicyInput {
         to,
@@ -81,19 +114,19 @@ pub async fn run(
                 db.update_draft_attachments(&draft.id, &draft_attachments)
                     .context("failed to persist draft attachments")?;
             }
+            persist_from_override(&db, &draft.id, from)?;
             let attachment_summary = attachment_summaries(&draft_attachments);
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "status": "drafted",
-                        "send_mode": mode,
-                        "draft_id": draft.id,
-                        "to": to,
-                        "subject": subject,
-                        "attachments": attachment_summary,
-                        "ui": ui::draft_ui(&creds.account.id, &draft.id),
-                    })
+                    crate::commands::contract::send_body::cli_drafted(
+                        serde_json::json!(mode),
+                        &draft.id,
+                        to,
+                        subject,
+                        serde_json::json!(attachment_summary),
+                        ui::draft_ui(&creds.account.id, &draft.id),
+                    )
                 );
             } else {
                 println!(
@@ -132,13 +165,58 @@ pub async fn run(
         }
     }
 
-    // ── Scheduled send path ──
-    if let Some(at_str) = at {
-        if from.is_some() {
-            anyhow::bail!(
-                "--from is not supported with --at (scheduled send does not persist sender override yet)"
+    // ── Attribution precheck (before ANY side effect) ──
+    //
+    // A bot-originated send must carry at least one factual declared attribute.
+    // This runs before the scheduled/queued draft is ever created, so a missing
+    // or invalid declaration produces the canonical recovery payload with no
+    // draft, no SMTP, and no Governor spawn.
+    let declared: Vec<String> = attr.to_vec();
+    let precheck_attachments = attachment_metadata(attach_paths);
+    let precheck_req = governor_request(
+        &creds.account.id,
+        account_domain(&creds.account.username),
+        subject,
+        to,
+        cc,
+        bcc,
+        SendSurface::Cli,
+        None,
+        &precheck_attachments,
+        false,
+        body,
+        html,
+        &declared,
+    );
+    if let Some(outcome) = precheck_attribution(&db, &creds.account.id, &precheck_req, None) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": outcome.status_str(),
+                    "error": outcome.error_json(),
+                    "ui": ui::account_ui(&creds.account.id),
+                })
             );
         }
+        anyhow::bail!("{}", outcome.reason_string());
+    }
+
+    // The validated resolution for the additive success `attribution` block. On
+    // queued/scheduled acceptance the real Governor decision runs later at the
+    // sweep, so the block is marked deferred (governor null).
+    let queued_attribution = precheck_req
+        .resolution
+        .as_ref()
+        .map(|r| success_attribution_block(r, None, None, true));
+
+    // The validated declaration is bound to the queued/scheduled draft in ONE
+    // atomic store CAS (declaration + schedule + due status) via
+    // `queue_bot_draft_for_send`, so the sweep gates on the SAME declaration the
+    // bot just validated and no partial schedule can survive.
+
+    // ── Scheduled send path ──
+    if let Some(at_str) = at {
         let send_at = parse_send_at(at_str).context("failed to parse --at value")?;
 
         // Snapshot attachment bytes at schedule time so delivery does not depend
@@ -162,24 +240,33 @@ pub async fn run(
             )
             .context("failed to create scheduled draft")?;
 
-        db.update_draft_send_after(&draft.id, &send_at)
-            .context("failed to set send_after on draft")?;
-
         if !scheduled_attachments.is_empty() {
             db.update_draft_attachments(&draft.id, &scheduled_attachments)
                 .context("failed to persist scheduled attachments")?;
         }
+        persist_from_override(&db, &draft.id, from)?;
+        // One atomic CAS at the draft's final revision (attachments bumped it):
+        // bind the declaration, set the schedule, and leave it at the due `draft`
+        // status together — no partial schedule, no stale declaration.
+        let revision = db
+            .get_draft(&draft.id)
+            .context("failed to reload scheduled draft")?
+            .map(|d| d.revision)
+            .ok_or_else(|| anyhow::anyhow!("scheduled draft vanished: {}", draft.id))?;
+        crate::commands::drafts::queue_bot_draft_for_send(
+            &db, &draft.id, revision, &send_at, &declared,
+        )?;
 
         if json {
             println!(
                 "{}",
-                serde_json::json!({
-                    "scheduled": true,
-                    "send_at": send_at,
-                    "draft_id": draft.id,
-                    "attachments": attachment_summaries(&scheduled_attachments),
-                    "ui": ui::draft_ui(&creds.account.id, &draft.id),
-                })
+                crate::commands::contract::send_body::cli_scheduled_at(
+                    &draft.id,
+                    &send_at,
+                    serde_json::json!(attachment_summaries(&scheduled_attachments)),
+                    serde_json::json!(queued_attribution),
+                    ui::draft_ui(&creds.account.id, &draft.id),
+                )
             );
         } else {
             println!("Scheduled for {send_at}. Draft ID: {}", draft.id);
@@ -250,26 +337,35 @@ pub async fn run(
                 db.update_draft_attachments(&draft.id, &queued_attachments)
                     .context("failed to persist queued attachments")?;
             }
+            persist_from_override(&db, &draft.id, from)?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            db.update_draft_send_after(&draft.id, &send_at)
-                .context("failed to set send_after on queued draft")?;
+            // One atomic CAS at the draft's final revision (attachments bumped it):
+            // declaration + schedule + due status together, or nothing.
+            let revision = db
+                .get_draft(&draft.id)
+                .context("failed to reload queued draft")?
+                .map(|d| d.revision)
+                .ok_or_else(|| anyhow::anyhow!("queued draft vanished: {}", draft.id))?;
+            crate::commands::drafts::queue_bot_draft_for_send(
+                &db, &draft.id, revision, &send_at, &declared,
+            )?;
 
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "status": "queued",
-                        "send_mode": mode,
-                        "draft_id": draft.id,
-                        "send_after": send_at,
-                        "cooldown_seconds": cd,
-                        "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
-                        "queued_reason": OUTBOX_COOLDOWN_REASON,
-                        "attachments": attachment_summaries(&queued_attachments),
-                        "ui": ui::draft_ui(&creds.account.id, &draft.id),
-                    })
+                    crate::commands::contract::send_body::cli_queued(
+                        serde_json::json!(mode),
+                        &draft.id,
+                        &send_at,
+                        cd,
+                        OUTBOX_COOLDOWN_REASON_CODE,
+                        OUTBOX_COOLDOWN_REASON,
+                        serde_json::json!(attachment_summaries(&queued_attachments)),
+                        serde_json::json!(queued_attribution),
+                        ui::draft_ui(&creds.account.id, &draft.id),
+                    )
                 );
             } else {
                 println!(
@@ -324,6 +420,9 @@ pub async fn run(
         None,
         &attachments,
         false,
+        body,
+        html,
+        &declared,
     );
     let gov_outcome = gate_and_record(&db, &creds.account.id, &gov_req);
     if !gov_outcome.allowed {
@@ -331,19 +430,13 @@ pub async fn run(
             println!(
                 "{}",
                 serde_json::json!({
-                    "status": "blocked",
-                    "error": gov_outcome.denial_json(),
+                    "status": gov_outcome.status_str(),
+                    "error": gov_outcome.error_json(),
                     "ui": ui::account_ui(&creds.account.id),
                 })
             );
         }
-        anyhow::bail!(
-            "send blocked by governor: {}",
-            gov_outcome
-                .block_reason
-                .clone()
-                .unwrap_or_else(|| "governor did not permit this send".to_string())
-        );
+        anyhow::bail!("{}", gov_outcome.reason_string());
     }
 
     let message_id = SmtpSender::send(
@@ -382,6 +475,8 @@ pub async fn run(
         body,
         html,
         cc,
+        bcc,
+        reply_to,
         None,
         &[],
         &message_id,
@@ -392,16 +487,8 @@ pub async fn run(
     let sent_mail_appended = copy_result.sent_mail_appended;
     let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
     let sent_mail_proof = copy_result.proof;
-    let provider_sent_copy = if matches!(sent_mail_proof.copy_source, "provider" | "unresolved") {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
-    let client_appended_copy = if sent_mail_proof.copy_source == "client_appended" {
-        Some(sent_mail_proof_json(&creds.account.id, &sent_mail_proof))
-    } else {
-        None
-    };
+    let (provider_sent_copy, client_appended_copy) =
+        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
     let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
@@ -421,6 +508,7 @@ pub async fn run(
                 "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
                 "provider_sent_copy": provider_sent_copy,
                 "client_appended_copy": client_appended_copy,
+                "attribution": gov_outcome.success_attribution(),
                 "attachments": attachments.iter().map(|a| serde_json::json!({
                     "filename": a.filename,
                     "content_type": a.content_type,
@@ -465,7 +553,9 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::drafts::{SentMailProof, provider_auto_saves_sent, sent_mail_proof_json};
+    use crate::commands::drafts::{
+        SentMailProof, provider_auto_saves_sent, sent_copy_convenience_objects,
+    };
 
     // Regression: CLI immediate send must call resolve_sent_copy_after_send
     // (pre-lookup before append), not the old append helper directly.
@@ -484,20 +574,13 @@ mod tests {
     fn cli_send_json_output_shape_includes_sent_copy_source_fields() {
         // Simulate the proof that resolve_sent_copy_after_send would return for a
         // provider-auto-save path (e.g. Gmail). provider_sent_copy should be Some,
-        // client_appended_copy should be None.
+        // client_appended_copy should be None. Uses the shared projection the CLI
+        // send path actually calls, so the two can never drift.
         let mut proof = SentMailProof::new(Some("Sent Mail".to_string()), Some(42), "found", None);
         proof.copy_source = "provider";
 
-        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
-        let client_appended_copy = if proof.copy_source == "client_appended" {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
 
         assert!(
             provider_sent_copy.is_some(),
@@ -518,16 +601,8 @@ mod tests {
         let mut proof = SentMailProof::new(Some("Sent".to_string()), Some(99), "found", None);
         proof.copy_source = "client_appended";
 
-        let provider_sent_copy = if matches!(proof.copy_source, "provider" | "unresolved") {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
-        let client_appended_copy = if proof.copy_source == "client_appended" {
-            Some(sent_mail_proof_json("acct@example.com", &proof))
-        } else {
-            None
-        };
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
 
         assert!(
             provider_sent_copy.is_none(),
@@ -544,11 +619,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_send_unresolved_never_reports_provider_sent_copy() {
+        // Blocker regression: a generic-provider APPEND failure resolves as
+        // `unresolved`; the CLI send output must not present it as provider proof.
+        let mut proof = SentMailProof::new(Some("Sent".to_string()), None, "not_found", None);
+        proof.copy_source = "unresolved";
+
+        let (provider_sent_copy, client_appended_copy) =
+            sent_copy_convenience_objects("acct@example.com", &proof);
+
+        assert!(
+            provider_sent_copy.is_none(),
+            "unresolved must never be presented as provider_sent_copy"
+        );
+        assert!(client_appended_copy.is_none());
+    }
+
+    #[test]
     fn provider_auto_saves_sent_is_accessible_from_send_module() {
         // Verify the send module can access provider detection (used by
         // resolve_sent_copy_after_send for pre-lookup routing).
         assert!(provider_auto_saves_sent(Some("gmail"), "smtp.gmail.com"));
         assert!(!provider_auto_saves_sent(None, "smtp.migadu.com"));
+    }
+
+    #[test]
+    fn every_new_draft_send_path_persists_explicit_from_identity() {
+        let src = include_str!("send.rs");
+        let obsolete_rejection = concat!("scheduled send does not persist sender ", "override yet");
+        assert!(
+            !src.contains(obsolete_rejection),
+            "scheduled sends must accept a validated --from override"
+        );
+        let persistence_call = concat!("persist_from_override", "(&db, &draft.id, from)?;");
+        assert_eq!(
+            src.matches(persistence_call).count(),
+            3,
+            "draft-only, scheduled, and cooldown queue paths must all persist From"
+        );
     }
 }
 

@@ -15,7 +15,7 @@ pub async fn run(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -27,7 +27,7 @@ pub async fn run(
         let account_id = creds.account.id.as_str();
         let enriched: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| ui::with_ui(m, ui::message_ui(account_id, m.uid, folder)))
+            .map(|m| ui::with_ui(m, ui::message_or_draft_ui(&db, account_id, m.uid, folder)))
             .collect();
         println!("{}", serde_json::to_string_pretty(&enriched)?);
     } else {

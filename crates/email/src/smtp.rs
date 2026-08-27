@@ -108,6 +108,7 @@ impl SmtpSender {
             from_override,
             cc,
             bcc,
+            false, // real send: drop Bcc from the wire (no leak to recipients)
             reply_to,
             in_reply_to,
             references,
@@ -200,6 +201,11 @@ pub fn build_message(
     from_override: Option<&str>,
     cc: Option<&str>,
     bcc: Option<&str>,
+    // Retain the `Bcc` header in the serialized message instead of dropping it
+    // after the envelope is computed. Real SMTP sends pass `false` (lettre's
+    // default) so recipients never see the BCC list; the sender-private Sent
+    // archive passes `true` so the sender keeps the true recipient record.
+    keep_bcc: bool,
     reply_to: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&[String]>,
@@ -222,9 +228,9 @@ pub fn build_message(
         .mailbox(header::To::from(parse_mailboxes(to, "to")?))
         .subject(subject)
         // Set the Message-ID explicitly so it is always present and matches the
-        // value we hand back to the caller. lettre wraps the bare id in angle
-        // brackets when it serializes the header.
-        .message_id(Some(strip_brackets(message_id_bare)));
+        // value we hand back to the caller. Lettre preserves an explicit value
+        // verbatim, so supply the RFC 5322 angle brackets ourselves.
+        .message_id(Some(format!("<{}>", strip_brackets(message_id_bare))));
 
     if let Some(cc_addr) = cc {
         if !cc_addr.trim().is_empty() {
@@ -236,6 +242,13 @@ pub fn build_message(
         if !bcc_addr.trim().is_empty() {
             builder = builder.mailbox(header::Bcc::from(parse_mailboxes(bcc_addr, "bcc")?));
         }
+    }
+
+    // By default lettre strips the `Bcc` header from the wire after deriving the
+    // envelope recipients (so normal sends never leak BCC). The sender-private
+    // Sent archive opts into keeping it.
+    if keep_bcc {
+        builder = builder.keep_bcc();
     }
 
     if let Some(reply) = reply_to {
@@ -500,6 +513,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -518,6 +532,15 @@ mod tests {
         );
         // The returned value matches what is on the wire.
         assert_eq!(returned, header);
+        assert!(
+            header.starts_with('<') && header.ends_with('>'),
+            "wire Message-ID must be RFC 5322 bracketed: {header}"
+        );
+        let wire = String::from_utf8(email.formatted()).unwrap();
+        assert!(
+            wire.contains(&format!("Message-ID: {header}\r\n")),
+            "serialized message must contain the bracketed Message-ID: {wire}"
+        );
         // The bare id we generated is preserved (modulo angle brackets).
         assert!(
             header.contains(strip_brackets(&bare).as_str()),
@@ -546,6 +569,7 @@ mod tests {
             None,
             Some("carol@example.com"),
             None,
+            false,
             None,
             Some("<parent@martin.fm>"),
             Some(refs.as_slice()),
@@ -557,6 +581,106 @@ mod tests {
         assert!(!header.trim().is_empty());
         assert_eq!(returned, header);
         assert!(header.contains(strip_brackets(&bare).as_str()));
+    }
+
+    #[test]
+    fn normalized_sent_copy_is_strict_crlf_and_keeps_message_id() {
+        // Mirrors sent_proof::append_sent_copy: the client_appended Sent
+        // archive is build_message → formatted() → normalize_crlf before IMAP
+        // APPEND (issue #87). Strict CRLF must hold for a mixed-line-ending
+        // body, and the transmitted Message-ID must survive normalization
+        // byte-for-byte or the post-append proof lookup breaks.
+        let acct = test_account("alice@martin.fm", Some("Alice"));
+        let bare = generate_message_id(&acct);
+        let (email, returned) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Re: mixed endings",
+            Some("línea uno\r\n\nline two é\nline three\r"),
+            Some("<p>Hola señor,</p>\r\n<p>línea</p>\r\n\n<p>tail</p>"),
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let rfc822 = crate::compose::normalize_crlf(&email.formatted());
+        for (i, &b) in rfc822.iter().enumerate() {
+            if b == b'\n' {
+                assert!(i > 0 && rfc822[i - 1] == b'\r', "bare LF at byte {i}");
+            }
+            if b == b'\r' {
+                assert_eq!(rfc822.get(i + 1), Some(&b'\n'), "bare CR at byte {i}");
+            }
+        }
+        let wire = String::from_utf8(rfc822).unwrap();
+        assert!(
+            wire.contains(&format!("Message-ID: {returned}\r\n")),
+            "normalized Sent copy must keep the transmitted Message-ID: {wire}"
+        );
+    }
+
+    #[test]
+    fn build_message_drops_bcc_by_default_and_keeps_it_when_requested() {
+        let acct = test_account("alice@martin.fm", None);
+        let bare = generate_message_id(&acct);
+
+        // Default (a real SMTP send): the Bcc address is used to derive the
+        // envelope recipients but stripped from the serialized message, so To/Cc
+        // recipients never see the BCC list.
+        let (dropped, _) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Hi",
+            Some("body"),
+            None,
+            None,
+            Some("carol@example.com"),
+            Some("hidden@example.com"),
+            false,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let wire = String::from_utf8(dropped.formatted()).unwrap();
+        assert!(
+            !wire.contains("hidden@example.com"),
+            "a normal send must not leak BCC onto the wire: {wire}"
+        );
+
+        // Sender-private Sent archive: keep_bcc=true retains the Bcc header so the
+        // sender keeps the true recipient record in their own Sent folder.
+        let (kept, _) = build_message(
+            &acct,
+            &bare,
+            "bob@example.com",
+            "Hi",
+            Some("body"),
+            None,
+            None,
+            Some("carol@example.com"),
+            Some("hidden@example.com"),
+            true,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let wire = String::from_utf8(kept.formatted()).unwrap();
+        assert!(
+            wire.contains("Bcc:") && wire.contains("hidden@example.com"),
+            "the archive copy must retain the BCC recipient record: {wire}"
+        );
     }
 
     #[test]
@@ -605,6 +729,135 @@ mod tests {
         assert!(err.to_string().contains("invalid bcc address"));
     }
 
+    /// The recipient headers are the narrowest address gate in the product,
+    /// and narrower than the bare-address validator it is easy to mistake for
+    /// it: `lettre::Address::from_str` accepts a quoted local part, but every
+    /// To/Cc/Bcc value goes through `Mailboxes`, which does not.
+    ///
+    /// Two other layers mirror this rule and must not drift from it —
+    /// `normalize_email` in `crates/store/src/address_book.rs` decides what the
+    /// address book may suggest, and `isValidEmail` in
+    /// `crates/dashboard/web/src/lib/addresses.ts` decides what the composer
+    /// will queue. An address either of them admitted here would reach SMTP and
+    /// fail. This test is what pins the rule they are mirroring.
+    #[test]
+    fn parse_mailboxes_rejects_what_the_suggestion_and_composer_gates_also_reject() {
+        for unsendable in [
+            // Quoted local part: `Address::from_str` says yes, `Mailboxes` no.
+            "\"john..doe\"@example.com",
+            "\"john doe\"@example.com",
+            // Non-breaking space — invisible in a chip, fatal at SMTP.
+            "a\u{a0}b@example.com",
+            "a..b@example.com",
+            "ada@-example.com",
+        ] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} must not be sendable"
+            );
+        }
+
+        // The tightening must not cost ordinary addresses, accented ones
+        // included: the local part is Unicode-aware on every layer.
+        for sendable in ["ada@example.com", "josé@example.com", "me+filing@x.test"] {
+            assert!(
+                parse_mailboxes(sendable, "to").is_ok(),
+                "{sendable:?} must stay sendable"
+            );
+        }
+    }
+
+    /// `Mailboxes` parses the WHOLE header value: `mailbox_list` is terminated
+    /// by `eof`, so text left over after the last mailbox fails the parse
+    /// rather than being ignored.
+    ///
+    /// The composer used to extract an angle address with a substring match,
+    /// which found `<ada@example.com>` inside `Ada <ada@example.com> trailing`
+    /// and validated only that. The entry passed every frontend gate and then
+    /// failed here. `isValidEmail` now requires the `>` to close the entry.
+    #[test]
+    fn parse_mailboxes_rejects_text_left_over_after_the_angle_address() {
+        for unsendable in [
+            "Ada <ada@example.com> trailing",
+            "<ada@example.com> <bob@example.com>",
+            "<ada@example.com>x",
+            "ada@example.com>",
+            "Ada <ada@example.com",
+        ] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} must not be sendable"
+            );
+        }
+
+        for sendable in [
+            "Ada <ada@example.com>",
+            "<ada@example.com>",
+            "\"Doe, Jane\" <jane@example.com>",
+        ] {
+            assert!(
+                parse_mailboxes(sendable, "to").is_ok(),
+                "{sendable:?} must stay sendable"
+            );
+        }
+    }
+
+    /// The size limits `lettre` enforces are BYTE limits — `email_address`
+    /// compares `str::len()` against 64 for the local part, 254 for the domain
+    /// and 63 for a label. A frontend counting UTF-16 code units instead reads
+    /// a 66-byte accented local part as 33 and queues a draft that dies here,
+    /// so `isValidEmail` measures with `TextEncoder`.
+    ///
+    /// Beyond the limits, `atext` is `char::is_alphanumeric` plus a fixed ASCII
+    /// set — NOT all of non-ASCII. An accented letter is admitted; a middle dot
+    /// or an emoji is not.
+    #[test]
+    fn parse_mailboxes_measures_addresses_in_utf8_bytes() {
+        // 33 × 'é' is 66 UTF-8 bytes but only 33 UTF-16 code units.
+        let overlong = format!("{}@example.com", "é".repeat(33));
+        assert!(
+            parse_mailboxes(&overlong, "to").is_err(),
+            "a 66-byte local part is over the 64-byte limit"
+        );
+        // 32 × 'é' is exactly 64 bytes, and stays sendable.
+        let at_limit = format!("{}@example.com", "é".repeat(32));
+        assert!(
+            parse_mailboxes(&at_limit, "to").is_ok(),
+            "a 64-byte local part is at the limit, not over it"
+        );
+
+        for unsendable in ["a\u{b7}b@example.com", "a\u{1f600}b@example.com"] {
+            assert!(
+                parse_mailboxes(unsendable, "to").is_err(),
+                "{unsendable:?} is non-ASCII but not alphanumeric"
+            );
+        }
+    }
+
+    /// Where the composer is deliberately NARROWER than this gate.
+    ///
+    /// `Address::check_domain` admits a Unicode domain — either `atext` takes
+    /// it directly or the `idna` fallback does — but nothing rewrites it: the
+    /// address goes on the wire in its Unicode spelling, and
+    /// `Connection::send` then refuses the envelope outright unless the server
+    /// advertises SMTPUTF8. A domain has a canonical ASCII spelling (punycode)
+    /// that costs the recipient nothing, so `isValidEmail` and
+    /// `normalize_email` require it and neither can offer a recipient whose
+    /// delivery depends on an extension the server may not have. A local part
+    /// has no such spelling, which is why the accented ones above stay
+    /// admitted on every layer.
+    #[test]
+    fn a_unicode_domain_parses_here_and_the_composer_still_refuses_it() {
+        assert!(
+            parse_mailboxes("ada@exämple.com", "to").is_ok(),
+            "the send edge itself parses a Unicode domain"
+        );
+        assert!(
+            parse_mailboxes("ada@xn--exmple-cua.com", "to").is_ok(),
+            "the punycode spelling the composer requires is sendable"
+        );
+    }
+
     #[test]
     fn unknown_content_type_falls_back_to_octet_stream() {
         let result: ContentType = "not/a valid mime type!!"
@@ -627,6 +880,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,

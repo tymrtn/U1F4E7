@@ -53,7 +53,7 @@ pub async fn run(
     if json {
         let enriched: Vec<serde_json::Value> = hits
             .iter()
-            .map(|(f, m)| ui::with_ui(m, ui::message_ui(&account_id, m.uid, f)))
+            .map(|(f, m)| ui::with_ui(m, ui::message_or_draft_ui(&db, &account_id, m.uid, f)))
             .collect();
         println!("{}", serde_json::to_string_pretty(&enriched)?);
     } else {

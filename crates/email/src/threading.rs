@@ -102,6 +102,27 @@ pub fn parse_references(refs: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract the full `References` chain from a parsed message as a
+/// space-separated string of bracket-free Message-IDs.
+///
+/// `mail_parser` models a lone reference as `Text` but a real chain as
+/// `TextList`, and `as_text()` collapses the list to its *last* element.
+/// Reading the header that way silently truncated every multi-hop thread to a
+/// single id, so this matches on both shapes.
+pub fn references_header(msg: &mail_parser::Message<'_>) -> Option<String> {
+    let joined = match msg.references() {
+        mail_parser::HeaderValue::Text(id) => id.trim().to_string(),
+        mail_parser::HeaderValue::TextList(ids) => ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// Extract a snippet (first ~200 chars) from message body text.
 pub fn extract_snippet(text: &str, max_len: usize) -> String {
     // Remove quoted lines (starting with >)
@@ -140,13 +161,26 @@ pub fn classify_folder_type(name: &str) -> Option<String> {
 ///
 /// This is incremental: it tracks the last-synced UID per folder and only
 /// fetches new messages since the last sync.
+///
+/// `rebuild` drops that watermark first, so the scan re-reads the most recent
+/// `max_messages` of each folder instead of only what arrived since last time.
+/// Rows are upserted by `message_id` + folder, so this repairs headers stored
+/// by an earlier parse rather than duplicating messages.
 pub async fn build_threads(
     account: &AccountWithCredentials,
     db: &Database,
     max_messages: u32,
+    rebuild: bool,
 ) -> Result<ThreadBuildResult, ImapError> {
     let account_id = &account.account.id;
     let account_email = &account.account.username;
+
+    if rebuild {
+        info!("rebuild requested — clearing thread sync watermark for {account_email}");
+        if let Err(e) = db.clear_last_synced_uid(account_id) {
+            warn!("failed to clear thread sync state: {e}");
+        }
+    }
 
     let mut client = imap::connect(account).await?;
 
@@ -185,6 +219,19 @@ pub async fn build_threads(
         total_indexed += sent_indexed.messages_indexed;
         threads_created += sent_indexed.threads_created;
         threads_updated += sent_indexed.threads_updated;
+    }
+
+    // Fold whatever the scan just wrote into the contacts address history that
+    // compose autocomplete reads. Local SQL over the rows already on disk: the
+    // store reads above a durable watermark, so an ordinary scan costs the
+    // messages it added rather than a rescan of the thread cache. A scan that
+    // rewrote an address on an already-cached row, or wiped a folder after a
+    // UIDVALIDITY change, has marked the account for a rebuild instead — that
+    // pass re-folds the account's thread cache from the start, which is the
+    // price of the corrected data being visible at all. A failure here is not a
+    // scan failure — the threads are indexed either way.
+    if let Err(e) = db.reconcile_address_history(account_id) {
+        warn!("address history reconcile failed for {account_email}: {e}");
     }
 
     Ok(ThreadBuildResult {
@@ -339,16 +386,22 @@ where
                 // Extract threading headers
                 let message_id = parsed.message_id().map(|s| s.to_string());
                 let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-                let references_raw = parsed.references().as_text().map(|s| s.to_string());
+                let references_raw = references_header(&parsed);
                 let subject = parsed.subject().unwrap_or_default().to_string();
                 let date = parsed
                     .date()
                     .map(|d| d.to_rfc3339())
                     .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-                // From/To
+                // From/To/Cc/Bcc. Cc recipients are correspondents exactly as
+                // the To line is; Bcc only ever appears on the sender's own
+                // copy of an outbound message, and is kept for the same reason
+                // the Sent archive keeps it — the sender's record of who
+                // actually received it.
                 let from_addr = mp_first_address(parsed.from());
                 let to_addr = mp_all_addresses(parsed.to());
+                let cc_addr = non_empty(mp_all_addresses(parsed.cc()));
+                let bcc_addr = non_empty(mp_all_addresses(parsed.bcc()));
 
                 // Is this outbound? (sent from our account)
                 let is_outbound = from_addr.to_lowercase() == account_email.to_lowercase();
@@ -435,6 +488,8 @@ where
                     folder,
                     &from_addr,
                     &to_addr,
+                    cc_addr.as_deref(),
+                    bcc_addr.as_deref(),
                     &date,
                     &subject,
                     is_outbound,
@@ -536,6 +591,16 @@ fn mp_all_addresses(header: Option<&mail_parser::Address<'_>>) -> String {
     }
 }
 
+/// `None` for a header that was absent or held no parseable address, so an
+/// empty Cc is stored as NULL rather than an empty string.
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// Result of building threads for one folder.
 #[derive(Debug, Default)]
 struct FolderScanResult {
@@ -586,6 +651,39 @@ mod tests {
         assert_eq!(
             parse_references("<single@host.com>"),
             vec!["<single@host.com>"]
+        );
+    }
+
+    /// A References header carrying more than one Message-ID must survive
+    /// extraction. `mail_parser` reports a single id as `Text` but a chain as
+    /// `TextList`, so reading it with `as_text()` silently dropped every real
+    /// reply chain — the exact case threading depends on.
+    #[test]
+    fn references_header_survives_multiple_ids() {
+        let single = b"Message-ID: <c@host>\r\nReferences: <a@host>\r\n\r\nBody\r\n";
+        let chain =
+            b"Message-ID: <c@host>\r\nReferences: <a@host> <b@host>\r\n\r\nBody\r\n" as &[u8];
+
+        // `mail_parser` yields bracket-free ids, matching `message_id()` and
+        // `in_reply_to()`. Bare ids are the stored form across the workspace.
+        let parsed = mail_parser::MessageParser::default()
+            .parse(single as &[u8])
+            .unwrap();
+        assert_eq!(
+            references_header(&parsed),
+            Some("a@host".to_string()),
+            "single-id References must be extracted"
+        );
+
+        let parsed = mail_parser::MessageParser::default().parse(chain).unwrap();
+        assert_eq!(
+            references_header(&parsed),
+            Some("a@host b@host".to_string()),
+            "multi-id References must be extracted, not dropped"
+        );
+        assert_eq!(
+            parse_references(&references_header(&parsed).unwrap()),
+            vec!["a@host", "b@host"]
         );
     }
 

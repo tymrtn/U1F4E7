@@ -7,10 +7,23 @@
 //! `List-Unsubscribe-Post`. Security: default is dry-run, execution
 //! requires explicit `--confirm`. Never auto-follows GET URLs (tracking).
 
+use std::future::Future;
+use std::pin::Pin;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::errors::SmtpError;
+
+/// An async mailto-unsubscribe SMTP sender: given the unsubscribe address, it
+/// returns a future that runs any gate and performs the actual SMTP send. It is
+/// awaited directly (never `block_on`ed inside a runtime, which would panic).
+///
+/// The future is intentionally NOT `Send`: the CLI closure captures per-command
+/// state (audit capture cells) and is awaited on the same task, so requiring
+/// `Send` would needlessly forbid that. The mailto path is taken at most once.
+pub type MailtoSender<'a> =
+    dyn Fn(&str) -> Pin<Box<dyn Future<Output = Result<(), SmtpError>> + 'a>> + 'a;
 
 /// Parsed unsubscribe options from a message's headers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +95,7 @@ pub fn parse_list_unsubscribe(header: &str, post_header: Option<&str>) -> Option
 pub async fn execute_unsubscribe(
     info: &UnsubscribeInfo,
     confirm: bool,
-    smtp_send: Option<&dyn Fn(&str) -> Result<(), SmtpError>>,
+    smtp_send: Option<&MailtoSender<'_>>,
 ) -> UnsubscribeResult {
     // Prefer HTTPS POST (RFC 8058 one-click)
     if info.one_click_post {
@@ -151,9 +164,9 @@ pub async fn execute_unsubscribe(
             };
         }
 
-        // If we have an SMTP sender callback, use it
+        // If we have an SMTP sender callback, await it (no block_on).
         if let Some(send_fn) = smtp_send {
-            match send_fn(addr) {
+            match send_fn(addr).await {
                 Ok(()) => {
                     info!("unsubscribed via mailto: {addr}");
                     return UnsubscribeResult {
@@ -263,5 +276,53 @@ mod tests {
         let result = execute_unsubscribe(&info, true, None).await;
         assert_eq!(result.method, "none");
         assert_eq!(result.status, "failed");
+    }
+
+    // ── Block 5: the mailto callback is a real awaited async path ────────────
+
+    fn mailto_only() -> UnsubscribeInfo {
+        UnsubscribeInfo {
+            https_urls: vec![],
+            mailto_urls: vec!["mailto:unsub@example.com".to_string()],
+            one_click_post: false,
+            raw_header: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_mailto_awaits_async_sender_without_block_on() {
+        // Regression: the sender is a future that is AWAITED (never block_on'ed
+        // inside the runtime, which panicked). Running under #[tokio::test] means
+        // any block_on inside the callback would abort this test.
+        let info = mailto_only();
+        let called = std::cell::Cell::new(false);
+        let send: Box<MailtoSender> = Box::new(|addr: &str| {
+            let called = &called;
+            let addr = addr.to_string();
+            Box::pin(async move {
+                assert_eq!(addr, "unsub@example.com");
+                called.set(true);
+                Ok(())
+            })
+        });
+        let result = execute_unsubscribe(&info, true, Some(send.as_ref())).await;
+        assert_eq!(result.status, "success");
+        assert_eq!(result.method, "mailto");
+        assert!(called.get(), "the async sender must actually run");
+    }
+
+    #[tokio::test]
+    async fn confirmed_mailto_async_sender_error_is_reported_failed() {
+        let info = mailto_only();
+        let send: Box<MailtoSender> = Box::new(|_addr: &str| {
+            Box::pin(async { Err(SmtpError::Send("gate refused".to_string())) })
+        });
+        let result = execute_unsubscribe(&info, true, Some(send.as_ref())).await;
+        assert_eq!(result.status, "failed");
+        assert!(
+            result.message.contains("gate refused"),
+            "the sender error surfaces: {}",
+            result.message
+        );
     }
 }

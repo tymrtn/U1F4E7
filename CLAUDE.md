@@ -5,13 +5,18 @@
 - Tests: `cargo test --workspace`
 - Full clippy currently has pre-existing store lint debt; use baseline-aware review before treating `cargo clippy --workspace --all-targets -- -D warnings` as a feature regression.
 
+## V1 release parity
+- Every V1 patch that lands in the shared runtime (the installed `envelope` CLI/dashboard Tyler and agents both use) must ship as a matching public release: version bump, changelog entry, tag. No dogfood-only divergence in the shared binary.
+- V1 dev builds stay isolated: `-dev`-labelled installs never replace the shared runtime and never substitute for cutting the public release.
+- V2 is a separate track. V2 work must not delay a V1 patch release, and V1 patch releases must not wait on V2 reconciliation.
+
 ## Keychain import invariants
 - `accounts import-keychain` must be explicit: metadata discovery first, no `security -w` password read unless `--confirm-read`, and no Envelope account mutation unless `--import` is also supplied after IMAP/SMTP auth verification.
 - JSON statuses are the public contract: `found_candidate`, `no_candidate`, `oauth_or_token_only`, `auth_verified`, `auth_failed`, `imported`. Never include password/token values in status JSON, errors, tests, docs, or logs.
 - OAuth/token-backed Mail.app accounts (Gmail/iCloud/etc. without internet-password entries) should report unsupported/app-password guidance rather than pretending raw passwords exist.
 
 ## Agent contract invariants
-- `envelope contract` exports `envelope.agent_contract.v1`; update `docs/schemas/envelope.agent_contract.v1.json` and `docs/agent-contract.md` after intentional contract changes.
+- `envelope contract` exports `envelope.agent_contract.v2` (v1 is retained as historical documentation); update `docs/schemas/envelope.agent_contract.v2.json` and `docs/agent-contract.md` after intentional contract changes.
 - MCP tool input schemas should be derived from `commands::contract` so CLI/MCP/Hermes/Codex advertise the same contract surface.
 - Do not change existing command `--json` output shapes without compatibility notes; removals/renames/type changes require a new contract schema id.
 

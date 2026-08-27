@@ -37,17 +37,29 @@ export interface MessageDetailFullResponse {
 
 // ── Thread types ──────────────────────────────────────────────────────
 
-/** A single message in a thread listing from GET /api/accounts/{id}/threads/{message_id}. */
+/**
+ * A single message in a thread listing from GET /api/accounts/{id}/threads/{message_id}.
+ *
+ * Mirrors `ThreadMessage` in crates/store/src/models.rs field-for-field — the
+ * handler serializes that struct directly. It is NOT the shape of a mailbox
+ * listing row: there are no `flags` and no `size` here, and the address fields
+ * are `from_address`/`to_addresses`. Reading `from_addr`/`flags` off one of
+ * these yields `undefined` and throws at the first `.match`/`.some`.
+ */
 export interface ThreadMessage {
+  id: number;
+  thread_id: string;
   uid: number;
   message_id: string | null;
-  from_addr: string;
-  to_addr: string;
-  subject: string;
+  in_reply_to: string | null;
+  references: string | null;
+  folder: string;
+  from_address: string | null;
+  to_addresses: string | null;
   date: string | null;
-  flags: string[];
-  size: number;
-  folder?: string;
+  subject: string | null;
+  is_outbound: boolean;
+  snippet: string | null;
 }
 
 export interface ThreadResponse {
@@ -143,6 +155,18 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Reduce a Message-ID to its bare `local@domain` form.
+ *
+ * Drafts persist the RFC 5322 bracketed form while the thread index stores
+ * bracket-free ids, so anything comparing the two — or putting one in a
+ * `/threads/{message_id}` path — has to normalize first.
+ * Mirrors `normalize_message_id` in crates/store/src/threads.rs.
+ */
+export function normalizeMessageId(messageId: string): string {
+  return messageId.trim().replace(/^<+/, '').replace(/>+$/, '').trim();
 }
 
 /** Return true when the flags array contains \\Seen. Case-insensitive. */

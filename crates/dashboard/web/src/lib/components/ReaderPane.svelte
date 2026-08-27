@@ -7,11 +7,22 @@
   //   • Headers block with from/to/cc/date/subject; to+cc collapsed behind Details
   //   • Thread strip (ThreadStrip)
   //   • Attachment list (AttachmentList)
-  //   • Explicit read toggle (never auto-marks read — invariant)
+  //   • Read-on-open: a successful open marks the message \Seen through an
+  //     intentional STORE mutation (the content fetch stays BODY.PEEK). A
+  //     failed load never marks read; re-opening a read message is idempotent.
+  //     Evidence/export paths are read-only and never reach this component.
+  //   • Explicit read/unread toggle (restores unread after auto-read)
   //   • MonoTag copy affordances for uid + message-id (click-to-copy, toast)
+  //   • Drafts intercept: a Drafts-folder deep link never loads the reader. It
+  //     resolves the local draft by IMAP UID and hands off to the review
+  //     composer, which is the only surface that can edit and send. The message
+  //     endpoint is not called (it can 404 while the draft row is fine) and the
+  //     draft is never marked Seen.
 
   import { page } from '$app/state';
-  import { Spinner, MonoTag, Badge, Toast } from '$lib/components';
+  import { goto } from '$app/navigation';
+  import { base } from '$app/paths';
+  import { Spinner, MonoTag, Badge, Toast, Modal } from '$lib/components';
   import BodyFrame from '$lib/components/BodyFrame.svelte';
   import ThreadStrip from '$lib/components/ThreadStrip.svelte';
   import AttachmentList from '$lib/components/AttachmentList.svelte';
@@ -23,13 +34,28 @@
     type MessageDetailFull,
     type ThreadMessage
   } from '$lib/reader-api';
-  import { EnvelopeApiError } from '$lib/api';
+  import { api, bulkClient, EnvelopeApiError } from '$lib/api';
+  import { looksLikeTrash } from '$lib/folder-kinds';
+  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+  import { isDraftsFolder } from '$lib/mailboxes';
+  import { folderHints } from '$lib/folder-hints.svelte';
+  import { readState } from '$lib/read-state.svelte';
+  import { getComposerStore } from '$lib/composer.svelte';
 
   // ── Route params ──────────────────────────────────────────────────────
 
   const accountId = $derived(page.params.account ?? '');
   const uid = $derived(Number(page.params.uid ?? 0));
-  const folder = $derived(page.url.searchParams.get('folder') ?? 'INBOX');
+  // Folder resolution, most trustworthy first: an explicit `?folder=` (the only
+  // source that can name a mailbox the list never loaded), then the folder the
+  // unified list recorded for this exact account+uid, then INBOX. The hint
+  // means a link that lost its query string opens the right mailbox instead of
+  // 404ing against INBOX — and a Drafts uid still reaches the drafts intercept.
+  const folder = $derived(
+    page.url.searchParams.get('folder') ||
+      folderHints.folderFor(page.params.account ?? null, Number(page.params.uid) || null) ||
+      'INBOX'
+  );
   const box = $derived(page.params.box ?? 'unified');
 
   // ── Message state ─────────────────────────────────────────────────────
@@ -38,6 +64,11 @@
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadKey = $state('');
+
+  // ── Drafts state ──────────────────────────────────────────────────────
+  // Set only when a Drafts UID has no local draft to hand off to. The reader
+  // would render it read-only and mark it Seen, so this card stands in instead.
+  let draftFallback = $state<{ uid: number; folder: string } | null>(null);
 
   // ── Thread state ──────────────────────────────────────────────────────
 
@@ -132,12 +163,29 @@
     message = null;
     threadMessages = [];
     localSeen = null;
+    localFlagged = null;
+    actionError = null;
     remoteImages = false;
     remoteBlockedCount = 0;
+    draftFallback = null;
+
+    if (isDraftsFolder(f)) {
+      await loadDraft(acct, u, f);
+      return;
+    }
 
     try {
       const res = await fetchMessageDetail(acct, u, f);
       message = res.message;
+
+      // Read-on-open: the successful load is the operator's explicit read
+      // action. Fire an intentional \Seen STORE (not a BODY[] side effect).
+      // Idempotent — skip when the message already carries \Seen.
+      if (!isSeen(message.flags)) {
+        void markReadOnOpen(acct, u, f);
+      } else {
+        readState.markRead(acct, f, u);
+      }
 
       // Thread: load if message_id is present (fire-and-forget, no blocking).
       if (message.message_id) {
@@ -169,6 +217,55 @@
     }
   }
 
+  // Resolve a Drafts-folder UID to its local draft and hand off to the review
+  // composer. Deliberately does NOT touch the message endpoint: an IMAP draft
+  // can be gone from the mailbox while the local row is still editable, and
+  // loading it here would also mark an unsent draft Seen.
+  async function loadDraft(acct: string, u: number, f: string) {
+    try {
+      const res = await api.draftByImapUid(acct, u);
+      const localId = res.draft?.id;
+      if (localId) {
+        await goto(
+          `${base}/accounts/${encodeURIComponent(acct)}/drafts/${encodeURIComponent(localId)}`
+        );
+        return;
+      }
+      // 200 with no draft would be a backend contract break; say so rather
+      // than falling through to a surface that cannot send.
+      draftFallback = { uid: u, folder: f };
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      if (err?.status === 404) {
+        draftFallback = { uid: u, folder: f };
+      } else {
+        error = {
+          code: err.code ?? 'draft_lookup_error',
+          message: err.message ?? 'Failed to open this draft.'
+        };
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
+  // Mark a freshly-opened unread message \Seen. On success, reflect Read in
+  // this pane and in the shared list store so the row un-bolds without a
+  // refetch. On failure, leave the message unread and say so (never silent).
+  async function markReadOnOpen(acct: string, u: number, f: string) {
+    try {
+      await postFlags(acct, u, f, ['\\Seen'], []);
+    } catch {
+      showToast('Couldn’t mark read', 'warn');
+      return;
+    }
+    readState.markRead(acct, f, u);
+    // Only reflect in this pane if it's still showing the same message.
+    if (accountId === acct && uid === u && folder === f) {
+      localSeen = true;
+    }
+  }
+
   $effect(() => {
     const key = `${accountId}:${uid}:${folder}`;
     if (accountId && uid && key !== loadKey) {
@@ -188,12 +285,190 @@
     try {
       await postFlags(accountId, uid, folder, add, remove);
       localSeen = !currentlyRead;
+      if (localSeen) readState.markRead(accountId, folder, uid);
+      else readState.markUnread(accountId, folder, uid);
       showToast(currentlyRead ? 'Marked unread' : 'Marked read');
     } catch (e) {
       const err = e as EnvelopeApiError;
       showToast(err.message ?? 'Could not update flag', 'warn');
     } finally {
       flagging = false;
+    }
+  }
+
+  // ── Reply / reply-all / forward ──────────────────────────────────────
+  // The composer store is the coordination point: the reader opens it in the
+  // right mode with this message as the parent and ComposerDrawer (mounted in
+  // the mail layout) does the rest. Reply/reply-all let the server derive
+  // recipients and threading headers from the parent; the quoted original is
+  // prefilled client-side so the operator sees and can trim what they are
+  // answering. Forward is a fresh message, so subject + quoted body are
+  // prefilled here.
+
+  const composer = getComposerStore();
+
+  function stripHtml(html: string): string {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|tr|h[1-6])>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function plainBody(): string {
+    if (!message) return '';
+    if (message.text_body) return message.text_body;
+    if (message.html_body) return stripHtml(message.html_body);
+    return '';
+  }
+
+  function quoted(text: string): string {
+    return text
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n');
+  }
+
+  function replyBodyPrefix(): string {
+    if (!message) return '';
+    const when = message.date ? fmtAbsolute(message.date) : '';
+    const attribution = when
+      ? `On ${when}, ${message.from_addr} wrote:`
+      : `${message.from_addr} wrote:`;
+    return `\n\n${attribution}\n${quoted(plainBody())}`;
+  }
+
+  function forwardSubject(): string {
+    const subject = message?.subject ?? '';
+    return /^\s*fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`;
+  }
+
+  function forwardBodyPrefix(): string {
+    if (!message) return '';
+    const lines = [
+      '',
+      '',
+      '---------- Forwarded message ----------',
+      `From: ${message.from_addr}`
+    ];
+    if (message.date) lines.push(`Date: ${fmtAbsolute(message.date)}`);
+    lines.push(`Subject: ${message.subject ?? ''}`);
+    const to = addrList(message.to_addrs, message.to_addr);
+    if (to) lines.push(`To: ${to}`);
+    lines.push('', plainBody());
+    return lines.join('\n');
+  }
+
+  function openReply(mode: 'reply' | 'reply-all') {
+    if (!message) return;
+    composer.open(mode, {
+      accountId,
+      parentUid: uid,
+      parentFolder: folder,
+      bodyPrefix: replyBodyPrefix()
+    });
+  }
+
+  function openForward() {
+    if (!message) return;
+    composer.open('forward', {
+      accountId,
+      subject: forwardSubject(),
+      bodyPrefix: forwardBodyPrefix()
+    });
+  }
+
+  // ── Mailbox actions: archive / delete / star ─────────────────────────
+  // Same canonical special-use targets and per-message endpoints BulkToolbar
+  // uses (the `/move` boundary resolves `\\Archive` / `\\Trash` to each
+  // provider's real folder). Delete is reversible (move to Trash) everywhere
+  // except inside Trash, where it is a confirmed permanent delete. A completed
+  // move leaves the reader: the list is told to refresh and we return to it.
+
+  const mailboxOps = getMailboxOpsStore();
+  let acting = $state(false);
+  let actionError = $state<string | null>(null);
+  let deleteConfirmOpen = $state(false);
+  let localFlagged = $state<boolean | null>(null);
+
+  const inTrash = $derived(looksLikeTrash(folder));
+
+  let isStarred = $derived(() => {
+    if (localFlagged !== null) return localFlagged;
+    if (!message) return false;
+    return message.flags.some((f) => f.toLowerCase() === '\\flagged');
+  });
+
+  function leaveToList() {
+    void goto(`${base}/mail/${encodeURIComponent(box)}`);
+  }
+
+  async function runMailboxOp(
+    op: Parameters<typeof bulkClient>[0],
+    verb: string
+  ): Promise<boolean> {
+    if (!message || acting) return false;
+    acting = true;
+    actionError = null;
+    try {
+      const result = await bulkClient(op, [{ accountId, uid, folder }]);
+      if (result.failed.length > 0) {
+        actionError = `Couldn’t ${verb}: ${result.failed[0].error}`;
+        return false;
+      }
+      mailboxOps.operated();
+      return true;
+    } finally {
+      acting = false;
+    }
+  }
+
+  async function archiveMessage() {
+    if (await runMailboxOp({ type: 'move', to_folder: '\\Archive', folder }, 'archive')) {
+      leaveToList();
+    }
+  }
+
+  async function trashMessage() {
+    if (await runMailboxOp({ type: 'move', to_folder: '\\Trash', folder }, 'move to Trash')) {
+      leaveToList();
+    }
+  }
+
+  async function deleteForever() {
+    deleteConfirmOpen = false;
+    if (await runMailboxOp({ type: 'delete', folder }, 'delete')) {
+      leaveToList();
+    }
+  }
+
+  async function toggleStar() {
+    if (!message || acting) return;
+    acting = true;
+    actionError = null;
+    const starred = isStarred();
+    try {
+      await postFlags(
+        accountId,
+        uid,
+        folder,
+        starred ? [] : ['\\Flagged'],
+        starred ? ['\\Flagged'] : []
+      );
+      localFlagged = !starred;
+      mailboxOps.operated();
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      actionError = `Couldn’t ${starred ? 'unstar' : 'star'}: ${err.message ?? 'flag update failed'}`;
+    } finally {
+      acting = false;
     }
   }
 
@@ -255,6 +530,19 @@
         Try again
       </button>
     </div>
+  {:else if draftFallback}
+    <section class="draft-card" id="draft-card">
+      <h1 class="draft-card-title">Draft</h1>
+      <p class="draft-card-msg">
+        This draft only exists in the mailbox on your mail server, so there is no editable copy
+        here yet and it can't be sent from this page.
+      </p>
+      <p class="draft-card-meta">
+        <MonoTag>uid {draftFallback.uid}</MonoTag>
+        <MonoTag>{draftFallback.folder}</MonoTag>
+      </p>
+      <a class="draft-card-link" href="{base}/mail/drafts">Open Drafts</a>
+    </section>
   {:else if message}
     <article class="msg" id="msg-{message.uid}">
       <!-- ── Header ──────────────────────────────────────────────────── -->
@@ -278,8 +566,66 @@
         </div>
       </header>
 
-      <!-- Reading note — plain language, no protocol jargon -->
-      <p class="reader-read-note">Reading here never marks messages as read.</p>
+      <!-- ── Reply / forward ───────────────────────────────────────── -->
+      <div class="msg-actions" role="group" aria-label="Message actions">
+        <button class="reader-action-btn" type="button" onclick={() => openReply('reply')}>
+          Reply
+        </button>
+        <button class="reader-action-btn" type="button" onclick={() => openReply('reply-all')}>
+          Reply all
+        </button>
+        <button class="reader-action-btn" type="button" onclick={openForward}>
+          Forward
+        </button>
+        <span class="msg-actions-spacer" aria-hidden="true"></span>
+        <button class="reader-action-btn" type="button" disabled={acting} onclick={archiveMessage}>
+          Archive
+        </button>
+        {#if inTrash}
+          <button
+            class="reader-action-btn reader-action-danger"
+            type="button"
+            disabled={acting}
+            onclick={() => (deleteConfirmOpen = true)}
+          >
+            Delete forever
+          </button>
+        {:else}
+          <button class="reader-action-btn" type="button" disabled={acting} onclick={trashMessage}>
+            Delete
+          </button>
+        {/if}
+        <button
+          class="reader-action-btn"
+          class:is-starred={isStarred()}
+          type="button"
+          disabled={acting}
+          aria-pressed={isStarred()}
+          onclick={toggleStar}
+        >
+          {isStarred() ? 'Unstar' : 'Star'}
+        </button>
+      </div>
+      {#if actionError}
+        <p class="msg-action-error" role="alert">{actionError}</p>
+      {/if}
+      <Modal
+        open={deleteConfirmOpen}
+        title="Delete this message forever?"
+        onclose={() => (deleteConfirmOpen = false)}
+      >
+        <p class="msg-delete-warn">
+          This permanently deletes the message from Trash. You can’t undo this.
+        </p>
+        {#snippet footer()}
+          <button type="button" class="modal-cancel" onclick={() => (deleteConfirmOpen = false)}>
+            Cancel
+          </button>
+          <button type="button" class="modal-delete" onclick={deleteForever}>
+            Permanently delete
+          </button>
+        {/snippet}
+      </Modal>
 
       <!-- ── Thread strip ───────────────────────────────────────────── -->
       {#if threadLoading || threadMessages.length > 1}
@@ -426,7 +772,7 @@
     <!-- Empty / no-message-selected state -->
     <div class="reader-empty" id="reader-empty">
       <p class="reader-empty-msg">Select a message to read it.</p>
-      <p class="reader-empty-note">Reading here never marks messages as read.</p>
+      <p class="reader-empty-note">Opening a message marks it read.</p>
     </div>
   {/if}
 </div>
@@ -485,6 +831,41 @@
     text-decoration: underline;
   }
 
+  /* Draft fallback card — a Drafts uid with no local draft to review. */
+  .draft-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 1rem 1.15rem;
+    border: 1px solid var(--env-accent);
+    border-left-width: 3px;
+    border-radius: var(--radius-xs, 2px);
+    background: var(--env-accent-soft);
+  }
+  .draft-card-title {
+    margin: 0;
+    font-size: 1.0625rem;
+    font-weight: 600;
+    color: var(--env-ink);
+  }
+  .draft-card-msg {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--env-ink);
+  }
+  .draft-card-meta {
+    display: flex;
+    gap: 0.4rem;
+    margin: 0;
+    flex-wrap: wrap;
+  }
+  .draft-card-link {
+    font-size: 0.8125rem;
+    color: var(--env-accent);
+  }
+
   /* Empty state */
   .reader-empty {
     padding: 2rem 0;
@@ -526,11 +907,41 @@
     flex-shrink: 0;
   }
 
-  /* Reader note */
-  .reader-read-note {
+  .msg-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
     margin: 0 0 0.75rem;
-    font-size: 0.75rem;
-    color: var(--env-muted);
+  }
+
+  .msg-actions-spacer {
+    flex: 1 1 auto;
+  }
+  .reader-action-danger {
+    color: var(--env-danger, #b42318);
+  }
+  .msg-action-error {
+    margin: -0.25rem 0 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--env-danger, #b42318);
+  }
+  .msg-delete-warn {
+    margin: 0;
+    font-size: 0.875rem;
+  }
+  .modal-cancel,
+  .modal-delete {
+    font: inherit;
+    padding: 0.4rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--env-rule);
+    background: transparent;
+    cursor: pointer;
+  }
+  .modal-delete {
+    color: #fff;
+    background: var(--env-danger, #b42318);
+    border-color: var(--env-danger, #b42318);
   }
 
   /* Meta dl */

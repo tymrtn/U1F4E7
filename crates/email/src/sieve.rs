@@ -53,6 +53,17 @@ pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
             }
         };
 
+        // Defensive: a canonical special-use sentinel (`\Junk`, `\Archive`, …)
+        // can never be exported as a literal Sieve `fileinto` target — this
+        // must hold even for a legacy row whose stored `sieve_exportable` flag
+        // is stale/incorrectly true (e.g. written before this guard existed).
+        if let Action::Move(dest) = &action {
+            if dest.starts_with('\\') {
+                skipped.push(rule.name.clone());
+                continue;
+            }
+        }
+
         let condition = match expr_to_sieve(&match_expr) {
             Some(c) => c,
             None => {
@@ -115,6 +126,13 @@ fn expr_to_sieve(expr: &MatchExpr) -> Option<String> {
         MatchExpr::From(pattern) => {
             let addr = glob_to_sieve_match(pattern);
             Some(format!("address :matches \"from\" \"{addr}\""))
+        }
+        MatchExpr::FromExact(addr) => {
+            // `:is` is a literal comparison — no glob interpretation, so a
+            // local-part containing `*`/`?` is matched exactly, same as local
+            // evaluation. Only quote/backslash characters are escaped here.
+            let escaped = glob_to_sieve_match(addr);
+            Some(format!("address :is \"from\" \"{escaped}\""))
         }
         MatchExpr::To(pattern) => {
             let addr = glob_to_sieve_match(pattern);
@@ -265,6 +283,21 @@ mod tests {
         assert!(script.contains("require [\"fileinto\"]"));
         assert!(script.contains("address :matches \"from\" \"*@notifications.github.com\""));
         assert!(script.contains("fileinto \"Archive\""));
+    }
+
+    #[test]
+    fn export_from_exact_uses_is_comparator() {
+        let rules = vec![make_rule(
+            "Block wildcard local-part",
+            r#"{"from_exact":"*@example.com"}"#,
+            r#"{"move":"Archive"}"#,
+            true,
+        )];
+        let (script, skipped) = export_sieve(&rules);
+        assert!(skipped.is_empty());
+        // `:is` — not `:matches` — so the literal `*` is never treated as a glob.
+        assert!(script.contains("address :is \"from\" \"*@example.com\""));
+        assert!(!script.contains(":matches \"from\""));
     }
 
     #[test]
@@ -421,6 +454,41 @@ mod tests {
         );
         assert!(action_line.contains("Line one"));
         assert!(action_line.contains("Line two"));
+    }
+
+    #[test]
+    fn export_skips_stale_sieve_exportable_true_with_canonical_move_destination() {
+        // A legacy row can have sieve_exportable=true even though its stored
+        // move destination is a canonical sentinel (e.g. written before the
+        // store-level guard existed, or edited directly). export_sieve must
+        // defensively skip it rather than emit a fileinto naming the literal
+        // backslash-prefixed sentinel string.
+        let rules = vec![make_rule(
+            "Legacy junk rule",
+            r#"{"from_exact":"someone@example.com"}"#,
+            r#"{"move":"\\Junk"}"#,
+            true,
+        )];
+        let (script, skipped) = export_sieve(&rules);
+        assert_eq!(skipped, vec!["Legacy junk rule"]);
+        assert!(!script.contains("fileinto"));
+        assert!(!script.contains("Junk"));
+    }
+
+    #[test]
+    fn export_still_exports_literal_custom_folder_move() {
+        // A literal (non-backslash) folder name is a real mailbox and must
+        // stay exportable — the defensive guard only targets canonical
+        // sentinels, not ordinary custom folders.
+        let rules = vec![make_rule(
+            "Custom folder rule",
+            r#"{"from":"*@example.com"}"#,
+            r#"{"move":"Receipts"}"#,
+            true,
+        )];
+        let (script, skipped) = export_sieve(&rules);
+        assert!(skipped.is_empty());
+        assert!(script.contains(r#"fileinto "Receipts";"#));
     }
 
     #[test]

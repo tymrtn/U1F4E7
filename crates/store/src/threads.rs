@@ -13,7 +13,20 @@ const THREAD_COLS: &str =
 
 /// The full SELECT column list for thread_messages.
 const THREAD_MSG_COLS: &str = "id, thread_id, uid, message_id, in_reply_to, reference_ids, folder, \
-     from_address, to_addresses, date, subject, is_outbound, snippet";
+     from_address, to_addresses, date, subject, is_outbound, snippet, cc_addresses, bcc_addresses";
+
+/// Reduce a Message-ID to its bare `local@domain` form for comparison.
+///
+/// Ingestion writes bracket-free ids (`mail_parser` strips them) while drafts
+/// and RFC 5322 headers carry `<...>`. Both forms must resolve to the same
+/// thread, so every lookup normalizes instead of matching the stored bytes.
+pub fn normalize_message_id(message_id: &str) -> String {
+    message_id
+        .trim()
+        .trim_matches(['<', '>'])
+        .trim()
+        .to_string()
+}
 
 impl Database {
     // ── Thread CRUD ──────────────────────────────────────────────────
@@ -121,6 +134,12 @@ impl Database {
 
     /// Insert or update a thread message (upsert by message_id + folder within an account).
     /// Returns the thread_message id.
+    ///
+    /// `cc_addresses`/`bcc_addresses` are the Cc/Bcc header values when the
+    /// scan saw them. They are recipients like the To line, so compose
+    /// autocomplete reads them; rows cached before they existed keep NULL
+    /// until a later scan revisits the message.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_thread_message(
         &self,
         thread_id: &str,
@@ -131,6 +150,8 @@ impl Database {
         folder: &str,
         from_address: &str,
         to_addresses: &str,
+        cc_addresses: Option<&str>,
+        bcc_addresses: Option<&str>,
         date: &str,
         subject: &str,
         is_outbound: bool,
@@ -165,12 +186,30 @@ impl Database {
         let is_outbound_int: i32 = if is_outbound { 1 } else { 0 };
 
         if let Some(id) = existing_id {
-            // Update existing
+            // The address history is derived above a watermark on this table's
+            // monotonic id, so an id that has already been folded in is never
+            // read again. Rewriting the addresses on such a row would leave
+            // the derived counts describing headers that are no longer there —
+            // so a rewrite that actually changes an address-bearing field
+            // invalidates the account's history instead. An unchanged rescan
+            // (the common case: `envelope thread` re-reading a folder) touches
+            // nothing.
+            let addresses_changed = self.thread_message_addresses_changed(
+                id,
+                from_address,
+                to_addresses,
+                cc_addresses,
+                bcc_addresses,
+                date,
+                is_outbound,
+            )?;
+
             self.conn().execute(
                 "UPDATE thread_messages SET
                     thread_id = ?1, uid = ?2, in_reply_to = ?3, reference_ids = ?4,
                     from_address = ?5, to_addresses = ?6, date = ?7, subject = ?8,
-                    is_outbound = ?9, snippet = ?10
+                    is_outbound = ?9, snippet = ?10, cc_addresses = ?12,
+                    bcc_addresses = ?13
                  WHERE id = ?11",
                 params![
                     thread_id,
@@ -183,17 +222,23 @@ impl Database {
                     subject,
                     is_outbound_int,
                     snippet,
-                    id
+                    id,
+                    cc_addresses,
+                    bcc_addresses
                 ],
             )?;
+            if addresses_changed {
+                self.invalidate_address_history_for_thread(thread_id)?;
+            }
             Ok(id)
         } else {
             // Insert new
             self.conn().execute(
                 "INSERT INTO thread_messages
                     (thread_id, uid, message_id, in_reply_to, reference_ids, folder,
-                     from_address, to_addresses, date, subject, is_outbound, snippet)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     from_address, to_addresses, date, subject, is_outbound, snippet,
+                     cc_addresses, bcc_addresses)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     thread_id,
                     uid as i64,
@@ -206,11 +251,52 @@ impl Database {
                     date,
                     subject,
                     is_outbound_int,
-                    snippet
+                    snippet,
+                    cc_addresses,
+                    bcc_addresses
                 ],
             )?;
             Ok(self.conn().last_insert_rowid())
         }
+    }
+
+    /// True when re-indexing this row would change a field the address history
+    /// derives from. Deliberately narrow: the subject, snippet, and threading
+    /// headers move around without changing who was on the message.
+    ///
+    /// `IS` rather than `=` so a NULL Cc compares equal to an absent one —
+    /// otherwise every rescan of a message without a Cc header would read as a
+    /// change. The row is always present (its id was just looked up), so a
+    /// count of zero means the values differ.
+    #[allow(clippy::too_many_arguments)]
+    fn thread_message_addresses_changed(
+        &self,
+        id: i64,
+        from_address: &str,
+        to_addresses: &str,
+        cc_addresses: Option<&str>,
+        bcc_addresses: Option<&str>,
+        date: &str,
+        is_outbound: bool,
+    ) -> Result<bool> {
+        let unchanged: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM thread_messages
+             WHERE id = ?1
+               AND from_address IS ?2 AND to_addresses IS ?3
+               AND cc_addresses IS ?4 AND bcc_addresses IS ?5
+               AND date IS ?6 AND is_outbound IS ?7",
+            params![
+                id,
+                from_address,
+                to_addresses,
+                cc_addresses,
+                bcc_addresses,
+                date,
+                i64::from(is_outbound)
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(unchanged == 0)
     }
 
     /// Get all messages in a thread, ordered by date ascending.
@@ -231,13 +317,17 @@ impl Database {
         message_id: &str,
         account_id: &str,
     ) -> Result<Option<String>> {
+        let needle = normalize_message_id(message_id);
+        if needle.is_empty() {
+            return Ok(None);
+        }
         let thread_id: Option<String> = self
             .conn()
             .query_row(
                 "SELECT tm.thread_id FROM thread_messages tm \
                  INNER JOIN threads t ON t.thread_id = tm.thread_id \
-                 WHERE tm.message_id = ?1 AND t.account_id = ?2 LIMIT 1",
-                params![message_id, account_id],
+                 WHERE trim(trim(tm.message_id), '<>') = ?1 AND t.account_id = ?2 LIMIT 1",
+                params![needle, account_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -273,21 +363,29 @@ impl Database {
         references: &[&str],
         account_id: &str,
     ) -> Result<Option<String>> {
-        if references.is_empty() {
+        // Normalize both sides: stored ids are bracket-free, header-derived
+        // references arrive wrapped in `<...>`.
+        let needles: Vec<String> = references
+            .iter()
+            .map(|r| normalize_message_id(r))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if needles.is_empty() {
             return Ok(None);
         }
         // Build a placeholder list: (?1, ?2, ..., ?N) for references,
         // then ?N+1 for account_id
-        let placeholders: Vec<String> = (1..=references.len()).map(|i| format!("?{i}")).collect();
-        let account_param_idx = references.len() + 1;
+        let placeholders: Vec<String> = (1..=needles.len()).map(|i| format!("?{i}")).collect();
+        let account_param_idx = needles.len() + 1;
         let sql = format!(
             "SELECT tm.thread_id FROM thread_messages tm \
              INNER JOIN threads t ON t.thread_id = tm.thread_id \
-             WHERE tm.message_id IN ({}) AND t.account_id = ?{account_param_idx} LIMIT 1",
+             WHERE trim(trim(tm.message_id), '<>') IN ({}) \
+               AND t.account_id = ?{account_param_idx} LIMIT 1",
             placeholders.join(", ")
         );
         let mut stmt = self.conn().prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = references
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = needles
             .iter()
             .map(|r| r as &dyn rusqlite::types::ToSql)
             .collect();
@@ -369,6 +467,20 @@ impl Database {
         Ok(())
     }
 
+    /// Drop the incremental-sync watermark for every folder of an account,
+    /// so the next thread scan re-reads from the beginning of each mailbox.
+    ///
+    /// Thread rows are upserted by `message_id` + folder, so a rescan corrects
+    /// existing rows in place rather than duplicating them — this is how
+    /// headers captured by an earlier, buggy parse get repaired.
+    pub fn clear_last_synced_uid(&self, account_id: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM thread_sync_state WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
     /// Get the stored UIDVALIDITY for a folder/account pair.
     pub fn get_uidvalidity(&self, account_id: &str, folder: &str) -> Result<Option<u32>> {
         let val: Option<i64> = self
@@ -415,6 +527,14 @@ impl Database {
              (SELECT thread_id FROM threads WHERE account_id = ?2)",
             params![folder, account_id],
         )?;
+        if deleted > 0 {
+            // Those rows are gone, and the rescan that follows re-inserts the
+            // same messages under fresh ids above the address-history
+            // watermark — which would count every one of them a second time.
+            // Invalidating forces the next reconcile to rebuild the account's
+            // derived counts from what is actually on disk.
+            self.invalidate_address_history(account_id)?;
+        }
 
         // Clean up any threads that now have zero messages
         self.conn().execute(
@@ -472,6 +592,8 @@ impl Database {
             subject: row.get(10)?,
             is_outbound: is_outbound_int != 0,
             snippet: row.get(12)?,
+            cc_addresses: row.get(13)?,
+            bcc_addresses: row.get(14)?,
         })
     }
 }
@@ -553,6 +675,8 @@ mod tests {
             "INBOX",
             "alice@example.com",
             "bob@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test Subject",
             false,
@@ -570,6 +694,8 @@ mod tests {
             "Sent",
             "bob@example.com",
             "alice@example.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test Subject",
             true,
@@ -615,6 +741,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -631,6 +759,92 @@ mod tests {
             .find_thread_by_message_id("<nonexistent@example.com>", "acct1")
             .unwrap();
         assert!(not_found.is_none());
+    }
+
+    /// Thread ingestion stores bracket-free Message-IDs (`mail_parser` strips
+    /// them), while drafts persist the RFC 5322 bracketed form. Lookup must
+    /// bridge the two: feeding a draft's `in_reply_to` straight in used to miss
+    /// the thread it plainly belongs to.
+    #[test]
+    fn find_thread_by_message_id_ignores_angle_brackets() {
+        let db = Database::open_memory().unwrap();
+        let thread = db
+            .create_thread(
+                "test",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "acct1",
+            )
+            .unwrap();
+
+        // Stored the way ingestion writes it: no brackets.
+        db.upsert_thread_message(
+            &thread.thread_id,
+            100,
+            Some("bare@example.com"),
+            None,
+            None,
+            "INBOX",
+            "a@b.com",
+            "c@d.com",
+            None,
+            None,
+            "2026-03-28T10:00:00",
+            "Test",
+            false,
+            None,
+        )
+        .unwrap();
+
+        for query in [
+            "bare@example.com",
+            "<bare@example.com>",
+            " <bare@example.com> ",
+        ] {
+            assert_eq!(
+                db.find_thread_by_message_id(query, "acct1").unwrap(),
+                Some(thread.thread_id.clone()),
+                "lookup of {query:?} must resolve to the thread"
+            );
+        }
+
+        // The reverse skew: bracketed on disk, bare in hand.
+        let other = db
+            .create_thread(
+                "other",
+                "2026-03-28T10:00:00",
+                "2026-03-28T10:00:00",
+                "acct1",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &other.thread_id,
+            101,
+            Some("<wrapped@example.com>"),
+            None,
+            None,
+            "INBOX",
+            "a@b.com",
+            "c@d.com",
+            None,
+            None,
+            "2026-03-28T10:00:00",
+            "Test",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.find_thread_by_message_id("wrapped@example.com", "acct1")
+                .unwrap(),
+            Some(other.thread_id.clone())
+        );
+
+        assert!(
+            db.find_thread_by_message_id("<nope@example.com>", "acct1")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -655,6 +869,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -697,6 +913,8 @@ mod tests {
             "INBOX",
             "them@x.com",
             "me@x.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -712,6 +930,8 @@ mod tests {
             "Sent",
             "me@x.com",
             "them@x.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,
@@ -742,6 +962,36 @@ mod tests {
         // Update
         db.set_last_synced_uid("acct1", "INBOX", 600).unwrap();
         assert_eq!(db.get_last_synced_uid("acct1", "INBOX").unwrap(), Some(600));
+    }
+
+    /// Clearing the watermark is what makes a rebuild possible: the scan
+    /// resumes from `last_uid`, so rows written by an earlier (buggy) parse are
+    /// otherwise never revisited.
+    #[test]
+    fn clearing_sync_state_is_scoped_and_repeatable() {
+        let db = Database::open_memory().unwrap();
+        db.set_last_synced_uid("acct1", "INBOX", 600).unwrap();
+        db.set_last_synced_uid("acct1", "INBOX/sent", 90).unwrap();
+        db.set_last_synced_uid("acct2", "INBOX", 42).unwrap();
+
+        db.clear_last_synced_uid("acct1").unwrap();
+
+        assert!(db.get_last_synced_uid("acct1", "INBOX").unwrap().is_none());
+        assert!(
+            db.get_last_synced_uid("acct1", "INBOX/sent")
+                .unwrap()
+                .is_none(),
+            "every folder for the account must be cleared, not just INBOX"
+        );
+        assert_eq!(
+            db.get_last_synced_uid("acct2", "INBOX").unwrap(),
+            Some(42),
+            "another account's sync state must be untouched"
+        );
+
+        // Idempotent: clearing an already-clear account is not an error.
+        db.clear_last_synced_uid("acct1").unwrap();
+        assert!(db.get_last_synced_uid("acct1", "INBOX").unwrap().is_none());
     }
 
     #[test]
@@ -822,6 +1072,8 @@ mod tests {
                 "INBOX",
                 "a@b.com",
                 "c@d.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Test",
                 false,
@@ -840,6 +1092,8 @@ mod tests {
                 "INBOX",
                 "a@b.com",
                 "c@d.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Test",
                 false,
@@ -876,6 +1130,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -923,6 +1179,8 @@ mod tests {
                 "INBOX",
                 &format!("{account_name}@example.com"),
                 "recipient@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Duplicate UID",
                 false,
@@ -974,6 +1232,8 @@ mod tests {
                 "INBOX",
                 "sender@example.com",
                 "alice@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Shared Message",
                 false,
@@ -991,6 +1251,8 @@ mod tests {
                 "INBOX",
                 "sender@example.com",
                 "bob@example.com",
+                None,
+                None,
                 "2026-03-28T10:00:00",
                 "Shared Message",
                 false,
@@ -1041,6 +1303,8 @@ mod tests {
             "INBOX",
             "sender@example.com",
             "alice@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Shared Subject",
             false,
@@ -1058,6 +1322,8 @@ mod tests {
             "INBOX",
             "sender@example.com",
             "bob@example.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Shared Subject",
             false,
@@ -1133,6 +1399,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -1148,6 +1416,8 @@ mod tests {
             "INBOX",
             "c@d.com",
             "a@b.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,
@@ -1208,6 +1478,8 @@ mod tests {
             "INBOX",
             "a@b.com",
             "c@d.com",
+            None,
+            None,
             "2026-03-28T10:00:00",
             "Test",
             false,
@@ -1225,6 +1497,8 @@ mod tests {
             "Sent",
             "c@d.com",
             "a@b.com",
+            None,
+            None,
             "2026-03-28T12:00:00",
             "Re: Test",
             true,

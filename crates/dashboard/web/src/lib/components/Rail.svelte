@@ -26,6 +26,12 @@
   let loading = $state(true);
   let error = $state<{ code: string; message: string } | null>(null);
 
+  // The account that owns the message open in the reader, so the rail can say
+  // which mailbox the thing you are reading actually came from. The unified
+  // list mixes every account together, so without this the rail highlights
+  // "Unified Inbox" and nothing else — the message's real home is invisible.
+  let { activeAccountId = null }: { activeAccountId?: string | null } = $props();
+
   let drawerAccount = $state<Account | null>(null);
   let drawerHealth = $state<AccountHealth>('unknown');
   let drawerOpen = $state(false);
@@ -118,9 +124,22 @@
       <ul class="rail-list">
         {#each accounts as account (account.id)}
           {@const h = healthFor(account)}
+          {@const owns = activeAccountId === account.id}
           <li>
-            <button class="rail-account" type="button" onclick={() => openAccount(account)}>
+            <button
+              class="rail-account"
+              class:is-active={owns}
+              type="button"
+              data-account-id={account.id}
+              aria-current={owns ? 'true' : undefined}
+              onclick={() => openAccount(account)}
+            >
               <span class="rail-account-name">{account.display_name || account.name}</span>
+              {#if owns}
+                <span class="rail-account-here" title="The open message is in this mailbox"
+                  >open here</span
+                >
+              {/if}
               {#if h === 'unhealthy'}
                 <Badge variant="warn">Reconnect</Badge>
               {:else if h === 'healthy'}
@@ -220,6 +239,23 @@
   }
   .rail-account:hover {
     background: var(--env-accent-soft);
+  }
+  /* The mailbox the open message belongs to. Mirrors .rail-item.is-active so
+     the rail reads as one selection model, with a left marker to distinguish
+     "contains what you're reading" from "the box you're browsing". */
+  .rail-account.is-active {
+    background: var(--env-accent-soft);
+    color: var(--env-accent);
+    font-weight: 600;
+    box-shadow: inset 2px 0 0 var(--env-accent);
+  }
+  .rail-account-here {
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--env-accent);
+    flex-shrink: 0;
   }
   .rail-account-name {
     overflow: hidden;

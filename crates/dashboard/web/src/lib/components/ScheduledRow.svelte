@@ -1,7 +1,8 @@
 <script lang="ts">
   // A scheduled send: subject, countdown (or "due"), the latest Governor verdict
-  // badge, and a Cancel action (routed to the existing per-account draft discard
-  // endpoint by the parent). Read-only aside from the explicit Cancel.
+  // badge, and a "Cancel send" action (routed to the per-account draft HOLD
+  // endpoint by the parent: the draft leaves the outbox and is kept). Read-only
+  // aside from that explicit action.
   import Button from './Button.svelte';
   import MonoTag from './MonoTag.svelte';
   import GovernorVerdictBadge from './GovernorVerdictBadge.svelte';
@@ -34,7 +35,7 @@
     </span>
   </div>
   <div class="scheduled-actions">
-    <Button variant="danger" disabled={busy} onclick={() => oncancel(item)}>Cancel</Button>
+    <Button variant="danger" disabled={busy} onclick={() => oncancel(item)}>Cancel send</Button>
   </div>
 </div>
 

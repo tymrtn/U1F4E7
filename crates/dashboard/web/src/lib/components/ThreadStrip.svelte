@@ -43,8 +43,11 @@
   );
 
   function msgHref(msg: ThreadMessage): string {
-    const q = folder !== 'INBOX' ? `?folder=${encodeURIComponent(folder)}` : '';
-    return `/v2/mail/${encodeURIComponent(box)}/${encodeURIComponent(accountId)}/${msg.uid}${q}`;
+    // The message's own folder wins: a thread spans INBOX and Sent, and linking
+    // a sent reply at the reader's current folder opens the wrong UID.
+    const target = msg.folder || folder;
+    const q = target !== 'INBOX' ? `?folder=${encodeURIComponent(target)}` : '';
+    return `/mail/${encodeURIComponent(box)}/${encodeURIComponent(accountId)}/${msg.uid}${q}`;
   }
 
   function fmtDate(iso: string | null): string {
@@ -54,12 +57,9 @@
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
 
-  function isMsgSeen(flags: string[]): boolean {
-    return flags.some((f) => f.toLowerCase() === '\\seen');
-  }
-
   /** Shorten an address to the local part or a display name. */
-  function shortAddr(addr: string): string {
+  function shortAddr(addr: string | null): string {
+    if (!addr) return 'unknown';
     const m = addr.match(/^(.+?)\s*<[^>]+>$/);
     if (m) return m[1].trim();
     return addr.split('@')[0] || addr;
@@ -72,19 +72,20 @@
   {:else if messages.length > 1}
     <span class="thread-label">Thread</span>
     <ul class="thread-messages">
-      {#each visible as msg (msg.uid)}
+      {#each visible as msg (msg.id)}
         {@const current = msg.uid === currentUid}
-        {@const read = isMsgSeen(msg.flags)}
         <li class="thread-msg-item">
           <a
             href={msgHref(msg)}
             class="thread-msg"
             class:is-current={current}
-            class:is-unread={!read}
+            class:is-outbound={msg.is_outbound}
             aria-current={current ? 'page' : undefined}
-            title="{msg.from_addr} — {msg.subject}"
+            title="{msg.from_address ?? 'unknown'} — {msg.subject ?? '(no subject)'}"
           >
-            <span class="thread-msg-from">{shortAddr(msg.from_addr)}</span>
+            <span class="thread-msg-from">
+              {msg.is_outbound ? 'me' : shortAddr(msg.from_address)}
+            </span>
             {#if msg.date}
               <span class="thread-msg-date">{fmtDate(msg.date)}</span>
             {/if}
@@ -162,11 +163,15 @@
     color: var(--env-accent);
     font-weight: 600;
   }
-  .thread-msg.is-unread .thread-msg-from {
-    font-weight: 700;
+  .thread-msg .thread-msg-from {
+    font-weight: 600;
     color: var(--env-ink);
   }
-  .thread-msg.is-current.is-unread .thread-msg-from {
+  .thread-msg.is-outbound .thread-msg-from {
+    font-weight: 400;
+    color: var(--env-muted);
+  }
+  .thread-msg.is-current .thread-msg-from {
     color: var(--env-accent);
   }
   .thread-msg-from {

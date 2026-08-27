@@ -1,4 +1,9 @@
 /target
+# Dropbox forks the build dir on sync collisions ('target (Selective Sync
+# Conflict 2)'), which /target does not match — thousands of build
+# artifacts otherwise land in `git add -A`.
+/target (Selective Sync Conflict*)
+/**/target (Selective Sync Conflict*)
 # dist/ holds generated release artifacts (ignored) — but dist/systemd/
 # unit templates are tracked source. Git needs the parent un-ignored for the
 # negation to work, hence the three-line pattern.
@@ -18,6 +23,7 @@
 _internal/
 worktrees/
 .hermes/
+/node_modules/
 
 # Out-of-scope subprojects (tracked separately or deferred)
 apps/

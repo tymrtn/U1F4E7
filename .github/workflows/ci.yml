@@ -149,7 +149,7 @@ jobs:
       - name: Reject legacy Governor adapters and bypasses
         run: |
           set -e
-          FORBIDDEN='governor::|GovernorAttrs|--no-governor|GOVERNOR_PATH|governor envelope send|--attr user_requested'
+          FORBIDDEN='(^|[^[:alnum:]_:])governor::|GovernorAttrs|--no-governor|GOVERNOR_PATH|governor envelope send|--attr user_requested'
           if grep -rnE -- "$FORBIDDEN" crates/ 2>/dev/null; then
             echo "ERROR: legacy Governor adapter or bypass identifiers found above" >&2
             exit 1

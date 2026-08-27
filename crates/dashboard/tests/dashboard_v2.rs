@@ -52,6 +52,52 @@ fn committed_v2_bundle_has_no_tailwind_cdn_reference() {
     );
 }
 
+#[test]
+fn committed_v2_bundle_ships_the_send_and_approve_copy() {
+    // `web/build/` is committed so `cargo install` never needs Node, which means
+    // a Svelte edit that is not rebuilt ships the OLD words to every operator.
+    // Both phrases here are safety-relevant: the send action's name is what tells
+    // Tyler this click is his own send rather than a Governor-scored one, and the
+    // approval queue's "does not send" is what stops Approve from reading like a
+    // send — the exact confusion the gate rules turn on. A stale bundle has to
+    // fail here instead of shipping quietly.
+    let build_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/build/_app");
+    let mut scanned = 0usize;
+    let mut send_label = false;
+    let mut approve_is_not_a_send = false;
+    let mut stack = vec![build_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("built SPA asset directory") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "js") {
+                scanned += 1;
+                let Ok(js) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                send_label |= js.contains("Human-only Send");
+                approve_is_not_a_send |= js.contains("does not send the draft");
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "no JS assets found under {}",
+        build_dir.display()
+    );
+    let stale = "run `npm run build` in crates/dashboard/web and commit web/build/ \
+                 ({scanned} JS assets scanned)";
+    assert!(
+        send_label,
+        "committed bundle is missing the Human-only Send label — {stale}"
+    );
+    assert!(
+        approve_is_not_a_send,
+        "committed bundle is missing the approval queue's non-send copy — {stale}"
+    );
+}
+
 #[tokio::test]
 async fn v2_root_serves_the_spa_index() {
     let (status, body, content_type) = get("/").await;

@@ -17,8 +17,11 @@
 //! and folder/query names go into URLs, and folder/draft values are
 //! percent-encoded so embedded `?` / `/` / spaces don't break the path.
 
+use envelope_email_store::Database;
+use envelope_email_transport::provider;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 /// Default dashboard origin when no dashboard base URL is configured.
 pub const DEFAULT_DASHBOARD_BASE: &str = "http://localhost:3141";
@@ -55,6 +58,14 @@ pub fn encode_segment(s: &str) -> String {
     out
 }
 
+/// The dashboard's cockpit client route. It is global, not account-scoped —
+/// the SPA has no `/accounts/{id}/cockpit` route and renders its own 404 there.
+const COCKPIT_PATH: &str = "/cockpit";
+
+/// The dashboard's rules client route. Global for the same reason as
+/// [`COCKPIT_PATH`].
+const RULES_PATH: &str = "/rules";
+
 /// Root-level UI metadata when there is no account/draft/message context.
 pub fn root_ui() -> Value {
     json!({
@@ -63,58 +74,105 @@ pub fn root_ui() -> Value {
     })
 }
 
-/// UI metadata anchored at an account's agent cockpit.
-pub fn account_ui(account_id: &str) -> Value {
-    let acct = encode_segment(account_id);
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+/// UI metadata anchored at the agent cockpit.
+///
+/// `account_id` is accepted so every call site stays account-aware, but the
+/// cockpit itself is a single global route: the account is selected inside the
+/// page, not in the URL.
+pub fn account_ui(_account_id: &str) -> Value {
     json!({
         "dashboard_url": dashboard_base(),
-        "dashboard_path": cockpit_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "dashboard_path": COCKPIT_PATH,
+        "cockpit_url": join(COCKPIT_PATH),
     })
 }
 
 /// UI metadata for a specific draft: `review_url` points at the draft
-/// approval surface inside the cockpit.
+/// approval surface, which *is* account-scoped in the SPA.
 pub fn draft_ui(account_id: &str, draft_id: &str) -> Value {
     let acct = encode_segment(account_id);
     let draft = encode_segment(draft_id);
     let draft_path = format!("/accounts/{acct}/drafts/{draft}");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
     json!({
         "dashboard_url": dashboard_base(),
         "dashboard_path": draft_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "cockpit_url": join(COCKPIT_PATH),
         "review_url": join(&draft_path),
     })
 }
 
 /// UI metadata for rule-related responses; `rules_url` is the rules panel.
-pub fn rules_ui(account_id: &str) -> Value {
-    let acct = encode_segment(account_id);
-    let rules_path = format!("/accounts/{acct}/rules");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+pub fn rules_ui(_account_id: &str) -> Value {
     json!({
         "dashboard_url": dashboard_base(),
-        "dashboard_path": rules_path.clone(),
-        "cockpit_url": join(&cockpit_path),
-        "rules_url": join(&rules_path),
+        "dashboard_path": RULES_PATH,
+        "cockpit_url": join(COCKPIT_PATH),
+        "rules_url": join(RULES_PATH),
     })
 }
 
-/// UI metadata for a specific message; `message_url` includes the folder
-/// as a query parameter so the dashboard can re-resolve the UID.
+/// UI metadata for a specific message; `message_url` is the canonical reader
+/// route and carries the folder as a query parameter, because IMAP UIDs are
+/// mailbox-scoped and the dashboard must re-resolve the UID in the right one.
 pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
     let acct = encode_segment(account_id);
     let folder_enc = encode_segment(folder);
-    let msg_path = format!("/accounts/{acct}/messages/{uid}?folder={folder_enc}");
-    let cockpit_path = format!("/accounts/{acct}/cockpit");
+    let msg_path = format!("/mail/unified/{acct}/{uid}?folder={folder_enc}");
     json!({
         "dashboard_url": dashboard_base(),
         "dashboard_path": msg_path.clone(),
-        "cockpit_url": join(&cockpit_path),
+        "cockpit_url": join(COCKPIT_PATH),
         "message_url": join(&msg_path),
     })
+}
+
+/// UI metadata for a message UID that may name an editable draft.
+///
+/// A UID in the Drafts folder points at a message the reader route can only
+/// *display*: `/mail/unified/...` has no recipient fields and no Send. When the
+/// folder classifies as drafts and a local draft row carries that UID, the link
+/// must resolve to the draft review composer instead — the one surface that can
+/// edit and send it.
+///
+/// `message_url` is set to the same review URL as `review_url` because callers
+/// already read `message_url` off message payloads; leaving it on the reader
+/// would hand out the dead-end link next to the working one. Every other folder
+/// keeps today's [`message_ui`] shape.
+pub fn message_or_draft_ui(db: &Database, account_id: &str, uid: u32, folder: &str) -> Value {
+    match local_draft_for_imap_uid(db, account_id, uid, folder) {
+        Some(draft_id) => {
+            let mut ui = draft_ui(account_id, &draft_id);
+            let review_url = ui["review_url"].clone();
+            if let Value::Object(map) = &mut ui {
+                map.insert("message_url".to_string(), review_url);
+            }
+            ui
+        }
+        None => message_ui(account_id, uid, folder),
+    }
+}
+
+/// The local draft id behind an IMAP Drafts-folder UID, when there is one.
+///
+/// A lookup failure is reported and treated as "no local draft": the reader URL
+/// is still a correct link for the UID, so a degraded database must not take
+/// down the whole command that was only annotating a response.
+fn local_draft_for_imap_uid(
+    db: &Database,
+    account_id: &str,
+    uid: u32,
+    folder: &str,
+) -> Option<String> {
+    if provider::classify_folder(folder) != Some("drafts") {
+        return None;
+    }
+    match db.get_draft_by_imap_uid(account_id, uid) {
+        Ok(draft) => draft.map(|d| d.id),
+        Err(e) => {
+            warn!("draft lookup for {folder} uid {uid} failed, linking to the reader instead: {e}");
+            None
+        }
+    }
 }
 
 /// In-place: attach `ui` to a JSON object. Non-objects are left unchanged.
@@ -191,15 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn account_ui_includes_cockpit_url() {
+    fn account_ui_points_at_the_global_cockpit_route() {
         let _guard = isolated_dashboard_config("account-default");
         let ui = account_ui("acct-1");
         assert_eq!(ui["dashboard_url"], "http://localhost:3141");
-        assert_eq!(ui["dashboard_path"], "/accounts/acct-1/cockpit");
-        assert_eq!(
-            ui["cockpit_url"],
-            "http://localhost:3141/accounts/acct-1/cockpit"
-        );
+        assert_eq!(ui["dashboard_path"], "/cockpit");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -209,35 +264,32 @@ mod tests {
 
         let ui = account_ui("acct/one");
         assert_eq!(ui["dashboard_url"], "https://dash.example.test/envelope");
-        assert_eq!(ui["dashboard_path"], "/accounts/acct%2Fone/cockpit");
+        assert_eq!(ui["dashboard_path"], "/cockpit");
         assert_eq!(
             ui["cockpit_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/cockpit"
+            "https://dash.example.test/envelope/cockpit"
         );
     }
 
     #[test]
-    fn draft_ui_includes_review_url() {
+    fn draft_ui_keeps_review_url_and_uses_global_cockpit() {
         let _guard = isolated_dashboard_config("draft-default");
         let ui = draft_ui("acct-1", "draft-abc");
+        assert_eq!(ui["dashboard_path"], "/accounts/acct-1/drafts/draft-abc");
         assert_eq!(
             ui["review_url"],
             "http://localhost:3141/accounts/acct-1/drafts/draft-abc"
         );
-        assert_eq!(
-            ui["cockpit_url"],
-            "http://localhost:3141/accounts/acct-1/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
-    fn rules_ui_includes_rules_url() {
+    fn rules_ui_points_at_the_global_rules_route() {
         let _guard = isolated_dashboard_config("rules-default");
         let ui = rules_ui("acct-1");
-        assert_eq!(
-            ui["rules_url"],
-            "http://localhost:3141/accounts/acct-1/rules"
-        );
+        assert_eq!(ui["dashboard_path"], "/rules");
+        assert_eq!(ui["rules_url"], "http://localhost:3141/rules");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -245,8 +297,12 @@ mod tests {
         let _guard = isolated_dashboard_config("message-default");
         let ui = message_ui("acct-1", 42, "Sent Items");
         assert_eq!(
+            ui["dashboard_path"],
+            "/mail/unified/acct-1/42?folder=Sent%20Items"
+        );
+        assert_eq!(
             ui["message_url"],
-            "http://localhost:3141/accounts/acct-1/messages/42?folder=Sent%20Items"
+            "http://localhost:3141/mail/unified/acct-1/42?folder=Sent%20Items"
         );
     }
 
@@ -258,11 +314,121 @@ mod tests {
         let ui = message_ui("acct/one", 42, "Sent/Items & Stuff");
         assert_eq!(
             ui["message_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/messages/42?folder=Sent%2FItems%20%26%20Stuff"
+            "https://dash.example.test/envelope/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
         );
         assert_eq!(
             ui["cockpit_url"],
-            "https://dash.example.test/envelope/accounts/acct%2Fone/cockpit"
+            "https://dash.example.test/envelope/cockpit"
+        );
+    }
+
+    /// The exact link shape reproduced against installed 1.0.10: a UUID account
+    /// and a Gmail folder carrying both `[` `]` and a space. The old
+    /// `/accounts/{id}/messages/{uid}` shape had no client route and rendered the
+    /// SvelteKit 404 page.
+    #[test]
+    fn message_ui_emits_the_canonical_reader_route_for_gmail_sent_mail() {
+        let _guard = isolated_dashboard_config("message-gmail-sent");
+        let ui = message_ui(
+            "109c5747-8498-4614-945a-837462ae0aaf",
+            33281,
+            "[Gmail]/Sent Mail",
+        );
+        assert_eq!(
+            ui["message_url"],
+            "http://localhost:3141/mail/unified/109c5747-8498-4614-945a-837462ae0aaf/33281\
+             ?folder=%5BGmail%5D%2FSent%20Mail"
+        );
+    }
+
+    /// In-memory database holding one account with a single local draft that
+    /// has been synced to the given Drafts UID.
+    fn db_with_synced_draft(account_id: &str, imap_uid: u32) -> (Database, String) {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES (?1, 'Spain Expat', 'editor@spainexpat.com', 'spainexpat.com',
+                         'smtp.spainexpat.com', 587, 'imap.spainexpat.com', 993, 'encrypted')",
+                [account_id],
+            )
+            .unwrap();
+        let draft = db
+            .create_draft(
+                account_id,
+                "tyler@example.com",
+                Some("Review this reply"),
+                Some("Looks ready to send."),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, imap_uid).unwrap();
+        (db, draft.id)
+    }
+
+    /// The bug: `envelope read --folder Drafts --json` handed back the
+    /// `/mail/unified/...` reader, which cannot edit or send. A Drafts UID that
+    /// resolves to a local draft must link to the review composer instead, on
+    /// both `review_url` and `message_url`.
+    #[test]
+    fn message_or_draft_ui_resolves_a_synced_draft_to_the_review_composer() {
+        let _guard = isolated_dashboard_config("draft-by-imap-uid");
+        let (db, draft_id) = db_with_synced_draft("acct-1", 38311);
+
+        for folder in ["Drafts", "[Gmail]/Drafts", "INBOX.Drafts", "drafts"] {
+            let ui = message_or_draft_ui(&db, "acct-1", 38311, folder);
+            let expected = format!("http://localhost:3141/accounts/acct-1/drafts/{draft_id}");
+            assert_eq!(
+                ui["dashboard_path"],
+                format!("/accounts/acct-1/drafts/{draft_id}"),
+                "{folder} dashboard_path"
+            );
+            assert_eq!(ui["review_url"], expected, "{folder} review_url");
+            assert_eq!(ui["message_url"], expected, "{folder} message_url");
+        }
+    }
+
+    /// Non-draft folders are untouched: the reader is the right surface there,
+    /// and a Drafts UID that has no local draft row has nothing better to offer.
+    #[test]
+    fn message_or_draft_ui_keeps_the_reader_route_for_everything_else() {
+        let _guard = isolated_dashboard_config("draft-by-imap-uid-miss");
+        let (db, _) = db_with_synced_draft("acct-1", 38311);
+
+        let inbox = message_or_draft_ui(&db, "acct-1", 57, "INBOX");
+        assert_eq!(
+            inbox["dashboard_path"],
+            "/mail/unified/acct-1/57?folder=INBOX"
+        );
+        assert_eq!(
+            inbox["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/57?folder=INBOX"
+        );
+        assert!(inbox.get("review_url").is_none());
+
+        let sent = message_or_draft_ui(&db, "acct-1", 38311, "[Gmail]/Sent Mail");
+        assert_eq!(
+            sent["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/38311?folder=%5BGmail%5D%2FSent%20Mail"
+        );
+
+        // Drafts folder, but no local draft carries this uid.
+        let orphan = message_or_draft_ui(&db, "acct-1", 999, "Drafts");
+        assert_eq!(
+            orphan["message_url"],
+            "http://localhost:3141/mail/unified/acct-1/999?folder=Drafts"
+        );
+
+        // Right uid, wrong account — drafts must never leak across accounts.
+        let other = message_or_draft_ui(&db, "acct-2", 38311, "Drafts");
+        assert_eq!(
+            other["message_url"],
+            "http://localhost:3141/mail/unified/acct-2/38311?folder=Drafts"
         );
     }
 
