@@ -1,17 +1,41 @@
 # Changelog
 
-## 1.0.28-dev
-
-- Fix queued, scheduled, and draft-only sends dropping an explicit `--from`
-  send-as identity. The review composer, SMTP sweep, and Sent-copy resolver now
-  use the same persisted public sender as the immediate-send path.
-
 All notable changes to Envelope Email are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.0.27-dev
+## [1.1.0] — 2026-08-26
+
+This release folds the dogfood dev builds since 1.0.12 (install labels
+`1.0.12-dev` through `1.0.28-dev`) into one public release.
+
+- Human-only Send: the dashboard send action is the one human boundary in the
+  send path. Clicking Send on the draft review page or composer queues that
+  exact revision with a durable `human_send` authorization, written in the same
+  store transaction as the queue transition and compare-and-set against the
+  revision the operator viewed; the scheduled-send sweep transmits it as a
+  human send and skips the Governor gate for that one transmission. Generic
+  Approve records only the review attestation and sends nothing — a later
+  agent send stays fully governed. An edit, Hold, or a CLI/MCP re-queue clears
+  the authorization (`envelope draft send` / `send_draft` clear it in the same
+  statement that binds the agent's declaration), so nothing stale ever reads
+  as the operator's click. The buttons and the confirmation are labelled
+  `Human-only Send`, and the confirmation says what the click means: this
+  click is the send; Governor scores what agents send on their own, and it
+  does not score this one. Details in `docs/agent-contract.md` under
+  "Human-only Send".
+
+- fix(drafts): the provider draft identity is tracked across a re-sync. The
+  replacement APPEND gives the server copy a new Message-ID; the local row now
+  records it, so post-send Drafts cleanup finds the copy it is meant to remove
+  instead of searching for an identity that is no longer there and leaving one
+  orphaned server draft behind per edit.
+
+- fix(send): queued, scheduled, and draft-only sends no longer drop an
+  explicit `--from` send-as identity. The review composer, SMTP sweep, and
+  Sent-copy resolver now use the same persisted public sender as the
+  immediate-send path.
 
 - fix(dashboard,store): the Unified Inbox is actually unified. The index listing ordered by an unparseable RFC 2822 date string, so the cap silently degenerated to "highest UID wins" and one account owned the whole 50-row page, flipping between loads; a parsed `date_epoch` is now stored (with a Rust backfill for existing rows) and the page is the true newest across accounts. Keyset pagination replaces the hard cap (`next_cursor` + a Load more that appends, deduplicated). The index refresh no longer crawls accounts serially — one slow provider used to pin the pass beyond 240 seconds; it now fans out 6 at a time with a 10-second per-account budget, times out stragglers (evicting their connection), and the unreachable-accounts banner names the accounts instead of only counting them.
 
@@ -51,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-queueing a stopped draft no longer leaves the stop alert on screen. After a Governor park, pressing Send again queued the draft correctly, but the review page kept rendering the red "This send was stopped" block beside the green countdown — two contradictory states for one message. The queue endpoint returns no draft row, so the page was still reading the pre-queue `pending_review` status and `metadata.send_block`; the stop explanation is now suppressed whenever the draft is queued, which is also what a reload shows.
 - Draft review now shows the effective send-as identity from `metadata.from`, with the transport account only as a fallback, and repeats that From identity in the final queue confirmation. The send path already preserved this header, but the dashboard displayed only the authenticating mailbox, making a correctly branded draft look unsafe to approve.
 
-- A draft parked for attribution no longer offers a button that cannot clear it. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop being the one unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — withholds `Send again` when re-approval provably cannot help, and points at `envelope draft send … --attr`, which is where declaring happens. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
+- A draft parked for attribution now explains itself and offers a send that works. Approving a bot-attributed draft again re-ran the identical declaration-free attempt: it spent another try and re-parked on the same reason, with the only surface that reported the stop unable to lift it. The banner now names what the park record holds — bot attribution, attempts spent, no fact labels declared for this revision — and offers `Human-only Send again`, which queues this exact revision on the operator's own authorization rather than re-running the agent's governed attempt. Declaring stays the sending agent's job at `envelope draft send … --attr`. Which label would pass is deliberately not shown: the park record carries no such field, and naming one would turn a blind declaration into lock-picking.
 - The composer's Text/HTML control swaps the body along with the label. It set the format flag and left whatever was already in the box, so a draft carrying both alternatives — every agent-generated HTML message — opened in plain text and then showed that same plain text under an HTML heading. A format switch alone marks the draft dirty, so the next Save wrote the plain-text body into `html_content` and cleared `text_content`: a real HTML part replaced by its text twin, one click from the review screen. Each format now keeps its own buffer, so switching shows that format's body and switching back returns an unsaved edit rather than the server copy.
 - The unified inbox heals itself when its cache has been blanked. An account whose index row carries a `last_error` reports zero messages however many rows are actually indexed behind it, so a sidecar started without `ENVELOPE_MASTER_PASSPHRASE_FILE` — a GUI launch inherits no shell environment — could write a credential-store error into the SHARED index for every account and leave the dashboard showing "Inbox is empty" over a full index. The stale-refresh predicate only fired on `stale`/`expired`, never `unavailable`, so it never retried: one such incident sat for a day. An empty list with connected accounts now triggers one refresh to disprove itself, while the steady state of a couple of permanently-unreachable accounts still does not re-IMAP the fleet on every open.
 - The `hold` endpoint stripped no attachment bytes. `draft_json` landed before Hold existed, so the new handler serialized the raw store row and shipped every attachment's `data_base64` on each hold. It now routes through `draft_json` like every other draft response, and a guard test fails the build if any future handler serializes a raw draft.

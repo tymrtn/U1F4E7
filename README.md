@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-1.0.0-green.svg" alt="v1.0.0">
+  <img src="https://img.shields.io/badge/version-1.1.0-green.svg" alt="v1.1.0">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -238,7 +238,7 @@ Envelope auto-discovers IMAP/SMTP from your email domain via DNS. Tested with:
 
 `envelope mcp` starts a Model Context Protocol server over stdio — drop-in email for Claude Code, Cursor, Zed, or any MCP runtime.
 
-Framing follows the MCP stdio spec: one newline-delimited JSON-RPC message per line on stdout, nothing else on that stream (logs go to stderr). On stdin the server accepts newline-delimited JSON and, for callers written against versions before 1.0.23, the legacy `Content-Length:` framing — detected per message.
+Framing follows the MCP stdio spec: one newline-delimited JSON-RPC message per line on stdout, nothing else on that stream (logs go to stderr). On stdin the server accepts newline-delimited JSON and, for callers written against versions before 1.1.0, the legacy `Content-Length:` framing — detected per message.
 
 ```bash
 # Print a ready-to-paste config snippet

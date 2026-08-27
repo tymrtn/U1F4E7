@@ -366,7 +366,7 @@ describe('DraftComposer names the send action Human-only Send', () => {
 
   it('names the action in the confirmation too', async () => {
     await renderLoaded();
-    await fireEvent.click(screen.getByRole('button', { name: /^human-only send$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
 
     const dialog = await screen.findByRole('dialog');
     expect(dialog).toHaveTextContent(/human-only send/i);
@@ -1517,8 +1517,9 @@ describe('DraftComposer HTML preview', () => {
 //
 // A bot-origin draft parked for attribution cannot be unstuck by approving it
 // again: the queue path re-runs the same declaration-free attempt, burns
-// another try, and re-parks. The banner has to say so rather than offering a
-// button that only spends attempts.
+// another try, and re-parks. The banner says so — and offers Human-only Send,
+// which queues this exact revision on the operator's own authorization
+// instead of re-running the agent's governed attempt.
 
 describe('DraftComposer attribution park', () => {
   function parked(attribution: Record<string, unknown>) {
@@ -1528,10 +1529,10 @@ describe('DraftComposer attribution park', () => {
     };
   }
 
-  it('does not offer Send again when no declaration is on record', async () => {
+  it('offers Human-only Send again even with no declaration on record', async () => {
     await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
 
-    expect(screen.queryByRole('button', { name: /send again/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^human-only send again$/i })).toBeEnabled();
   });
 
   it('says what the attribution record actually holds', async () => {

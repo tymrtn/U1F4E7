@@ -1583,11 +1583,23 @@ mod tests {
         let db = setup();
         let draft = db
             .create_draft(
-                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
             )
             .unwrap();
-        db.mark_draft_message_id(&draft.id, "original@mac.lan").unwrap();
-        let claim = db.claim_draft_for_sync(&draft.id, draft.revision).unwrap().unwrap();
+        db.mark_draft_message_id(&draft.id, "original@mac.lan")
+            .unwrap();
+        let claim = db
+            .claim_draft_for_sync(&draft.id, draft.revision)
+            .unwrap()
+            .unwrap();
 
         db.finalize_synced_draft_bookkeeping(
             &draft.id,
@@ -1615,10 +1627,19 @@ mod tests {
         let db = setup();
         let draft = db
             .create_draft(
-                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
             )
             .unwrap();
-        db.mark_draft_message_id(&draft.id, "<same@mac.lan>").unwrap();
+        db.mark_draft_message_id(&draft.id, "<same@mac.lan>")
+            .unwrap();
         let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;
         let claim = db.claim_draft_for_sync(&draft.id, rev).unwrap().unwrap();
 
@@ -1646,10 +1667,19 @@ mod tests {
         let db = setup();
         let draft = db
             .create_draft(
-                "acc1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+                "acc1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
             )
             .unwrap();
-        db.mark_draft_message_id(&draft.id, "first@mac.lan").unwrap();
+        db.mark_draft_message_id(&draft.id, "first@mac.lan")
+            .unwrap();
 
         for next in ["second@mac.lan", "third@mac.lan"] {
             let rev = db.get_draft(&draft.id).unwrap().unwrap().revision;

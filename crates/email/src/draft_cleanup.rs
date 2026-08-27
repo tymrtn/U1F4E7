@@ -205,7 +205,15 @@ mod tests {
             .unwrap();
         let draft = db
             .create_draft(
-                "gmail1", "to@test.com", Some("S"), Some("B"), None, None, None, None, Some("cli"),
+                "gmail1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("cli"),
             )
             .unwrap();
         db.mark_draft_message_id(&draft.id, "<current@mac.lan>")
