@@ -11,9 +11,11 @@
 //! [`envelope_email_dashboard::dashboard_human_send_authorized`] is the exact
 //! predicate `run_governor_gate` branches on.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use envelope_email_dashboard::dashboard_human_send_authorized;
 use envelope_email_store::{Database, Draft};
@@ -237,8 +239,10 @@ fn an_agent_cannot_write_the_authorization_through_the_draft_surfaces() {
 
 // ── MCP stdio plumbing ──────────────────────────────────────────────
 
-/// Send one framed `tools/call` and return the parsed tool-result text as JSON,
-/// plus whether the MCP layer marked it an error.
+/// Send one `tools/call` over the MCP stdio transport — newline-delimited
+/// JSON-RPC, one message per line, the framing the server speaks — and return
+/// the parsed tool-result text as JSON, plus whether the MCP layer marked it
+/// an error.
 fn tool_call(home: &std::path::Path, name: &str, arguments: Value) -> (Value, bool) {
     let mut child = Command::new(envelope_bin())
         .arg("mcp")
@@ -251,19 +255,20 @@ fn tool_call(home: &std::path::Path, name: &str, arguments: Value) -> (Value, bo
         .expect("spawn mcp");
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stdout = BufReader::new(stdout);
 
-    write_framed(
-        &mut stdin,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": arguments }
-        }),
-    );
-    let resp = read_framed(&mut stdout);
-    drop(stdin);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    });
+    let mut line = serde_json::to_vec(&request).expect("serialize request");
+    line.push(b'\n');
+    stdin.write_all(&line).expect("write request line");
+    stdin.flush().expect("flush request");
+
+    let resp = read_response_line(stdout, &mut child);
+    drop(stdin); // EOF ends the server's read loop
     child.wait().expect("wait mcp");
 
     let result = &resp["result"];
@@ -277,38 +282,38 @@ fn tool_call(home: &std::path::Path, name: &str, arguments: Value) -> (Value, bo
     (parsed, is_error)
 }
 
-fn write_framed(stdin: &mut ChildStdin, value: &Value) {
-    let body = serde_json::to_vec(value).expect("serialize request");
-    write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame header");
-    stdin.write_all(&body).expect("write frame body");
-    stdin.flush().expect("flush frame");
-}
-
-fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Value {
-    let started = Instant::now();
-    let mut content_length = None;
-
-    loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "timed out waiting for MCP response headers"
-        );
+/// Read the server's one-line JSON-RPC response off a helper thread so a
+/// server that never answers fails the test in seconds — kill the child,
+/// panic — instead of deadlocking the suite. A plain `read_line` here would
+/// block while the server blocks on its next request, and no elapsed-time
+/// assertion between reads can ever fire.
+fn read_response_line(stdout: ChildStdout, child: &mut Child) -> Value {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read response header");
-        assert_ne!(bytes, 0, "EOF while reading response headers");
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
+        let outcome = loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break Err("EOF before the MCP response line".to_string()),
+                Ok(_) if line.trim().is_empty() => continue,
+                Ok(_) => break Ok(line.trim().to_string()),
+                Err(e) => break Err(format!("failed reading the MCP response: {e}")),
+            }
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(line)) => serde_json::from_str(&line).expect("parse response JSON"),
+        Ok(Err(reason)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{reason}");
         }
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for the MCP response line");
         }
     }
-
-    let len = content_length.expect("Content-Length header");
-    let mut body = vec![0; len];
-    stdout.read_exact(&mut body).expect("read response body");
-    serde_json::from_slice(&body).expect("parse response JSON")
 }
