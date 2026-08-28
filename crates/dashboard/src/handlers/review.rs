@@ -319,7 +319,8 @@ fn account_label(accounts: &[Account], account_id: &str) -> String {
 }
 
 /// Curated event fields only — never the raw payload blob, which writers may
-/// stuff with anything.
+/// stuff with anything, and never the snippet, which carries message-body
+/// content. Subject + sender identify the message; the link opens it.
 fn event_summary(event: &Event, accounts: &[Account]) -> Value {
     json!({
         "id": event.id,
@@ -329,7 +330,6 @@ fn event_summary(event: &Event, accounts: &[Account]) -> Value {
         "outcome": super::cockpit::event_outcome_from_type(event),
         "from_addr": event.from_addr,
         "subject": event.subject,
-        "snippet": event.snippet,
         "folder": event.folder,
         "uid": event.uid,
         "message_link": event.uid
@@ -848,6 +848,31 @@ mod tests {
             Some("waiting-on@example.test"),
         )
         .unwrap();
+        // Events on both queue paths (message-anchored → needs_triage, bare →
+        // decide_now) carrying body and raw-payload sentinels.
+        for (id, uid) in [("evt-triage", Some(7)), ("evt-decide", None)] {
+            db.insert_event(&Event {
+                id: id.to_string(),
+                account_id: "acc1".to_string(),
+                event_type: if uid.is_some() {
+                    "watch.message_matched".to_string()
+                } else {
+                    "send_policy.denied".to_string()
+                },
+                folder: "INBOX".to_string(),
+                uid,
+                message_id: uid.map(|u| format!("<msg-{u}@example.com>")),
+                from_addr: Some("sender@example.com".to_string()),
+                subject: Some("Visible subject".to_string()),
+                snippet: Some("snippet-private-body".to_string()),
+                payload: Some(r#"{"raw":"payload-private-material"}"#.to_string()),
+                idempotency_key: None,
+                secure_pending: false,
+                acked_at: None,
+                created_at: "2026-05-09T08:58:00".to_string(),
+            })
+            .unwrap();
+        }
         db.record_failed_auth("acc1", "imap", "LOGIN failed password=hunter2-secret", None)
             .unwrap();
         let route = db
@@ -881,6 +906,8 @@ mod tests {
             1
         );
         assert_eq!(payload["waiting"]["scheduled"]["count"], 1);
+        assert_eq!(payload["needs_triage"]["count"], 1);
+        assert_eq!(payload["decide_now"]["events"]["count"], 1);
 
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(!serialized.contains("secret-recipient@example.test"));
@@ -888,6 +915,10 @@ mod tests {
         assert!(!serialized.contains("counterparty@gmail.example"));
         assert!(!serialized.contains("scheduled-body-marker"));
         assert!(!serialized.contains("waiting-on@example.test"));
+        assert!(!serialized.contains("snippet-private-body"));
+        assert!(!serialized.contains("payload-private-material"));
+        assert!(!serialized.contains("\"snippet\""));
+        assert!(!serialized.contains("\"payload\""));
         assert!(!serialized.contains("hunter2-secret"));
         assert!(!serialized.contains(&full_secret));
         assert!(!serialized.contains("to_addr"));

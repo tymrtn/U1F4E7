@@ -159,7 +159,6 @@ function populatedResponse(): ReviewResponse {
         outcome: 'recorded',
         from_addr: 'sender@example.com',
         subject: 'Invoice due',
-        snippet: 'Please pay',
         folder: 'INBOX',
         uid: 101,
         message_link: '/mail/unified/acc1/101?folder=INBOX',
@@ -273,5 +272,18 @@ describe('Review page groups', () => {
     await waitFor(() => expect(screen.getByText('Review unavailable')).toBeInTheDocument());
     expect(screen.getByText(/backend unreachable/)).toBeInTheDocument();
     expect(screen.queryByText('Nothing to decide')).not.toBeInTheDocument();
+  });
+
+  it('never renders a message-body snippet, even from a stale server payload', async () => {
+    // The API contract no longer carries `snippet`; an older server might
+    // still send it. The page must drop it, not render it.
+    const stale = populatedResponse();
+    (stale.needs_triage.items[0] as unknown as Record<string, unknown>)['snippet'] =
+      'snippet-private-body';
+    reviewMock.get.mockResolvedValue(stale);
+    const { container } = render(ReviewPage);
+
+    await waitFor(() => expect(screen.getByText('Invoice due')).toBeInTheDocument());
+    expect(container.textContent).not.toContain('snippet-private-body');
   });
 });

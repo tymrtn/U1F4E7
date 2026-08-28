@@ -49,7 +49,6 @@ export interface ReviewEventItem {
   outcome: string;
   from_addr: string | null;
   subject: string | null;
-  snippet: string | null;
   folder: string;
   uid: number | null;
   message_link: string | null;

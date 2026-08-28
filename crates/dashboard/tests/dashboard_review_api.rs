@@ -95,8 +95,8 @@ fn seeded_state() -> (AppState, String) {
         message_id: Some("<msg-101@example.com>".into()),
         from_addr: Some("sender@example.com".into()),
         subject: Some("Invoice due".into()),
-        snippet: Some("Please pay".into()),
-        payload: None,
+        snippet: Some("event-snippet-private-body".into()),
+        payload: Some(r#"{"raw":"event-payload-private-material"}"#.into()),
         idempotency_key: None,
         secure_pending: false,
         acked_at: None,
@@ -158,6 +158,13 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
         json["needs_triage"]["items"][0]["message_link"],
         "/mail/unified/acc1/101?folder=INBOX"
     );
+    // Operator context survives redaction: subject and sender identify the
+    // message without carrying its body.
+    assert_eq!(json["needs_triage"]["items"][0]["subject"], "Invoice due");
+    assert_eq!(
+        json["needs_triage"]["items"][0]["from_addr"],
+        "sender@example.com"
+    );
     assert_eq!(json["operational_health"]["failed_auth"]["count"], 1);
     assert!(json["generated_at"].is_string());
     for group in [
@@ -172,11 +179,16 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
         );
     }
 
-    // Safe summaries: no recipient addresses, draft bodies, or secrets.
+    // Safe summaries: no recipient addresses, draft bodies, event snippets,
+    // raw event payloads, or secrets.
     let serialized = serde_json::to_string(&json).unwrap();
     assert!(!serialized.contains("review-private@example.test"));
     assert!(!serialized.contains("review-private-body"));
     assert!(!serialized.contains("counterparty@example.test"));
     assert!(!serialized.contains("queued-private-body"));
+    assert!(!serialized.contains("event-snippet-private-body"));
+    assert!(!serialized.contains("event-payload-private-material"));
+    assert!(!serialized.contains("\"snippet\""));
+    assert!(!serialized.contains("\"payload\""));
     assert!(!serialized.contains("secret-token"));
 }
