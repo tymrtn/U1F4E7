@@ -206,9 +206,7 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                if let Err(e) =
-                    handlers::messages::run_sent_index_sweep(&sent_sweep_state).await
-                {
+                if let Err(e) = handlers::messages::run_sent_index_sweep(&sent_sweep_state).await {
                     tracing::warn!("sent index sweep error: {e}");
                 }
             }
@@ -328,6 +326,8 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/cockpit",
             get(handlers::cockpit::get_for_account),
         )
+        // Review queue: the operator's daily decision queue (read-only aggregate).
+        .route("/review", get(handlers::review::get))
         // Per-agent attribution feed + approval queue (read-only aggregate).
         .route("/agents", get(handlers::agents::get))
         // Scheduled sends + Governor verdict visibility (read-only aggregate).
@@ -4876,7 +4876,7 @@ mod tests {
     fn embedded_spa_bundle_routes_every_canonical_deep_link_target() {
         let entry = embedded_spa_entry_chunk();
 
-        for route_id in [CONTROL_ROUTE_ID, "/cockpit", "/rules"] {
+        for route_id in [CONTROL_ROUTE_ID, "/review", "/cockpit", "/rules"] {
             assert!(
                 entry.contains(&format!("\"{route_id}\"")),
                 "canonical route {route_id} missing from the embedded route table — deep \

@@ -147,11 +147,30 @@ describe('app shell layout', () => {
     const nav = screen.getByRole('navigation', { name: 'Primary navigation' });
     expect(nav).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Mail' })).toHaveAttribute('href', '/v2/mail/unified');
+    expect(screen.getByRole('link', { name: 'Review' })).toHaveAttribute('href', '/v2/review');
     expect(screen.getByRole('link', { name: 'Cockpit' })).toHaveAttribute('href', '/v2/cockpit');
     expect(screen.getByRole('link', { name: 'Rules' })).toHaveAttribute('href', '/v2/rules');
+    // The daily Review queue outranks the diagnostic Cockpit in nav order.
+    const labels = Array.from(nav.querySelectorAll('a')).map((a) => a.textContent?.trim());
+    expect(labels).toEqual(['Mail', 'Review', 'Cockpit', 'Rules']);
     // The stub page url is /v2/mail/unified, so Mail is the active tab.
     expect(screen.getByRole('link', { name: 'Mail' })).toHaveClass('is-active');
     expect(screen.getByRole('link', { name: 'Cockpit' })).not.toHaveClass('is-active');
+  });
+
+  it('sizes the mobile nav grid to the actual tab count', async () => {
+    stubFetch(async () => healthOk('1.0.3'));
+
+    const { container } = render(AppShell, { props: { children } });
+
+    // The 640px breakpoint lays tabs out as `repeat(N, minmax(0, 1fr))`. A
+    // hard-coded N smaller than the tab count silently wraps the last tab onto
+    // a second row — keep the declared column count in lockstep.
+    const match = SHELL_SOURCE.match(/repeat\((\d+), minmax\(0, 1fr\)\)/);
+    expect(match).not.toBeNull();
+    const columns = Number(match![1]);
+    const tabCount = container.querySelectorAll('.app-nav a').length;
+    expect(columns).toBe(tabCount);
   });
 
   it('renders route children inside the main region', async () => {

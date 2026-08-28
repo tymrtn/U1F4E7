@@ -155,7 +155,7 @@ fn verdict_bucket(verdict: &GovernorVerdict) -> &'static str {
 /// `None` (already due / unknown). Both values are UTC — `now` is RFC 3339 `Z`
 /// and `future` may be a legacy naive-UTC row; [`crate::timefmt::parse_utc`]
 /// puts them in the same frame.
-fn seconds_between(now: &str, future: &str) -> Option<i64> {
+pub(crate) fn seconds_between(now: &str, future: &str) -> Option<i64> {
     let (n, f) = (
         crate::timefmt::parse_utc(now)?,
         crate::timefmt::parse_utc(future)?,
@@ -352,6 +352,7 @@ mod tests {
         for (name, source) in [
             ("scheduled.rs", include_str!("scheduled.rs")),
             ("cockpit.rs", include_str!("cockpit.rs")),
+            ("review.rs", include_str!("review.rs")),
             ("drafts.rs", include_str!("drafts.rs")),
             ("compose.rs", include_str!("compose.rs")),
             ("lib.rs", include_str!("../lib.rs")),

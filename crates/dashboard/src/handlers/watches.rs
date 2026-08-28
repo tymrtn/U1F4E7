@@ -93,7 +93,7 @@ fn secret_prefix(secret: &str) -> String {
     secret.chars().take(10).collect()
 }
 
-fn watch_health(status: &str) -> &'static str {
+pub(crate) fn watch_health(status: &str) -> &'static str {
     match status {
         "running" => "ok",
         "failed" | "error" => "danger",

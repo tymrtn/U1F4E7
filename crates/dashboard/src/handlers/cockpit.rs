@@ -331,7 +331,7 @@ fn cockpit_event_json(event: &Event, accounts: &[Account]) -> Value {
     })
 }
 
-fn is_routine_audit_event(event: &Event) -> bool {
+pub(crate) fn is_routine_audit_event(event: &Event) -> bool {
     matches!(event.event_type.as_str(), "send_policy.allowed")
 }
 
@@ -371,7 +371,7 @@ fn event_source_from_type(event_type: &str) -> &'static str {
     }
 }
 
-fn event_outcome_from_type(event: &Event) -> &'static str {
+pub(crate) fn event_outcome_from_type(event: &Event) -> &'static str {
     let event_type = event.event_type.as_str();
     if event.secure_pending {
         "needs_review"
