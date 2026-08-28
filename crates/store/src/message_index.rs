@@ -558,7 +558,9 @@ mod tests {
         )
         .unwrap();
 
-        let rows = db.list_indexed_detected_folder_page("sent", 10, None).unwrap();
+        let rows = db
+            .list_indexed_detected_folder_page("sent", 10, None)
+            .unwrap();
         let subjects: Vec<&str> = rows.iter().map(|r| r.summary.subject.as_str()).collect();
         assert_eq!(subjects, vec!["gmail-sent", "dovecot-sent"]);
         assert_eq!(rows[0].folder, "[Gmail]/Sent Mail");
@@ -581,7 +583,9 @@ mod tests {
         )
         .unwrap();
 
-        let rows = db.list_message_index_detected_folder_freshness("sent").unwrap();
+        let rows = db
+            .list_message_index_detected_folder_freshness("sent")
+            .unwrap();
         let a = rows.iter().find(|r| r.account_id == "acct-a").unwrap();
         assert_eq!(a.freshness, "fresh");
         assert_eq!(a.message_count, 1);
