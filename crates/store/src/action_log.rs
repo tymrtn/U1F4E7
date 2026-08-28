@@ -7,6 +7,28 @@ use crate::models::ActionLog;
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
+/// Action statuses that mean the action itself terminally did not succeed.
+/// This is the stable failure predicate the review queue's "failed agent
+/// actions" group is built on: a whitelist, so in-flight ("pending",
+/// "queued"), successful ("completed", "sent", "ok"), and unknown statuses
+/// are never classified as failures.
+pub const ACTION_FAILURE_STATUSES: &[&str] = &["failed", "error", "denied"];
+
+/// Whether `status` is a terminal failure per [`ACTION_FAILURE_STATUSES`].
+pub fn is_action_failure_status(status: &str) -> bool {
+    ACTION_FAILURE_STATUSES.contains(&status)
+}
+
+/// `'failed', 'error', 'denied'` — the SQL IN-list form of the predicate.
+/// Values are compile-time constants, never user input.
+fn failure_statuses_sql() -> String {
+    ACTION_FAILURE_STATUSES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Database {
     /// Log an agent action and return the created record.
     pub fn log_action(
@@ -175,6 +197,40 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(actions)
+    }
+
+    /// List failed actions for an account, newest first. Failure means a
+    /// status in [`ACTION_FAILURE_STATUSES`]; in-flight or unknown statuses
+    /// are excluded in SQL, so the cap counts only actual failures.
+    pub fn list_failed_actions(&self, account_id: &str, limit: u32) -> Result<Vec<ActionLog>> {
+        let sql = format!(
+            "SELECT id, account_id, action_type, confidence, justification, action_taken,
+                    message_id, draft_id, event_id, action_status, created_at
+             FROM action_log
+             WHERE account_id = ?1 AND action_status IN ({})
+             ORDER BY created_at DESC
+             LIMIT ?2",
+            failure_statuses_sql()
+        );
+        let mut stmt = self.conn().prepare(&sql)?;
+        let actions = stmt
+            .query_map(params![account_id, limit], map_action_log)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(actions)
+    }
+
+    /// True total of failed actions for an account — the uncapped companion
+    /// to [`Database::list_failed_actions`], so a capped item list can still
+    /// report the whole backlog.
+    pub fn count_failed_actions(&self, account_id: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM action_log
+             WHERE account_id = ?1 AND action_status IN ({})",
+            failure_statuses_sql()
+        );
+        Ok(self
+            .conn()
+            .query_row(&sql, params![account_id], |row| row.get(0))?)
     }
 
     fn insert_action_log(&self, input: ActionLogInsert<'_>) -> Result<ActionLog> {
@@ -383,6 +439,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ev_agent.as_deref(), Some("agent-bravo"));
+    }
+
+    #[test]
+    fn failure_predicate_matches_only_terminal_failure_statuses() {
+        let db = Database::open_memory().unwrap();
+        // One row per status; only the whitelist counts as failure.
+        for (id, status) in [
+            ("a-completed", "completed"),
+            ("a-sent", "sent"),
+            ("a-ok", "ok"),
+            ("a-pending", "pending"),
+            ("a-queued", "queued"),
+            ("a-blocked", "blocked"),
+            ("a-mystery", "some_future_status"),
+            ("a-failed", "failed"),
+            ("a-error", "error"),
+            ("a-denied", "denied"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO action_log (id, account_id, action_type, confidence,
+                            justification, action_taken, action_status)
+                     VALUES (?1, 'acc-1', 'send', 1.0, 'j', '{}', ?2)",
+                    super::params![id, status],
+                )
+                .unwrap();
+            assert_eq!(
+                super::is_action_failure_status(status),
+                matches!(status, "failed" | "error" | "denied"),
+                "predicate disagrees for status {status}"
+            );
+        }
+
+        let failed = db.list_failed_actions("acc-1", 25).unwrap();
+        let mut ids: Vec<&str> = failed.iter().map(|a| a.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["a-denied", "a-error", "a-failed"]);
+        assert_eq!(db.count_failed_actions("acc-1").unwrap(), 3);
+        // The cap bounds the list; the count stays the true total.
+        assert_eq!(db.list_failed_actions("acc-1", 2).unwrap().len(), 2);
+        assert_eq!(db.count_failed_actions("acc-1").unwrap(), 3);
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod snoozed;
 pub mod tag_store;
 pub mod threads;
 
+pub use action_log::{ACTION_FAILURE_STATUSES, is_action_failure_status};
 pub use address_book::{ADDRESS_HISTORY_CHUNK_ROWS, AddressHistoryReconcile, AddressSuggestion};
 pub use agent_cockpit::{AgentActivityCounts, GovernorVerdict};
 pub use agent_identity::{

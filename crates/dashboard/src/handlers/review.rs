@@ -48,6 +48,7 @@ pub async fn get(State(state): State<AppState>) -> impl IntoResponse {
 const DRAFT_LIMIT: u32 = 100;
 const PER_ACCOUNT_ACTIONS: u32 = 25;
 const PER_ACCOUNT_UNACKED: usize = 50;
+const HEALTH_LIMIT: u32 = 50;
 
 fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     let accounts = db.list_accounts()?;
@@ -56,6 +57,9 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     // account is selected — the cockpit regression this endpoint fixes).
     let pending = db.list_all_drafts_by_status(DraftStatus::PendingReview.as_str(), DRAFT_LIMIT)?;
     let blocked = db.list_all_drafts_by_status(DraftStatus::Blocked.as_str(), DRAFT_LIMIT)?;
+    let pending_total = db.count_all_drafts_by_status(DraftStatus::PendingReview.as_str())?;
+    let blocked_total = db.count_all_drafts_by_status(DraftStatus::Blocked.as_str())?;
+    let drafts_total = pending_total + blocked_total;
     let mut awaiting: Vec<&Draft> = pending.iter().chain(blocked.iter()).collect();
     awaiting.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let draft_items: Vec<Value> = awaiting
@@ -68,21 +72,20 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
         })
         .collect();
 
-    // ── Decide now: failed agent actions. Completed/sent/ok actions are
-    // routine activity and stay out of the queue.
+    // ── Decide now: failed agent actions — terminal failures only, per the
+    // store's ACTION_FAILURE_STATUSES whitelist. In-flight and unknown
+    // statuses are not failures and never inflate this group.
     let mut failed_actions = Vec::new();
+    let mut failed_actions_total: i64 = 0;
     for account in &accounts {
-        for action in db.list_actions(&account.id, PER_ACCOUNT_ACTIONS)? {
-            if matches!(action.action_status.as_str(), "completed" | "sent" | "ok") {
-                continue;
-            }
+        failed_actions_total += db.count_failed_actions(&account.id)?;
+        for action in db.list_failed_actions(&account.id, PER_ACCOUNT_ACTIONS)? {
             failed_actions.push(json!({
                 "id": action.id,
                 "account_id": action.account_id,
                 "account_label": account_label(&accounts, &action.account_id),
                 "action_type": action.action_type,
                 "action_status": action.action_status,
-                "justification": action.justification,
                 "draft_id": action.draft_id,
                 "draft_link": action.draft_id.as_deref()
                     .map(|draft_id| draft_dashboard_path(&action.account_id, draft_id)),
@@ -95,10 +98,17 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     // ── Unacked events, split by message anchor: an event with a uid names an
     // exact message and belongs in Needs triage with a reader link; one without
     // (policy denial, failure) is a decision in its own right. Routine audit
-    // events (send_policy.allowed) never inflate the queue.
+    // events (send_policy.allowed) never inflate the queue — the SQL totals
+    // exclude the same ROUTINE_AUDIT_EVENT_TYPES the item filter uses.
     let mut decide_events = Vec::new();
     let mut triage_items = Vec::new();
+    let mut decide_events_total: i64 = 0;
+    let mut triage_total: i64 = 0;
     for account in &accounts {
+        let (anchored, bare) =
+            db.count_unacked_by_anchor(&account.id, super::cockpit::ROUTINE_AUDIT_EVENT_TYPES)?;
+        triage_total += anchored;
+        decide_events_total += bare;
         for event in db.list_unacked(&account.id, PER_ACCOUNT_UNACKED)? {
             if super::cockpit::is_routine_audit_event(&event) {
                 continue;
@@ -139,8 +149,11 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
         }
     }
 
-    // ── Waiting: scheduled sends with due/countdown facts.
+    // ── Waiting: scheduled sends with due/countdown facts. Totals come from
+    // SQL, not the capped list — 100 due items must never read as "100 total".
     let scheduled_drafts = db.list_scheduled_drafts(None, DRAFT_LIMIT)?;
+    let scheduled_total = db.count_scheduled_drafts(None, None)?;
+    let scheduled_due_total = db.count_scheduled_drafts(None, Some(now))?;
     let now_utc = crate::timefmt::parse_utc(now);
     let scheduled_items: Vec<Value> = scheduled_drafts
         .iter()
@@ -165,10 +178,6 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
             })
         })
         .collect();
-    let scheduled_due = scheduled_items
-        .iter()
-        .filter(|item| item["due"] == json!(true))
-        .count();
 
     // ── Waiting: due snoozes, plus not-yet-due awaiting-reply follow-ups.
     // A due awaiting-reply snooze belongs in the due list, not both.
@@ -189,9 +198,11 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
         .map(|snooze| snooze_summary(snooze, &accounts, false))
         .collect();
 
-    // ── Operational health: actual failures only.
+    // ── Operational health: actual failures only. Free-text failure prose
+    // (auth reasons, retry guidance, watch failure reasons) stays server-side;
+    // the aggregate carries structured status labels and timestamps.
     let failed_auth: Vec<Value> = db
-        .list_failed_auth(None, 50)?
+        .list_failed_auth(None, HEALTH_LIMIT)?
         .iter()
         .map(|attempt| {
             json!({
@@ -199,16 +210,15 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
                 "account_id": attempt.account_id,
                 "account_label": account_label(&accounts, &attempt.account_id),
                 "backend": attempt.backend,
-                "reason": attempt.reason,
-                "retry_guidance": attempt.retry_guidance,
+                "status": "auth_failed",
                 "created_at": attempt.created_at,
             })
         })
         .collect();
+    let failed_auth_total = db.count_failed_auth(None)?;
     let failed_watches: Vec<Value> = db
-        .list_watches(None, 50)?
+        .list_watches_with_statuses(None, super::watches::DANGER_WATCH_STATUSES, HEALTH_LIMIT)?
         .iter()
-        .filter(|watch| super::watches::watch_health(&watch.status) == "danger")
         .map(|watch| {
             json!({
                 "id": watch.id,
@@ -216,11 +226,12 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
                 "account_label": account_label(&accounts, &watch.account_id),
                 "folder": watch.folder,
                 "status": watch.status,
-                "failure_reason": watch.failure_reason,
                 "last_heartbeat_at": watch.last_heartbeat_at,
             })
         })
         .collect();
+    let failed_watches_total =
+        db.count_watches_with_statuses(None, super::watches::DANGER_WATCH_STATUSES)?;
     let mut dead_routes = Vec::new();
     for account in &accounts {
         for route in db.list_event_routes(&account.id)? {
@@ -232,7 +243,6 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
                 "id": route.id,
                 "account_id": route.account_id,
                 "account_label": account_label(&accounts, &route.account_id),
-                "match_expr": route.match_expr,
                 "enabled": route.enabled,
                 "dead": dead,
             }));
@@ -240,44 +250,51 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     }
     let dead_letter_total = db.dead_letter_count()?;
 
+    // Group counts are true totals from the count queries; only the item
+    // lists are capped, and each capped source says so.
     let decide_now_count =
-        draft_items.len() + failed_actions.len() + decide_events.len() + proposed_rules.len();
-    let waiting_count = scheduled_items.len() + due_snoozes.len() + awaiting_reply.len();
-    let triage_count = triage_items.len();
-    let health_count = failed_auth.len() + failed_watches.len() + dead_routes.len();
+        drafts_total + failed_actions_total + decide_events_total + proposed_rules.len() as i64;
+    let waiting_count = scheduled_total + (due_snoozes.len() + awaiting_reply.len()) as i64;
+    let health_count = failed_auth_total + failed_watches_total + dead_routes.len() as i64;
 
     Ok(json!({
         "summary": {
             "decide_now": decide_now_count,
             "waiting": waiting_count,
-            "needs_triage": triage_count,
+            "needs_triage": triage_total,
             "operational_health": health_count,
         },
         "decide_now": {
             "count": decide_now_count,
             "drafts": {
                 "counts": {
-                    "pending_review": pending.len(),
-                    "blocked": blocked.len(),
+                    "pending_review": pending_total,
+                    "blocked": blocked_total,
                 },
+                "returned": draft_items.len(),
+                "truncated": (draft_items.len() as i64) < drafts_total,
                 "items": draft_items,
             },
-            "failed_actions": { "count": failed_actions.len(), "items": failed_actions },
-            "events": { "count": decide_events.len(), "items": decide_events },
+            "failed_actions": capped(failed_actions_total, failed_actions),
+            "events": capped(decide_events_total, decide_events),
             "proposed_rules": { "count": proposed_rules.len(), "items": proposed_rules },
         },
         "waiting": {
             "count": waiting_count,
             "scheduled": {
-                "count": scheduled_items.len(),
-                "due": scheduled_due,
+                "count": scheduled_total,
+                "due": scheduled_due_total,
+                "returned": scheduled_items.len(),
+                "truncated": (scheduled_items.len() as i64) < scheduled_total,
                 "items": scheduled_items,
             },
             "due_snoozes": { "count": due_snoozes.len(), "items": due_snoozes },
             "awaiting_reply": { "count": awaiting_reply.len(), "items": awaiting_reply },
         },
         "needs_triage": {
-            "count": triage_count,
+            "count": triage_total,
+            "returned": triage_items.len(),
+            "truncated": (triage_items.len() as i64) < triage_total,
             // Truth-in-labeling: only durable store events land here. This is
             // not an inbox classifier and never scans or scores messages.
             "source": "durable_events",
@@ -285,8 +302,8 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
         },
         "operational_health": {
             "count": health_count,
-            "failed_auth": { "count": failed_auth.len(), "items": failed_auth },
-            "failed_watches": { "count": failed_watches.len(), "items": failed_watches },
+            "failed_auth": capped(failed_auth_total, failed_auth),
+            "failed_watches": capped(failed_watches_total, failed_watches),
             "dead_letters": {
                 "count": dead_letter_total,
                 "routes": dead_routes,
@@ -294,6 +311,17 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
         },
         "generated_at": now,
     }))
+}
+
+/// Wrap a capped item list with its true total: `count` is the whole queue,
+/// `returned` how many items crossed the wire, `truncated` whether they differ.
+fn capped(total: i64, items: Vec<Value>) -> Value {
+    json!({
+        "count": total,
+        "returned": items.len(),
+        "truncated": (items.len() as i64) < total,
+        "items": items,
+    })
 }
 
 /// Display label for an account id or username alias: `display_name` → `name`
@@ -340,7 +368,9 @@ fn event_summary(event: &Event, accounts: &[Account]) -> Value {
 }
 
 /// Snooze summary without the `recipient` column — a full address that must
-/// not cross the aggregate surface. The link targets the snoozed folder, where
+/// not cross the aggregate surface — and without the free-text `reason` and
+/// `note` columns, which writers may fill with anything. The `due` flag and
+/// group placement carry the state; the link opens the snoozed folder, where
 /// the message currently lives.
 fn snooze_summary(snooze: &SnoozedMessage, accounts: &[Account], due: bool) -> Value {
     json!({
@@ -349,8 +379,6 @@ fn snooze_summary(snooze: &SnoozedMessage, accounts: &[Account], due: bool) -> V
         "account_label": account_label(accounts, &snooze.account),
         "subject": snooze.subject,
         "return_at": snooze.return_at,
-        "reason": snooze.reason,
-        "note": snooze.note,
         "folder": snooze.snoozed_folder,
         "uid": snooze.uid,
         "message_link": message_dashboard_path(&snooze.account, &snooze.snoozed_folder, snooze.uid),
@@ -679,8 +707,18 @@ mod tests {
         assert_eq!(payload["summary"]["needs_triage"], 1);
     }
 
+    fn insert_action(db: &Database, id: &str, status: &str, justification: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO action_log (id, account_id, action_type, confidence, justification, action_taken, draft_id, action_status)
+                 VALUES (?1, 'acc1', 'send', 1.0, ?2, '{}', 'd-123', ?3)",
+                [id, justification, status],
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn review_failed_actions_surface_with_draft_links() {
+    fn review_failed_actions_contain_only_terminal_failures() {
         let db = Database::open_memory().unwrap();
         seed_account(&db, "acc1", "Work", "op@example.com");
         // A completed action is routine activity, not a decision.
@@ -694,25 +732,95 @@ mod tests {
             None,
         )
         .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO action_log (id, account_id, action_type, confidence, justification, action_taken, draft_id, action_status)
-                 VALUES ('act-fail', 'acc1', 'send', 1.0, 'SMTP 550 relay refused', '{}', 'd-123', 'failed')",
-                [],
-            )
-            .unwrap();
+        // In-flight and unknown statuses are not failures and must stay out.
+        insert_action(&db, "act-pending", "pending", "still working");
+        insert_action(&db, "act-queued", "queued", "waiting for slot");
+        insert_action(&db, "act-mystery", "some_future_status", "who knows");
+        // Terminal failures land in the group.
+        insert_action(&db, "act-fail", "failed", "SMTP 550 relay refused");
+        insert_action(&db, "act-denied", "denied", "policy clamp");
+        insert_action(&db, "act-error", "error", "boom");
 
         let payload = super::build_review_json(&db, NOW).unwrap();
 
-        assert_eq!(payload["decide_now"]["failed_actions"]["count"], 1);
-        let failed = &payload["decide_now"]["failed_actions"]["items"][0];
-        assert_eq!(failed["id"], "act-fail");
+        assert_eq!(payload["decide_now"]["failed_actions"]["count"], 3);
+        let items = payload["decide_now"]["failed_actions"]["items"]
+            .as_array()
+            .unwrap();
+        let mut ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["act-denied", "act-error", "act-fail"]);
+        let failed = items.iter().find(|i| i["id"] == "act-fail").unwrap();
         assert_eq!(failed["action_status"], "failed");
-        assert_eq!(failed["justification"], "SMTP 550 relay refused");
         assert_eq!(failed["draft_link"], "/accounts/acc1/drafts/d-123");
-        // The completed action must not appear anywhere.
+        // Neither routine activity nor free-text justifications appear.
         let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("act-pending"));
+        assert!(!serialized.contains("act-queued"));
+        assert!(!serialized.contains("act-mystery"));
         assert!(!serialized.contains("filed newsletter"));
+        assert!(!serialized.contains("SMTP 550 relay refused"));
+        assert!(!serialized.contains("\"justification\""));
+    }
+
+    #[test]
+    fn review_capped_sources_report_true_totals_and_truncation() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "Work", "op@example.com");
+        // 30 failed actions against a per-account item cap of 25.
+        for i in 0..30 {
+            insert_action(&db, &format!("act-{i:02}"), "failed", "j");
+        }
+        // 55 message-anchored and 3 bare non-routine unacked events against a
+        // per-account fetch cap of 50. The anchored rows are older, so the
+        // capped fetch returns none of the bare ones — their group must still
+        // report the true total.
+        for i in 0..55i64 {
+            insert_event(
+                &db,
+                &format!("evt-anchored-{i:02}"),
+                "acc1",
+                "watch.message_matched",
+                Some(100 + i),
+                false,
+                &format!("2026-05-09T07:{:02}:{:02}", i / 60, i % 60),
+            );
+        }
+        for i in 0..3 {
+            insert_event(
+                &db,
+                &format!("evt-bare-{i}"),
+                "acc1",
+                "send_policy.denied",
+                None,
+                false,
+                &format!("2026-05-09T08:00:0{i}"),
+            );
+        }
+
+        let payload = super::build_review_json(&db, NOW).unwrap();
+
+        let actions = &payload["decide_now"]["failed_actions"];
+        assert_eq!(actions["count"], 30);
+        assert_eq!(actions["returned"], 25);
+        assert_eq!(actions["truncated"], true);
+        assert_eq!(actions["items"].as_array().unwrap().len(), 25);
+
+        let triage = &payload["needs_triage"];
+        assert_eq!(triage["count"], 55);
+        assert_eq!(triage["returned"], 50);
+        assert_eq!(triage["truncated"], true);
+
+        // All 50 fetched events were anchored, so the bare-event group
+        // returned zero items — but its count is still the truth.
+        let events = &payload["decide_now"]["events"];
+        assert_eq!(events["count"], 3);
+        assert_eq!(events["returned"], 0);
+        assert_eq!(events["truncated"], true);
+
+        // Top-level group counts are the true totals, not item-list lengths.
+        assert_eq!(payload["summary"]["decide_now"], 30 + 3);
+        assert_eq!(payload["summary"]["needs_triage"], 55);
     }
 
     #[test]
@@ -774,12 +882,12 @@ mod tests {
         assert_eq!(payload["operational_health"]["failed_watches"]["count"], 1);
         let watch = &payload["operational_health"]["failed_watches"]["items"][0];
         assert_eq!(watch["folder"], "Archive");
-        assert_eq!(watch["failure_reason"], "IDLE connection dropped");
+        assert_eq!(watch["status"], "failed");
 
         assert_eq!(payload["operational_health"]["failed_auth"]["count"], 1);
         let auth = &payload["operational_health"]["failed_auth"]["items"][0];
         assert_eq!(auth["backend"], "imap");
-        assert!(!auth["reason"].as_str().unwrap().contains("secret-token"));
+        assert_eq!(auth["status"], "auth_failed");
 
         assert_eq!(payload["operational_health"]["dead_letters"]["count"], 1);
         let dead_route = &payload["operational_health"]["dead_letters"]["routes"][0];
@@ -789,6 +897,8 @@ mod tests {
         // running watch is not an operator problem and must not be counted.
         assert_eq!(payload["summary"]["operational_health"], 3);
         let serialized = serde_json::to_string(&payload).unwrap();
+        // Failure prose stays server-side; the status label is the item.
+        assert!(!serialized.contains("IDLE connection dropped"));
         assert!(
             !serialized.contains("\"INBOX\"") || {
                 // The running watch specifically must be absent from health items.
@@ -844,9 +954,37 @@ mod tests {
             None,
             Some("Waiting for them"),
             Some("waiting-reply"),
-            None,
+            Some("note-private-material"),
             Some("waiting-on@example.test"),
         )
+        .unwrap();
+        // A due snooze whose reason carries operator prose.
+        db.create_snoozed(
+            "acc1",
+            45,
+            "INBOX",
+            "Snoozed",
+            "2026-05-09T08:00:00",
+            None,
+            Some("Due item"),
+            Some("reason-private-material"),
+            None,
+            None,
+        )
+        .unwrap();
+        // A failed agent action whose justification carries message context.
+        insert_action(&db, "act-fail", "failed", "justification-private-material");
+        // A failed watch whose failure_reason may quote server responses.
+        db.upsert_watch(envelope_email_store::WatchUpsert {
+            account_id: "acc1",
+            folder: "INBOX",
+            status: "failed",
+            process_id: None,
+            schedule: Some("foreground"),
+            last_heartbeat_at: Some("2026-05-09T08:00:00"),
+            last_event_at: None,
+            failure_reason: Some("watch-failure-private-material"),
+        })
         .unwrap();
         // Events on both queue paths (message-anchored → needs_triage, bare →
         // decide_now) carrying body and raw-payload sentinels.
@@ -873,12 +1011,17 @@ mod tests {
             })
             .unwrap();
         }
-        db.record_failed_auth("acc1", "imap", "LOGIN failed password=hunter2-secret", None)
-            .unwrap();
+        db.record_failed_auth(
+            "acc1",
+            "imap",
+            "LOGIN failed password=hunter2-secret",
+            Some("guidance-private-material"),
+        )
+        .unwrap();
         let route = db
             .create_event_route(
                 "acc1",
-                r#"{"event_types":["new_message"]}"#,
+                r#"{"event_types":["new_message"],"from_contains":"match-private@example.test"}"#,
                 r#"{"type":"webhook","url":"https://example.test/hook"}"#,
                 true,
                 100,
@@ -908,6 +1051,9 @@ mod tests {
         assert_eq!(payload["waiting"]["scheduled"]["count"], 1);
         assert_eq!(payload["needs_triage"]["count"], 1);
         assert_eq!(payload["decide_now"]["events"]["count"], 1);
+        assert_eq!(payload["decide_now"]["failed_actions"]["count"], 1);
+        assert_eq!(payload["operational_health"]["failed_auth"]["count"], 1);
+        assert_eq!(payload["operational_health"]["failed_watches"]["count"], 1);
 
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(!serialized.contains("secret-recipient@example.test"));
@@ -923,6 +1069,21 @@ mod tests {
         assert!(!serialized.contains(&full_secret));
         assert!(!serialized.contains("to_addr"));
         assert!(!serialized.contains("text_content"));
+        // Free-text columns never cross the aggregate: not their sentinel
+        // values, and not even their keys.
+        assert!(!serialized.contains("justification-private-material"));
+        assert!(!serialized.contains("\"justification\""));
+        assert!(!serialized.contains("note-private-material"));
+        assert!(!serialized.contains("\"note\""));
+        assert!(!serialized.contains("reason-private-material"));
+        assert!(!serialized.contains("\"reason\""));
+        assert!(!serialized.contains("watch-failure-private-material"));
+        assert!(!serialized.contains("failure_reason"));
+        assert!(!serialized.contains("guidance-private-material"));
+        assert!(!serialized.contains("retry_guidance"));
+        assert!(!serialized.contains("LOGIN failed"));
+        assert!(!serialized.contains("match-private@example.test"));
+        assert!(!serialized.contains("match_expr"));
     }
 
     #[test]

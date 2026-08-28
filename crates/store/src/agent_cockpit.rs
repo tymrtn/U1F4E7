@@ -104,6 +104,46 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// True total of drafts in one status across every account — the uncapped
+    /// companion to [`Database::list_all_drafts_by_status`], so capped item
+    /// lists can still report the whole queue.
+    pub fn count_all_drafts_by_status(&self, status: &str) -> Result<i64> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM drafts WHERE status = ?1",
+            params![status],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// True total of scheduled drafts (same predicate as
+    /// [`Database::list_scheduled_drafts`]). With `due_before` set, counts only
+    /// those whose `send_after` has passed — ISO 8601 strings compare
+    /// lexicographically, matching the snooze due queries.
+    pub fn count_scheduled_drafts(
+        &self,
+        account_id: Option<&str>,
+        due_before: Option<&str>,
+    ) -> Result<i64> {
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM drafts
+             WHERE status IN ('draft', 'sending', 'syncing') AND send_after IS NOT NULL",
+        );
+        let mut params_vec: Vec<&str> = Vec::new();
+        if let Some(account) = account_id {
+            params_vec.push(account);
+            sql.push_str(&format!(" AND account_id = ?{}", params_vec.len()));
+        }
+        if let Some(now) = due_before {
+            params_vec.push(now);
+            sql.push_str(&format!(" AND send_after <= ?{}", params_vec.len()));
+        }
+        Ok(self
+            .conn()
+            .query_row(&sql, rusqlite::params_from_iter(params_vec), |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Scheduled drafts: those carrying a `send_after` and still queued
     /// (`status = 'draft'`, not yet sent/discarded). Optionally scoped to one
     /// account. Ordered by soonest send time first so countdowns read top-down.

@@ -86,7 +86,8 @@
       {:else}
         {#if data.decide_now.drafts.items.length > 0}
           <h3 class="sub-title">
-            Drafts awaiting review · {data.decide_now.drafts.items.length}
+            Drafts awaiting review ·
+            {data.decide_now.drafts.counts.pending_review + data.decide_now.drafts.counts.blocked}
           </h3>
           <ul class="rows">
             {#each data.decide_now.drafts.items as draft (draft.id)}
@@ -105,22 +106,28 @@
               </li>
             {/each}
           </ul>
+          {#if data.decide_now.drafts.truncated}
+            <p class="rows-more">
+              Showing {data.decide_now.drafts.returned} of
+              {data.decide_now.drafts.counts.pending_review + data.decide_now.drafts.counts.blocked}.
+            </p>
+          {/if}
         {/if}
-        {#if data.decide_now.failed_actions.items.length > 0}
+        {#if data.decide_now.failed_actions.count > 0}
           <h3 class="sub-title">
-            Failed agent actions · {data.decide_now.failed_actions.items.length}
+            Failed agent actions · {data.decide_now.failed_actions.count}
           </h3>
           <ul class="rows">
             {#each data.decide_now.failed_actions.items as action (action.id)}
               <li class="row">
                 {#if action.draft_link}
                   <a class="row-link" href="{base}{action.draft_link}">
-                    <span class="row-main">{action.action_type}: {action.justification}</span>
+                    <span class="row-main">{action.action_type}</span>
                     <span class="row-meta">{action.account_label} · {age(action.created_at)}</span>
                   </a>
                 {:else}
                   <div class="row-link">
-                    <span class="row-main">{action.action_type}: {action.justification}</span>
+                    <span class="row-main">{action.action_type}</span>
                     <span class="row-meta">{action.account_label} · {age(action.created_at)}</span>
                   </div>
                 {/if}
@@ -128,9 +135,15 @@
               </li>
             {/each}
           </ul>
+          {#if data.decide_now.failed_actions.truncated}
+            <p class="rows-more">
+              Showing {data.decide_now.failed_actions.returned} of
+              {data.decide_now.failed_actions.count}.
+            </p>
+          {/if}
         {/if}
-        {#if data.decide_now.events.items.length > 0}
-          <h3 class="sub-title">Unacknowledged events · {data.decide_now.events.items.length}</h3>
+        {#if data.decide_now.events.count > 0}
+          <h3 class="sub-title">Unacknowledged events · {data.decide_now.events.count}</h3>
           <ul class="rows">
             {#each data.decide_now.events.items as event (event.id)}
               <li class="row">
@@ -144,6 +157,11 @@
               </li>
             {/each}
           </ul>
+          {#if data.decide_now.events.truncated}
+            <p class="rows-more">
+              Showing {data.decide_now.events.returned} of {data.decide_now.events.count}.
+            </p>
+          {/if}
         {/if}
         {#if data.decide_now.proposed_rules.items.length > 0}
           <h3 class="sub-title">
@@ -179,9 +197,9 @@
           hint="Scheduled sends and snoozes appear here with their due times."
         />
       {:else}
-        {#if data.waiting.scheduled.items.length > 0}
+        {#if data.waiting.scheduled.count > 0}
           <h3 class="sub-title">
-            Scheduled sends · {data.waiting.scheduled.items.length}
+            Scheduled sends · {data.waiting.scheduled.count}
           </h3>
           <ul class="rows">
             {#each data.waiting.scheduled.items as item (item.id)}
@@ -199,6 +217,11 @@
               </li>
             {/each}
           </ul>
+          {#if data.waiting.scheduled.truncated}
+            <p class="rows-more">
+              Showing {data.waiting.scheduled.returned} of {data.waiting.scheduled.count}.
+            </p>
+          {/if}
         {/if}
         {#if data.waiting.due_snoozes.items.length > 0}
           <h3 class="sub-title">Due snoozes · {data.waiting.due_snoozes.items.length}</h3>
@@ -207,10 +230,7 @@
               <li class="row">
                 <a class="row-link" href="{base}{snooze.message_link}">
                   <span class="row-main">{snooze.subject ?? '(no subject)'}</span>
-                  <span class="row-meta">
-                    {snooze.account_label}
-                    {#if snooze.reason}· {snooze.reason}{/if}
-                  </span>
+                  <span class="row-meta">{snooze.account_label}</span>
                 </a>
                 <span class="chip chip-pending">due now</span>
               </li>
@@ -226,10 +246,7 @@
               <li class="row">
                 <a class="row-link" href="{base}{snooze.message_link}">
                   <span class="row-main">{snooze.subject ?? '(no subject)'}</span>
-                  <span class="row-meta">
-                    {snooze.account_label}
-                    {#if snooze.note}· {snooze.note}{/if}
-                  </span>
+                  <span class="row-meta">{snooze.account_label}</span>
                 </a>
                 <span class="chip">returns {age(snooze.return_at) || snooze.return_at}</span>
               </li>
@@ -278,6 +295,11 @@
             </li>
           {/each}
         </ul>
+        {#if data.needs_triage.truncated}
+          <p class="rows-more">
+            Showing {data.needs_triage.returned} of {data.needs_triage.count}.
+          </p>
+        {/if}
       {/if}
     </section>
 
@@ -293,39 +315,51 @@
           hint="Failed logins, failed watches, and dead-lettered deliveries appear here."
         />
       {:else}
-        {#if data.operational_health.failed_auth.items.length > 0}
+        {#if data.operational_health.failed_auth.count > 0}
           <h3 class="sub-title">
-            Failed auth · {data.operational_health.failed_auth.items.length}
+            Failed auth · {data.operational_health.failed_auth.count}
           </h3>
           <ul class="rows">
             {#each data.operational_health.failed_auth.items as attempt (attempt.id)}
               <li class="row">
                 <div class="row-link">
                   <span class="row-main">{attempt.account_label}: {attempt.backend} login failed</span>
-                  <span class="row-meta">
-                    {attempt.retry_guidance ?? attempt.reason} · {age(attempt.created_at)}
-                  </span>
+                  <span class="row-meta">{age(attempt.created_at)}</span>
                 </div>
                 <span class="chip chip-danger">auth</span>
               </li>
             {/each}
           </ul>
+          {#if data.operational_health.failed_auth.truncated}
+            <p class="rows-more">
+              Showing {data.operational_health.failed_auth.returned} of
+              {data.operational_health.failed_auth.count}.
+            </p>
+          {/if}
         {/if}
-        {#if data.operational_health.failed_watches.items.length > 0}
+        {#if data.operational_health.failed_watches.count > 0}
           <h3 class="sub-title">
-            Failed watches · {data.operational_health.failed_watches.items.length}
+            Failed watches · {data.operational_health.failed_watches.count}
           </h3>
           <ul class="rows">
             {#each data.operational_health.failed_watches.items as watch (watch.id)}
               <li class="row">
                 <div class="row-link">
                   <span class="row-main">{watch.account_label} · {watch.folder}</span>
-                  <span class="row-meta">{watch.failure_reason ?? watch.status}</span>
+                  <span class="row-meta">
+                    {#if watch.last_heartbeat_at}last heartbeat {age(watch.last_heartbeat_at)}{:else}{watch.status}{/if}
+                  </span>
                 </div>
                 <span class="chip chip-danger">{watch.status}</span>
               </li>
             {/each}
           </ul>
+          {#if data.operational_health.failed_watches.truncated}
+            <p class="rows-more">
+              Showing {data.operational_health.failed_watches.returned} of
+              {data.operational_health.failed_watches.count}.
+            </p>
+          {/if}
         {/if}
         {#if data.operational_health.dead_letters.routes.length > 0}
           <h3 class="sub-title">
@@ -430,6 +464,13 @@
     display: flex;
     flex-direction: column;
     gap: 0.35rem;
+  }
+  /* Honest cap disclosure: rendered only when the list is truncated. */
+  .rows-more {
+    margin: 0.35rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.71875rem;
+    color: var(--env-muted);
   }
   .row {
     display: flex;

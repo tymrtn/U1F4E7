@@ -331,8 +331,13 @@ fn cockpit_event_json(event: &Event, accounts: &[Account]) -> Value {
     })
 }
 
+/// Event types that are routine audit noise, never operator decisions. The
+/// review queue excludes this same set in its SQL totals, so its counts and
+/// its item filter share one definition.
+pub(crate) const ROUTINE_AUDIT_EVENT_TYPES: &[&str] = &["send_policy.allowed"];
+
 pub(crate) fn is_routine_audit_event(event: &Event) -> bool {
-    matches!(event.event_type.as_str(), "send_policy.allowed")
+    ROUTINE_AUDIT_EVENT_TYPES.contains(&event.event_type.as_str())
 }
 
 fn event_bucket(event: &Event) -> &'static str {

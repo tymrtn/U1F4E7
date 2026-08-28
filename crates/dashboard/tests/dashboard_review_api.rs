@@ -154,6 +154,11 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
     assert_eq!(json["waiting"]["scheduled"]["due"], 1);
     assert_eq!(json["waiting"]["due_snoozes"]["count"], 1);
     assert_eq!(json["needs_triage"]["count"], 1);
+    // Capped sources declare how much of the queue the item list covers.
+    assert_eq!(json["needs_triage"]["returned"], 1);
+    assert_eq!(json["needs_triage"]["truncated"], false);
+    assert_eq!(json["waiting"]["scheduled"]["returned"], 1);
+    assert_eq!(json["waiting"]["scheduled"]["truncated"], false);
     assert_eq!(
         json["needs_triage"]["items"][0]["message_link"],
         "/mail/unified/acc1/101?folder=INBOX"
@@ -191,4 +196,14 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
     assert!(!serialized.contains("\"snippet\""));
     assert!(!serialized.contains("\"payload\""));
     assert!(!serialized.contains("secret-token"));
+    // Durable free-text columns stay out of the aggregate entirely: no
+    // auth reasons or guidance, snooze reasons/notes, action justifications,
+    // watch failure prose, or route match expressions.
+    assert!(!serialized.contains("Create an app password"));
+    assert!(!serialized.contains("\"reason\""));
+    assert!(!serialized.contains("retry_guidance"));
+    assert!(!serialized.contains("\"justification\""));
+    assert!(!serialized.contains("\"note\""));
+    assert!(!serialized.contains("failure_reason"));
+    assert!(!serialized.contains("match_expr"));
 }

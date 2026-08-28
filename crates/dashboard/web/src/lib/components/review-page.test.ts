@@ -23,22 +23,27 @@ function emptyResponse(): ReviewResponse {
     summary: { decide_now: 0, waiting: 0, needs_triage: 0, operational_health: 0 },
     decide_now: {
       count: 0,
-      drafts: { counts: { pending_review: 0, blocked: 0 }, items: [] },
-      failed_actions: { count: 0, items: [] },
-      events: { count: 0, items: [] },
+      drafts: {
+        counts: { pending_review: 0, blocked: 0 },
+        returned: 0,
+        truncated: false,
+        items: []
+      },
+      failed_actions: { count: 0, returned: 0, truncated: false, items: [] },
+      events: { count: 0, returned: 0, truncated: false, items: [] },
       proposed_rules: { count: 0, items: [] }
     },
     waiting: {
       count: 0,
-      scheduled: { count: 0, due: 0, items: [] },
+      scheduled: { count: 0, due: 0, returned: 0, truncated: false, items: [] },
       due_snoozes: { count: 0, items: [] },
       awaiting_reply: { count: 0, items: [] }
     },
-    needs_triage: { count: 0, source: 'durable_events', items: [] },
+    needs_triage: { count: 0, returned: 0, truncated: false, source: 'durable_events', items: [] },
     operational_health: {
       count: 0,
-      failed_auth: { count: 0, items: [] },
-      failed_watches: { count: 0, items: [] },
+      failed_auth: { count: 0, returned: 0, truncated: false, items: [] },
+      failed_watches: { count: 0, returned: 0, truncated: false, items: [] },
       dead_letters: { count: 0, routes: [] }
     },
     generated_at: '2026-05-09T09:00:00'
@@ -47,11 +52,13 @@ function emptyResponse(): ReviewResponse {
 
 function populatedResponse(): ReviewResponse {
   const base = emptyResponse();
-  base.summary = { decide_now: 3, waiting: 2, needs_triage: 1, operational_health: 1 };
+  base.summary = { decide_now: 4, waiting: 2, needs_triage: 1, operational_health: 2 };
   base.decide_now = {
-    count: 3,
+    count: 4,
     drafts: {
       counts: { pending_review: 1, blocked: 1 },
+      returned: 2,
+      truncated: false,
       items: [
         {
           id: 'd1',
@@ -84,10 +91,23 @@ function populatedResponse(): ReviewResponse {
       ]
     },
     failed_actions: {
-      count: 0,
-      items: []
+      count: 1,
+      returned: 1,
+      truncated: false,
+      items: [
+        {
+          id: 'fa-act-1',
+          account_id: 'acc1',
+          account_label: 'Work',
+          action_type: 'send',
+          action_status: 'failed',
+          draft_id: 'd9',
+          draft_link: '/accounts/acc1/drafts/d9',
+          created_at: '2026-05-09T08:45:00'
+        }
+      ]
     },
-    events: { count: 0, items: [] },
+    events: { count: 0, returned: 0, truncated: false, items: [] },
     proposed_rules: {
       count: 1,
       items: [
@@ -112,6 +132,8 @@ function populatedResponse(): ReviewResponse {
     scheduled: {
       count: 1,
       due: 0,
+      returned: 1,
+      truncated: false,
       items: [
         {
           id: 'd3',
@@ -136,8 +158,6 @@ function populatedResponse(): ReviewResponse {
           account_label: 'Work',
           subject: 'Due follow-up',
           return_at: '2026-05-09T08:30:00',
-          reason: 'review',
-          note: null,
           folder: 'Snoozed',
           uid: 42,
           message_link: '/mail/unified/acc1/42?folder=Snoozed',
@@ -149,6 +169,8 @@ function populatedResponse(): ReviewResponse {
   };
   base.needs_triage = {
     count: 1,
+    returned: 1,
+    truncated: false,
     source: 'durable_events',
     items: [
       {
@@ -168,22 +190,37 @@ function populatedResponse(): ReviewResponse {
     ]
   };
   base.operational_health = {
-    count: 1,
+    count: 2,
     failed_auth: {
       count: 1,
+      returned: 1,
+      truncated: false,
       items: [
         {
           id: 'fa1',
           account_id: 'acc1',
           account_label: 'Work',
           backend: 'imap',
-          reason: 'LOGIN failed',
-          retry_guidance: 'Create an app password and retry verification.',
+          status: 'auth_failed',
           created_at: '2026-05-09T08:00:00'
         }
       ]
     },
-    failed_watches: { count: 0, items: [] },
+    failed_watches: {
+      count: 1,
+      returned: 1,
+      truncated: false,
+      items: [
+        {
+          id: 'w1',
+          account_id: 'acc1',
+          account_label: 'Work',
+          folder: 'Archive',
+          status: 'failed',
+          last_heartbeat_at: '2026-05-09T08:00:00'
+        }
+      ]
+    },
     dead_letters: { count: 0, routes: [] }
   };
   return base;
@@ -209,11 +246,11 @@ describe('Review page groups', () => {
       'Operational health'
     ]);
     // Counts ride next to their headings.
-    expect(container.querySelector('#review-decide-now .group-count')?.textContent).toBe('3');
+    expect(container.querySelector('#review-decide-now .group-count')?.textContent).toBe('4');
     expect(container.querySelector('#review-waiting .group-count')?.textContent).toBe('2');
     expect(container.querySelector('#review-needs-triage .group-count')?.textContent).toBe('1');
     expect(container.querySelector('#review-operational-health .group-count')?.textContent).toBe(
-      '1'
+      '2'
     );
   });
 
@@ -285,5 +322,50 @@ describe('Review page groups', () => {
 
     await waitFor(() => expect(screen.getByText('Invoice due')).toBeInTheDocument());
     expect(container.textContent).not.toContain('snippet-private-body');
+  });
+
+  it('never renders server free-text fields, even from a stale server payload', async () => {
+    // The contract carries structured labels only. An older server might
+    // still send the removed free-text columns; none may reach the DOM.
+    const stale = populatedResponse();
+    const patch = (item: unknown, fields: Record<string, string>) =>
+      Object.assign(item as Record<string, unknown>, fields);
+    patch(stale.decide_now.failed_actions.items[0], {
+      justification: 'justification-private-material'
+    });
+    patch(stale.waiting.due_snoozes.items[0], {
+      reason: 'reason-private-material',
+      note: 'note-private-material'
+    });
+    patch(stale.operational_health.failed_auth.items[0], {
+      reason: 'auth-reason-private-material',
+      retry_guidance: 'guidance-private-material'
+    });
+    patch(stale.operational_health.failed_watches.items[0], {
+      failure_reason: 'watch-failure-private-material'
+    });
+    reviewMock.get.mockResolvedValue(stale);
+    const { container } = render(ReviewPage);
+
+    await waitFor(() => expect(screen.getByText('Due follow-up')).toBeInTheDocument());
+    expect(container.textContent).not.toContain('-private-material');
+  });
+
+  it('says showing-N-of-M when a capped source is truncated', async () => {
+    const truncated = populatedResponse();
+    truncated.decide_now.failed_actions.count = 30;
+    truncated.decide_now.failed_actions.returned = 1;
+    truncated.decide_now.failed_actions.truncated = true;
+    truncated.summary.decide_now = 33;
+    truncated.decide_now.count = 33;
+    reviewMock.get.mockResolvedValue(truncated);
+    const { container } = render(ReviewPage);
+
+    await waitFor(() => expect(screen.getByText('Approve outreach')).toBeInTheDocument());
+    // The heading carries the true total, the disclosure the honest cap, and
+    // the group badge never reports an item-list length as the whole queue.
+    expect(screen.getByText('Failed agent actions · 30')).toBeInTheDocument();
+    expect(container.textContent).toMatch(/Showing 1 of\s+30\./);
+    expect(container.querySelector('#review-decide-now .group-count')?.textContent).toBe('33');
   });
 });

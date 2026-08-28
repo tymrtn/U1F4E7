@@ -157,6 +157,38 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// True totals of unacked events for an account, excluding the given
+    /// event types, split by message anchor: `(anchored, bare)` where anchored
+    /// rows carry a uid. The uncapped companion to [`Database::list_unacked`],
+    /// so the review queue's capped item lists can report whole-queue counts.
+    pub fn count_unacked_by_anchor(
+        &self,
+        account_id: &str,
+        exclude_event_types: &[&str],
+    ) -> Result<(i64, i64)> {
+        let mut sql = String::from(
+            "SELECT
+                COALESCE(SUM(CASE WHEN uid IS NOT NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN uid IS NULL THEN 1 ELSE 0 END), 0)
+             FROM events
+             WHERE account_id = ?1 AND acked_at IS NULL",
+        );
+        if !exclude_event_types.is_empty() {
+            let placeholders = (0..exclude_event_types.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" AND event_type NOT IN ({placeholders})"));
+        }
+        let params_iter = std::iter::once(account_id).chain(exclude_event_types.iter().copied());
+        let mut stmt = self.conn().prepare(&sql)?;
+        Ok(
+            stmt.query_row(rusqlite::params_from_iter(params_iter), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?,
+        )
+    }
+
     /// Fetch a single event by id.
     pub fn get_event(&self, event_id: &str) -> Result<Option<Event>> {
         let mut stmt = self.conn().prepare(

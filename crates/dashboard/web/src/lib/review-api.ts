@@ -28,16 +28,31 @@ export interface ReviewDraftItem {
   action_base: string;
 }
 
+/**
+ * A terminally failed agent action (status `failed`, `error`, or `denied` —
+ * the store's ACTION_FAILURE_STATUSES whitelist). In-flight and unknown
+ * statuses never land here. Free-text `justification` stays server-side.
+ */
 export interface ReviewFailedAction {
   id: string;
   account_id: string;
   account_label: string;
   action_type: string;
   action_status: string;
-  justification: string;
   draft_id: string | null;
   draft_link: string | null;
   created_at: string;
+}
+
+/**
+ * A capped item list with its true total: `count` is the whole queue,
+ * `returned` how many items are present, `truncated` whether they differ.
+ */
+export interface CappedList<T> {
+  count: number;
+  returned: number;
+  truncated: boolean;
+  items: T[];
 }
 
 /** An unacked, non-routine event. Message-anchored ones land in needs_triage. */
@@ -92,8 +107,6 @@ export interface ReviewSnoozeItem {
   account_label: string;
   subject: string | null;
   return_at: string;
-  reason: string | null;
-  note: string | null;
   folder: string;
   uid: number;
   message_link: string;
@@ -107,8 +120,7 @@ export interface ReviewFailedAuth {
   account_id: string;
   account_label: string;
   backend: string;
-  reason: string;
-  retry_guidance: string | null;
+  status: 'auth_failed';
   created_at: string;
 }
 
@@ -118,7 +130,6 @@ export interface ReviewFailedWatch {
   account_label: string;
   folder: string;
   status: string;
-  failure_reason: string | null;
   last_heartbeat_at: string | null;
 }
 
@@ -126,7 +137,6 @@ export interface ReviewDeadRoute {
   id: string;
   account_id: string;
   account_label: string;
-  match_expr: string;
   enabled: boolean;
   dead: number;
 }
@@ -143,29 +153,40 @@ export interface ReviewResponse {
   decide_now: {
     count: number;
     drafts: {
+      /** True per-status totals, not capped item-list lengths. */
       counts: { pending_review: number; blocked: number };
+      returned: number;
+      truncated: boolean;
       items: ReviewDraftItem[];
     };
-    failed_actions: { count: number; items: ReviewFailedAction[] };
-    events: { count: number; items: ReviewEventItem[] };
+    failed_actions: CappedList<ReviewFailedAction>;
+    events: CappedList<ReviewEventItem>;
     proposed_rules: { count: number; items: ReviewProposedRule[] };
   };
   waiting: {
     count: number;
-    scheduled: { count: number; due: number; items: ReviewScheduledItem[] };
+    scheduled: {
+      count: number;
+      due: number;
+      returned: number;
+      truncated: boolean;
+      items: ReviewScheduledItem[];
+    };
     due_snoozes: { count: number; items: ReviewSnoozeItem[] };
     awaiting_reply: { count: number; items: ReviewSnoozeItem[] };
   };
   needs_triage: {
     count: number;
+    returned: number;
+    truncated: boolean;
     /** Truth-in-labeling: only durable store events, never a classifier. */
     source: 'durable_events';
     items: ReviewEventItem[];
   };
   operational_health: {
     count: number;
-    failed_auth: { count: number; items: ReviewFailedAuth[] };
-    failed_watches: { count: number; items: ReviewFailedWatch[] };
+    failed_auth: CappedList<ReviewFailedAuth>;
+    failed_watches: CappedList<ReviewFailedWatch>;
     dead_letters: { count: number; routes: ReviewDeadRoute[] };
   };
   generated_at: string;
