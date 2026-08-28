@@ -197,6 +197,23 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             }
         });
 
+        // Hourly Sent index sweep: keeps the cross-account Sent cache warm so
+        // the Sent box reads locally instead of fanning IMAP from the browser.
+        // First tick fires immediately, so the index populates on startup.
+        println!("Background Sent index sweep running every 3600s");
+        let sent_sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(e) =
+                    handlers::messages::run_sent_index_sweep(&sent_sweep_state).await
+                {
+                    tracing::warn!("sent index sweep error: {e}");
+                }
+            }
+        });
+
         // The durable webhook delivery executor interleaves DB reads/writes with
         // HTTP awaits and holds a non-Send rusqlite handle across those awaits,
         // so it cannot run on the multi-threaded runtime's `tokio::spawn` (which
@@ -334,6 +351,11 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route(
             "/messages/unified/refresh",
             post(handlers::messages::refresh_unified_inbox),
+        )
+        .route("/messages/sent", get(handlers::messages::sent_inbox))
+        .route(
+            "/messages/sent/refresh",
+            post(handlers::messages::refresh_sent_inbox),
         )
         .route("/accounts/{id}/messages", get(handlers::messages::list))
         .route(

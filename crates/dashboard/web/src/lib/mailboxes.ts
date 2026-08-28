@@ -42,29 +42,3 @@ export function isDraftsFolder(name: string | null | undefined): boolean {
   if (!name) return false;
   return DRAFTS_FOLDERS.has(name.toLowerCase());
 }
-
-/**
- * IMAP folder names that `provider::classify_folder` returns `"sent"` for.
- * Kept in sync by hand with crates/email/src/provider.rs — the Sent smart
- * mailbox resolves each account's real Sent folder through this set, so a
- * name missing here silently drops that account from the Sent list.
- */
-const SENT_FOLDERS = new Set([
-  'sent',
-  'sent mail',
-  'sent messages',
-  'sent items',
-  '[gmail]/sent mail',
-  'inbox.sent',
-  'inbox.sent messages',
-  'inbox/sent',
-  'inbox/sent mail',
-  'inbox/sent messages',
-  'inbox/sent items'
-]);
-
-/** True when `name` is a Sent mailbox, matching the backend classification. */
-export function isSentFolder(name: string | null | undefined): boolean {
-  if (!name) return false;
-  return SENT_FOLDERS.has(name.toLowerCase());
-}

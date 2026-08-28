@@ -17,6 +17,8 @@ const { apiMock } = vi.hoisted(() => ({
     stats: vi.fn(),
     unifiedInbox: vi.fn(),
     refreshUnifiedInbox: vi.fn(),
+    sentInbox: vi.fn(),
+    refreshSentInbox: vi.fn(),
     message: vi.fn(),
     verifyAccount: vi.fn(),
     deleteAccount: vi.fn(),
@@ -973,59 +975,62 @@ describe('Box-specific wired boxes', () => {
     await waitFor(() => expect(screen.getByText('No drafts')).toBeInTheDocument());
   });
 
-  it('sent: loads each account Sent folder and renders the merged list', async () => {
+  it('sent: renders the indexed cross-account list without any IMAP fan-out', async () => {
     pageState.params = { box: 'sent' };
     pageState.url = new URL('http://localhost/v2/mail/sent') as typeof pageState.url;
-    apiMock.listAccounts.mockResolvedValue({
-      accounts: [{
-        id: 'acct-ok', name: 'Work', username: 'work@example.com',
-        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
-        imap_host: 'imap.example.com', imap_port: 993
-      }]
-    });
-    apiMock.folders.mockResolvedValue({
-      folders: [
-        { folder: 'INBOX', exists: 5, recent: 0, unseen: 1 },
-        { folder: 'Sent', exists: 2, recent: 0, unseen: 0 }
-      ],
-      snoozed_virtual: { folder: 'Snoozed', exists: 0, recent: 0, unseen: null, virtual: true }
-    });
-    apiMock.folderMessages.mockResolvedValue({
+    apiMock.sentInbox.mockResolvedValue({
+      scope: 'sent', status: 'ok', folder: 'sent', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [],
       messages: [{
         uid: 41, message_id: '<sent@x>', from_addr: 'work@example.com',
         to_addr: 'bob@example.com', subject: 'Sent message subject',
-        date: '2026-07-09T10:00:00Z', flags: ['\\Seen'], size: 10, unread: false
+        date: '2026-07-09T10:00:00Z', flags: ['\\Seen'], size: 10, unread: false,
+        account_id: 'acct-ok', account_username: 'work@example.com',
+        account_display_name: 'Work Mail', folder: '[Gmail]/Sent Mail',
+        uidvalidity: 1, snippet: null, thread_id: null,
+        indexed_at: '2026-07-09T10:01:00Z', index_freshness: 'fresh'
       }]
     });
 
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Sent message subject')).toBeInTheDocument());
-    // Loaded from the account's real Sent folder, never a hardcoded name guess.
-    expect(apiMock.folderMessages).toHaveBeenCalledWith('acct-ok', 'Sent');
-    // The unwired placeholder must be gone.
+    // Served from the index — the read path never lists folders or fans out
+    // per-account folder fetches from the browser.
+    expect(apiMock.sentInbox).toHaveBeenCalled();
+    expect(apiMock.folders).not.toHaveBeenCalled();
+    expect(apiMock.folderMessages).not.toHaveBeenCalled();
+    // A fresh index needs no server-side refresh round-trip.
+    expect(apiMock.refreshSentInbox).not.toHaveBeenCalled();
     expect(screen.queryByText(/doesn't load its own list/)).not.toBeInTheDocument();
   });
 
-  it('sent: renders empty state (not the unwired placeholder) when Sent is empty', async () => {
+  it('sent: a missing index triggers one server-side refresh, then renders it', async () => {
     pageState.params = { box: 'sent' };
     pageState.url = new URL('http://localhost/v2/mail/sent') as typeof pageState.url;
-    apiMock.listAccounts.mockResolvedValue({
-      accounts: [{
-        id: 'acct-ok', name: 'Work', username: 'work@example.com',
-        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
-        imap_host: 'imap.example.com', imap_port: 993
+    apiMock.sentInbox.mockResolvedValue({
+      scope: 'sent', status: 'error', folder: 'sent', limit: 50,
+      unread_count: 0, freshness: 'unavailable', errors: [], messages: [],
+      // Never-swept index: the account reports unavailable, which the
+      // blanked-out trigger treats as worth one server-side refresh.
+      accounts: [{ account_id: 'acct-ok', freshness: 'unavailable' }]
+    });
+    apiMock.refreshSentInbox.mockResolvedValue({
+      scope: 'sent', status: 'ok', folder: 'sent', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [],
+      messages: [{
+        uid: 9, message_id: '<r@x>', from_addr: 'work@example.com',
+        to_addr: 'carol@example.com', subject: 'Refreshed sent subject',
+        date: '2026-07-09T10:00:00Z', flags: [], size: 10, unread: false,
+        account_id: 'acct-ok', account_username: 'work@example.com',
+        account_display_name: null, folder: 'INBOX.Sent',
+        uidvalidity: 1, snippet: null, thread_id: null,
+        indexed_at: '2026-07-09T10:01:00Z', index_freshness: 'fresh'
       }]
     });
-    apiMock.folders.mockResolvedValue({
-      folders: [{ folder: 'INBOX.Sent', exists: 0, recent: 0, unseen: 0 }],
-      snoozed_virtual: { folder: 'Snoozed', exists: 0, recent: 0, unseen: null, virtual: true }
-    });
-    apiMock.folderMessages.mockResolvedValue({ messages: [] });
 
     render(MailLayout, { children: emptyChildren });
-    await waitFor(() => expect(screen.getByText('No sent messages')).toBeInTheDocument());
-    expect(apiMock.folderMessages).toHaveBeenCalledWith('acct-ok', 'INBOX.Sent');
-    expect(screen.queryByText(/doesn't load its own list/)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Refreshed sent subject')).toBeInTheDocument());
+    expect(apiMock.refreshSentInbox).toHaveBeenCalled();
   });
 });
 

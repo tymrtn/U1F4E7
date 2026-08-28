@@ -195,6 +195,114 @@ impl Database {
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
+    /// One page of cached summaries across accounts for a detected special-use
+    /// mailbox (`detected_folders.folder_type`, e.g. "sent"). Mirrors
+    /// `list_indexed_message_summaries_page`, except each account contributes
+    /// rows from ITS detected folder — special-use names differ per provider
+    /// ([Gmail]/Sent Mail, INBOX.Sent, …), so no single literal folder name can
+    /// scope the listing. Accounts with no detected folder simply contribute
+    /// nothing.
+    pub fn list_indexed_detected_folder_page(
+        &self,
+        folder_type: &str,
+        limit: u32,
+        cursor: Option<&UnifiedPageCursor>,
+    ) -> Result<Vec<IndexedMessageSummary>> {
+        let has_cursor = i64::from(cursor.is_some());
+        let cursor_epoch = cursor
+            .map(|c| c.date_epoch.unwrap_or(0))
+            .unwrap_or(i64::MAX);
+        let cursor_uid = cursor.map(|c| i64::from(c.uid)).unwrap_or(i64::MAX);
+        let cursor_account = cursor.map(|c| c.account_id.clone()).unwrap_or_default();
+        let mut stmt = self.conn().prepare(
+            "SELECT ims.account_id, a.username, a.display_name, ims.folder,
+                    ims.uidvalidity, ims.uid, ims.message_id, ims.from_addr,
+                    ims.to_addr, ims.subject, ims.date, ims.flags_json, ims.size,
+                    ims.snippet, ims.thread_id, ims.indexed_at,
+                    CASE
+                        WHEN ims.indexed_at IS NULL THEN 'unknown'
+                        WHEN strftime('%s','now') - strftime('%s', ims.indexed_at) <= ?2 THEN 'fresh'
+                        WHEN strftime('%s','now') - strftime('%s', ims.indexed_at) <= ?3 THEN 'stale'
+                        ELSE 'expired'
+                    END AS freshness,
+                    ims.date_epoch
+             FROM indexed_message_summaries ims
+             INNER JOIN accounts a ON a.id = ims.account_id
+             INNER JOIN detected_folders df
+               ON df.account_id = ims.account_id
+              AND df.folder_type = ?1
+              AND df.folder_name = ims.folder
+             LEFT JOIN message_index_state mis
+               ON mis.account_id = ims.account_id AND mis.folder = ims.folder
+             WHERE mis.last_error IS NULL
+               AND (?5 = 0
+                    OR (COALESCE(ims.date_epoch, 0), ims.uid, ims.account_id)
+                       < (?6, ?7, ?8))
+             ORDER BY COALESCE(ims.date_epoch, 0) DESC, ims.uid DESC, ims.account_id DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                folder_type,
+                FRESH_AFTER_SECONDS,
+                STALE_AFTER_SECONDS,
+                limit as i64,
+                has_cursor,
+                cursor_epoch,
+                cursor_uid,
+                cursor_account,
+            ],
+            map_indexed_message_summary,
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Per-account cache metadata for a detected special-use mailbox. Mirrors
+    /// `list_message_index_account_freshness` with the folder resolved through
+    /// `detected_folders` per account; an account with no detected folder
+    /// reports 'missing' (never detected/indexed), same as never-indexed.
+    pub fn list_message_index_detected_folder_freshness(
+        &self,
+        folder_type: &str,
+    ) -> Result<Vec<MessageIndexAccountFreshness>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT a.id, COALESCE(df.folder_name, ?1) AS folder,
+                    CASE WHEN mis.last_error IS NOT NULL THEN 0 ELSE COUNT(ims.uid) END AS message_count,
+                    COALESCE(mis.indexed_at, MAX(ims.indexed_at)) AS indexed_at,
+                    CASE
+                        WHEN mis.last_error IS NOT NULL THEN 'unavailable'
+                        WHEN COALESCE(mis.indexed_at, MAX(ims.indexed_at)) IS NULL THEN 'missing'
+                        WHEN strftime('%s','now') - strftime('%s', COALESCE(mis.indexed_at, MAX(ims.indexed_at))) <= ?2 THEN 'fresh'
+                        WHEN strftime('%s','now') - strftime('%s', COALESCE(mis.indexed_at, MAX(ims.indexed_at))) <= ?3 THEN 'stale'
+                        ELSE 'expired'
+                    END AS freshness,
+                    mis.last_error
+             FROM accounts a
+             LEFT JOIN detected_folders df
+               ON df.account_id = a.id AND df.folder_type = ?1
+             LEFT JOIN message_index_state mis
+               ON mis.account_id = a.id AND mis.folder = df.folder_name
+             LEFT JOIN indexed_message_summaries ims
+               ON ims.account_id = a.id AND ims.folder = df.folder_name
+             GROUP BY a.id, mis.indexed_at, mis.last_error
+             ORDER BY a.created_at",
+        )?;
+        let rows = stmt.query_map(
+            params![folder_type, FRESH_AFTER_SECONDS, STALE_AFTER_SECONDS],
+            |row| {
+                Ok(MessageIndexAccountFreshness {
+                    account_id: row.get(0)?,
+                    folder: row.get(1)?,
+                    message_count: row.get::<_, i64>(2)? as usize,
+                    indexed_at: row.get(3)?,
+                    freshness: row.get(4)?,
+                    last_error: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
     /// Per-account cache metadata for partial/stale dashboard status.
     pub fn list_message_index_account_freshness(
         &self,
@@ -410,6 +518,77 @@ mod tests {
             )
             .unwrap();
         assert!(page3.is_empty(), "no third page");
+    }
+
+    // ── detected-folder listing (sent smart mailbox) ───────────────────
+
+    #[test]
+    fn detected_folder_page_merges_each_accounts_own_folder_name() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-gmail", "g@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-dovecot", "d@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-undetected", "u@example.test")
+            .unwrap();
+        db.set_detected_folder("acct-gmail", "sent", "[Gmail]/Sent Mail")
+            .unwrap();
+        db.set_detected_folder("acct-dovecot", "sent", "INBOX.Sent")
+            .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-gmail",
+            "[Gmail]/Sent Mail",
+            1,
+            &[msg(7, "Sun, 23 Aug 2026 10:00:00 +0000", "gmail-sent")],
+        )
+        .unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-dovecot",
+            "INBOX.Sent",
+            1,
+            &[msg(9, "Sat, 22 Aug 2026 10:00:00 +0000", "dovecot-sent")],
+        )
+        .unwrap();
+        // Same account also has an indexed INBOX — must never leak into sent.
+        db.upsert_indexed_message_summaries(
+            "acct-gmail",
+            "INBOX",
+            1,
+            &[msg(1, "Mon, 24 Aug 2026 10:00:00 +0000", "inbox-noise")],
+        )
+        .unwrap();
+
+        let rows = db.list_indexed_detected_folder_page("sent", 10, None).unwrap();
+        let subjects: Vec<&str> = rows.iter().map(|r| r.summary.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["gmail-sent", "dovecot-sent"]);
+        assert_eq!(rows[0].folder, "[Gmail]/Sent Mail");
+        assert_eq!(rows[1].folder, "INBOX.Sent");
+    }
+
+    #[test]
+    fn detected_folder_freshness_reports_missing_for_undetected_accounts() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-a", "a@example.test")
+            .unwrap();
+        db.test_insert_account_row("acct-b", "b@example.test")
+            .unwrap();
+        db.set_detected_folder("acct-a", "sent", "Sent").unwrap();
+        db.upsert_indexed_message_summaries(
+            "acct-a",
+            "Sent",
+            1,
+            &[msg(2, "Sun, 23 Aug 2026 10:00:00 +0000", "s")],
+        )
+        .unwrap();
+
+        let rows = db.list_message_index_detected_folder_freshness("sent").unwrap();
+        let a = rows.iter().find(|r| r.account_id == "acct-a").unwrap();
+        assert_eq!(a.freshness, "fresh");
+        assert_eq!(a.message_count, 1);
+        assert_eq!(a.folder, "Sent");
+        let b = rows.iter().find(|r| r.account_id == "acct-b").unwrap();
+        assert_eq!(b.freshness, "missing");
+        assert_eq!(b.message_count, 0);
     }
 
     #[test]

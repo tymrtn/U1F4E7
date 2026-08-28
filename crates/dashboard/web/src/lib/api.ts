@@ -627,6 +627,32 @@ export const api = {
     return request('/messages/unified/refresh', { ...o, method: 'POST', query: { limit } });
   },
 
+  /**
+   * GET /api/messages/sent — cross-account Sent from the server's local index
+   * (kept warm by an hourly sweep; no per-account IMAP fan-out on read). Same
+   * response shape as the unified inbox; each row's `folder` is that account's
+   * real Sent folder.
+   */
+  sentInbox(
+    limit = 50,
+    before?: UnifiedNextCursor | null,
+    o?: RequestOptions
+  ): Promise<UnifiedInboxResponse> {
+    return request('/messages/sent', {
+      ...o,
+      query: {
+        limit,
+        before_epoch: before?.date_epoch ?? undefined,
+        before_uid: before?.uid,
+        before_account: before?.account_id
+      }
+    });
+  },
+
+  refreshSentInbox(limit = 50, o?: RequestOptions): Promise<UnifiedInboxResponse> {
+    return request('/messages/sent/refresh', { ...o, method: 'POST', query: { limit } });
+  },
+
   folderMessages(
     accountId: string,
     folder: string,

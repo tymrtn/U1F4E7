@@ -13,7 +13,7 @@
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
-  import { mailboxBySlug, isSentFolder } from '$lib/mailboxes';
+  import { mailboxBySlug } from '$lib/mailboxes';
   import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
   import { folderHints } from '$lib/folder-hints.svelte';
   import { SelectionStore } from '$lib/selection.svelte';
@@ -31,7 +31,6 @@
     type Draft,
     type SnoozedItem,
     type SearchMessageSummary,
-    type MessageSummary,
     type FolderStats,
     type ComposeResponse,
     type Account,
@@ -80,7 +79,9 @@
   let unifiedLoadingMore = $state(false);
   let drafts = $state<Draft[]>([]);
   let snoozed = $state<SnoozedItem[]>([]);
-  let sentMessages = $state<SentHit[]>([]);
+  let sentMessages = $state<UnifiedInboxMessage[]>([]);
+  let sentNextCursor = $state<UnifiedNextCursor | null>(null);
+  let sentLoadingMore = $state(false);
   let listErrors = $state<UnifiedInboxError[]>([]);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
@@ -92,12 +93,6 @@
    *  here as results are merged. Bulk actions and navigation both need the real
    *  identity, never a placeholder. */
   type SearchHit = SearchMessageSummary & { account_id: string; folder: string };
-
-  /** A Sent-folder row tagged with the account it came from and the account's
-   *  real Sent folder name (folder names differ per provider — [Gmail]/Sent
-   *  Mail, INBOX.Sent, …), so reader links and bulk actions dispatch against
-   *  the true identity. `unread` rides along from the list endpoint. */
-  type SentHit = MessageSummary & { unread?: boolean; account_id: string; folder: string };
 
   /** The mailbox `runSearch` searches. Tagged onto every hit so links and bulk
    *  dispatch name the folder the UIDs are actually scoped to, rather than
@@ -284,36 +279,54 @@
     }
   }
 
+  function applySent(res: {
+    messages: UnifiedInboxMessage[];
+    next_cursor?: UnifiedNextCursor | null;
+  }) {
+    sentMessages = res.messages;
+    sentNextCursor = res.next_cursor ?? null;
+    folderHints.remember(res.messages);
+  }
+
+  /** Sent reads the server's local index (kept warm by an hourly sweep), so
+   *  opening the box never fans IMAP from the browser. A missing/stale index
+   *  triggers one server-side refresh, same contract as the unified inbox. */
   async function loadSent() {
-    loading = true;
+    loading = sentMessages.length === 0;
     error = null;
     try {
-      const { accounts } = await api.listAccounts();
-      const allSent: SentHit[] = [];
-      await Promise.all(
-        accounts.map(async (acct) => {
-          try {
-            const { folders } = await api.folders(acct.id);
-            const sentFolder = (folders ?? []).find((f) => isSentFolder(f.folder))?.folder;
-            if (!sentFolder) return;
-            const res = await api.folderMessages(acct.id, sentFolder);
-            allSent.push(
-              ...res.messages.map((m) => ({ ...m, account_id: acct.id, folder: sentFolder }))
-            );
-          } catch {
-            // best-effort
-          }
-        })
-      );
-      allSent.sort(
-        (a, b) => (Date.parse(b.date ?? '') || 0) - (Date.parse(a.date ?? '') || 0)
-      );
-      sentMessages = allSent;
+      const res = await api.sentInbox(50);
+      applySent(res);
+      loading = false;
+      if (unifiedNeedsRefresh(res)) {
+        const refreshed = await api.refreshSentInbox(50);
+        applySent(refreshed);
+      }
     } catch (e) {
       const err = e as EnvelopeApiError;
       error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load sent messages.' };
     } finally {
       loading = false;
+    }
+  }
+
+  /** Next Sent page via the keyset cursor, deduped by account:uid like the
+   *  unified pager. */
+  async function loadMoreSent() {
+    const cursor = sentNextCursor;
+    if (!cursor || sentLoadingMore) return;
+    sentLoadingMore = true;
+    try {
+      const res = await api.sentInbox(50, cursor);
+      const seen = new Set(sentMessages.map((m) => `${m.account_id}:${m.uid}`));
+      const fresh = res.messages.filter((m) => !seen.has(`${m.account_id}:${m.uid}`));
+      sentMessages = [...sentMessages, ...fresh];
+      sentNextCursor = res.next_cursor ?? null;
+      folderHints.remember(fresh);
+    } catch {
+      // Keep the loaded rows; the button stays for a retry.
+    } finally {
+      sentLoadingMore = false;
     }
   }
 
@@ -477,12 +490,6 @@
     return m.from_addr || m.account_username;
   }
 
-  /** Folder-list rows carry only an account id; chip the human identity the
-   *  way the unified list does (display name, then username). */
-  const accountChipById = $derived(
-    new Map(allAccounts.map((a) => [a.id, a.display_name || a.username || a.name]))
-  );
-
   const orderedUnifiedKeys = $derived(
     unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
   );
@@ -536,7 +543,7 @@
     return idx;
   });
 
-  /** Sent rows carry the account and real Sent folder tagged in `loadSent`,
+  /** Sent rows carry each account's real Sent folder from the server index,
    *  so bulk actions (move/flag/delete…) dispatch against each row's actual
    *  mailbox rather than a hardcoded folder name. */
   const sentMessageIndex = $derived.by(() => {
@@ -953,10 +960,10 @@
                   subject: m.subject || '(no subject)',
                   from: m.to_addr || m.from_addr,
                   date: m.date,
-                  snippet: null,
+                  snippet: m.snippet,
                   unread: false,
                   starred: isStarred(m.uid, m.account_id, m.flags),
-                  accountChip: accountChipById.get(m.account_id) ?? m.account_id,
+                  accountChip: m.account_display_name || m.account_username,
                   href: `${base}/mail/sent/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
@@ -965,6 +972,18 @@
             </li>
           {/each}
         </ul>
+        {#if sentNextCursor}
+          <div class="load-more-row">
+            <button
+              class="load-more-btn"
+              type="button"
+              disabled={sentLoadingMore}
+              onclick={loadMoreSent}
+            >
+              {sentLoadingMore ? 'Loading…' : 'Load more'}
+            </button>
+          </div>
+        {/if}
       {/if}
 
     {:else}
