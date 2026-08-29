@@ -65,6 +65,34 @@ The v1 contract covers:
 - delivery/watch health: `watch_status`
 - snooze management: `snooze`
 
+## Authored bodies and literal escape sequences (`input_normalization`)
+
+An agent composing through a shell writes `--body "Hi,\n\nThanks"` and the shell delivers the two characters `\` and `n` — not a line break. The same accident reaches the JSON surfaces when a caller double-encodes a string. Left alone, the draft is appended, reviewed, and sent with visible `\n` markers in the text.
+
+Every surface that accepts an authored body (`draft create`/`reply`/`forward`/`edit`, `send`, and the MCP tools `send`, `reply`, `create_reply_draft`, `create_forward_draft`, `modify_draft`) checks `body` and `html` before the message is built:
+
+- **No real line break in the text, and literal `\n` sequences present** — unambiguously an encoding accident. Envelope decodes them (`\n`, `\r`, `\r\n` become line breaks; `\\` becomes one backslash) and reports `applied: true`.
+- **Literal `\n` sequences alongside real line breaks** — ambiguous (the text may be *about* escape sequences). Nothing is rewritten; the result reports `applied: false` with `newlines_left_as_written`.
+- **Clean input** — no `input_normalization` key at all.
+
+`\t` is never decoded: a tab is rare in an email body and common in a Windows path (`C:\temp`). To keep a literal backslash-n in the text of a body that is being repaired, write `\\n`.
+
+The report is additive and appears only when there is something to say:
+
+```json
+"input_normalization": {
+  "applied": true,
+  "fields": [
+    {"field": "body", "action": "decoded", "newlines_converted": 4,
+     "backslashes_unescaped": 0, "newlines_left_as_written": 0}
+  ],
+  "explanation": "body: 4 literal \\n sequences arrived as text instead of line breaks and were decoded",
+  "verify": "Open the draft and read the final text before you report this task complete to your operator — escaped input usually means the rest of the body was assembled the same way."
+}
+```
+
+Agents must treat the presence of this block as a signal to re-read the draft (`envelope draft show <id> --json`, or the review URL) and confirm the rendered text before reporting the task complete.
+
 ## Read-only list/search limits
 
 Agent-facing CLI/MCP `inbox` and `search` surfaces default to `limit: 25`, accept `limit: 1..=1000`, and reject out-of-range limits before opening an IMAP connection. Dashboard aggregate endpoints keep their own lower defaults/caps and are not governed by this agent limit.

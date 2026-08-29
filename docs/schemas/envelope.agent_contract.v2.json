@@ -1548,7 +1548,8 @@
         "json_output": true
       },
       "compatibility_notes": [
-        "No output fields contain SMTP credentials or attachment bytes."
+        "No output fields contain SMTP credentials or attachment bytes.",
+        "A body whose line breaks arrived as the literal characters \\ and n is repaired before RFC822/SMTP, and the result carries input_normalization saying so."
       ],
       "input_schema": {
         "additionalProperties": false,
@@ -1730,6 +1731,13 @@
             "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary",
             "type": "object"
           },
+          "input_normalization": {
+            "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "message_id": {
             "description": "SMTP Message-ID when sent immediately; null/absent on a queued, scheduled, or draft-only outcome",
             "type": [
@@ -1901,7 +1909,8 @@
         "json_output": true
       },
       "compatibility_notes": [
-        "Agent send flows should draft first, then send only after explicit human approval."
+        "Agent send flows should draft first, then send only after explicit human approval.",
+        "A body whose line breaks arrived as the literal characters \\ and n (shell quoting, or a double-encoded JSON string) is repaired before the draft is built, and the result carries input_normalization saying so."
       ],
       "input_schema": {
         "additionalProperties": false,
@@ -1987,6 +1996,13 @@
             "description": "IMAP Drafts UID when present",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "input_normalization": {
+            "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete.",
+            "type": [
+              "object",
               "null"
             ]
           },

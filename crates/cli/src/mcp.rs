@@ -10,6 +10,7 @@ use crate::commands::agent_context::{self, AgentContext};
 use crate::commands::attachments::{
     attachment_summaries, decode_attachments, snapshot_attachments,
 };
+use crate::commands::authored_body::AuthoredBody;
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
 use crate::commands::drafts::{
     SentMailProofUi, sent_copy_convenience_objects, sent_mail_proof_json,
@@ -320,7 +321,10 @@ async fn handle_tool_call(
         }
         return Err(denial);
     }
-    let result = dispatch_tool_call(tool_name, params, backend, ctx).await?;
+    let mut result = dispatch_tool_call(tool_name, params, backend, ctx).await?;
+    // A repaired (or suspicious) authored body is reported on the tool result
+    // itself, centrally, so no draft-producing handler can drop the notice.
+    crate::commands::authored_body::attach_tool_notice(tool_name, params, &mut result);
     if agent_context::agent_id_of(ctx).is_some() && DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
         if let Ok(db) = Database::open_default() {
             if let Some(acct) = audit_account_id(&db, params) {
@@ -509,8 +513,14 @@ async fn handle_send(
         .get("subject")
         .and_then(|v| v.as_str())
         .ok_or("subject is required")?;
-    let body = params.get("body").and_then(|v| v.as_str());
-    let html = params.get("html").and_then(|v| v.as_str());
+    // Repair literal escape sequences before the body reaches RFC822, the
+    // draft record, or SMTP. The notice rides back on the tool result.
+    let authored = AuthoredBody::new(
+        params.get("body").and_then(|v| v.as_str()),
+        params.get("html").and_then(|v| v.as_str()),
+    );
+    let body = authored.text();
+    let html = authored.html();
     let from = params.get("from").and_then(|v| v.as_str());
     let from = crate::commands::drafts::validate_from_override(from).map_err(|e| e.to_string())?;
     let cc = params.get("cc").and_then(|v| v.as_str());
@@ -958,11 +968,12 @@ async fn handle_reply(
         .get("uid")
         .and_then(|v| v.as_u64())
         .ok_or("uid is required")? as u32;
-    let body = params
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or("body is required")?;
-    let html = params.get("html").and_then(|v| v.as_str());
+    let authored = AuthoredBody::new(
+        params.get("body").and_then(|v| v.as_str()),
+        params.get("html").and_then(|v| v.as_str()),
+    );
+    let body = authored.text().ok_or("body is required")?;
+    let html = authored.html();
     let reply_all = params
         .get("reply_all")
         .and_then(|v| v.as_bool())
@@ -1325,8 +1336,7 @@ async fn handle_create_reply_draft(
         .get("add_signature")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let body = optional_str(params, "body");
-    let html = optional_str(params, "html");
+    let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
@@ -1337,8 +1347,7 @@ async fn handle_create_reply_draft(
         uid,
         folder,
         reply_all,
-        body,
-        html,
+        &authored,
         add_signature,
         &attach_paths,
     )
@@ -1360,8 +1369,7 @@ async fn handle_create_forward_draft(
         .get("add_signature")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let body = optional_str(params, "body");
-    let html = optional_str(params, "html");
+    let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
     let include_attachments = params
         .get("include_attachments")
@@ -1376,8 +1384,7 @@ async fn handle_create_forward_draft(
         uid,
         folder,
         to,
-        body,
-        html,
+        &authored,
         add_signature,
         &attach_paths,
         include_attachments,
@@ -1400,6 +1407,8 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
+
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
     let draft = crate::commands::drafts::modify_draft(
@@ -1407,8 +1416,7 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
         &creds,
         id,
         optional_str(params, "from"),
-        optional_str(params, "body"),
-        optional_str(params, "html"),
+        &authored,
         optional_str(params, "to"),
         optional_str(params, "cc"),
         optional_str(params, "bcc"),

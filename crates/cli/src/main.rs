@@ -156,7 +156,8 @@ enum Commands {
         /// Subject line
         #[arg(long)]
         subject: String,
-        /// Plain-text body
+        /// Plain-text body. Pass real line breaks — a shell-quoted \n arrives as
+        /// literal text, which Envelope repairs and reports.
         #[arg(long)]
         body: Option<String>,
         /// HTML body
@@ -802,7 +803,8 @@ enum DraftCmd {
         /// Subject
         #[arg(long)]
         subject: Option<String>,
-        /// Body text
+        /// Body text. Pass real line breaks — a shell-quoted \n arrives as
+        /// literal text, which Envelope repairs and reports.
         #[arg(long)]
         body: Option<String>,
         /// Account ID or email
@@ -838,7 +840,7 @@ enum DraftCmd {
         /// Reply to all recipients (excludes self from Cc)
         #[arg(long)]
         all: bool,
-        /// Agent-authored reply body (plain text)
+        /// Agent-authored reply body (plain text; a shell-quoted \n is repaired and reported)
         #[arg(long)]
         body: Option<String>,
         /// Agent-authored reply body (HTML)
@@ -864,7 +866,7 @@ enum DraftCmd {
         /// Recipient(s) for the forward
         #[arg(long)]
         to: Option<String>,
-        /// Agent-authored intro body (plain text)
+        /// Agent-authored intro body (plain text; a shell-quoted \n is repaired and reported)
         #[arg(long)]
         body: Option<String>,
         /// Agent-authored intro body (HTML)
@@ -890,7 +892,7 @@ enum DraftCmd {
         /// Override the From header (sender identity). SMTP auth still uses --account credentials.
         #[arg(long)]
         from: Option<String>,
-        /// New authored body (plain text)
+        /// New authored body (plain text; a shell-quoted \n is repaired and reported)
         #[arg(long)]
         body: Option<String>,
         /// New authored body (HTML)

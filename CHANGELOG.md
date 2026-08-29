@@ -5,6 +5,23 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] — 2026-08-28
+
+- fix(drafts,send): an authored body whose line breaks arrived as the literal
+  characters `\` and `n` is repaired before the message is built. A shell hands
+  `--body "Hi,\n\nThanks"` to Envelope as ordinary text, and the draft was
+  appended, reviewed, and sent with visible `\n` markers standing where the
+  paragraph breaks belonged. Every surface that accepts a body — CLI `draft
+  create` / `reply` / `forward` / `edit`, `send`, and the MCP tools behind them
+  — now decodes those sequences when the text carries no real line break at
+  all, and leaves them exactly as written when real line breaks are already
+  present, since the text may be *about* escape sequences. Either way the
+  result carries an additive `input_normalization` block naming what changed
+  and telling the agent to read the finished draft before reporting the task
+  complete to its operator. `\t` is never decoded, so a Windows path survives;
+  write `\\n` to keep a literal backslash-n in a body that is being repaired.
+  Details in `docs/agent-contract.md`.
+
 ## [1.1.0] — 2026-08-26
 
 This release folds the dogfood dev builds since 1.0.12 (install labels
