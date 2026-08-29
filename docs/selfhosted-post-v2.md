@@ -89,8 +89,8 @@ Outbound mail doesn't go straight out. A send queues into an outbox with a coold
 - Localhost web dashboard (`envelope serve`, includes an Agent Cockpit for reviewing/approving drafts)
 - Draft management: create/list/send/discard
 - Rules engine (`envelope rule create`) and snooze (`envelope snooze set`)
-- MCP server with 22 tools for Claude Code / Cursor / Zed (`envelope mcp --config`)
-- Single static binary (~13MB on aarch64-apple-darwin)
+- MCP server with 23 tools for Claude Code / Cursor / Zed (`envelope mcp --config`)
+- Single static binary (~14MB on aarch64-apple-darwin)
 
 ### What it's NOT
 

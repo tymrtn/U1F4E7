@@ -9,6 +9,7 @@
 # negation to work, hence the three-line pattern.
 /dist/*
 !/dist/systemd
+!/dist/install.sh
 **/*.rs.bk
 *.swp
 *.swo
