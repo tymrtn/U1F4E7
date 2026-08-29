@@ -13,6 +13,7 @@ pub mod compose;
 pub mod discovery;
 pub mod draft_cleanup;
 pub mod errors;
+pub mod escapes;
 pub mod event_delivery;
 pub mod event_pipeline;
 pub mod event_types;

@@ -299,11 +299,15 @@ fn surfaces() -> Value {
                 "draft_id": string("Local draft id when scheduled or draft-only"),
                 "to": string("Recipient address"),
                 "subject": string("Subject"),
-                "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view)"})
+                "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view)"}),
+                "input_normalization": json!({"type": ["object", "null"], "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete."}),
             }),
             json!([]),
         ),
-        vec!["No output fields contain SMTP credentials or attachment bytes."],
+        vec![
+            "No output fields contain SMTP credentials or attachment bytes.",
+            "A body whose line breaks arrived as the literal characters \\ and n is repaired before RFC822/SMTP, and the result carries input_normalization saying so.",
+        ],
     ));
     items.push(surface_entry(
         "thread",
@@ -360,11 +364,15 @@ fn surfaces() -> Value {
                 "sent_message_url": string("Dashboard URL for the sent message when resolved"),
                 "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted."}),
                 "provider_sent_copy": json!({"type": ["object", "null"], "description": "Provider-created/auto-filed Sent copy proof when applicable; null otherwise."}),
-                "client_appended_copy": json!({"type": ["object", "null"], "description": "Envelope-created client-side Sent archive copy when applicable; not independent delivery proof."})
+                "client_appended_copy": json!({"type": ["object", "null"], "description": "Envelope-created client-side Sent archive copy when applicable; not independent delivery proof."}),
+                "input_normalization": json!({"type": ["object", "null"], "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete."}),
             }),
             json!([]),
         ),
-        vec!["Agent send flows should draft first, then send only after explicit human approval."],
+        vec![
+            "Agent send flows should draft first, then send only after explicit human approval.",
+            "A body whose line breaks arrived as the literal characters \\ and n (shell quoting, or a double-encoded JSON string) is repaired before the draft is built, and the result carries input_normalization saying so.",
+        ],
     ));
     items.push(surface_entry(
         "watch",

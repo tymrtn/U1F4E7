@@ -16,6 +16,7 @@ use envelope_email_transport::{
 use std::str::FromStr;
 
 use super::attachments::{attachment_summaries, snapshot_attachments};
+use super::authored_body::{AuthoredBody, attach_notice};
 use super::common::setup_credentials;
 use super::datetime::parse_send_at;
 use super::drafts::{
@@ -53,6 +54,14 @@ fn attachment_metadata(attach_paths: &[String]) -> Vec<Attachment> {
         .collect()
 }
 
+/// Print a send result, carrying the input-normalization notice when the
+/// authored body needed repair. Every JSON outcome an agent can act on goes
+/// through here so the repair is never invisible.
+fn emit_json(mut value: serde_json::Value, authored: &AuthoredBody) {
+    attach_notice(&mut value, authored);
+    println!("{value}");
+}
+
 /// Send an email immediately, or schedule it for later with `--at`.
 #[tokio::main]
 pub async fn run(
@@ -79,6 +88,17 @@ pub async fn run(
     confirm_send_now: bool,
 ) -> Result<()> {
     check_new_re_subject_guard(Some(subject), false, confirm_new_re_subject, json)?;
+
+    // Repair a body whose line breaks arrived as literal `\n` text before it
+    // reaches the draft record, RFC822, or SMTP. In JSON mode the notice rides
+    // on the result object; in human mode it is printed here, up front, because
+    // the operator should see it whether or not the send goes through.
+    let authored = AuthoredBody::new(body, html);
+    let body = authored.text();
+    let html = authored.html();
+    if !json {
+        authored.print_notice(None);
+    }
 
     let (db, creds) = setup_credentials(account, backend)?;
     let from = validate_from_override(from)?;
@@ -117,8 +137,7 @@ pub async fn run(
             persist_from_override(&db, &draft.id, from)?;
             let attachment_summary = attachment_summaries(&draft_attachments);
             if json {
-                println!(
-                    "{}",
+                emit_json(
                     crate::commands::contract::send_body::cli_drafted(
                         serde_json::json!(mode),
                         &draft.id,
@@ -126,7 +145,8 @@ pub async fn run(
                         subject,
                         serde_json::json!(attachment_summary),
                         ui::draft_ui(&creds.account.id, &draft.id),
-                    )
+                    ),
+                    &authored,
                 );
             } else {
                 println!(
@@ -258,15 +278,15 @@ pub async fn run(
         )?;
 
         if json {
-            println!(
-                "{}",
+            emit_json(
                 crate::commands::contract::send_body::cli_scheduled_at(
                     &draft.id,
                     &send_at,
                     serde_json::json!(attachment_summaries(&scheduled_attachments)),
                     serde_json::json!(queued_attribution),
                     ui::draft_ui(&creds.account.id, &draft.id),
-                )
+                ),
+                &authored,
             );
         } else {
             println!("Scheduled for {send_at}. Draft ID: {}", draft.id);
@@ -353,8 +373,7 @@ pub async fn run(
             )?;
 
             if json {
-                println!(
-                    "{}",
+                emit_json(
                     crate::commands::contract::send_body::cli_queued(
                         serde_json::json!(mode),
                         &draft.id,
@@ -365,7 +384,8 @@ pub async fn run(
                         serde_json::json!(attachment_summaries(&queued_attachments)),
                         serde_json::json!(queued_attribution),
                         ui::draft_ui(&creds.account.id, &draft.id),
-                    )
+                    ),
+                    &authored,
                 );
             } else {
                 println!(
@@ -493,8 +513,7 @@ pub async fn run(
     let sent_ui = sent_mail_proof.ui(&creds.account.id);
 
     if json {
-        println!(
-            "{}",
+        emit_json(
             serde_json::json!({
                 "status": "sent",
                 "to": to,
@@ -515,7 +534,8 @@ pub async fn run(
                     "size": a.data.len(),
                 })).collect::<Vec<_>>(),
                 "ui": sent_ui,
-            })
+            }),
+            &authored,
         );
     } else {
         println!("Sent to {to}");

@@ -24,6 +24,7 @@ use mail_builder::headers::address::Address as BuilderAddress;
 use tracing::{info, warn};
 
 use super::attachments::{attachment_summaries, decode_attachments, snapshot_attachments};
+use super::authored_body::{AuthoredBody, attach_notice};
 use super::common::{resolve_account, setup_credentials};
 use super::re_subject_guard::check_new_re_subject_guard;
 use super::ui;
@@ -764,8 +765,7 @@ pub(crate) async fn create_reply_draft(
     uid: u32,
     folder: &str,
     reply_all: bool,
-    body: Option<&str>,
-    html: Option<&str>,
+    authored: &AuthoredBody,
     signature: bool,
     attach_paths: &[String],
 ) -> Result<Draft> {
@@ -806,8 +806,8 @@ pub(crate) async fn create_reply_draft(
         subject: headers.subject,
         in_reply_to: headers.in_reply_to,
         references: headers.references,
-        agent_text: body.unwrap_or("").to_string(),
-        agent_html: html.map(str::to_string),
+        agent_text: authored.text().unwrap_or("").to_string(),
+        agent_html: authored.html().map(str::to_string),
         signature,
         context: compose::build_reply_context(&parent),
         preview_source: compose::message_preview_source(&parent),
@@ -861,8 +861,7 @@ pub(crate) async fn create_forward_draft(
     uid: u32,
     folder: &str,
     to: Option<&str>,
-    body: Option<&str>,
-    html: Option<&str>,
+    authored: &AuthoredBody,
     signature: bool,
     attach_paths: &[String],
     include_attachments: bool,
@@ -899,8 +898,8 @@ pub(crate) async fn create_forward_draft(
         // Forwarding does not thread as a reply.
         in_reply_to: None,
         references: Vec::new(),
-        agent_text: body.unwrap_or("").to_string(),
-        agent_html: html.map(str::to_string),
+        agent_text: authored.text().unwrap_or("").to_string(),
+        agent_html: authored.html().map(str::to_string),
         signature,
         context: compose::build_forward_context(&parent),
         preview_source: compose::message_preview_source(&parent),
@@ -919,8 +918,7 @@ pub(crate) async fn modify_draft(
     creds: &AccountWithCredentials,
     id: &str,
     from: Option<&str>,
-    body: Option<&str>,
-    html: Option<&str>,
+    authored: &AuthoredBody,
     to: Option<&str>,
     cc: Option<&str>,
     bcc: Option<&str>,
@@ -965,7 +963,8 @@ pub(crate) async fn modify_draft(
     let context = context_from_metadata(&meta);
 
     // Agent body: override or keep prior authored content.
-    let agent_text = body
+    let agent_text = authored
+        .text()
         .map(str::to_string)
         .or_else(|| {
             meta.get("agent_body_text")
@@ -974,7 +973,8 @@ pub(crate) async fn modify_draft(
         })
         .or_else(|| draft.text_content.clone())
         .unwrap_or_default();
-    let agent_html = html
+    let agent_html = authored
+        .html()
         .map(str::to_string)
         .or_else(|| {
             meta.get("agent_body_html")
@@ -1275,9 +1275,15 @@ async fn modify_claimed_draft(
 }
 
 /// Build and print (or pretty-print) the consistent contextual-draft envelope.
-fn emit_draft_envelope(draft: &Draft, json: bool) {
+/// Print a draft envelope, carrying any input-normalization notice from the
+/// surface that authored it so the caller learns its body was repaired.
+fn emit_draft_envelope(draft: &Draft, json: bool, authored: Option<&AuthoredBody>) {
     if json {
-        println!("{}", draft_envelope_json(draft));
+        let mut envelope = draft_envelope_json(draft);
+        if let Some(authored) = authored {
+            attach_notice(&mut envelope, authored);
+        }
+        println!("{envelope}");
         return;
     }
     let meta = draft
@@ -1323,6 +1329,9 @@ fn emit_draft_envelope(draft: &Draft, json: bool) {
         println!("  IMAP:    synced (UID {})", draft.imap_uid.unwrap());
     } else {
         println!("  ⚠ IMAP:  saved locally only");
+    }
+    if let Some(authored) = authored {
+        authored.print_notice(Some(&draft_dashboard_url(&draft.account_id, &draft.id)));
     }
 }
 
@@ -1441,19 +1450,19 @@ pub async fn run_reply(
     attach_paths: &[String],
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let authored = AuthoredBody::new(body, html);
     let draft = create_reply_draft(
         &db,
         &creds,
         uid,
         folder,
         reply_all,
-        body,
-        html,
+        &authored,
         signature,
         attach_paths,
     )
     .await?;
-    emit_draft_envelope(&draft, json);
+    emit_draft_envelope(&draft, json, Some(&authored));
     Ok(())
 }
 
@@ -1477,20 +1486,20 @@ pub async fn run_forward(
     include_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let authored = AuthoredBody::new(body, html);
     let draft = create_forward_draft(
         &db,
         &creds,
         uid,
         folder,
         to,
-        body,
-        html,
+        &authored,
         signature,
         attach_paths,
         include_attachments,
     )
     .await?;
-    emit_draft_envelope(&draft, json);
+    emit_draft_envelope(&draft, json, Some(&authored));
     Ok(())
 }
 
@@ -1653,13 +1662,13 @@ pub async fn run_edit(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let resolved_id = resolve_edit_draft_id(&db, &creds, id).await?;
+    let authored = AuthoredBody::new(body, html);
     let draft = modify_draft(
         &db,
         &creds,
         &resolved_id,
         from,
-        body,
-        html,
+        &authored,
         to,
         cc,
         bcc,
@@ -1670,7 +1679,7 @@ pub async fn run_edit(
         clear_attachments,
     )
     .await?;
-    emit_draft_envelope(&draft, json);
+    emit_draft_envelope(&draft, json, Some(&authored));
     Ok(())
 }
 
@@ -1685,7 +1694,7 @@ pub fn run_show(id: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", draft_envelope_json(&draft));
     } else {
-        emit_draft_envelope(&draft, false);
+        emit_draft_envelope(&draft, false, None);
     }
     Ok(())
 }
@@ -1876,6 +1885,11 @@ pub async fn run_create(
 ) -> Result<()> {
     check_new_re_subject_guard(subject, in_reply_to.is_some(), confirm_new_re_subject, json)?;
 
+    // Check the authored body for encoding damage BEFORE it is built into
+    // RFC822, appended to the provider, or cached locally — the three copies
+    // must agree, and none of them should carry visible `\n` markers.
+    let authored = AuthoredBody::new(body, None);
+
     let (db, creds) = setup_credentials(account, backend)?;
 
     // Snapshot attachment bytes now so review/send preserve them even if the
@@ -1893,7 +1907,7 @@ pub async fn run_create(
         &from_addr,
         to,
         subject,
-        body,
+        authored.text(),
         cc,
         bcc,
         in_reply_to,
@@ -1914,7 +1928,7 @@ pub async fn run_create(
             &creds.account.id,
             to,
             subject,
-            body,
+            authored.text(),
             None, // html_content
             in_reply_to,
             cc,
@@ -1939,7 +1953,7 @@ pub async fn run_create(
     // the send-as identity and APPEND provenance even when post-APPEND UID
     // discovery missed, so a later edit knows an exact old copy may exist.
     let mut metadata = serde_json::json!({
-        "agent_body_text": body,
+        "agent_body_text": authored.text(),
         "agent_body_html": null,
         "signature_applied": false,
         "storage": {
@@ -1969,9 +1983,7 @@ pub async fn run_create(
     let dashboard_url = draft_dashboard_url(&creds.account.id, &draft.id);
 
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
+        let mut payload = serde_json::json!({
                 "id": draft.id,
                 "to": draft.to_addr,
                 "subject": draft.subject,
@@ -1994,8 +2006,9 @@ pub async fn run_create(
                 },
                 "warning": serde_json::Value::Null,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
-            })
-        );
+        });
+        attach_notice(&mut payload, &authored);
+        println!("{payload}");
     } else {
         println!("Draft created: {}", draft.id);
         println!("  To:      {}", draft.to_addr);
@@ -2024,6 +2037,7 @@ pub async fn run_create(
         } else {
             println!("  IMAP:    saved to {drafts_folder_name} (UID pending)");
         }
+        authored.print_notice(Some(&dashboard_url));
     }
 
     Ok(())
@@ -3604,8 +3618,7 @@ mod tests {
             &creds,
             &draft.id,
             Some(alias),
-            Some("new body"),
-            Some("<p>new body</p>"),
+            &AuthoredBody::new(Some("new body"), Some("<p>new body</p>")),
             None,
             None,
             None,
@@ -3673,8 +3686,7 @@ mod tests {
             &creds,
             &draft.id,
             None,
-            None,
-            None,
+            &AuthoredBody::new(None, None),
             None,
             None,
             None,
