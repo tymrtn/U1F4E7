@@ -67,7 +67,7 @@ envelope inbox --json | jq '.[0].subject'
 envelope search "FROM boss@co.com SINCE 01-Mar-2026" --json
 ```
 
-It also runs as an MCP server (22 tools — inbox, search, send, reply, draft management, rules, snooze, and the agent/policy surface above) that Claude Code, Cursor, or Zed can attach to directly:
+It also runs as an MCP server (23 tools — inbox, search, send, reply, draft management, rules, snooze, and the agent/policy surface above) that Claude Code, Cursor, or Zed can attach to directly:
 
 ```bash
 envelope mcp --config
