@@ -36,7 +36,7 @@ impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        crate::migrations::run(&mut conn).map_err(|e| StoreError::Migration(format!("{e}")))?;
+        crate::migrations::run(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -58,7 +58,7 @@ impl Database {
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
-        crate::migrations::run(&mut conn).map_err(|e| StoreError::Migration(format!("{e}")))?;
+        crate::migrations::run(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -240,5 +240,35 @@ mod tests {
         let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary.uid, 12);
+    }
+
+    /// The shared on-disk database may have been advanced by the isolated V2
+    /// runtime to its known additive schema level. V1 must open it and keep
+    /// working against its own tables, without moving the schema version.
+    #[test]
+    fn open_works_on_known_forward_v2_schema_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forward.db");
+        {
+            let db = Database::open(&path).unwrap();
+            crate::migrations::v2_fixture::apply(db.conn());
+        }
+
+        let db = Database::open(&path).unwrap();
+
+        db.test_insert_account_row("acct-fwd", "fwd@example.test")
+            .unwrap();
+        db.set_detected_folder("acct-fwd", "drafts", "Drafts")
+            .unwrap();
+        assert_eq!(
+            db.get_drafts_folder("acct-fwd").unwrap().as_deref(),
+            Some("Drafts")
+        );
+
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::migrations::v2_fixture::V2_SCHEMA_VERSION);
     }
 }

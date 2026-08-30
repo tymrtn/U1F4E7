@@ -7,17 +7,54 @@
 //! Migration 0 is the baseline (v0.4.1 schema). All statements use
 //! `IF NOT EXISTS` so they are safe for both fresh and existing databases.
 
+use crate::errors::StoreError;
 use rusqlite::Connection;
 use rusqlite::Transaction;
 use rusqlite_migration::{M, Migrations};
 
+/// How many migrations past the end of [`migration_list`] this build can open
+/// without understanding them.
+///
+/// The isolated V2/CRM line extends the V1 sequence with three migrations
+/// verified additive-only: 17 creates `send_receipts` and its indexes, 18 the
+/// relationship/CRM tables (`persons`, `person_emails`, interactions,
+/// per-person thread states), 19 `graph_ledger_state`. None alter or remove
+/// anything V1 reads or writes, so a database at schema versions 17–19 is
+/// opened as-is — no migrations run, no `user_version` write, nothing
+/// deleted. Any version beyond that is unknown and fails closed.
+const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 3;
+
 /// Run all pending migrations on the given connection.
-pub fn run(conn: &mut Connection) -> Result<(), rusqlite_migration::Error> {
-    migrations().to_latest(conn)
+///
+/// A database whose `PRAGMA user_version` is past the V1 sequence but within
+/// the known additive V2 range opens untouched: version 17+ implies every V1
+/// migration already ran on the shared line, and the extra tables are ones V1
+/// never uses.
+pub fn run(conn: &mut Connection) -> crate::errors::Result<()> {
+    let list = migration_list();
+    let v1_version = list.len() as i64;
+    let max_known = v1_version + KNOWN_ADDITIVE_V2_MIGRATIONS as i64;
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > v1_version {
+        if current <= max_known {
+            return Ok(());
+        }
+        return Err(StoreError::Migration(format!(
+            "database schema version {current} is newer than this envelope build supports \
+             (max known-compatible version {max_known}); upgrade envelope, or open this \
+             database with the newer runtime that created it"
+        )));
+    }
+    Migrations::new(list)
+        .to_latest(conn)
+        .map_err(|e| StoreError::Migration(format!("{e}")))
 }
 
-fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![
+/// The V1 migration sequence. `rusqlite_migration` records progress in
+/// `PRAGMA user_version` as the count of applied migrations, so this list's
+/// length is the schema version a fully migrated V1 database carries.
+fn migration_list() -> Vec<M<'static>> {
+    vec![
         // ── Migration 0: baseline (v0.4.1 schema) ──────────────────
         // All IF NOT EXISTS — safe for existing databases.
         M::up(
@@ -924,7 +961,70 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-    ])
+    ]
+}
+
+/// Fixtures mirroring the isolated V2 line's additive migrations 17–19
+/// (send receipts, relationship/CRM tables, graph ledger state). The exact
+/// column shapes are irrelevant to V1, which never reads these tables; the
+/// fixtures exist to prove V1 opens alongside them without touching them.
+#[cfg(test)]
+pub(crate) mod v2_fixture {
+    use rusqlite::Connection;
+
+    /// The schema version the live V2 runtime has advanced the shared
+    /// database to (V1's 16 migrations plus V2 migrations 17–19).
+    pub(crate) const V2_SCHEMA_VERSION: i64 = 19;
+
+    pub(crate) fn apply(conn: &Connection) {
+        conn.execute_batch(&format!(
+            "
+            CREATE TABLE send_receipts (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                draft_id TEXT,
+                message_id TEXT,
+                sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_send_receipts_account
+                ON send_receipts(account_id, sent_at);
+
+            CREATE TABLE persons (
+                id TEXT PRIMARY KEY,
+                display_name TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE person_emails (
+                person_id TEXT NOT NULL REFERENCES persons(id),
+                email TEXT NOT NULL,
+                PRIMARY KEY (person_id, email)
+            );
+            CREATE TABLE person_interactions (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            );
+            CREATE TABLE person_thread_states (
+                person_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (person_id, thread_id)
+            );
+            CREATE TABLE graph_ledger_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cursor TEXT,
+                updated_at TEXT
+            );
+
+            INSERT INTO send_receipts (id, account_id) VALUES ('sr-1', 'acc');
+            INSERT INTO persons (id, display_name) VALUES ('p-1', 'Ada');
+
+            PRAGMA user_version = {V2_SCHEMA_VERSION};
+            "
+        ))
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -934,7 +1034,20 @@ mod tests {
     #[test]
     fn migrations_are_valid() {
         // rusqlite_migration validates that migrations are well-formed
-        migrations().validate().unwrap();
+        Migrations::new(migration_list()).validate().unwrap();
+    }
+
+    /// Pins the forward-compatibility boundary: V1's sequence produces schema
+    /// version 16, and the known additive V2 level is 19. If this fails
+    /// because a V1 migration was added, its version number collides with the
+    /// V2 line's 17–19 — reconcile with the V2 track before shipping.
+    #[test]
+    fn forward_schema_boundary_is_pinned_to_the_v2_line() {
+        assert_eq!(migration_list().len(), 16);
+        assert_eq!(
+            migration_list().len() + KNOWN_ADDITIVE_V2_MIGRATIONS,
+            super::v2_fixture::V2_SCHEMA_VERSION as usize
+        );
     }
 
     /// Regression for migration 11: a pre-revision draft row (database created
@@ -1416,5 +1529,63 @@ mod tests {
         assert!(columns.contains(&"idempotency_key".to_string()));
         assert!(columns.contains(&"secure_pending".to_string()));
         assert!(columns.contains(&"acked_at".to_string()));
+    }
+
+    /// A database the V2 runtime advanced to its known additive schema level
+    /// opens without running anything: the schema version is left exactly
+    /// where V2 put it, the V2 tables and their rows survive untouched, and
+    /// V1's own tables remain writable.
+    #[test]
+    fn known_additive_v2_schema_opens_without_mutation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        super::v2_fixture::apply(&conn);
+
+        run(&mut conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version,
+            super::v2_fixture::V2_SCHEMA_VERSION,
+            "opening must not rewrite user_version"
+        );
+
+        let receipts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM send_receipts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(receipts, 1, "V2 rows survive a V1 open");
+
+        conn.execute(
+            "INSERT INTO detected_folders (account_id, folder_type, folder_name)
+             VALUES ('acc', 'drafts', 'Drafts')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// A schema version above the known additive V2 level is unknown
+    /// territory: fail closed, name both versions, and leave the database
+    /// exactly as found.
+    #[test]
+    fn unknown_future_schema_version_fails_closed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        super::v2_fixture::apply(&conn);
+        let unknown = super::v2_fixture::V2_SCHEMA_VERSION + 1;
+        conn.pragma_update(None, "user_version", unknown).unwrap();
+
+        let err = run(&mut conn).unwrap_err().to_string();
+        assert!(
+            err.contains(&unknown.to_string())
+                && err.contains(&super::v2_fixture::V2_SCHEMA_VERSION.to_string()),
+            "error must name the found and max supported versions, got: {err}"
+        );
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, unknown, "rejection must not rewrite user_version");
     }
 }
