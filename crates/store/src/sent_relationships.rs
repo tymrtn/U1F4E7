@@ -22,7 +22,9 @@
 //! To line attributes to each individual address and a malformed entry is
 //! dropped rather than surfaced as a garbage counterparty. Addresses
 //! configured as any Envelope account's username are the operator's own and
-//! are never counterparties.
+//! are never counterparties, and neither is a `+tag` variant of one at the
+//! same domain; everyone else's plus-addresses are kept verbatim as distinct
+//! counterparties.
 
 use std::collections::{HashMap, HashSet};
 
@@ -93,6 +95,43 @@ pub struct SentRelationshipPage {
     pub items: Vec<SentRelationship>,
 }
 
+/// The operator's own identity, used only to exclude counterparties. Exact
+/// configured usernames are self, and so is a `+tag` variant of one at the
+/// exact same domain (`me+receipts@example.test` when `me@example.test` is
+/// configured). This never rewrites a counterparty's identity — a non-self
+/// plus-address stays its own distinct row — and there is deliberately no
+/// Gmail-dot guessing or any other provider aliasing heuristic.
+struct OwnAddresses {
+    exact: HashSet<String>,
+    /// `base@domain` per configured username, base = local part before `+`.
+    plus_bases: HashSet<String>,
+}
+
+impl OwnAddresses {
+    fn insert(&mut self, email: String) {
+        if let Some((local, domain)) = email.split_once('@') {
+            let base = local.split_once('+').map_or(local, |(base, _)| base);
+            self.plus_bases.insert(format!("{base}@{domain}"));
+        }
+        self.exact.insert(email);
+    }
+
+    fn is_self(&self, email: &str) -> bool {
+        if self.exact.contains(email) {
+            return true;
+        }
+        let Some((local, domain)) = email.split_once('@') else {
+            return false;
+        };
+        // Only an explicit `+tag` form maps back to a configured base; a
+        // bare address never matches through this branch.
+        match local.split_once('+') {
+            Some((base, _tag)) => self.plus_bases.contains(&format!("{base}@{domain}")),
+            None => false,
+        }
+    }
+}
+
 /// Per-counterparty accumulator while walking the thread cache.
 #[derive(Default)]
 struct Tally {
@@ -136,13 +175,22 @@ impl Database {
         limit: usize,
     ) -> Result<SentRelationshipPage> {
         // Every configured account's address is the operator's own identity;
-        // none of them is ever a counterparty, whichever account is aggregated.
-        let own_addresses: HashSet<String> = {
+        // none of them — nor a same-domain `+tag` variant of one — is ever a
+        // counterparty, whichever account is aggregated.
+        let own_addresses = {
             let mut stmt = self.conn().prepare("SELECT username FROM accounts")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.filter_map(|row| row.ok())
+            let mut own = OwnAddresses {
+                exact: HashSet::new(),
+                plus_bases: HashSet::new(),
+            };
+            for email in rows
+                .filter_map(|row| row.ok())
                 .filter_map(|username| normalize_email(&username))
-                .collect()
+            {
+                own.insert(email);
+            }
+            own
         };
 
         let mut tallies: HashMap<String, Tally> = HashMap::new();
@@ -176,7 +224,7 @@ impl Database {
                     .flatten()
                 {
                     for parsed in parse_address_list(raw) {
-                        if !own_addresses.contains(&parsed.email) {
+                        if !own_addresses.is_self(&parsed.email) {
                             recipients.insert(parsed.email);
                         }
                     }
@@ -506,6 +554,135 @@ mod tests {
 
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].counterparty_email, "real@x.test");
+    }
+
+    /// A `+tag` variant of a configured account address at the same domain is
+    /// still the operator (`me+receipts@example.test` for `me@example.test`),
+    /// for any configured account. The same base at a different domain is
+    /// someone else.
+    #[test]
+    fn plus_addressed_variants_of_own_accounts_are_excluded() {
+        let db = db_with_accounts();
+        let thread = new_thread(&db, "acct-a", "receipts");
+        add_message(
+            &db,
+            &thread,
+            1,
+            "Sent",
+            "me@example.test",
+            "me+receipts@example.test, personal+travel@example.org, real@x.test",
+            None,
+            None,
+            "2026-08-01T00:00:00",
+            true,
+        );
+        add_message(
+            &db,
+            &thread,
+            2,
+            "Sent",
+            "me@example.test",
+            "me+tag@elsewhere.test",
+            None,
+            None,
+            "2026-08-02T00:00:00",
+            true,
+        );
+
+        let page = db.aggregate_sent_relationships("acct-a", NOW, 25).unwrap();
+
+        assert_eq!(page.total, 2);
+        let mut emails: Vec<&str> = page
+            .items
+            .iter()
+            .map(|rel| rel.counterparty_email.as_str())
+            .collect();
+        emails.sort_unstable();
+        assert_eq!(emails, vec!["me+tag@elsewhere.test", "real@x.test"]);
+    }
+
+    /// Self-exclusion must not grow into alias normalization: an external
+    /// plus-address stays a distinct counterparty under its verbatim identity,
+    /// even at the same domain as a configured account, and independent tags
+    /// are never grouped together or collapsed onto the base address.
+    #[test]
+    fn external_plus_addresses_stay_distinct_counterparties() {
+        let db = db_with_accounts();
+        let thread = new_thread(&db, "acct-a", "vendor");
+        outbound(
+            &db,
+            &thread,
+            1,
+            "vendor+trip@example.test",
+            "2026-08-01T00:00:00",
+        );
+        outbound(
+            &db,
+            &thread,
+            2,
+            "vendor+hotel@example.test",
+            "2026-08-02T00:00:00",
+        );
+        outbound(
+            &db,
+            &thread,
+            3,
+            "vendor@example.test",
+            "2026-08-03T00:00:00",
+        );
+
+        let page = db.aggregate_sent_relationships("acct-a", NOW, 25).unwrap();
+
+        assert_eq!(page.total, 3);
+        let mut emails: Vec<&str> = page
+            .items
+            .iter()
+            .map(|rel| rel.counterparty_email.as_str())
+            .collect();
+        emails.sort_unstable();
+        assert_eq!(
+            emails,
+            vec![
+                "vendor+hotel@example.test",
+                "vendor+trip@example.test",
+                "vendor@example.test"
+            ]
+        );
+        for rel in &page.items {
+            assert_eq!(rel.outbound_count, 1, "{}", rel.counterparty_email);
+        }
+    }
+
+    /// The page carries relationship identity and aggregate counts only. The
+    /// fixture plants sentinel subject/snippet text on every message and a
+    /// sentinel thread label; none of it may appear anywhere in the output.
+    #[test]
+    fn page_carries_no_subject_snippet_or_thread_label_material() {
+        let db = db_with_accounts();
+        let thread = new_thread(&db, "acct-a", "thread-label-sentinel-private");
+        outbound(
+            &db,
+            &thread,
+            1,
+            "vendor+trip@example.test",
+            "2026-08-01T00:00:00",
+        );
+        inbound(
+            &db,
+            &thread,
+            2,
+            "vendor+trip@example.test",
+            "2026-08-02T00:00:00",
+        );
+
+        let page = db.aggregate_sent_relationships("acct-a", NOW, 25).unwrap();
+
+        assert_eq!(page.total, 1);
+        let rendered = format!("{page:?}");
+        assert!(
+            !rendered.contains("sentinel"),
+            "aggregate must not carry subject, snippet, or thread label material: {rendered}"
+        );
     }
 
     /// An inbound-only sender is not a sent relationship: nothing qualifies
