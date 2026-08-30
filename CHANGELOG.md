@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Store:** the CLI and dashboard open a shared database the isolated V2 line has advanced to schema versions 17–19 (`send_receipts`, relationship/CRM tables, `graph_ledger_state` — all additive). Previously the open failed with `DatabaseTooFarAhead` and the managed dashboard could not start. The database is opened exactly as found: no migrations run, no `user_version` write, no V2 table touched. Schema versions past 19 still fail closed with an error naming the found and max supported versions.
 - Review summaries now keep their boundaries honest: arbitrary body-like or secret-bearing free text stays out of the aggregate; terminal action failures are not confused with ordinary queued work; capped lists show their actual totals; own plus-address aliases do not become counterparties; and RFC 3339 dashboard timestamps correctly distinguish recent outbound history from historical one-way history.
 
 ## [1.1.3] — 2026-08-28
