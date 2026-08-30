@@ -113,6 +113,37 @@ fn seeded_state() -> (AppState, String) {
     )
     .unwrap();
 
+    // Observed thread history for the sent-history context group: two
+    // outbound messages to one counterparty, subjects and snippets carrying
+    // sentinels that must never cross the aggregate.
+    let thread = db
+        .create_thread(
+            "itinerary",
+            "2025-06-01T00:00:00",
+            "2025-11-15T00:00:00",
+            "acc1",
+        )
+        .unwrap();
+    for (uid, date) in [(1u32, "2025-06-01T08:00:00"), (2, "2025-11-15T09:30:00")] {
+        db.upsert_thread_message(
+            &thread.thread_id,
+            uid,
+            Some(&format!("<sent-{uid}@fixture.test>")),
+            None,
+            None,
+            "Sent",
+            "op@example.com",
+            "history-counterparty@x.test",
+            None,
+            None,
+            date,
+            "thread-subject-private-material",
+            true,
+            Some("thread-snippet-private-body"),
+        )
+        .unwrap();
+    }
+
     (AppState::new(db, CredentialBackend::File), pending.id)
 }
 
@@ -171,6 +202,30 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
         "sender@example.com"
     );
     assert_eq!(json["operational_health"]["failed_auth"]["count"], 1);
+
+    // Sent relationship history rides after the queue groups as context:
+    // exact counterparty identity, observed counts, a truthful signal, and
+    // an explicit no-link state instead of an invented destination.
+    assert_eq!(json["sent_history"]["source"], "observed_thread_history");
+    assert!(
+        json["sent_history"]["coverage"]
+            .as_str()
+            .unwrap()
+            .contains("not a complete mailbox census")
+    );
+    assert_eq!(json["sent_history"]["count"], 1);
+    let history_item = &json["sent_history"]["items"][0];
+    assert_eq!(history_item["counterparty"], "history-counterparty@x.test");
+    assert_eq!(history_item["outbound_count"], 2);
+    assert_eq!(history_item["inbound_count"], 0);
+    assert_eq!(history_item["thread_count"], 1);
+    assert_eq!(history_item["signal"], "historical_one_way");
+    assert_eq!(history_item["link"], Value::Null);
+    assert_eq!(history_item["link_state"], "not_available");
+    // History is context: it never inflates the decision summary or Waiting.
+    assert!(json["summary"].get("sent_history").is_none());
+    assert_eq!(json["waiting"]["awaiting_reply"]["count"], 0);
+
     assert!(json["generated_at"].is_string());
     for group in [
         "decide_now",
@@ -193,6 +248,8 @@ async fn review_endpoint_aggregates_globally_without_account_or_imap() {
     assert!(!serialized.contains("queued-private-body"));
     assert!(!serialized.contains("event-snippet-private-body"));
     assert!(!serialized.contains("event-payload-private-material"));
+    assert!(!serialized.contains("thread-subject-private-material"));
+    assert!(!serialized.contains("thread-snippet-private-body"));
     assert!(!serialized.contains("\"snippet\""));
     assert!(!serialized.contains("\"payload\""));
     assert!(!serialized.contains("secret-token"));

@@ -59,6 +59,21 @@
   function draftState(status: string): string {
     return status === 'pending_review' ? 'pending review' : status;
   }
+
+  // Truthful topology-and-recency labels only. Deliberately no
+  // task/obligation vocabulary: relationship history is context.
+  function signalLabel(signal: string): string {
+    switch (signal) {
+      case 'historical_one_way':
+        return 'one-way · historical';
+      case 'recent_outbound_history':
+        return 'outbound · recent';
+      case 'bilateral_history':
+        return 'bilateral';
+      default:
+        return signal;
+    }
+  }
 </script>
 
 <div class="review" id="review">
@@ -376,6 +391,46 @@
               </li>
             {/each}
           </ul>
+        {/if}
+      {/if}
+    </section>
+
+    <!-- 5 · Sent relationship history — context after the queue groups. -->
+    <section class="group" id="review-sent-history">
+      <div class="group-head">
+        <h2 class="group-title">Sent relationship history</h2>
+        <span class="group-count">{data.sent_history.count}</span>
+      </div>
+      <p class="group-note">
+        Context only — who this mailbox writes to, and how the correspondence
+        has run. {data.sent_history.coverage}
+      </p>
+      {#if data.sent_history.count === 0}
+        <EmptyState
+          title="No sent relationship history"
+          hint="Appears after thread scans observe outbound mail."
+        />
+      {:else}
+        <ul class="rows">
+          {#each data.sent_history.items as rel (`${rel.account_id}:${rel.counterparty}`)}
+            <li class="row">
+              <div class="row-link">
+                <span class="row-main">{rel.counterparty}</span>
+                <span class="row-meta">
+                  {rel.account_label}
+                  · {rel.outbound_count} sent · {rel.inbound_count} received
+                  · {rel.thread_count} {rel.thread_count === 1 ? 'thread' : 'threads'}
+                  {#if rel.last_observed}· last active {age(rel.last_observed)}{/if}
+                </span>
+              </div>
+              <span class="chip">{signalLabel(rel.signal)}</span>
+            </li>
+          {/each}
+        </ul>
+        {#if data.sent_history.truncated}
+          <p class="rows-more">
+            Showing {data.sent_history.returned} of {data.sent_history.count}.
+          </p>
         {/if}
       {/if}
     </section>

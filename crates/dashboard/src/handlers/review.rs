@@ -15,6 +15,12 @@
 //!   4. `operational_health` — actual failures only: failed auth, failed
 //!      watches, dead-lettered routes. No generic activity.
 //!
+//! After the queue groups, `sent_history` carries context rather than tasks:
+//! observed thread history aggregated by outbound counterparty, so heavy
+//! correspondence like a travel service the operator has mailed hundreds of
+//! times is visible as relationship history without ever being dressed up as
+//! an "awaiting reply" obligation.
+//!
 //! Read-only: one build over the store, no IMAP, no sweep, no send, no ack, no
 //! rule application. Unlike the cockpit aggregate, drafts and rules are
 //! aggregated globally — nothing is silently empty when no account is selected.
@@ -49,6 +55,7 @@ const DRAFT_LIMIT: u32 = 100;
 const PER_ACCOUNT_ACTIONS: u32 = 25;
 const PER_ACCOUNT_UNACKED: usize = 50;
 const HEALTH_LIMIT: u32 = 50;
+const SENT_HISTORY_LIMIT: usize = 25;
 
 fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     let accounts = db.list_accounts()?;
@@ -250,6 +257,52 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
     }
     let dead_letter_total = db.dead_letter_count()?;
 
+    // ── Sent relationship history: context, not a queue. Observed thread
+    // history grouped by outbound counterparty, per account — never merged
+    // across accounts. Reads the store's read-only aggregate primitive: no
+    // reconcile, no IMAP, no writes. Deliberately absent from `summary`,
+    // because nothing here needs a decision — "awaiting reply" stays
+    // reserved for the explicit durable snoozes above.
+    let mut sent_relationships = Vec::new();
+    let mut sent_history_total: i64 = 0;
+    for account in &accounts {
+        let page = db.aggregate_sent_relationships(&account.id, now, SENT_HISTORY_LIMIT)?;
+        sent_history_total += page.total;
+        sent_relationships.extend(page.items);
+    }
+    // Highest-signal rows across accounts: outbound volume, then recency.
+    // Each account was fetched already ordered this way and capped at the
+    // same limit, so the merged top-N is exact.
+    sent_relationships.sort_by(|a, b| {
+        b.outbound_count
+            .cmp(&a.outbound_count)
+            .then_with(|| b.last_observed.cmp(&a.last_observed))
+            .then_with(|| a.counterparty_email.cmp(&b.counterparty_email))
+            .then_with(|| a.account_id.cmp(&b.account_id))
+    });
+    sent_relationships.truncate(SENT_HISTORY_LIMIT);
+    let sent_history_items: Vec<Value> = sent_relationships
+        .iter()
+        .map(|rel| {
+            json!({
+                "counterparty": rel.counterparty_email,
+                "account_id": rel.account_id,
+                "account_label": account_label(&accounts, &rel.account_id),
+                "message_count": rel.message_count,
+                "outbound_count": rel.outbound_count,
+                "inbound_count": rel.inbound_count,
+                "thread_count": rel.thread_count,
+                "first_observed": rel.first_observed,
+                "last_observed": rel.last_observed,
+                "signal": rel.signal.as_str(),
+                // No canonical relationship surface exists yet; say so
+                // rather than inventing a destination.
+                "link": Value::Null,
+                "link_state": "not_available",
+            })
+        })
+        .collect();
+
     // Group counts are true totals from the count queries; only the item
     // lists are capped, and each capped source says so.
     let decide_now_count =
@@ -308,6 +361,14 @@ fn build_review_json(db: &Database, now: &str) -> StoreResult<Value> {
                 "count": dead_letter_total,
                 "routes": dead_routes,
             },
+        },
+        "sent_history": {
+            "source": "observed_thread_history",
+            "coverage": "Observed thread history from locally scanned folders; not a complete mailbox census.",
+            "count": sent_history_total,
+            "returned": sent_history_items.len(),
+            "truncated": (sent_history_items.len() as i64) < sent_history_total,
+            "items": sent_history_items,
         },
         "generated_at": now,
     }))
@@ -1086,6 +1147,247 @@ mod tests {
         assert!(!serialized.contains("match_expr"));
     }
 
+    /// Create a thread and hang messages off it. Outbound rows carry the
+    /// account's own From line; inbound rows carry the counterparty's.
+    fn seed_thread(db: &Database, account_id: &str, label: &str) -> String {
+        db.create_thread(
+            label,
+            "2020-01-01T00:00:00",
+            "2020-01-01T00:00:00",
+            account_id,
+        )
+        .unwrap()
+        .thread_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_thread_message(
+        db: &Database,
+        thread_id: &str,
+        uid: u32,
+        folder: &str,
+        from: &str,
+        to: &str,
+        date: &str,
+        outbound: bool,
+    ) {
+        db.upsert_thread_message(
+            thread_id,
+            uid,
+            Some(&format!("<{folder}-{uid}@fixture.test>")),
+            None,
+            None,
+            folder,
+            from,
+            to,
+            None,
+            None,
+            date,
+            "thread-subject-private-material",
+            outbound,
+            Some("thread-snippet-private-body"),
+        )
+        .unwrap();
+    }
+
+    /// The product correction this group exists for: a TripIt-like history —
+    /// 382 outbound / 2 inbound across 332 threads, quiet since Nov 2025 —
+    /// must surface as historical one-way relationship context, with exact
+    /// observed counts, and must never appear in Waiting or as any kind of
+    /// awaiting-reply obligation.
+    #[test]
+    fn review_sent_history_surfaces_high_volume_outbound_as_context_not_waiting() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "Work", "op@example.com");
+        let mut uid = 0u32;
+        for t in 0..332 {
+            let thread = seed_thread(&db, "acc1", &format!("trip {t}"));
+            let per_thread = if t == 331 { 51 } else { 1 };
+            for i in 0..per_thread {
+                uid += 1;
+                let date = if t == 331 && i == per_thread - 1 {
+                    "2025-11-15T09:30:00"
+                } else {
+                    "2025-06-01T08:00:00"
+                };
+                seed_thread_message(
+                    &db,
+                    &thread,
+                    uid,
+                    "Sent",
+                    "op@example.com",
+                    "plans@tripit.com",
+                    date,
+                    true,
+                );
+            }
+            if t == 331 {
+                for (inbound_uid, date) in
+                    [(9001, "2025-07-01T10:00:00"), (9002, "2025-08-01T10:00:00")]
+                {
+                    seed_thread_message(
+                        &db,
+                        &thread,
+                        inbound_uid,
+                        "INBOX",
+                        "plans@tripit.com",
+                        "op@example.com",
+                        date,
+                        false,
+                    );
+                }
+            }
+        }
+
+        let payload = super::build_review_json(&db, NOW).unwrap();
+
+        let history = &payload["sent_history"];
+        assert_eq!(history["count"], 1);
+        assert_eq!(history["returned"], 1);
+        assert_eq!(history["truncated"], false);
+        assert_eq!(history["source"], "observed_thread_history");
+        assert!(
+            history["coverage"]
+                .as_str()
+                .unwrap()
+                .contains("not a complete mailbox census")
+        );
+        let item = &history["items"][0];
+        assert_eq!(item["counterparty"], "plans@tripit.com");
+        assert_eq!(item["account_label"], "Work");
+        assert_eq!(item["message_count"], 384);
+        assert_eq!(item["outbound_count"], 382);
+        assert_eq!(item["inbound_count"], 2);
+        assert_eq!(item["thread_count"], 332);
+        assert_eq!(item["last_observed"], "2025-11-15T09:30:00");
+        assert_eq!(item["signal"], "historical_one_way");
+        // No canonical relationship surface exists yet; say so instead of
+        // inventing a link.
+        assert_eq!(item["link"], serde_json::Value::Null);
+        assert_eq!(item["link_state"], "not_available");
+
+        // Context, never a task: Waiting stays reserved for explicit
+        // snoozes/schedules, and the queue summary does not count history.
+        assert_eq!(payload["waiting"]["awaiting_reply"]["count"], 0);
+        assert_eq!(payload["summary"]["waiting"], 0);
+        assert!(payload["summary"].get("sent_history").is_none());
+    }
+
+    /// Multi-recipient outbound splits into individual counterparties, and
+    /// the same counterparty seen from two accounts stays two account-scoped
+    /// observations.
+    #[test]
+    fn review_sent_history_splits_recipients_and_keeps_accounts_separate() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "Work", "op@example.com");
+        seed_account(&db, "acc2", "Personal", "me@example.org");
+        let work = seed_thread(&db, "acc1", "team");
+        seed_thread_message(
+            &db,
+            &work,
+            1,
+            "Sent",
+            "op@example.com",
+            "\"Doe, Jane\" <jane@x.test>, shared@x.test",
+            "2026-05-01T00:00:00",
+            true,
+        );
+        let personal = seed_thread(&db, "acc2", "shared");
+        seed_thread_message(
+            &db,
+            &personal,
+            1,
+            "Sent",
+            "me@example.org",
+            "shared@x.test",
+            "2026-05-02T00:00:00",
+            true,
+        );
+
+        let payload = super::build_review_json(&db, NOW).unwrap();
+
+        let items = payload["sent_history"]["items"].as_array().unwrap();
+        assert_eq!(payload["sent_history"]["count"], 3);
+        let mut seen: Vec<(String, String)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item["counterparty"].as_str().unwrap().to_string(),
+                    item["account_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("jane@x.test".to_string(), "acc1".to_string()),
+                ("shared@x.test".to_string(), "acc1".to_string()),
+                ("shared@x.test".to_string(), "acc2".to_string()),
+            ]
+        );
+        // The raw comma-separated header never crosses the aggregate.
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("jane@x.test, shared@x.test"));
+    }
+
+    /// The deep payload carries the intentional counterparty identity and
+    /// nothing else from the thread cache: no subjects, snippets, or raw
+    /// header strings.
+    #[test]
+    fn review_sent_history_redacts_thread_content_but_keeps_counterparty() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "Work", "op@example.com");
+        let thread = seed_thread(&db, "acc1", "trip");
+        seed_thread_message(
+            &db,
+            &thread,
+            1,
+            "Sent",
+            "op@example.com",
+            "plans@tripit.com",
+            "2025-11-15T09:30:00",
+            true,
+        );
+
+        let payload = super::build_review_json(&db, NOW).unwrap();
+
+        assert_eq!(payload["sent_history"]["count"], 1);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(serialized.contains("plans@tripit.com"));
+        assert!(!serialized.contains("thread-subject-private-material"));
+        assert!(!serialized.contains("thread-snippet-private-body"));
+    }
+
+    /// Capping exposes the real total/returned/truncated state instead of
+    /// presenting the cap as the whole history.
+    #[test]
+    fn review_sent_history_caps_with_true_totals() {
+        let db = Database::open_memory().unwrap();
+        seed_account(&db, "acc1", "Work", "op@example.com");
+        for c in 0..30u32 {
+            let thread = seed_thread(&db, "acc1", &format!("c{c}"));
+            seed_thread_message(
+                &db,
+                &thread,
+                c + 1,
+                "Sent",
+                "op@example.com",
+                &format!("c{c:02}@x.test"),
+                "2026-05-01T00:00:00",
+                true,
+            );
+        }
+
+        let payload = super::build_review_json(&db, NOW).unwrap();
+
+        let history = &payload["sent_history"];
+        assert_eq!(history["count"], 30);
+        assert_eq!(history["returned"], 25);
+        assert_eq!(history["truncated"], true);
+        assert_eq!(history["items"].as_array().unwrap().len(), 25);
+    }
+
     #[test]
     fn review_aggregate_is_read_only_against_the_store() {
         let db = Database::open_memory().unwrap();
@@ -1127,11 +1429,23 @@ mod tests {
             None,
         )
         .unwrap();
+        let thread = seed_thread(&db, "acc1", "trip");
+        seed_thread_message(
+            &db,
+            &thread,
+            1,
+            "Sent",
+            "op@example.com",
+            "plans@tripit.com",
+            "2025-11-15T09:30:00",
+            true,
+        );
 
         let first = super::build_review_json(&db, NOW).unwrap();
         assert_eq!(first["decide_now"]["drafts"]["counts"]["pending_review"], 1);
         assert_eq!(first["needs_triage"]["count"], 1);
         assert_eq!(first["waiting"]["due_snoozes"]["count"], 1);
+        assert_eq!(first["sent_history"]["count"], 1);
 
         // Building the aggregate again returns the identical payload: nothing
         // was acked, unsnoozed, sent, or status-transitioned by the read.
@@ -1143,5 +1457,14 @@ mod tests {
             DraftStatus::PendingReview
         );
         assert_eq!(db.list_snoozed(Some("acc1")).unwrap().len(), 1);
+        // The sent-history aggregate read neither mutated the thread cache
+        // nor piggybacked an address-history reconcile on the load.
+        let reconcile_rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM address_history_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(reconcile_rows, 0);
     }
 }

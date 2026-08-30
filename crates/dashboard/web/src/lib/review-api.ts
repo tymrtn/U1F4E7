@@ -141,6 +141,40 @@ export interface ReviewDeadRoute {
   dead: number;
 }
 
+// ── Sent relationship history ─────────────────────────────────────────
+
+/**
+ * Fixed, truthful relationship signal derived only from aggregate topology
+ * (outbound/inbound balance) and recency. Never an inferred obligation —
+ * "awaiting reply" stays reserved for explicit durable snoozes.
+ */
+export type SentRelationshipSignal =
+  | 'historical_one_way'
+  | 'recent_outbound_history'
+  | 'bilateral_history';
+
+/**
+ * One observed outbound counterparty for one account. The exact address is
+ * the relationship identity and is carried deliberately; subjects, snippets,
+ * and raw recipient headers never ride along. `link` stays null while no
+ * canonical relationship surface exists — `link_state` says so instead of
+ * inventing a destination.
+ */
+export interface SentRelationshipItem {
+  counterparty: string;
+  account_id: string;
+  account_label: string;
+  message_count: number;
+  outbound_count: number;
+  inbound_count: number;
+  thread_count: number;
+  first_observed: string | null;
+  last_observed: string | null;
+  signal: SentRelationshipSignal;
+  link: string | null;
+  link_state: 'not_available';
+}
+
 // ── Response ──────────────────────────────────────────────────────────
 
 export interface ReviewResponse {
@@ -188,6 +222,20 @@ export interface ReviewResponse {
     failed_auth: CappedList<ReviewFailedAuth>;
     failed_watches: CappedList<ReviewFailedWatch>;
     dead_letters: { count: number; routes: ReviewDeadRoute[] };
+  };
+  /**
+   * Context, not a queue: observed thread history grouped by outbound
+   * counterparty, per account. Deliberately absent from `summary` — nothing
+   * here needs a decision. `coverage` is the server's own provenance
+   * disclosure (observed history, not a complete mailbox census).
+   */
+  sent_history: {
+    source: 'observed_thread_history';
+    coverage: string;
+    count: number;
+    returned: number;
+    truncated: boolean;
+    items: SentRelationshipItem[];
   };
   generated_at: string;
 }

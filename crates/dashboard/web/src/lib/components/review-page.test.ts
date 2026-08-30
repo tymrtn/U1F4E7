@@ -46,6 +46,15 @@ function emptyResponse(): ReviewResponse {
       failed_watches: { count: 0, returned: 0, truncated: false, items: [] },
       dead_letters: { count: 0, routes: [] }
     },
+    sent_history: {
+      source: 'observed_thread_history',
+      coverage:
+        'Observed thread history from locally scanned folders; not a complete mailbox census.',
+      count: 0,
+      returned: 0,
+      truncated: false,
+      items: []
+    },
     generated_at: '2026-05-09T09:00:00'
   };
 }
@@ -223,6 +232,30 @@ function populatedResponse(): ReviewResponse {
     },
     dead_letters: { count: 0, routes: [] }
   };
+  base.sent_history = {
+    source: 'observed_thread_history',
+    coverage:
+      'Observed thread history from locally scanned folders; not a complete mailbox census.',
+    count: 1,
+    returned: 1,
+    truncated: false,
+    items: [
+      {
+        counterparty: 'plans@tripit.com',
+        account_id: 'acc1',
+        account_label: 'Work',
+        message_count: 384,
+        outbound_count: 382,
+        inbound_count: 2,
+        thread_count: 332,
+        first_observed: '2024-05-01T00:00:00',
+        last_observed: '2025-11-15T09:30:00',
+        signal: 'historical_one_way',
+        link: null,
+        link_state: 'not_available'
+      }
+    ]
+  };
   return base;
 }
 
@@ -243,7 +276,8 @@ describe('Review page groups', () => {
       'Decide now',
       'Waiting',
       'Needs triage',
-      'Operational health'
+      'Operational health',
+      'Sent relationship history'
     ]);
     // Counts ride next to their headings.
     expect(container.querySelector('#review-decide-now .group-count')?.textContent).toBe('4');
@@ -349,6 +383,71 @@ describe('Review page groups', () => {
 
     await waitFor(() => expect(screen.getByText('Due follow-up')).toBeInTheDocument());
     expect(container.textContent).not.toContain('-private-material');
+  });
+
+  it('renders sent relationship history as context with observed counts, never as a task', async () => {
+    const { container } = render(ReviewPage);
+    await waitFor(() => expect(screen.getByText('plans@tripit.com')).toBeInTheDocument());
+
+    const section = container.querySelector('#review-sent-history');
+    expect(section).not.toBeNull();
+    // Provenance disclosure: observed history, not a census, context only.
+    expect(section!.textContent).toContain('not a complete mailbox census');
+    expect(section!.textContent).toContain('Context only');
+    // Observed aggregate facts, verbatim (template line breaks collapsed).
+    expect(section!.textContent!.replace(/\s+/g, ' ')).toContain(
+      '382 sent · 2 received · 332 threads'
+    );
+    // The truthful signal chip — and no task/obligation language anywhere.
+    expect(screen.getByText('one-way · historical')).toBeInTheDocument();
+    expect(section!.textContent!.toLowerCase()).not.toContain('awaiting');
+    expect(section!.textContent!.toLowerCase()).not.toContain('reply');
+    // No canonical relationship surface exists: the row must not be a link.
+    expect(section!.querySelector('a')).toBeNull();
+  });
+
+  it('orders sent relationship history last, after the operational groups', async () => {
+    const { container } = render(ReviewPage);
+    await waitFor(() => expect(screen.getByText('plans@tripit.com')).toBeInTheDocument());
+
+    const sections = Array.from(container.querySelectorAll('section.group')).map((s) => s.id);
+    expect(sections[sections.length - 1]).toBe('review-sent-history');
+  });
+
+  it('says showing-N-of-M when sent history is capped', async () => {
+    const capped = populatedResponse();
+    capped.sent_history.count = 40;
+    capped.sent_history.returned = 1;
+    capped.sent_history.truncated = true;
+    reviewMock.get.mockResolvedValue(capped);
+    const { container } = render(ReviewPage);
+
+    await waitFor(() => expect(screen.getByText('plans@tripit.com')).toBeInTheDocument());
+    const section = container.querySelector('#review-sent-history');
+    expect(section!.textContent).toMatch(/Showing 1 of\s+40\./);
+    expect(section!.querySelector('.group-count')?.textContent).toBe('40');
+  });
+
+  it('never renders thread subjects or snippets from a stale sent-history payload', async () => {
+    const stale = populatedResponse();
+    Object.assign(stale.sent_history.items[0] as unknown as Record<string, unknown>, {
+      subject: 'thread-subject-private-material',
+      snippet: 'thread-snippet-private-body'
+    });
+    reviewMock.get.mockResolvedValue(stale);
+    const { container } = render(ReviewPage);
+
+    await waitFor(() => expect(screen.getByText('plans@tripit.com')).toBeInTheDocument());
+    expect(container.textContent).not.toContain('-private-');
+  });
+
+  it('shows a truthful sent-history empty state', async () => {
+    reviewMock.get.mockResolvedValue(emptyResponse());
+    render(ReviewPage);
+
+    await waitFor(() =>
+      expect(screen.getByText('No sent relationship history')).toBeInTheDocument()
+    );
   });
 
   it('says showing-N-of-M when a capped source is truncated', async () => {
