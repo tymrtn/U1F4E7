@@ -140,11 +140,18 @@
     min-height: 0;
     display: flex;
   }
-  @media (max-width: 640px) {
+  /* The mail layout and draft composer collapse to one column at 760px and
+     hand scrolling to the document. The shell's viewport clamp has to release
+     at the same width: keeping height: 100vh between 640 and 760px forces the
+     panes back onto their inner scrollers, which is the nested-scroller trap
+     the one-column layouts exist to avoid. */
+  @media (max-width: 760px) {
     .app-shell {
       height: auto;
       min-height: 100vh;
     }
+  }
+  @media (max-width: 640px) {
     .app-header {
       height: auto;
       min-height: 68px;

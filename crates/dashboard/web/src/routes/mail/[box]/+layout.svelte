@@ -1195,6 +1195,12 @@
     }
     .mail-shell.is-reading .reader {
       display: flex;
+      /* One column, one scroller: the document. The desktop overflow-y: auto
+         makes this pane the scroll container, and on iOS a touch that starts
+         on the tall sandboxed message iframe belongs to the pane's scroller
+         and never chains out — the end of a long HTML message becomes
+         unreachable. The grid row grows with the content instead. */
+      overflow: visible;
     }
     .pane-head {
       align-items: stretch;
