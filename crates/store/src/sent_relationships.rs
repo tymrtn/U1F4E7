@@ -166,8 +166,9 @@ impl Database {
     /// then recency then address, and capped at `limit` with the true total
     /// reported alongside.
     ///
-    /// `now` is a `%Y-%m-%dT%H:%M:%S` UTC timestamp used solely to derive the
-    /// recency half of the signal.
+    /// `now` is an RFC 3339 timestamp (`Z` or numeric offset) or a legacy
+    /// naive `%Y-%m-%dT%H:%M:%S` UTC value, used solely to derive the recency
+    /// half of the signal.
     pub fn aggregate_sent_relationships(
         &self,
         account_id: &str,
@@ -302,18 +303,25 @@ impl Database {
     }
 }
 
-/// The oldest `%Y-%m-%dT%H:%M:%S` timestamp that still counts as recent, or
-/// `None` when `now` does not parse — in which case nothing reads as recent,
-/// which errs toward the quieter "historical" label rather than inventing
-/// freshness.
+/// The oldest naive-UTC `%Y-%m-%dT%H:%M:%S` timestamp that still counts as
+/// recent, or `None` when `now` does not parse — in which case nothing reads
+/// as recent, which errs toward the quieter "historical" label rather than
+/// inventing freshness.
+///
+/// `now` arrives as RFC 3339 from the dashboard (`Z` or a numeric offset,
+/// converted to UTC) or as legacy naive UTC; the floor is formatted naive so
+/// it compares lexicographically against the [`normalize_timestamp`]-shaped
+/// observed dates in the same UTC frame.
 fn recent_floor(now: &str) -> Option<String> {
-    chrono::NaiveDateTime::parse_from_str(now, "%Y-%m-%dT%H:%M:%S")
-        .ok()
-        .map(|parsed| {
-            (parsed - chrono::Duration::days(SENT_RELATIONSHIP_RECENT_DAYS))
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string()
-        })
+    let parsed = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|dt| dt.naive_utc())
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(now, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
+    Some(
+        (parsed - chrono::Duration::days(SENT_RELATIONSHIP_RECENT_DAYS))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+    )
 }
 
 /// Fixed signal from aggregate topology and recency only. No per-message
@@ -810,6 +818,67 @@ mod tests {
         );
         assert_eq!(
             by_email("fresh@x.test").signal,
+            SentRelationshipSignal::RecentOutboundHistory
+        );
+    }
+
+    /// Production callers pass `now` as RFC 3339 UTC with a `Z` suffix (the
+    /// dashboard's `utc_now_string()`), and the recency window must hold in
+    /// that format. Regression: a `Z`-suffixed `now` once failed to parse,
+    /// which relabeled every recent one-way relationship as historical.
+    #[test]
+    fn rfc3339_now_keeps_recent_one_way_relationships_recent() {
+        let db = db_with_accounts();
+        let fresh = new_thread(&db, "acct-a", "fresh");
+        outbound(&db, &fresh, 1, "fresh@x.test", "2026-08-25T00:00:00");
+        let old = new_thread(&db, "acct-a", "old");
+        outbound(&db, &old, 2, "old@x.test", "2025-11-15T09:30:00");
+
+        let page = db
+            .aggregate_sent_relationships("acct-a", "2026-08-30T12:00:00Z", 25)
+            .unwrap();
+
+        assert_eq!(page.total, 2);
+        let by_email = |email: &str| {
+            page.items
+                .iter()
+                .find(|rel| rel.counterparty_email == email)
+                .unwrap()
+        };
+        assert_eq!(
+            by_email("fresh@x.test").signal,
+            SentRelationshipSignal::RecentOutboundHistory
+        );
+        assert_eq!(
+            by_email("old@x.test").signal,
+            SentRelationshipSignal::HistoricalOneWay
+        );
+    }
+
+    /// A `now` carrying a numeric offset denotes the same instant as its UTC
+    /// form, and observed dates with offsets normalize into the same UTC
+    /// frame before comparison. The fixture sits one hour inside the 90-day
+    /// window: it reads historical if either side keeps its wall-clock
+    /// offset instead of converting to UTC.
+    #[test]
+    fn offset_now_and_offset_observed_dates_compare_in_utc() {
+        let db = db_with_accounts();
+        let thread = new_thread(&db, "acct-a", "edge");
+        // 2026-06-01T13:00:00 UTC, one hour after the 90-day floor of a
+        // 2026-08-30T12:00:00 UTC "now".
+        outbound(&db, &thread, 1, "edge@x.test", "2026-06-01T15:00:00+02:00");
+
+        let page = db
+            .aggregate_sent_relationships("acct-a", "2026-08-30T14:00:00+02:00", 25)
+            .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(
+            page.items[0].last_observed.as_deref(),
+            Some("2026-06-01T13:00:00")
+        );
+        assert_eq!(
+            page.items[0].signal,
             SentRelationshipSignal::RecentOutboundHistory
         );
     }
