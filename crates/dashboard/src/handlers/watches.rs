@@ -93,10 +93,17 @@ fn secret_prefix(secret: &str) -> String {
     secret.chars().take(10).collect()
 }
 
-fn watch_health(status: &str) -> &'static str {
+/// Watch statuses that mean the watch itself has failed. The review queue's
+/// operational-health query filters on this same set, so the health badge and
+/// the queue can never disagree about what counts as a failing watch.
+pub(crate) const DANGER_WATCH_STATUSES: &[&str] = &["failed", "error"];
+
+pub(crate) fn watch_health(status: &str) -> &'static str {
+    if DANGER_WATCH_STATUSES.contains(&status) {
+        return "danger";
+    }
     match status {
         "running" => "ok",
-        "failed" | "error" => "danger",
         _ => "pending",
     }
 }

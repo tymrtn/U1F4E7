@@ -1227,7 +1227,7 @@ fn unquote_display_name(raw: &str) -> String {
 /// Normalize a header date to the `%Y-%m-%dT%H:%M:%S` UTC form the contacts
 /// table already uses, so `first_seen`/`last_seen` stay lexicographically
 /// comparable across sources.
-fn normalize_timestamp(raw: &str) -> Option<String> {
+pub(crate) fn normalize_timestamp(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

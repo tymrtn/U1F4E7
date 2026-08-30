@@ -25,10 +25,12 @@ pub mod models;
 pub mod ops_primitives;
 pub mod paths;
 pub mod rule_store;
+pub mod sent_relationships;
 pub mod snoozed;
 pub mod tag_store;
 pub mod threads;
 
+pub use action_log::{ACTION_FAILURE_STATUSES, is_action_failure_status};
 pub use address_book::{ADDRESS_HISTORY_CHUNK_ROWS, AddressHistoryReconcile, AddressSuggestion};
 pub use agent_cockpit::{AgentActivityCounts, GovernorVerdict};
 pub use agent_identity::{
@@ -43,4 +45,5 @@ pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use models::*;
 pub use ops_primitives::{RuleRunAuditInput, WatchUpsert};
 pub use paths::{app_data_dir, config_root_dir, credential_file_path, database_path};
+pub use sent_relationships::{SentRelationship, SentRelationshipPage, SentRelationshipSignal};
 pub use threads::ThreadContext;

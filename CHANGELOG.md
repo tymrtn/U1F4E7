@@ -5,6 +5,17 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] — 2026-08-30
+
+### Added
+
+- **Review:** a read-only, cross-account operator queue that puts pending draft decisions, explicit waits, durable mailbox triage signals, and actual operational failures ahead of agent telemetry. Every action-bearing item links to its existing draft, message, or Rules surface; the aggregate never opens IMAP, sends, acknowledges events, or runs rules.
+- **Sent relationship history:** Review now shows observed thread history grouped by exact outbound counterparty and account: sent/received message counts, thread count, first/last observed activity, and an intentionally modest topology signal. High-volume historical correspondence—such as an automated travel-service relationship—appears as context, not a fabricated "awaiting reply" task. The section says plainly that it reflects cached thread history, not a full mailbox census.
+
+### Fixed
+
+- Review summaries now keep their boundaries honest: arbitrary body-like or secret-bearing free text stays out of the aggregate; terminal action failures are not confused with ordinary queued work; capped lists show their actual totals; own plus-address aliases do not become counterparties; and RFC 3339 dashboard timestamps correctly distinguish recent outbound history from historical one-way history.
+
 ## [1.1.3] — 2026-08-28
 
 - fix(drafts,send): an authored body whose line breaks arrived as the literal

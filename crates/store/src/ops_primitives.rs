@@ -4,8 +4,39 @@
 use crate::db::Database;
 use crate::errors::Result;
 use crate::models::{FailedAuthAttempt, RuleRunAudit, WatchRecord};
-use rusqlite::params;
+use rusqlite::{params, params_from_iter};
 use uuid::Uuid;
+
+/// WHERE clause + bound params for watch queries filtered by account and a
+/// caller-supplied status set. Placeholders are numbered from ?1.
+fn watch_status_filter<'a>(
+    account_id: Option<&'a str>,
+    statuses: &[&'a str],
+) -> (String, Vec<&'a str>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params_vec: Vec<&str> = Vec::new();
+    if let Some(account) = account_id {
+        params_vec.push(account);
+        clauses.push(format!("account_id = ?{}", params_vec.len()));
+    }
+    if !statuses.is_empty() {
+        let placeholders = statuses
+            .iter()
+            .map(|status| {
+                params_vec.push(status);
+                format!("?{}", params_vec.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("status IN ({placeholders})"));
+    }
+    let filter_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    (filter_sql, params_vec)
+}
 
 pub struct WatchUpsert<'a> {
     pub account_id: &'a str,
@@ -84,6 +115,47 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Watches restricted to the given statuses, newest-updated first. Unlike
+    /// [`Database::list_watches`], the status filter runs in SQL, so failing
+    /// watches are found even when the registry holds more healthy rows than
+    /// the cap. Statuses are caller constants, bound as placeholders.
+    pub fn list_watches_with_statuses(
+        &self,
+        account_id: Option<&str>,
+        statuses: &[&str],
+        limit: u32,
+    ) -> Result<Vec<WatchRecord>> {
+        let (filter_sql, mut params_vec) = watch_status_filter(account_id, statuses);
+        let sql = format!(
+            "SELECT id, account_id, folder, status, process_id, schedule,
+                    last_heartbeat_at, last_event_at, failure_reason, created_at, updated_at
+             FROM watch_registry
+             {filter_sql}
+             ORDER BY updated_at DESC
+             LIMIT ?{}",
+            params_vec.len() + 1
+        );
+        let limit_string = limit.to_string();
+        params_vec.push(limit_string.as_str());
+        let mut stmt = self.conn().prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params_vec), map_watch)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// True total of watches in the given statuses — the uncapped companion to
+    /// [`Database::list_watches_with_statuses`].
+    pub fn count_watches_with_statuses(
+        &self,
+        account_id: Option<&str>,
+        statuses: &[&str],
+    ) -> Result<i64> {
+        let (filter_sql, params_vec) = watch_status_filter(account_id, statuses);
+        let sql = format!("SELECT COUNT(*) FROM watch_registry {filter_sql}");
+        Ok(self
+            .conn()
+            .query_row(&sql, params_from_iter(params_vec), |row| row.get(0))?)
+    }
+
     fn get_watch(&self, account_id: &str, folder: &str) -> Result<WatchRecord> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, folder, status, process_id, schedule,
@@ -153,6 +225,27 @@ impl Database {
             stmt.query_map(params![limit], map_failed_auth)?
         };
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// True total of recent failed-auth attempts — the uncapped companion to
+    /// [`Database::list_failed_auth`], sharing its 4-hour recency window so
+    /// count and list never disagree about what "recent" means.
+    pub fn count_failed_auth(&self, account_id: Option<&str>) -> Result<i64> {
+        let (sql, params_vec): (&str, Vec<&str>) = match account_id {
+            Some(account) => (
+                "SELECT COUNT(*) FROM failed_auth_history
+                 WHERE account_id = ?1 AND created_at >= datetime('now', '-4 hours')",
+                vec![account],
+            ),
+            None => (
+                "SELECT COUNT(*) FROM failed_auth_history
+                 WHERE created_at >= datetime('now', '-4 hours')",
+                Vec::new(),
+            ),
+        };
+        Ok(self
+            .conn()
+            .query_row(sql, params_from_iter(params_vec), |row| row.get(0))?)
     }
 
     pub fn record_rule_run(&self, input: RuleRunAuditInput<'_>) -> Result<RuleRunAudit> {
