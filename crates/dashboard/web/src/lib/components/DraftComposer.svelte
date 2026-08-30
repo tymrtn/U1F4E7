@@ -1641,6 +1641,14 @@
   @media (max-width: 760px) {
     .draft-review {
       padding: 0.75rem;
+      /* One column, one scroller: the document. The desktop overflow: auto
+         makes this pane the scroll container, and on iOS a touch that starts
+         on the tall sandboxed preview iframe belongs to the pane's scroller
+         and never chains out — the action controls under a long forwarded
+         HTML message become unreachable. The content sizes the pane instead;
+         BodyFrame already sizes the iframe to its document, so the page is
+         the only thing that scrolls. */
+      overflow: visible;
     }
     .draft-field-row {
       grid-template-columns: 3.75rem minmax(0, 1fr) auto;

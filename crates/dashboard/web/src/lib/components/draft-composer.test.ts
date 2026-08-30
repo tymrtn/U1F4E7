@@ -1572,3 +1572,46 @@ describe('DraftComposer attribution park', () => {
     expect(screen.getByRole('button', { name: /send again/i })).toBeInTheDocument();
   });
 });
+
+// ── Tall forwarded HTML draft ─────────────────────────────────────────
+//
+// The mobile scroll regression was hit on exactly this shape of draft: a
+// forward whose rendered HTML body is far taller than any phone screen. The
+// CSS side of the fix is pinned by mobile-scroll-contract.test.ts; this
+// proves the composer side of the bargain — the ENTIRE body reaches the
+// sandboxed frame (BodyFrame sizes the frame to it, so a truncated srcdoc
+// would render as a short message, not a scrollable one) and the action
+// controls stay mounted in the same document flow below it.
+
+describe('DraftComposer tall forwarded HTML draft', () => {
+  const rows = Array.from(
+    { length: 400 },
+    (_, i) => `<tr><td style="padding:8px">Order line ${i} — EU-2026-${i}</td></tr>`
+  ).join('');
+  const FORWARD =
+    '<div dir="ltr">Passing this along.<br><br>' +
+    '---------- Forwarded message ---------<br>' +
+    'From: <b>Billing &lt;billing@vendor.example&gt;</b><br>' +
+    'Subject: Your invoice</div>' +
+    `<table width="600">${rows}</table>` +
+    '<p>— The Vendor Team (end of forward)</p>';
+
+  it('feeds the whole forward into the frame and keeps the controls below it', async () => {
+    await renderLoaded({
+      subject: 'Fwd: Your invoice',
+      text_content: null,
+      html_content: FORWARD
+    });
+
+    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const srcdoc = frame.getAttribute('srcdoc') ?? '';
+    expect(srcdoc).toContain('Order line 0');
+    expect(srcdoc).toContain('Order line 399');
+    expect(srcdoc).toContain('end of forward');
+
+    // The send controls live under the message in the same document flow —
+    // they exist and are reachable, not trapped behind an inner scroller.
+    expect(screen.getByRole('button', { name: /human-only send in/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /human-only send now/i })).toBeEnabled();
+  });
+});
