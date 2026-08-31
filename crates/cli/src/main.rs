@@ -340,6 +340,14 @@ enum Commands {
         /// Disable background unsnooze and scheduled-send sweeps (desktop diagnostics / read-only shell)
         #[arg(long)]
         no_background_sweeps: bool,
+
+        /// Ignore any configured dashboard auth for this run. The non-loopback
+        /// guard still applies, so this can only ever open a loopback bind. The
+        /// desktop shell needs it: it runs a private server on an ephemeral
+        /// loopback port, and the browser UI has no way to present a bearer
+        /// token, so an inherited token would 401 every API call.
+        #[arg(long)]
+        no_auth: bool,
     },
 
     /// Compose a new email (licensed tier)
@@ -2290,7 +2298,8 @@ fn main() {
             port,
             bind,
             no_background_sweeps,
-        } => commands::serve::run(port, bind, no_background_sweeps),
+            no_auth,
+        } => commands::serve::run(port, bind, no_background_sweeps, no_auth),
         Commands::Compose { .. } => {
             eprintln!("License required — visit https://envelope-email.dev");
             std::process::exit(1);

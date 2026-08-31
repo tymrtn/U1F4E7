@@ -5,6 +5,12 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] — 2026-08-31
+
+### Added
+
+- **Serve:** `envelope serve --no-auth`, for the desktop shell's bundled sidecar. The shell starts a private server on an ephemeral loopback port per launch, and its browser UI cannot present a bearer token, so without the flag the sidecar could not run under 1.1.4 at all. The flag is guarded: with dashboard auth configured it refuses to start on the default port 3141, because the documented `tailscale serve` setup fronts that loopback port and an open listener there would serve every mailbox to the tailnet. On an explicit private port it starts open and warns that the configured auth is being ignored. Without the flag, configured auth is enforced exactly as before, and a non-loopback bind without a credential is still refused.
+
 ## [1.1.4] — 2026-08-30
 
 ### Added
