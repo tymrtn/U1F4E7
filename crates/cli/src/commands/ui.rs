@@ -7,11 +7,9 @@
 //! should carry a `ui` object so Envelopie/Hermes/Codex can hand Tyler the
 //! relevant dashboard URL without reconstructing it.
 //!
-//! Base URL precedence:
-//!   1. `ENVELOPE_DASHBOARD_BASE_URL` environment variable
-//!   2. `ENVELOPE_DASHBOARD_URL` backwards-compatible alias
-//!   3. persistent `dashboard.base_url` config
-//!   4. `http://localhost:3141`
+//! Agent-facing origins are discovered from an active local Tailscale Serve
+//! route to Envelope's loopback dashboard. A stale configured hostname does not
+//! prove the service is still reachable, so it is never used for these links.
 //!
 //! Helpers never emit secrets — only account ids, draft ids, message UIDs
 //! and folder/query names go into URLs, and folder/draft values are
@@ -21,14 +19,142 @@ use envelope_email_store::Database;
 use envelope_email_transport::provider;
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(not(test))]
+use std::io::Read;
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
+#[cfg(not(test))]
+use std::sync::OnceLock;
+#[cfg(not(test))]
+use std::time::Duration;
 use tracing::warn;
+#[cfg(not(test))]
+use wait_timeout::ChildExt;
 
-/// Default dashboard origin when no dashboard base URL is configured.
+/// Default dashboard origin when no verified Tailscale Serve route is active.
 pub const DEFAULT_DASHBOARD_BASE: &str = "http://localhost:3141";
+#[cfg(not(test))]
+const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const DASHBOARD_LOOPBACK_PROXY: &str = "http://127.0.0.1:3141";
 
-/// Resolve the dashboard base URL (origin only, no trailing slash).
+#[cfg(not(test))]
+static DISCOVERED_DASHBOARD_BASE: OnceLock<String> = OnceLock::new();
+
+/// Resolve the dashboard origin once per CLI process. Only a live Tailscale
+/// Serve route to Envelope's loopback listener can produce a non-local origin.
 pub fn dashboard_base() -> String {
-    super::config::resolved_dashboard_base_url().value
+    #[cfg(test)]
+    {
+        // Unit tests exercise the pure parser below; never require a local
+        // Tailscale installation or leak its machine-specific host into tests.
+        return DEFAULT_DASHBOARD_BASE.to_string();
+    }
+
+    #[cfg(not(test))]
+    DISCOVERED_DASHBOARD_BASE
+        .get_or_init(discover_dashboard_base)
+        .clone()
+}
+
+#[cfg(not(test))]
+fn discover_dashboard_base() -> String {
+    let Some(status) = tailscale_serve_status() else {
+        return DEFAULT_DASHBOARD_BASE.to_string();
+    };
+    parse_tailscale_serve_status(&status).unwrap_or_else(|| DEFAULT_DASHBOARD_BASE.to_string())
+}
+
+#[cfg(not(test))]
+fn tailscale_serve_status() -> Option<String> {
+    let mut child = Command::new("tailscale")
+        .args(["serve", "status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let status = match child.wait_timeout(TAILSCALE_STATUS_TIMEOUT).ok()? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    Some(output)
+}
+
+/// Parse Tailscale Serve status without trusting any configured hostname.
+///
+/// Exactly one HTTPS Web listener must expose its root path directly to
+/// Envelope's loopback dashboard. Unknown status shapes and ambiguous matches
+/// fail closed so agent links never point at an unverified tailnet host.
+pub(crate) fn parse_tailscale_serve_status(status: &str) -> Option<String> {
+    let status: Value = serde_json::from_str(status).ok()?;
+    let tcp = status.get("TCP")?.as_object()?;
+    let web = status.get("Web")?.as_object()?;
+    let mut origins = Vec::new();
+
+    for (listener, config) in web {
+        let Some((host, port)) = parse_https_listener(listener) else {
+            continue;
+        };
+        if !tcp
+            .get(&port.to_string())
+            .and_then(|listener| listener.get("HTTPS"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(proxy) = config
+            .get("Handlers")
+            .and_then(Value::as_object)
+            .and_then(|handlers| handlers.get("/"))
+            .and_then(|handler| handler.get("Proxy"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if matches_dashboard_loopback_proxy(proxy) {
+            origins.push(format!("https://{host}"));
+        }
+    }
+
+    match origins.as_slice() {
+        [origin] => Some(origin.clone()),
+        _ => None,
+    }
+}
+
+fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
+    let (host, port) = listener.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if port != 443 {
+        return None;
+    }
+
+    // Tailscale hostnames are DNS hostnames. Normalize case and the harmless
+    // DNS trailing dot, while rejecting anything that could alter a URL origin.
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn matches_dashboard_loopback_proxy(proxy: &str) -> bool {
+    proxy.strip_suffix('/').unwrap_or(proxy) == DASHBOARD_LOOPBACK_PROXY
 }
 
 fn join(path: &str) -> String {
@@ -215,27 +341,79 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_base_strips_trailing_slash() {
-        let guard = isolated_dashboard_config("trailing-slash");
-        guard.set_primary_env("http://example.test:8080/");
-        assert_eq!(dashboard_base(), "http://example.test:8080");
+    fn configured_dashboard_origins_do_not_affect_agent_ui_urls() {
+        let _guard = isolated_dashboard_config("configured-origin-ignored");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://stale.example.test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(dashboard_base(), "http://localhost:3141");
     }
 
     #[test]
-    fn dashboard_base_prefers_primary_env_over_alias() {
-        let guard = isolated_dashboard_config("primary-env");
-        guard.set_alias_env("https://alias.example.test/");
-        guard.set_primary_env("https://primary.example.test/");
-
-        assert_eq!(dashboard_base(), "https://primary.example.test");
+    fn tailscale_serve_status_discovers_the_active_loopback_dashboard_route() {
+        let status = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        assert_eq!(
+            parse_tailscale_serve_status(status).as_deref(),
+            Some("https://14inches.tail87a011.ts.net")
+        );
     }
 
     #[test]
-    fn dashboard_base_uses_alias_when_primary_env_is_absent() {
-        let guard = isolated_dashboard_config("alias-env");
-        guard.set_alias_env("https://alias.example.test/");
+    fn tailscale_serve_status_rejects_wrong_proxy_or_missing_https() {
+        let wrong_proxy = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"node.tailnet.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3142"}}
+            }}
+        }"#;
+        let no_https = r#"{
+            "TCP": {"443": {"HTTPS": false}},
+            "Web": {"node.tailnet.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        assert_eq!(parse_tailscale_serve_status(wrong_proxy), None);
+        assert_eq!(parse_tailscale_serve_status(no_https), None);
+    }
 
-        assert_eq!(dashboard_base(), "https://alias.example.test");
+    #[test]
+    fn tailscale_serve_status_fails_closed_for_malformed_or_ambiguous_routes() {
+        let ambiguous = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {
+                "one.tailnet.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}},
+                "two.tailnet.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3141/"}}}
+            }
+        }"#;
+        assert_eq!(parse_tailscale_serve_status("not json"), None);
+        assert_eq!(parse_tailscale_serve_status(ambiguous), None);
+    }
+
+    #[test]
+    fn tailscale_serve_status_normalizes_host_and_port() {
+        let status = r#"{
+            "TCP": {"443": {"HTTPS": true}, "8443": {"HTTPS": true}},
+            "Web": {
+                "14INCHES.tail87a011.ts.net.:0443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141/"}}
+                },
+                "ignored.tailnet.ts.net:8443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_tailscale_serve_status(status).as_deref(),
+            Some("https://14inches.tail87a011.ts.net")
+        );
     }
 
     #[test]
@@ -258,17 +436,19 @@ mod tests {
     }
 
     #[test]
-    fn account_ui_uses_configured_base_url_for_cockpit_url() {
-        let guard = isolated_dashboard_config("account-configured-base");
-        guard.set_primary_env("https://dash.example.test/envelope/");
+    fn account_ui_ignores_configured_base_url_for_cockpit_url() {
+        let _guard = isolated_dashboard_config("account-configured-base");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://dash.example.test/envelope"}}"#,
+        )
+        .unwrap();
 
         let ui = account_ui("acct/one");
-        assert_eq!(ui["dashboard_url"], "https://dash.example.test/envelope");
+        assert_eq!(ui["dashboard_url"], "http://localhost:3141");
         assert_eq!(ui["dashboard_path"], "/cockpit");
-        assert_eq!(
-            ui["cockpit_url"],
-            "https://dash.example.test/envelope/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -307,19 +487,21 @@ mod tests {
     }
 
     #[test]
-    fn message_ui_uses_configured_base_url_and_preserves_query_encoding() {
-        let guard = isolated_dashboard_config("message-configured-base");
-        guard.set_primary_env("https://dash.example.test/envelope/");
+    fn message_ui_ignores_configured_base_url_and_preserves_query_encoding() {
+        let _guard = isolated_dashboard_config("message-configured-base");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://dash.example.test/envelope"}}"#,
+        )
+        .unwrap();
 
         let ui = message_ui("acct/one", 42, "Sent/Items & Stuff");
         assert_eq!(
             ui["message_url"],
-            "https://dash.example.test/envelope/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
+            "http://localhost:3141/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
         );
-        assert_eq!(
-            ui["cockpit_url"],
-            "https://dash.example.test/envelope/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     /// The exact link shape reproduced against installed 1.0.10: a UUID account

@@ -5,6 +5,17 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Agent dashboard URLs verify their origin from live Tailscale Serve status.**
+  CLI/MCP UI metadata and top-level draft `dashboard_url`/`review_url` use
+  exactly one active HTTPS root proxy to Envelope's loopback dashboard, or safely
+  fall back to `http://localhost:3141`. Configured dashboard hostnames and
+  dashboard-base environment variables are no longer emitted as agent links;
+  `dashboard_path` remains the canonical portable handle.
+
 ## [1.1.6] — 2026-08-31
 
 ### Fixed
@@ -254,11 +265,10 @@ This release folds the dogfood dev builds since 1.0.12 (install labels
 
 ### Fixed
 
-- **Draft review URLs honor the configured dashboard host consistently.** CLI
-  draft output now uses the canonical dashboard base URL resolver for top-level
-  `dashboard_url` and `review_url` fields, matching nested `ui` metadata instead
-  of falling back to `http://localhost:3141` when only persistent
-  `dashboard.base_url` is configured.
+- **Draft review URLs matched the then-configured dashboard host consistently.**
+  This historical behavior is superseded by the live Tailscale Serve discovery
+  introduced in 1.1.6; configured dashboard origins are no longer used for
+  agent-facing links.
 
 ### Fixed
 

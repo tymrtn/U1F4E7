@@ -98,9 +98,8 @@ fn draft_dashboard_url_with_base(base_url: &str, account_id: &str, draft_id: &st
 }
 
 pub(crate) fn draft_dashboard_url(account_id: &str, draft_id: &str) -> String {
-    // Resolve through the canonical dashboard base URL precedence
-    // (ENVELOPE_DASHBOARD_BASE_URL → legacy alias → persisted dashboard.base_url
-    // → localhost) so top-level draft URLs match the nested `ui` review URLs.
+    // Use the same live-discovered origin as nested UI metadata, never a stale
+    // configured dashboard hostname.
     draft_dashboard_url_with_base(&ui::dashboard_base(), account_id, draft_id)
 }
 
@@ -3079,13 +3078,13 @@ mod tests {
     }
 
     #[test]
-    fn draft_urls_use_persisted_dashboard_base_url() {
-        let path = drafts_test_config_path("persisted-base");
+    fn draft_urls_ignore_configured_dashboard_origins() {
+        let path = drafts_test_config_path("configured-origin-ignored");
         let _ = std::fs::remove_file(&path);
         let _guard = crate::commands::config::isolated_dashboard_config(path.clone());
         std::fs::write(
             &path,
-            r#"{"dashboard":{"base_url":"https://macbook-pro.tail87a011.ts.net"}}"#,
+            r#"{"dashboard":{"base_url":"https://stale-config.example"}}"#,
         )
         .unwrap();
 
@@ -3093,36 +3092,12 @@ mod tests {
         let draft = "draft-123";
         let top_level = draft_dashboard_url(account, draft);
         let ui = ui::draft_ui(account, draft);
+        let expected = "http://localhost:3141/accounts/editor%40spainexpat.com/drafts/draft-123";
 
-        let expected = "https://macbook-pro.tail87a011.ts.net/accounts/editor%40spainexpat.com/drafts/draft-123";
         assert_eq!(top_level, expected);
         assert_eq!(ui["review_url"], expected);
-        assert_eq!(ui["dashboard_url"], "https://macbook-pro.tail87a011.ts.net");
+        assert_eq!(ui["dashboard_url"], "http://localhost:3141");
         // Top-level draft URL must agree with the nested UI review URL.
-        assert_eq!(top_level, ui["review_url"].as_str().unwrap());
-    }
-
-    #[test]
-    fn draft_urls_prefer_env_over_persisted_dashboard_base_url() {
-        let path = drafts_test_config_path("env-precedence");
-        let _ = std::fs::remove_file(&path);
-        let guard = crate::commands::config::isolated_dashboard_config(path.clone());
-        std::fs::write(
-            &path,
-            r#"{"dashboard":{"base_url":"https://config.example"}}"#,
-        )
-        .unwrap();
-        guard.set_primary_env("https://env.example/");
-
-        let account = "a@b.com";
-        let draft = "d1";
-        let top_level = draft_dashboard_url(account, draft);
-        let ui = ui::draft_ui(account, draft);
-
-        assert_eq!(
-            top_level,
-            "https://env.example/accounts/a%40b.com/drafts/d1"
-        );
         assert_eq!(top_level, ui["review_url"].as_str().unwrap());
     }
 

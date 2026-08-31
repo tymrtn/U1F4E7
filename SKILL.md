@@ -235,15 +235,16 @@ envelope-email serve --port 8080
 envelope-email config set dashboard.tailscale_allow "you@your-tailnet.ts.net"   # humans, no token
 envelope-email config set dashboard.auth_token "$(openssl rand -hex 32)"        # agents/scripts (Bearer)
 tailscale serve --bg 3141
-envelope-email config set dashboard.base_url https://your-node.your-tailnet.ts.net
 ```
 
 Opens an account management dashboard at `http://localhost:3141`. JSON `ui`
-metadata uses `ENVELOPE_DASHBOARD_BASE_URL` first, then the legacy
-`ENVELOPE_DASHBOARD_URL`, then persistent `dashboard.base_url`, then localhost.
-Use Tailscale Serve for tailnet-only handoff URLs. Tailscale Funnel publishes
-the dashboard on the public internet; do not use Funnel for mailbox dashboards
-unless that exposure is intentional.
+metadata discovers an active local `tailscale serve` HTTPS route whose root
+proxy targets `http://127.0.0.1:3141`; otherwise it uses localhost.
+`dashboard_path` remains the canonical portable handle. `dashboard.base_url`
+and the legacy dashboard-base environment variables are compatibility-only and
+do not affect emitted agent UI links. Use Tailscale Serve for tailnet-only
+handoff URLs. Tailscale Funnel publishes the dashboard on the public internet;
+do not use Funnel for mailbox dashboards unless that exposure is intentional.
 
 Loopback is unauthenticated (single-user local trust). Before exposing the
 dashboard beyond loopback, set `dashboard.auth_token` (Bearer, for agents) or
