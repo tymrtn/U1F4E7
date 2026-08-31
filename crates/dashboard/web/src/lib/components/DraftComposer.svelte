@@ -514,16 +514,29 @@
     // which clears the other alternate server-side — that is what stops a
     // stale HTML part from being delivered instead of the edit.
     const format: BodyFormat = next.html_content != null ? 'html' : 'text';
+    // Keep the values painted into the controls and the saved baseline as one
+    // snapshot. In particular, recipient controls render their parsed,
+    // canonical header form rather than the server's original whitespace and
+    // separators. Taking the baseline from those exact rendered values is what
+    // lets a successful edit immediately unlock the human-only send actions.
+    const rendered: Snapshot = {
+      to: serializeAddrs(next.to_addr ?? ''),
+      cc: serializeAddrs(next.cc_addr ?? ''),
+      bcc: serializeAddrs(next.bcc_addr ?? ''),
+      subject: next.subject ?? '',
+      body: (format === 'html' ? next.html_content : next.text_content) ?? '',
+      format
+    };
 
     draft = next;
     // Normalized to the recipient field's canonical `a@x, b@y` form BEFORE the
     // baseline snapshot: the field re-serializes whatever it is given, so an
     // un-normalized server value would come back changed and read as an
     // unsaved edit the operator never made — which blocks Send.
-    toRaw = serializeAddrs(next.to_addr ?? '');
-    ccRaw = serializeAddrs(next.cc_addr ?? '');
-    bccRaw = serializeAddrs(next.bcc_addr ?? '');
-    subjectRaw = next.subject ?? '';
+    toRaw = rendered.to;
+    ccRaw = rendered.cc;
+    bccRaw = rendered.bcc;
+    subjectRaw = rendered.subject;
     // A draft carrying only one alternative seeds the empty slot from the one
     // it has: switching format there means "send this body as the other
     // format", not "start from an empty box".
@@ -531,14 +544,14 @@
       text: (next.text_content ?? next.html_content) ?? '',
       html: (next.html_content ?? next.text_content) ?? ''
     };
-    bodyRaw = bodyByFormat[format];
-    bodyFormat = format;
+    bodyRaw = rendered.body;
+    bodyFormat = rendered.format;
     // HTML opens rendered. Reading markup is the exception, so it lives behind
     // the toggle rather than being what a review lands on.
     previewing = format === 'html';
     showBcc = bccRaw.length > 0;
     conflict = false;
-    baseline = snapshot();
+    baseline = rendered;
   }
 
   /**

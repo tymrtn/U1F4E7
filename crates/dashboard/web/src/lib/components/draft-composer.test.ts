@@ -343,6 +343,55 @@ describe('DraftComposer edit', () => {
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(screen.getByText(/changes saved/i)).toBeInTheDocument());
   });
+
+  it('adopts the canonical saved draft as the baseline and re-enables both human-only sends', async () => {
+    apiMock.editDraft.mockResolvedValueOnce({
+      draft: {
+        ...BASE_DRAFT,
+        // The response deliberately differs from the submitted values: the
+        // server owns canonical headers and the next revision, and this draft
+        // also proves attachments are not a special post-save path.
+        to_addr: 'Canonical Recipient <canonical@example.com>',
+        cc_addr: null,
+        subject: 'Canonical subject',
+        text_content: 'Canonical body',
+        attachments: [{ filename: 'safe-note.txt', content_type: 'text/plain', size: 12 }],
+        revision: 8
+      },
+      status: 'edited'
+    });
+    await renderLoaded({ attachments: [{ filename: 'safe-note.txt', content_type: 'text/plain', size: 12 }] });
+
+    await setRecipients('To', 'temporary@example.com');
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Temporary subject' } });
+    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Temporary body' } });
+    expect(screen.getByRole('button', { name: /^human-only send now$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeDisabled();
+
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/changes saved/i)).toBeInTheDocument();
+      expect(screen.queryByText(/unsaved changes\. save your changes before sending/i)).not.toBeInTheDocument();
+      expect(chips('To')).toEqual(['Canonical Recipient']);
+      expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Canonical subject');
+      expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Canonical body');
+      expect(screen.getByRole('button', { name: /^human-only send now$/i })).toBeEnabled();
+      expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeEnabled();
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+    await waitFor(() =>
+      expect(apiMock.sendDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT, {
+        confirm: true,
+        expected_revision: 8,
+        send_now: false
+      })
+    );
+  });
 });
 
 // ── Sending ───────────────────────────────────────────────────────────
