@@ -130,9 +130,10 @@ asks Governor to score them with `governor score --catalog envelope`; only an
 opaque Governor `allow` sends in required mode. Message bodies, full recipient
 addresses, attachment bytes, and secrets never enter the Governor request.
 
-Dashboard URL metadata in `--json` output is discovered once per CLI process
-from an active local `tailscale serve` HTTPS route whose root proxy targets
-`http://127.0.0.1:3141`. It otherwise falls back to `http://localhost:3141`.
+Dashboard URL metadata in `--json` output is discovered fresh for each UI
+construction or request, from an active local `tailscale serve` HTTPS route whose
+root proxy targets `http://127.0.0.1:3141`. It otherwise falls back to
+`http://localhost:3141`.
 Every agent-facing `ui` object reports that decision as
 `dashboard_origin_source` (`tailscale_serve` or `localhost_fallback`) and adds
 a non-secret `dashboard_origin_warning` only when discovery needs attention.

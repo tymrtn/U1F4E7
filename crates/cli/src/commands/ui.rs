@@ -272,13 +272,13 @@ fn normalize_dns_name(name: &str) -> Option<String> {
     Some(host)
 }
 
-/// A Tailscale Serve listener must identify a machine on a tailnet, not merely
-/// look like an arbitrary DNS name. Normal machine DNS names have a machine and
-/// tailnet label before the exact `.ts.net` suffix.
+/// A Tailscale Serve listener must identify exactly one machine on one tailnet,
+/// not merely look like an arbitrary DNS name. A machine DNS name has exactly
+/// `machine.tailnet.ts.net` labels after normalization.
 fn normalize_tailscale_dns_name(name: &str) -> Option<String> {
     let host = normalize_dns_name(name)?;
     let labels = host.split('.').collect::<Vec<_>>();
-    if labels.len() < 4 || labels[labels.len() - 2] != "ts" || labels[labels.len() - 1] != "net" {
+    if labels.len() != 4 || labels[2] != "ts" || labels[3] != "net" {
         return None;
     }
     Some(host)
@@ -588,6 +588,8 @@ mod tests {
             "attacker.example:443",
             "ts.net:443",
             "tailnet.ts.net:443",
+            "extra.machine.tailnet.ts.net:443",
+            "node..tailnet.ts.net:443",
             "node.tailnet.ts.net.evil:443",
             "node.tailnet.ts.net@attacker.example:443",
             "node.tailnet.ts.net/attacker:443",
@@ -613,6 +615,10 @@ mod tests {
         );
         assert_eq!(
             parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"ts.net"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"extra.machine.tailnet.ts.net"}}"#),
             None
         );
     }
