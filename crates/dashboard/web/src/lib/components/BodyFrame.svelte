@@ -297,4 +297,19 @@
     background: var(--env-paper);
     display: block;
   }
+
+  /* One-column mobile layout (same 760px breakpoint the panes collapse at):
+     the document owns scrolling, but iOS keeps a vertical touch that STARTS
+     inside the sandboxed iframe captive in the frame's context — a tall
+     forwarded message can never be flicked past to the attachments and
+     Human-only Send controls under it. Refuse the gesture at the frame so it
+     lands on the document scroller. Tradeoff, accepted for reachable
+     controls: the preview is read-only on narrow screens (no link taps or
+     quote toggles). The frame stays visible, focusable, and in the
+     accessibility tree. */
+  @media (max-width: 760px) {
+    .body-frame {
+      pointer-events: none;
+    }
+  }
 </style>
