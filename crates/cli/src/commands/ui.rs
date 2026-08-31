@@ -38,36 +38,49 @@ const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_LOOPBACK_PROXY: &str = "http://127.0.0.1:3141";
 
 #[cfg(not(test))]
-static DISCOVERED_DASHBOARD_BASE: OnceLock<String> = OnceLock::new();
+static DISCOVERED_DASHBOARD_ORIGIN: OnceLock<ResolvedDashboardOrigin> = OnceLock::new();
+
+/// A verified dashboard origin and the bounded observability information used
+/// to select it. The warning deliberately contains only safe DNS labels, never
+/// a full tailnet DNS name or Tailscale identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDashboardOrigin {
+    base_url: String,
+    dashboard_origin_source: &'static str,
+    dashboard_origin_warning: Option<String>,
+}
 
 /// Resolve the dashboard origin once per CLI process. Only a live Tailscale
 /// Serve route to Envelope's loopback listener can produce a non-local origin.
 pub fn dashboard_base() -> String {
+    dashboard_origin().base_url
+}
+
+fn dashboard_origin() -> ResolvedDashboardOrigin {
     #[cfg(test)]
     {
         // Unit tests exercise the pure parser below; never require a local
         // Tailscale installation or leak its machine-specific host into tests.
-        return DEFAULT_DASHBOARD_BASE.to_string();
+        return localhost_origin(None);
     }
 
     #[cfg(not(test))]
-    DISCOVERED_DASHBOARD_BASE
-        .get_or_init(discover_dashboard_base)
+    DISCOVERED_DASHBOARD_ORIGIN
+        .get_or_init(discover_dashboard_origin)
         .clone()
 }
 
 #[cfg(not(test))]
-fn discover_dashboard_base() -> String {
-    let Some(status) = tailscale_serve_status() else {
-        return DEFAULT_DASHBOARD_BASE.to_string();
-    };
-    parse_tailscale_serve_status(&status).unwrap_or_else(|| DEFAULT_DASHBOARD_BASE.to_string())
+fn discover_dashboard_origin() -> ResolvedDashboardOrigin {
+    let serve_status = tailscale_json(["serve", "status", "--json"]);
+    let node_status = tailscale_json(["status", "--json"]);
+    resolve_dashboard_origin(serve_status.as_deref(), node_status.as_deref())
 }
 
 #[cfg(not(test))]
-fn tailscale_serve_status() -> Option<String> {
+fn tailscale_json<const N: usize>(args: [&str; N]) -> Option<String> {
     let mut child = Command::new("tailscale")
-        .args(["serve", "status", "--json"])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -88,6 +101,58 @@ fn tailscale_serve_status() -> Option<String> {
     let mut output = String::new();
     child.stdout.take()?.read_to_string(&mut output).ok()?;
     Some(output)
+}
+
+/// Resolve dashboard origin from local CLI outputs only. A verified Serve route
+/// remains authoritative even when it belongs to a different node hostname:
+/// the route, not node identity, proves ingress to Envelope.
+fn resolve_dashboard_origin(
+    serve_status: Option<&str>,
+    node_status: Option<&str>,
+) -> ResolvedDashboardOrigin {
+    let serve_origin = serve_status.and_then(parse_tailscale_serve_status);
+    let self_dns_name = node_status.and_then(parse_tailscale_self_dns_name);
+
+    match (serve_origin, self_dns_name) {
+        (Some(base_url), Some(self_dns_name)) => {
+            let serve_host = base_url
+                .strip_prefix("https://")
+                .expect("verified Tailscale origin always has HTTPS scheme");
+            let dashboard_origin_warning = (serve_host != self_dns_name).then(|| {
+                format!(
+                    "Verified Tailscale Serve host `{}` differs from this node's Tailscale DNS name `{}`; using the Serve host because it is the active Envelope ingress.",
+                    safe_dns_label(serve_host),
+                    safe_dns_label(&self_dns_name),
+                )
+            });
+            ResolvedDashboardOrigin {
+                base_url,
+                dashboard_origin_source: "tailscale_serve",
+                dashboard_origin_warning,
+            }
+        }
+        (Some(base_url), None) => ResolvedDashboardOrigin {
+            base_url,
+            dashboard_origin_source: "tailscale_serve",
+            dashboard_origin_warning: None,
+        },
+        (None, Some(self_dns_name)) => localhost_origin(Some(format!(
+            "Local Tailscale node `{}` is online but is not serving Envelope through a verified HTTPS root proxy; using localhost.",
+            safe_dns_label(&self_dns_name),
+        ))),
+        (None, None) => localhost_origin(Some(
+            "Tailscale dashboard-origin discovery was unavailable or returned malformed status; using localhost."
+                .to_string(),
+        )),
+    }
+}
+
+fn localhost_origin(dashboard_origin_warning: Option<String>) -> ResolvedDashboardOrigin {
+    ResolvedDashboardOrigin {
+        base_url: DEFAULT_DASHBOARD_BASE.to_string(),
+        dashboard_origin_source: "localhost_fallback",
+        dashboard_origin_warning,
+    }
 }
 
 /// Parse Tailscale Serve status without trusting any configured hostname.
@@ -133,6 +198,15 @@ pub(crate) fn parse_tailscale_serve_status(status: &str) -> Option<String> {
     }
 }
 
+/// Read the local node DNS name from `tailscale status --json`. This accepts
+/// only an ordinary DNS hostname so it cannot be reused to inject URL or
+/// warning content.
+pub(crate) fn parse_tailscale_self_dns_name(status: &str) -> Option<String> {
+    let status: Value = serde_json::from_str(status).ok()?;
+    let dns_name = status.get("Self")?.get("DNSName")?.as_str()?;
+    normalize_dns_name(dns_name)
+}
+
 fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
     let (host, port) = listener.rsplit_once(':')?;
     let port = port.parse::<u16>().ok()?;
@@ -142,27 +216,51 @@ fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
 
     // Tailscale hostnames are DNS hostnames. Normalize case and the harmless
     // DNS trailing dot, while rejecting anything that could alter a URL origin.
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    Some((normalize_dns_name(host)?, port))
+}
+
+fn normalize_dns_name(name: &str) -> Option<String> {
+    let host = name.trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty()
+        || host.split('.').any(|label| label.is_empty())
         || !host
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
     {
         return None;
     }
-    Some((host, port))
+    Some(host)
+}
+
+fn safe_dns_label(host: &str) -> &str {
+    host.split('.').next().unwrap_or("unknown")
 }
 
 fn matches_dashboard_loopback_proxy(proxy: &str) -> bool {
     proxy.strip_suffix('/').unwrap_or(proxy) == DASHBOARD_LOOPBACK_PROXY
 }
 
-fn join(path: &str) -> String {
-    let base = dashboard_base();
+fn join(base: &str, path: &str) -> String {
     if path.starts_with('/') {
         format!("{base}{path}")
     } else {
         format!("{base}/{path}")
+    }
+}
+
+fn attach_dashboard_origin_metadata(ui: &mut Value, origin: &ResolvedDashboardOrigin) {
+    let Value::Object(map) = ui else {
+        return;
+    };
+    map.insert(
+        "dashboard_origin_source".to_string(),
+        Value::String(origin.dashboard_origin_source.to_string()),
+    );
+    if let Some(warning) = &origin.dashboard_origin_warning {
+        map.insert(
+            "dashboard_origin_warning".to_string(),
+            Value::String(warning.clone()),
+        );
     }
 }
 
@@ -194,10 +292,13 @@ const RULES_PATH: &str = "/rules";
 
 /// Root-level UI metadata when there is no account/draft/message context.
 pub fn root_ui() -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": "/",
-    })
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata anchored at the agent cockpit.
@@ -206,50 +307,62 @@ pub fn root_ui() -> Value {
 /// cockpit itself is a single global route: the account is selected inside the
 /// page, not in the URL.
 pub fn account_ui(_account_id: &str) -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": COCKPIT_PATH,
-        "cockpit_url": join(COCKPIT_PATH),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a specific draft: `review_url` points at the draft
 /// approval surface, which *is* account-scoped in the SPA.
 pub fn draft_ui(account_id: &str, draft_id: &str) -> Value {
+    let origin = dashboard_origin();
     let acct = encode_segment(account_id);
     let draft = encode_segment(draft_id);
     let draft_path = format!("/accounts/{acct}/drafts/{draft}");
-    json!({
-        "dashboard_url": dashboard_base(),
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": draft_path.clone(),
-        "cockpit_url": join(COCKPIT_PATH),
-        "review_url": join(&draft_path),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "review_url": join(&origin.base_url, &draft_path),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for rule-related responses; `rules_url` is the rules panel.
 pub fn rules_ui(_account_id: &str) -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": RULES_PATH,
-        "cockpit_url": join(COCKPIT_PATH),
-        "rules_url": join(RULES_PATH),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "rules_url": join(&origin.base_url, RULES_PATH),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a specific message; `message_url` is the canonical reader
 /// route and carries the folder as a query parameter, because IMAP UIDs are
 /// mailbox-scoped and the dashboard must re-resolve the UID in the right one.
 pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
+    let origin = dashboard_origin();
     let acct = encode_segment(account_id);
     let folder_enc = encode_segment(folder);
     let msg_path = format!("/mail/unified/{acct}/{uid}?folder={folder_enc}");
-    json!({
-        "dashboard_url": dashboard_base(),
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": msg_path.clone(),
-        "cockpit_url": join(COCKPIT_PATH),
-        "message_url": join(&msg_path),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "message_url": join(&origin.base_url, &msg_path),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a message UID that may name an editable draft.
@@ -414,6 +527,93 @@ mod tests {
             parse_tailscale_serve_status(status).as_deref(),
             Some("https://14inches.tail87a011.ts.net")
         );
+    }
+
+    #[test]
+    fn matching_tailscale_serve_and_self_hostname_has_no_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"14INCHES.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        assert_eq!(origin.dashboard_origin_warning, None);
+    }
+
+    #[test]
+    fn different_tailscale_serve_and_self_hostname_keeps_serve_with_safe_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"rey2026.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(warning.contains("`14inches`"));
+        assert!(warning.contains("`rey2026`"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn online_node_without_envelope_serve_route_falls_back_with_safe_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"rey2026.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3142"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"rey2026.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, DEFAULT_DASHBOARD_BASE);
+        assert_eq!(origin.dashboard_origin_source, "localhost_fallback");
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(warning.contains("online but is not serving Envelope"));
+        assert!(warning.contains("`rey2026`"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn malformed_or_unavailable_tailscale_status_falls_back() {
+        let origin = resolve_dashboard_origin(Some("not json"), None);
+        assert_eq!(origin.base_url, DEFAULT_DASHBOARD_BASE);
+        assert_eq!(origin.dashboard_origin_source, "localhost_fallback");
+        assert!(
+            origin
+                .dashboard_origin_warning
+                .as_deref()
+                .unwrap()
+                .contains("unavailable or returned malformed status")
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"bad host"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn every_ui_object_includes_origin_source_and_omits_empty_warning() {
+        let ui_objects = [
+            root_ui(),
+            account_ui("acct-1"),
+            draft_ui("acct-1", "draft-1"),
+            rules_ui("acct-1"),
+            message_ui("acct-1", 42, "INBOX"),
+        ];
+        for ui in ui_objects {
+            assert_eq!(ui["dashboard_origin_source"], "localhost_fallback");
+            assert!(ui.get("dashboard_origin_warning").is_none());
+        }
     }
 
     #[test]

@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly one active HTTPS root proxy to Envelope's loopback dashboard, or safely
   fall back to `http://localhost:3141`. Configured dashboard hostnames and
   dashboard-base environment variables are no longer emitted as agent links;
-  `dashboard_path` remains the canonical portable handle.
+  `dashboard_path` remains the canonical portable handle. UI metadata now also
+  identifies the selected origin source and emits privacy-preserving warnings
+  when Serve and node hostnames disagree or an online node is not serving
+  Envelope.
 
 ## [1.1.6] — 2026-08-31
 

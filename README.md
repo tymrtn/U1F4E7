@@ -133,6 +133,9 @@ addresses, attachment bytes, and secrets never enter the Governor request.
 Dashboard URL metadata in `--json` output is discovered once per CLI process
 from an active local `tailscale serve` HTTPS route whose root proxy targets
 `http://127.0.0.1:3141`. It otherwise falls back to `http://localhost:3141`.
+Every agent-facing `ui` object reports that decision as
+`dashboard_origin_source` (`tailscale_serve` or `localhost_fallback`) and adds
+a non-secret `dashboard_origin_warning` only when discovery needs attention.
 `dashboard_path` is always portable and remains the canonical handle for agents;
 `dashboard.base_url` and the legacy dashboard-base environment variables are
 retained only for compatibility and do not affect emitted agent UI links.
