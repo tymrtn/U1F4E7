@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Draft review:** a successful save now adopts one canonical server snapshot for both the editor controls and the dirty baseline. Canonical recipient formatting can no longer leave a saved draft falsely marked as unsaved and disable its Human-only Send choices.
 
+- **Draft review:** Human-only Send now closes its confirmation as soon as Envelope durably queues the exact revision. Slow draft/attachment refreshes, SMTP, Sent-folder filing, and later reconciliation happen in the background; a late queued refresh cannot re-lock a draft that has been successfully Held.
+
 ## [1.1.5] — 2026-08-31
 
 ### Added
