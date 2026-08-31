@@ -5,6 +5,12 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] — 2026-08-31
+
+### Fixed
+
+- **Dashboard (mobile):** finishing the 1.1.5 one-column scroll fix. Handing scrolling to the document was not enough on iOS: a vertical touch that starts inside the sandboxed HTML message iframe stays captive in the iframe's own context, so a long forwarded email still could not be flicked past to the attachments and Human-only Send controls beneath it. Under the same 760px breakpoint the frame now sets `pointer-events: none`, so every gesture lands on the document scroller. The preview is read-only on narrow screens (no link taps or quote toggles inside the message); it stays visible and in the accessibility tree. Desktop keeps the fully interactive frame.
+
 ## [1.1.5] — 2026-08-31
 
 ### Added

@@ -105,6 +105,26 @@ describe('mobile one-scroller contract: reader + draft composer', () => {
     expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/overflow/);
   });
 
+  it('lets a touch on the HTML preview frame scroll the document in the one-column layout', () => {
+    // Handing scrolling to the document (above) is not enough on iOS: a
+    // vertical touch that STARTS inside the sandboxed <iframe srcdoc> stays
+    // captive in the iframe's own context and never chains to the page, so a
+    // tall forwarded message still cannot be flicked past to the attachments
+    // and Human-only Send controls. In the one-column layout the frame must
+    // refuse the gesture entirely so it lands on the document scroller.
+    const mobile = mediaBlock(bodyFrame, MOBILE_QUERY);
+    const frame = ruleFor(mobile, '.body-frame');
+    expect(frame).toContain('pointer-events: none');
+    // Touch pass-through, not removal: the message stays visible and in the
+    // accessibility tree.
+    expect(frame).not.toMatch(/display|visibility|content-visibility/);
+  });
+
+  it('keeps the desktop preview frame interactive for links and text selection', () => {
+    // The base rule is the desktop contract — pass-through is mobile-only.
+    expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/pointer-events/);
+  });
+
   it('keeps the desktop three-pane internal scrollers', () => {
     expect(ruleFor(mail, '.reader')).toContain('overflow-y: auto');
     expect(ruleFor(mail, '.list')).toContain('overflow-y: auto');
