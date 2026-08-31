@@ -508,7 +508,7 @@ pub async fn send(
                 });
             // Release the DB lock before the sweep runs — it takes the same lock
             // to claim the row, and holding it here would deadlock the send we
-            // just asked for.
+            // just atomically acknowledged.
             drop(db);
             if req.send_now {
                 let sweep_state = state.clone();

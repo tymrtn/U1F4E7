@@ -222,7 +222,9 @@
   // `send_after` nor `draft` status. That stale flag also suppressed the stop
   // alert below, which is how a Governor-blocked message displayed as "Queued —
   // due now" with a Hold button, for hours, having never been transmitted.
-  // `queued` is now only a hint that a reload is owed (see `confirmSend`).
+  // On acknowledgement `confirmSend` copies the receipt's durable `send_after`
+  // onto `draft`, so this remains server-shaped state rather than a permanent
+  // local queued flag.
   const isQueued = $derived(persistedQueue);
 
   /**
@@ -358,7 +360,10 @@
         if (event.draft_id !== watchedDraft) return;
         if (event.account_id && event.account_id !== watchedAccount) return;
         if (accountId !== watchedAccount || draftId !== watchedDraft) return;
-        void load();
+        // The queue receipt already paints the committed transition. Do not let
+        // its matching event replace that UI with a blocking full-draft load;
+        // later lifecycle events and the past-due poll still reconcile truth.
+        if (!queueing) void load(true);
       }
     );
     return off;
@@ -370,7 +375,7 @@
   // soon as the row is no longer queued.
   $effect(() => {
     if (!isQueued || !pastDue) return;
-    const timer = setInterval(() => void load(), 5000);
+    const timer = setInterval(() => void load(true), 5000);
     return () => clearInterval(timer);
   });
 
@@ -469,19 +474,26 @@
     previewing = false;
   }
 
-  async function load() {
+  /**
+   * Re-read the full draft. Lifecycle/poll callers use a background refresh so
+   * a slow body or attachment payload never replaces already-rendered truth
+   * with a page-sized loading state.
+   */
+  async function load(background = false) {
     const generation = ++loadGeneration;
     const forKey = routeKey;
     const requestedAccount = accountId;
     const requestedDraft = draftId;
 
-    loading = true;
-    notFound = false;
-    loadError = null;
-    conflict = false;
-    actionError = null;
-    queued = null;
-    saved = false;
+    if (!background) {
+      loading = true;
+      notFound = false;
+      loadError = null;
+      conflict = false;
+      actionError = null;
+      queued = null;
+      saved = false;
+    }
 
     try {
       const res = await api.draft(requestedAccount, requestedDraft);
@@ -489,8 +501,15 @@
       applyDraft(res.draft);
       loadedForKey = forKey;
       accountLabel = res.account?.username ?? res.draft.account_id;
+      // This draft is newer server truth than the queue acknowledgement, so it
+      // may safely replace its response-only cooldown metadata.
+      queued = null;
     } catch (e) {
       if (generation !== loadGeneration) return;
+      // A background refresh must preserve the state already on screen. The
+      // next lifecycle event/poll can retry; an operator-visible reload still
+      // presents a concrete error below.
+      if (background) return;
       const err = e as EnvelopeApiError;
       if (err.status === 404) {
         notFound = true;
@@ -501,7 +520,7 @@
         };
       }
     } finally {
-      if (generation === loadGeneration) loading = false;
+      if (!background && generation === loadGeneration) loading = false;
     }
   }
 
@@ -686,11 +705,21 @@
       });
       if (generation !== loadGeneration) return;
       queued = res;
+      // The POST response is an atomic acknowledgement that the server stored
+      // this queue transition. It is not a DraftStatus: the persisted row stays
+      // `draft` so the scheduled sweep can find it, and no SMTP has happened.
+      // Preserve the reviewed content/revision while copying only the durable
+      // queue fact required to paint the outbox state immediately.
+      draft = { ...draft, status: 'draft', send_after: res.send_after };
       confirmOpen = false;
-      // Re-read the row the server actually holds. Trusting the POST body is
-      // what produced a countdown that outlived the send it described: this
-      // response says what was ASKED for, `load()` says what IS.
-      await load();
+      // Do not await a full draft GET here: body and attachment reads can be
+      // slow, but the queue is already durably acknowledged. SSE lifecycle
+      // events and the past-due poll reconcile later state in the background.
+      // Start a nonblocking reconciliation now as well; `load(true)` preserves
+      // the receipt-derived UI until it obtains newer server truth.
+      queueing = false;
+      sendNowPending = false;
+      void load(true);
     } catch (e) {
       if (generation !== loadGeneration) return;
       confirmOpen = false;

@@ -477,9 +477,54 @@ describe('DraftComposer send', () => {
     );
   });
 
+  it('unlocks from the atomic queue receipt without waiting for a slow draft reload', async () => {
+    await renderLoaded();
+    const sendAfter = new Date(Date.now() + 60_000).toISOString();
+    apiMock.sendDraft.mockResolvedValueOnce({
+      draft_id: DRAFT,
+      sent: false,
+      status: 'queued',
+      send_after: sendAfter,
+      cooldown_seconds: 60,
+      queued_reason_code: 'outbox_cooldown',
+      queued_reason: 'held in the outbox cooldown'
+    });
+    // A body/attachment-bearing draft can make this endpoint slow. The queue
+    // receipt is enough to unlock the human UI; this stalled refresh must not
+    // hold the confirmation open or erase the acknowledged queue state.
+    let resolveSlowDraft!: (value: unknown) => void;
+    apiMock.draft.mockReturnValueOnce(new Promise((resolve) => (resolveSlowDraft = resolve)));
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const queued = document.getElementById('draft-queued');
+    expect(queued).toBeTruthy();
+    expect(queued).toHaveTextContent(/sends in/i);
+    expect(queued).toHaveTextContent(/not transmitted yet/i);
+    expect(queued).not.toHaveTextContent(/\bwas sent\b/i);
+    expect(screen.queryByText(/^sent$/i)).not.toBeInTheDocument();
+    // The post-commit reconciliation may start, but the UI transition must not
+    // wait on its full payload.
+    expect(apiMock.draft).toHaveBeenCalledTimes(2);
+    resolveSlowDraft(draftResponse({ send_after: sendAfter }));
+  });
+
   it('reports the queued outcome honestly — queued, not sent', async () => {
     const soon = new Date(Date.now() + 60_000).toISOString();
     serverRowAfterSend({}, { send_after: soon });
+    apiMock.sendDraft.mockResolvedValueOnce({
+      draft_id: DRAFT,
+      sent: false,
+      status: 'queued',
+      send_after: soon,
+      cooldown_seconds: 60,
+      queued_reason_code: 'outbox_cooldown',
+      queued_reason: 'held in the outbox cooldown'
+    });
     render(DraftComposer);
     await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 
