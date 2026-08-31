@@ -5,7 +5,7 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.6] — 2026-08-31
 
 ### Fixed
 
@@ -19,11 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when Serve and node hostnames disagree or an online node is not serving
   Envelope.
 
-## [1.1.6] — 2026-08-31
-
-### Fixed
-
 - **Dashboard:** HTML message previews no longer capture vertical scrolling. Because wheel and touch events do not cross the sandboxed iframe boundary, the parent now hands their vertical deltas to the reader or document scroller while leaving links, taps, text selection, horizontal gestures, and pinch zoom native. The frame also grows to its full measured content height instead of stopping at 20,000px, so very large emails stay reachable without an inner scrollbar; the existing one-column mobile document scroller and desktop pane scrollers remain the owners.
+
+- **Draft review:** a successful save now adopts one canonical server snapshot for both the editor controls and the dirty baseline. Canonical recipient formatting can no longer leave a saved draft falsely marked as unsaved and disable its Human-only Send choices.
 
 ## [1.1.5] — 2026-08-31
 
