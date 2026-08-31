@@ -114,7 +114,6 @@ envelope config set dashboard.tailscale_allow "you@your-tailnet.ts.net,skippy@yo
 envelope config set dashboard.auth_token "$(openssl rand -hex 32)"
 
 tailscale serve --bg 3141
-envelope config set dashboard.base_url https://your-node.your-tailnet.ts.net
 
 # See where Envelope is storing local state
 envelope paths
@@ -131,14 +130,19 @@ asks Governor to score them with `governor score --catalog envelope`; only an
 opaque Governor `allow` sends in required mode. Message bodies, full recipient
 addresses, attachment bytes, and secrets never enter the Governor request.
 
-Dashboard URL metadata in `--json` output defaults to
-`http://localhost:3141`. For agent handoffs across devices, set
-`ENVELOPE_DASHBOARD_BASE_URL` or persist it with
-`envelope config set dashboard.base_url <base-url>`. The older
-`ENVELOPE_DASHBOARD_URL` name is still honored when the primary env var is
-absent. Tailscale Serve keeps the dashboard tailnet-only; Tailscale Funnel
-publishes it on the public internet, so do not use Funnel for a mailbox
-dashboard unless that exposure is intentional.
+Dashboard URL metadata in `--json` output is discovered fresh for each UI
+construction or request, from an active local `tailscale serve` HTTPS route whose
+root proxy targets `http://127.0.0.1:3141`. It otherwise falls back to
+`http://localhost:3141`.
+Every agent-facing `ui` object reports that decision as
+`dashboard_origin_source` (`tailscale_serve` or `localhost_fallback`) and adds
+a non-secret `dashboard_origin_warning` only when discovery needs attention.
+`dashboard_path` is always portable and remains the canonical handle for agents;
+`dashboard.base_url` and the legacy dashboard-base environment variables are
+retained only for compatibility and do not affect emitted agent UI links.
+Tailscale Serve keeps the dashboard tailnet-only; Tailscale Funnel publishes it
+on the public internet, so do not use Funnel for a mailbox dashboard unless that
+exposure is intentional.
 
 ### Authentication (required before any non-loopback exposure)
 

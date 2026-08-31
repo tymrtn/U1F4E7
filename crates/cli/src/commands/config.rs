@@ -10,15 +10,12 @@
 use crate::ConfigCmd;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::app_data_dir;
-use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const DASHBOARD_BASE_URL_KEY: &str = "dashboard.base_url";
-pub const ENV_DASHBOARD_BASE_URL: &str = "ENVELOPE_DASHBOARD_BASE_URL";
-pub const ENV_DASHBOARD_URL_ALIAS: &str = "ENVELOPE_DASHBOARD_URL";
 
 /// Bearer token gating the dashboard REST API when exposed beyond loopback.
 pub const DASHBOARD_AUTH_TOKEN_KEY: &str = "dashboard.auth_token";
@@ -28,12 +25,6 @@ pub const DASHBOARD_TAILSCALE_ALLOW_KEY: &str = "dashboard.tailscale_allow";
 pub const ENV_DASHBOARD_TAILSCALE_ALLOW: &str = "ENVELOPE_DASHBOARD_TAILSCALE_ALLOW";
 
 const CONFIG_FILE_NAME: &str = "config.json";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResolvedDashboardBaseUrl {
-    pub value: String,
-    pub source: &'static str,
-}
 
 fn cmd_key(cmd: &ConfigCmd) -> &str {
     match cmd {
@@ -52,14 +43,12 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
         ConfigCmd::Get { key } => {
             require_supported_key(&key)?;
             let stored_value = persistent_dashboard_base_url()?;
-            let effective = resolved_dashboard_base_url();
             if json_output {
                 let value = super::ui::with_ui(
                     &json!({
                         "key": DASHBOARD_BASE_URL_KEY,
                         "value": stored_value,
-                        "effective_value": effective.value,
-                        "source": effective.source,
+                        "agent_ui_origin": "discovered from active tailscale serve or http://localhost:3141; dashboard_origin_source explains the selected origin; dashboard.base_url does not affect agent UI links",
                         "config_path": display_config_path(),
                     }),
                     super::ui::root_ui(),
@@ -67,12 +56,14 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else if let Some(value) = stored_value {
                 println!("{DASHBOARD_BASE_URL_KEY}={value}");
-                println!("effective {DASHBOARD_BASE_URL_KEY}={}", effective.value);
-                println!("source={}", effective.source);
+                println!(
+                    "Note: {DASHBOARD_BASE_URL_KEY} is retained for compatibility and does not affect agent UI links."
+                );
             } else {
                 println!("{DASHBOARD_BASE_URL_KEY} is not set");
-                println!("effective {DASHBOARD_BASE_URL_KEY}={}", effective.value);
-                println!("source={}", effective.source);
+                println!(
+                    "Note: {DASHBOARD_BASE_URL_KEY} does not affect agent UI links; their origin is discovered from active tailscale serve or falls back to http://localhost:3141."
+                );
             }
             Ok(())
         }
@@ -84,15 +75,13 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
                 )
             })?;
             set_persistent_dashboard_base_url(&normalized)?;
-            let effective = resolved_dashboard_base_url();
             if json_output {
                 let value = super::ui::with_ui(
                     &json!({
                         "status": "set",
                         "key": DASHBOARD_BASE_URL_KEY,
                         "value": normalized,
-                        "effective_value": effective.value,
-                        "source": effective.source,
+                        "agent_ui_origin": "discovered from active tailscale serve or http://localhost:3141; dashboard_origin_source explains the selected origin; dashboard.base_url does not affect agent UI links",
                         "config_path": display_config_path(),
                     }),
                     super::ui::root_ui(),
@@ -100,27 +89,22 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("Set {DASHBOARD_BASE_URL_KEY}={normalized}");
-                if effective.source != "config" {
-                    println!(
-                        "Effective value is still {} from {}",
-                        effective.value, effective.source
-                    );
-                }
+                println!(
+                    "Note: this compatibility setting does not affect agent UI links; their origin is discovered from active tailscale serve or falls back to http://localhost:3141."
+                );
             }
             Ok(())
         }
         ConfigCmd::Unset { key } => {
             require_supported_key(&key)?;
             unset_persistent_dashboard_base_url()?;
-            let effective = resolved_dashboard_base_url();
             if json_output {
                 let value = super::ui::with_ui(
                     &json!({
                         "status": "unset",
                         "key": DASHBOARD_BASE_URL_KEY,
                         "value": Value::Null,
-                        "effective_value": effective.value,
-                        "source": effective.source,
+                        "agent_ui_origin": "discovered from active tailscale serve or http://localhost:3141; dashboard_origin_source explains the selected origin; dashboard.base_url does not affect agent UI links",
                         "config_path": display_config_path(),
                     }),
                     super::ui::root_ui(),
@@ -128,39 +112,12 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("Unset {DASHBOARD_BASE_URL_KEY}");
-                println!("effective {DASHBOARD_BASE_URL_KEY}={}", effective.value);
-                println!("source={}", effective.source);
+                println!(
+                    "Note: {DASHBOARD_BASE_URL_KEY} does not affect agent UI links; their origin is discovered from active tailscale serve or falls back to http://localhost:3141."
+                );
             }
             Ok(())
         }
-    }
-}
-
-pub fn resolved_dashboard_base_url() -> ResolvedDashboardBaseUrl {
-    if let Some(value) = dashboard_base_url_from_env(ENV_DASHBOARD_BASE_URL) {
-        return ResolvedDashboardBaseUrl {
-            value,
-            source: "env:ENVELOPE_DASHBOARD_BASE_URL",
-        };
-    }
-
-    if let Some(value) = dashboard_base_url_from_env(ENV_DASHBOARD_URL_ALIAS) {
-        return ResolvedDashboardBaseUrl {
-            value,
-            source: "env:ENVELOPE_DASHBOARD_URL",
-        };
-    }
-
-    if let Ok(Some(value)) = persistent_dashboard_base_url() {
-        return ResolvedDashboardBaseUrl {
-            value,
-            source: "config",
-        };
-    }
-
-    ResolvedDashboardBaseUrl {
-        value: super::ui::DEFAULT_DASHBOARD_BASE.to_string(),
-        source: "default",
     }
 }
 
@@ -189,12 +146,6 @@ fn persistent_dashboard_base_url_from(path: &Path) -> Result<Option<String>> {
         Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("{DASHBOARD_BASE_URL_KEY} must be a string"),
     }
-}
-
-fn dashboard_base_url_from_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| normalize_dashboard_base(&value))
 }
 
 fn normalize_dashboard_base(value: &str) -> Option<String> {
@@ -449,7 +400,6 @@ fn config_object(value: &mut Value) -> Result<&mut Map<String, Value>> {
 
 #[cfg(test)]
 mod test_support {
-    use super::{ENV_DASHBOARD_BASE_URL, ENV_DASHBOARD_URL_ALIAS};
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -462,30 +412,10 @@ mod test_support {
 
     pub(crate) struct DashboardConfigTestGuard {
         _guard: MutexGuard<'static, ()>,
-        prev_primary: Option<String>,
-        prev_alias: Option<String>,
-    }
-
-    impl DashboardConfigTestGuard {
-        pub(crate) fn set_primary_env(&self, value: &str) {
-            unsafe { std::env::set_var(ENV_DASHBOARD_BASE_URL, value) };
-        }
-
-        pub(crate) fn set_alias_env(&self, value: &str) {
-            unsafe { std::env::set_var(ENV_DASHBOARD_URL_ALIAS, value) };
-        }
     }
 
     impl Drop for DashboardConfigTestGuard {
         fn drop(&mut self) {
-            match &self.prev_primary {
-                Some(value) => unsafe { std::env::set_var(ENV_DASHBOARD_BASE_URL, value) },
-                None => unsafe { std::env::remove_var(ENV_DASHBOARD_BASE_URL) },
-            }
-            match &self.prev_alias {
-                Some(value) => unsafe { std::env::set_var(ENV_DASHBOARD_URL_ALIAS, value) },
-                None => unsafe { std::env::remove_var(ENV_DASHBOARD_URL_ALIAS) },
-            }
             TEST_CONFIG_FILE_PATH.with(|path| *path.borrow_mut() = None);
         }
     }
@@ -495,16 +425,8 @@ mod test_support {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("dashboard config test env lock poisoned");
-        let prev_primary = std::env::var(ENV_DASHBOARD_BASE_URL).ok();
-        let prev_alias = std::env::var(ENV_DASHBOARD_URL_ALIAS).ok();
-        unsafe { std::env::remove_var(ENV_DASHBOARD_BASE_URL) };
-        unsafe { std::env::remove_var(ENV_DASHBOARD_URL_ALIAS) };
         TEST_CONFIG_FILE_PATH.with(|slot| *slot.borrow_mut() = Some(path));
-        DashboardConfigTestGuard {
-            _guard: guard,
-            prev_primary,
-            prev_alias,
-        }
+        DashboardConfigTestGuard { _guard: guard }
     }
 
     pub(crate) fn test_config_file_path() -> Option<PathBuf> {
@@ -529,43 +451,8 @@ mod tests {
     }
 
     #[test]
-    fn resolves_primary_env_before_alias_and_config() {
-        let path = test_config_path("env-precedence");
-        let _ = fs::remove_file(&path);
-        let guard = isolated_dashboard_config(path.clone());
-        write_config_value(
-            &path,
-            &json!({"dashboard": {"base_url": "https://config.example/"}}),
-        )
-        .unwrap();
-        guard.set_alias_env("https://alias.example/");
-        guard.set_primary_env("https://primary.example/");
-
-        let resolved = resolved_dashboard_base_url();
-        assert_eq!(resolved.value, "https://primary.example");
-        assert_eq!(resolved.source, "env:ENVELOPE_DASHBOARD_BASE_URL");
-    }
-
-    #[test]
-    fn resolves_alias_env_before_config() {
-        let path = test_config_path("alias-precedence");
-        let _ = fs::remove_file(&path);
-        let guard = isolated_dashboard_config(path.clone());
-        write_config_value(
-            &path,
-            &json!({"dashboard": {"base_url": "https://config.example/"}}),
-        )
-        .unwrap();
-        guard.set_alias_env("https://alias.example/");
-
-        let resolved = resolved_dashboard_base_url();
-        assert_eq!(resolved.value, "https://alias.example");
-        assert_eq!(resolved.source, "env:ENVELOPE_DASHBOARD_URL");
-    }
-
-    #[test]
-    fn resolves_persistent_config_before_default() {
-        let path = test_config_path("config-default");
+    fn persisted_dashboard_base_url_is_retained_as_compatibility_data() {
+        let path = test_config_path("compatibility-data");
         let _ = fs::remove_file(&path);
         let _guard = isolated_dashboard_config(path.clone());
         write_config_value(
@@ -574,9 +461,10 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = resolved_dashboard_base_url();
-        assert_eq!(resolved.value, "https://config.example");
-        assert_eq!(resolved.source, "config");
+        assert_eq!(
+            persistent_dashboard_base_url().unwrap(),
+            Some("https://config.example".to_string())
+        );
     }
 
     #[test]

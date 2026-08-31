@@ -187,6 +187,64 @@ describe('BodyFrame', () => {
     const srcdoc = frame.getAttribute('srcdoc') ?? '';
     expect(srcdoc).not.toContain('onclick');
   });
+
+  it('keeps a 105 KB transactional email parent-scrollable well past the old 20,000px cap', async () => {
+    const rows = Array.from(
+      { length: 900 },
+      (_, i) =>
+        `<tr style="height:72px;overflow:hidden"><td style="height:72px;overflow:auto">` +
+        `Booking.com reservation line ${i}: confirmation details and policies</td></tr>`
+    ).join('');
+    const longHtml = `<table style="overflow:hidden">${rows}</table><p>End of booking</p>`;
+    expect(new TextEncoder().encode(longHtml).byteLength).toBeGreaterThan(105 * 1024);
+
+    render(BodyFrame, { html: longHtml });
+    const frame = await screen.findByTitle('Message body') as HTMLIFrameElement;
+    const srcdoc = frame.getAttribute('srcdoc') ?? '';
+    expect(srcdoc).toContain('Booking.com reservation line 0');
+    expect(srcdoc).toContain('Booking.com reservation line 899');
+    expect(srcdoc).toContain('End of booking');
+
+    // jsdom does not lay out srcdoc, so provide the rendered measurement the
+    // browser exposes after load. This is deliberately beyond the old cap.
+    const renderedDocument = document.implementation.createHTMLDocument('Long message');
+    renderedDocument.body.innerHTML = `<table>${rows}</table><p>End of booking</p>`;
+    Object.defineProperty(renderedDocument.documentElement, 'scrollHeight', {
+      configurable: true,
+      value: 105_000
+    });
+    Object.defineProperty(frame, 'contentDocument', {
+      configurable: true,
+      value: renderedDocument
+    });
+
+    await fireEvent.load(frame);
+    expect(frame.style.height).toBe('105016px');
+
+  });
+
+  it('cleans iframe document listeners on srcdoc replacement and teardown', async () => {
+    const { rerender, unmount } = render(BodyFrame, { html: '<p>First</p>' });
+    const frame = await screen.findByTitle('Message body') as HTMLIFrameElement;
+    const firstDocument = frame.contentDocument;
+    expect(firstDocument).not.toBeNull();
+    const firstRemove = vi.spyOn(firstDocument as Document, 'removeEventListener');
+
+    await fireEvent.load(frame);
+    firstRemove.mockClear();
+    await rerender({ html: '<p>Second</p>' });
+    await waitFor(() =>
+      expect(firstRemove).toHaveBeenCalledWith('wheel', expect.any(Function), true)
+    );
+
+    const secondDocument = frame.contentDocument;
+    expect(secondDocument).not.toBeNull();
+    const secondRemove = vi.spyOn(secondDocument as Document, 'removeEventListener');
+    await fireEvent.load(frame);
+    secondRemove.mockClear();
+    unmount();
+    expect(secondRemove).toHaveBeenCalledWith('wheel', expect.any(Function), true);
+  });
 });
 
 // ── ThreadStrip ───────────────────────────────────────────────────────

@@ -62,9 +62,9 @@ AGENT WORKFLOWS
     envelope paths
     envelope paths --json
 
-  Share dashboard URLs for agent handoffs:
-    export ENVELOPE_DASHBOARD_BASE_URL=https://your-node.tailnet.ts.net
-    envelope config set dashboard.base_url https://your-node.tailnet.ts.net
+  Share dashboard URLs for agent handoffs (after configuring dashboard auth):
+    tailscale serve --bg 3141
+    # Agent JSON discovers this live HTTPS Serve route; otherwise it uses localhost.
 
   Every command supports --json for machine consumption:
     envelope inbox --json | jq '.[0].subject'
@@ -716,19 +716,19 @@ enum SignatureCmd {
 enum ConfigCmd {
     /// Get a persistent config value
     Get {
-        /// Supported key: dashboard.base_url
+        /// Supported compatibility key: dashboard.base_url (does not affect agent UI links)
         key: String,
     },
     /// Set a persistent config value
     Set {
-        /// Supported key: dashboard.base_url
+        /// Supported compatibility key: dashboard.base_url (does not affect agent UI links)
         key: String,
         /// Value to store
         value: String,
     },
     /// Unset a persistent config value
     Unset {
-        /// Supported key: dashboard.base_url
+        /// Supported compatibility key: dashboard.base_url (does not affect agent UI links)
         key: String,
     },
 }

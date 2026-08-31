@@ -7,11 +7,9 @@
 //! should carry a `ui` object so Envelopie/Hermes/Codex can hand Tyler the
 //! relevant dashboard URL without reconstructing it.
 //!
-//! Base URL precedence:
-//!   1. `ENVELOPE_DASHBOARD_BASE_URL` environment variable
-//!   2. `ENVELOPE_DASHBOARD_URL` backwards-compatible alias
-//!   3. persistent `dashboard.base_url` config
-//!   4. `http://localhost:3141`
+//! Agent-facing origins are discovered from an active local Tailscale Serve
+//! route to Envelope's loopback dashboard. A stale configured hostname does not
+//! prove the service is still reachable, so it is never used for these links.
 //!
 //! Helpers never emit secrets — only account ids, draft ids, message UIDs
 //! and folder/query names go into URLs, and folder/draft values are
@@ -21,22 +19,300 @@ use envelope_email_store::Database;
 use envelope_email_transport::provider;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::io::Read;
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
+#[cfg(not(test))]
+use std::time::Duration;
 use tracing::warn;
+#[cfg(not(test))]
+use wait_timeout::ChildExt;
 
-/// Default dashboard origin when no dashboard base URL is configured.
+/// Default dashboard origin when no verified Tailscale Serve route is active.
 pub const DEFAULT_DASHBOARD_BASE: &str = "http://localhost:3141";
+#[cfg(not(test))]
+const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Limit a malformed or unexpectedly large local CLI response without ever
+/// leaving its stdout pipe unread while the child is running.
+const TAILSCALE_STATUS_MAX_OUTPUT: usize = 1024 * 1024;
+const DASHBOARD_LOOPBACK_PROXY: &str = "http://127.0.0.1:3141";
 
-/// Resolve the dashboard base URL (origin only, no trailing slash).
-pub fn dashboard_base() -> String {
-    super::config::resolved_dashboard_base_url().value
+/// A verified dashboard origin and the bounded observability information used
+/// to select it. The warning deliberately contains only safe DNS labels, never
+/// a full tailnet DNS name or Tailscale identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDashboardOrigin {
+    base_url: String,
+    dashboard_origin_source: &'static str,
+    dashboard_origin_warning: Option<String>,
 }
 
-fn join(path: &str) -> String {
-    let base = dashboard_base();
+/// Resolve the dashboard origin from current local Tailscale state. Only a live
+/// Tailscale Serve route to Envelope's loopback listener can produce a
+/// non-local origin.
+pub fn dashboard_base() -> String {
+    dashboard_origin().base_url
+}
+
+fn dashboard_origin() -> ResolvedDashboardOrigin {
+    #[cfg(test)]
+    {
+        // Unit tests exercise the pure parser below; never require a local
+        // Tailscale installation or leak its machine-specific host into tests.
+        return localhost_origin(None);
+    }
+
+    #[cfg(not(test))]
+    discover_dashboard_origin()
+}
+
+#[cfg(not(test))]
+fn discover_dashboard_origin() -> ResolvedDashboardOrigin {
+    let serve_status = tailscale_json(["serve", "status", "--json"]);
+    let node_status = tailscale_json(["status", "--json"]);
+    resolve_dashboard_origin(serve_status.as_deref(), node_status.as_deref())
+}
+
+#[cfg(not(test))]
+fn tailscale_json<const N: usize>(args: [&str; N]) -> Option<String> {
+    let mut child = Command::new("tailscale")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        read_bounded_stdout(&mut stdout, TAILSCALE_STATUS_MAX_OUTPUT)
+    });
+
+    let status = match child.wait_timeout(TAILSCALE_STATUS_TIMEOUT) {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+    };
+    let output = match reader.join() {
+        Ok(Some(output)) => output,
+        _ => return None,
+    };
+    if !status.success() {
+        return None;
+    }
+    Some(output)
+}
+
+/// Drain a reader completely while retaining at most `output_limit` bytes.
+///
+/// Returning `None` for oversized, invalid UTF-8, or failed reads lets callers
+/// fail closed, while draining through EOF prevents a child process from
+/// blocking on a full stdout pipe.
+fn read_bounded_stdout<R: Read>(reader: &mut R, output_limit: usize) -> Option<String> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut exceeded_limit = false;
+
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+
+        if !exceeded_limit {
+            let remaining = output_limit.saturating_sub(output.len());
+            let retained = remaining.min(read);
+            output.extend_from_slice(&buffer[..retained]);
+            exceeded_limit = retained < read;
+        }
+    }
+
+    (!exceeded_limit)
+        .then(|| String::from_utf8(output).ok())
+        .flatten()
+}
+
+/// Resolve dashboard origin from local CLI outputs only. A verified Serve route
+/// remains authoritative even when it belongs to a different node hostname:
+/// the route, not node identity, proves ingress to Envelope.
+fn resolve_dashboard_origin(
+    serve_status: Option<&str>,
+    node_status: Option<&str>,
+) -> ResolvedDashboardOrigin {
+    let serve_origin = serve_status.and_then(parse_tailscale_serve_status);
+    let self_dns_name = node_status.and_then(parse_tailscale_self_dns_name);
+
+    match (serve_origin, self_dns_name) {
+        (Some(base_url), Some(self_dns_name)) => {
+            let serve_host = base_url
+                .strip_prefix("https://")
+                .expect("verified Tailscale origin always has HTTPS scheme");
+            let dashboard_origin_warning = (serve_host != self_dns_name).then(|| {
+                format!(
+                    "Verified Tailscale Serve host `{}` differs from this node's Tailscale DNS name `{}`; using the Serve host because it is the active Envelope ingress.",
+                    safe_dns_label(serve_host),
+                    safe_dns_label(&self_dns_name),
+                )
+            });
+            ResolvedDashboardOrigin {
+                base_url,
+                dashboard_origin_source: "tailscale_serve",
+                dashboard_origin_warning,
+            }
+        }
+        (Some(base_url), None) => ResolvedDashboardOrigin {
+            base_url,
+            dashboard_origin_source: "tailscale_serve",
+            dashboard_origin_warning: Some(
+                "Verified Tailscale Serve origin is active, but node identity could not be verified."
+                    .to_string(),
+            ),
+        },
+        (None, Some(self_dns_name)) => localhost_origin(Some(format!(
+            "Local Tailscale node `{}` is online but is not serving Envelope through a verified HTTPS root proxy; using localhost.",
+            safe_dns_label(&self_dns_name),
+        ))),
+        (None, None) => localhost_origin(Some(
+            "Tailscale dashboard-origin discovery was unavailable or returned malformed status; using localhost."
+                .to_string(),
+        )),
+    }
+}
+
+fn localhost_origin(dashboard_origin_warning: Option<String>) -> ResolvedDashboardOrigin {
+    ResolvedDashboardOrigin {
+        base_url: DEFAULT_DASHBOARD_BASE.to_string(),
+        dashboard_origin_source: "localhost_fallback",
+        dashboard_origin_warning,
+    }
+}
+
+/// Parse Tailscale Serve status without trusting any configured hostname.
+///
+/// Exactly one HTTPS Web listener must expose its root path directly to
+/// Envelope's loopback dashboard. Unknown status shapes and ambiguous matches
+/// fail closed so agent links never point at an unverified tailnet host.
+pub(crate) fn parse_tailscale_serve_status(status: &str) -> Option<String> {
+    let status: Value = serde_json::from_str(status).ok()?;
+    let tcp = status.get("TCP")?.as_object()?;
+    let web = status.get("Web")?.as_object()?;
+    let mut origins = Vec::new();
+
+    for (listener, config) in web {
+        let Some((host, port)) = parse_https_listener(listener) else {
+            continue;
+        };
+        if !tcp
+            .get(&port.to_string())
+            .and_then(|listener| listener.get("HTTPS"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(proxy) = config
+            .get("Handlers")
+            .and_then(Value::as_object)
+            .and_then(|handlers| handlers.get("/"))
+            .and_then(|handler| handler.get("Proxy"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if matches_dashboard_loopback_proxy(proxy) {
+            origins.push(format!("https://{host}"));
+        }
+    }
+
+    match origins.as_slice() {
+        [origin] => Some(origin.clone()),
+        _ => None,
+    }
+}
+
+/// Read the local node DNS name from `tailscale status --json`. This accepts
+/// only an ordinary DNS hostname so it cannot be reused to inject URL or
+/// warning content.
+pub(crate) fn parse_tailscale_self_dns_name(status: &str) -> Option<String> {
+    let status: Value = serde_json::from_str(status).ok()?;
+    let dns_name = status.get("Self")?.get("DNSName")?.as_str()?;
+    normalize_tailscale_dns_name(dns_name)
+}
+
+fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
+    let (host, port) = listener.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if port != 443 {
+        return None;
+    }
+
+    // Tailscale hostnames are DNS hostnames. Normalize case and the harmless
+    // DNS trailing dot, while rejecting anything that could alter a URL origin.
+    Some((normalize_tailscale_dns_name(host)?, port))
+}
+
+fn normalize_dns_name(name: &str) -> Option<String> {
+    let host = name.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || host.split('.').any(|label| label.is_empty())
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    Some(host)
+}
+
+/// A Tailscale Serve listener must identify exactly one machine on one tailnet,
+/// not merely look like an arbitrary DNS name. A machine DNS name has exactly
+/// `machine.tailnet.ts.net` labels after normalization.
+fn normalize_tailscale_dns_name(name: &str) -> Option<String> {
+    let host = normalize_dns_name(name)?;
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.len() != 4 || labels[2] != "ts" || labels[3] != "net" {
+        return None;
+    }
+    Some(host)
+}
+
+fn safe_dns_label(host: &str) -> &str {
+    host.split('.').next().unwrap_or("unknown")
+}
+
+fn matches_dashboard_loopback_proxy(proxy: &str) -> bool {
+    proxy.strip_suffix('/').unwrap_or(proxy) == DASHBOARD_LOOPBACK_PROXY
+}
+
+fn join(base: &str, path: &str) -> String {
     if path.starts_with('/') {
         format!("{base}{path}")
     } else {
         format!("{base}/{path}")
+    }
+}
+
+fn attach_dashboard_origin_metadata(ui: &mut Value, origin: &ResolvedDashboardOrigin) {
+    let Value::Object(map) = ui else {
+        return;
+    };
+    map.insert(
+        "dashboard_origin_source".to_string(),
+        Value::String(origin.dashboard_origin_source.to_string()),
+    );
+    if let Some(warning) = &origin.dashboard_origin_warning {
+        map.insert(
+            "dashboard_origin_warning".to_string(),
+            Value::String(warning.clone()),
+        );
     }
 }
 
@@ -68,10 +344,13 @@ const RULES_PATH: &str = "/rules";
 
 /// Root-level UI metadata when there is no account/draft/message context.
 pub fn root_ui() -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": "/",
-    })
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata anchored at the agent cockpit.
@@ -80,50 +359,62 @@ pub fn root_ui() -> Value {
 /// cockpit itself is a single global route: the account is selected inside the
 /// page, not in the URL.
 pub fn account_ui(_account_id: &str) -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": COCKPIT_PATH,
-        "cockpit_url": join(COCKPIT_PATH),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a specific draft: `review_url` points at the draft
 /// approval surface, which *is* account-scoped in the SPA.
 pub fn draft_ui(account_id: &str, draft_id: &str) -> Value {
+    let origin = dashboard_origin();
     let acct = encode_segment(account_id);
     let draft = encode_segment(draft_id);
     let draft_path = format!("/accounts/{acct}/drafts/{draft}");
-    json!({
-        "dashboard_url": dashboard_base(),
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": draft_path.clone(),
-        "cockpit_url": join(COCKPIT_PATH),
-        "review_url": join(&draft_path),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "review_url": join(&origin.base_url, &draft_path),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for rule-related responses; `rules_url` is the rules panel.
 pub fn rules_ui(_account_id: &str) -> Value {
-    json!({
-        "dashboard_url": dashboard_base(),
+    let origin = dashboard_origin();
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": RULES_PATH,
-        "cockpit_url": join(COCKPIT_PATH),
-        "rules_url": join(RULES_PATH),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "rules_url": join(&origin.base_url, RULES_PATH),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a specific message; `message_url` is the canonical reader
 /// route and carries the folder as a query parameter, because IMAP UIDs are
 /// mailbox-scoped and the dashboard must re-resolve the UID in the right one.
 pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
+    let origin = dashboard_origin();
     let acct = encode_segment(account_id);
     let folder_enc = encode_segment(folder);
     let msg_path = format!("/mail/unified/{acct}/{uid}?folder={folder_enc}");
-    json!({
-        "dashboard_url": dashboard_base(),
+    let mut ui = json!({
+        "dashboard_url": origin.base_url,
         "dashboard_path": msg_path.clone(),
-        "cockpit_url": join(COCKPIT_PATH),
-        "message_url": join(&msg_path),
-    })
+        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "message_url": join(&origin.base_url, &msg_path),
+    });
+    attach_dashboard_origin_metadata(&mut ui, &origin);
+    ui
 }
 
 /// UI metadata for a message UID that may name an editable draft.
@@ -193,6 +484,7 @@ pub fn with_ui<T: Serialize>(item: &T, ui: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     fn test_config_path(name: &str) -> PathBuf {
@@ -215,27 +507,252 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_base_strips_trailing_slash() {
-        let guard = isolated_dashboard_config("trailing-slash");
-        guard.set_primary_env("http://example.test:8080/");
-        assert_eq!(dashboard_base(), "http://example.test:8080");
+    fn configured_dashboard_origins_do_not_affect_agent_ui_urls() {
+        let _guard = isolated_dashboard_config("configured-origin-ignored");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://stale.example.test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(dashboard_base(), "http://localhost:3141");
     }
 
     #[test]
-    fn dashboard_base_prefers_primary_env_over_alias() {
-        let guard = isolated_dashboard_config("primary-env");
-        guard.set_alias_env("https://alias.example.test/");
-        guard.set_primary_env("https://primary.example.test/");
-
-        assert_eq!(dashboard_base(), "https://primary.example.test");
+    fn tailscale_serve_status_discovers_the_active_loopback_dashboard_route() {
+        let status = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        assert_eq!(
+            parse_tailscale_serve_status(status).as_deref(),
+            Some("https://14inches.tail87a011.ts.net")
+        );
     }
 
     #[test]
-    fn dashboard_base_uses_alias_when_primary_env_is_absent() {
-        let guard = isolated_dashboard_config("alias-env");
-        guard.set_alias_env("https://alias.example.test/");
+    fn tailscale_serve_status_rejects_wrong_proxy_or_missing_https() {
+        let wrong_proxy = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"node.tailnet.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3142"}}
+            }}
+        }"#;
+        let no_https = r#"{
+            "TCP": {"443": {"HTTPS": false}},
+            "Web": {"node.tailnet.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        assert_eq!(parse_tailscale_serve_status(wrong_proxy), None);
+        assert_eq!(parse_tailscale_serve_status(no_https), None);
+    }
 
-        assert_eq!(dashboard_base(), "https://alias.example.test");
+    #[test]
+    fn tailscale_serve_status_fails_closed_for_malformed_or_ambiguous_routes() {
+        let ambiguous = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {
+                "one.tailnet.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}},
+                "two.tailnet.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3141/"}}}
+            }
+        }"#;
+        assert_eq!(parse_tailscale_serve_status("not json"), None);
+        assert_eq!(parse_tailscale_serve_status(ambiguous), None);
+    }
+
+    #[test]
+    fn tailscale_serve_status_normalizes_host_and_port() {
+        let status = r#"{
+            "TCP": {"443": {"HTTPS": true}, "8443": {"HTTPS": true}},
+            "Web": {
+                "14INCHES.tail87a011.ts.net.:0443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141/"}}
+                },
+                "ignored.tailnet.ts.net:8443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_tailscale_serve_status(status).as_deref(),
+            Some("https://14inches.tail87a011.ts.net")
+        );
+    }
+
+    #[test]
+    fn tailscale_serve_status_rejects_non_tailnet_or_injected_hosts() {
+        for listener in [
+            "attacker.example:443",
+            "ts.net:443",
+            "tailnet.ts.net:443",
+            "extra.machine.tailnet.ts.net:443",
+            "node..tailnet.ts.net:443",
+            "node.tailnet.ts.net.evil:443",
+            "node.tailnet.ts.net@attacker.example:443",
+            "node.tailnet.ts.net/attacker:443",
+        ] {
+            let status = format!(
+                r#"{{
+                    "TCP": {{"443": {{"HTTPS": true}}}},
+                    "Web": {{"{listener}": {{
+                        "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:3141"}}}}
+                    }}}}
+                }}"#
+            );
+            assert_eq!(
+                parse_tailscale_serve_status(&status),
+                None,
+                "must reject listener {listener:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"attacker.example"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"ts.net"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"extra.machine.tailnet.ts.net"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn matching_tailscale_serve_and_self_hostname_has_no_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"14INCHES.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        assert_eq!(origin.dashboard_origin_warning, None);
+    }
+
+    #[test]
+    fn different_tailscale_serve_and_self_hostname_keeps_serve_with_safe_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"rey2026.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(warning.contains("`14inches`"));
+        assert!(warning.contains("`rey2026`"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn verified_serve_without_valid_node_identity_keeps_origin_with_generic_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some("not json"));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        assert_eq!(
+            origin.dashboard_origin_warning.as_deref(),
+            Some(
+                "Verified Tailscale Serve origin is active, but node identity could not be verified."
+            )
+        );
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(!warning.contains("14inches"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn online_node_without_envelope_serve_route_falls_back_with_safe_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"rey2026.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3142"}}
+            }}
+        }"#;
+        let node = r#"{"Self":{"DNSName":"rey2026.tail87a011.ts.net."}}"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some(node));
+        assert_eq!(origin.base_url, DEFAULT_DASHBOARD_BASE);
+        assert_eq!(origin.dashboard_origin_source, "localhost_fallback");
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(warning.contains("online but is not serving Envelope"));
+        assert!(warning.contains("`rey2026`"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn malformed_or_unavailable_tailscale_status_falls_back() {
+        let origin = resolve_dashboard_origin(Some("not json"), None);
+        assert_eq!(origin.base_url, DEFAULT_DASHBOARD_BASE);
+        assert_eq!(origin.dashboard_origin_source, "localhost_fallback");
+        assert!(
+            origin
+                .dashboard_origin_warning
+                .as_deref()
+                .unwrap()
+                .contains("unavailable or returned malformed status")
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"bad host"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_stdout_reader_drains_oversized_output_and_fails_closed() {
+        let bytes = vec![b'x'; TAILSCALE_STATUS_MAX_OUTPUT + 32];
+        let mut reader = Cursor::new(bytes.clone());
+
+        assert_eq!(
+            read_bounded_stdout(&mut reader, TAILSCALE_STATUS_MAX_OUTPUT),
+            None
+        );
+        assert_eq!(reader.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn bounded_stdout_reader_accepts_limited_utf8_output() {
+        let mut reader = Cursor::new(b"status".to_vec());
+        assert_eq!(
+            read_bounded_stdout(&mut reader, 6).as_deref(),
+            Some("status")
+        );
+        assert_eq!(reader.position(), 6);
+    }
+
+    #[test]
+    fn every_ui_object_includes_origin_source_and_omits_empty_warning() {
+        let ui_objects = [
+            root_ui(),
+            account_ui("acct-1"),
+            draft_ui("acct-1", "draft-1"),
+            rules_ui("acct-1"),
+            message_ui("acct-1", 42, "INBOX"),
+        ];
+        for ui in ui_objects {
+            assert_eq!(ui["dashboard_origin_source"], "localhost_fallback");
+            assert!(ui.get("dashboard_origin_warning").is_none());
+        }
     }
 
     #[test]
@@ -258,17 +775,19 @@ mod tests {
     }
 
     #[test]
-    fn account_ui_uses_configured_base_url_for_cockpit_url() {
-        let guard = isolated_dashboard_config("account-configured-base");
-        guard.set_primary_env("https://dash.example.test/envelope/");
+    fn account_ui_ignores_configured_base_url_for_cockpit_url() {
+        let _guard = isolated_dashboard_config("account-configured-base");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://dash.example.test/envelope"}}"#,
+        )
+        .unwrap();
 
         let ui = account_ui("acct/one");
-        assert_eq!(ui["dashboard_url"], "https://dash.example.test/envelope");
+        assert_eq!(ui["dashboard_url"], "http://localhost:3141");
         assert_eq!(ui["dashboard_path"], "/cockpit");
-        assert_eq!(
-            ui["cockpit_url"],
-            "https://dash.example.test/envelope/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     #[test]
@@ -307,19 +826,21 @@ mod tests {
     }
 
     #[test]
-    fn message_ui_uses_configured_base_url_and_preserves_query_encoding() {
-        let guard = isolated_dashboard_config("message-configured-base");
-        guard.set_primary_env("https://dash.example.test/envelope/");
+    fn message_ui_ignores_configured_base_url_and_preserves_query_encoding() {
+        let _guard = isolated_dashboard_config("message-configured-base");
+        let path = crate::commands::config::test_config_file_path().unwrap();
+        std::fs::write(
+            path,
+            r#"{"dashboard":{"base_url":"https://dash.example.test/envelope"}}"#,
+        )
+        .unwrap();
 
         let ui = message_ui("acct/one", 42, "Sent/Items & Stuff");
         assert_eq!(
             ui["message_url"],
-            "https://dash.example.test/envelope/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
+            "http://localhost:3141/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
         );
-        assert_eq!(
-            ui["cockpit_url"],
-            "https://dash.example.test/envelope/cockpit"
-        );
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
     }
 
     /// The exact link shape reproduced against installed 1.0.10: a UUID account

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { installBodyFrameScrollBridge } from './body-frame-scroll';
+
   // BodyFrame — renders an HTML email body inside a sandboxed <iframe srcdoc>.
   //
   // Sandbox design (mirrors and tightens v1 dashboard.js):
@@ -43,6 +45,7 @@
 
   let frameEl = $state<HTMLIFrameElement | null>(null);
   let resizeObserver: ResizeObserver | null = null;
+  let removeFrameListeners: (() => void) | null = null;
 
   /** Sanitize an HTML email string and wrap it in a safe document.
    *  Returns { srcdoc, remoteBlocked } — side-effects (callback) stay in $effect. */
@@ -220,8 +223,15 @@
       // Don't observe our own measurement.
       resizeObserver?.disconnect();
       frameEl.style.height = '0px';
-      const height = doc.documentElement.scrollHeight;
-      if (height > 0) frameEl.style.height = `${Math.min(height + 16, 20000)}px`;
+      const height = Math.max(
+        doc.documentElement.scrollHeight,
+        doc.documentElement.offsetHeight,
+        doc.body?.scrollHeight ?? 0,
+        doc.body?.offsetHeight ?? 0
+      );
+      // Do not cap this height. A capped iframe turns the remainder into an
+      // inner scroll surface and makes the end of a tall email unreachable.
+      if (height > 0) frameEl.style.height = `${height + 16}px`;
       if (doc.body && resizeObserver) resizeObserver.observe(doc.body);
     } catch {
       // Cross-origin or not yet ready — leave the fallback height.
@@ -240,8 +250,12 @@
    */
   function onLoad() {
     if (!frameEl) return;
+    clearFrameListeners();
+    resizeObserver?.disconnect();
     const doc = frameEl.contentDocument;
     if (!doc) return;
+
+    const listenerCleanups = [installBodyFrameScrollBridge(frameEl)];
 
     // Create the observer before the first measurement so `fitToContent` can
     // suspend it around its own writes.
@@ -255,18 +269,34 @@
       if (!img.complete) {
         img.addEventListener('load', fitToContent, { once: true });
         img.addEventListener('error', fitToContent, { once: true });
+        listenerCleanups.push(() => {
+          img.removeEventListener('load', fitToContent);
+          img.removeEventListener('error', fitToContent);
+        });
       }
     }
 
+    removeFrameListeners = () => listenerCleanups.forEach((cleanup) => cleanup());
   }
 
-  $effect(() => {
-    return () => resizeObserver?.disconnect();
-  });
+  function clearFrameListeners(): void {
+    removeFrameListeners?.();
+    removeFrameListeners = null;
+  }
 
   // Build the srcdoc as a derived value (pure computation — no side effects).
   let built = $derived(buildSrcdoc(html, remoteImages));
   let srcdoc = $derived(built.srcdoc);
+
+  // Replacing srcdoc replaces the document. Detach listeners from the old
+  // document immediately, and perform the same cleanup on component teardown.
+  $effect(() => {
+    void srcdoc;
+    return () => {
+      clearFrameListeners();
+      resizeObserver?.disconnect();
+    };
+  });
 
   // Notify the parent of blocked-image count after each build.
   // $effect is the right place for callbacks that touch external state.
@@ -298,18 +328,4 @@
     display: block;
   }
 
-  /* One-column mobile layout (same 760px breakpoint the panes collapse at):
-     the document owns scrolling, but iOS keeps a vertical touch that STARTS
-     inside the sandboxed iframe captive in the frame's context — a tall
-     forwarded message can never be flicked past to the attachments and
-     Human-only Send controls under it. Refuse the gesture at the frame so it
-     lands on the document scroller. Tradeoff, accepted for reachable
-     controls: the preview is read-only on narrow screens (no link taps or
-     quote toggles). The frame stays visible, focusable, and in the
-     accessibility tree. */
-  @media (max-width: 760px) {
-    .body-frame {
-      pointer-events: none;
-    }
-  }
 </style>

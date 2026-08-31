@@ -222,7 +222,9 @@
   // `send_after` nor `draft` status. That stale flag also suppressed the stop
   // alert below, which is how a Governor-blocked message displayed as "Queued —
   // due now" with a Hold button, for hours, having never been transmitted.
-  // `queued` is now only a hint that a reload is owed (see `confirmSend`).
+  // On acknowledgement `confirmSend` copies the receipt's durable `send_after`
+  // onto `draft`, so this remains server-shaped state rather than a permanent
+  // local queued flag.
   const isQueued = $derived(persistedQueue);
 
   /**
@@ -358,7 +360,10 @@
         if (event.draft_id !== watchedDraft) return;
         if (event.account_id && event.account_id !== watchedAccount) return;
         if (accountId !== watchedAccount || draftId !== watchedDraft) return;
-        void load();
+        // The queue receipt already paints the committed transition. Do not let
+        // its matching event replace that UI with a blocking full-draft load;
+        // later lifecycle events and the past-due poll still reconcile truth.
+        if (!queueing) void load(true);
       }
     );
     return off;
@@ -370,7 +375,7 @@
   // soon as the row is no longer queued.
   $effect(() => {
     if (!isQueued || !pastDue) return;
-    const timer = setInterval(() => void load(), 5000);
+    const timer = setInterval(() => void load(true), 5000);
     return () => clearInterval(timer);
   });
 
@@ -469,19 +474,26 @@
     previewing = false;
   }
 
-  async function load() {
+  /**
+   * Re-read the full draft. Lifecycle/poll callers use a background refresh so
+   * a slow body or attachment payload never replaces already-rendered truth
+   * with a page-sized loading state.
+   */
+  async function load(background = false) {
     const generation = ++loadGeneration;
     const forKey = routeKey;
     const requestedAccount = accountId;
     const requestedDraft = draftId;
 
-    loading = true;
-    notFound = false;
-    loadError = null;
-    conflict = false;
-    actionError = null;
-    queued = null;
-    saved = false;
+    if (!background) {
+      loading = true;
+      notFound = false;
+      loadError = null;
+      conflict = false;
+      actionError = null;
+      queued = null;
+      saved = false;
+    }
 
     try {
       const res = await api.draft(requestedAccount, requestedDraft);
@@ -489,8 +501,15 @@
       applyDraft(res.draft);
       loadedForKey = forKey;
       accountLabel = res.account?.username ?? res.draft.account_id;
+      // This draft is newer server truth than the queue acknowledgement, so it
+      // may safely replace its response-only cooldown metadata.
+      queued = null;
     } catch (e) {
       if (generation !== loadGeneration) return;
+      // A background refresh must preserve the state already on screen. The
+      // next lifecycle event/poll can retry; an operator-visible reload still
+      // presents a concrete error below.
+      if (background) return;
       const err = e as EnvelopeApiError;
       if (err.status === 404) {
         notFound = true;
@@ -501,7 +520,7 @@
         };
       }
     } finally {
-      if (generation === loadGeneration) loading = false;
+      if (!background && generation === loadGeneration) loading = false;
     }
   }
 
@@ -514,16 +533,29 @@
     // which clears the other alternate server-side — that is what stops a
     // stale HTML part from being delivered instead of the edit.
     const format: BodyFormat = next.html_content != null ? 'html' : 'text';
+    // Keep the values painted into the controls and the saved baseline as one
+    // snapshot. In particular, recipient controls render their parsed,
+    // canonical header form rather than the server's original whitespace and
+    // separators. Taking the baseline from those exact rendered values is what
+    // lets a successful edit immediately unlock the human-only send actions.
+    const rendered: Snapshot = {
+      to: serializeAddrs(next.to_addr ?? ''),
+      cc: serializeAddrs(next.cc_addr ?? ''),
+      bcc: serializeAddrs(next.bcc_addr ?? ''),
+      subject: next.subject ?? '',
+      body: (format === 'html' ? next.html_content : next.text_content) ?? '',
+      format
+    };
 
     draft = next;
     // Normalized to the recipient field's canonical `a@x, b@y` form BEFORE the
     // baseline snapshot: the field re-serializes whatever it is given, so an
     // un-normalized server value would come back changed and read as an
     // unsaved edit the operator never made — which blocks Send.
-    toRaw = serializeAddrs(next.to_addr ?? '');
-    ccRaw = serializeAddrs(next.cc_addr ?? '');
-    bccRaw = serializeAddrs(next.bcc_addr ?? '');
-    subjectRaw = next.subject ?? '';
+    toRaw = rendered.to;
+    ccRaw = rendered.cc;
+    bccRaw = rendered.bcc;
+    subjectRaw = rendered.subject;
     // A draft carrying only one alternative seeds the empty slot from the one
     // it has: switching format there means "send this body as the other
     // format", not "start from an empty box".
@@ -531,14 +563,14 @@
       text: (next.text_content ?? next.html_content) ?? '',
       html: (next.html_content ?? next.text_content) ?? ''
     };
-    bodyRaw = bodyByFormat[format];
-    bodyFormat = format;
+    bodyRaw = rendered.body;
+    bodyFormat = rendered.format;
     // HTML opens rendered. Reading markup is the exception, so it lives behind
     // the toggle rather than being what a review lands on.
     previewing = format === 'html';
     showBcc = bccRaw.length > 0;
     conflict = false;
-    baseline = snapshot();
+    baseline = rendered;
   }
 
   /**
@@ -673,11 +705,21 @@
       });
       if (generation !== loadGeneration) return;
       queued = res;
+      // The POST response is an atomic acknowledgement that the server stored
+      // this queue transition. It is not a DraftStatus: the persisted row stays
+      // `draft` so the scheduled sweep can find it, and no SMTP has happened.
+      // Preserve the reviewed content/revision while copying only the durable
+      // queue fact required to paint the outbox state immediately.
+      draft = { ...draft, status: 'draft', send_after: res.send_after };
       confirmOpen = false;
-      // Re-read the row the server actually holds. Trusting the POST body is
-      // what produced a countdown that outlived the send it described: this
-      // response says what was ASKED for, `load()` says what IS.
-      await load();
+      // Do not await a full draft GET here: body and attachment reads can be
+      // slow, but the queue is already durably acknowledged. SSE lifecycle
+      // events and the past-due poll reconcile later state in the background.
+      // Start a nonblocking reconciliation now as well; `load(true)` preserves
+      // the receipt-derived UI until it obtains newer server truth.
+      queueing = false;
+      sendNowPending = false;
+      void load(true);
     } catch (e) {
       if (generation !== loadGeneration) return;
       confirmOpen = false;
@@ -731,7 +773,10 @@
    */
   async function hold() {
     if (!draft || !canHold) return;
-    const generation = loadGeneration;
+    // A queue acknowledgement starts a nonblocking reconciliation. Invalidate
+    // any response it already has in flight before requesting Hold, so only the
+    // returned unlocked draft can become authoritative after a successful hold.
+    const generation = ++loadGeneration;
     const targetAccount = accountId;
     const targetDraft = draftId;
 

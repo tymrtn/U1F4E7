@@ -343,6 +343,55 @@ describe('DraftComposer edit', () => {
     await fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(screen.getByText(/changes saved/i)).toBeInTheDocument());
   });
+
+  it('adopts the canonical saved draft as the baseline and re-enables both human-only sends', async () => {
+    apiMock.editDraft.mockResolvedValueOnce({
+      draft: {
+        ...BASE_DRAFT,
+        // The response deliberately differs from the submitted values: the
+        // server owns canonical headers and the next revision, and this draft
+        // also proves attachments are not a special post-save path.
+        to_addr: 'Canonical Recipient <canonical@example.com>',
+        cc_addr: null,
+        subject: 'Canonical subject',
+        text_content: 'Canonical body',
+        attachments: [{ filename: 'safe-note.txt', content_type: 'text/plain', size: 12 }],
+        revision: 8
+      },
+      status: 'edited'
+    });
+    await renderLoaded({ attachments: [{ filename: 'safe-note.txt', content_type: 'text/plain', size: 12 }] });
+
+    await setRecipients('To', 'temporary@example.com');
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Temporary subject' } });
+    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Temporary body' } });
+    expect(screen.getByRole('button', { name: /^human-only send now$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeDisabled();
+
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/changes saved/i)).toBeInTheDocument();
+      expect(screen.queryByText(/unsaved changes\. save your changes before sending/i)).not.toBeInTheDocument();
+      expect(chips('To')).toEqual(['Canonical Recipient']);
+      expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Canonical subject');
+      expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Canonical body');
+      expect(screen.getByRole('button', { name: /^human-only send now$/i })).toBeEnabled();
+      expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeEnabled();
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+    await waitFor(() =>
+      expect(apiMock.sendDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT, {
+        confirm: true,
+        expected_revision: 8,
+        send_now: false
+      })
+    );
+  });
 });
 
 // ── Sending ───────────────────────────────────────────────────────────
@@ -428,9 +477,54 @@ describe('DraftComposer send', () => {
     );
   });
 
+  it('unlocks from the atomic queue receipt without waiting for a slow draft reload', async () => {
+    await renderLoaded();
+    const sendAfter = new Date(Date.now() + 60_000).toISOString();
+    apiMock.sendDraft.mockResolvedValueOnce({
+      draft_id: DRAFT,
+      sent: false,
+      status: 'queued',
+      send_after: sendAfter,
+      cooldown_seconds: 60,
+      queued_reason_code: 'outbox_cooldown',
+      queued_reason: 'held in the outbox cooldown'
+    });
+    // A body/attachment-bearing draft can make this endpoint slow. The queue
+    // receipt is enough to unlock the human UI; this stalled refresh must not
+    // hold the confirmation open or erase the acknowledged queue state.
+    let resolveSlowDraft!: (value: unknown) => void;
+    apiMock.draft.mockReturnValueOnce(new Promise((resolve) => (resolveSlowDraft = resolve)));
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const queued = document.getElementById('draft-queued');
+    expect(queued).toBeTruthy();
+    expect(queued).toHaveTextContent(/sends in/i);
+    expect(queued).toHaveTextContent(/not transmitted yet/i);
+    expect(queued).not.toHaveTextContent(/\bwas sent\b/i);
+    expect(screen.queryByText(/^sent$/i)).not.toBeInTheDocument();
+    // The post-commit reconciliation may start, but the UI transition must not
+    // wait on its full payload.
+    expect(apiMock.draft).toHaveBeenCalledTimes(2);
+    resolveSlowDraft(draftResponse({ send_after: sendAfter }));
+  });
+
   it('reports the queued outcome honestly — queued, not sent', async () => {
     const soon = new Date(Date.now() + 60_000).toISOString();
     serverRowAfterSend({}, { send_after: soon });
+    apiMock.sendDraft.mockResolvedValueOnce({
+      draft_id: DRAFT,
+      sent: false,
+      status: 'queued',
+      send_after: soon,
+      cooldown_seconds: 60,
+      queued_reason_code: 'outbox_cooldown',
+      queued_reason: 'held in the outbox cooldown'
+    });
     render(DraftComposer);
     await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 
@@ -747,6 +841,52 @@ describe('DraftComposer hold', () => {
     // The transient send response must not keep the banner alive after a hold.
     await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
     expect(screen.getByLabelText('Subject')).not.toBeDisabled();
+  });
+
+  it('does not let a stale queued refresh overwrite a successful hold', async () => {
+    await renderLoaded();
+    const sendAfter = new Date(Date.now() + 60_000).toISOString();
+    let resolveQueuedRefresh!: (value: unknown) => void;
+    apiMock.draft.mockReturnValueOnce(new Promise((resolve) => (resolveQueuedRefresh = resolve)));
+    apiMock.holdDraft.mockResolvedValueOnce({
+      draft: {
+        ...BASE_DRAFT,
+        revision: 8,
+        subject: 'Held server subject',
+        text_content: 'Held server content',
+        send_after: null
+      },
+      status: 'held'
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+    expect(apiMock.draft).toHaveBeenCalledTimes(2);
+
+    await fireEvent.click(holdButton());
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+
+    // The reconciliation began while the receipt still described a queued row,
+    // but arrives only after Hold has made the unlocked server row authoritative.
+    resolveQueuedRefresh(
+      draftResponse({
+        revision: 7,
+        subject: 'Stale queued subject',
+        text_content: 'Stale queued content',
+        send_after: sendAfter
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(document.getElementById('draft-queued')).toBeFalsy();
+    expect(screen.getByLabelText('Subject')).not.toBeDisabled();
+    expect(screen.getByLabelText('Message')).not.toBeDisabled();
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Held server subject');
+    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Held server content');
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeEnabled();
   });
 
   it('disables Hold while the request is in flight', async () => {
