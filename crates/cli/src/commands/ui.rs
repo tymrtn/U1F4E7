@@ -19,12 +19,9 @@ use envelope_email_store::Database;
 use envelope_email_transport::provider;
 use serde::Serialize;
 use serde_json::{Value, json};
-#[cfg(not(test))]
 use std::io::Read;
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
-#[cfg(not(test))]
-use std::sync::OnceLock;
 #[cfg(not(test))]
 use std::time::Duration;
 use tracing::warn;
@@ -35,10 +32,10 @@ use wait_timeout::ChildExt;
 pub const DEFAULT_DASHBOARD_BASE: &str = "http://localhost:3141";
 #[cfg(not(test))]
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Limit a malformed or unexpectedly large local CLI response without ever
+/// leaving its stdout pipe unread while the child is running.
+const TAILSCALE_STATUS_MAX_OUTPUT: usize = 1024 * 1024;
 const DASHBOARD_LOOPBACK_PROXY: &str = "http://127.0.0.1:3141";
-
-#[cfg(not(test))]
-static DISCOVERED_DASHBOARD_ORIGIN: OnceLock<ResolvedDashboardOrigin> = OnceLock::new();
 
 /// A verified dashboard origin and the bounded observability information used
 /// to select it. The warning deliberately contains only safe DNS labels, never
@@ -50,8 +47,9 @@ struct ResolvedDashboardOrigin {
     dashboard_origin_warning: Option<String>,
 }
 
-/// Resolve the dashboard origin once per CLI process. Only a live Tailscale
-/// Serve route to Envelope's loopback listener can produce a non-local origin.
+/// Resolve the dashboard origin from current local Tailscale state. Only a live
+/// Tailscale Serve route to Envelope's loopback listener can produce a
+/// non-local origin.
 pub fn dashboard_base() -> String {
     dashboard_origin().base_url
 }
@@ -65,9 +63,7 @@ fn dashboard_origin() -> ResolvedDashboardOrigin {
     }
 
     #[cfg(not(test))]
-    DISCOVERED_DASHBOARD_ORIGIN
-        .get_or_init(discover_dashboard_origin)
-        .clone()
+    discover_dashboard_origin()
 }
 
 #[cfg(not(test))]
@@ -86,21 +82,62 @@ fn tailscale_json<const N: usize>(args: [&str; N]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let status = match child.wait_timeout(TAILSCALE_STATUS_TIMEOUT).ok()? {
-        Some(status) => status,
-        None => {
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        read_bounded_stdout(&mut stdout, TAILSCALE_STATUS_MAX_OUTPUT)
+    });
+
+    let status = match child.wait_timeout(TAILSCALE_STATUS_TIMEOUT) {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = reader.join();
             return None;
         }
+    };
+    let output = match reader.join() {
+        Ok(Some(output)) => output,
+        _ => return None,
     };
     if !status.success() {
         return None;
     }
-
-    let mut output = String::new();
-    child.stdout.take()?.read_to_string(&mut output).ok()?;
     Some(output)
+}
+
+/// Drain a reader completely while retaining at most `output_limit` bytes.
+///
+/// Returning `None` for oversized, invalid UTF-8, or failed reads lets callers
+/// fail closed, while draining through EOF prevents a child process from
+/// blocking on a full stdout pipe.
+fn read_bounded_stdout<R: Read>(reader: &mut R, output_limit: usize) -> Option<String> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut exceeded_limit = false;
+
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+
+        if !exceeded_limit {
+            let remaining = output_limit.saturating_sub(output.len());
+            let retained = remaining.min(read);
+            output.extend_from_slice(&buffer[..retained]);
+            exceeded_limit = retained < read;
+        }
+    }
+
+    (!exceeded_limit)
+        .then(|| String::from_utf8(output).ok())
+        .flatten()
 }
 
 /// Resolve dashboard origin from local CLI outputs only. A verified Serve route
@@ -134,7 +171,10 @@ fn resolve_dashboard_origin(
         (Some(base_url), None) => ResolvedDashboardOrigin {
             base_url,
             dashboard_origin_source: "tailscale_serve",
-            dashboard_origin_warning: None,
+            dashboard_origin_warning: Some(
+                "Verified Tailscale Serve origin is active, but node identity could not be verified."
+                    .to_string(),
+            ),
         },
         (None, Some(self_dns_name)) => localhost_origin(Some(format!(
             "Local Tailscale node `{}` is online but is not serving Envelope through a verified HTTPS root proxy; using localhost.",
@@ -204,7 +244,7 @@ pub(crate) fn parse_tailscale_serve_status(status: &str) -> Option<String> {
 pub(crate) fn parse_tailscale_self_dns_name(status: &str) -> Option<String> {
     let status: Value = serde_json::from_str(status).ok()?;
     let dns_name = status.get("Self")?.get("DNSName")?.as_str()?;
-    normalize_dns_name(dns_name)
+    normalize_tailscale_dns_name(dns_name)
 }
 
 fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
@@ -216,7 +256,7 @@ fn parse_https_listener(listener: &str) -> Option<(String, u16)> {
 
     // Tailscale hostnames are DNS hostnames. Normalize case and the harmless
     // DNS trailing dot, while rejecting anything that could alter a URL origin.
-    Some((normalize_dns_name(host)?, port))
+    Some((normalize_tailscale_dns_name(host)?, port))
 }
 
 fn normalize_dns_name(name: &str) -> Option<String> {
@@ -227,6 +267,18 @@ fn normalize_dns_name(name: &str) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
     {
+        return None;
+    }
+    Some(host)
+}
+
+/// A Tailscale Serve listener must identify a machine on a tailnet, not merely
+/// look like an arbitrary DNS name. Normal machine DNS names have a machine and
+/// tailnet label before the exact `.ts.net` suffix.
+fn normalize_tailscale_dns_name(name: &str) -> Option<String> {
+    let host = normalize_dns_name(name)?;
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.len() < 4 || labels[labels.len() - 2] != "ts" || labels[labels.len() - 1] != "net" {
         return None;
     }
     Some(host)
@@ -432,6 +484,7 @@ pub fn with_ui<T: Serialize>(item: &T, ui: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     fn test_config_path(name: &str) -> PathBuf {
@@ -530,6 +583,41 @@ mod tests {
     }
 
     #[test]
+    fn tailscale_serve_status_rejects_non_tailnet_or_injected_hosts() {
+        for listener in [
+            "attacker.example:443",
+            "ts.net:443",
+            "tailnet.ts.net:443",
+            "node.tailnet.ts.net.evil:443",
+            "node.tailnet.ts.net@attacker.example:443",
+            "node.tailnet.ts.net/attacker:443",
+        ] {
+            let status = format!(
+                r#"{{
+                    "TCP": {{"443": {{"HTTPS": true}}}},
+                    "Web": {{"{listener}": {{
+                        "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:3141"}}}}
+                    }}}}
+                }}"#
+            );
+            assert_eq!(
+                parse_tailscale_serve_status(&status),
+                None,
+                "must reject listener {listener:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"attacker.example"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"ts.net"}}"#),
+            None
+        );
+    }
+
+    #[test]
     fn matching_tailscale_serve_and_self_hostname_has_no_warning() {
         let serve = r#"{
             "TCP": {"443": {"HTTPS": true}},
@@ -561,6 +649,29 @@ mod tests {
         let warning = origin.dashboard_origin_warning.as_deref().unwrap();
         assert!(warning.contains("`14inches`"));
         assert!(warning.contains("`rey2026`"));
+        assert!(!warning.contains("tail87a011"));
+    }
+
+    #[test]
+    fn verified_serve_without_valid_node_identity_keeps_origin_with_generic_warning() {
+        let serve = r#"{
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"14inches.tail87a011.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3141"}}
+            }}
+        }"#;
+
+        let origin = resolve_dashboard_origin(Some(serve), Some("not json"));
+        assert_eq!(origin.base_url, "https://14inches.tail87a011.ts.net");
+        assert_eq!(origin.dashboard_origin_source, "tailscale_serve");
+        assert_eq!(
+            origin.dashboard_origin_warning.as_deref(),
+            Some(
+                "Verified Tailscale Serve origin is active, but node identity could not be verified."
+            )
+        );
+        let warning = origin.dashboard_origin_warning.as_deref().unwrap();
+        assert!(!warning.contains("14inches"));
         assert!(!warning.contains("tail87a011"));
     }
 
@@ -599,6 +710,28 @@ mod tests {
             parse_tailscale_self_dns_name(r#"{"Self":{"DNSName":"bad host"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn bounded_stdout_reader_drains_oversized_output_and_fails_closed() {
+        let bytes = vec![b'x'; TAILSCALE_STATUS_MAX_OUTPUT + 32];
+        let mut reader = Cursor::new(bytes.clone());
+
+        assert_eq!(
+            read_bounded_stdout(&mut reader, TAILSCALE_STATUS_MAX_OUTPUT),
+            None
+        );
+        assert_eq!(reader.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn bounded_stdout_reader_accepts_limited_utf8_output() {
+        let mut reader = Cursor::new(b"status".to_vec());
+        assert_eq!(
+            read_bounded_stdout(&mut reader, 6).as_deref(),
+            Some("status")
+        );
+        assert_eq!(reader.position(), 6);
     }
 
     #[test]
