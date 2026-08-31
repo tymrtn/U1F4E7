@@ -5,11 +5,10 @@
 // message iframe was sized correctly; the problem was WHO owned the scroll.
 // Desktop uses internal pane scrollers (`.reader` / `.draft-review` with
 // overflow auto). On iOS, a touch that starts on a tall sandboxed <iframe>
-// belongs to the pane's scroller and never chains out of the frame, so the
-// pane cannot be flicked past the email. The one-column mobile layout must
-// therefore hand scrolling to the document: panes get `overflow: visible`
-// and heights that grow with content, and the app shell releases its 100vh
-// clamp at the same 760px breakpoint the layouts collapse at.
+// belongs to the iframe and never chains out, so the page cannot be flicked
+// past the email. The one-column mobile layout therefore hands scrolling to
+// the document: panes get `overflow: visible`, heights grow with content, and
+// BodyFrame forwards iframe touch deltas to that document scroller.
 //
 // jsdom applies neither media queries nor real layout, so this contract is
 // asserted against the component styles themselves: the mobile media block
@@ -105,24 +104,14 @@ describe('mobile one-scroller contract: reader + draft composer', () => {
     expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/overflow/);
   });
 
-  it('lets a touch on the HTML preview frame scroll the document in the one-column layout', () => {
-    // Handing scrolling to the document (above) is not enough on iOS: a
-    // vertical touch that STARTS inside the sandboxed <iframe srcdoc> stays
-    // captive in the iframe's own context and never chains to the page, so a
-    // tall forwarded message still cannot be flicked past to the attachments
-    // and Human-only Send controls. In the one-column layout the frame must
-    // refuse the gesture entirely so it lands on the document scroller.
-    const mobile = mediaBlock(bodyFrame, MOBILE_QUERY);
-    const frame = ruleFor(mobile, '.body-frame');
-    expect(frame).toContain('pointer-events: none');
-    // Touch pass-through, not removal: the message stays visible and in the
-    // accessibility tree.
-    expect(frame).not.toMatch(/display|visibility|content-visibility/);
+  it('keeps the desktop HTML preview interactive', () => {
+    expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/pointer-events/);
   });
 
-  it('keeps the desktop preview frame interactive for links and text selection', () => {
-    // The base rule is the desktop contract — pass-through is mobile-only.
-    expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/pointer-events/);
+  it('keeps the mobile HTML preview interactive', () => {
+    // The event bridge owns scrolling; no responsive rule may disable links,
+    // quote toggles, text selection, focus, or taps on narrow screens.
+    expect(bodyFrame).not.toMatch(/pointer-events\s*:\s*none/);
   });
 
   it('keeps the desktop three-pane internal scrollers', () => {

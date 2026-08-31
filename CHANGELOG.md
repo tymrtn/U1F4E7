@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Dashboard (mobile):** finishing the 1.1.5 one-column scroll fix. Handing scrolling to the document was not enough on iOS: a vertical touch that starts inside the sandboxed HTML message iframe stays captive in the iframe's own context, so a long forwarded email still could not be flicked past to the attachments and Human-only Send controls beneath it. Under the same 760px breakpoint the frame now sets `pointer-events: none`, so every gesture lands on the document scroller. The preview is read-only on narrow screens (no link taps or quote toggles inside the message); it stays visible and in the accessibility tree. Desktop keeps the fully interactive frame.
+- **Dashboard:** HTML message previews no longer capture vertical scrolling. Because wheel and touch events do not cross the sandboxed iframe boundary, the parent now hands their vertical deltas to the reader or document scroller while leaving links, taps, text selection, horizontal gestures, and pinch zoom native. The frame also grows to its full measured content height instead of stopping at 20,000px, so very large emails stay reachable without an inner scrollbar; the existing one-column mobile document scroller and desktop pane scrollers remain the owners.
 
 ## [1.1.5] — 2026-08-31
 
