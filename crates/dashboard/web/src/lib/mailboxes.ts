@@ -1,21 +1,31 @@
-// Smart-mailbox catalog for the v2 rail. Each box is a client route under
-// /v2/mail/<slug>; an unwired box renders an honest "not yet wired" empty
-// state (no fake data), per the dashboard "surface explicit follow-up
-// states" invariant.
+// GTD-stage catalog for the v2 rail (design plan rev 3). Each box is a client
+// route under /v2/mail/<slug>; a box with `wired: false` renders an honest
+// "not yet wired" empty state (no fake data), per the dashboard "surface
+// explicit follow-up states" invariant.
+//
+// The rail groups these as GTD stages: `process` is the loop you drive to
+// zero (capture → clarify → decide), `working` holds mail you're producing.
+// Review surfaces (Cockpit, Approvals) are routes of their own, not boxes.
+import type { IconName } from './icons';
 
 export interface Mailbox {
   slug: string;
   label: string;
+  icon: IconName;
+  group: 'process' | 'working';
   /** True once this box loads real messages; gates the list vs. empty state. */
   wired: boolean;
 }
 
 export const MAILBOXES: Mailbox[] = [
-  { slug: 'unified', label: 'Unified Inbox', wired: true },
-  { slug: 'needs-attention', label: 'Needs Attention', wired: false },
-  { slug: 'snoozed', label: 'Snoozed', wired: true },
-  { slug: 'drafts', label: 'Drafts', wired: true },
-  { slug: 'sent', label: 'Sent', wired: true }
+  { slug: 'unified', label: 'Inbox', icon: 'inbox', group: 'process', wired: true },
+  { slug: 'today', label: 'Today', icon: 'zap', group: 'process', wired: false },
+  { slug: 'waiting-on', label: 'Waiting On', icon: 'hourglass', group: 'process', wired: false },
+  { slug: 'snoozed', label: 'Snoozed', icon: 'clock', group: 'process', wired: true },
+  { slug: 'scheduled', label: 'Scheduled', icon: 'calendar', group: 'process', wired: false },
+  { slug: 'reference', label: 'Reference', icon: 'archive', group: 'process', wired: false },
+  { slug: 'drafts', label: 'Drafts', icon: 'pen-line', group: 'working', wired: true },
+  { slug: 'sent', label: 'Sent', icon: 'send', group: 'working', wired: true }
 ];
 
 export function mailboxBySlug(slug: string): Mailbox | undefined {

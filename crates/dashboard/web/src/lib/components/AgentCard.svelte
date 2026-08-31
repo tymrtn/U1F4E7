@@ -2,26 +2,25 @@
   // Agent identity card — the cockpit money shot. Name prominent, envtok_ prefix
   // in a MonoTag, last-active + attributed action/event counts, and a compact
   // policy summary (send-mode ceiling + scope tightness). Read-only.
-  import Badge from './Badge.svelte';
   import MonoTag from './MonoTag.svelte';
   import type { AgentCard } from '$lib/cockpit-api';
 
   let { agent, age }: { agent: AgentCard; age: (iso: string | null) => string } = $props();
 
   const totalActivity = $derived(agent.activity.action_count + agent.activity.event_count);
+  const revoked = $derived(agent.status === 'revoked');
 </script>
 
-<article class="agent-card" class:revoked={agent.status === 'revoked'}>
+<article class="agent-card" class:revoked>
   <header class="agent-head">
     <div class="agent-id">
       <h3 class="agent-name">{agent.name}</h3>
       <MonoTag>{agent.token_prefix}</MonoTag>
     </div>
-    {#if agent.status === 'revoked'}
-      <Badge variant="danger">revoked</Badge>
-    {:else}
-      <Badge variant="ok">active</Badge>
-    {/if}
+    <span class="agent-status" class:is-revoked={revoked}>
+      <span class="status-light" aria-hidden="true"></span>
+      <span class="status-label">{revoked ? 'revoked' : 'active'}</span>
+    </span>
   </header>
 
   <dl class="agent-stats">
@@ -86,6 +85,34 @@
     color: var(--env-ink);
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Instrument status light: a lit dot + mono readout (design plan rev 3, D). */
+  .agent-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-shrink: 0;
+  }
+  .status-light {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--env-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--env-accent) 20%, transparent);
+  }
+  .agent-status.is-revoked .status-light {
+    background: var(--env-warn);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--env-warn) 20%, transparent);
+  }
+  .status-label {
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--env-accent);
+  }
+  .agent-status.is-revoked .status-label {
+    color: var(--env-warn);
   }
   .agent-stats {
     display: grid;

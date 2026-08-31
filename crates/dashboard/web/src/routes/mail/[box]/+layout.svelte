@@ -768,10 +768,10 @@
     {:else if !box.wired}
       <EmptyState
         title="{box.label} has no messages to show here"
-        hint="This smart mailbox doesn't load its own list yet. Unified Inbox has your mail."
+        hint="This smart mailbox doesn't load its own list yet. Inbox has your mail."
       >
         {#snippet action()}
-          <a class="empty-link" href="{base}/mail/unified">Go to Unified Inbox</a>
+          <a class="empty-link" href="{base}/mail/unified">Go to Inbox</a>
         {/snippet}
       </EmptyState>
     {:else if loading}
@@ -821,6 +821,7 @@
                   snippet: null,
                   unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
+                  folder: m.folder,
                   href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
@@ -860,11 +861,13 @@
                   unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
                   starred: isStarred(m.uid, m.account_id, m.flags),
                   accountChip: m.account_display_name || m.account_username,
+                  folder: m.folder,
                   href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedUnifiedKeys}
                 {active}
+                verbs
                 onstar={handleStar}
               />
             </li>
@@ -989,10 +992,10 @@
     {:else}
       <EmptyState
         title="{box.label} has no messages to show here"
-        hint="This smart mailbox doesn't load its own list yet. Unified Inbox has your mail."
+        hint="This smart mailbox doesn't load its own list yet. Inbox has your mail."
       >
         {#snippet action()}
-          <a class="empty-link" href="{base}/mail/unified">Go to Unified Inbox</a>
+          <a class="empty-link" href="{base}/mail/unified">Go to Inbox</a>
         {/snippet}
       </EmptyState>
     {/if}

@@ -1,0 +1,1 @@
+import{E as e,K as t,W as n,at as r,w as i,y as a}from"../chunks/8Njs-mcn.js";import"../chunks/xihTtKlq.js";import{c as o}from"../chunks/00D3_7_2.js";var s=e(`<div class="digest-shell svelte-1ow4sf2"><!> <div class="digest-main svelte-1ow4sf2"><!></div></div>`);function c(e,c){var l=s(),u=n(l);o(u,{});var d=t(u,2);a(n(d),()=>c.children),r(d),r(l),i(e,l)}export{c as component};

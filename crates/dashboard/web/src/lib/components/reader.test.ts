@@ -668,3 +668,89 @@ describe('ReaderPane mailbox actions', () => {
     );
   });
 });
+
+// ── Phase C: reader as a document ─────────────────────────────────────
+// Header hierarchy (subject headline + removable folder chip + right-edge
+// cluster), an exact timestamp, and a Quick Reply that PROMOTES to the review
+// composer — never a new send path.
+
+describe('ReaderPane — document view (Phase C)', () => {
+  it('shows an exact timestamp as a <time> with a machine datetime', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    const time = document.querySelector('time.msg-meta-date') as HTMLTimeElement | null;
+    expect(time).not.toBeNull();
+    expect(time!.getAttribute('datetime')).toBe('2026-07-08T10:00:00Z');
+    // Down to the second, per A5.
+    expect(time!.textContent).toMatch(/\d{1,2}:\d{2}:\d{2}/);
+  });
+
+  it('the folder chip ✕ archives (removes from the source folder)', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove from Inbox' }));
+    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
+    expect(apiMock.bulkClient).toHaveBeenCalledWith(
+      { type: 'move', to_folder: '\\Archive', folder: 'INBOX' },
+      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
+    );
+  });
+
+  it('Details reveals the full headers (To, UID)', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    expect(screen.queryByText('uid 42')).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Details' }));
+    await waitFor(() => expect(screen.getByText('uid 42')).toBeInTheDocument());
+  });
+
+  it('Quick Reply carries typed text into the composer, above the quote — no direct send', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    const box = screen.getByPlaceholderText(/reply to/i);
+    await fireEvent.input(box, { target: { value: 'On it, thanks.' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply in composer' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply');
+    expect(composer.context.parentUid).toBe(42);
+    // Typed text leads; the quote follows. The composer is the only send path.
+    expect(composer.context.bodyPrefix?.startsWith('On it, thanks.')).toBe(true);
+    expect(composer.context.bodyPrefix).toContain('sender@example.com wrote:');
+  });
+
+  it('Quick Reply with no text still promotes to the composer with just the quote', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Reply in composer' }));
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.context.bodyPrefix).toContain('sender@example.com wrote:');
+  });
+
+  it('Cmd/Ctrl+Enter in the Quick Reply box promotes to the composer', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    const box = screen.getByPlaceholderText(/reply to/i);
+    await fireEvent.input(box, { target: { value: 'Quick keyboard reply.' } });
+    // A plain Enter must NOT promote (it inserts a newline in the textarea).
+    await fireEvent.keyDown(box, { key: 'Enter' });
+    expect(getComposerStore().isOpen).toBe(false);
+    // Cmd/Ctrl+Enter promotes, carrying the typed text.
+    await fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+    const composer = getComposerStore();
+    expect(composer.isOpen).toBe(true);
+    expect(composer.mode).toBe('reply');
+    expect(composer.context.bodyPrefix?.startsWith('Quick keyboard reply.')).toBe(true);
+  });
+
+  it('keeps a dotted leaf name intact in the folder chip on a /-hierarchy server', async () => {
+    pageState.url = new URL(
+      'http://localhost/v2/mail/unified/acct-a/42?folder=Clients/Acme.com'
+    ) as typeof pageState.url;
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    // Not 'Remove from Com' — the '.' in the leaf must not be a separator here.
+    expect(screen.getByRole('button', { name: 'Remove from Acme.com' })).toBeInTheDocument();
+  });
+});

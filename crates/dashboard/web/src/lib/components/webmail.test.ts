@@ -116,7 +116,7 @@ describe('Rail', () => {
     render(Rail);
     await waitFor(() => expect(screen.getByText('Work Mail')).toBeInTheDocument());
     expect(screen.getByText('Broken Mail')).toBeInTheDocument();
-    expect(screen.getByText('Unified Inbox')).toBeInTheDocument();
+    expect(screen.getByText('Inbox')).toBeInTheDocument();
     expect(screen.getByText('Snoozed')).toBeInTheDocument();
     // Snoozed count from stats.
     expect(screen.getByText('3')).toBeInTheDocument();

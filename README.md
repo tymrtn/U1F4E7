@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="#quick-start">Setup</a> •
+  <a href="#travel">Travel</a> •
   <a href="#cli-reference">CLI</a> •
   <a href="#rules-engine">Rules</a> •
   <a href="#why-not-himalaya--cloudflare--resend">vs. Alternatives</a> •
@@ -303,6 +304,52 @@ The LLM teaches Envelope what to look for. Envelope applies those patterns deter
 - Compose with text/html toggle and file attachments
 - ★ Snoozed virtual folder with overdue highlighting
 - IMAP search
+
+## Travel
+
+Envelope Travel is a self-hosted itinerary and family-coordination workspace at
+[`/travel`](http://localhost:3141/travel). It uses the Gmail or Google Workspace
+address you already own—no forwarding address or new travel account.
+
+1. Turn on Google 2-Step Verification and create an app-specific password.
+2. Run `envelope serve`, open **Travel**, and enter the address plus that app
+   password. Envelope verifies Gmail before saving the encrypted credential.
+   A fresh macOS install uses Keychain automatically; an existing encrypted
+   file store remains in place. On a headless Linux host, set
+   `ENVELOPE_MASTER_KEY` or `ENVELOPE_MASTER_PASSPHRASE_FILE` before starting
+   the service.
+3. Leave confirmations in the configured Gmail folder (INBOX by default), pick
+   `[Gmail]/All Mail` in Travel settings to include archived confirmations, or
+   paste a confirmation into the receipt desk. The mailbox scan is read-only:
+   IMAP `EXAMINE` plus `BODY.PEEK[]` never marks mail as read.
+
+The workspace groups flights, lodging, rail, cars, and activities into trips;
+keeps the source receipt and parser provenance; quarantines uncertain details
+for approval; detects emailed changes and cancellations; schedules reminders;
+and provides shared tasks. Family links are revocable and structurally omit
+confirmation codes, receipt text, private notes, and parser metadata. Each
+share also gets a separate read-only `.ics` capability, so Apple Calendar,
+Google Calendar, or another subscriber never receives task-edit authority.
+
+For a computer-only install, keep `envelope serve` running while you need sync,
+alerts, family pages, or calendar refreshes; a sleeping laptop cannot poll
+Gmail. For access from family devices, the recommended remote shape is the
+Tailscale setup in Quick start. For an always-on Linux host, install the
+systemd user service from [docs/install-linux.md](docs/install-linux.md), put
+`ENVELOPE_HOME` on persistent encrypted storage, require dashboard auth, and
+terminate TLS with Tailscale Serve or a trusted reverse proxy. Do not expose a
+mailbox dashboard anonymously. Gmail onboarding is deliberately disabled when
+Envelope binds directly to a non-loopback address: enter the app password only
+through localhost, or through an HTTPS/Tailscale proxy whose Envelope listener
+remains on loopback. A custom proxy must overwrite `X-Forwarded-Proto` with the
+actual client-facing scheme; plaintext proxy requests and conflicting HTTP
+browser origins are refused for Gmail credential setup.
+
+Travel changes and delays currently come from messages received in Gmail.
+Live gate, aircraft, baggage-belt, and operational delay telemetry requires a
+separate flight-status provider and is not inferred when the airline has not
+emailed an update. Scheduled alerts appear in the Travel workspace; this build
+does not yet deliver push notifications when the browser is closed.
 
 ## Commercial licensing
 

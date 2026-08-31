@@ -12,7 +12,7 @@
 </script>
 
 <div class="root-redirect">
-  <Spinner label="Opening Unified Inbox" />
+  <Spinner label="Opening Digest" />
 </div>
 
 <style>

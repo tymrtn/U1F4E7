@@ -5,6 +5,7 @@
   // aside from that explicit action.
   import Button from './Button.svelte';
   import MonoTag from './MonoTag.svelte';
+  import Icon from './Icon.svelte';
   import GovernorVerdictBadge from './GovernorVerdictBadge.svelte';
   import type { ScheduledItem } from '$lib/cockpit-api';
 
@@ -28,7 +29,10 @@
       {#if item.created_by}
         <MonoTag>{item.created_by}</MonoTag>
       {/if}
-      <span class="scheduled-when" class:due={item.due}>{countdown(item)}</span>
+      <span class="scheduled-when" class:due={item.due}>
+        <Icon name="clock" size={12} />
+        {countdown(item)}
+      </span>
       {#if item.governor}
         <GovernorVerdictBadge verdict={item.governor.verdict} decision={item.governor.decision} />
       {/if}
@@ -73,9 +77,13 @@
     gap: 0.5rem;
   }
   .scheduled-when {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
     font-family: var(--font-mono);
     font-size: 0.75rem;
     color: var(--env-muted);
+    font-variant-numeric: tabular-nums;
   }
   .scheduled-when.due {
     color: var(--env-accent);

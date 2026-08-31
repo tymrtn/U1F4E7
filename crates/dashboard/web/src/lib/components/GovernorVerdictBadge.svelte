@@ -19,4 +19,15 @@
   const label = $derived(decision ?? verdict);
 </script>
 
-<Badge {variant}>{label}</Badge>
+<!-- A Governor verdict reads as an instrument readout: mono, uppercase, the
+     decision word carried by the Badge's severity accent. -->
+<Badge {variant}><span class="verdict-readout">{label}</span></Badge>
+
+<style>
+  .verdict-readout {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+</style>

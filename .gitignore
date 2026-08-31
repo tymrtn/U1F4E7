@@ -32,3 +32,6 @@ apps/
 # Stray scratch files
 *.tif
 .worktrees/
+
+# Agent instructions live in the parent dir, never in this public repo
+CLAUDE.md

@@ -56,6 +56,18 @@
   --env-page: #f3f1ec;
   --env-soft: #fbfaf8;
   --env-rule-soft: #ebe8e1;
+
+  /* Dark instrument rail (design plan rev 3). The rail is the one dark
+   * surface framing the paper content; these values are AA-checked against
+   * the ground (text 11.7:1, muted 5.3:1, accent 6.1:1, badge 5.1:1). */
+  --env-rail-ground: #171a21;
+  --env-rail-lift: rgba(255, 255, 255, 0.07);
+  --env-rail-hover: rgba(255, 255, 255, 0.045);
+  --env-rail-text: #d6d4cd;
+  --env-rail-muted: #8b8e96;
+  --env-rail-accent: #57a983;
+  --env-rail-active-text: #ffffff;
+  --env-rail-warn: #e08a70;
 }
 
 *,

@@ -1,8 +1,9 @@
 <script lang="ts">
-  // Left rail: smart mailboxes (deep-linked client routes) + accounts with
-  // per-account health badges derived from the cockpit aggregate. Clicking an
-  // account row opens the contextual AccountDrawer. Every data surface here has
-  // an explicit loading / error / empty state — no silent failures.
+  // Left rail — the dark instrument frame (design plan rev 3). GTD stages as
+  // places (Process / Working), review surfaces (Cockpit, Approvals), then
+  // accounts with per-account health and identity hue. Clicking an account row
+  // opens the contextual AccountDrawer. Every data surface here has an
+  // explicit loading / error / empty state — no silent failures.
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import {
@@ -15,7 +16,10 @@
     type AccountHealth
   } from '$lib/api';
   import { MAILBOXES } from '$lib/mailboxes';
+  import { cockpitApi } from '$lib/cockpit-api';
+  import { identityColor } from '$lib/hue';
   import Badge from './Badge.svelte';
+  import Icon from './Icon.svelte';
   import Spinner from './Spinner.svelte';
   import MonoTag from './MonoTag.svelte';
   import AccountDrawer from './AccountDrawer.svelte';
@@ -23,13 +27,16 @@
   let accounts = $state<Account[]>([]);
   let cockpit = $state<CockpitResponse | null>(null);
   let stats = $state<StatsResponse | null>(null);
+  // Actionable count for the Approvals place — drafts an agent left for a human
+  // (design plan rev 3, D). Best-effort: a failed fetch just hides the badge.
+  let awaitingApproval = $state(0);
   let loading = $state(true);
   let error = $state<{ code: string; message: string } | null>(null);
 
   // The account that owns the message open in the reader, so the rail can say
   // which mailbox the thing you are reading actually came from. The unified
   // list mixes every account together, so without this the rail highlights
-  // "Unified Inbox" and nothing else — the message's real home is invisible.
+  // "Inbox" and nothing else — the message's real home is invisible.
   let { activeAccountId = null }: { activeAccountId?: string | null } = $props();
 
   let drawerAccount = $state<Account | null>(null);
@@ -37,6 +44,12 @@
   let drawerOpen = $state(false);
 
   const activeBox = $derived(page.params.box ?? 'unified');
+  const onCockpit = $derived(page.url.pathname.startsWith(`${base}/cockpit`));
+  const onDigest = $derived(page.url.pathname.startsWith(`${base}/digest`));
+  const boxRoutesActive = $derived(!onCockpit && !onDigest);
+
+  const processBoxes = MAILBOXES.filter((b) => b.group === 'process');
+  const workingBoxes = MAILBOXES.filter((b) => b.group === 'working');
 
   async function load() {
     loading = true;
@@ -62,8 +75,20 @@
     }
   }
 
+  // Approvals badge is pure decoration on the rail and must never gate the
+  // load-bearing accounts render, so it runs on its own and swallows failures.
+  async function loadApprovals() {
+    try {
+      const res = await cockpitApi.agents();
+      awaitingApproval = res.summary.awaiting_approval;
+    } catch {
+      awaitingApproval = 0;
+    }
+  }
+
   $effect(() => {
     load();
+    loadApprovals();
   });
 
   function healthFor(account: Account): AccountHealth {
@@ -84,28 +109,85 @@
   }
 </script>
 
+{#snippet boxRow(box: (typeof MAILBOXES)[number])}
+  {@const count = boxCount(box.slug)}
+  <li>
+    <a
+      class="rail-item"
+      class:is-active={activeBox === box.slug && boxRoutesActive}
+      href="{base}/mail/{box.slug}"
+      aria-current={activeBox === box.slug && boxRoutesActive ? 'page' : undefined}
+    >
+      <span class="rail-item-main">
+        <Icon name={box.icon} size={15} />
+        <span class="rail-item-label">{box.label}</span>
+      </span>
+      {#if count !== null && count > 0}
+        <span class="rail-count">{count}</span>
+      {/if}
+    </a>
+  </li>
+{/snippet}
+
 <aside class="rail" aria-label="Mailboxes">
-  <p class="rail-label">Mailboxes</p>
+  <p class="rail-label">Process</p>
   <ul class="rail-list">
-    {#each MAILBOXES as box (box.slug)}
-      {@const count = boxCount(box.slug)}
-      <li>
-        <a
-          class="rail-item"
-          class:is-active={activeBox === box.slug}
-          href="{base}/mail/{box.slug}"
-          aria-current={activeBox === box.slug ? 'page' : undefined}
-        >
-          <span class="rail-item-label">{box.label}</span>
-          {#if count !== null && count > 0}
-            <span class="rail-count">{count}</span>
-          {/if}
-        </a>
-      </li>
+    <li>
+      <a
+        class="rail-item"
+        class:is-active={onDigest}
+        href="{base}/digest"
+        aria-current={onDigest ? 'page' : undefined}
+      >
+        <span class="rail-item-main">
+          <Icon name="list-checks" size={15} />
+          <span class="rail-item-label">Digest</span>
+        </span>
+      </a>
+    </li>
+    {#each processBoxes as box (box.slug)}
+      {@render boxRow(box)}
     {/each}
   </ul>
 
-  <p class="rail-label rail-accounts-label">Accounts</p>
+  <p class="rail-label rail-gap">Working</p>
+  <ul class="rail-list">
+    {#each workingBoxes as box (box.slug)}
+      {@render boxRow(box)}
+    {/each}
+  </ul>
+
+  <p class="rail-label rail-gap">Review</p>
+  <ul class="rail-list">
+    <li>
+      <a
+        class="rail-item"
+        class:is-active={onCockpit}
+        href="{base}/cockpit"
+        aria-current={onCockpit ? 'page' : undefined}
+      >
+        <span class="rail-item-main">
+          <Icon name="bot" size={15} />
+          <span class="rail-item-label">Cockpit</span>
+        </span>
+      </a>
+    </li>
+    <li>
+      <a class="rail-item" href="{base}/cockpit#approvals">
+        <span class="rail-item-main">
+          <Icon name="shield-check" size={15} />
+          <span class="rail-item-label">Approvals</span>
+        </span>
+        {#if awaitingApproval > 0}
+          <span class="rail-badge-warn" aria-label="{awaitingApproval} awaiting approval"
+            >{awaitingApproval}</span
+          >
+        {/if}
+      </a>
+    </li>
+  </ul>
+
+  <p class="rail-label rail-gap">Accounts</p>
   <div class="rail-accounts">
     {#if loading}
       <div class="rail-loading"><Spinner label="Loading accounts" /> <span>Loading…</span></div>
@@ -134,6 +216,11 @@
               aria-current={owns ? 'true' : undefined}
               onclick={() => openAccount(account)}
             >
+              <span
+                class="rail-account-tick"
+                style="background: {identityColor(account.id)}"
+                aria-hidden="true"
+              ></span>
               <span class="rail-account-name">{account.display_name || account.name}</span>
               {#if owns}
                 <span class="rail-account-here" title="The open message is in this mailbox"
@@ -163,24 +250,26 @@
 
 <style>
   .rail {
-    border-right: 1px solid var(--env-rule);
-    padding: 0.85rem 0.75rem;
+    border-right: 1px solid var(--env-rail-ground);
+    padding: 0.85rem 0.6rem;
     display: flex;
     flex-direction: column;
-    gap: 0.35rem;
-    background: var(--env-paper);
+    gap: 0.2rem;
+    background: var(--env-rail-ground);
+    color: var(--env-rail-text);
     overflow-y: auto;
   }
   .rail-label {
     font-family: var(--font-mono);
-    font-size: 0.6875rem;
+    font-size: 0.625rem;
     text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--env-muted);
-    margin: 0 0 0.35rem;
+    letter-spacing: 0.14em;
+    color: var(--env-rail-muted);
+    margin: 0 0 0.3rem;
+    padding: 0 0.5rem;
   }
-  .rail-accounts-label {
-    margin-top: 1rem;
+  .rail-gap {
+    margin-top: 1.1rem;
   }
   .rail-list {
     list-style: none;
@@ -188,7 +277,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
+    gap: 0.1rem;
   }
   .rail-item {
     display: flex;
@@ -196,87 +285,138 @@
     justify-content: space-between;
     gap: 0.5rem;
     padding: 0 0.5rem;
-    height: 34px;
+    height: 32px;
     font-size: 0.8125rem;
     border-radius: var(--radius-sm, 3px);
-    color: var(--env-ink);
+    color: var(--env-rail-text);
     text-decoration: none;
   }
+  .rail-item-main {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+  .rail-item-main :global(.icon) {
+    color: var(--env-rail-muted);
+  }
   .rail-item:hover {
-    background: var(--env-accent-soft);
+    background: var(--env-rail-hover);
   }
+  /* Active place: brighter text on a faint lift with an accent edge — the
+     rev-3 active language; no green wash. */
   .rail-item.is-active {
-    background: var(--env-accent-soft);
-    color: var(--env-accent);
+    background: var(--env-rail-lift);
+    color: var(--env-rail-active-text);
     font-weight: 600;
+    box-shadow: inset 2px 0 0 var(--env-rail-accent);
   }
+  .rail-item.is-active :global(.icon) {
+    color: var(--env-rail-accent);
+  }
+  .rail-item-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Quiet numerals — dim, mono, unboxed (A4). */
   .rail-count {
     font-family: var(--font-mono);
     font-size: 0.6875rem;
-    color: var(--env-muted);
-    background: var(--env-surface);
-    border: 1px solid var(--env-rule);
+    color: var(--env-rail-muted);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .rail-item.is-active .rail-count {
+    color: var(--env-rail-text);
+  }
+  /* Actionable badge — the only lit count in the rail (A4): a human is owed
+     something. Warn-colored pill, legible on the dark ground. */
+  .rail-badge-warn {
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: #2b120a;
+    background: var(--env-rail-warn);
     border-radius: 999px;
     padding: 0 0.4rem;
-    min-width: 1.25rem;
+    min-width: 1.15rem;
     text-align: center;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
   }
   .rail-account {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 0.5rem;
     width: 100%;
     padding: 0 0.5rem;
-    height: 34px;
+    height: 32px;
     font-size: 0.8125rem;
     border: none;
     background: none;
     border-radius: var(--radius-sm, 3px);
-    color: var(--env-ink);
+    color: var(--env-rail-text);
     cursor: pointer;
     text-align: left;
   }
   .rail-account:hover {
-    background: var(--env-accent-soft);
+    background: var(--env-rail-hover);
   }
   /* The mailbox the open message belongs to. Mirrors .rail-item.is-active so
-     the rail reads as one selection model, with a left marker to distinguish
-     "contains what you're reading" from "the box you're browsing". */
+     the rail reads as one selection model. */
   .rail-account.is-active {
-    background: var(--env-accent-soft);
-    color: var(--env-accent);
+    background: var(--env-rail-lift);
+    color: var(--env-rail-active-text);
     font-weight: 600;
-    box-shadow: inset 2px 0 0 var(--env-accent);
+    box-shadow: inset 2px 0 0 var(--env-rail-accent);
+  }
+  /* Identity hue as metadata (A3): a small tick, never a row wash. */
+  .rail-account-tick {
+    width: 3px;
+    height: 14px;
+    border-radius: 2px;
+    flex-shrink: 0;
   }
   .rail-account-here {
     font-family: var(--font-mono);
     font-size: 0.625rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: var(--env-accent);
+    color: var(--env-rail-accent);
     flex-shrink: 0;
+    margin-left: auto;
   }
   .rail-account-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .rail-account :global(.env-badge) {
+    margin-left: auto;
+  }
+  .rail-account-here + :global(.env-badge) {
+    margin-left: 0;
+  }
   .rail-dot {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
     flex-shrink: 0;
+    margin-left: auto;
+  }
+  .rail-account-here ~ .rail-dot {
+    margin-left: 0;
   }
   .rail-dot-ok {
-    background: var(--env-accent);
+    background: var(--env-rail-accent);
   }
   .rail-loading {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     font-size: 0.8125rem;
-    color: var(--env-muted);
+    color: var(--env-rail-muted);
     padding: 0.35rem 0.5rem;
   }
   .rail-error {
@@ -288,7 +428,7 @@
   .rail-error-msg {
     margin: 0;
     font-size: 0.8125rem;
-    color: var(--env-warn);
+    color: var(--env-rail-warn);
   }
   .rail-error-code {
     margin: 0;
@@ -296,7 +436,7 @@
   .rail-retry {
     align-self: flex-start;
     font-size: 0.75rem;
-    color: var(--env-accent);
+    color: var(--env-rail-accent);
     background: none;
     border: none;
     padding: 0;
@@ -310,11 +450,12 @@
     margin: 0 0 0.2rem;
     font-size: 0.8125rem;
     font-weight: 600;
+    color: var(--env-rail-text);
   }
   .rail-empty-hint {
     margin: 0;
     font-size: 0.75rem;
-    color: var(--env-muted);
+    color: var(--env-rail-muted);
     line-height: 1.4;
   }
 </style>

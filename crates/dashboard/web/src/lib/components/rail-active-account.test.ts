@@ -37,6 +37,8 @@ function stubFetch() {
     'fetch',
     vi.fn(async (url: RequestInfo | URL) => {
       const u = String(url);
+      if (u.includes('/api/agents'))
+        return jsonResponse({ agents: [], approval_queue: [], summary: { agents: 0, active_agents: 0, awaiting_approval: 3 } });
       if (u.includes('/api/accounts')) return jsonResponse(ACCOUNTS);
       if (u.includes('/api/cockpit')) return jsonResponse({ accounts: [] });
       if (u.includes('/api/stats')) return jsonResponse({ drafts: 0, snoozed: 0 });
@@ -93,5 +95,15 @@ describe('Rail — owning mailbox of the open message', () => {
     render(Rail, { props: { activeAccountId: 'acc-work' } });
 
     await waitFor(() => expect(screen.getByText('open here')).toBeTruthy());
+  });
+
+  it('badges Approvals with the awaiting-approval count from the fleet aggregate', async () => {
+    stubFetch();
+    render(Rail, { props: { activeAccountId: null } });
+    // The rail's Approvals place lights up with the count a human is owed.
+    await waitFor(() =>
+      expect(screen.getByLabelText('3 awaiting approval')).toBeInTheDocument()
+    );
+    expect(screen.getByLabelText('3 awaiting approval').textContent).toBe('3');
   });
 });
