@@ -843,6 +843,52 @@ describe('DraftComposer hold', () => {
     expect(screen.getByLabelText('Subject')).not.toBeDisabled();
   });
 
+  it('does not let a stale queued refresh overwrite a successful hold', async () => {
+    await renderLoaded();
+    const sendAfter = new Date(Date.now() + 60_000).toISOString();
+    let resolveQueuedRefresh!: (value: unknown) => void;
+    apiMock.draft.mockReturnValueOnce(new Promise((resolve) => (resolveQueuedRefresh = resolve)));
+    apiMock.holdDraft.mockResolvedValueOnce({
+      draft: {
+        ...BASE_DRAFT,
+        revision: 8,
+        subject: 'Held server subject',
+        text_content: 'Held server content',
+        send_after: null
+      },
+      status: 'held'
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^human-only send in\b/i }));
+    await fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: /^send in\b/i })
+    );
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeTruthy());
+    expect(apiMock.draft).toHaveBeenCalledTimes(2);
+
+    await fireEvent.click(holdButton());
+    await waitFor(() => expect(document.getElementById('draft-queued')).toBeFalsy());
+
+    // The reconciliation began while the receipt still described a queued row,
+    // but arrives only after Hold has made the unlocked server row authoritative.
+    resolveQueuedRefresh(
+      draftResponse({
+        revision: 7,
+        subject: 'Stale queued subject',
+        text_content: 'Stale queued content',
+        send_after: sendAfter
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(document.getElementById('draft-queued')).toBeFalsy();
+    expect(screen.getByLabelText('Subject')).not.toBeDisabled();
+    expect(screen.getByLabelText('Message')).not.toBeDisabled();
+    expect((screen.getByLabelText('Subject') as HTMLInputElement).value).toBe('Held server subject');
+    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Held server content');
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeEnabled();
+  });
+
   it('disables Hold while the request is in flight', async () => {
     await renderLoaded({ send_after: QUEUED_AT });
     let resolveHold!: (value: unknown) => void;

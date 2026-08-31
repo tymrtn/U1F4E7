@@ -773,7 +773,10 @@
    */
   async function hold() {
     if (!draft || !canHold) return;
-    const generation = loadGeneration;
+    // A queue acknowledgement starts a nonblocking reconciliation. Invalidate
+    // any response it already has in flight before requesting Hold, so only the
+    // returned unlocked draft can become authoritative after a successful hold.
+    const generation = ++loadGeneration;
     const targetAccount = accountId;
     const targetDraft = draftId;
 
