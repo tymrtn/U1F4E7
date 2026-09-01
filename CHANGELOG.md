@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PII, commitment language, BCC, broad reach, and other risk facts remain
   independent counterweights. Agent catalog output remains weight-free.
 
+- **Draft review:** governed drafts stopped for review can open **Refine context**. The dashboard shows factual attributes and provenance without scores or recommendations; an operator may correct only declarable facts on that exact revision, then queue a normal governed retry. It cannot alter host-observed facts, mint human approval, or replace Human-only Send. Edits, attachment changes, Hold, and non-dashboard requeues invalidate the correction.
+
 ## [1.1.6] — 2026-08-31
 
 ### Fixed
