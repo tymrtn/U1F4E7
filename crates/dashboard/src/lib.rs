@@ -454,6 +454,14 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/drafts/{draft_id}/send",
             post(handlers::drafts::send),
         )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/context-refinement",
+            get(handlers::drafts::context_refinement),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/context-refinement/retry",
+            post(handlers::drafts::retry_with_context_refinement),
+        )
         // Draft attachments. The bytes live in the draft row, so download
         // reads the stored snapshot rather than IMAP — an unsent draft's
         // files exist nowhere else. Upload/remove are revision-guarded edits.
@@ -1540,7 +1548,7 @@ fn should_pause_for_review(outcome: &envelope_email_transport::outbound::Governo
 /// surfaces such as the dashboard approve/send actions) and declares the
 /// `tyler_approved` attribute to Governor's blind scoring. It is an input
 /// attribute, never a bypass: the fail-closed gate still runs in full.
-fn scheduled_send_context(
+pub(crate) fn scheduled_send_context(
     db: &Database,
     draft: &envelope_email_store::Draft,
     account_domain: Option<String>,
@@ -1668,7 +1676,7 @@ pub(crate) fn account_domain_from_username(username: &str) -> Option<String> {
 /// persisted snapshots, for deriving the `has_attachment`/`sensitive_attachment`
 /// host facts without rehydrating the snapshotted bytes. Uses the same snapshot
 /// fields the sweep decodes, so the derived attribute set is identical.
-fn draft_attachment_stubs(
+pub(crate) fn draft_attachment_stubs(
     draft: &envelope_email_store::Draft,
 ) -> Vec<envelope_email_transport::smtp::Attachment> {
     draft

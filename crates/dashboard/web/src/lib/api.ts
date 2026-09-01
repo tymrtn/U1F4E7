@@ -523,6 +523,51 @@ export interface DraftHeldResponse {
   status: string;
 }
 
+export type ContextRefinementAttributeState =
+  | 'selected'
+  | 'not_selected'
+  | 'observed'
+  | 'not_observed'
+  | 'unavailable';
+
+/** One public, weight-free catalog fact in the dashboard-only projection. */
+export interface ContextRefinementAttribute {
+  key: string;
+  category: string;
+  description: string;
+  provenance: 'declarable' | 'host_derived' | 'requires_attestation';
+  state: ContextRefinementAttributeState;
+  selectable: boolean;
+  read_only: boolean;
+  explanation: string | null;
+}
+
+export interface ContextRefinementResponse {
+  eligible: boolean;
+  revision: number;
+  action: 'send';
+  protocol: string;
+  catalog: string;
+  catalog_version: number;
+  reason_code: string | null;
+  explanation: string;
+  attributes: ContextRefinementAttribute[];
+}
+
+export interface ContextRefinementRetryBody {
+  expected_revision: number;
+  declarable_attributes: string[];
+  confirm_factual_accuracy: boolean;
+}
+
+export interface ContextRefinementRetryResponse {
+  draft_id: string;
+  revision: number;
+  status: 'governed_retry_queued';
+  send_after: string;
+  message: string;
+}
+
 /**
  * Agent Cockpit aggregate. The full payload is broad; we type only the slices
  * the v2 rail derives account health from. `auth.items` and `actions.failed`
@@ -684,6 +729,35 @@ export const api = {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}`,
       o
+    );
+  },
+
+  /**
+   * Dashboard-only, content-free Governor context projection for one draft.
+   * This is intentionally separate from the generic draft response: it exposes
+   * public catalog facts and provenance, never message fields or diagnostics.
+   */
+  contextRefinement(
+    accountId: string,
+    draftId: string,
+    o?: RequestOptions
+  ): Promise<ContextRefinementResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/context-refinement`,
+      o
+    );
+  },
+
+  /** Record a factual replacement and queue the exact revision for the normal sweep. */
+  retryContextRefinement(
+    accountId: string,
+    draftId: string,
+    body: ContextRefinementRetryBody,
+    o?: RequestOptions
+  ): Promise<ContextRefinementRetryResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/context-refinement/retry`,
+      { ...o, method: 'POST', body }
     );
   },
 

@@ -40,7 +40,10 @@ pub use agent_identity::{
 pub use build_info::{BuildInfo, VERSION};
 pub use credential_store::CredentialBackend;
 pub use db::Database;
-pub use drafts::SyncClaim;
+pub use drafts::{
+    CONTEXT_CORRECTION_CONTRACT, CONTEXT_REFINED_EVENT, CONTEXT_REFINEMENT_INVALIDATED_EVENT,
+    ContextCorrection, SyncClaim,
+};
 pub use errors::StoreError;
 pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use models::*;

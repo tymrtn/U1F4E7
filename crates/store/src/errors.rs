@@ -23,6 +23,11 @@ pub enum StoreError {
     #[error("draft modified concurrently, approval not recorded: {0}")]
     DraftModifiedConcurrently(String),
 
+    /// A dashboard context-correction record failed its closed, token-only
+    /// contract validation. This is caller input, not a database failure.
+    #[error("invalid context correction: {0}")]
+    InvalidContextCorrection(String),
+
     /// A hold/unqueue was asked of a draft that carries no `send_after`.
     /// Distinct from [`StoreError::DraftNotEditable`]: the row is perfectly
     /// editable, it simply was never queued, so reporting success would claim

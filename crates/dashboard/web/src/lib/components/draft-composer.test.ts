@@ -25,6 +25,8 @@ const { apiMock } = vi.hoisted(() => ({
     editDraft: vi.fn(),
     sendDraft: vi.fn(),
     holdDraft: vi.fn(),
+    contextRefinement: vi.fn(),
+    retryContextRefinement: vi.fn(),
     discardDraft: vi.fn(),
     // Recipient autocomplete. Stubbed empty so these tests exercise the draft
     // save/send contract rather than the suggestion dropdown, which has its own
@@ -151,6 +153,24 @@ beforeEach(() => {
   apiMock.holdDraft.mockImplementation(() =>
     Promise.resolve({ draft: { ...BASE_DRAFT, send_after: null }, status: 'held' })
   );
+  apiMock.contextRefinement.mockResolvedValue({
+    eligible: true,
+    revision: BASE_DRAFT.revision,
+    action: 'send',
+    protocol: 'envelope.attribution.v1',
+    catalog: 'envelope',
+    catalog_version: 1,
+    reason_code: 'attributes_required',
+    explanation: 'Confirm only facts that are true of this exact draft.',
+    attributes: []
+  });
+  apiMock.retryContextRefinement.mockResolvedValue({
+    draft_id: DRAFT,
+    revision: BASE_DRAFT.revision,
+    status: 'governed_retry_queued',
+    send_after: '2026-07-30T10:02:00Z',
+    message: 'Corrected context recorded. Governed retry queued.'
+  });
 });
 
 afterEach(() => {
@@ -1683,12 +1703,43 @@ describe('DraftComposer attribution park', () => {
     expect(banner.textContent).toMatch(/no fact labels/i);
   });
 
-  it('points at the surface that can declare', async () => {
+  it('offers the dashboard factual refinement surface without CLI mutation coaching', async () => {
     await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
 
     const banner = document.getElementById('draft-send-block') as HTMLElement;
-    expect(banner.textContent).toContain('envelope draft send');
-    expect(banner.textContent).toContain('--attr');
+    expect(screen.getByRole('button', { name: 'Refine context' })).toBeEnabled();
+    expect(banner.textContent).not.toContain('envelope draft send');
+    expect(banner.textContent).not.toContain('--attr');
+  });
+
+  it('loads the purpose-built projection only when Refine context is opened', async () => {
+    await renderLoaded(parked({ origin: 'bot', declared_attrs: [], attempts: 4 }));
+
+    expect(apiMock.contextRefinement).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Refine context' }));
+
+    await waitFor(() =>
+      expect(apiMock.contextRefinement).toHaveBeenCalledWith(ACCOUNT, DRAFT)
+    );
+    expect(await screen.findByRole('dialog', { name: 'Refine Governor context' })).toBeInTheDocument();
+  });
+
+  it('does not offer factual refinement for a generic manual review row', async () => {
+    await renderLoaded({ status: 'pending_review', metadata: null, created_by: 'human:dashboard' });
+
+    expect(screen.queryByRole('button', { name: 'Refine context' })).not.toBeInTheDocument();
+  });
+
+  it('does not offer factual refinement when current Human-only Send authority exists', async () => {
+    await renderLoaded({
+      ...parked({ origin: 'bot', declared_attrs: [], attempts: 4 }),
+      metadata: {
+        attribution: { origin: 'bot', park_reason: 'attribution_exhausted' },
+        human_send: { revision: BASE_DRAFT.revision, queued_by: 'human:dashboard' }
+      }
+    });
+
+    expect(screen.queryByRole('button', { name: 'Refine context' })).not.toBeInTheDocument();
   });
 
   it('never names the label that would pass', async () => {

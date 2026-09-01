@@ -3,8 +3,9 @@
 
 use crate::db::Database;
 use crate::errors::{Result, StoreError};
-use crate::models::{Draft, DraftStatus};
+use crate::models::{Draft, DraftStatus, Event};
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Compare Message-IDs by their bare form: `<id@host>` and `id@host` name the
@@ -24,6 +25,183 @@ pub const SUPERSEDED_MESSAGE_IDS: &str = "superseded_message_ids";
 /// the row without limit.
 pub const MAX_SUPERSEDED_MESSAGE_IDS: usize = 16;
 
+/// Append-only event carrying the current dashboard context correction.
+///
+/// The payload is deliberately token-only and content-free. Keeping the
+/// record in the audit ledger rather than `Draft::metadata` prevents generic
+/// draft/CLI/MCP output from exposing a dashboard operator's correction while
+/// still making the record durable and revision-bound.
+pub const CONTEXT_REFINED_EVENT: &str = "send_governor.context_refined";
+
+/// Append-only tombstone for a same-revision correction withdrawn by Hold or
+/// any requeue other than the dedicated dashboard refinement transition.
+pub const CONTEXT_REFINEMENT_INVALIDATED_EVENT: &str =
+    "send_governor.context_refinement_invalidated";
+
+/// Stable, audit-safe dashboard correction contract.
+pub const CONTEXT_CORRECTION_CONTRACT: &str = "envelope.context_correction.v1";
+
+/// A durable factual correction tied to one account, draft, action, and exact
+/// revision. All variable strings are identifiers, catalog tokens, or public
+/// attribute keys; there is no field capable of carrying message content,
+/// recipients, attachment names/bytes, diagnostics, or free-form rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextCorrection {
+    pub contract: String,
+    pub correction_id: String,
+    pub account_id: String,
+    pub draft_id: String,
+    pub revision: i64,
+    pub action: String,
+    pub protocol: String,
+    pub catalog: String,
+    pub catalog_version: u32,
+    pub source: String,
+    pub recorded_at: String,
+    pub declarable_attributes: Vec<String>,
+    pub prior_refusal_code: Option<String>,
+}
+
+impl ContextCorrection {
+    /// Construct the only correction shape this repository accepts: a
+    /// dashboard-originated factual replacement for the `send` action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dashboard_send(
+        account_id: &str,
+        draft_id: &str,
+        revision: i64,
+        protocol: &str,
+        catalog: &str,
+        catalog_version: u32,
+        recorded_at: &str,
+        declarable_attributes: &[String],
+        prior_refusal_code: Option<&str>,
+    ) -> Result<Self> {
+        let mut normalized: Vec<String> = declarable_attributes
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
+        normalized.sort();
+        normalized.dedup();
+        let record = Self {
+            contract: CONTEXT_CORRECTION_CONTRACT.to_string(),
+            correction_id: Uuid::new_v4().to_string(),
+            account_id: account_id.to_string(),
+            draft_id: draft_id.to_string(),
+            revision,
+            action: "send".to_string(),
+            protocol: protocol.to_string(),
+            catalog: catalog.to_string(),
+            catalog_version,
+            source: "dashboard".to_string(),
+            recorded_at: recorded_at.to_string(),
+            declarable_attributes: normalized,
+            prior_refusal_code: prior_refusal_code.map(str::to_string),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let fail = |reason: &str| StoreError::InvalidContextCorrection(reason.to_string());
+        if self.contract != CONTEXT_CORRECTION_CONTRACT {
+            return Err(fail("unsupported contract"));
+        }
+        if self.action != "send" || self.source != "dashboard" {
+            return Err(fail("correction is not a dashboard send correction"));
+        }
+        if self.revision < 0 || self.catalog_version == 0 {
+            return Err(fail("revision and catalog version must be positive"));
+        }
+        if self.correction_id.is_empty()
+            || self.account_id.is_empty()
+            || self.draft_id.is_empty()
+            || self.protocol.is_empty()
+            || self.catalog.is_empty()
+        {
+            return Err(fail("required identifier is empty"));
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.recorded_at).is_err() {
+            return Err(fail("recorded_at must be RFC 3339"));
+        }
+        if self.declarable_attributes.is_empty() {
+            return Err(fail("at least one factual attribute is required"));
+        }
+        if self.declarable_attributes.len() > 64
+            || self
+                .declarable_attributes
+                .iter()
+                .any(|key| !safe_token(key))
+        {
+            return Err(fail("declarable attributes must be bounded public keys"));
+        }
+        if self
+            .prior_refusal_code
+            .as_deref()
+            .is_some_and(|code| !safe_token(code))
+        {
+            return Err(fail("prior refusal code must be a stable token"));
+        }
+        let mut normalized = self.declarable_attributes.clone();
+        normalized.sort();
+        normalized.dedup();
+        if normalized != self.declarable_attributes {
+            return Err(fail("declarable attributes must be normalized"));
+        }
+        Ok(())
+    }
+
+    fn event(&self) -> Result<Event> {
+        self.validate()?;
+        let payload = serde_json::json!({
+            "contract": self.contract,
+            "correction_id": self.correction_id,
+            "account_id": self.account_id,
+            "draft_id": self.draft_id,
+            "revision": self.revision,
+            "action": self.action,
+            "protocol": self.protocol,
+            "catalog": self.catalog,
+            "catalog_version": self.catalog_version,
+            "source": self.source,
+            "recorded_at": self.recorded_at,
+            "declarable_attributes": self.declarable_attributes,
+            "attribute_count": self.declarable_attributes.len(),
+            "prior_refusal_code": self.prior_refusal_code,
+        });
+        Ok(Event {
+            id: self.correction_id.clone(),
+            account_id: self.account_id.clone(),
+            event_type: CONTEXT_REFINED_EVENT.to_string(),
+            folder: "policy".to_string(),
+            uid: None,
+            message_id: None,
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(payload.to_string()),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some(self.recorded_at.clone()),
+            created_at: self.recorded_at.clone(),
+        })
+    }
+}
+
+/// Public catalog/refusal tokens are lowercase ASCII identifiers. Bounding the
+/// length and alphabet makes it impossible to smuggle free-form text through
+/// the correction ledger's token fields.
+fn safe_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+        })
+}
+
 /// A held provider-sync lease: the opaque owner token plus the status to
 /// restore on release.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +211,114 @@ pub struct SyncClaim {
 }
 
 impl Database {
+    /// Return the current dashboard correction for an exact draft revision.
+    ///
+    /// Only the latest correction-lifecycle event for this account/draft is
+    /// considered. A later Hold/non-refinement requeue tombstone returns
+    /// `None`, as does a correction bound to any other revision. Event payloads
+    /// that are malformed or fail the closed token contract are ignored.
+    pub fn current_context_correction(
+        &self,
+        account_id: &str,
+        draft_id: &str,
+        revision: i64,
+    ) -> Result<Option<ContextCorrection>> {
+        let row: Option<(String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT event_type, payload
+                 FROM events
+                 WHERE account_id = ?1
+                   AND event_type IN (?2, ?3)
+                   AND payload IS NOT NULL
+                   AND json_valid(payload)
+                   AND json_extract(payload, '$.draft_id') = ?4
+                 ORDER BY rowid DESC
+                 LIMIT 1",
+                params![
+                    account_id,
+                    CONTEXT_REFINED_EVENT,
+                    CONTEXT_REFINEMENT_INVALIDATED_EVENT,
+                    draft_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((event_type, payload)) = row else {
+            return Ok(None);
+        };
+        if event_type != CONTEXT_REFINED_EVENT {
+            return Ok(None);
+        }
+        let mut value: serde_json::Value = match serde_json::from_str(&payload) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        // `attribute_count` is an audit convenience derived from the bounded
+        // key set, not part of the canonical correction object.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("attribute_count");
+        }
+        let correction: ContextCorrection = match serde_json::from_value(value) {
+            Ok(correction) => correction,
+            Err(_) => return Ok(None),
+        };
+        if correction.validate().is_err()
+            || correction.account_id != account_id
+            || correction.draft_id != draft_id
+            || correction.revision != revision
+        {
+            return Ok(None);
+        }
+        Ok(Some(correction))
+    }
+
+    /// Append a content-free invalidation marker when a current correction is
+    /// superseded without a material revision bump. Callers invoke this inside
+    /// the same transaction as Hold or their requeue transition.
+    fn invalidate_current_context_correction(&self, draft: &Draft, reason: &str) -> Result<()> {
+        if self
+            .current_context_correction(&draft.account_id, &draft.id, draft.revision)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        if !safe_token(reason) {
+            return Err(StoreError::InvalidContextCorrection(
+                "invalidation reason must be a stable token".to_string(),
+            ));
+        }
+        let recorded_at = chrono::Utc::now().to_rfc3339();
+        let event = Event {
+            id: Uuid::new_v4().to_string(),
+            account_id: draft.account_id.clone(),
+            event_type: CONTEXT_REFINEMENT_INVALIDATED_EVENT.to_string(),
+            folder: "policy".to_string(),
+            uid: None,
+            message_id: None,
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(
+                serde_json::json!({
+                    "contract": "envelope.context_correction_invalidation.v1",
+                    "account_id": draft.account_id,
+                    "draft_id": draft.id,
+                    "revision": draft.revision,
+                    "action": "send",
+                    "source": reason,
+                    "recorded_at": recorded_at,
+                })
+                .to_string(),
+            ),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some(recorded_at.clone()),
+            created_at: recorded_at,
+        };
+        self.insert_event(&event)
+    }
+
     pub fn create_draft(
         &self,
         account_id: &str,
@@ -525,6 +811,19 @@ impl Database {
 
     /// Set the `send_after` timestamp on a draft (for scheduled sending).
     pub fn update_draft_send_after(&self, id: &str, send_after: &str) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        self.update_draft_send_after_inner(id, send_after)?;
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        self.invalidate_current_context_correction(&draft, "non_dashboard_requeue")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transaction-inheriting schedule write used by compound queue methods.
+    /// The outer method owns correction invalidation and commit/rollback.
+    fn update_draft_send_after_inner(&self, id: &str, send_after: &str) -> Result<()> {
         // Editable-status guard in the same statement: rescheduling a claimed
         // (`sending`) or terminal row is refused atomically.
         let rows = self.conn().execute(
@@ -564,6 +863,7 @@ impl Database {
     ///
     /// Returns the held row.
     pub fn hold_scheduled_draft(&self, id: &str) -> Result<Draft> {
+        let tx = self.conn().unchecked_transaction()?;
         let rows = self.conn().execute(
             "UPDATE drafts SET
                 send_after = NULL,
@@ -576,8 +876,12 @@ impl Database {
         if rows == 0 {
             return Err(self.classify_hold_miss(id));
         }
-        self.get_draft(id)?
-            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        self.invalidate_current_context_correction(&draft, "hold")?;
+        tx.commit()?;
+        Ok(draft)
     }
 
     /// Explain why [`Self::hold_scheduled_draft`] matched zero rows, in
@@ -963,6 +1267,7 @@ impl Database {
         send_after: &str,
         attribution: &serde_json::Value,
     ) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
         let serialized = serde_json::to_string(attribution)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET
@@ -984,7 +1289,124 @@ impl Database {
         if rows == 0 {
             return Err(self.classify_queue_miss(id));
         }
+        let draft = self
+            .get_draft(id)?
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        self.invalidate_current_context_correction(&draft, "non_dashboard_requeue")?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically record a dashboard factual correction and requeue the exact
+    /// parked draft revision into the ordinary scheduled Governor path.
+    ///
+    /// This transition is intentionally distinct from Human-only Send: it
+    /// accepts only `pending_review`/`blocked`, requires exact account and
+    /// revision binding, refuses any extant human-send authorization, preserves
+    /// `created_by`, stamps a bot-origin declaration, writes no human approval
+    /// or authorization, and appends the correction audit event in the same
+    /// transaction as the schedule/status update.
+    pub fn queue_draft_with_context_correction(
+        &self,
+        account_id: &str,
+        id: &str,
+        expected_revision: i64,
+        send_after: &str,
+        attribution: &serde_json::Value,
+        correction: &ContextCorrection,
+    ) -> Result<Draft> {
+        correction.validate()?;
+        if correction.account_id != account_id
+            || correction.draft_id != id
+            || correction.revision != expected_revision
+        {
+            return Err(StoreError::InvalidContextCorrection(
+                "account, draft, or revision binding mismatch".to_string(),
+            ));
+        }
+        let declared = attribution
+            .get("declared_attrs")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if attribution
+            .get("origin")
+            .and_then(serde_json::Value::as_str)
+            != Some("bot")
+            || attribution
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                != Some(correction.protocol.as_str())
+            || attribution
+                .get("catalog")
+                .and_then(serde_json::Value::as_str)
+                != Some(correction.catalog.as_str())
+            || attribution
+                .get("catalog_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(correction.catalog_version))
+            || declared != correction.declarable_attributes
+        {
+            return Err(StoreError::InvalidContextCorrection(
+                "persisted bot declaration does not match correction".to_string(),
+            ));
+        }
+
+        let tx = self.conn().unchecked_transaction()?;
+        let serialized = serde_json::to_string(attribution)?;
+        let rows = self.conn().execute(
+            "UPDATE drafts SET
+                status = 'draft',
+                send_after = ?1,
+                metadata = json_remove(
+                    json_set(
+                        COALESCE(metadata, '{}'),
+                        '$.attribution',
+                        json_set(json(?2), '$.revision', revision)
+                    ),
+                    '$.human_send', '$.send_block'
+                ),
+                updated_at = datetime('now')
+             WHERE account_id = ?3 AND id = ?4 AND revision = ?5
+               AND status IN ('pending_review', 'blocked')
+               AND json_type(COALESCE(metadata, '{}'), '$.human_send') IS NULL",
+            params![send_after, serialized, account_id, id, expected_revision],
+        )?;
+        if rows == 0 {
+            return Err(self.classify_context_refinement_miss(account_id, id, expected_revision));
+        }
+        self.insert_event(&correction.event()?)?;
+        let queued = self
+            .get_draft(id)?
+            .filter(|draft| draft.account_id == account_id)
+            .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    fn classify_context_refinement_miss(
+        &self,
+        account_id: &str,
+        id: &str,
+        expected_revision: i64,
+    ) -> StoreError {
+        match self.get_draft(id) {
+            Ok(None) => StoreError::DraftNotFound(id.to_string()),
+            Ok(Some(current)) if current.account_id != account_id => {
+                StoreError::DraftNotFound(id.to_string())
+            }
+            Ok(Some(current)) if current.revision != expected_revision => {
+                StoreError::DraftModifiedConcurrently(id.to_string())
+            }
+            Ok(Some(current)) => StoreError::DraftNotEditable(current.status.as_str().to_string()),
+            Err(error) => error,
+        }
     }
 
     /// Record a failed SMTP-time attribution attempt and leave the draft due for a
@@ -1468,7 +1890,7 @@ impl Database {
                 ));
             }
         }
-        self.update_draft_send_after(id, send_after)?;
+        self.update_draft_send_after_inner(id, send_after)?;
         self.record_draft_human_approval(id, expected_revision, approved_by, approved_at)?;
         self.record_draft_human_send(id, expected_revision, approved_by, approved_at)?;
         // Read the attested row inside the transaction, then commit. The caller
@@ -1476,6 +1898,7 @@ impl Database {
         let attested = self
             .get_draft(id)?
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
+        self.invalidate_current_context_correction(&attested, "human_send")?;
         tx.commit()?;
         Ok(attested)
     }
@@ -4873,5 +5296,325 @@ mod tests {
             .unwrap();
         assert_eq!(requeued.send_after.as_deref(), Some("2030-06-01T00:00:00"));
         assert!(requeued.human_approved());
+    }
+
+    fn parked_bot_for_context(db: &Database) -> Draft {
+        let draft = db
+            .create_draft(
+                "acc1",
+                "private-recipient@example.test",
+                Some("private-subject-sentinel"),
+                Some("private-body-sentinel"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.set_draft_attribution(
+            &draft.id,
+            &serde_json::json!({
+                "protocol": "envelope.attribution.v1",
+                "catalog": "envelope",
+                "catalog_version": 1,
+                "origin": "bot",
+                "declared_attrs": ["informational"],
+                "attempts": 3,
+                "park_reason": "attribution_exhausted",
+            }),
+        )
+        .unwrap();
+        db.update_draft_status(&draft.id, DraftStatus::PendingReview)
+            .unwrap();
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    fn context_record(draft: &Draft, attributes: &[&str]) -> ContextCorrection {
+        ContextCorrection::dashboard_send(
+            &draft.account_id,
+            &draft.id,
+            draft.revision,
+            "envelope.attribution.v1",
+            "envelope",
+            1,
+            "2026-09-01T12:00:00Z",
+            &attributes
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>(),
+            Some("attributes_required"),
+        )
+        .unwrap()
+    }
+
+    fn context_attribution(attributes: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "envelope.attribution.v1",
+            "catalog": "envelope",
+            "catalog_version": 1,
+            "origin": "bot",
+            "declared_attrs": attributes,
+            "revision": 0,
+            "attempts": 0,
+            "park_reason": null,
+        })
+    }
+
+    #[test]
+    fn context_correction_requeue_is_atomic_revision_bound_and_bot_origin() {
+        let db = setup();
+        let draft = parked_bot_for_context(&db);
+        let correction = context_record(&draft, &["scheduling"]);
+
+        let queued = db
+            .queue_draft_with_context_correction(
+                "acc1",
+                &draft.id,
+                draft.revision,
+                "2030-01-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &correction,
+            )
+            .unwrap();
+
+        assert_eq!(queued.status, DraftStatus::Draft);
+        assert_eq!(queued.revision, draft.revision);
+        assert_eq!(queued.created_by.as_deref(), Some("agent"));
+        assert_eq!(queued.human_send_surface(), None);
+        assert!(!queued.human_approved(), "correction never mints approval");
+        assert_eq!(
+            queued.metadata.as_ref().unwrap()["attribution"]["origin"],
+            "bot"
+        );
+        assert_eq!(
+            db.current_context_correction("acc1", &draft.id, draft.revision)
+                .unwrap(),
+            Some(correction.clone())
+        );
+
+        let event = db
+            .list_events(Some("acc1"), 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == CONTEXT_REFINED_EVENT)
+            .unwrap();
+        let payload = event.payload.unwrap();
+        assert!(payload.contains("scheduling"));
+        for prohibited in [
+            "private-recipient@example.test",
+            "private-subject-sentinel",
+            "private-body-sentinel",
+            "filename",
+            "data_base64",
+            "human_approval",
+            "human_send",
+        ] {
+            assert!(!payload.contains(prohibited), "audit leaked {prohibited}");
+        }
+    }
+
+    #[test]
+    fn stale_or_cross_account_context_correction_writes_nothing() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc2', 'Other', 'other@test.com', 'test.com', 'smtp.test.com', 587,
+                         'imap.test.com', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = parked_bot_for_context(&db);
+        let stale = ContextCorrection::dashboard_send(
+            "acc1",
+            &draft.id,
+            draft.revision + 1,
+            "envelope.attribution.v1",
+            "envelope",
+            1,
+            "2026-09-01T12:00:00Z",
+            &["scheduling".to_string()],
+            Some("attributes_required"),
+        )
+        .unwrap();
+        let err = db
+            .queue_draft_with_context_correction(
+                "acc1",
+                &draft.id,
+                draft.revision + 1,
+                "2030-01-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &stale,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DraftModifiedConcurrently(_)));
+
+        let wrong_scope = ContextCorrection::dashboard_send(
+            "acc2",
+            &draft.id,
+            draft.revision,
+            "envelope.attribution.v1",
+            "envelope",
+            1,
+            "2026-09-01T12:00:00Z",
+            &["scheduling".to_string()],
+            Some("attributes_required"),
+        )
+        .unwrap();
+        let err = db
+            .queue_draft_with_context_correction(
+                "acc2",
+                &draft.id,
+                draft.revision,
+                "2030-01-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &wrong_scope,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DraftNotFound(_)));
+
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert!(after.send_after.is_none());
+        assert!(
+            db.current_context_correction("acc1", &draft.id, draft.revision)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn correction_event_failure_rolls_back_the_requeue() {
+        let db = setup();
+        let draft = parked_bot_for_context(&db);
+        let correction = context_record(&draft, &["scheduling"]);
+        db.queue_draft_with_context_correction(
+            "acc1",
+            &draft.id,
+            draft.revision,
+            "2030-01-01T00:00:00Z",
+            &context_attribution(&["scheduling"]),
+            &correction,
+        )
+        .unwrap();
+        // Simulate the normal Governor park without invalidating the correction.
+        db.conn()
+            .execute(
+                "UPDATE drafts SET status = 'pending_review', send_after = NULL WHERE id = ?1",
+                params![draft.id],
+            )
+            .unwrap();
+
+        // Reusing the correction id makes the append-only event insert fail.
+        // The preceding queue UPDATE must roll back with it.
+        assert!(
+            db.queue_draft_with_context_correction(
+                "acc1",
+                &draft.id,
+                draft.revision,
+                "2030-02-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &correction,
+            )
+            .is_err()
+        );
+        let after = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(after.status, DraftStatus::PendingReview);
+        assert!(after.send_after.is_none());
+    }
+
+    #[test]
+    fn edits_hold_and_non_dashboard_requeue_invalidate_corrections() {
+        let db = setup();
+        let draft = parked_bot_for_context(&db);
+        let correction = context_record(&draft, &["scheduling"]);
+        let queued = db
+            .queue_draft_with_context_correction(
+                "acc1",
+                &draft.id,
+                draft.revision,
+                "2030-01-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &correction,
+            )
+            .unwrap();
+
+        let held = db.hold_scheduled_draft(&queued.id).unwrap();
+        assert!(
+            db.current_context_correction("acc1", &held.id, held.revision)
+                .unwrap()
+                .is_none(),
+            "Hold appends a same-revision invalidation"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE drafts SET status = 'pending_review' WHERE id = ?1",
+                params![held.id],
+            )
+            .unwrap();
+        let replacement = context_record(&held, &["informational"]);
+        let corrected_again = db
+            .queue_draft_with_context_correction(
+                "acc1",
+                &held.id,
+                held.revision,
+                "2030-01-01T00:00:00Z",
+                &context_attribution(&["informational"]),
+                &replacement,
+            )
+            .unwrap();
+        db.queue_draft_for_send(
+            &corrected_again.id,
+            corrected_again.revision,
+            "2030-03-01T00:00:00Z",
+            &context_attribution(&["low_stakes"]),
+        )
+        .unwrap();
+        assert!(
+            db.current_context_correction("acc1", &corrected_again.id, corrected_again.revision)
+                .unwrap()
+                .is_none(),
+            "ordinary CLI/MCP requeue invalidates the dashboard correction"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE drafts SET status = 'pending_review', send_after = NULL WHERE id = ?1",
+                params![corrected_again.id],
+            )
+            .unwrap();
+        let current = db.get_draft(&corrected_again.id).unwrap().unwrap();
+        let third = context_record(&current, &["scheduling"]);
+        let corrected_third = db
+            .queue_draft_with_context_correction(
+                "acc1",
+                &current.id,
+                current.revision,
+                "2030-04-01T00:00:00Z",
+                &context_attribution(&["scheduling"]),
+                &third,
+            )
+            .unwrap();
+        let edited = db
+            .update_draft_content(
+                &corrected_third.id,
+                None,
+                corrected_third.cc_addr.as_deref(),
+                corrected_third.bcc_addr.as_deref(),
+                Some("material edit"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_ne!(edited.revision, corrected_third.revision);
+        assert!(
+            db.current_context_correction("acc1", &edited.id, edited.revision)
+                .unwrap()
+                .is_none(),
+            "the exact revision binding invalidates every material edit"
+        );
     }
 }
