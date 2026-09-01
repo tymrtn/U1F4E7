@@ -498,7 +498,8 @@ pub async fn send(
                 }
                 Err(e) => return draft_error(e),
             };
-            let attribution = crate::human_queue_attribution_block(&attested, &account.username);
+            let attribution =
+                crate::human_queue_attribution_block(&db, &attested, &account.username);
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftQueued {
@@ -777,7 +778,7 @@ mod tests {
 
         // The attribution block built from that row carries the real attachment
         // fact (derived from the persisted snapshot), agreeing with the sweep.
-        let block = crate::human_queue_attribution_block(&attested, "agent@example.com");
+        let block = crate::human_queue_attribution_block(&db, &attested, "agent@example.com");
         let derived: Vec<&str> = block["derived_attrs"]
             .as_array()
             .unwrap()

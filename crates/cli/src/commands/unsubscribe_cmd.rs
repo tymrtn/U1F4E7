@@ -143,6 +143,7 @@ pub async fn run(
         let captured_error = &captured_error;
         Box::pin(async move {
             let req = super::governor_gate::unsubscribe_request(
+                db_ref,
                 account_id,
                 account_dom.clone(),
                 &addr,

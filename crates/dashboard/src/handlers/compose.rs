@@ -158,7 +158,8 @@ pub async fn send(
         // The additive human-origin attribution block (tyler_approved derived; no
         // fabricated bot declaration) is built from the attested row, deriving
         // attachment facts and the account domain exactly as the sweep will.
-        let attribution = crate::human_queue_attribution_block(&attested, &creds.account.username);
+        let attribution =
+            crate::human_queue_attribution_block(&db, &attested, &creds.account.username);
         (draft, attribution)
     };
 
@@ -324,7 +325,8 @@ pub async fn reply(
                     .into_response();
             }
         };
-        let attribution = crate::human_queue_attribution_block(&attested, &creds.account.username);
+        let attribution =
+            crate::human_queue_attribution_block(&db, &attested, &creds.account.username);
         (draft, attribution)
     };
 
