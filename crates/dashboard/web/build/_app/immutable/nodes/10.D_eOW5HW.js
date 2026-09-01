@@ -1,0 +1,1 @@
+import"../chunks/8Njs-mcn.js";import"../chunks/xihTtKlq.js";import{m as e}from"../chunks/VMCy6OAp.js";import"../chunks/DJfZF_Zv.js";function t(t){e(t,{title:`Open a message to read it`,hint:`Select a message from the list. Opening a message marks it read.`})}export{t as component};

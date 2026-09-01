@@ -1548,6 +1548,7 @@ fn scheduled_send_context(
 ) -> envelope_email_transport::attribution::AttributedSendContext {
     use envelope_email_transport::attribution::{
         AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
+        is_calendar_invitation_content_type,
     };
     let summary = collect_recipient_domains(
         &draft.to_addr,
@@ -1557,6 +1558,12 @@ fn scheduled_send_context(
     let sensitive_attachment = attachments
         .iter()
         .any(|a| classify_sensitive_attachment(&a.filename, &a.content_type));
+    // Calendar invitation is a MIME-only structural fact. Do not infer it from
+    // filenames, bodies, or subjects: an attachment is eligible only when its
+    // declared content type is text/calendar.
+    let calendar_invitation = attachments
+        .iter()
+        .any(|a| is_calendar_invitation_content_type(&a.content_type));
     // The shared store helper is bounded and local-only. A DB failure or
     // exhausted scan returns no relationship claim rather than inventing a new
     // contact/domain fact for a future scheduled transmission.
@@ -1577,6 +1584,7 @@ fn scheduled_send_context(
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        calendar_invitation,
         known_contact: relationship.known_contact,
         frequent_contact: relationship.frequent_contact,
         cold_email: if is_reply {

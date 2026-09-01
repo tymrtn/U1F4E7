@@ -220,9 +220,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vendored_catalog_has_thirty_unique_keys_and_no_weights() {
+    fn vendored_catalog_has_thirty_four_unique_keys_and_no_weights() {
         let attrs = catalog_attributes();
-        assert_eq!(attrs.len(), 30, "envelope catalog is 30 keys");
+        assert_eq!(attrs.len(), 34, "envelope catalog is 34 keys");
 
         let mut keys: Vec<&str> = attrs.iter().map(|a| a.key.as_str()).collect();
         keys.sort_unstable();
@@ -231,7 +231,7 @@ mod tests {
             k.dedup();
             k.len()
         };
-        assert_eq!(unique, 30, "catalog keys must be unique");
+        assert_eq!(unique, 34, "catalog keys must be unique");
 
         // No weight/score-like field may exist in the vendored JSON.
         let raw: Value = serde_json::from_str(VENDORED_JSON).unwrap();
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn declarable_keys_are_the_seven_author_context_keys() {
+    fn declarable_keys_include_scheduling_and_low_stakes_author_context() {
         // `agent_drafted` is declarable author-context: only the bot knows its own
         // authorship and Envelope has no durable, verifiable origin signal for it.
         let mut d = declarable_keys();
@@ -260,6 +260,8 @@ mod tests {
                 "has_pii",
                 "informational",
                 "legal_content",
+                "low_stakes",
+                "scheduling",
                 "uncited_claims",
             ]
         );
@@ -268,8 +270,8 @@ mod tests {
     #[test]
     fn agent_submittable_keys_are_declarable_plus_host_derived_without_attestation() {
         let submittable = agent_submittable_keys();
-        // Declarable ∪ HostDerived = 7 + 21 = 28; attestation keys excluded.
-        assert_eq!(submittable.len(), 28, "7 declarable + 21 host-derived");
+        // Declarable ∪ HostDerived = 9 + 23 = 32; attestation keys excluded.
+        assert_eq!(submittable.len(), 32, "9 declarable + 23 host-derived");
         // Every declarable and host-derived key is submittable.
         for k in declarable_keys() {
             assert!(

@@ -5,6 +5,19 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] — 2026-09-01
+
+### Changed
+
+- **Governor attribution:** ordinary one-recipient calendar invitations can carry
+  the non-sensitive, MIME-derived `calendar_invitation` structural fact when an
+  attachment has media type `text/calendar`. It is evaluated with the factual
+  scheduling/low-stakes/informational declaration and ordinary relationship,
+  recipient, and body facts by Governor's opaque envelope catalog; it is not a
+  calendar bypass. Sensitive attachments, unknown/first-contact recipients,
+  PII, commitment language, BCC, broad reach, and other risk facts remain
+  independent counterweights. Agent catalog output remains weight-free.
+
 ## [1.1.6] — 2026-08-31
 
 ### Fixed

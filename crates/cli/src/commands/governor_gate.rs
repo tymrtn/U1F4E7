@@ -15,6 +15,7 @@
 use envelope_email_store::{Database, Event};
 use envelope_email_transport::attribution::{
     AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
+    is_calendar_invitation_content_type,
 };
 use envelope_email_transport::outbound::{
     GovernorConfig, GovernorMode, GovernorOutcome, GovernorRequest, SendSurface,
@@ -54,6 +55,12 @@ pub(crate) fn governor_request(
     let sensitive_attachment = attachments
         .iter()
         .any(|a| classify_sensitive_attachment(&a.filename, &a.content_type));
+    // Calendar invitation is a MIME-only structural fact. Do not infer it from
+    // filenames, bodies, or subjects: an attachment is eligible only when its
+    // declared content type is text/calendar.
+    let calendar_invitation = attachments
+        .iter()
+        .any(|a| is_calendar_invitation_content_type(&a.content_type));
     // Store errors and bounded/exhausted lookups deliberately produce no facts:
     // absence is never treated as a first-contact claim without authoritative
     // local evidence.
@@ -68,6 +75,7 @@ pub(crate) fn governor_request(
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        calendar_invitation,
         known_contact: relationship.known_contact,
         frequent_contact: relationship.frequent_contact,
         // A reply has a definitive structural relationship and cannot be a first

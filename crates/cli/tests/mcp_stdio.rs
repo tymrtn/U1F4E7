@@ -1490,7 +1490,7 @@ fn mcp_governor_catalog_is_always_allowed_and_weight_free() {
     assert!(!is_error, "governor_catalog must be always allowed: {resp}");
     assert_eq!(resp["protocol"], "envelope.attribution.v1");
     assert_eq!(resp["catalog_version"], 1);
-    assert_eq!(resp["attributes"].as_array().unwrap().len(), 30);
+    assert_eq!(resp["attributes"].as_array().unwrap().len(), 34);
 
     // No weights/scores anywhere; provenance present; tyler_approved is attestation.
     let text = serde_json::to_string(&resp).unwrap();
@@ -1667,7 +1667,7 @@ fn cli_governor_catalog_prints_weight_free_projection() {
     assert!(out.status.success(), "governor catalog --json must succeed");
     let v: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(v["protocol"], "envelope.attribution.v1");
-    assert_eq!(v["attributes"].as_array().unwrap().len(), 30);
+    assert_eq!(v["attributes"].as_array().unwrap().len(), 34);
     let text = serde_json::to_string(&v).unwrap();
     assert!(!text.contains("weight"));
     assert!(!text.contains("\"score\""));
