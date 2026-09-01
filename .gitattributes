@@ -1,0 +1,4 @@
+# Generated SPA bundles can contain compiler-emitted template whitespace.
+# They are verified by the dashboard build/drift checks; keep source and tests
+# under Git's normal whitespace validation.
+crates/dashboard/web/build/** -whitespace

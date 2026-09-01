@@ -2365,6 +2365,7 @@ pub(crate) fn precheck_draft(
         })?;
     let attachments = draft_attachment_stubs(&draft);
     let gov_req = super::governor_gate::governor_request(
+        db,
         &draft.account_id,
         super::governor_gate::account_domain(&acct.username),
         draft.subject.as_deref().unwrap_or(""),
@@ -2687,6 +2688,7 @@ pub(crate) async fn send_existing_draft(
     // re-derived from what will actually be transmitted.
     let gov_attribution = {
         let gov_req = super::governor_gate::governor_request(
+            &db,
             &acct.id,
             super::governor_gate::account_domain(&creds.account.username),
             &subject,

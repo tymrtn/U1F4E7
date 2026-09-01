@@ -30,7 +30,10 @@
 use serde_json::{Value, json};
 
 use crate::attribution::AttributionResolution;
-use crate::governor_catalog::{ATTRIBUTION_PROTOCOL, CATALOG_NAME, catalog_version};
+use crate::attribution_provenance::{Provenance, provenance_of};
+use crate::governor_catalog::{
+    ATTRIBUTION_PROTOCOL, CATALOG_NAME, catalog_version, declarable_keys,
+};
 
 /// Draft-metadata key under which the persisted declaration lives.
 pub const ATTRIBUTION_METADATA_KEY: &str = "attribution";
@@ -42,6 +45,69 @@ pub const MAX_ATTRIBUTION_ATTEMPTS: u32 = 3;
 
 /// Stable `park_reason` recorded when a draft exhausts its attribution attempts.
 pub const PARK_REASON_ATTRIBUTION_EXHAUSTED: &str = "attribution_exhausted";
+
+/// Stable validation failure for a dashboard context-correction replacement.
+/// The optional key is always a public catalog-shaped token, never message
+/// content or free-form operator text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCorrectionAttrError {
+    pub code: &'static str,
+    pub key: Option<String>,
+}
+
+/// Normalize the dashboard modal's replacement factual declaration.
+///
+/// Only the catalog's current `Declarable` keys are accepted. Host-derived
+/// facts are projected read-only and attestation keys remain unavailable, so
+/// neither class may cross the mutation boundary. The result is deduplicated in
+/// canonical catalog order, making durable records stable across UI ordering.
+pub fn normalize_context_correction_attrs(
+    requested: &[String],
+) -> Result<Vec<String>, ContextCorrectionAttrError> {
+    let mut supplied = Vec::new();
+    for raw in requested {
+        let key = raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        match provenance_of(key) {
+            Some(Provenance::Declarable) => {
+                if !supplied.iter().any(|existing| existing == key) {
+                    supplied.push(key.to_string());
+                }
+            }
+            Some(Provenance::HostDerived) => {
+                return Err(ContextCorrectionAttrError {
+                    code: "host_fact_read_only",
+                    key: Some(key.to_string()),
+                });
+            }
+            Some(Provenance::RequiresAttestation) => {
+                return Err(ContextCorrectionAttrError {
+                    code: "authority_fact_unavailable",
+                    key: Some(key.to_string()),
+                });
+            }
+            None => {
+                return Err(ContextCorrectionAttrError {
+                    code: "unknown_attribute",
+                    key: Some(key.to_string()),
+                });
+            }
+        }
+    }
+    if supplied.is_empty() {
+        return Err(ContextCorrectionAttrError {
+            code: "attributes_required",
+            key: None,
+        });
+    }
+
+    Ok(declarable_keys()
+        .into_iter()
+        .filter(|key| supplied.contains(key))
+        .collect())
+}
 
 /// Who took responsibility for the declaration carried on a queued draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

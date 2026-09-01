@@ -9,7 +9,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use envelope_email_store::DraftStatus;
 use envelope_email_store::models::Account;
-use envelope_email_store::{Database, StoreError};
+use envelope_email_store::{ContextCorrection, Database, StoreError};
+use envelope_email_transport::attribution::{AttributionState, resolve};
+use envelope_email_transport::attribution_persist::{
+    PersistedDeclaration, ScheduledOrigin, normalize_context_correction_attrs, scheduled_origin,
+};
+use envelope_email_transport::attribution_provenance::{Provenance, provenance_of};
+use envelope_email_transport::governor_catalog::{
+    ATTRIBUTION_PROTOCOL, CATALOG_NAME, catalog_attributes, catalog_version,
+};
 use envelope_email_transport::outbound::{
     OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE, resolve_cooldown_seconds,
 };
@@ -98,6 +106,308 @@ pub struct DraftSendRequest {
     /// only thing skipped is the waiting.
     #[serde(default)]
     pub send_now: bool,
+}
+
+/// Replacement factual declaration submitted only by the authenticated
+/// dashboard context-refinement modal. Unknown fields are refused so this can
+/// never grow an approval, send, diagnostic, or free-text side channel.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRefinementRetryRequest {
+    pub expected_revision: i64,
+    #[serde(default)]
+    pub declarable_attributes: Vec<String>,
+    #[serde(default)]
+    pub confirm_factual_accuracy: bool,
+}
+
+fn prior_context_refusal_code(draft: &envelope_email_store::Draft) -> Option<String> {
+    let stored = draft
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("send_block"))
+        .and_then(|block| block.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            matches!(
+                *code,
+                "attributes_required" | "attributes_invalid" | "governor_blocked"
+            )
+        });
+    if let Some(code) = stored {
+        return Some(code.to_string());
+    }
+    let exhausted = draft
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("attribution"))
+        .and_then(|attribution| attribution.get("park_reason"))
+        .and_then(serde_json::Value::as_str)
+        == Some("attribution_exhausted");
+    exhausted.then(|| "attributes_required".to_string())
+}
+
+fn context_refinement_eligible(draft: &envelope_email_store::Draft) -> bool {
+    if !matches!(
+        draft.status,
+        DraftStatus::PendingReview | DraftStatus::Blocked
+    ) || crate::dashboard_human_send_authorized(draft)
+        || prior_context_refusal_code(draft).is_none()
+    {
+        return false;
+    }
+    let persisted = PersistedDeclaration::from_metadata(draft.metadata.as_ref());
+    scheduled_origin(
+        draft.created_by.as_deref(),
+        persisted.as_ref(),
+        draft.revision,
+    ) == ScheduledOrigin::Bot
+}
+
+fn context_refinement_explanation(code: Option<&str>, eligible: bool) -> &'static str {
+    if !eligible {
+        return "Context refinement is unavailable for this draft state.";
+    }
+    match code {
+        Some("attributes_required") => {
+            "Envelope paused this governed send because its factual context was missing or incomplete. Confirm only facts that are true of this exact draft; retry runs the normal Governor path again."
+        }
+        Some("attributes_invalid") => {
+            "Envelope paused this governed send because its factual context could not be verified. Replace it with only facts that are true of this exact draft; retry runs the normal Governor path again."
+        }
+        _ => {
+            "Envelope paused this governed send for review. Correct only factual context that is true of this exact draft; retry runs the normal Governor path again."
+        }
+    }
+}
+
+/// Purpose-built, content-free projection for the dashboard modal. It returns
+/// public catalog descriptions and provenance plus tri-state host observation;
+/// it never serializes the draft, its message fields, attachment metadata, or
+/// Governor diagnostics.
+pub async fn context_refinement(
+    State(state): State<AppState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    let draft = match ensure_draft_account(&db, &account_id, &draft_id) {
+        Ok(draft) => draft,
+        Err(error) => return draft_error(error),
+    };
+    let account = match db.get_account(&draft.account_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return draft_error(StoreError::AccountNotFound(draft.account_id.clone()));
+        }
+        Err(error) => return draft_error(error),
+    };
+    let eligible = context_refinement_eligible(&draft);
+    let prior_code = prior_context_refusal_code(&draft);
+    let attachments = crate::draft_attachment_stubs(&draft);
+    let context = crate::scheduled_send_context(
+        &db,
+        &draft,
+        crate::account_domain_from_username(&account.username),
+        &attachments,
+    );
+    let existing = match db.current_context_correction(&draft.account_id, &draft.id, draft.revision)
+    {
+        Ok(correction) => correction,
+        Err(error) => return draft_error(error),
+    };
+    let persisted = PersistedDeclaration::from_metadata(draft.metadata.as_ref());
+    let selected: Vec<String> = existing
+        .map(|correction| correction.declarable_attributes)
+        .unwrap_or_else(|| {
+            persisted
+                .filter(|declaration| declaration.is_current(draft.revision))
+                .map(|declaration| {
+                    declaration
+                        .declared_attrs
+                        .into_iter()
+                        .filter(|key| provenance_of(key) == Some(Provenance::Declarable))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
+    let attributes: Vec<serde_json::Value> = catalog_attributes()
+        .iter()
+        .map(|attribute| {
+            let provenance = provenance_of(&attribute.key).unwrap_or(Provenance::HostDerived);
+            let (state, selectable, read_only, explanation) = match provenance {
+                Provenance::Declarable => (
+                    if selected.contains(&attribute.key) {
+                        "selected"
+                    } else {
+                        "not_selected"
+                    },
+                    true,
+                    false,
+                    None,
+                ),
+                Provenance::HostDerived => (
+                    match context.observe_host_key(&attribute.key) {
+                        Some(true) => "observed",
+                        Some(false) => "not_observed",
+                        None => "unavailable",
+                    },
+                    false,
+                    true,
+                    None,
+                ),
+                Provenance::RequiresAttestation => (
+                    "unavailable",
+                    false,
+                    true,
+                    Some("Authority facts cannot be asserted in this modal."),
+                ),
+            };
+            json!({
+                "key": attribute.key,
+                "category": attribute.category,
+                "description": attribute.description,
+                "provenance": provenance.as_str(),
+                "state": state,
+                "selectable": selectable,
+                "read_only": read_only,
+                "explanation": explanation,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "eligible": eligible,
+        "revision": draft.revision,
+        "action": "send",
+        "protocol": ATTRIBUTION_PROTOCOL,
+        "catalog": CATALOG_NAME,
+        "catalog_version": catalog_version(),
+        "reason_code": prior_code,
+        "explanation": context_refinement_explanation(prior_code.as_deref(), eligible),
+        "attributes": attributes,
+    }))
+    .into_response()
+}
+
+fn invalid_context_refinement(message: &'static str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": message,
+            "code": "context_refinement_invalid",
+        })),
+    )
+        .into_response()
+}
+
+/// Record a dashboard factual correction and queue the exact revision for the
+/// ordinary scheduled Governor sweep. This handler never invokes SMTP, creates
+/// approval, grants Human-only Send authority, or interprets a future outcome.
+pub async fn retry_with_context_refinement(
+    State(state): State<AppState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+    Json(req): Json<ContextRefinementRetryRequest>,
+) -> impl IntoResponse {
+    if !req.confirm_factual_accuracy {
+        return invalid_context_refinement("Confirm that the selected facts are accurate.");
+    }
+    let declared = match normalize_context_correction_attrs(&req.declarable_attributes) {
+        Ok(declared) => declared,
+        Err(_) => {
+            return invalid_context_refinement(
+                "Select only public factual attributes available in this modal.",
+            );
+        }
+    };
+
+    let db = state.db.lock().await;
+    let draft = match ensure_draft_account(&db, &account_id, &draft_id) {
+        Ok(draft) => draft,
+        Err(error) => return draft_error(error),
+    };
+    if draft.revision != req.expected_revision {
+        return draft_error(StoreError::DraftModifiedConcurrently(draft.id));
+    }
+    if !context_refinement_eligible(&draft) {
+        return (
+            StatusCode::CONFLICT,
+            "draft is not eligible for context refinement",
+        )
+            .into_response();
+    }
+    let account = match db.get_account(&draft.account_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return draft_error(StoreError::AccountNotFound(draft.account_id.clone()));
+        }
+        Err(error) => return draft_error(error),
+    };
+    let attachments = crate::draft_attachment_stubs(&draft);
+    let context = crate::scheduled_send_context(
+        &db,
+        &draft,
+        crate::account_domain_from_username(&account.username),
+        &attachments,
+    );
+    let resolution = resolve(&declared, &context, true);
+    if resolution.state != AttributionState::Attributed {
+        return invalid_context_refinement(
+            "The selected factual attributes could not be validated for this retry.",
+        );
+    }
+
+    let recorded_at = crate::timefmt::utc_now_string();
+    let correction = match ContextCorrection::dashboard_send(
+        &draft.account_id,
+        &draft.id,
+        draft.revision,
+        ATTRIBUTION_PROTOCOL,
+        CATALOG_NAME,
+        catalog_version(),
+        &recorded_at,
+        &declared,
+        prior_context_refusal_code(&draft).as_deref(),
+    ) {
+        Ok(correction) => correction,
+        Err(error) => return draft_error(error),
+    };
+    // Persist exactly the normalized replacement set carried by the correction
+    // record. The store verifies byte-for-byte equality before it can queue.
+    let declaration =
+        PersistedDeclaration::new_bot(&correction.declarable_attributes, draft.revision);
+    let cooldown = resolve_cooldown_seconds(None);
+    let send_after = (chrono::Utc::now() + chrono::Duration::seconds(cooldown))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let queued = match db.queue_draft_with_context_correction(
+        &draft.account_id,
+        &draft.id,
+        req.expected_revision,
+        &send_after,
+        &declaration.to_value(),
+        &correction,
+    ) {
+        Ok(queued) => queued,
+        Err(error) => return draft_error(error),
+    };
+    state
+        .events
+        .publish(crate::events::DashboardEvent::DraftQueued {
+            account_id: queued.account_id.clone(),
+            draft_id: queued.id.clone(),
+            origin: "context_refinement",
+        });
+    drop(db);
+
+    Json(json!({
+        "draft_id": queued.id,
+        "revision": queued.revision,
+        "status": "governed_retry_queued",
+        "send_after": send_after,
+        "message": "Corrected context recorded. Governed retry queued.",
+    }))
+    .into_response()
 }
 
 /// Serialize a draft for the JSON API with attachment bytes stripped.
@@ -498,7 +808,8 @@ pub async fn send(
                 }
                 Err(e) => return draft_error(e),
             };
-            let attribution = crate::human_queue_attribution_block(&attested, &account.username);
+            let attribution =
+                crate::human_queue_attribution_block(&db, &attested, &account.username);
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftQueued {
@@ -569,6 +880,14 @@ pub(crate) fn draft_error(e: envelope_email_store::StoreError) -> axum::response
         envelope_email_store::StoreError::DraftNotScheduled(_) => {
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
+        envelope_email_store::StoreError::InvalidContextCorrection(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Context refinement was invalid.",
+                "code": "context_refinement_invalid",
+            })),
+        )
+            .into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
     }
 }
@@ -777,7 +1096,7 @@ mod tests {
 
         // The attribution block built from that row carries the real attachment
         // fact (derived from the persisted snapshot), agreeing with the sweep.
-        let block = crate::human_queue_attribution_block(&attested, "agent@example.com");
+        let block = crate::human_queue_attribution_block(&db, &attested, "agent@example.com");
         let derived: Vec<&str> = block["derived_attrs"]
             .as_array()
             .unwrap()

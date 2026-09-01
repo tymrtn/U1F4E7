@@ -24,6 +24,7 @@ pub mod migrations;
 pub mod models;
 pub mod ops_primitives;
 pub mod paths;
+pub mod relationship_facts;
 pub mod rule_store;
 pub mod sent_relationships;
 pub mod snoozed;
@@ -39,11 +40,15 @@ pub use agent_identity::{
 pub use build_info::{BuildInfo, VERSION};
 pub use credential_store::CredentialBackend;
 pub use db::Database;
-pub use drafts::SyncClaim;
+pub use drafts::{
+    CONTEXT_CORRECTION_CONTRACT, CONTEXT_REFINED_EVENT, CONTEXT_REFINEMENT_INVALIDATED_EVENT,
+    ContextCorrection, SyncClaim,
+};
 pub use errors::StoreError;
 pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use models::*;
 pub use ops_primitives::{RuleRunAuditInput, WatchUpsert};
 pub use paths::{app_data_dir, config_root_dir, credential_file_path, database_path};
+pub use relationship_facts::{RELATIONSHIP_FACT_RECIPIENT_LIMIT, RelationshipFacts};
 pub use sent_relationships::{SentRelationship, SentRelationshipPage, SentRelationshipSignal};
 pub use threads::ThreadContext;

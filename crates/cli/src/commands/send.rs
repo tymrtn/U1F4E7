@@ -194,6 +194,7 @@ pub async fn run(
     let declared: Vec<String> = attr.to_vec();
     let precheck_attachments = attachment_metadata(attach_paths);
     let precheck_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         subject,
@@ -430,6 +431,7 @@ pub async fn run(
 
     // ── Governor gate (fail-closed before any real SMTP) ──
     let gov_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         subject,

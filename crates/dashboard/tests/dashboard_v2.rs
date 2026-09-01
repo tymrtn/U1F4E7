@@ -65,6 +65,7 @@ fn committed_v2_bundle_ships_the_send_and_approve_copy() {
     let mut scanned = 0usize;
     let mut send_label = false;
     let mut approve_is_not_a_send = false;
+    let mut refinement_label = false;
     let mut stack = vec![build_dir.clone()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("built SPA asset directory") {
@@ -78,6 +79,7 @@ fn committed_v2_bundle_ships_the_send_and_approve_copy() {
                 };
                 send_label |= js.contains("Human-only Send");
                 approve_is_not_a_send |= js.contains("does not send the draft");
+                refinement_label |= js.contains("Retry with corrected context");
             }
         }
     }
@@ -95,6 +97,10 @@ fn committed_v2_bundle_ships_the_send_and_approve_copy() {
     assert!(
         approve_is_not_a_send,
         "committed bundle is missing the approval queue's non-send copy — {stale}"
+    );
+    assert!(
+        refinement_label,
+        "committed bundle is missing the context-refinement retry label — {stale}"
     );
 }
 

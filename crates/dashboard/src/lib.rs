@@ -454,6 +454,14 @@ pub fn dashboard_router(state: AppState) -> Router {
             "/accounts/{id}/drafts/{draft_id}/send",
             post(handlers::drafts::send),
         )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/context-refinement",
+            get(handlers::drafts::context_refinement),
+        )
+        .route(
+            "/accounts/{id}/drafts/{draft_id}/context-refinement/retry",
+            post(handlers::drafts::retry_with_context_refinement),
+        )
         // Draft attachments. The bytes live in the draft row, so download
         // reads the stored snapshot rather than IMAP — an unsent draft's
         // files exist nowhere else. Upload/remove are revision-guarded edits.
@@ -1540,13 +1548,15 @@ fn should_pause_for_review(outcome: &envelope_email_transport::outbound::Governo
 /// surfaces such as the dashboard approve/send actions) and declares the
 /// `tyler_approved` attribute to Governor's blind scoring. It is an input
 /// attribute, never a bypass: the fail-closed gate still runs in full.
-fn scheduled_send_context(
+pub(crate) fn scheduled_send_context(
+    db: &Database,
     draft: &envelope_email_store::Draft,
     account_domain: Option<String>,
     attachments: &[envelope_email_transport::smtp::Attachment],
 ) -> envelope_email_transport::attribution::AttributedSendContext {
     use envelope_email_transport::attribution::{
         AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
+        is_calendar_invitation_content_type,
     };
     let summary = collect_recipient_domains(
         &draft.to_addr,
@@ -1556,14 +1566,41 @@ fn scheduled_send_context(
     let sensitive_attachment = attachments
         .iter()
         .any(|a| classify_sensitive_attachment(&a.filename, &a.content_type));
+    // Calendar invitation is a MIME-only structural fact. Do not infer it from
+    // filenames, bodies, or subjects: an attachment is eligible only when its
+    // declared content type is text/calendar.
+    let calendar_invitation = attachments
+        .iter()
+        .any(|a| is_calendar_invitation_content_type(&a.content_type));
+    // The shared store helper is bounded and local-only. A DB failure or
+    // exhausted scan returns no relationship claim rather than inventing a new
+    // contact/domain fact for a future scheduled transmission.
+    let relationship = db
+        .derive_outbound_relationship_facts(
+            &draft.account_id,
+            &draft.to_addr,
+            draft.cc_addr.as_deref(),
+            draft.bcc_addr.as_deref(),
+        )
+        .unwrap_or_default();
+    let is_reply = draft.in_reply_to.is_some() || scheduled_threading(draft).0.is_some();
     AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
         recipient_count: summary.count,
-        is_reply: draft.in_reply_to.is_some() || scheduled_threading(draft).0.is_some(),
+        is_reply,
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        calendar_invitation,
+        known_contact: relationship.known_contact,
+        frequent_contact: relationship.frequent_contact,
+        cold_email: if is_reply {
+            Some(false)
+        } else {
+            relationship.cold_email
+        },
+        unknown_domain: relationship.unknown_domain,
         human_approved: draft.human_approved(),
         // Derive `short_body` from the FINAL persisted bodies being transmitted
         // via the one canonical policy, so the sweep corroborates a bot's
@@ -1596,6 +1633,7 @@ fn scheduled_send_context(
 /// queue's advertised block agrees with the sweep's derivation rather than
 /// omitting those facts.
 pub(crate) fn human_queue_attribution_block(
+    db: &Database,
     draft: &envelope_email_store::Draft,
     account_username: &str,
 ) -> serde_json::Value {
@@ -1618,7 +1656,7 @@ pub(crate) fn human_queue_attribution_block(
     let require = require && !dashboard_human_send_authorized(draft);
     let account_domain = account_domain_from_username(account_username);
     let attachments = draft_attachment_stubs(draft);
-    let ctx = scheduled_send_context(draft, account_domain, &attachments);
+    let ctx = scheduled_send_context(db, draft, account_domain, &attachments);
     let resolution = resolve(&declared, &ctx, require);
     success_attribution_block(&resolution, None, None, true)
 }
@@ -1638,7 +1676,7 @@ pub(crate) fn account_domain_from_username(username: &str) -> Option<String> {
 /// persisted snapshots, for deriving the `has_attachment`/`sensitive_attachment`
 /// host facts without rehydrating the snapshotted bytes. Uses the same snapshot
 /// fields the sweep decodes, so the derived attribute set is identical.
-fn draft_attachment_stubs(
+pub(crate) fn draft_attachment_stubs(
     draft: &envelope_email_store::Draft,
 ) -> Vec<envelope_email_transport::smtp::Attachment> {
     draft
@@ -1779,7 +1817,10 @@ async fn run_governor_gate(
     // before SMTP, and resolve it against the durable bot declaration. This is
     // the authoritative gate: recipients, attachments, and threading are read
     // from what will actually be transmitted.
-    let ctx = scheduled_send_context(draft, account_domain, attachments);
+    let ctx = {
+        let db = state.db.lock().await;
+        scheduled_send_context(&db, draft, account_domain, attachments)
+    };
     let req = GovernorRequest::from_context_with_declared(
         &draft.account_id,
         subject,
@@ -2347,7 +2388,13 @@ mod tests {
             persisted.as_ref(),
             draft.revision,
         );
-        let ctx = scheduled_send_context(draft, Some("example.com".to_string()), &[]);
+        let relationship_db = Database::open_memory().unwrap();
+        let ctx = scheduled_send_context(
+            &relationship_db,
+            draft,
+            Some("example.com".to_string()),
+            &[],
+        );
         let req = GovernorRequest::from_context_with_declared(
             &draft.account_id,
             draft.subject.as_deref().unwrap_or(""),
@@ -3269,7 +3316,7 @@ mod tests {
 
         // The account domain is derived from the username, exactly as the sweep
         // does (`agent@example.com` → `example.com`).
-        let block = human_queue_attribution_block(&attested, "agent@example.com");
+        let block = human_queue_attribution_block(&db, &attested, "agent@example.com");
         assert_eq!(block["attribution_state"], "attributed");
         assert!(
             block["declared_attrs"].as_array().unwrap().is_empty(),
@@ -3301,7 +3348,8 @@ mod tests {
         let draft = seed_gate_draft(&state, "agent").await;
         let queued = dashboard_human_send(&state, &draft.id).await;
 
-        let block = human_queue_attribution_block(&queued, "agent@example.com");
+        let db = state.db.lock().await;
+        let block = human_queue_attribution_block(&db, &queued, "agent@example.com");
         assert_eq!(
             block["attribution_state"], "attributed",
             "the sweep will send this; the block must not claim otherwise: {block}"
@@ -3358,7 +3406,7 @@ mod tests {
             .unwrap();
         let attested = db.get_draft(&draft.id).unwrap().unwrap();
 
-        let block = human_queue_attribution_block(&attested, "agent@example.com");
+        let block = human_queue_attribution_block(&db, &attested, "agent@example.com");
         let derived: Vec<&str> = block["derived_attrs"]
             .as_array()
             .unwrap()
@@ -3604,7 +3652,7 @@ mod tests {
         }];
 
         // The authoritative gate re-derives from what will actually be sent.
-        let ctx = scheduled_send_context(&draft, Some("martin.fm".to_string()), &attachments);
+        let ctx = scheduled_send_context(&db, &draft, Some("martin.fm".to_string()), &attachments);
         let attrs = ctx.to_governor_attrs();
 
         assert!(attrs.contains(&"reply_to_thread"), "{attrs:?}");
@@ -3613,6 +3661,54 @@ mod tests {
         assert!(attrs.contains(&"sensitive_attachment"), "{attrs:?}");
         // External recipient — never internal.
         assert!(!attrs.contains(&"internal_domain"), "{attrs:?}");
+    }
+
+    #[test]
+    fn scheduled_context_uses_shared_relationship_history_derivation() {
+        let db = sweep_test_db();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "known@example.net",
+                Some("Scheduled note"),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let thread = db
+            .create_thread(
+                "prior correspondence",
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+                "acc1",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            1,
+            Some("prior@example.test"),
+            None,
+            None,
+            "Sent",
+            "agent@example.com",
+            "known@example.net",
+            None,
+            None,
+            "2026-09-01T00:00:00Z",
+            "prior correspondence",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let attrs = scheduled_send_context(&db, &draft, Some("example.com".to_string()), &[])
+            .to_governor_attrs();
+        assert!(attrs.contains(&"known_contact"), "{attrs:?}");
+        assert!(!attrs.contains(&"cold_email"), "{attrs:?}");
     }
 
     #[test]
@@ -3648,7 +3744,7 @@ mod tests {
                     Some("agent"),
                 )
                 .unwrap();
-            scheduled_send_context(&draft, Some("martin.fm".to_string()), &[]).short_body
+            scheduled_send_context(&db, &draft, Some("martin.fm".to_string()), &[]).short_body
         };
 
         assert_eq!(
@@ -3736,7 +3832,7 @@ mod tests {
         .unwrap();
 
         let unapproved = db.get_draft(&draft.id).unwrap().unwrap();
-        let attrs = scheduled_send_context(&unapproved, Some("example.com".to_string()), &[])
+        let attrs = scheduled_send_context(&db, &unapproved, Some("example.com".to_string()), &[])
             .to_governor_attrs();
         assert!(
             !attrs.contains(&"tyler_approved"),
@@ -3755,7 +3851,7 @@ mod tests {
         )
         .unwrap();
         let approved = db.get_draft(&draft.id).unwrap().unwrap();
-        let attrs = scheduled_send_context(&approved, Some("example.com".to_string()), &[])
+        let attrs = scheduled_send_context(&db, &approved, Some("example.com".to_string()), &[])
             .to_governor_attrs();
         assert!(attrs.contains(&"tyler_approved"), "{attrs:?}");
         // Threading survived the attestation merge and still attributes.
@@ -3775,7 +3871,7 @@ mod tests {
         )
         .unwrap();
         let edited = db.get_draft(&draft.id).unwrap().unwrap();
-        let attrs = scheduled_send_context(&edited, Some("example.com".to_string()), &[])
+        let attrs = scheduled_send_context(&db, &edited, Some("example.com".to_string()), &[])
             .to_governor_attrs();
         assert!(
             !attrs.contains(&"tyler_approved"),

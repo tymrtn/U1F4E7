@@ -15,6 +15,7 @@
 use envelope_email_store::{Database, Event};
 use envelope_email_transport::attribution::{
     AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
+    is_calendar_invitation_content_type,
 };
 use envelope_email_transport::outbound::{
     GovernorConfig, GovernorMode, GovernorOutcome, GovernorRequest, SendSurface,
@@ -28,12 +29,14 @@ use envelope_email_transport::smtp::Attachment;
 /// This is the single place the CLI and MCP send surfaces derive their
 /// blind-attribution keys, so they converge on identical semantics: thread /
 /// domain / recipient shape from the headers, attachment sensitivity classified
-/// from filenames (class only), plus the bot's own declarations. Store
-/// relationship facts and content classifiers are left unknown (omitted) until
-/// they are wired; they are never fabricated. Bot-originated surfaces (CLI/MCP)
-/// require at least one factual declaration — host facts never substitute.
+/// from filenames (class only), bounded relationship facts from the local store,
+/// plus the bot's own declarations. Classifier facts without a real classifier
+/// remain unknown (omitted); they are never fabricated. Bot-originated surfaces
+/// (CLI/MCP) require at least one factual declaration — host facts never
+/// substitute.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn governor_request(
+    db: &Database,
     account_id: &str,
     account_domain: Option<String>,
     subject: &str,
@@ -52,6 +55,18 @@ pub(crate) fn governor_request(
     let sensitive_attachment = attachments
         .iter()
         .any(|a| classify_sensitive_attachment(&a.filename, &a.content_type));
+    // Calendar invitation is a MIME-only structural fact. Do not infer it from
+    // filenames, bodies, or subjects: an attachment is eligible only when its
+    // declared content type is text/calendar.
+    let calendar_invitation = attachments
+        .iter()
+        .any(|a| is_calendar_invitation_content_type(&a.content_type));
+    // Store errors and bounded/exhausted lookups deliberately produce no facts:
+    // absence is never treated as a first-contact claim without authoritative
+    // local evidence.
+    let relationship = db
+        .derive_outbound_relationship_facts(account_id, to, cc, bcc)
+        .unwrap_or_default();
     let ctx = AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
@@ -60,6 +75,17 @@ pub(crate) fn governor_request(
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
+        calendar_invitation,
+        known_contact: relationship.known_contact,
+        frequent_contact: relationship.frequent_contact,
+        // A reply has a definitive structural relationship and cannot be a first
+        // contact, regardless of a bounded cache lookup.
+        cold_email: if is_reply {
+            Some(false)
+        } else {
+            relationship.cold_email
+        },
+        unknown_domain: relationship.unknown_domain,
         // Derive `short_body` from the FINAL bodies actually being sent via the
         // one canonical policy, so a bot's `short_body` declaration is
         // corroborated (not rejected host_verification_unavailable) for every
@@ -97,6 +123,7 @@ pub(crate) fn governor_request(
 /// facts (recipient domain, the empty-body `short_body`) never substitute for the
 /// declaration; an empty/invalid `--attr` set fails closed before Governor/SMTP.
 pub(crate) fn unsubscribe_request(
+    db: &Database,
     account_id: &str,
     account_domain: Option<String>,
     mailto_addr: &str,
@@ -106,11 +133,18 @@ pub(crate) fn unsubscribe_request(
         .rsplit_once('@')
         .map(|(_, d)| d.trim().to_ascii_lowercase())
         .filter(|d| !d.is_empty());
+    let relationship = db
+        .derive_outbound_relationship_facts(account_id, mailto_addr, None, None)
+        .unwrap_or_default();
     let ctx = AttributedSendContext {
         account_domain,
         recipient_domains: domain.into_iter().collect(),
         recipient_count: 1,
         short_body: Some(true),
+        known_contact: relationship.known_contact,
+        frequent_contact: relationship.frequent_contact,
+        cold_email: relationship.cold_email,
+        unknown_domain: relationship.unknown_domain,
         ..Default::default()
     };
     GovernorRequest::from_context_with_declared(
@@ -268,6 +302,7 @@ mod tests {
         // governor_unavailable). Host facts (short_body, recipient domain) never
         // substitute.
         let req = unsubscribe_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "list@vendor.example",
@@ -287,6 +322,7 @@ mod tests {
         // attributed and actually spawns Governor — a missing binary is then an
         // operator-side governor_unavailable, NOT an attribution failure.
         let req = unsubscribe_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "list@vendor.example",
@@ -305,6 +341,7 @@ mod tests {
         // the send boundary failed to observe the body (real evidence case C).
         let short = "just a handful of words in this short body";
         let req = governor_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "subject",
@@ -330,12 +367,81 @@ mod tests {
     }
 
     #[test]
+    fn direct_governor_request_derives_known_contact_from_shared_store_history() {
+        let db = Database::open_memory().unwrap();
+        let thread = db
+            .create_thread(
+                "prior correspondence",
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+                "acc1",
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            1,
+            Some("prior@example.test"),
+            None,
+            None,
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            None,
+            None,
+            "2026-09-01T00:00:00Z",
+            "prior correspondence",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let req = governor_request(
+            &db,
+            "acc1",
+            Some("example.test".into()),
+            "subject",
+            "known@example.net",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            Some("short body"),
+            None,
+            &["known_contact".to_string()],
+        );
+        let resolution = req.resolution.unwrap();
+        assert!(
+            resolution.is_attributed(),
+            "{:?}",
+            resolution.rejected_attrs
+        );
+        assert!(
+            resolution
+                .accepted_redundant
+                .contains(&"known_contact".to_string())
+        );
+        assert!(
+            resolution
+                .governor_attrs
+                .contains(&"known_contact".to_string())
+        );
+        assert!(
+            !resolution
+                .governor_attrs
+                .contains(&"cold_email".to_string())
+        );
+    }
+
+    #[test]
     fn governor_request_derives_short_body_from_html_only_body() {
         // Real evidence: an HTML-only send left `short_body` unobserved because
         // the boundary inspected only the text alternative. The canonical policy
         // now counts the HTML's visible text, so a truthful `short_body`
         // declaration on an HTML-only message is corroborated.
         let req = governor_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "subject",
@@ -365,6 +471,7 @@ mod tests {
         // long body contradicts Envelope's observation and fails the request.
         let long = vec!["word"; 150].join(" ");
         let req = governor_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "subject",
@@ -396,6 +503,7 @@ mod tests {
         // generic CLI process is accepted, never rejected
         // host_verification_unavailable (real evidence case C).
         let req = governor_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "subject",
@@ -420,6 +528,7 @@ mod tests {
     fn unsubscribe_request_rejects_invalid_declaration() {
         // An attestation-only key can never be declared here either.
         let req = unsubscribe_request(
+            &Database::open_memory().unwrap(),
             "acc1",
             Some("example.com".into()),
             "list@vendor.example",

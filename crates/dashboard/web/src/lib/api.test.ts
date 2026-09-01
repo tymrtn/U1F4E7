@@ -207,6 +207,69 @@ describe('api.draftByImapUid()', () => {
   });
 });
 
+describe('dashboard context refinement API', () => {
+  it('GETs the account-scoped, draft-scoped content-free projection', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        eligible: true,
+        revision: 9,
+        action: 'send',
+        protocol: 'envelope.attribution.v1',
+        catalog: 'envelope',
+        catalog_version: 1,
+        reason_code: 'attributes_required',
+        explanation: 'Review factual context.',
+        attributes: []
+      })
+    );
+
+    const result = await api.contextRefinement('acct a', 'draft/b', { fetchImpl });
+
+    expect(result.revision).toBe(9);
+    const [url, init] = fetchCalls(fetchImpl)[0]!;
+    expect(url).toBe('/api/accounts/acct%20a/drafts/draft%2Fb/context-refinement');
+    expect((init?.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('POSTs only the revision-bound replacement and factual confirmation with CSRF', async () => {
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url).includes('/api/csrf')) return jsonResponse({ token: 'context-token' });
+      return jsonResponse({
+        draft_id: 'draft-b',
+        revision: 9,
+        status: 'governed_retry_queued',
+        send_after: '2026-09-01T12:01:00Z',
+        message: 'Corrected context recorded. Governed retry queued.'
+      });
+    });
+
+    await api.retryContextRefinement(
+      'acct-a',
+      'draft-b',
+      {
+        expected_revision: 9,
+        declarable_attributes: ['informational'],
+        confirm_factual_accuracy: true
+      },
+      { fetchImpl }
+    );
+
+    const call = fetchCalls(fetchImpl).find(([url]) =>
+      String(url).includes('/context-refinement/retry')
+    );
+    expect(call).toBeTruthy();
+    const [url, init] = call!;
+    expect(url).toBe('/api/accounts/acct-a/drafts/draft-b/context-refinement/retry');
+    expect(init?.method).toBe('POST');
+    expect(init?.headers).toMatchObject({ 'X-Envelope-CSRF': 'context-token' });
+    expect(JSON.parse(String(init?.body))).toEqual({
+      expected_revision: 9,
+      declarable_attributes: ['informational'],
+      confirm_factual_accuracy: true
+    });
+  });
+});
+
 describe('api.snoozeMessage()', () => {
   it('POSTs /messages/{uid}/snooze with folder + return_at body', async () => {
     const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {

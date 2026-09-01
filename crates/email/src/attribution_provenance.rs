@@ -50,6 +50,8 @@ impl Provenance {
 /// agent-drafted). See [`crate::attribution::AttributedSendContext`].
 pub const DECLARABLE: &[&str] = &[
     "informational",
+    "scheduling",
+    "low_stakes",
     "financial_content",
     "legal_content",
     "commitment_language",
@@ -76,6 +78,7 @@ pub const HOST_DERIVED: &[&str] = &[
     "human_edited",
     "short_body",
     "has_attachment",
+    "calendar_invitation",
     "sensitive_attachment",
     "internal_domain",
     "trusted_domain",
@@ -85,6 +88,7 @@ pub const HOST_DERIVED: &[&str] = &[
     "gov_domain",
     "bulk_send",
     "has_bcc",
+    "single_recipient",
 ];
 
 /// Mutually-exclusive attribute pairs. If both are present in the resolved

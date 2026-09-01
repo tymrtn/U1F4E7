@@ -63,6 +63,9 @@ pub struct AttributedSendContext {
     pub attachment_count: usize,
     /// At least one attachment classifies as contract/NDA/financial (class only).
     pub sensitive_attachment: bool,
+    /// At least one attachment has MIME media type `text/calendar`. This is a
+    /// non-sensitive structural fact; no attachment name or body is retained.
+    pub calendar_invitation: bool,
     /// Configured trusted-domain allowlist (lowercased).
     pub trusted_domains: Vec<String>,
     /// The action only saves a draft; nothing is transmitted.
@@ -151,6 +154,9 @@ impl AttributedSendContext {
         if self.attachment_count > 0 {
             attrs.push("has_attachment");
         }
+        if self.calendar_invitation {
+            attrs.push("calendar_invitation");
+        }
         if self.sensitive_attachment {
             attrs.push("sensitive_attachment");
         }
@@ -163,6 +169,9 @@ impl AttributedSendContext {
         push_if(&mut attrs, "commitment_language", self.commitment_language);
 
         // ── Recipient ───────────────────────────────────────────────────
+        if self.recipient_count == 1 {
+            attrs.push("single_recipient");
+        }
         if self.recipient_count >= 6 {
             attrs.push("bulk_send");
         }
@@ -220,9 +229,11 @@ impl AttributedSendContext {
             // Authoritative structural facts, always observable at send time.
             "reply_to_thread" => Some(self.is_reply),
             "has_attachment" => Some(self.attachment_count > 0),
+            "calendar_invitation" => Some(self.calendar_invitation),
             "sensitive_attachment" => Some(self.sensitive_attachment),
             "has_bcc" => Some(self.has_bcc),
             "bulk_send" => Some(self.recipient_count >= 6),
+            "single_recipient" => Some(self.recipient_count == 1),
             "draft_only" => Some(self.draft_only),
             // An actual send is never a read-only / folder / delete op.
             "read_only" | "move_to_folder" | "delete_message" => Some(false),
@@ -888,6 +899,7 @@ fn contradiction_detail(key: &str) -> String {
         "has_attachment" => "the message has no attachments".into(),
         "has_bcc" => "the message has no BCC recipients".into(),
         "bulk_send" => "the message has fewer than 6 recipients".into(),
+        "single_recipient" => "the message does not have exactly one recipient".into(),
         "internal_domain" => "not every recipient is on the sender's domain".into(),
         "freemail_domain" => "no recipient is on a freemail domain".into(),
         "disposable_domain" => "no recipient is on a disposable-email domain".into(),
@@ -923,6 +935,15 @@ const SHORT_BODY_MAX_WORDS: usize = 100;
 /// empty body is trivially short.
 pub fn is_short_body(body: &str) -> bool {
     body.split_whitespace().count() < SHORT_BODY_MAX_WORDS
+}
+
+/// True only for a `text/calendar` MIME media type. Parameters and case are
+/// ignored; attachment names and payloads are deliberately never inspected.
+pub fn is_calendar_invitation_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/calendar"))
 }
 
 /// Canonical final-body policy for the `short_body` Governor attribute.

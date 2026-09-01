@@ -33,6 +33,7 @@
   import Button from './Button.svelte';
   import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
+  import GovernorContextRefinementModal from './GovernorContextRefinementModal.svelte';
   import Modal from './Modal.svelte';
   import MonoTag from './MonoTag.svelte';
   import RecipientField from './RecipientField.svelte';
@@ -44,6 +45,7 @@
     isSendableDraftStatus,
     type Draft,
     type DraftEditBody,
+    type ContextRefinementRetryResponse,
     type DraftQueuedResponse,
     type DraftStatus,
     type EnvelopeApiError
@@ -165,6 +167,8 @@
   let queueing = $state(false);
   let holding = $state(false);
   let confirmOpen = $state(false);
+  let refinementOpen = $state(false);
+  let refinementResult = $state<ContextRefinementRetryResponse | null>(null);
   let queued = $state<DraftQueuedResponse | null>(null);
   let conflict = $state(false);
   let actionError = $state<{ code: string; message: string; reload?: boolean } | null>(null);
@@ -237,8 +241,6 @@
     title: string;
     explanation: string;
     action?: string;
-    /** Where the agent-path block can also be cleared, when the CLI carries it. */
-    remedy?: string;
   };
   function asSendBlock(value: unknown): SendBlock | null {
     if (!value || typeof value !== 'object') return null;
@@ -272,11 +274,9 @@
       const record = attribution as Record<string, unknown>;
       const declared = Array.isArray(record.declared_attrs) ? record.declared_attrs : [];
       const attempts = typeof record.attempts === 'number' ? record.attempts : 0;
-      // Which label would pass is deliberately NOT shown — the park record
-      // carries no such field, and coaching one would turn a blind
-      // declaration into lock-picking. Human-only Send stays offered: it
-      // queues this exact revision on the operator's own authorization, so
-      // it does not re-run the exhausted agent attempt.
+      // Which label would pass is deliberately NOT shown. The dashboard can
+      // replace factual context, but it never exposes scoring or coaches an
+      // allow outcome. Human-only Send remains a separate authority path.
       const stuck = record.origin === 'bot' && declared.length === 0;
       return {
         code: 'attribution_exhausted',
@@ -284,12 +284,9 @@
         explanation: stuck
           ? `Envelope paused this message because the send is bot-attributed and carries no fact labels. ` +
             `${attempts} attempts were spent and no fact labels were declared for this revision. ` +
-            `Approving it again repeats the same governed attempt; Human-only Send transmits it on your own authorization.`
+            `Approving it again repeats the same governed attempt. You can correct factual context and retry the normal Governor path, or use Human-only Send on your own authorization.`
           : 'Envelope paused this message because it could not complete a required fact label. Nothing was transmitted.',
-        action: stuck ? undefined : 'send',
-        remedy: stuck
-          ? `Declaring is the sending agent's job, and only the CLI can carry it: envelope draft send ${draft.id} --attr <label>`
-          : undefined
+        action: 'send'
       };
     }
     if (draft.status === 'blocked') {
@@ -307,6 +304,24 @@
         'Envelope paused this message before it left. Nothing was transmitted. Envelope did not record a more specific reason on this draft.',
       action: 'send'
     };
+  });
+  const hasCurrentHumanSend = $derived.by(() => {
+    if (!draft) return false;
+    const authorization = draft.metadata?.human_send;
+    if (!authorization || typeof authorization !== 'object') return false;
+    const record = authorization as Record<string, unknown>;
+    return record.revision === draft.revision && record.queued_by === 'human:dashboard';
+  });
+  const botOrigin = $derived.by(() => {
+    if (!draft) return false;
+    const attribution = draft.metadata?.attribution;
+    if (attribution && typeof attribution === 'object') {
+      const record = attribution as Record<string, unknown>;
+      if (record.origin === 'bot' && (record.revision == null || record.revision === draft.revision)) {
+        return true;
+      }
+    }
+    return draft.created_by === 'agent' || draft.created_by === 'mcp' || draft.created_by === 'cli';
   });
   const queuedAt = $derived(queued?.send_after ?? draft?.send_after ?? null);
 
@@ -391,6 +406,14 @@
         bodyRaw !== baseline.body ||
         bodyFormat !== baseline.format)
   );
+  const canRefineContext = $derived(
+    !!sendBlock &&
+      sendBlock.action === 'send' &&
+      botOrigin &&
+      !hasCurrentHumanSend &&
+      !dirty &&
+      identityMatches
+  );
 
   /**
    * Whether the body pair itself changed. The edit endpoint treats
@@ -458,6 +481,8 @@
   function resetForRoute() {
     loadGeneration += 1;
     confirmOpen = false;
+    refinementOpen = false;
+    refinementResult = null;
     queueing = false;
     holding = false;
     saving = false;
@@ -670,6 +695,16 @@
   function requestSend() {
     if (!canSend) return;
     confirmOpen = true;
+  }
+
+  function contextRefinementSucceeded(result: ContextRefinementRetryResponse) {
+    if (!draft) return;
+    refinementResult = result;
+    draft = { ...draft, status: 'draft', send_after: result.send_after };
+    refinementOpen = false;
+    // The response acknowledges a durable requeue, not a Governor decision.
+    // Lifecycle events and this background read reconcile the later outcome.
+    void load(true);
   }
 
   /**
@@ -947,6 +982,13 @@
       </div>
     {/if}
 
+    {#if refinementResult}
+      <div class="draft-banner is-refined" id="draft-context-refined" role="status">
+        <p class="draft-banner-title">Corrected context recorded. Governed retry queued.</p>
+        <p>Envelope will run the normal Governor check before any transmission.</p>
+      </div>
+    {/if}
+
     {#if isQueued}
       <!-- One line of state, the actions beside it, the explanation available
            but not shouted. The old banner spent five sentences describing a
@@ -998,10 +1040,10 @@
         <p class="draft-banner-title">{sendBlock.title}</p>
         <p>{sendBlock.explanation}</p>
         <MonoTag>{sendBlock.code}</MonoTag>
-        {#if sendBlock.remedy}
-          <p class="draft-banner-remedy">{sendBlock.remedy}</p>
-        {/if}
         <div class="draft-banner-action">
+          {#if canRefineContext}
+            <Button variant="ghost" onclick={() => (refinementOpen = true)}>Refine context</Button>
+          {/if}
           {#if sendable}
             <Button variant="primary" disabled={!canSend} onclick={requestSend}>
               Human-only Send again
@@ -1228,6 +1270,14 @@
   {/snippet}
 </Modal>
 
+<GovernorContextRefinementModal
+  open={refinementOpen}
+  {accountId}
+  {draftId}
+  onclose={() => (refinementOpen = false)}
+  onsuccess={contextRefinementSucceeded}
+/>
+
 <style>
   .draft-review {
     flex: 1;
@@ -1348,6 +1398,10 @@
   }
   .is-stopped .draft-banner-title {
     color: var(--env-warn);
+  }
+  .is-refined {
+    border-color: var(--env-accent);
+    background: var(--env-accent-soft);
   }
 
   /* ── Outbox strip ──
@@ -1581,12 +1635,6 @@
        document. BodyFrame sizes its iframe to the rendered height, so the body
        flows and the page is the only thing that scrolls. */
     background: var(--env-surface);
-  }
-  .draft-banner-remedy {
-    margin: 0.4rem 0 0;
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    overflow-wrap: anywhere;
   }
   .draft-format-note {
     margin: 0;

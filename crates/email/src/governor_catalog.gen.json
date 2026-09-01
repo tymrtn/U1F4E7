@@ -3,37 +3,177 @@
   "catalog": "envelope",
   "catalog_version": 1,
   "source": "checked-in public projection of the Governor envelope catalog; regenerate with scripts/gen-governor-catalog.sh when the upstream catalog changes",
-  "note": "Public projection only: key, description, category. Governor's protected numeric calibration is intentionally excluded and must never be added to this file.",
+  "note": "Public projection only: key, description, category. Governor's protected numeric calibration is intentionally excluded and must never be added here.",
   "attributes": [
-    { "key": "reply_to_thread", "category": "relationship", "description": "Replying within an existing email thread (In-Reply-To set)" },
-    { "key": "known_contact", "category": "relationship", "description": "Recipient exists in address book or prior correspondence" },
-    { "key": "frequent_contact", "category": "relationship", "description": "Recipient exchanged 5+ messages in last 30 days" },
-    { "key": "cold_email", "category": "relationship", "description": "First-ever email to this recipient, no prior contact" },
-    { "key": "tyler_approved", "category": "intent", "description": "The authorizing human explicitly approved this message content" },
-    { "key": "authorized_campaign", "category": "intent", "description": "Send belongs to an outreach campaign the authorizing human explicitly pre-authorized (declared only via an operator-controlled campaign signal)" },
-    { "key": "read_only", "category": "intent", "description": "Operation is read-only (inbox list, search, read message)" },
-    { "key": "draft_only", "category": "intent", "description": "Saving as draft, not sending (reversible)" },
-    { "key": "informational", "category": "intent", "description": "Message is purely informational (status update, FYI)" },
-    { "key": "move_to_folder", "category": "intent", "description": "Moving message between folders (non-destructive)" },
-    { "key": "delete_message", "category": "intent", "description": "Permanently deleting an email message" },
-    { "key": "unauthorized_outreach", "category": "intent", "description": "Agent-initiated bulk or campaign-style outreach with NO operator campaign authorization (the mirror of authorized_campaign)" },
-    { "key": "human_edited", "category": "content", "description": "Draft was edited by the human after agent generation" },
-    { "key": "short_body", "category": "content", "description": "Message body is under 100 words" },
-    { "key": "agent_drafted", "category": "content", "description": "Content was entirely drafted by an AI agent" },
-    { "key": "has_attachment", "category": "content", "description": "Message includes one or more attachments" },
-    { "key": "has_pii", "category": "content", "description": "Message contains personally identifiable information" },
-    { "key": "uncited_claims", "category": "content", "description": "Message contains factual claims without sources" },
-    { "key": "sensitive_attachment", "category": "content", "description": "Attachment is a contract, NDA, or financial document" },
-    { "key": "internal_domain", "category": "domain", "description": "Recipient is on the same domain as the sender" },
-    { "key": "trusted_domain", "category": "domain", "description": "Recipient domain is on the trusted list" },
-    { "key": "unknown_domain", "category": "domain", "description": "Recipient domain has never been contacted before" },
-    { "key": "freemail_domain", "category": "domain", "description": "Recipient is on a freemail provider (gmail, yahoo, etc.)" },
-    { "key": "disposable_domain", "category": "domain", "description": "Recipient domain is a known disposable email service" },
-    { "key": "gov_domain", "category": "domain", "description": "Recipient is a government domain (.gov, .gob.es, .mil)" },
-    { "key": "financial_content", "category": "stakes", "description": "Message discusses money, invoices, or payments" },
-    { "key": "legal_content", "category": "stakes", "description": "Message has legal implications (contracts, IP, DMCA)" },
-    { "key": "commitment_language", "category": "stakes", "description": "Message makes promises or commitments on the human's behalf" },
-    { "key": "bulk_send", "category": "recipient", "description": "Sending to multiple recipients (6+ targets)" },
-    { "key": "has_bcc", "category": "recipient", "description": "Message uses the BCC field" }
+    {
+      "key": "reply_to_thread",
+      "category": "relationship",
+      "description": "Replying within an existing email thread (In-Reply-To set)"
+    },
+    {
+      "key": "known_contact",
+      "category": "relationship",
+      "description": "Recipient exists in address book or prior correspondence"
+    },
+    {
+      "key": "frequent_contact",
+      "category": "relationship",
+      "description": "Recipient exchanged 5+ messages in last 30 days"
+    },
+    {
+      "key": "cold_email",
+      "category": "relationship",
+      "description": "First-ever email to this recipient, no prior contact"
+    },
+    {
+      "key": "tyler_approved",
+      "category": "intent",
+      "description": "The authorizing human explicitly approved this message content"
+    },
+    {
+      "key": "authorized_campaign",
+      "category": "intent",
+      "description": "Send belongs to an outreach campaign the authorizing human explicitly pre-authorized"
+    },
+    {
+      "key": "read_only",
+      "category": "intent",
+      "description": "Operation is read-only"
+    },
+    {
+      "key": "draft_only",
+      "category": "intent",
+      "description": "Saving as draft, not sending (reversible)"
+    },
+    {
+      "key": "informational",
+      "category": "intent",
+      "description": "Message is purely informational (status update, FYI)"
+    },
+    {
+      "key": "scheduling",
+      "category": "intent",
+      "description": "Message concerns ordinary scheduling or a calendar invitation"
+    },
+    {
+      "key": "move_to_folder",
+      "category": "intent",
+      "description": "Moving message between folders (non-destructive)"
+    },
+    {
+      "key": "delete_message",
+      "category": "intent",
+      "description": "Permanently deleting an email message"
+    },
+    {
+      "key": "unauthorized_outreach",
+      "category": "intent",
+      "description": "Agent-initiated bulk or campaign-style outreach with no operator authorization"
+    },
+    {
+      "key": "human_edited",
+      "category": "content",
+      "description": "Draft was edited by the human after agent generation"
+    },
+    {
+      "key": "short_body",
+      "category": "content",
+      "description": "Message body is under 100 words"
+    },
+    {
+      "key": "calendar_invitation",
+      "category": "content",
+      "description": "Message carries a non-sensitive text/calendar invitation"
+    },
+    {
+      "key": "agent_drafted",
+      "category": "content",
+      "description": "Content was entirely drafted by an AI agent"
+    },
+    {
+      "key": "has_attachment",
+      "category": "content",
+      "description": "Message includes one or more attachments"
+    },
+    {
+      "key": "has_pii",
+      "category": "content",
+      "description": "Message contains personally identifiable information"
+    },
+    {
+      "key": "uncited_claims",
+      "category": "content",
+      "description": "Message contains factual claims without sources"
+    },
+    {
+      "key": "sensitive_attachment",
+      "category": "content",
+      "description": "Attachment is a contract, NDA, or financial document"
+    },
+    {
+      "key": "internal_domain",
+      "category": "domain",
+      "description": "Recipient is on the same domain as the sender"
+    },
+    {
+      "key": "trusted_domain",
+      "category": "domain",
+      "description": "Recipient domain is on the trusted list"
+    },
+    {
+      "key": "unknown_domain",
+      "category": "domain",
+      "description": "Recipient domain has never been contacted before"
+    },
+    {
+      "key": "freemail_domain",
+      "category": "domain",
+      "description": "Recipient is on a freemail provider"
+    },
+    {
+      "key": "disposable_domain",
+      "category": "domain",
+      "description": "Recipient domain is a known disposable email service"
+    },
+    {
+      "key": "gov_domain",
+      "category": "domain",
+      "description": "Recipient is a government domain"
+    },
+    {
+      "key": "financial_content",
+      "category": "stakes",
+      "description": "Message discusses money, invoices, or payments"
+    },
+    {
+      "key": "legal_content",
+      "category": "stakes",
+      "description": "Message has legal implications"
+    },
+    {
+      "key": "commitment_language",
+      "category": "stakes",
+      "description": "Message makes promises or commitments on the human's behalf"
+    },
+    {
+      "key": "low_stakes",
+      "category": "stakes",
+      "description": "A mistaken invitation would be trivial to correct"
+    },
+    {
+      "key": "bulk_send",
+      "category": "recipient",
+      "description": "Sending to multiple recipients (6+ targets)"
+    },
+    {
+      "key": "has_bcc",
+      "category": "recipient",
+      "description": "Message uses the BCC field"
+    },
+    {
+      "key": "single_recipient",
+      "category": "recipient",
+      "description": "Message has exactly one recipient across To, Cc, and Bcc"
+    }
   ]
 }

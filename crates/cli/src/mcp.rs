@@ -638,6 +638,7 @@ async fn handle_send(
     // ── Attribution precheck (before ANY side effect: no draft, no SMTP, no
     // Governor spawn on an unattributed/invalid request) ──
     let precheck_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         subject,
@@ -739,6 +740,7 @@ async fn handle_send(
 
     // ── Governor gate (fail-closed before any real SMTP) ──
     let gov_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         subject,
@@ -1120,6 +1122,7 @@ async fn handle_reply(
 
     // ── Attribution precheck (before ANY side effect) ──
     let precheck_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         &headers.subject,
@@ -1231,6 +1234,7 @@ async fn handle_reply(
 
     // ── Governor gate (fail-closed before any real SMTP) ──
     let gov_req = governor_request(
+        &db,
         &creds.account.id,
         account_domain(&creds.account.username),
         &headers.subject,

@@ -11,7 +11,7 @@
 
 use envelope_email_transport::attribution::{
     AttributedSendContext, classify_sensitive_attachment, collect_recipient_domains,
-    is_disposable_domain, is_freemail_domain, is_gov_domain,
+    is_calendar_invitation_content_type, is_disposable_domain, is_freemail_domain, is_gov_domain,
 };
 
 /// Every key the send-side attribution primitive is allowed to emit. Emitting
@@ -28,6 +28,7 @@ const CANONICAL_SEND_KEYS: &[&str] = &[
     "human_edited",
     "short_body",
     "has_attachment",
+    "calendar_invitation",
     "has_pii",
     "uncited_claims",
     "sensitive_attachment",
@@ -42,6 +43,7 @@ const CANONICAL_SEND_KEYS: &[&str] = &[
     "commitment_language",
     "bulk_send",
     "has_bcc",
+    "single_recipient",
 ];
 
 #[test]
@@ -108,6 +110,27 @@ fn attachment_present_but_not_sensitive_only_emits_has_attachment() {
     let attrs = ctx.to_governor_attrs();
     assert!(attrs.contains(&"has_attachment"));
     assert!(!attrs.contains(&"sensitive_attachment"));
+}
+
+#[test]
+fn calendar_invitation_is_mime_only_and_stays_an_attachment_fact() {
+    assert!(is_calendar_invitation_content_type("text/calendar"));
+    assert!(is_calendar_invitation_content_type(
+        "TEXT/CALENDAR; method=REQUEST"
+    ));
+    assert!(!is_calendar_invitation_content_type("application/ics"));
+    assert!(!is_calendar_invitation_content_type("text/plain"));
+
+    let attrs = AttributedSendContext {
+        attachment_count: 1,
+        calendar_invitation: true,
+        recipient_count: 1,
+        ..Default::default()
+    }
+    .to_governor_attrs();
+    assert!(attrs.contains(&"has_attachment"));
+    assert!(attrs.contains(&"calendar_invitation"));
+    assert!(attrs.contains(&"single_recipient"));
 }
 
 #[test]
