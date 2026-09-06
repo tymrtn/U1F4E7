@@ -5,6 +5,14 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.8] — 2026-09-06
+
+### Changed
+
+- **Release alignment:** publishes the current verified 1.1.x runtime as the
+  deployment target for Rey. No new mailbox, Governor, or dashboard behavior is
+  introduced in this patch release.
+
 ## [1.1.7] — 2026-09-01
 
 ### Changed
