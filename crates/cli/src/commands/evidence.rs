@@ -735,7 +735,13 @@ fn build_manifest(
         exported_at_utc: evidence_core::exported_at_now_utc(),
         account: EvidenceAccount {
             id: src.account.id.clone(),
-            email: format!("{}@{}", src.account.username, src.account.domain),
+            // Preserve configured identity verbatim when it is already address-shaped. Avoid
+            // broader validation or normalization here: evidence metadata records provenance.
+            email: if src.account.username.contains('@') {
+                src.account.username.clone()
+            } else {
+                format!("{}@{}", src.account.username, src.account.domain)
+            },
             imap_host: Some(src.account.imap_host.clone()),
             imap_port: Some(src.account.imap_port),
             imap_username: Some(src.effective_imap_username().to_string()),
@@ -868,6 +874,104 @@ fn emit(json_output: bool, event: EvidenceEvent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_for_account(
+        username: &str,
+        domain: &str,
+        imap_username: Option<&str>,
+    ) -> EvidenceManifest {
+        let src = envelope_email_store::AccountWithCredentials {
+            account: envelope_email_store::Account {
+                id: "acct-test".to_string(),
+                name: "Test".to_string(),
+                username: username.to_string(),
+                domain: domain.to_string(),
+                smtp_host: "smtp.example.com".to_string(),
+                smtp_port: 587,
+                imap_host: "imap.example.com".to_string(),
+                imap_port: 993,
+                smtp_username: None,
+                imap_username: imap_username.map(str::to_string),
+                display_name: None,
+                signature_text: None,
+                signature_html: None,
+                created_at: "2026-09-15T00:00:00Z".to_string(),
+            },
+            password: "fixture-password".to_string(),
+            smtp_password: None,
+            imap_password: None,
+        };
+
+        build_manifest(
+            &src,
+            "INBOX",
+            1,
+            "ALL",
+            None,
+            EvidenceQueryFilters::default(),
+            false,
+            500,
+            SourceStoreProvenance {
+                credential_backend: "test".to_string(),
+                app_data_dir: "/tmp/envelope".to_string(),
+                database_path: "/tmp/envelope/envelope.db".to_string(),
+                home: None,
+                warnings: vec![],
+            },
+            vec![],
+            vec![],
+            0,
+        )
+    }
+
+    fn assert_manifest_account_contract(
+        manifest: &EvidenceManifest,
+        expected_email: &str,
+        expected_imap_username: &str,
+    ) {
+        assert_eq!(manifest.account.email, expected_email);
+        assert_eq!(
+            manifest.account.imap_username.as_deref(),
+            Some(expected_imap_username)
+        );
+
+        let rendered = serde_json::to_value(manifest).unwrap();
+        assert_eq!(
+            rendered["account"],
+            serde_json::json!({
+                "id": "acct-test",
+                "email": expected_email,
+                "imap_host": "imap.example.com",
+                "imap_port": 993,
+                "imap_username": expected_imap_username,
+            })
+        );
+        assert_eq!(
+            rendered["evidence_format_version"],
+            evidence_core::EVIDENCE_FORMAT_VERSION
+        );
+        assert_eq!(rendered["tool"], TOOL_NAME);
+        assert_eq!(rendered["collection_spec"]["folder"], "INBOX");
+        assert_eq!(rendered["collection_spec"]["compiled_query"], "ALL");
+    }
+
+    #[test]
+    fn build_manifest_preserves_full_address_account_username() {
+        let manifest = manifest_for_account(
+            "tyler@martin.fm",
+            "martin.fm",
+            Some("imap-login@example.net"),
+        );
+
+        assert_manifest_account_contract(&manifest, "tyler@martin.fm", "imap-login@example.net");
+    }
+
+    #[test]
+    fn build_manifest_appends_domain_to_local_part_account_username() {
+        let manifest = manifest_for_account("tyler", "martin.fm", None);
+
+        assert_manifest_account_contract(&manifest, "tyler@martin.fm", "tyler");
+    }
 
     #[test]
     fn source_store_provenance_omits_credential_file_path() {
