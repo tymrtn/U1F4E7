@@ -924,6 +924,37 @@ mod tests {
         )
     }
 
+    fn assert_manifest_account_contract(
+        manifest: &EvidenceManifest,
+        expected_email: &str,
+        expected_imap_username: &str,
+    ) {
+        assert_eq!(manifest.account.email, expected_email);
+        assert_eq!(
+            manifest.account.imap_username.as_deref(),
+            Some(expected_imap_username)
+        );
+
+        let rendered = serde_json::to_value(manifest).unwrap();
+        assert_eq!(
+            rendered["account"],
+            serde_json::json!({
+                "id": "acct-test",
+                "email": expected_email,
+                "imap_host": "imap.example.com",
+                "imap_port": 993,
+                "imap_username": expected_imap_username,
+            })
+        );
+        assert_eq!(
+            rendered["evidence_format_version"],
+            evidence_core::EVIDENCE_FORMAT_VERSION
+        );
+        assert_eq!(rendered["tool"], TOOL_NAME);
+        assert_eq!(rendered["collection_spec"]["folder"], "INBOX");
+        assert_eq!(rendered["collection_spec"]["compiled_query"], "ALL");
+    }
+
     #[test]
     fn build_manifest_preserves_full_address_account_username() {
         let manifest = manifest_for_account(
@@ -932,21 +963,14 @@ mod tests {
             Some("imap-login@example.net"),
         );
 
-        assert_eq!(manifest.account.email, "tyler@martin.fm");
-        assert_eq!(
-            manifest.account.imap_username.as_deref(),
-            Some("imap-login@example.net")
-        );
-        let rendered = serde_json::to_value(&manifest).unwrap();
-        assert_eq!(rendered["account"]["email"], "tyler@martin.fm");
+        assert_manifest_account_contract(&manifest, "tyler@martin.fm", "imap-login@example.net");
     }
 
     #[test]
     fn build_manifest_appends_domain_to_local_part_account_username() {
         let manifest = manifest_for_account("tyler", "martin.fm", None);
 
-        assert_eq!(manifest.account.email, "tyler@martin.fm");
-        assert_eq!(manifest.account.imap_username.as_deref(), Some("tyler"));
+        assert_manifest_account_contract(&manifest, "tyler@martin.fm", "tyler");
     }
 
     #[test]
