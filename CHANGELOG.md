@@ -5,6 +5,17 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-09-15
+
+### Fixed
+
+- **Evidence manifests:** exports now preserve a configured account username
+  that is already a complete email address. Previously an account configured as
+  `name@example.com` on `example.com` was recorded as
+  `name@example.com@example.com`. Local-part usernames still receive their
+  configured domain, and the independent IMAP login field remains unchanged.
+  Existing evidence bundles are deliberately not rewritten.
+
 ## [1.2.1] — 2026-09-08
 
 ### Fixed
