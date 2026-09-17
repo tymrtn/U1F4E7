@@ -1,6 +1,7 @@
 <script lang="ts">
   import { installBodyFrameScrollBridge } from './body-frame-scroll';
   import { resolveFrameHeight } from './bodyframe-size';
+  import { sanitizeEmailHtml } from './rich-html';
 
   // BodyFrame — renders an HTML email body inside a sandboxed <iframe srcdoc>.
   //
@@ -51,89 +52,21 @@
   /** Sanitize an HTML email string and wrap it in a safe document.
    *  Returns { srcdoc, remoteBlocked } — side-effects (callback) stay in $effect. */
   function buildSrcdoc(rawHtml: string, allowRemote: boolean): { srcdoc: string; remoteBlocked: number } {
-    // ── Sanitize inside a detached document ──
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(rawHtml, 'text/html');
-
-    // 1. Strip dangerous elements.
-    doc
-      .querySelectorAll(
-        'script, link, form, input, button, textarea, select, iframe, object, embed, applet, meta, base'
-      )
-      .forEach((el) => el.remove());
-
-    // 2. Strip dangerous attributes on every element.
-    doc.querySelectorAll('*').forEach((el) => {
-      for (const attr of Array.from(el.attributes)) {
-        const name = attr.name.toLowerCase();
-        const value = attr.value || '';
-
-        // Event handlers
-        if (name.startsWith('on')) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        // background attr (old HTML)
-        if (name === 'background') {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        // srcset on anything
-        if (name === 'srcset') {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        // javascript: / data:text/html hrefs
-        if ((name === 'href' || name === 'xlink:href') && isDangerousUrl(value)) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        // CSS url() / @import in style attrs (tracking pixels / remote fonts)
-        if (name === 'style' && hasCssUrlLoad(value)) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-      }
-      // External links open in a new tab with noopener.
-      const tag = el.tagName.toLowerCase();
-      if (tag === 'a') {
-        const href = el.getAttribute('href') || '';
-        if (/^https?:\/\//i.test(href)) {
-          el.setAttribute('target', '_blank');
-          el.setAttribute('rel', 'noopener noreferrer');
-        }
-      }
-    });
-
-    // 3. Handle images: count remote ones; block or permit per remoteImages flag.
-    let remoteBlocked = 0;
-    doc.querySelectorAll('img').forEach((img) => {
-      const src = (img.getAttribute('src') || '').trim();
-      img.removeAttribute('srcset');
-      if (/^https?:\/\//i.test(src)) {
-        if (!allowRemote) {
-          img.setAttribute('data-remote-src', src);
-          img.setAttribute('src', transparentDataUrl());
-          img.setAttribute('alt', img.getAttribute('alt') || 'Remote image (blocked)');
-          img.setAttribute('title', 'Remote images are blocked');
-          remoteBlocked += 1;
-        }
-        // If allowRemote, leave the src untouched.
-        return;
-      }
-      // Block other non-inline non-data sources.
-      if (src && !/^data:/i.test(src) && !/^cid:/i.test(src)) {
-        img.removeAttribute('src');
-      }
-    });
+    // Sanitize first, then parse that inert body to apply reader-only quote
+    // collapsing. Keeping the sanitizer shared with the rich draft editor
+    // prevents the editable and read-only HTML boundaries from drifting.
+    const sanitized = sanitizeEmailHtml(rawHtml, { remoteImages: allowRemote });
+    const doc = new DOMParser().parseFromString(sanitized.html, 'text/html');
 
     // Collapse quoted replies with <details> (no JS needed).
     collapseQuotes(doc);
 
     const imgSrc = allowRemote ? "data: cid: https:" : "data: cid:";
     const csp =
-      `default-src 'none'; style-src 'unsafe-inline'; img-src ${imgSrc}; ` +
-      `font-src data:; frame-src 'none'; media-src 'none'; object-src 'none';`;
+      `default-src 'none'; script-src 'none'; connect-src 'none'; ` +
+      `style-src 'unsafe-inline'; img-src ${imgSrc}; ` +
+      `font-src data:; frame-src 'none'; media-src 'none'; object-src 'none'; ` +
+      `form-action 'none'; base-uri 'none';`;
 
     const body = doc.body ? doc.body.innerHTML : '';
     const srcdoc = `<!doctype html><html><head>` +
@@ -157,20 +90,7 @@
       // viewport height, which is why the previous sizer had to collapse first.
       `</style></head><body><div id="env-content">${body}</div></body></html>`;
 
-    return { srcdoc, remoteBlocked };
-  }
-
-  function isDangerousUrl(value: string): boolean {
-    const t = value.trim();
-    return /^javascript:/i.test(t) || /^data:text\/html/i.test(t);
-  }
-
-  function hasCssUrlLoad(value: string): boolean {
-    return /@import\b/i.test(value) || /url\s*\(/i.test(value);
-  }
-
-  function transparentDataUrl(): string {
-    return 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%221%22 height=%221%22/%3E';
+    return { srcdoc, remoteBlocked: sanitized.remoteBlocked };
   }
 
   function collapseQuotes(doc: Document): void {

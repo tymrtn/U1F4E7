@@ -21,6 +21,7 @@ import shellSource from '../../routes/+layout.svelte?raw';
 import mailSource from '../../routes/mail/[box]/+layout.svelte?raw';
 import composerSource from './DraftComposer.svelte?raw';
 import bodyFrameSource from './BodyFrame.svelte?raw';
+import richEditorSource from './RichHtmlEditor.svelte?raw';
 
 const MOBILE_QUERY = '@media (max-width: 760px)';
 
@@ -64,6 +65,7 @@ const shell = styleOf(shellSource);
 const mail = styleOf(mailSource);
 const composer = styleOf(composerSource);
 const bodyFrame = styleOf(bodyFrameSource);
+const richEditor = styleOf(richEditorSource);
 
 describe('mobile one-scroller contract: reader + draft composer', () => {
   it('releases the app shell viewport clamp at the layouts’ 760px breakpoint', () => {
@@ -95,13 +97,17 @@ describe('mobile one-scroller contract: reader + draft composer', () => {
     expect(review).not.toMatch(/overflow[^;]*(auto|scroll|hidden)/);
   });
 
-  it('keeps the preview chain free of inner scrollers and height wells', () => {
-    // `.draft-preview` once trapped the message in a fixed-height well with
-    // its own scrollbar; the frame now sizes to the document and the page
-    // scrolls. Neither surface may reintroduce a clamp.
-    const preview = ruleFor(composer, '.draft-preview');
-    expect(preview).not.toMatch(/overflow|max-height|flex\s*:/);
+  it('keeps the HTML iframe chain free of inner scrollers and height caps', () => {
+    // Both read-only and editable frames grow to their document roots. Neither
+    // surface may reintroduce an overflow well or a maximum-height clamp.
     expect(ruleFor(bodyFrame, '.body-frame')).not.toMatch(/overflow/);
+    expect(ruleFor(richEditor, '.rich-editor')).not.toMatch(/overflow|max-height/);
+    expect(ruleFor(richEditor, '.rich-frame')).not.toMatch(/overflow|max-height/);
+  });
+
+  it('bridges iframe scroll gestures for both read-only and editable HTML', () => {
+    expect(bodyFrameSource).toContain('installBodyFrameScrollBridge(frameEl)');
+    expect(richEditorSource).toContain('installBodyFrameScrollBridge(frameEl)');
   });
 
   it('keeps the desktop HTML preview interactive', () => {
