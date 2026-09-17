@@ -346,3 +346,32 @@ async fn retry_atomically_records_safe_correction_and_requeues_normal_bot_path()
     assert!(audit.contains("informational"));
     assert!(!audit.contains("calendar_invitation"));
 }
+
+/// The **envelope** catalog is shared across every governed operation, so it
+/// carries keys that describe IMAP verbs rather than transmission. A send is
+/// never a read-only, folder-move, or delete op — `observe_host_key` hard-codes
+/// them to `Some(false)` — so projecting them into a send-refinement dialog is
+/// pure noise the operator must scroll past to reach the facts they can
+/// actually correct.
+#[tokio::test]
+async fn projection_omits_catalog_keys_that_cannot_describe_a_send() {
+    let (state, draft_id, _) = seeded_state();
+    let app = dashboard_router(state);
+    let uri = format!("/api/accounts/{ACCOUNT}/drafts/{draft_id}/context-refinement");
+    let (status, body, _) = request_json(&app, Method::GET, &uri, None, false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let attributes = body["attributes"].as_array().unwrap();
+    for key in envelope_email_transport::attribution::NON_SEND_OPERATION_KEYS {
+        assert!(
+            !attributes.iter().any(|entry| entry["key"] == *key),
+            "projected non-send operation key {key}"
+        );
+    }
+    // Every other catalog key still projects: the filter drops exactly the
+    // non-send verbs, never a fact the operator needs to see or correct.
+    let projected = attributes.len();
+    let expected = envelope_email_transport::governor_catalog::catalog_attributes().len()
+        - envelope_email_transport::attribution::NON_SEND_OPERATION_KEYS.len();
+    assert_eq!(projected, expected);
+}

@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use envelope_email_store::DraftStatus;
 use envelope_email_store::models::Account;
 use envelope_email_store::{ContextCorrection, Database, StoreError};
+use envelope_email_transport::attribution::NON_SEND_OPERATION_KEYS;
 use envelope_email_transport::attribution::{AttributionState, resolve};
 use envelope_email_transport::attribution_persist::{
     PersistedDeclaration, ScheduledOrigin, normalize_context_correction_attrs, scheduled_origin,
@@ -233,6 +234,10 @@ pub async fn context_refinement(
 
     let attributes: Vec<serde_json::Value> = catalog_attributes()
         .iter()
+        // The catalog is shared with the IMAP verbs; a send can never be a
+        // read-only / folder / delete op, so those keys are noise the operator
+        // would have to read past to reach the facts they can correct.
+        .filter(|attribute| !NON_SEND_OPERATION_KEYS.contains(&attribute.key.as_str()))
         .map(|attribute| {
             let provenance = provenance_of(&attribute.key).unwrap_or(Provenance::HostDerived);
             let (state, selectable, read_only, explanation) = match provenance {

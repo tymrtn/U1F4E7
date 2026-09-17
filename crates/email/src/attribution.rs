@@ -38,6 +38,15 @@
 use crate::attribution_provenance::{Provenance, conflicting_partner, provenance_of};
 use crate::governor_catalog::{catalog_version, nearest_keys};
 
+/// Catalog keys that describe an IMAP verb rather than a transmission.
+///
+/// The **envelope** catalog is shared across every governed operation, so it
+/// carries keys a send can never satisfy. [`AttributedSendContext::observe_host_key`]
+/// resolves each of these to `Some(false)` for any send; surfaces that project
+/// the catalog to a human for a *send* decision filter them out rather than make
+/// the operator read past them.
+pub const NON_SEND_OPERATION_KEYS: &[&str] = &["read_only", "move_to_folder", "delete_message"];
+
 /// Observable, sanitized facts about an outbound send, mapped to canonical
 /// Governor **envelope** catalog attribute keys via
 /// [`AttributedSendContext::to_governor_attrs`].
@@ -236,7 +245,7 @@ impl AttributedSendContext {
             "single_recipient" => Some(self.recipient_count == 1),
             "draft_only" => Some(self.draft_only),
             // An actual send is never a read-only / folder / delete op.
-            "read_only" | "move_to_folder" | "delete_message" => Some(false),
+            key if NON_SEND_OPERATION_KEYS.contains(&key) => Some(false),
             // Domain-shape facts: observable only when we actually have recipient
             // domains (and, for internal, the sender domain).
             "internal_domain" => {

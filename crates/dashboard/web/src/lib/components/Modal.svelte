@@ -74,8 +74,12 @@
     max-width: 30rem;
     display: flex;
     flex-direction: column;
+    /* The backdrop is fixed and centres its child, so an unclamped dialog
+       grows past BOTH viewport edges and clips its own title and buttons. */
+    max-height: 100%;
   }
   .env-modal-head {
+    flex: none;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -99,11 +103,18 @@
     color: var(--env-ink);
   }
   .env-modal-body {
+    /* The body owns the scroll; head and foot stay pinned and reachable.
+       `min-height: 0` is what lets this flex child shrink below its content. */
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 1rem;
     font-size: 0.875rem;
     line-height: 1.5;
   }
   .env-modal-foot {
+    flex: none;
     display: flex;
     justify-content: flex-end;
     gap: 0.5rem;
