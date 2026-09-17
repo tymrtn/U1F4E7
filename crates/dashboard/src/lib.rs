@@ -518,7 +518,7 @@ pub fn dashboard_router(state: AppState) -> Router {
     // ── Envelope v2 webmail (SvelteKit SPA, adapter-static) ──
     // As of 1.0.0 the v2 webmail IS the dashboard: it serves at `/`, and the
     // root fallback returns embedded `web/build/` assets or the SPA shell for
-    // client-side routes (`/cockpit`, `/rules`, `/mail/...`) built with
+    // client-side routes (`/review`, `/rules`, `/mail/...`) built with
     // `paths.base = ''`. The old v1 static dashboard and its `/v2` mount are
     // gone. CLI/MCP `ui` deep links resolve through the same SPA shell.
     //
@@ -535,6 +535,7 @@ pub fn dashboard_router(state: AppState) -> Router {
             get(legacy_message_redirect),
         )
         .route("/accounts/{account}/cockpit", get(legacy_cockpit_redirect))
+        .route("/cockpit", get(legacy_cockpit_redirect))
         .route("/accounts/{account}/rules", get(legacy_rules_redirect))
         .nest("/api", api)
         .fallback(spa_fallback)
@@ -1953,7 +1954,7 @@ async fn spa_shell() -> Response {
 
 /// Root fallback: return a real embedded `web/build/` asset by request path
 /// (e.g. `/_app/immutable/...`, `/favicon.svg`) with its guessed content type,
-/// or the SPA shell for any client-side route (`/cockpit`, `/mail/...`) so the
+/// or the SPA shell for any client-side route (`/review`, `/mail/...`) so the
 /// SvelteKit router — built with `paths.base = ''` — resolves it instead of
 /// 404ing.
 async fn spa_fallback(uri: axum::http::Uri) -> Response {
@@ -2043,10 +2044,13 @@ async fn draft_review_path_for_imap_uid(
     }
 }
 
-/// Redirect `/accounts/{account}/cockpit` to the global cockpit route. The
-/// account is dropped because the SPA cockpit spans every account.
+/// Redirect `/cockpit` and `/accounts/{account}/cockpit` to the Review queue.
+/// The Cockpit page was removed (2026-09-17); its approval list and scheduled
+/// sends live on Review, which spans every account, so the account segment is
+/// dropped. Bare `/cockpit` is still what `cockpit_url` in older agent
+/// transcripts and notifications points at.
 async fn legacy_cockpit_redirect() -> Redirect {
-    Redirect::permanent("/cockpit")
+    Redirect::permanent("/review")
 }
 
 /// Redirect `/accounts/{account}/rules` to the global rules route.
@@ -4927,8 +4931,9 @@ mod tests {
         let app = dashboard_router(state);
 
         for (uri, expected) in [
-            ("/accounts/acc1/cockpit", "/cockpit"),
-            ("/accounts/acct%2Fone/cockpit", "/cockpit"),
+            ("/cockpit", "/review"),
+            ("/accounts/acc1/cockpit", "/review"),
+            ("/accounts/acct%2Fone/cockpit", "/review"),
             ("/accounts/acc1/rules", "/rules"),
             ("/accounts/acct%2Fone/rules", "/rules"),
         ] {
@@ -5053,7 +5058,7 @@ mod tests {
     fn embedded_spa_bundle_routes_every_canonical_deep_link_target() {
         let entry = embedded_spa_entry_chunk();
 
-        for route_id in [CONTROL_ROUTE_ID, "/review", "/cockpit", "/rules"] {
+        for route_id in [CONTROL_ROUTE_ID, "/review", "/rules"] {
             assert!(
                 entry.contains(&format!("\"{route_id}\"")),
                 "canonical route {route_id} missing from the embedded route table — deep \

@@ -1,6 +1,6 @@
 <script lang="ts">
   // Left rail — the dark instrument frame (design plan rev 3). GTD stages as
-  // places (Process / Working), review surfaces (Cockpit, Approvals), then
+  // places (Process / Working), the Approvals queue, then
   // accounts with per-account health and identity hue. Clicking an account row
   // opens the contextual AccountDrawer. Every data surface here has an
   // explicit loading / error / empty state — no silent failures.
@@ -16,7 +16,7 @@
     type AccountHealth
   } from '$lib/api';
   import { MAILBOXES } from '$lib/mailboxes';
-  import { cockpitApi } from '$lib/cockpit-api';
+  import { agentsApi } from '$lib/agents-api';
   import { identityColor } from '$lib/hue';
   import Badge from './Badge.svelte';
   import Icon from './Icon.svelte';
@@ -44,9 +44,8 @@
   let drawerOpen = $state(false);
 
   const activeBox = $derived(page.params.box ?? 'unified');
-  const onCockpit = $derived(page.url.pathname.startsWith(`${base}/cockpit`));
   const onDigest = $derived(page.url.pathname.startsWith(`${base}/digest`));
-  const boxRoutesActive = $derived(!onCockpit && !onDigest);
+  const boxRoutesActive = $derived(!onDigest);
 
   const processBoxes = MAILBOXES.filter((b) => b.group === 'process');
   const workingBoxes = MAILBOXES.filter((b) => b.group === 'working');
@@ -79,7 +78,7 @@
   // load-bearing accounts render, so it runs on its own and swallows failures.
   async function loadApprovals() {
     try {
-      const res = await cockpitApi.agents();
+      const res = await agentsApi.agents();
       awaitingApproval = res.summary.awaiting_approval;
     } catch {
       awaitingApproval = 0;
@@ -160,20 +159,7 @@
   <p class="rail-label rail-gap">Review</p>
   <ul class="rail-list">
     <li>
-      <a
-        class="rail-item"
-        class:is-active={onCockpit}
-        href="{base}/cockpit"
-        aria-current={onCockpit ? 'page' : undefined}
-      >
-        <span class="rail-item-main">
-          <Icon name="bot" size={15} />
-          <span class="rail-item-label">Cockpit</span>
-        </span>
-      </a>
-    </li>
-    <li>
-      <a class="rail-item" href="{base}/cockpit#approvals">
+      <a class="rail-item" href="{base}/review">
         <span class="rail-item-main">
           <Icon name="shield-check" size={15} />
           <span class="rail-item-label">Approvals</span>

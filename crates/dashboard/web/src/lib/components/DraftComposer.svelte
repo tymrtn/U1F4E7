@@ -1,7 +1,7 @@
 <script lang="ts">
   // Draft review composer — the surface behind every generated draft link
-  // (`review_url` / `dashboard_url` from the CLI and MCP, and the cockpit's
-  // Edit action). It is a Gmail-like editable composer, not an approval card:
+  // (`review_url` / `dashboard_url` from the CLI and MCP, and Review's row
+  // deep links). It is a Gmail-like editable composer, not an approval card:
   // the operator lands on the actual message and can change it before it goes.
   //
   // Safety contract, mirrored from crates/dashboard/src/handlers/drafts.rs:
@@ -165,6 +165,7 @@
   let saved = $state(false);
   let queueing = $state(false);
   let holding = $state(false);
+  let approving = $state(false);
   let confirmOpen = $state(false);
   let refinementOpen = $state(false);
   let refinementResult = $state<ContextRefinementRetryResponse | null>(null);
@@ -395,6 +396,34 @@
 
   const editable = $derived(statusEditable && !isQueued);
   const sendable = $derived(!!draft && isSendableDraftStatus(draft.status) && !isQueued);
+
+  /**
+   * Approve is the human's "I reviewed exactly this revision". It is offered
+   * on the two statuses that are parked for a human decision: `pending_review`
+   * (an agent left it for you) and `blocked` (changes were requested; approval
+   * is what returns it to `draft`). Review only — see `approve()`.
+   */
+  const approvable = $derived(
+    !!draft && (draft.status === 'pending_review' || draft.status === 'blocked') && !isQueued
+  );
+
+  /**
+   * The stored attestation, valid only for the revision on screen. The edit
+   * endpoint strips it, so a mismatched revision means the draft changed after
+   * it was approved and the badge must not carry over.
+   */
+  const humanApproved = $derived.by(() => {
+    if (!draft) return false;
+    const attestation = draft.metadata?.human_approval as
+      | { approved_by?: unknown; revision?: unknown }
+      | undefined;
+    return (
+      !!attestation &&
+      typeof attestation.approved_by === 'string' &&
+      attestation.approved_by.startsWith('human:') &&
+      attestation.revision === draft.revision
+    );
+  });
 
   const dirty = $derived(
     !!draft &&
@@ -783,6 +812,53 @@
     }
   }
 
+  // ── Approve (review only; sends nothing) ──────────────────────────────
+
+  const canApprove = $derived(approvable && !dirty && !saving && !approving && identityMatches);
+
+  /**
+   * Record the review attestation for the revision on screen. The endpoint is
+   * compare-and-set on `expected_revision`, so a concurrent edit rolls the
+   * approval back (409) and the conflict banner asks for a reload — the edited
+   * content never inherits `tyler_approved`. Nothing is queued and no
+   * `human_send` authorization is written: a later agent send of this draft is
+   * still fully Governor-gated. Sending from here is Human-only Send.
+   */
+  async function approve() {
+    if (!draft || !canApprove) return;
+    const generation = ++loadGeneration;
+    const targetAccount = accountId;
+    const targetDraft = draftId;
+    const revision = draft.revision;
+
+    approving = true;
+    conflict = false;
+    actionError = null;
+
+    try {
+      const res = await api.approveDraft(targetAccount, targetDraft, {
+        expected_revision: revision
+      });
+      if (generation !== loadGeneration) return;
+      queued = null;
+      applyDraft(res.draft);
+      saved = false;
+    } catch (e) {
+      if (generation !== loadGeneration) return;
+      const err = e as EnvelopeApiError;
+      if (err.status === 409) {
+        conflict = true;
+      } else {
+        actionError = {
+          code: err.code ?? 'approve_failed',
+          message: err.message ?? 'Could not record the approval.'
+        };
+      }
+    } finally {
+      if (generation === loadGeneration) approving = false;
+    }
+  }
+
   // ── Hold (unqueue, keep the draft) ────────────────────────────────────
 
   const canHold = $derived(isQueued && !holding && identityMatches);
@@ -965,6 +1041,9 @@
         {:else if statusMeta}
           <Badge variant={statusMeta.variant}>{statusMeta.label}</Badge>
         {/if}
+        {#if humanApproved && !isQueued}
+          <Badge variant="ok">Approved</Badge>
+        {/if}
         <MonoTag>rev {draft.revision}</MonoTag>
       </div>
     </header>
@@ -1044,7 +1123,7 @@
           {:else}
             Not transmitted yet. Holding returns it to an editable draft — it is never discarded.
           {/if}
-          <a class="draft-outbox-link" id="draft-outbox-link" href="/cockpit#scheduled-panel">
+          <a class="draft-outbox-link" id="draft-outbox-link" href="/review#review-waiting">
             All queued sends
           </a>
         </p>
@@ -1201,6 +1280,15 @@
       onconflict={() => (conflict = true)}
     />
 
+    {#if approvable}
+      <p class="draft-banner draft-send-note" id="draft-approve-note">
+        <strong>Approve</strong> records that you reviewed this version. It does not send the draft,
+        and it does not exempt a later agent send from Governor — an agent that sends an approved
+        draft is scored exactly as it would be otherwise. To send it yourself, use
+        <strong>Human-only Send</strong>.
+      </p>
+    {/if}
+
     {#if sendable}
       <p class="draft-banner draft-send-note" id="draft-human-send-note">
         <strong>Human-only Send</strong> is your explicit send of this exact version. It still waits
@@ -1224,6 +1312,8 @@
           <span class="is-saved">Editing is locked while this message is in the outbox.</span>
         {:else if sendable && !recipientsValid}
           <span class="is-warn">Add a valid recipient before sending.</span>
+        {:else if humanApproved}
+          <span class="is-saved">Approved rev {draft.revision}. Nothing was sent.</span>
         {:else if !statusEditable && statusMeta}
           <span>{statusMeta.label} — read-only.</span>
         {/if}
@@ -1233,6 +1323,12 @@
           <Button variant="ghost" disabled={!canSave} onclick={save}>
             {#if saving}<Spinner label="Saving" />{/if}
             {saving ? 'Saving' : 'Save changes'}
+          </Button>
+        {/if}
+        {#if approvable}
+          <Button variant="ghost" disabled={!canApprove} onclick={approve}>
+            {#if approving}<Spinner label="Approving" />{/if}
+            {approving ? 'Approving' : 'Approve'}
           </Button>
         {/if}
         {#if sendable}

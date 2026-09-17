@@ -5,7 +5,7 @@
 //
 // The rail groups these as GTD stages: `process` is the loop you drive to
 // zero (capture → clarify → decide), `working` holds mail you're producing.
-// Review surfaces (Cockpit, Approvals) are routes of their own, not boxes.
+// Review surfaces (Approvals) are routes of their own, not boxes.
 import type { IconName } from './icons';
 
 export interface Mailbox {

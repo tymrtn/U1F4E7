@@ -1,7 +1,7 @@
 // Typed API client for the Review queue aggregate (`GET /api/review`).
 //
 // Reuses the CSRF-aware `request()` core from api.ts — imported, never
-// re-implemented — following the cockpit-api.ts convention of one sibling
+// re-implemented — following the agents-api.ts convention of one sibling
 // client per aggregate surface. The review load is strictly read-only; acting
 // on an item happens on the surface its `link` points to.
 //
