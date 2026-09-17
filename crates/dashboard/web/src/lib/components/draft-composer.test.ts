@@ -96,9 +96,23 @@ async function renderLoaded(overrides: Partial<Draft> = {}) {
   await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
 }
 
-/** An HTML body opens rendered; drop to the source textarea to type into it. */
+/** An HTML body opens rich; switch to the source textarea when a test needs markup. */
 async function openSource() {
-  await fireEvent.click(screen.getByRole('button', { name: /edit html/i }));
+  await fireEvent.click(screen.getByRole('button', { name: /edit html source/i }));
+}
+
+/** jsdom does not load iframe srcdoc, so install the rendered document explicitly. */
+async function installRichDocument(): Promise<{ frame: HTMLIFrameElement; editor: HTMLElement }> {
+  const frame = screen.getByTitle('Rich text message editor') as HTMLIFrameElement;
+  const doc = frame.contentDocument;
+  if (!doc) throw new Error('rich editor iframe has no contentDocument');
+  doc.open();
+  doc.write(frame.getAttribute('srcdoc') ?? '');
+  doc.close();
+  await fireEvent.load(frame);
+  const editor = doc.getElementById('env-editor');
+  if (!editor) throw new Error('rich editor iframe has no #env-editor root');
+  return { frame, editor };
 }
 
 /** The token field wrapping a recipient input. */
@@ -614,6 +628,20 @@ describe('DraftComposer status guards', () => {
     expect(screen.getByLabelText('Message')).toBeDisabled();
     expect(screen.queryByRole('button', { name: /^human-only send in\b/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
+  });
+
+  it('disables rich editing for a read-only HTML draft', async () => {
+    await renderLoaded({
+      status: 'sent',
+      sent_at: '2026-07-30T11:00:00Z',
+      text_content: null,
+      html_content: '<p>Already sent</p>'
+    });
+
+    const { editor } = await installRichDocument();
+    expect(editor).toHaveAttribute('contenteditable', 'false');
+    expect(screen.getByRole('button', { name: 'Bold' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /edit html source/i })).toBeDisabled();
   });
 
   it('lets a blocked draft be edited but not queued', async () => {
@@ -1445,6 +1473,17 @@ describe('DraftComposer body preservation', () => {
     expect(body.subject).toBe('New subject');
   });
 
+  it('does not normalize untouched HTML into a subject-only save', async () => {
+    await renderLoaded({ text_content: 'Plain body', html_content: '<P CLASS="hero">Rich body</P>' });
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'New subject' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
+    const body = apiMock.editDraft.mock.calls[0][2];
+    expect(body).not.toHaveProperty('text_content');
+    expect(body).not.toHaveProperty('html_content');
+  });
+
   it('omits both body fields on a recipient-only save', async () => {
     await renderLoaded(DUAL);
     await setRecipients('To', 'someone@example.com');
@@ -1557,7 +1596,7 @@ describe('DraftComposer body format switching', () => {
     await renderLoaded(DUAL);
 
     expect(screen.getByRole('button', { name: 'HTML' })).toHaveAttribute('aria-pressed', 'true');
-    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const frame = (await screen.findByTitle('Rich text message editor')) as HTMLIFrameElement;
     expect(frame.getAttribute('srcdoc')).toContain('Rich body');
     expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
   });
@@ -1575,6 +1614,16 @@ describe('DraftComposer body format switching', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
 
     expect(messageBox().value).toBe('Plain body');
+  });
+
+  it('warns that an HTML-only draft keeps literal markup when switched to Text', async () => {
+    await renderLoaded({ text_content: null, html_content: '<p>Only rich</p>' });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
+
+    expect(messageBox().value).toBe('<p>Only rich</p>');
+    expect(screen.getByRole('status')).toHaveTextContent(/literal markup/i);
+    expect(screen.getByRole('status')).toHaveTextContent(/does not convert html to prose/i);
   });
 
   it('shows the HTML source behind Edit HTML', async () => {
@@ -1617,14 +1666,69 @@ describe('DraftComposer body format switching', () => {
   });
 });
 
-// ── HTML preview ──────────────────────────────────────────────────────
+// ── Rich HTML editing ─────────────────────────────────────────────────
 //
-// An HTML body is unreadable as source. The preview renders it through the
-// same sandboxed BodyFrame the reader uses, so the operator approves what the
-// recipient will actually see.
+// The default HTML surface is directly editable inside a scriptless sandbox.
+// Source remains available as an explicit alternate mode.
 
-describe('DraftComposer HTML preview', () => {
+describe('DraftComposer rich HTML editor', () => {
   const DUAL = { text_content: 'Plain body', html_content: '<p>Rich body</p>' };
+
+  it('opens HTML directly editable with the complete compact toolbar', async () => {
+    await renderLoaded(DUAL);
+
+    const { frame, editor } = await installRichDocument();
+    expect(frame.getAttribute('sandbox')).toBe('allow-same-origin');
+    expect(editor).toHaveAttribute('contenteditable', 'true');
+    for (const name of ['Bold', 'Italic', 'Underline', 'Insert link', 'Ordered list', 'Unordered list', 'Clear formatting']) {
+      expect(screen.getByRole('button', { name })).toBeEnabled();
+    }
+  });
+
+  it('saves rich input as html_content only and keeps Send disabled while dirty', async () => {
+    await renderLoaded({ text_content: null, html_content: '<p>Original</p>' });
+    const { editor } = await installRichDocument();
+    editor.innerHTML = '<p><strong>Rewritten</strong></p>';
+    await fireEvent.input(editor);
+
+    expect(screen.getByText(/unsaved changes/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^human-only send now$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeDisabled();
+
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+    await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
+    const payload = apiMock.editDraft.mock.calls[0][2];
+    expect(payload.html_content).toBe('<p><strong>Rewritten</strong></p>');
+    expect(payload).not.toHaveProperty('text_content');
+  });
+
+  it('does not replace srcdoc while rich input follows parent state', async () => {
+    await renderLoaded(DUAL);
+    const { frame, editor } = await installRichDocument();
+    const documentBefore = frame.contentDocument;
+    editor.innerHTML = '<p>Caret-safe edit</p>';
+
+    await fireEvent.input(editor);
+
+    expect(frame.contentDocument).toBe(documentBefore);
+    expect(editor.innerHTML).toBe('<p>Caret-safe edit</p>');
+  });
+
+  it('sanitizes source edits at the final html_content save boundary', async () => {
+    await renderLoaded({ text_content: null, html_content: '<p>Original</p>' });
+    await openSource();
+    await fireEvent.input(screen.getByLabelText('Message'), {
+      target: {
+        value:
+          '<p onclick="evil()">Safe</p><script>alert(1)</script>' +
+          '<form><input></form><a href="java\nscript:evil()">bad</a>'
+      }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+    await waitFor(() => expect(apiMock.editDraft).toHaveBeenCalled());
+    expect(apiMock.editDraft.mock.calls[0][2].html_content).toBe('<p>Safe</p><a>bad</a>');
+  });
 
   it('offers no preview while the body is plain text', async () => {
     await renderLoaded({ text_content: 'Only text', html_content: null });
@@ -1635,23 +1739,26 @@ describe('DraftComposer HTML preview', () => {
   it('renders the HTML body in a sandboxed frame', async () => {
     await renderLoaded(DUAL);
 
-    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const frame = (await screen.findByTitle('Rich text message editor')) as HTMLIFrameElement;
     const sandbox = frame.getAttribute('sandbox') ?? '';
     expect(sandbox).toContain('allow-same-origin');
     expect(sandbox).not.toContain('allow-scripts');
   });
 
-  it('previews the unsaved edit rather than the saved body', async () => {
+  it('round-trips an unsaved source edit into rich mode', async () => {
     await renderLoaded(DUAL);
     await openSource();
     await fireEvent.input(screen.getByLabelText('Message'), {
       target: { value: '<p>Rewritten</p>' }
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: /preview/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /rich text/i }));
 
-    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const frame = (await screen.findByTitle('Rich text message editor')) as HTMLIFrameElement;
     expect(frame.getAttribute('srcdoc')).toContain('Rewritten');
+
+    await openSource();
+    expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('<p>Rewritten</p>');
   });
 
   it('leaves the preview when the format switches to plain text', async () => {
@@ -1660,7 +1767,7 @@ describe('DraftComposer HTML preview', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Text' }));
 
     expect((screen.getByLabelText('Message') as HTMLTextAreaElement).value).toBe('Plain body');
-    expect(screen.queryByTitle('Message body')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Rich text message editor')).not.toBeInTheDocument();
   });
 
   it('renders again when the format switches back to HTML', async () => {
@@ -1669,7 +1776,7 @@ describe('DraftComposer HTML preview', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'HTML' }));
 
-    expect(await screen.findByTitle('Message body')).toBeInTheDocument();
+    expect(await screen.findByTitle('Rich text message editor')).toBeInTheDocument();
   });
 });
 
@@ -1794,7 +1901,7 @@ describe('DraftComposer tall forwarded HTML draft', () => {
       html_content: FORWARD
     });
 
-    const frame = (await screen.findByTitle('Message body')) as HTMLIFrameElement;
+    const frame = (await screen.findByTitle('Rich text message editor')) as HTMLIFrameElement;
     const srcdoc = frame.getAttribute('srcdoc') ?? '';
     expect(srcdoc).toContain('Order line 0');
     expect(srcdoc).toContain('Order line 399');

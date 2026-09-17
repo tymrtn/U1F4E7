@@ -29,7 +29,6 @@
     validateAddrs
   } from '$lib/addresses';
   import Badge from './Badge.svelte';
-  import BodyFrame from './BodyFrame.svelte';
   import Button from './Button.svelte';
   import DraftAttachments from './DraftAttachments.svelte';
   import DraftThread from './DraftThread.svelte';
@@ -37,7 +36,9 @@
   import Modal from './Modal.svelte';
   import MonoTag from './MonoTag.svelte';
   import RecipientField from './RecipientField.svelte';
+  import RichHtmlEditor from './RichHtmlEditor.svelte';
   import Spinner from './Spinner.svelte';
+  import { sanitizeEmailHtml } from './rich-html';
   import { getLiveStore } from '$lib/live.svelte';
   import {
     api,
@@ -148,15 +149,13 @@
   // live body on the way out means switching back returns the operator's
   // unsaved edit rather than the server copy.
   let bodyByFormat = $state<Record<BodyFormat, string>>({ text: '', html: '' });
-  // Approving an HTML body means seeing what the recipient will see, so the
-  // preview renders it through the same sandboxed frame the reader uses.
-  let previewing = $state(false);
-  // Remote images always load in the draft composer. Blocking them is an
-  // INBOUND privacy control — it stops a stranger's tracking pixel confirming
-  // you opened their mail. This is your own outgoing message: you are the
-  // sender, there is no read receipt to leak, and hiding the artwork means
-  // reviewing a layout your recipient will see and you will not.
-  const remoteImages = true;
+  // HTML opens in the isolated rich editor. Source is an explicit alternate
+  // mode rather than the only way to edit an HTML draft.
+  let htmlSource = $state(false);
+  let richEditor = $state<{ flush: () => string } | null>(null);
+  // An HTML-only body is copied literally into the text slot to preserve the
+  // existing format-switch semantics. It is not an HTML-to-prose conversion.
+  let textSeededFromHtml = $state(false);
   let showBcc = $state(false);
   let baseline = $state<Snapshot>({ to: '', cc: '', bcc: '', subject: '', body: '', format: 'text' });
 
@@ -496,7 +495,9 @@
     loadedForKey = '';
     accountLabel = '';
     loading = true;
-    previewing = false;
+    htmlSource = false;
+    richEditor = null;
+    textSeededFromHtml = false;
   }
 
   /**
@@ -590,9 +591,10 @@
     };
     bodyRaw = rendered.body;
     bodyFormat = rendered.format;
-    // HTML opens rendered. Reading markup is the exception, so it lives behind
-    // the toggle rather than being what a review lands on.
-    previewing = format === 'html';
+    // HTML opens directly editable. Reading/writing source is the exception,
+    // so it lives behind the toggle rather than being what review lands on.
+    htmlSource = false;
+    textSeededFromHtml = next.text_content == null && next.html_content != null;
     showBcc = bccRaw.length > 0;
     conflict = false;
     baseline = rendered;
@@ -624,11 +626,18 @@
    */
   function setFormat(next: BodyFormat) {
     if (next === bodyFormat) return;
+    if (bodyFormat === 'html' && !htmlSource) richEditor?.flush();
     bodyByFormat[bodyFormat] = bodyRaw;
     bodyRaw = bodyByFormat[next];
     bodyFormat = next;
-    // Entering HTML renders it; plain text has nothing to render.
-    previewing = next === 'html';
+    htmlSource = false;
+  }
+
+  /** Flush the live iframe root before an explicit rich/source transition. */
+  function setHtmlSource(next: boolean) {
+    if (next === htmlSource) return;
+    if (next) richEditor?.flush();
+    htmlSource = next;
   }
 
   function snapshot(): Snapshot {
@@ -658,7 +667,14 @@
     // half. When the body did change, send exactly the edited format — clearing
     // the stale alternate is the intended behaviour there.
     if (bodyChanged) {
-      if (bodyFormat === 'html') payload.html_content = bodyRaw;
+      if (bodyFormat === 'html') {
+        // Source mode is intentionally allowed to display literal markup, but
+        // only the shared sanitized body root may cross the save boundary.
+        payload.html_content = sanitizeEmailHtml(bodyRaw, {
+          remoteImages: true,
+          externalLinkTargets: false
+        }).html;
+      }
       else payload.text_content = bodyRaw;
     }
     return payload;
@@ -1138,10 +1154,11 @@
           <button
             type="button"
             class="draft-preview-toggle"
-            aria-pressed={previewing}
-            onclick={() => (previewing = !previewing)}
+            aria-pressed={htmlSource}
+            disabled={inputsLocked}
+            onclick={() => setHtmlSource(!htmlSource)}
           >
-            {previewing ? 'Edit HTML' : 'Preview'}
+            {htmlSource ? 'Rich text' : 'Edit HTML source'}
           </button>
         {/if}
 
@@ -1152,13 +1169,19 @@
           </p>
         {/if}
       </div>
-      {#if previewing && bodyFormat === 'html'}
-        <div class="draft-preview">
-          <BodyFrame
-            html={bodyRaw}
-            {remoteImages}
-          />
-        </div>
+      {#if bodyFormat === 'text' && textSeededFromHtml}
+        <p class="draft-format-warning" role="status">
+          This HTML-only draft has no plain-text alternative. Switching to Text keeps the literal
+          markup; it does not convert HTML to prose.
+        </p>
+      {/if}
+      {#if bodyFormat === 'html' && !htmlSource}
+        <RichHtmlEditor
+          bind:this={richEditor}
+          html={bodyRaw}
+          disabled={inputsLocked}
+          onchange={(html) => (bodyRaw = html)}
+        />
       {:else}
         <label class="draft-sr-only" for="draft-body">Message</label>
         <textarea
@@ -1628,16 +1651,16 @@
     background: var(--env-ink);
     color: var(--env-surface);
   }
-  .draft-preview {
-    /* No inner scroller and no flex clamp. The message IS this page's content;
-       trapping a full HTML email in a 20rem well and asking the operator to
-       scroll it inside a page that also scrolls is two scrollbars for one
-       document. BodyFrame sizes its iframe to the rendered height, so the body
-       flows and the page is the only thing that scrolls. */
-    background: var(--env-surface);
-  }
   .draft-format-note {
     margin: 0;
+    color: var(--env-pending);
+    font-size: 0.75rem;
+  }
+  .draft-format-warning {
+    margin: 0;
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--env-pending);
+    background: var(--env-pending-soft);
     color: var(--env-pending);
     font-size: 0.75rem;
   }

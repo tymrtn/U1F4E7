@@ -5,6 +5,19 @@ All notable changes to Envelope Email are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.2.3] — 2026-09-17
+
+### Fixed
+
+- **Dashboard (draft review):** HTML drafts now open in a directly editable rich-text editor with
+  compact formatting controls and an explicit raw-source mode. Rich edits remain isolated in a
+  scriptless same-origin sandbox, pass through the shared active-content and URL sanitizer, save
+  through the existing revision guard as `html_content`, and keep Send disabled until saved. Format
+  switching preserves unsaved HTML/text alternatives and warns that switching an HTML-only draft
+  to Text keeps literal markup rather than converting it to prose.
+
 ## [1.2.2] — 2026-09-15
 
 ### Fixed
