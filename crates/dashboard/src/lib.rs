@@ -491,6 +491,8 @@ pub fn dashboard_router(state: AppState) -> Router {
         // browser `EventSource` rides the cookie/identity credential; bearer-only
         // clients pass `?access_token=`.
         .route("/events/stream", get(handlers::events_stream::stream))
+        // The Logs page's read: collapsed, filterable, paged.
+        .route("/events", get(handlers::events_log::get))
         // CSRF token mint. Inside the protected router so it shares the auth
         // gate, but GET is never CSRF-checked so it is always reachable to the
         // authorized frontend.
@@ -5058,7 +5060,7 @@ mod tests {
     fn embedded_spa_bundle_routes_every_canonical_deep_link_target() {
         let entry = embedded_spa_entry_chunk();
 
-        for route_id in [CONTROL_ROUTE_ID, "/review", "/rules"] {
+        for route_id in [CONTROL_ROUTE_ID, "/review", "/logs", "/rules"] {
             assert!(
                 entry.contains(&format!("\"{route_id}\"")),
                 "canonical route {route_id} missing from the embedded route table — deep \

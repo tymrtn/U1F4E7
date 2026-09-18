@@ -387,7 +387,7 @@ fn capped(total: i64, items: Vec<Value>) -> Value {
 
 /// Display label for an account id or username alias: `display_name` → `name`
 /// → `username`, falling back to the raw id (same resolution as the cockpit).
-fn account_label(accounts: &[Account], account_id: &str) -> String {
+pub(crate) fn account_label(accounts: &[Account], account_id: &str) -> String {
     accounts
         .iter()
         .find(|acct| acct.id == account_id || acct.username == account_id)

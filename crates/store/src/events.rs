@@ -6,6 +6,34 @@ use crate::errors::Result;
 use crate::models::Event;
 use rusqlite::{OptionalExtension, params};
 
+/// Filters for the Logs read ([`Database::list_event_log`]). Every field is
+/// optional; `limit` counts entries after collapse, not raw rows.
+#[derive(Debug, Default, Clone)]
+pub struct EventLogFilter {
+    pub account_id: Option<String>,
+    /// An exact event type, or a dotted prefix: `send_governor` matches
+    /// `send_governor.blocked` and `send_governor.allowed`.
+    pub event_type: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub since: Option<String>,
+    /// Exclusive upper bound on `created_at` — the paging cursor.
+    pub before: Option<String>,
+    pub limit: usize,
+}
+
+/// One Logs entry: the newest event of a same-day run of the same event about
+/// the same draft (or message), plus what that run collapsed.
+#[derive(Debug, Clone)]
+pub struct EventLogEntry {
+    pub event: Event,
+    pub agent_id: Option<String>,
+    /// From the payload (`$.draft_id` or `$.request.draft_id`), when the event
+    /// concerns a draft.
+    pub draft_id: Option<String>,
+    pub repeat_count: i64,
+    pub first_at: String,
+}
+
 impl Database {
     /// Insert an event into the events table. Attribution is human/legacy
     /// (agent_id stored as NULL); use [`Database::insert_event_with_agent`] to
@@ -106,6 +134,60 @@ impl Database {
 
         let mut stmt = self.conn().prepare(sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(query_params.iter()), map_event)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The Logs read: newest first, with same-day runs of one event type about
+    /// one draft (or message) collapsed into a single entry. The scheduled
+    /// sweep re-evaluates a blocked draft every cooldown and writes a
+    /// `send_governor.blocked` row each time — 22k rows for one July draft on
+    /// the reference install — so without this the page is one draft repeated.
+    /// Runs never merge across days, so "blocked again next week" stays its own
+    /// entry. The bare columns ride along with `MAX(created_at)`, which SQLite
+    /// guarantees come from that newest row.
+    pub fn list_event_log(&self, filter: &EventLogFilter) -> Result<Vec<EventLogEntry>> {
+        let type_prefix = filter.event_type.as_ref().map(|t| format!("{t}.%"));
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
+                    snippet, payload, idempotency_key, secure_pending, acked_at,
+                    MAX(created_at) AS last_at,
+                    agent_id,
+                    COALESCE(json_extract(payload, '$.draft_id'),
+                             json_extract(payload, '$.request.draft_id')) AS draft_id,
+                    COUNT(*) AS repeat_count,
+                    MIN(created_at) AS first_at
+             FROM events
+             WHERE (?1 IS NULL OR account_id = ?1)
+               AND (?2 IS NULL OR event_type = ?2 OR event_type LIKE ?3)
+               AND (?4 IS NULL OR created_at >= ?4)
+               AND (?5 IS NULL OR created_at < ?5)
+             GROUP BY account_id, event_type,
+                      COALESCE(json_extract(payload, '$.draft_id'),
+                               json_extract(payload, '$.request.draft_id'),
+                               message_id, id),
+                      substr(created_at, 1, 10)
+             ORDER BY last_at DESC
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                filter.account_id,
+                filter.event_type,
+                type_prefix,
+                filter.since,
+                filter.before,
+                filter.limit as i64
+            ],
+            |row| {
+                Ok(EventLogEntry {
+                    event: map_event(row)?,
+                    agent_id: row.get(14)?,
+                    draft_id: row.get(15)?,
+                    repeat_count: row.get(16)?,
+                    first_at: row.get(17)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 

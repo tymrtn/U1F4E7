@@ -148,12 +148,14 @@ describe('app shell layout', () => {
     expect(nav).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Mail' })).toHaveAttribute('href', '/v2/mail/unified');
     expect(screen.getByRole('link', { name: 'Review' })).toHaveAttribute('href', '/v2/review');
+    expect(screen.getByRole('link', { name: 'Logs' })).toHaveAttribute('href', '/v2/logs');
     expect(screen.getByRole('link', { name: 'Rules' })).toHaveAttribute('href', '/v2/rules');
     // The Cockpit demo grid is gone (2026-09-17): its approval queue and
-    // scheduled sends live on Review, its agent cards on Rules.
+    // scheduled sends live on Review, its agent cards on Rules, and Logs is
+    // the record of what agents and Envelope did.
     expect(screen.queryByRole('link', { name: 'Cockpit' })).toBeNull();
     const labels = Array.from(nav.querySelectorAll('a')).map((a) => a.textContent?.trim());
-    expect(labels).toEqual(['Mail', 'Review', 'Rules']);
+    expect(labels).toEqual(['Mail', 'Review', 'Logs', 'Rules']);
     // The stub page url is /v2/mail/unified, so Mail is the active tab.
     expect(screen.getByRole('link', { name: 'Mail' })).toHaveClass('is-active');
     expect(screen.getByRole('link', { name: 'Review' })).not.toHaveClass('is-active');

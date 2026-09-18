@@ -16,6 +16,7 @@ pub mod cockpit;
 pub mod compose;
 pub mod draft_attachments;
 pub mod drafts;
+pub mod events_log;
 pub mod events_stream;
 pub mod folders;
 pub mod health;
