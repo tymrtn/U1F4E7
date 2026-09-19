@@ -171,6 +171,23 @@ pub struct MailEngineStatus {
     pub last_error: Option<String>,
 }
 
+/// Privacy-minimized handle for a message routed into the digest queue.
+/// Message content remains in the mailbox and can be fetched read-only by UID
+/// when a digest compiler is ready to render a batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MailEngineDigestCandidate {
+    pub account_id: String,
+    pub folder: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
+    pub route_probability: Option<f64>,
+    pub route_confidence: Option<f64>,
+    pub urgency: String,
+    pub requires_reply_probability: Option<f64>,
+    pub bulk_or_subscription_probability: Option<f64>,
+    pub decided_at: String,
+}
+
 impl Database {
     /// Plan a new-only mailbox scan. The first observation and every
     /// UIDVALIDITY change establish a baseline at the current highest UID and
@@ -501,6 +518,49 @@ impl Database {
             |row| Ok(row.get::<_, i64>(0)? as u32),
         )?;
         Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn list_mail_engine_digest_queue(
+        &self,
+        account_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailEngineDigestCandidate>> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::Config(
+                "mail engine digest queue limit must be between 1 and 100".into(),
+            ));
+        }
+        let mut stmt = self.conn().prepare(
+            "SELECT d.account_id, d.folder, d.uidvalidity, d.uid,
+                    d.route_probability, d.route_confidence, d.urgency,
+                    d.requires_reply_probability, d.bulk_or_subscription_probability,
+                    d.updated_at
+             FROM mail_engine_decisions d
+             JOIN mail_engine_mailboxes m
+               ON m.account_id = d.account_id AND m.folder = d.folder
+              AND m.uidvalidity = d.uidvalidity
+             WHERE d.route = 'digest_news' AND d.status = 'decided'
+               AND (?1 IS NULL OR d.account_id = ?1)
+             ORDER BY d.updated_at DESC, d.account_id ASC, d.folder ASC,
+                      d.uidvalidity DESC, d.uid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit as i64], |row| {
+            Ok(MailEngineDigestCandidate {
+                account_id: row.get(0)?,
+                folder: row.get(1)?,
+                uidvalidity: row.get::<_, i64>(2)? as u32,
+                uid: row.get::<_, i64>(3)? as u32,
+                route_probability: row.get(4)?,
+                route_confidence: row.get(5)?,
+                urgency: row.get(6)?,
+                requires_reply_probability: row.get(7)?,
+                bulk_or_subscription_probability: row.get(8)?,
+                decided_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn mail_engine_decision_exists(
@@ -1041,6 +1101,45 @@ mod tests {
                 .unwrap(),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn digest_queue_is_bounded_filtered_and_contains_only_message_handles() {
+        let db = db();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 100).unwrap();
+        db.plan_mail_engine_scan("other", "INBOX", 10, 100).unwrap();
+        for (uid, route, account_id, uidvalidity) in [
+            (5_u32, "digest_news", "acct", 9_u32),
+            (4_u32, "digest_news", "acct", 10),
+            (2_u32, "important", "acct", 10),
+            (3_u32, "digest_news", "other", 10),
+            (1_u32, "digest_news", "acct", 10),
+        ] {
+            let mut item = decision();
+            item.uid = uid;
+            item.route = route;
+            item.account_id = account_id;
+            item.uidvalidity = uidvalidity;
+            assert!(db.insert_mail_engine_decision_if_absent(&item).unwrap());
+        }
+
+        let queue = db.list_mail_engine_digest_queue(Some("acct"), 1).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].account_id, "acct");
+        assert_eq!(queue[0].folder, "INBOX");
+        assert_eq!(queue[0].uidvalidity, 10);
+        assert_eq!(queue[0].uid, 4);
+        assert_eq!(queue[0].urgency, "not_urgent");
+        let rendered = serde_json::to_string(&queue).unwrap();
+        for forbidden in ["decision_json", "input_hash", "model", "subject", "sender"] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert_eq!(
+            db.list_mail_engine_digest_queue(None, 100).unwrap().len(),
+            3
+        );
+        assert!(db.list_mail_engine_digest_queue(None, 0).is_err());
+        assert!(db.list_mail_engine_digest_queue(None, 101).is_err());
     }
 
     #[test]

@@ -74,7 +74,7 @@ The v3 contract covers:
 - delivery/watch health: `watch_status`
 - snooze management: `snooze`
 - read observation (CLI only): `analytics_show`
-- CLI-only Jev mail engine: `engine once`, `engine run`, `engine status`
+- CLI-only Jev mail engine: `engine once`, `engine run`, `engine status`, `engine digest-queue`
 
 ## Jev new-mail decision engine
 
@@ -83,6 +83,8 @@ The v3 contract covers:
 Each new message causes at most one request to OpenRouter's Decisions API using `typesafe/jev-1.13`. Envelope sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender, interaction, and reply statistics. This is third-party data egress. Envelope excludes credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs. The API key is read from `OPENROUTER_API_KEY`, never persisted, and production transport is pinned to `https://openrouter.ai/api/alpha/decisions` with redirects disabled.
 
 The one request asks independent typed questions for route, urgency, immediate notification, reply requirement, and bulk/subscription status. Code—not Jev—owns policy and side effects. A durable claim is written before the paid request, so concurrent workers and crash retries do not spend twice. Malformed, uncertain, unavailable, or unparseable cases become local `review` decisions and leave Inbox unchanged.
+
+`envelope engine digest-queue` exposes a bounded, account-filterable list of message handles routed to `digest_news` in each mailbox's current UIDVALIDITY epoch; stale numeric UIDs from recreated mailboxes are excluded. It is local and read-only: output contains account, folder, UIDVALIDITY, UID, typed probabilities, urgency, and decision time, but no sender, subject, body, Message-ID, model response, or credential material. A later digest compiler can deliberately fetch only those selected messages with read-only IMAP operations.
 
 Without `--apply`, all decisions are local queues. With `--apply`, only a high-confidence `junk` decision may move a message into an already detected spam folder. Automated moves require UIDPLUS and refuse servers that would need mailbox-wide `EXPUNGE`; there is no permanent deletion or outbound email. `unsubscribe_candidate` never performs network navigation or sends mail—it remains queued for the separate governed unsubscribe workflow. Urgent notifications are recorded as redacted local events.
 

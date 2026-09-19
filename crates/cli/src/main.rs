@@ -1508,6 +1508,15 @@ enum EngineCmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// List privacy-minimized handles queued for news-digest compilation
+    DigestQueue {
+        /// Account ID or email (all configured accounts when omitted)
+        #[arg(long)]
+        account: Option<String>,
+        /// Maximum queued message handles to return (1..=100)
+        #[arg(long, default_value = "50", value_parser = parse_engine_digest_limit)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1919,6 +1928,16 @@ fn parse_engine_interval(value: &str) -> Result<u64, String> {
         .map_err(|error| format!("--interval-seconds invalid integer: {error}"))?;
     if parsed < 60 {
         return Err("--interval-seconds must be at least 60".into());
+    }
+    Ok(parsed)
+}
+
+fn parse_engine_digest_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("--limit invalid integer: {error}"))?;
+    if !(1..=100).contains(&parsed) {
+        return Err("--limit must be between 1 and 100 for the engine digest queue".into());
     }
     Ok(parsed)
 }
@@ -2941,6 +2960,9 @@ fn main() {
             EngineCmd::Status { account } => {
                 commands::engine::run_status(account.as_deref(), cli.json)
             }
+            EngineCmd::DigestQueue { account, limit } => {
+                commands::engine::run_digest_queue(account.as_deref(), limit, cli.json)
+            }
         },
 
         Commands::Unsubscribe {
@@ -3153,6 +3175,34 @@ mod tests {
                 subcommand: EngineCmd::Status { .. }
             }
         ));
+    }
+
+    #[test]
+    fn engine_digest_queue_parses_bounded_limit() {
+        let queue = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "digest-queue",
+            "--account",
+            "account@example.test",
+            "--limit",
+            "25",
+            "--json",
+        ])
+        .expect("engine digest queue should parse");
+        assert!(queue.json);
+        assert!(matches!(
+            queue.command,
+            Commands::Engine {
+                subcommand: EngineCmd::DigestQueue { limit: 25, .. }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["envelope", "engine", "digest-queue", "--limit", "0"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["envelope", "engine", "digest-queue", "--limit", "101"]).is_err()
+        );
     }
 
     #[test]

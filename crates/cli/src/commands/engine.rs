@@ -135,6 +135,39 @@ pub fn run_status(account: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn run_digest_queue(account: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let account_id = account
+        .map(|value| resolve_account(&db, Some(value)).map(|account| account.id))
+        .transpose()?;
+    let queue = db.list_mail_engine_digest_queue(account_id.as_deref(), limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&queue)?);
+    } else if queue.is_empty() {
+        println!("The Jev news-digest queue is empty.");
+    } else {
+        for item in queue {
+            println!(
+                "{} {} UID {} (UIDVALIDITY {}, route probability {}, confidence {}, decided {})",
+                item.account_id,
+                item.folder,
+                item.uid,
+                item.uidvalidity,
+                display_probability(item.route_probability),
+                display_probability(item.route_confidence),
+                item.decided_at,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn display_probability(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>> {
     let db = Database::open_default().context("failed to open database")?;
     let passphrase = credential_store::get_or_create_passphrase(options.backend)
