@@ -18,6 +18,7 @@ pub mod event_deliveries;
 pub mod event_routes;
 pub mod events;
 pub mod license_store;
+pub mod mail_engine;
 pub mod message_index;
 pub mod migration;
 pub mod migrations;
@@ -47,6 +48,10 @@ pub use drafts::{
 pub use errors::StoreError;
 pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use events::{EventLogEntry, EventLogFilter};
+pub use mail_engine::{
+    MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineSenderStats, MailEngineStatus,
+    MailboxScanPlan, NewMailEngineDecision, mail_engine_hash,
+};
 pub use models::*;
 pub use ops_primitives::{RuleRunAuditInput, WatchUpsert};
 pub use paths::{app_data_dir, config_root_dir, credential_file_path, database_path};

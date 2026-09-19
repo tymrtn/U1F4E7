@@ -23,6 +23,7 @@ pub mod governor_catalog;
 pub mod idle;
 pub mod imap;
 pub mod ingress;
+pub mod jev;
 pub mod managesieve;
 pub mod migrate;
 pub mod outbound;

@@ -19,6 +19,7 @@ pub mod datetime;
 pub mod deliverability;
 pub mod doctor;
 pub mod drafts;
+pub mod engine;
 pub mod events;
 pub mod evidence;
 pub mod flags;
