@@ -74,7 +74,7 @@ The v3 contract covers:
 - delivery/watch health: `watch_status`
 - snooze management: `snooze`
 - read observation (CLI only): `analytics_show`
-- CLI-only Jev mail engine: `engine once`, `engine run`, `engine status`, `engine digest-queue`
+- CLI-only Jev mail engine: `engine once`, `engine run`, `engine status`, `engine digest-queue`, `engine digest`
 
 ## Jev new-mail decision engine
 
@@ -85,6 +85,8 @@ Each new message causes at most one request to OpenRouter's Decisions API using 
 The one request asks independent typed questions for route, urgency, immediate notification, reply requirement, and bulk/subscription status. Code—not Jev—owns policy and side effects. A durable claim is written before the paid request, so concurrent workers and crash retries do not spend twice. Malformed, uncertain, unavailable, or unparseable cases become local `review` decisions and leave Inbox unchanged.
 
 `envelope engine digest-queue` exposes a bounded, account-filterable list of message handles routed to `digest_news` in each mailbox's current UIDVALIDITY epoch; stale numeric UIDs from recreated mailboxes are excluded. It is local and read-only: output contains account, folder, UIDVALIDITY, UID, typed probabilities, urgency, and decision time, but no sender, subject, body, Message-ID, model response, or credential material. A later digest compiler can deliberately fetch only those selected messages with read-only IMAP operations.
+
+`envelope engine digest` is that bounded read-only compiler's first output surface. It revalidates UIDVALIDITY at the mailbox edge, opens folders with `EXAMINE`, and fetches only `From`, `Subject`, and `Date` through UID `BODY.PEEK[HEADER.FIELDS ...]` requests. It never fetches a message body or marks a message read. JSON nests sanitized sender/subject/date under `untrusted_content` and attaches the standard `envelope.inbound-trust.v1` marker with `instructions_authoritative=false`; host-owned message handles and typed route metadata remain separate. Recipient fields, Message-ID, flags, message size, provider-spam metadata, credentials, and raw errors are excluded. Account/folder failures are returned as coarse error codes so one unavailable mailbox does not fabricate digest items.
 
 Without `--apply`, all decisions are local queues. With `--apply`, only a high-confidence `junk` decision may move a message into an already detected spam folder. Automated moves require UIDPLUS and refuse servers that would need mailbox-wide `EXPUNGE`; there is no permanent deletion or outbound email. `unsubscribe_candidate` never performs network navigation or sends mail—it remains queued for the separate governed unsubscribe workflow. Urgent notifications are recorded as redacted local events.
 

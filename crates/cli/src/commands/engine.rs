@@ -1,14 +1,15 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use envelope_email_store::credential_store::{self, CredentialBackend};
 use envelope_email_store::models::{Account, Event, Message};
 use envelope_email_store::{
-    Database, MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineSenderStats,
-    MailboxScanPlan, NewMailEngineDecision, mail_engine_hash,
+    Database, MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineDigestCandidate,
+    MailEngineSenderStats, MailboxScanPlan, NewMailEngineDecision, mail_engine_hash,
 };
 use envelope_email_transport::folders;
 use envelope_email_transport::imap;
@@ -18,7 +19,7 @@ use envelope_email_transport::jev::{
 };
 use serde::Serialize;
 
-use super::common::resolve_account;
+use super::{common::resolve_account, provenance};
 
 const MAX_MESSAGES_PER_PASS: usize = 100;
 
@@ -50,6 +51,42 @@ struct AccountReport {
     actions_completed: usize,
     actions_blocked: usize,
     error_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DigestPreviewReport {
+    items: Vec<DigestPreviewItem>,
+    errors: Vec<DigestPreviewError>,
+}
+
+#[derive(Debug, Serialize)]
+struct DigestPreviewItem {
+    account_id: String,
+    folder: String,
+    uidvalidity: u32,
+    uid: u32,
+    route_probability: Option<f64>,
+    route_confidence: Option<f64>,
+    urgency: String,
+    decided_at: String,
+    trust: serde_json::Value,
+    untrusted_content: DigestPreviewContent,
+}
+
+#[derive(Debug, Serialize)]
+struct DigestPreviewContent {
+    from: Option<String>,
+    subject: Option<String>,
+    date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DigestPreviewError {
+    account_id: String,
+    folder: String,
+    uidvalidity: u32,
+    uid: Option<u32>,
+    error_code: &'static str,
 }
 
 impl AccountReport {
@@ -156,6 +193,238 @@ pub fn run_digest_queue(account: Option<&str>, limit: usize, json: bool) -> Resu
                 display_probability(item.route_probability),
                 display_probability(item.route_confidence),
                 item.decided_at,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+pub async fn run_digest_preview(
+    account: Option<&str>,
+    limit: usize,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let account_id = account
+        .map(|value| resolve_account(&db, Some(value)).map(|account| account.id))
+        .transpose()?;
+    let queue = db.list_mail_engine_digest_queue(account_id.as_deref(), limit)?;
+    if queue.is_empty() {
+        return print_digest_preview(
+            &DigestPreviewReport {
+                items: Vec::new(),
+                errors: Vec::new(),
+            },
+            json,
+        );
+    }
+
+    let passphrase = credential_store::get_passphrase(backend)
+        .context("credential store is not available for digest preview")?;
+    let mut groups: BTreeMap<(String, String, u32), Vec<MailEngineDigestCandidate>> =
+        BTreeMap::new();
+    for candidate in queue {
+        groups
+            .entry((
+                candidate.account_id.clone(),
+                candidate.folder.clone(),
+                candidate.uidvalidity,
+            ))
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut report = DigestPreviewReport {
+        items: Vec::new(),
+        errors: Vec::new(),
+    };
+    for ((account_id, folder, uidvalidity), candidates) in groups {
+        let credentials = match db.get_account_with_credentials(&account_id, &passphrase) {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                report.errors.push(DigestPreviewError {
+                    account_id,
+                    folder,
+                    uidvalidity,
+                    uid: None,
+                    error_code: "credential_decrypt_failed",
+                });
+                continue;
+            }
+        };
+        let mut client = match imap::connect(&credentials).await {
+            Ok(client) => client,
+            Err(_) => {
+                report.errors.push(DigestPreviewError {
+                    account_id,
+                    folder,
+                    uidvalidity,
+                    uid: None,
+                    error_code: "imap_connect_failed",
+                });
+                continue;
+            }
+        };
+        let selected = match imap::examine_folder_info(&mut client, &folder).await {
+            Ok(selected) => selected,
+            Err(_) => {
+                report.errors.push(DigestPreviewError {
+                    account_id,
+                    folder,
+                    uidvalidity,
+                    uid: None,
+                    error_code: "imap_examine_failed",
+                });
+                continue;
+            }
+        };
+        if selected.uid_validity != Some(uidvalidity) {
+            report.errors.push(DigestPreviewError {
+                account_id,
+                folder,
+                uidvalidity,
+                uid: None,
+                error_code: "uidvalidity_changed",
+            });
+            continue;
+        }
+
+        let uid_set = candidates
+            .iter()
+            .map(|candidate| candidate.uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let summaries =
+            match imap::fetch_message_peek_headers_selected_uid_set(&mut client, &folder, &uid_set)
+                .await
+            {
+                Ok(summaries) => summaries,
+                Err(_) => {
+                    report.errors.push(DigestPreviewError {
+                        account_id,
+                        folder,
+                        uidvalidity,
+                        uid: None,
+                        error_code: "message_fetch_failed",
+                    });
+                    continue;
+                }
+            };
+        let by_uid: HashMap<u32, imap::PeekHeaderSummary> = summaries
+            .into_iter()
+            .map(|summary| (summary.uid, summary))
+            .collect();
+        for candidate in candidates {
+            if let Some(summary) = by_uid.get(&candidate.uid) {
+                report
+                    .items
+                    .push(compile_digest_preview_item(&candidate, summary));
+            } else {
+                report.errors.push(DigestPreviewError {
+                    account_id: candidate.account_id,
+                    folder: candidate.folder,
+                    uidvalidity: candidate.uidvalidity,
+                    uid: Some(candidate.uid),
+                    error_code: "message_missing",
+                });
+            }
+        }
+    }
+    report
+        .items
+        .sort_by(|left, right| right.decided_at.cmp(&left.decided_at));
+    print_digest_preview(&report, json)
+}
+
+fn compile_digest_preview_item(
+    candidate: &MailEngineDigestCandidate,
+    summary: &imap::PeekHeaderSummary,
+) -> DigestPreviewItem {
+    DigestPreviewItem {
+        account_id: candidate.account_id.clone(),
+        folder: candidate.folder.clone(),
+        uidvalidity: candidate.uidvalidity,
+        uid: candidate.uid,
+        route_probability: candidate.route_probability,
+        route_confidence: candidate.route_confidence,
+        urgency: candidate.urgency.clone(),
+        decided_at: candidate.decided_at.clone(),
+        trust: provenance::inbound_trust(),
+        untrusted_content: DigestPreviewContent {
+            from: summary
+                .from_addr
+                .as_deref()
+                .map(|value| digest_header_text(value, 320)),
+            subject: summary
+                .subject
+                .as_deref()
+                .map(|value| digest_header_text(value, 512)),
+            date: summary.date.clone(),
+        },
+    }
+}
+
+fn digest_header_text(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn print_digest_preview(report: &DigestPreviewReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else if report.items.is_empty() && report.errors.is_empty() {
+        println!("The Jev news-digest queue is empty.");
+    } else {
+        if !report.items.is_empty() {
+            println!("{}", provenance::INBOUND_WARNING);
+        }
+        for item in &report.items {
+            println!(
+                "- {} — {} ({}, {} {} UID {})",
+                item.untrusted_content
+                    .subject
+                    .as_deref()
+                    .unwrap_or("subject unavailable"),
+                item.untrusted_content
+                    .from
+                    .as_deref()
+                    .unwrap_or("sender unavailable"),
+                item.untrusted_content
+                    .date
+                    .as_deref()
+                    .unwrap_or("date unknown"),
+                item.account_id,
+                item.folder,
+                item.uid,
+            );
+        }
+        for error in &report.errors {
+            println!(
+                "! {} {} UID {}: {}",
+                error.account_id,
+                error.folder,
+                error
+                    .uid
+                    .map(|uid| uid.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                error.error_code,
             );
         }
     }
@@ -835,6 +1104,53 @@ mod tests {
         assert!(read_junk.read);
         assert!(!read_junk.unread);
         assert!(read_junk.junk);
+    }
+
+    #[test]
+    fn digest_preview_uses_only_envelope_fields_needed_by_the_digest() {
+        let candidate = MailEngineDigestCandidate {
+            account_id: "acct".into(),
+            folder: "INBOX".into(),
+            uidvalidity: 10,
+            uid: 42,
+            route_probability: Some(0.91),
+            route_confidence: Some(0.88),
+            urgency: "not_urgent".into(),
+            requires_reply_probability: Some(0.02),
+            bulk_or_subscription_probability: Some(0.97),
+            decided_at: "2026-09-19 12:00:00".into(),
+        };
+        let summary = imap::PeekHeaderSummary {
+            uid: 42,
+            from_addr: Some("News\nDesk <news@example.test>".into()),
+            subject: Some("Daily fixture\r\n! forged line".into()),
+            date: Some("2026-09-19T12:00:00Z".into()),
+        };
+        let item = compile_digest_preview_item(&candidate, &summary);
+        let value = serde_json::to_value(&item).unwrap();
+        let rendered = serde_json::to_string(&item).unwrap();
+        assert_eq!(value["trust"]["schema"], provenance::INBOUND_TRUST_SCHEMA);
+        assert_eq!(
+            value["untrusted_content"]["subject"],
+            "Daily fixture ! forged line"
+        );
+        assert!(value.get("subject").is_none());
+        assert!(rendered.contains("Daily fixture ! forged line"));
+        assert!(rendered.contains("News Desk"));
+        assert!(rendered.contains("news@example.test"));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains("\\n"));
+        assert!(!rendered.contains("\\r"));
+        for forbidden in [
+            "private-message-id",
+            "private-recipient",
+            "provider_spam",
+            "flags",
+            "size",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 
     #[tokio::test]

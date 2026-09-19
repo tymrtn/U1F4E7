@@ -545,6 +545,32 @@ pub async fn fetch_folder_summaries_read_only(
     Ok(summaries)
 }
 
+/// Fetch only From/Subject/Date headers for explicit UIDs in the currently
+/// selected mailbox. Callers that require a read-only operation must first use
+/// EXAMINE. BODY.PEEK prevents changes to the Seen flag.
+pub async fn fetch_message_peek_headers_selected_uid_set(
+    client: &mut ImapClient,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<PeekHeaderSummary>, ImapError> {
+    validate_imap_input(folder)?;
+    validate_uid_set(uid_set)?;
+    let messages = client
+        .session
+        .uid_fetch(uid_set, QUICKSTART_PEEK_FETCH_DESCRIPTOR)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH digest {folder} {uid_set}: {e}")))?;
+    let mut summaries = Vec::new();
+    let mut stream = messages;
+    while let Some(item) = stream.next().await {
+        let fetch =
+            item.map_err(|e| ImapError::Protocol(format!("UID FETCH digest parse error: {e}")))?;
+        summaries.push(digest_peek_header_summary_from_fetch(&fetch)?);
+    }
+    summaries.sort_unstable_by_key(|summary| summary.uid);
+    Ok(summaries)
+}
+
 fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
     let uid = fetch.uid.unwrap_or(0);
     let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
@@ -1261,6 +1287,41 @@ pub(crate) fn missing_body_protocol_error(
     ))
 }
 
+/// Parse one bounded From/Subject/Date BODY.PEEK response.
+fn digest_peek_header_summary_from_fetch(
+    fetch: &async_imap::types::Fetch,
+) -> Result<PeekHeaderSummary, ImapError> {
+    let uid = fetch
+        .uid
+        .ok_or_else(|| ImapError::Protocol("header peek response without UID".into()))?;
+    let header = fetch.header().ok_or_else(|| {
+        ImapError::Protocol(format!(
+            "header peek response without header bytes for UID {uid}"
+        ))
+    })?;
+    digest_peek_header_summary_from_bytes(uid, header)
+}
+
+fn digest_peek_header_summary_from_bytes(
+    uid: u32,
+    header: &[u8],
+) -> Result<PeekHeaderSummary, ImapError> {
+    let parsed = mail_parser::MessageParser::default()
+        .parse(header)
+        .ok_or_else(|| ImapError::Protocol(format!("header peek parse failed for UID {uid}")))?;
+    let from_addr = parsed
+        .from()
+        .and_then(|addresses| addresses.first())
+        .and_then(|address| address.address())
+        .map(ToString::to_string);
+    Ok(PeekHeaderSummary {
+        uid,
+        from_addr,
+        subject: parsed.subject().map(ToString::to_string),
+        date: parsed.date().map(|date| date.to_rfc3339()),
+    })
+}
+
 /// Fetch only recent headers after opening a mailbox read-only with EXAMINE.
 pub async fn peek_folder_headers_read_only(
     client: &mut ImapClient,
@@ -1296,11 +1357,11 @@ pub async fn peek_folder_headers_read_only(
             .map(|parsed| {
                 let from = parsed
                     .from()
-                    .and_then(|a| a.first())
-                    .and_then(|a| a.address())
-                    .map(|s| s.to_string());
-                let subject = parsed.subject().map(|s| s.to_string());
-                let date = parsed.date().map(|d| d.to_rfc3339());
+                    .and_then(|addresses| addresses.first())
+                    .and_then(|address| address.address())
+                    .map(ToString::to_string);
+                let subject = parsed.subject().map(ToString::to_string);
+                let date = parsed.date().map(|date| date.to_rfc3339());
                 (from, subject, date)
             })
             .unwrap_or((None, None, None));
@@ -2452,6 +2513,16 @@ mod tests {
     // ── parse_message_id_from_header_section (FETCH section boundary) ───
     // Representative `BODY[HEADER.FIELDS (MESSAGE-ID)]` section payloads:
     // header lines, CRLF-terminated, ending with an empty line.
+
+    #[test]
+    fn digest_peek_parser_reads_only_header_section_bytes() {
+        let header = b"From: News Desk <news@example.test>\r\nSubject: Daily fixture\r\nDate: Sat, 19 Sep 2026 12:00:00 +0000\r\nTo: private-recipient@example.test\r\nMessage-ID: <private-message-id@example.test>\r\n\r\n";
+        let summary = digest_peek_header_summary_from_bytes(42, header).unwrap();
+        assert_eq!(summary.uid, 42);
+        assert_eq!(summary.from_addr.as_deref(), Some("news@example.test"));
+        assert_eq!(summary.subject.as_deref(), Some("Daily fixture"));
+        assert_eq!(summary.date.as_deref(), Some("2026-09-19T12:00:00Z"));
+    }
 
     #[test]
     fn header_section_parses_message_id_from_representative_fetch_data() {
