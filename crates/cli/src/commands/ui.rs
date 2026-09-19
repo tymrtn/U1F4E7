@@ -334,12 +334,16 @@ pub fn encode_segment(s: &str) -> String {
     out
 }
 
-/// The dashboard's cockpit client route. It is global, not account-scoped —
-/// the SPA has no `/accounts/{id}/cockpit` route and renders its own 404 there.
-const COCKPIT_PATH: &str = "/cockpit";
+/// The dashboard's Review queue client route. It is global, not account-scoped —
+/// the SPA has no `/accounts/{id}/review` route and renders its own 404 there.
+///
+/// This is also what the `cockpit_url` key points at. The Cockpit page was
+/// removed on 2026-09-17 and its approval queue moved to Review; the key name
+/// is kept so agents already reading it keep landing somewhere real.
+const REVIEW_PATH: &str = "/review";
 
 /// The dashboard's rules client route. Global for the same reason as
-/// [`COCKPIT_PATH`].
+/// [`REVIEW_PATH`].
 const RULES_PATH: &str = "/rules";
 
 /// Root-level UI metadata when there is no account/draft/message context.
@@ -353,17 +357,16 @@ pub fn root_ui() -> Value {
     ui
 }
 
-/// UI metadata anchored at the agent cockpit.
+/// UI metadata anchored at the Review queue.
 ///
-/// `account_id` is accepted so every call site stays account-aware, but the
-/// cockpit itself is a single global route: the account is selected inside the
-/// page, not in the URL.
+/// `account_id` is accepted so every call site stays account-aware, but Review
+/// is a single global route: it lists every account's pending decisions.
 pub fn account_ui(_account_id: &str) -> Value {
     let origin = dashboard_origin();
     let mut ui = json!({
         "dashboard_url": origin.base_url,
-        "dashboard_path": COCKPIT_PATH,
-        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "dashboard_path": REVIEW_PATH,
+        "cockpit_url": join(&origin.base_url, REVIEW_PATH),
     });
     attach_dashboard_origin_metadata(&mut ui, &origin);
     ui
@@ -379,7 +382,7 @@ pub fn draft_ui(account_id: &str, draft_id: &str) -> Value {
     let mut ui = json!({
         "dashboard_url": origin.base_url,
         "dashboard_path": draft_path.clone(),
-        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "cockpit_url": join(&origin.base_url, REVIEW_PATH),
         "review_url": join(&origin.base_url, &draft_path),
     });
     attach_dashboard_origin_metadata(&mut ui, &origin);
@@ -392,7 +395,7 @@ pub fn rules_ui(_account_id: &str) -> Value {
     let mut ui = json!({
         "dashboard_url": origin.base_url,
         "dashboard_path": RULES_PATH,
-        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "cockpit_url": join(&origin.base_url, REVIEW_PATH),
         "rules_url": join(&origin.base_url, RULES_PATH),
     });
     attach_dashboard_origin_metadata(&mut ui, &origin);
@@ -410,7 +413,7 @@ pub fn message_ui(account_id: &str, uid: u32, folder: &str) -> Value {
     let mut ui = json!({
         "dashboard_url": origin.base_url,
         "dashboard_path": msg_path.clone(),
-        "cockpit_url": join(&origin.base_url, COCKPIT_PATH),
+        "cockpit_url": join(&origin.base_url, REVIEW_PATH),
         "message_url": join(&origin.base_url, &msg_path),
     });
     attach_dashboard_origin_metadata(&mut ui, &origin);
@@ -770,8 +773,8 @@ mod tests {
         let _guard = isolated_dashboard_config("account-default");
         let ui = account_ui("acct-1");
         assert_eq!(ui["dashboard_url"], "http://localhost:3141");
-        assert_eq!(ui["dashboard_path"], "/cockpit");
-        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
+        assert_eq!(ui["dashboard_path"], "/review");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/review");
     }
 
     #[test]
@@ -786,8 +789,8 @@ mod tests {
 
         let ui = account_ui("acct/one");
         assert_eq!(ui["dashboard_url"], "http://localhost:3141");
-        assert_eq!(ui["dashboard_path"], "/cockpit");
-        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
+        assert_eq!(ui["dashboard_path"], "/review");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/review");
     }
 
     #[test]
@@ -799,7 +802,7 @@ mod tests {
             ui["review_url"],
             "http://localhost:3141/accounts/acct-1/drafts/draft-abc"
         );
-        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/review");
     }
 
     #[test]
@@ -808,7 +811,7 @@ mod tests {
         let ui = rules_ui("acct-1");
         assert_eq!(ui["dashboard_path"], "/rules");
         assert_eq!(ui["rules_url"], "http://localhost:3141/rules");
-        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/review");
     }
 
     #[test]
@@ -840,7 +843,7 @@ mod tests {
             ui["message_url"],
             "http://localhost:3141/mail/unified/acct%2Fone/42?folder=Sent%2FItems%20%26%20Stuff"
         );
-        assert_eq!(ui["cockpit_url"], "http://localhost:3141/cockpit");
+        assert_eq!(ui["cockpit_url"], "http://localhost:3141/review");
     }
 
     /// The exact link shape reproduced against installed 1.0.10: a UUID account

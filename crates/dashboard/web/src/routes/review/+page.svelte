@@ -2,8 +2,7 @@
   // Review — the operator's daily queue. One scannable page of what is
   // pending, grouped by the decision needed, across every account. Strictly
   // read-only: every row deep-links to the surface where the action happens
-  // (draft review, message reader, rules page). The Cockpit stays the
-  // diagnostic view; this page is the queue.
+  // (draft review, message reader, rules page). This page is the queue.
   import { onMount } from 'svelte';
   import { base } from '$app/paths';
   import { Spinner, EmptyState } from '$lib/components';

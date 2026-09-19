@@ -1,6 +1,6 @@
 // Tests for the draft review composer mounted at
 // /accounts/[account]/drafts/[draft] — the surface CLI/MCP `review_url` and
-// the cockpit Edit action deep-link into.
+// Review's row deep-links land on.
 //
 // Coverage:
 //   • loads the exact draft named by the route params
@@ -13,6 +13,8 @@
 //   • a queued draft shows a live countdown, a link to the outbox, and a Hold
 //     control that unqueues without discarding
 //   • non-editable statuses render read-only
+//   • Approve is offered only on a draft awaiting review, posts the viewed
+//     revision, sends nothing, and says so
 
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,6 +27,7 @@ const { apiMock } = vi.hoisted(() => ({
     editDraft: vi.fn(),
     sendDraft: vi.fn(),
     holdDraft: vi.fn(),
+    approveDraft: vi.fn(),
     contextRefinement: vi.fn(),
     retryContextRefinement: vi.fn(),
     discardDraft: vi.fn(),
@@ -785,12 +788,12 @@ describe('DraftComposer queued countdown', () => {
     expect(secondary?.textContent).not.toContain(at);
   });
 
-  it('links to the cockpit outbox panel', async () => {
+  it('links to the Review page’s Waiting section, where every queued send is listed', async () => {
     await renderLoaded({ send_after: '2026-07-30T10:02:00Z' });
 
     const link = document.getElementById('draft-outbox-link') as HTMLAnchorElement;
     expect(link).toBeTruthy();
-    expect(link.getAttribute('href')).toBe('/cockpit#scheduled-panel');
+    expect(link.getAttribute('href')).toBe('/review#review-waiting');
   });
 
   it('does not count down a draft that is not queued', async () => {
@@ -1911,5 +1914,113 @@ describe('DraftComposer tall forwarded HTML draft', () => {
     // they exist and are reachable, not trapped behind an inner scroller.
     expect(screen.getByRole('button', { name: /human-only send in/i })).toBeEnabled();
     expect(screen.getByRole('button', { name: /human-only send now/i })).toBeEnabled();
+  });
+});
+
+describe('DraftComposer approve', () => {
+  // Approve moved here from the deleted Cockpit (2026-09-17). It is the
+  // human's "I reviewed exactly this revision" — review only. It queues
+  // nothing, so a later agent send stays Governor-gated (with `tyler_approved`
+  // on top). Sending from this page is Human-only Send, a separate click.
+  const approveButton = () => screen.getByRole('button', { name: /^approv/i });
+  const APPROVED_META = {
+    human_approval: { approved_by: 'human:dashboard', approved_at: '2026-09-17T20:00:00Z', revision: 7 }
+  };
+
+  it('offers Approve on a draft awaiting review and on a blocked one', async () => {
+    await renderLoaded({ status: 'pending_review' });
+    expect(approveButton()).toBeEnabled();
+  });
+
+  it('offers Approve on a blocked draft — that is how it gets back to draft', async () => {
+    await renderLoaded({ status: 'blocked' });
+    expect(approveButton()).toBeEnabled();
+  });
+
+  it('offers no Approve on a plain draft, a queued one, or a sent one', async () => {
+    await renderLoaded({ status: 'draft' });
+    expect(screen.queryByRole('button', { name: /^approv/i })).toBeNull();
+  });
+
+  it('offers no Approve once the message is sent', async () => {
+    await renderLoaded({ status: 'sent', sent_at: '2026-09-17T20:00:00Z' });
+    expect(screen.queryByRole('button', { name: /^approv/i })).toBeNull();
+  });
+
+  it('says plainly that Approve neither sends nor exempts a later agent send', async () => {
+    await renderLoaded({ status: 'pending_review' });
+    const note = document.getElementById('draft-approve-note');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toContain('does not send the draft');
+    expect(note!.textContent).toContain('does not exempt a later agent send');
+    expect(note!.textContent).toContain('Human-only Send');
+  });
+
+  it('posts the shown revision to the approve endpoint', async () => {
+    apiMock.approveDraft.mockResolvedValue({
+      draft: { ...BASE_DRAFT, status: 'draft', metadata: APPROVED_META },
+      status: 'approved'
+    });
+    await renderLoaded({ status: 'pending_review' });
+
+    await fireEvent.click(approveButton());
+
+    await waitFor(() =>
+      expect(apiMock.approveDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT, { expected_revision: 7 })
+    );
+  });
+
+  it('adopts the approved row: Approved badge, no Approve button, nothing queued', async () => {
+    apiMock.approveDraft.mockResolvedValue({
+      draft: { ...BASE_DRAFT, status: 'draft', metadata: APPROVED_META },
+      status: 'approved'
+    });
+    await renderLoaded({ status: 'pending_review' });
+
+    await fireEvent.click(approveButton());
+
+    await waitFor(() => expect(screen.getByText('Approved')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /^approv/i })).toBeNull();
+    expect(document.getElementById('draft-queued')).toBeFalsy();
+    expect(screen.getByText(/Approved rev 7\. Nothing was sent\./)).toBeInTheDocument();
+    // Approval leaves the draft editable and sendable by the human.
+    expect(screen.getByLabelText('Subject')).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: /^human-only send in\b/i })).toBeEnabled();
+  });
+
+  it('shows the Approved badge on load when the stored attestation matches this revision', async () => {
+    await renderLoaded({ status: 'draft', metadata: APPROVED_META });
+    expect(screen.getByText('Approved')).toBeInTheDocument();
+  });
+
+  it('shows no Approved badge when the attestation is for an older revision', async () => {
+    await renderLoaded({
+      status: 'draft',
+      metadata: { human_approval: { ...APPROVED_META.human_approval, revision: 6 } }
+    });
+    expect(screen.queryByText('Approved')).toBeNull();
+  });
+
+  it('disables Approve while there are unsaved changes', async () => {
+    await renderLoaded({ status: 'pending_review' });
+    expect(approveButton()).toBeEnabled();
+
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Edited' } });
+
+    expect(approveButton()).toBeDisabled();
+    expect(apiMock.approveDraft).not.toHaveBeenCalled();
+  });
+
+  it('raises the conflict banner on 409 and adopts nothing', async () => {
+    apiMock.approveDraft.mockRejectedValue(
+      new EnvelopeApiError(409, 'http_409', 'draft modified concurrently', null)
+    );
+    await renderLoaded({ status: 'pending_review' });
+
+    await fireEvent.click(approveButton());
+
+    await waitFor(() => expect(document.getElementById('draft-conflict')).toBeTruthy());
+    expect(screen.queryByText('Approved')).toBeNull();
+    expect(screen.getByText('Pending review')).toBeInTheDocument();
   });
 });

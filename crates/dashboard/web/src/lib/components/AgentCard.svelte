@@ -1,9 +1,9 @@
 <script lang="ts">
-  // Agent identity card — the cockpit money shot. Name prominent, envtok_ prefix
+  // Agent identity card, shown on Rules. Name prominent, envtok_ prefix
   // in a MonoTag, last-active + attributed action/event counts, and a compact
   // policy summary (send-mode ceiling + scope tightness). Read-only.
   import MonoTag from './MonoTag.svelte';
-  import type { AgentCard } from '$lib/cockpit-api';
+  import type { AgentCard } from '$lib/agents-api';
 
   let { agent, age }: { agent: AgentCard; age: (iso: string | null) => string } = $props();
 

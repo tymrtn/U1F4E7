@@ -523,6 +523,12 @@ export interface DraftHeldResponse {
   status: string;
 }
 
+/** Response to POST /api/accounts/{id}/drafts/{draftId}/approve. */
+export interface DraftApprovedResponse {
+  draft: Draft;
+  status: string;
+}
+
 export type ContextRefinementAttributeState =
   | 'selected'
   | 'not_selected'
@@ -1054,6 +1060,26 @@ export const api = {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/hold`,
       { ...o, method: 'POST', body: {} }
+    );
+  },
+
+  /**
+   * POST /api/accounts/{id}/drafts/{draftId}/approve
+   * Record that a human reviewed exactly `expected_revision`. Review only: it
+   * queues nothing and writes no `human_send` authorization, so a later agent
+   * send is still fully Governor-gated (with `tyler_approved` on top). The
+   * store flips `pending_review` / `blocked` back to `draft`. 409 when the
+   * draft changed since it was shown.
+   */
+  approveDraft(
+    accountId: string,
+    draftId: string,
+    body: { expected_revision: number },
+    o?: RequestOptions
+  ): Promise<DraftApprovedResponse> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/approve`,
+      { ...o, method: 'POST', body }
     );
   },
 

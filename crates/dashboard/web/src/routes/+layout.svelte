@@ -57,7 +57,7 @@
     <nav class="app-nav" aria-label="Primary navigation">
       <a class:is-active={page.url.pathname.startsWith(`${base}/mail`)} href="{base}/mail/unified">Mail</a>
       <a class:is-active={page.url.pathname.startsWith(`${base}/review`)} href="{base}/review">Review</a>
-      <a class:is-active={page.url.pathname.startsWith(`${base}/cockpit`)} href="{base}/cockpit">Cockpit</a>
+      <a class:is-active={page.url.pathname.startsWith(`${base}/logs`)} href="{base}/logs">Logs</a>
       <a class:is-active={page.url.pathname.startsWith(`${base}/rules`)} href="{base}/rules">Rules</a>
     </nav>
   </header>

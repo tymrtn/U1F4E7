@@ -7,6 +7,8 @@
   //     (with confirm when enabling a rule that deletes/unsubscribes)
   //   • Create / edit modal: matcher builder + action builder
   //   • Hit stats (hit_count + last_hit_at) when present
+  //   • Agents: read-only identity cards (token prefix, send ceiling, scope).
+  //     Global, not per-account; minted and revoked from the CLI.
   //
   // Safety bounds from CLAUDE.md:
   //   "Preserve the Rules Control Plane controls and safety bounds when adding
@@ -16,8 +18,9 @@
   //    confirmation for delete/unsubscribe rules.
 
   import { onMount } from 'svelte';
-  import { Modal, Button, Spinner, EmptyState, MonoTag, Toast } from '$lib/components';
+  import { Modal, Button, Spinner, EmptyState, MonoTag, Toast, AgentCard } from '$lib/components';
   import { api, type Account, type FolderStats, EnvelopeApiError } from '$lib/api';
+  import { agentsApi, type AgentCard as AgentCardT } from '$lib/agents-api';
   import {
     rulesApi,
     buildMatchExpr,
@@ -39,6 +42,11 @@
   let selectedAccountId = $state<string | null>(null);
   let rules = $state<Rule[]>([]);
   let folders = $state<FolderStats[]>([]);
+
+  let agents = $state<AgentCardT[]>([]);
+  let activeAgents = $state(0);
+  let agentsLoading = $state(true);
+  let agentsError = $state<string | null>(null);
 
   let loadingAccounts = $state(true);
   let loadingRules = $state(false);
@@ -119,6 +127,7 @@
   // ── Bootstrap ────────────────────────────────────────────────────────
 
   onMount(async () => {
+    void loadAgents();
     try {
       const res = await api.listAccounts();
       accounts = res.accounts;
@@ -150,6 +159,38 @@
     } finally {
       loadingRules = false;
     }
+  }
+
+  // Agents are global identities, so this load is independent of the account
+  // switcher and never gates the rules table.
+  async function loadAgents() {
+    agentsLoading = true;
+    agentsError = null;
+    try {
+      const res = await agentsApi.agents();
+      agents = res.agents;
+      activeAgents = res.summary.active_agents;
+    } catch (e) {
+      agentsError =
+        e instanceof EnvelopeApiError
+          ? `${e.message} (${e.code})`
+          : (e instanceof Error ? e.message : 'Failed to load agents.');
+    } finally {
+      agentsLoading = false;
+    }
+  }
+
+  function age(iso: string | null): string {
+    if (!iso) return 'never';
+    const then = Date.parse(iso.includes('Z') || iso.includes('+') ? iso : `${iso}Z`);
+    if (Number.isNaN(then)) return iso;
+    const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (secs < 60) return `${secs}s ago`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
   }
 
   async function loadFolders(accountId: string) {
@@ -531,6 +572,38 @@
       </table>
       <p class="rules-count">{rules.length} rule{rules.length === 1 ? '' : 's'}</p>
     {/if}
+
+    <!-- ── Agents ────────────────────────────────────────────────────── -->
+    <section class="rules-agents" id="rules-agents" aria-labelledby="rules-agents-title">
+      <div class="rules-agents-head">
+        <h2 class="rules-agents-title" id="rules-agents-title">Agents</h2>
+        <span class="rules-agents-count">{activeAgents} active</span>
+      </div>
+      <p class="rules-agents-hint">
+        Identities agents act under, with their send ceiling and scope. Mint one with
+        <MonoTag>envelope agent create &lt;name&gt;</MonoTag>; revoke with
+        <MonoTag>envelope agent revoke &lt;name&gt;</MonoTag>.
+      </p>
+      {#if agentsLoading}
+        <div class="rules-loading"><Spinner label="Loading agents" /> Loading agents…</div>
+      {:else if agentsError}
+        <div class="rules-page-error" role="alert">
+          <p class="error-msg">{agentsError}</p>
+          <button class="retry-link" type="button" onclick={loadAgents}>Retry</button>
+        </div>
+      {:else if agents.length === 0}
+        <EmptyState
+          title="No agents registered"
+          hint="Mint an agent identity with envelope agent create <name> to attribute actions."
+        />
+      {:else}
+        <div class="rules-agents-grid">
+          {#each agents as agent (agent.id)}
+            <AgentCard {agent} {age} />
+          {/each}
+        </div>
+      {/if}
+    </section>
   </div>
 </div>
 
@@ -882,6 +955,46 @@
     padding: 0;
     cursor: pointer;
     text-decoration: underline;
+  }
+
+  /* ── Agents ──────────────────────────────────────────────── */
+  .rules-agents {
+    padding: 1.25rem;
+    border-top: 1px solid var(--env-rule);
+  }
+
+  .rules-agents-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .rules-agents-title {
+    margin: 0;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .rules-agents-count {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--env-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .rules-agents-hint {
+    margin: 0.35rem 0 0.9rem;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--env-muted);
+  }
+
+  .rules-agents-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+    gap: 0.75rem;
   }
 
   /* ── Rules table ─────────────────────────────────────────── */

@@ -13,7 +13,3 @@ export { default as ComposerDrawer } from './ComposerDrawer.svelte';
 export { default as DraftComposer } from './DraftComposer.svelte';
 export { default as UndoToast } from './UndoToast.svelte';
 export { default as AgentCard } from './AgentCard.svelte';
-export { default as ApprovalRow } from './ApprovalRow.svelte';
-export { default as ScheduledRow } from './ScheduledRow.svelte';
-export { default as GovernorVerdictBadge } from './GovernorVerdictBadge.svelte';
-export { default as WatchPanel } from './WatchPanel.svelte';
