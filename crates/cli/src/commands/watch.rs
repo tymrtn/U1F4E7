@@ -121,7 +121,9 @@ pub async fn run(
                         Ok(true) => {
                             emit_event(&event, webhook, http_client.as_ref());
                             if deliver {
-                                enqueue_deliveries_for_event(&db, &event);
+                                if let Err(error) = enqueue_deliveries_for_event(&db, &event) {
+                                    warn!("failed to enqueue event deliveries: {error}");
+                                }
                             }
                         }
                         Ok(false) => continue,
@@ -151,7 +153,11 @@ pub async fn run(
                                 Ok(true) => {
                                     emit_event(&otp_event, webhook, http_client.as_ref());
                                     if deliver {
-                                        enqueue_deliveries_for_event(&db, &otp_event);
+                                        if let Err(error) =
+                                            enqueue_deliveries_for_event(&db, &otp_event)
+                                        {
+                                            warn!("failed to enqueue OTP deliveries: {error}");
+                                        }
                                     }
                                 }
                                 Ok(false) => {}
@@ -323,31 +329,30 @@ fn confidence_for_pattern(pattern: OtpPatternId) -> f32 {
 /// Enqueue a pending delivery for every enabled route (in this event's account)
 /// whose match expression accepts the event type. Deterministic delivery ids
 /// keep enqueue idempotent so re-processing the same event never double-sends.
-fn enqueue_deliveries_for_event(db: &envelope_email_store::Database, event: &Event) {
-    let routes = match db.list_enabled_event_routes(Some(&event.account_id)) {
-        Ok(routes) => routes,
-        Err(e) => {
-            warn!("failed to load event routes: {e}");
-            return;
-        }
-    };
+pub(super) fn enqueue_deliveries_for_event(
+    db: &envelope_email_store::Database,
+    event: &Event,
+) -> Result<usize, envelope_email_store::StoreError> {
+    let routes = db.list_enabled_event_routes(Some(&event.account_id))?;
     let now = chrono::Utc::now().to_rfc3339();
+    let mut enqueued = 0usize;
     for route in &routes {
         if !route_matches(route, &event.event_type) {
             continue;
         }
         let delivery_row_id = format!("{}:{}", event.id, route.id);
         let delivery_marker = stable_hash(&delivery_row_id);
-        if let Err(e) = db.enqueue_delivery(
+        if db.enqueue_delivery(
             &delivery_row_id,
             &event.id,
             &route.id,
             &delivery_marker,
             &now,
-        ) {
-            warn!("failed to enqueue delivery: {e}");
+        )? {
+            enqueued += 1;
         }
     }
+    Ok(enqueued)
 }
 
 /// Does a route's `match_expr` accept this event type? The expression is JSON:

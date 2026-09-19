@@ -8,9 +8,11 @@ use anyhow::{Context, Result, bail};
 use envelope_email_store::credential_store::{self, CredentialBackend};
 use envelope_email_store::models::{Account, Event, Message};
 use envelope_email_store::{
-    Database, MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineDigestCandidate,
-    MailEngineSenderStats, MailboxScanPlan, NewMailEngineDecision, mail_engine_hash,
+    Database, MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineDecisionRecovery,
+    MailEngineDigestCandidate, MailEngineSenderStats, MailboxScanPlan, NewMailEngineDecision,
+    mail_engine_hash,
 };
+use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
 use envelope_email_transport::folders;
 use envelope_email_transport::imap;
 use envelope_email_transport::jev::{
@@ -28,6 +30,7 @@ pub struct EngineOptions<'a> {
     pub account: Option<&'a str>,
     pub folder: &'a str,
     pub apply: bool,
+    pub deliver: bool,
     pub json: bool,
     pub backend: CredentialBackend,
 }
@@ -38,6 +41,7 @@ struct EnginePassReport {
     interval_seconds: Option<u64>,
     apply: bool,
     accounts: Vec<AccountReport>,
+    delivery: Option<DeliveryPassReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +54,17 @@ struct AccountReport {
     review: usize,
     actions_completed: usize,
     actions_blocked: usize,
+    notifications_enqueued: usize,
     error_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveryPassReport {
+    examined: usize,
+    delivered: usize,
+    retried: usize,
+    dead_lettered: usize,
+    skipped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +114,7 @@ impl AccountReport {
             review: 0,
             actions_completed: 0,
             actions_blocked: 0,
+            notifications_enqueued: 0,
             error_code: None,
         }
     }
@@ -108,12 +123,14 @@ impl AccountReport {
 #[tokio::main]
 pub async fn run_once(options: EngineOptions<'_>) -> Result<()> {
     let accounts = process_once(&options).await?;
+    let delivery = drain_due_event_deliveries(options.deliver).await?;
     print_report(
         &EnginePassReport {
             mode: "once",
             interval_seconds: None,
             apply: options.apply,
             accounts,
+            delivery,
         },
         options.json,
     )
@@ -126,12 +143,14 @@ pub async fn run_loop(options: EngineOptions<'_>, interval_seconds: u64) -> Resu
     }
     loop {
         let accounts = process_once(&options).await?;
+        let delivery = drain_due_event_deliveries(options.deliver).await?;
         print_report(
             &EnginePassReport {
                 mode: "run",
                 interval_seconds: Some(interval_seconds),
                 apply: options.apply,
                 accounts,
+                delivery,
             },
             options.json,
         )?;
@@ -141,6 +160,27 @@ pub async fn run_loop(options: EngineOptions<'_>, interval_seconds: u64) -> Resu
         }
     }
     Ok(())
+}
+
+async fn drain_due_event_deliveries(deliver: bool) -> Result<Option<DeliveryPassReport>> {
+    if !deliver {
+        return Ok(None);
+    }
+    let db = Database::open_default().context("failed to open database for event delivery")?;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build event delivery client")?;
+    let report = deliver_due_events(&db, &http, chrono::Utc::now(), DeliveryLimits::default())
+        .await
+        .context("event delivery executor failed")?;
+    Ok(Some(DeliveryPassReport {
+        examined: report.examined,
+        delivered: report.delivered,
+        retried: report.retried,
+        dead_lettered: report.dead_lettered,
+        skipped: report.skipped,
+    }))
 }
 
 pub fn run_status(account: Option<&str>, json: bool) -> Result<()> {
@@ -554,13 +594,38 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>>
                 }
                 for uid in uids {
                     report.examined += 1;
-                    if let Some((route, execution_status)) = db.get_mail_engine_decision_execution(
+                    if let Some(existing) = db.get_mail_engine_decision_execution(
                         &account.id,
                         options.folder,
                         uidvalidity,
                         uid,
                     )? {
-                        if options.apply && route == "junk" && execution_status == "pending" {
+                        if !recovery_is_terminal(&existing) {
+                            report.status = "held".into();
+                            report.error_code = Some("decision_incomplete".into());
+                            break;
+                        }
+                        if let Some(urgency) = recovery_notification_urgency(&existing) {
+                            match persist_urgent_event(
+                                &db,
+                                &account.id,
+                                options.folder,
+                                uidvalidity,
+                                uid,
+                                urgency,
+                            ) {
+                                Ok(enqueued) => report.notifications_enqueued += enqueued,
+                                Err(_) => {
+                                    report.actions_blocked += 1;
+                                    report.error_code = Some("notification_enqueue_failed".into());
+                                    break;
+                                }
+                            }
+                        }
+                        if options.apply
+                            && existing.route == "junk"
+                            && existing.execution_status == "pending"
+                        {
                             execute_junk(
                                 &db,
                                 &mut client,
@@ -630,7 +695,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>>
                             continue;
                         }
                     };
-                    let policy = classify_and_persist(
+                    let Some(policy) = classify_and_persist(
                         &db,
                         &account.id,
                         options.folder,
@@ -638,21 +703,37 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>>
                         &message,
                         None,
                     )
-                    .await?;
+                    .await?
+                    else {
+                        // Another worker won the durable claim after the
+                        // initial lookup. Its row may still be `processing`;
+                        // stop this ordered pass rather than leap the
+                        // watermark over unfinished work.
+                        report.status = "held".into();
+                        report.error_code = Some("decision_incomplete".into());
+                        break;
+                    };
                     if policy.route == MailRoute::Review {
                         report.review += 1;
                     } else {
                         report.decided += 1;
                     }
                     if policy.notify_user_now {
-                        persist_urgent_event(
+                        match persist_urgent_event(
                             &db,
                             &account.id,
                             options.folder,
                             uidvalidity,
                             uid,
                             policy.urgency,
-                        );
+                        ) {
+                            Ok(enqueued) => report.notifications_enqueued += enqueued,
+                            Err(_) => {
+                                report.actions_blocked += 1;
+                                report.error_code = Some("notification_enqueue_failed".into());
+                                break;
+                            }
+                        }
                     }
                     if options.apply && policy.route == MailRoute::Junk {
                         execute_junk(
@@ -695,7 +776,7 @@ async fn classify_and_persist(
     uidvalidity: u32,
     message: &Message,
     client_override: Option<&JevClient>,
-) -> Result<PolicyDecision> {
+) -> Result<Option<PolicyDecision>> {
     let sender_address = message.from_addr.trim();
     if sender_address.is_empty() {
         persist_review(
@@ -706,7 +787,7 @@ async fn classify_and_persist(
             message.uid,
             "sender_missing",
         )?;
-        return Ok(review_policy());
+        return Ok(Some(review_policy()));
     }
     let stats = db
         .derive_mail_engine_sender_stats(account_id, sender_address)
@@ -768,8 +849,9 @@ async fn classify_and_persist(
         model: "typesafe/jev-1.13",
     })? {
         // Another worker already owns or completed this immutable input. Never
-        // issue a second paid request; the durable row is the authority.
-        return Ok(review_policy());
+        // issue a second paid request and never let this caller advance the
+        // ordered watermark until a later pass observes a terminal row.
+        return Ok(None);
     }
     let owned_client = if client_override.is_none() {
         let client_result = match std::env::var("OPENROUTER_API_KEY") {
@@ -788,7 +870,7 @@ async fn classify_and_persist(
                     &input_hash,
                     "jev_request_failed",
                 )?;
-                return Ok(review_policy());
+                return Ok(Some(review_policy()));
             }
         }
     } else {
@@ -809,7 +891,7 @@ async fn classify_and_persist(
                 &input_hash,
                 "jev_request_failed",
             )?;
-            return Ok(review_policy());
+            return Ok(Some(review_policy()));
         }
     };
     let policy = apply_policy(&decision);
@@ -823,7 +905,7 @@ async fn classify_and_persist(
         &decision,
         &policy,
     )?;
-    Ok(policy)
+    Ok(Some(policy))
 }
 
 fn persist_decision(
@@ -989,6 +1071,21 @@ async fn execute_junk(
     }
 }
 
+fn recovery_is_terminal(existing: &MailEngineDecisionRecovery) -> bool {
+    matches!(existing.status.as_str(), "decided" | "review")
+}
+
+fn recovery_notification_urgency(existing: &MailEngineDecisionRecovery) -> Option<Urgency> {
+    if existing.notify_user_probability.unwrap_or(0.0) < 0.90 {
+        return None;
+    }
+    match existing.urgency.as_str() {
+        "urgent" => Some(Urgency::Urgent),
+        "critical" => Some(Urgency::Critical),
+        _ => None,
+    }
+}
+
 fn persist_urgent_event(
     db: &Database,
     account_id: &str,
@@ -996,12 +1093,12 @@ fn persist_urgent_event(
     uidvalidity: u32,
     uid: u32,
     urgency: Urgency,
-) {
+) -> Result<usize> {
     let marker = mail_engine_hash(&format!(
         "{account_id}:{folder}:{uidvalidity}:{uid}:mail_engine_urgent"
     ));
     let event = Event {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: marker.clone(),
         account_id: account_id.to_string(),
         event_type: "mail_engine_urgent".into(),
         folder: folder.to_string(),
@@ -1018,7 +1115,8 @@ fn persist_urgent_event(
         acked_at: None,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let _ = db.insert_event_idempotent(&event);
+    db.insert_event_idempotent(&event)?;
+    Ok(super::watch::enqueue_deliveries_for_event(db, &event)?)
 }
 
 fn message_flags(flags: &[String]) -> MessageFlags {
@@ -1075,7 +1173,7 @@ fn print_report(report: &EnginePassReport, json: bool) -> Result<()> {
     } else {
         for account in &report.accounts {
             println!(
-                "{}: {} — {} examined, {} decided, {} review, {} actions completed, {} blocked",
+                "{}: {} — {} examined, {} decided, {} review, {} actions completed, {} blocked, {} urgent deliveries enqueued",
                 account.account_id,
                 account.status,
                 account.examined,
@@ -1083,6 +1181,17 @@ fn print_report(report: &EnginePassReport, json: bool) -> Result<()> {
                 account.review,
                 account.actions_completed,
                 account.actions_blocked,
+                account.notifications_enqueued,
+            );
+        }
+        if let Some(delivery) = &report.delivery {
+            println!(
+                "event delivery: {} examined, {} delivered, {} retried, {} dead-lettered, {} skipped",
+                delivery.examined,
+                delivery.delivered,
+                delivery.retried,
+                delivery.dead_lettered,
+                delivery.skipped,
             );
         }
     }
@@ -1104,6 +1213,81 @@ mod tests {
         assert!(read_junk.read);
         assert!(!read_junk.unread);
         assert!(read_junk.junk);
+    }
+
+    #[test]
+    fn persisted_notification_state_recovers_only_high_confidence_urgent_routes() {
+        let recovery = |urgency: &str, probability| MailEngineDecisionRecovery {
+            status: "decided".into(),
+            route: "important".into(),
+            execution_status: "not_requested".into(),
+            urgency: urgency.into(),
+            notify_user_probability: probability,
+        };
+        let mut processing = recovery("not_urgent", None);
+        processing.status = "processing".into();
+        assert!(!recovery_is_terminal(&processing));
+        assert!(recovery_is_terminal(&recovery("not_urgent", None)));
+        assert_eq!(
+            recovery_notification_urgency(&recovery("critical", Some(0.95))),
+            Some(Urgency::Critical)
+        );
+        assert_eq!(
+            recovery_notification_urgency(&recovery("urgent", Some(0.90))),
+            Some(Urgency::Urgent)
+        );
+        assert_eq!(
+            recovery_notification_urgency(&recovery("urgent", Some(0.89))),
+            None
+        );
+        assert_eq!(
+            recovery_notification_urgency(&recovery("not_urgent", Some(0.99))),
+            None
+        );
+    }
+
+    #[test]
+    fn urgent_event_recovery_enqueues_one_idempotent_delivery_without_message_content() {
+        let db = Database::open_memory().unwrap();
+        db.create_event_route(
+            "acct",
+            r#"{"event_types":["mail_engine_urgent"]}"#,
+            r#"{"type":"webhook","url":"https://example.test/urgent"}"#,
+            true,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            persist_urgent_event(&db, "acct", "INBOX", 10, 42, Urgency::Critical).unwrap(),
+            1
+        );
+        assert_eq!(
+            persist_urgent_event(&db, "acct", "INBOX", 10, 42, Urgency::Critical).unwrap(),
+            0
+        );
+
+        let marker = mail_engine_hash("acct:INBOX:10:42:mail_engine_urgent");
+        let event = db.get_event(&marker).unwrap().unwrap();
+        assert_eq!(event.id, marker);
+        assert_eq!(event.event_type, "mail_engine_urgent");
+        assert!(event.message_id.is_none());
+        assert!(event.from_addr.is_none());
+        assert!(event.subject.is_none());
+        assert!(event.snippet.is_none());
+        let payload: serde_json::Value =
+            serde_json::from_str(event.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["urgency"], "critical");
+        assert_eq!(payload["source"], "jev");
+
+        let due = db
+            .list_due_deliveries(
+                &(chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].event_id, marker);
     }
 
     #[test]
@@ -1151,6 +1335,60 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn contended_decision_claim_returns_hold_without_calling_jev() {
+        let db = Database::open_memory().unwrap();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 0).unwrap();
+        assert!(
+            db.claim_mail_engine_decision(&MailEngineDecisionClaim {
+                account_id: "acct",
+                folder: "INBOX",
+                uidvalidity: 10,
+                uid: 1,
+                input_hash: "claimed-by-another-worker",
+                model: "typesafe/jev-1.13",
+            })
+            .unwrap()
+        );
+        // Port 9 has no fixture server. A network attempt would fail the test;
+        // claim contention must return before any paid/model request.
+        let client = JevClient::loopback_fixture("http://127.0.0.1:9/api/alpha/decisions").unwrap();
+        let message = Message {
+            uid: 1,
+            message_id: Some("contended@example.test".into()),
+            from_addr: "sender@example.test".into(),
+            to_addr: "me@example.test".into(),
+            cc_addr: None,
+            to_addrs: vec!["me@example.test".into()],
+            cc_addrs: Vec::new(),
+            subject: "Contended fixture".into(),
+            date: Some("2026-09-19T00:00:00Z".into()),
+            text_body: Some("This must not reach JEV.".into()),
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            flags: Vec::new(),
+            attachments: Vec::new(),
+            provider_spam: None,
+        };
+
+        let outcome = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client))
+            .await
+            .unwrap();
+
+        assert!(outcome.is_none());
+        let recovery = db
+            .get_mail_engine_decision_execution("acct", "INBOX", 10, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.status, "processing");
+        assert!(!recovery_is_terminal(&recovery));
+        assert!(matches!(
+            db.plan_mail_engine_scan("acct", "INBOX", 10, 2).unwrap(),
+            MailboxScanPlan::NewRange { after_uid: 0, .. }
+        ));
     }
 
     #[tokio::test]
@@ -1250,7 +1488,8 @@ mod tests {
         };
         let policy = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("the uncontended fixture should return a policy");
         server.await.unwrap();
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);

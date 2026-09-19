@@ -122,8 +122,8 @@ pub fn agent_contract() -> Value {
         "mail_engine": {
             "surface": "cli_only",
             "commands": [
-                "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply]",
-                "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply]",
+                "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply] [--deliver]",
+                "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply] [--deliver]",
                 "envelope engine status [--account <id-or-email>]",
                 "envelope engine digest-queue [--account <id-or-email>] [--limit 50]",
                 "envelope engine digest [--account <id-or-email>] [--limit 25]"
@@ -135,9 +135,10 @@ pub fn agent_contract() -> Value {
             "state_egress": "Each decision sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender/interaction/reply statistics to OpenRouter. Credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs are excluded.",
             "questions": ["route", "urgency", "notify_user", "requires_reply", "bulk_or_subscription"],
             "routes": ["junk", "follow_up", "important", "routine", "digest_news", "unsubscribe_candidate", "review"],
-            "action_safety": "Without --apply, decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
-            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "jev_request_failed", "imap_move_failed", "spam_folder_not_found"],
-            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
+            "action_safety": "Without --apply, mailbox decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. Urgent events and matching delivery rows are durable local state; --deliver is the separate explicit external-side-effect flag that drains the existing signed retry/dead-letter delivery pipeline. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
+            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "jev_request_failed", "imap_move_failed", "spam_folder_not_found", "notification_enqueue_failed", "decision_incomplete"],
+            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
+            "urgent_delivery": "notify_user_now creates a deterministic content-free mail_engine_urgent event keyed by account/folder/UIDVALIDITY/UID and one idempotent local delivery row for every enabled matching route. A retry that finds an existing durable decision re-derives notification intent from its persisted policy output and repairs a missing event/delivery before advancing the watermark. --deliver drains due rows through the existing HMAC-signed webhook executor, bounded backoff, and dead-letter recovery. Redirects are disabled in the engine delivery client.",
             "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time. The explicit digest command reads bounded From/Subject/Date fields for those handles, sanitizes control characters, nests them under untrusted_content with envelope.inbound-trust.v1, and excludes body, recipient, Message-ID, flags, size, and provider-spam metadata."
         },
         "agent_identity": {
@@ -1341,6 +1342,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("before the paid request")
+        );
+        assert!(
+            engine["urgent_delivery"]
+                .as_str()
+                .unwrap()
+                .contains("HMAC-signed webhook executor")
+        );
+        assert!(
+            engine["urgent_delivery"]
+                .as_str()
+                .unwrap()
+                .contains("idempotent local delivery row")
         );
         assert!(
             engine["commands"]
