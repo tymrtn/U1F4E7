@@ -1380,6 +1380,15 @@ enum EngineCmd {
         #[arg(long, default_value = "50", value_parser = parse_engine_digest_limit)]
         limit: usize,
     },
+    /// Fetch a read-only subject-level preview for queued news messages
+    Digest {
+        /// Account ID or email (all configured accounts when omitted)
+        #[arg(long)]
+        account: Option<String>,
+        /// Maximum queued messages to include (1..=100)
+        #[arg(long, default_value = "25", value_parser = parse_engine_digest_limit)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2749,6 +2758,9 @@ fn main() {
             EngineCmd::DigestQueue { account, limit } => {
                 commands::engine::run_digest_queue(account.as_deref(), limit, cli.json)
             }
+            EngineCmd::Digest { account, limit } => {
+                commands::engine::run_digest_preview(account.as_deref(), limit, cli.json, backend)
+            }
         },
 
         Commands::Unsubscribe {
@@ -2981,6 +2993,24 @@ mod tests {
             queue.command,
             Commands::Engine {
                 subcommand: EngineCmd::DigestQueue { limit: 25, .. }
+            }
+        ));
+        let preview = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "digest",
+            "--account",
+            "account@example.test",
+            "--limit",
+            "10",
+            "--json",
+        ])
+        .expect("engine digest preview should parse");
+        assert!(preview.json);
+        assert!(matches!(
+            preview.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Digest { limit: 10, .. }
             }
         ));
         assert!(
