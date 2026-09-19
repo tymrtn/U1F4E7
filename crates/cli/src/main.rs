@@ -447,6 +447,12 @@ enum Commands {
         subcommand: RuleCmd,
     },
 
+    /// Classify and route newly arrived mail through the Jev decision engine
+    Engine {
+        #[command(subcommand)]
+        subcommand: EngineCmd,
+    },
+
     /// Manage contacts
     Contacts {
         #[command(subcommand)]
@@ -1468,6 +1474,43 @@ enum TagCmd {
 }
 
 #[derive(Subcommand)]
+enum EngineCmd {
+    /// Run one new-mail pass and exit; first use establishes a baseline only
+    Once {
+        /// Account ID or email (all configured accounts when omitted)
+        #[arg(long)]
+        account: Option<String>,
+        /// Folder to evaluate
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Run continuously, one non-overlapping pass every five minutes by default
+    Run {
+        /// Account ID or email (all configured accounts when omitted)
+        #[arg(long)]
+        account: Option<String>,
+        /// Folder to evaluate
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
+        #[arg(long)]
+        apply: bool,
+        /// Poll interval in seconds (minimum 60)
+        #[arg(long, default_value = "300", value_parser = parse_engine_interval)]
+        interval_seconds: u64,
+    },
+    /// Show redacted engine watermarks and queue counts
+    Status {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum RuleCmd {
     /// Create a new rule
     #[allow(clippy::struct_field_names)]
@@ -1866,6 +1909,16 @@ fn parse_agent_list_limit(value: &str) -> Result<u32, String> {
             "--limit must be at most {} for agent/CLI read-only list/search surfaces",
             commands::contract::MAX_AGENT_LIST_LIMIT
         ));
+    }
+    Ok(parsed)
+}
+
+fn parse_engine_interval(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("--interval-seconds invalid integer: {error}"))?;
+    if parsed < 60 {
+        return Err("--interval-seconds must be at least 60".into());
     }
     Ok(parsed)
 }
@@ -2858,6 +2911,38 @@ fn main() {
             ),
         },
 
+        Commands::Engine { subcommand } => match subcommand {
+            EngineCmd::Once {
+                account,
+                folder,
+                apply,
+            } => commands::engine::run_once(commands::engine::EngineOptions {
+                account: account.as_deref(),
+                folder: &folder,
+                apply,
+                json: cli.json,
+                backend,
+            }),
+            EngineCmd::Run {
+                account,
+                folder,
+                apply,
+                interval_seconds,
+            } => commands::engine::run_loop(
+                commands::engine::EngineOptions {
+                    account: account.as_deref(),
+                    folder: &folder,
+                    apply,
+                    json: cli.json,
+                    backend,
+                },
+                interval_seconds,
+            ),
+            EngineCmd::Status { account } => {
+                commands::engine::run_status(account.as_deref(), cli.json)
+            }
+        },
+
         Commands::Unsubscribe {
             uid,
             folder,
@@ -3012,6 +3097,62 @@ mod tests {
             }
             _ => panic!("expected doctor command"),
         }
+    }
+
+    #[test]
+    fn engine_run_defaults_to_five_minutes_and_rejects_fast_polling() {
+        let cli = Cli::try_parse_from(["envelope", "engine", "run", "--json"])
+            .expect("engine run should parse");
+        assert!(cli.json);
+        match cli.command {
+            Commands::Engine {
+                subcommand:
+                    EngineCmd::Run {
+                        interval_seconds,
+                        apply,
+                        account,
+                        folder,
+                        ..
+                    },
+            } => {
+                assert_eq!(interval_seconds, 300);
+                assert!(!apply);
+                assert!(account.is_none());
+                assert_eq!(folder, "INBOX");
+            }
+            _ => panic!("expected engine run"),
+        }
+        assert!(
+            Cli::try_parse_from(["envelope", "engine", "run", "--interval-seconds", "59"]).is_err()
+        );
+    }
+
+    #[test]
+    fn engine_once_and_status_parse() {
+        let once = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "once",
+            "--account",
+            "account@example.test",
+            "--apply",
+        ])
+        .expect("engine once should parse");
+        assert!(matches!(
+            once.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Once { apply: true, .. }
+            }
+        ));
+        let status = Cli::try_parse_from(["envelope", "engine", "status", "--json"])
+            .expect("engine status should parse");
+        assert!(status.json);
+        assert!(matches!(
+            status.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Status { .. }
+            }
+        ));
     }
 
     #[test]

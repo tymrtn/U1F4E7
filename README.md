@@ -125,6 +125,13 @@ envelope snooze set 42 --until monday --reason waiting-reply
 # Watch for new mail in real time (IMAP IDLE push)
 envelope watch --json
 
+# Establish a new-mail-only Jev baseline, then run every 5 minutes.
+# Requires OPENROUTER_API_KEY. Each new message sends its sender/domain, subject,
+# up to 8 KiB of derived text, flags, and interaction statistics to OpenRouter.
+# Omit --account to cover every configured account; add --apply for confident junk moves.
+envelope engine once --account you@example.com --json
+envelope engine run --account you@example.com --interval-seconds 300 --apply --json
+
 # Retrieve a verification-code JSON result for unattended automation (bounded and fail-closed)
 envelope --json code --account you@example.com --from otp@issuer.example --wait 60
 
@@ -242,6 +249,7 @@ Himalaya is a great CLI email client. Envelope is a CLI email client built for a
 | Unsubscribe (RFC 8058 one-click) | ✅ | ❌ |
 | Sieve export | ✅ | ❌ |
 | IMAP IDLE push (`envelope watch`) | ✅ | ❌ |
+| Jev new-mail decision engine (`envelope engine`) | ✅ | ❌ |
 | Verification code extraction | ✅ | ❌ |
 | MCP server (Claude Code, Cursor, Zed) | ✅ | ❌ |
 | Scheduled send (`--at`) | ✅ | ❌ |

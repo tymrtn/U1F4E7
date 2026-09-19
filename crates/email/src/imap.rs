@@ -1102,6 +1102,60 @@ pub async fn fetch_raw_messages_selected_uid_set(
     fetch_raw_messages_selected_uid_set_preflighted(client, folder, uid_set, &expected_sizes).await
 }
 
+/// Parse a bounded raw `BODY.PEEK[]` fetch into Envelope's normal message
+/// shape without selecting the mailbox or changing flags. The caller must have
+/// opened the mailbox with `EXAMINE` when read-only behavior is required.
+pub fn parse_raw_message(raw: &RawMessage) -> Result<Message, ImapError> {
+    let parsed = mail_parser::MessageParser::default()
+        .parse(&raw.rfc822)
+        .ok_or_else(|| ImapError::Protocol(format!("failed to parse message UID {}", raw.uid)))?;
+    let to_addrs = mp_all_addresses(parsed.to());
+    let cc_addrs = mp_all_addresses(parsed.cc());
+    let attachments = parsed
+        .attachments()
+        .map(|attachment| {
+            let content_type: Option<&mail_parser::ContentType> = attachment.content_type();
+            AttachmentMeta {
+                filename: attachment
+                    .attachment_name()
+                    .unwrap_or("unnamed")
+                    .to_string(),
+                content_type: ingress::normalize_content_type(
+                    &content_type
+                        .map(|content_type| {
+                            format!(
+                                "{}/{}",
+                                content_type.ctype(),
+                                content_type.subtype().unwrap_or("octet-stream")
+                            )
+                        })
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                ),
+                size: attachment.len() as u64,
+                content_id: attachment.content_id().map(ToString::to_string),
+            }
+        })
+        .collect();
+    Ok(Message {
+        uid: raw.uid,
+        message_id: parsed.message_id().map(ToString::to_string),
+        from_addr: mp_first_address(parsed.from()),
+        to_addr: to_addrs.first().cloned().unwrap_or_default(),
+        cc_addr: cc_addrs.first().cloned(),
+        to_addrs,
+        cc_addrs,
+        subject: parsed.subject().unwrap_or_default().to_string(),
+        date: parsed.date().map(|date| date.to_rfc3339()),
+        text_body: parsed.body_text(0).map(|text| text.to_string()),
+        html_body: parsed.body_html(0).map(|html| html.to_string()),
+        in_reply_to: parsed.in_reply_to().as_text().map(ToString::to_string),
+        references: crate::threading::references_header(&parsed),
+        flags: raw.flags.clone(),
+        attachments,
+        provider_spam: provider_spam_from_header_bytes(&raw.rfc822),
+    })
+}
+
 /// Fetch a batch after the caller has already obtained and bounded its exact
 /// RFC822.SIZE values. Evidence collection uses this to cap the aggregate before
 /// any raw body fetch, without issuing a second size preflight.
@@ -1821,6 +1875,82 @@ pub async fn search(
     Ok(summaries)
 }
 
+fn ensure_automated_move_uidvalidity(
+    observed: Option<u32>,
+    expected: u32,
+) -> Result<(), ImapError> {
+    if observed == Some(expected) {
+        Ok(())
+    } else {
+        Err(ImapError::Protocol(format!(
+            "automated move refused: UIDVALIDITY changed before mutation (expected {expected}, found {observed:?})"
+        )))
+    }
+}
+
+/// Move a message only when the server supports UID-scoped expunge.
+///
+/// Automated classifiers must not use the general bare-EXPUNGE fallback: on a
+/// server without UIDPLUS it could expunge unrelated messages another client
+/// marked `\\Deleted`. Refuse before COPY so the mailbox remains unchanged.
+pub async fn move_message_uidplus_required(
+    client: &mut ImapClient,
+    uid: u32,
+    from: &str,
+    to: &str,
+    expected_uidvalidity: u32,
+) -> Result<(), ImapError> {
+    validate_imap_input(from)?;
+    validate_imap_input(to)?;
+    let selected = client
+        .session
+        .select(from)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("SELECT {from}: {e}")))?;
+    ensure_automated_move_uidvalidity(selected.uid_validity, expected_uidvalidity)?;
+    let has_uidplus = client
+        .session
+        .capabilities()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("CAPABILITY: {e}")))?
+        .has_str("UIDPLUS");
+    if !has_uidplus {
+        return Err(ImapError::Protocol(
+            "automated move refused: server lacks UIDPLUS for UID-scoped expunge".into(),
+        ));
+    }
+    let uid_str = uid.to_string();
+    let quoted_to = imap_mailbox_arg(to);
+    client
+        .session
+        .uid_copy(&uid_str, &quoted_to)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID COPY {uid} to {to}: {e}")))?;
+    {
+        let mut store_stream = client
+            .session
+            .uid_store(&uid_str, "+FLAGS (\\Deleted)")
+            .await
+            .map_err(|e| ImapError::Protocol(format!("UID STORE +FLAGS \\Deleted {uid}: {e}")))?;
+        while let Some(item) = store_stream.next().await {
+            item.map_err(|e| {
+                ImapError::Protocol(format!("UID STORE +FLAGS \\Deleted {uid} response: {e}"))
+            })?;
+        }
+    }
+    let expunge_stream = client
+        .session
+        .uid_expunge(&uid_str)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID EXPUNGE {uid}: {e}")))?;
+    let mut expunge_stream = pin!(expunge_stream);
+    while let Some(item) = expunge_stream.next().await {
+        item.map_err(|e| ImapError::Protocol(format!("UID EXPUNGE {uid} response: {e}")))?;
+    }
+    debug!("moved UID {uid} from {from} to {to} with validated UIDVALIDITY");
+    Ok(())
+}
+
 /// Move a message from one folder to another by UID (copy + delete).
 pub async fn move_message(
     client: &mut ImapClient,
@@ -2361,6 +2491,17 @@ mod tests {
     #[test]
     fn test_imap_mailbox_arg_escapes_quoted_string_metacharacters() {
         assert_eq!(imap_mailbox_arg(r#"Foo\"Bar"#), r#""Foo\\\"Bar""#);
+    }
+
+    #[test]
+    fn automated_move_requires_the_same_known_uidvalidity() {
+        assert!(ensure_automated_move_uidvalidity(Some(42), 42).is_ok());
+        for observed in [None, Some(41), Some(43)] {
+            let error = ensure_automated_move_uidvalidity(observed, 42)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("UIDVALIDITY changed before mutation"));
+        }
     }
 
     #[test]
