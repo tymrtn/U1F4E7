@@ -171,6 +171,15 @@ pub struct MailEngineStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MailEngineDecisionRecovery {
+    pub status: String,
+    pub route: String,
+    pub execution_status: String,
+    pub urgency: String,
+    pub notify_user_probability: Option<f64>,
+}
+
 /// Privacy-minimized handle for a message routed into the digest queue.
 /// Message content remains in the mailbox and can be fetched read-only by UID
 /// when a digest compiler is ready to render a batch.
@@ -435,13 +444,22 @@ impl Database {
         folder: &str,
         uidvalidity: u32,
         uid: u32,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<MailEngineDecisionRecovery>> {
         self.conn()
             .query_row(
-                "SELECT route, execution_status FROM mail_engine_decisions
+                "SELECT status, route, execution_status, urgency, notify_user_probability
+                 FROM mail_engine_decisions
                  WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4",
                 params![account_id, folder, i64::from(uidvalidity), i64::from(uid)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok(MailEngineDecisionRecovery {
+                        status: row.get(0)?,
+                        route: row.get(1)?,
+                        execution_status: row.get(2)?,
+                        urgency: row.get(3)?,
+                        notify_user_probability: row.get(4)?,
+                    })
+                },
             )
             .optional()
             .map_err(Into::into)
@@ -1060,7 +1078,13 @@ mod tests {
         assert_eq!(
             db.get_mail_engine_decision_execution("acct", "INBOX", 10, 101)
                 .unwrap(),
-            Some(("follow_up".into(), "not_requested".into()))
+            Some(MailEngineDecisionRecovery {
+                status: "decided".into(),
+                route: "follow_up".into(),
+                execution_status: "not_requested".into(),
+                urgency: "not_urgent".into(),
+                notify_user_probability: Some(0.1),
+            })
         );
     }
 

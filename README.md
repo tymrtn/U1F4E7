@@ -129,8 +129,9 @@ envelope watch --json
 # Requires OPENROUTER_API_KEY. Each new message sends its sender/domain, subject,
 # up to 8 KiB of derived text, flags, and interaction statistics to OpenRouter.
 # Omit --account to cover every configured account; add --apply for confident junk moves.
+# Add --deliver to drain configured signed event routes for urgent notifications.
 envelope engine once --account you@example.com --json
-envelope engine run --account you@example.com --interval-seconds 300 --apply --json
+envelope engine run --account you@example.com --interval-seconds 300 --apply --deliver --json
 # List privacy-minimized handles queued for a later read-only news digest compiler.
 envelope engine digest-queue --account you@example.com --limit 50 --json
 # Fetch a bounded subject-level digest preview with EXAMINE + BODY.PEEK headers only.

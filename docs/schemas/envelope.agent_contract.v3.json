@@ -97,10 +97,10 @@
     "codex"
   ],
   "mail_engine": {
-    "action_safety": "Without --apply, decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
+    "action_safety": "Without --apply, mailbox decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. Urgent events and matching delivery rows are durable local state; --deliver is the separate explicit external-side-effect flag that drains the existing signed retry/dead-letter delivery pipeline. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
     "commands": [
-      "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply]",
-      "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply]",
+      "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply] [--deliver]",
+      "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply] [--deliver]",
       "envelope engine status [--account <id-or-email>]",
       "envelope engine digest-queue [--account <id-or-email>] [--limit 50]",
       "envelope engine digest [--account <id-or-email>] [--limit 25]"
@@ -117,9 +117,11 @@
       "sender_missing",
       "jev_request_failed",
       "imap_move_failed",
-      "spam_folder_not_found"
+      "spam_folder_not_found",
+      "notification_enqueue_failed",
+      "decision_incomplete"
     ],
-    "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
+    "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
     "model": "typesafe/jev-1.13",
     "new_only": "First observation and UIDVALIDITY changes baseline at the current highest UID without classifying historical messages; later passes process only higher extant UIDs.",
     "polling": {
@@ -145,7 +147,8 @@
       "review"
     ],
     "state_egress": "Each decision sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender/interaction/reply statistics to OpenRouter. Credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs are excluded.",
-    "surface": "cli_only"
+    "surface": "cli_only",
+    "urgent_delivery": "notify_user_now creates a deterministic content-free mail_engine_urgent event keyed by account/folder/UIDVALIDITY/UID and one idempotent local delivery row for every enabled matching route. A retry that finds an existing durable decision re-derives notification intent from its persisted policy output and repairs a missing event/delivery before advancing the watermark. --deliver drains due rows through the existing HMAC-signed webhook executor, bounded backoff, and dead-letter recovery. Redirects are disabled in the engine delivery client."
   },
   "mcp_tools": [
     {

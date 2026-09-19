@@ -1486,6 +1486,9 @@ enum EngineCmd {
         /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
         #[arg(long)]
         apply: bool,
+        /// Enqueue urgent events to matching routes and drain due webhook deliveries
+        #[arg(long)]
+        deliver: bool,
     },
     /// Run continuously, one non-overlapping pass every five minutes by default
     Run {
@@ -1498,6 +1501,9 @@ enum EngineCmd {
         /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
         #[arg(long)]
         apply: bool,
+        /// Enqueue urgent events to matching routes and drain due webhook deliveries
+        #[arg(long)]
+        deliver: bool,
         /// Poll interval in seconds (minimum 60)
         #[arg(long, default_value = "300", value_parser = parse_engine_interval)]
         interval_seconds: u64,
@@ -2944,10 +2950,12 @@ fn main() {
                 account,
                 folder,
                 apply,
+                deliver,
             } => commands::engine::run_once(commands::engine::EngineOptions {
                 account: account.as_deref(),
                 folder: &folder,
                 apply,
+                deliver,
                 json: cli.json,
                 backend,
             }),
@@ -2955,12 +2963,14 @@ fn main() {
                 account,
                 folder,
                 apply,
+                deliver,
                 interval_seconds,
             } => commands::engine::run_loop(
                 commands::engine::EngineOptions {
                     account: account.as_deref(),
                     folder: &folder,
                     apply,
+                    deliver,
                     json: cli.json,
                     backend,
                 },
@@ -3144,6 +3154,7 @@ mod tests {
                     EngineCmd::Run {
                         interval_seconds,
                         apply,
+                        deliver,
                         account,
                         folder,
                         ..
@@ -3151,6 +3162,7 @@ mod tests {
             } => {
                 assert_eq!(interval_seconds, 300);
                 assert!(!apply);
+                assert!(!deliver);
                 assert!(account.is_none());
                 assert_eq!(folder, "INBOX");
             }
@@ -3170,12 +3182,17 @@ mod tests {
             "--account",
             "account@example.test",
             "--apply",
+            "--deliver",
         ])
         .expect("engine once should parse");
         assert!(matches!(
             once.command,
             Commands::Engine {
-                subcommand: EngineCmd::Once { apply: true, .. }
+                subcommand: EngineCmd::Once {
+                    apply: true,
+                    deliver: true,
+                    ..
+                }
             }
         ));
         let status = Cli::try_parse_from(["envelope", "engine", "status", "--json"])
