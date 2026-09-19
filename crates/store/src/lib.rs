@@ -49,8 +49,9 @@ pub use errors::StoreError;
 pub use event_deliveries::{DeliveryStatusFilter, RESPONSE_SNIPPET_CAP_BYTES};
 pub use events::{EventLogEntry, EventLogFilter};
 pub use mail_engine::{
-    MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineSenderStats, MailEngineStatus,
-    MailboxScanPlan, NewMailEngineDecision, mail_engine_hash,
+    MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineDigestCandidate,
+    MailEngineSenderStats, MailEngineStatus, MailboxScanPlan, NewMailEngineDecision,
+    mail_engine_hash,
 };
 pub use models::*;
 pub use ops_primitives::{RuleRunAuditInput, WatchUpsert};

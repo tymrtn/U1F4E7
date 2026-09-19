@@ -56,7 +56,7 @@ pub fn agent_contract() -> Value {
                 "SUCCESSFUL outbound results (immediate send and queued/scheduled acceptance) gained an additive sanitized `attribution` block (protocol, catalog/version, attribution_state, the attribute sets, and Governor decision/route where applicable; never a score/weight/threshold/body/raw recipient/secret). New optional field, backward-compatible.",
                 "The `mailto:` compliance unsubscribe is a real SMTP surface and is now attribution-gated: `envelope unsubscribe` accepts repeatable --attr keys and requires a non-empty valid declaration before Governor/SMTP (a missing/invalid declaration fails closed with the canonical attribution error). HTTPS one-click unsubscribe is not an SMTP send and is unaffected.",
                 "Attribution fails closed in warn mode too: warn only softens a Governor VERDICT on an already-attributed send; it never waives the attribution precondition, so a bot-originated send with a missing/invalid declaration is refused in warn exactly as in required.",
-                "Additive Jev mail-engine CLI surface: `engine once|run|status` processes only messages newer than a durable first-run/UIDVALIDITY baseline, polls every 300 seconds by default, and sends bounded untrusted message state plus indexed sender/interaction history to OpenRouter's Decisions API. Classification is separated from actions; only confident junk may move to a detected spam folder under explicit --apply, while unsubscribe is candidate-only.",
+                "Additive Jev mail-engine CLI surface: `engine once|run|status|digest-queue` processes only messages newer than a durable first-run/UIDVALIDITY baseline, polls every 300 seconds by default, and sends bounded untrusted message state plus indexed sender/interaction history to OpenRouter's Decisions API. Classification is separated from actions; only confident junk may move to a detected spam folder under explicit --apply, while digest and unsubscribe routes remain local queues.",
                 "v2 (envelope.agent_contract.v2) is retained as historical documentation at docs/schemas/envelope.agent_contract.v2.json; generic {code, reason} error handling is unaffected."
             ]
         },
@@ -124,7 +124,8 @@ pub fn agent_contract() -> Value {
             "commands": [
                 "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply]",
                 "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply]",
-                "envelope engine status [--account <id-or-email>]"
+                "envelope engine status [--account <id-or-email>]",
+                "envelope engine digest-queue [--account <id-or-email>] [--limit 50]"
             ],
             "model": "typesafe/jev-1.13",
             "endpoint": "https://openrouter.ai/api/alpha/decisions",
@@ -136,7 +137,7 @@ pub fn agent_contract() -> Value {
             "action_safety": "Without --apply, decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
             "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "jev_request_failed", "imap_move_failed", "spam_folder_not_found"],
             "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
-            "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body."
+            "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time so a later read-only compiler can fetch selected mailbox content deliberately."
         },
         "agent_identity": {
             "env": "ENVELOPE_AGENT_TOKEN",
@@ -1339,6 +1340,13 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("before the paid request")
+        );
+        assert!(
+            engine["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command.as_str().unwrap().contains("digest-queue"))
         );
     }
 

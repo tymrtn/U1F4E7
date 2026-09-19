@@ -93,6 +93,8 @@ envelope watch --json
 # Omit --account to cover every configured account; add --apply for confident junk moves.
 envelope engine once --account you@example.com --json
 envelope engine run --account you@example.com --interval-seconds 300 --apply --json
+# List privacy-minimized handles queued for a later read-only news digest compiler.
+envelope engine digest-queue --account you@example.com --limit 50 --json
 
 # Retrieve a verification-code JSON result for unattended automation (bounded and fail-closed)
 envelope --json code --account you@example.com --from otp@issuer.example --wait 60
