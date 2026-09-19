@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.4] — 2026-09-19
+
+### Added
+
+- **Dashboard (Logs):** a `Logs` page and `GET /api/events` — what agents and Envelope did,
+  newest first, across every account, read from the `events` table. Filter by account, by event
+  type (an exact type or a dotted prefix such as `send_governor`), and by range; page with a
+  `before` cursor; a malformed query is refused with `events_query_invalid`. Same-day runs of one
+  event about one draft collapse into a single entry with a repeat count: the scheduled sweep
+  re-evaluates a blocked draft every cooldown and writes a row each time, and one install carried
+  21,280 such rows for five drafts in a week. Each entry is a fixed projection — the raw payload,
+  the message snippet, and the subject hash never leave the store. Rows deep-link to the draft or
+  message they concern.
+- **Dashboard (draft review):** an `Approve` action on the draft page for drafts awaiting review
+  or blocked. It records that a human reviewed exactly this revision. It does not send the draft,
+  and it does not exempt a later agent send from Governor. A concurrent edit rolls the approval
+  back and the page asks for a reload.
+
+### Changed
+
+- **Dashboard (navigation):** the Cockpit page is gone. Its approval queue and scheduled sends
+  were already on Review, its watch and delivery health under Review's Operational health, and
+  its Evidence panel could never hold content. Agent identities, send ceilings, and scope now sit
+  on Rules as a read-only Agents section, and the hint names the real commands,
+  `envelope agent create` and `envelope agent revoke`. `/cockpit` and `/accounts/{id}/cockpit`
+  redirect to `/review`, and the `ui` metadata keeps its `cockpit_url` key pointed at `/review`
+  so links in older agent transcripts still resolve. The nav reads Mail · Review · Logs · Rules.
+
+### Fixed
+
+- **Dashboard (modals):** dialogs clamp to the viewport and scroll inside. The Governor
+  context-refinement dialog lists every catalog attribute, and with no height ceiling and no
+  scroller on a centred backdrop it grew past both edges of the window: the title and the
+  "Facts you can correct" checkboxes clipped off the top, Cancel and Retry off the bottom, and
+  nothing scrolled. The body now owns the scroll while the head and foot stay pinned. The
+  refinement dialog also stops listing the three catalog keys a send can never satisfy
+  (`read_only`, `move_to_folder`, `delete_message`).
+
 ## [1.2.3] — 2026-09-17
 
 ### Fixed
