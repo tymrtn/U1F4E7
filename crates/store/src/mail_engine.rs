@@ -62,6 +62,28 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mail_engine_decisions_status
             ON mail_engine_decisions(account_id, status, created_at);
 
+        CREATE TABLE IF NOT EXISTS mail_engine_digest_consumptions (
+            account_id TEXT NOT NULL,
+            folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            consumed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (account_id, folder, uidvalidity, uid)
+        );
+
+        CREATE TABLE IF NOT EXISTS mail_engine_decision_corrections (
+            account_id TEXT NOT NULL,
+            folder TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            route TEXT NOT NULL,
+            urgency TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (account_id, folder, uidvalidity, uid, revision)
+        );
+
         CREATE TABLE IF NOT EXISTS mail_engine_sender_stats (
             account_id TEXT NOT NULL,
             sender_hash TEXT NOT NULL,
@@ -163,12 +185,52 @@ pub struct MailEngineStatus {
     pub baseline_reason: String,
     pub decision_count: u64,
     pub review_count: u64,
+    pub processing_count: u64,
+    pub junk_count: u64,
     pub follow_up_count: u64,
     pub important_count: u64,
+    pub routine_count: u64,
     pub digest_news_count: u64,
     pub unsubscribe_candidate_count: u64,
     pub notification_count: u64,
     pub last_error: Option<String>,
+}
+
+/// Privacy-minimized decision record for operator inspection. Message headers
+/// and bodies stay in IMAP and are fetched only by an explicit review command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MailEngineDecisionSummary {
+    pub account_id: String,
+    pub folder: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
+    pub model_status: String,
+    pub status: String,
+    pub route: String,
+    pub effective_route: String,
+    pub route_probability: Option<f64>,
+    pub route_confidence: Option<f64>,
+    pub urgency: String,
+    pub effective_urgency: String,
+    pub notify_user_probability: Option<f64>,
+    pub requires_reply_probability: Option<f64>,
+    pub bulk_or_subscription_probability: Option<f64>,
+    pub execution_status: String,
+    pub executed_action: Option<String>,
+    pub model_error_code: Option<String>,
+    pub error_code: Option<String>,
+    pub correction_revision: u64,
+    pub decided_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MailEngineDecisionDisplay {
+    #[serde(flatten)]
+    pub decision: MailEngineDecisionSummary,
+    pub metadata_state: String,
+    pub from_addr: Option<String>,
+    pub subject: Option<String>,
+    pub date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +257,14 @@ pub struct MailEngineDigestCandidate {
     pub requires_reply_probability: Option<f64>,
     pub bulk_or_subscription_probability: Option<f64>,
     pub decided_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct MailEngineDigestKey {
+    pub account_id: String,
+    pub folder: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
 }
 
 impl Database {
@@ -447,9 +517,24 @@ impl Database {
     ) -> Result<Option<MailEngineDecisionRecovery>> {
         self.conn()
             .query_row(
-                "SELECT status, route, execution_status, urgency, notify_user_probability
-                 FROM mail_engine_decisions
-                 WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4",
+                "SELECT
+                    CASE WHEN c.revision IS NOT NULL THEN 'decided' ELSE d.status END,
+                    COALESCE(c.route, d.route),
+                    d.execution_status,
+                    COALESCE(c.urgency, d.urgency),
+                    d.notify_user_probability
+                 FROM mail_engine_decisions d
+                 LEFT JOIN mail_engine_decision_corrections c
+                   ON c.account_id = d.account_id AND c.folder = d.folder
+                  AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+                  AND c.revision = (
+                      SELECT MAX(c2.revision)
+                      FROM mail_engine_decision_corrections c2
+                      WHERE c2.account_id = d.account_id AND c2.folder = d.folder
+                        AND c2.uidvalidity = d.uidvalidity AND c2.uid = d.uid
+                  )
+                 WHERE d.account_id = ?1 AND d.folder = ?2
+                   AND d.uidvalidity = ?3 AND d.uid = ?4",
                 params![account_id, folder, i64::from(uidvalidity), i64::from(uid)],
                 |row| {
                     Ok(MailEngineDecisionRecovery {
@@ -465,6 +550,125 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Resolve an abandoned current-epoch claim without issuing another paid
+    /// request. The message remains explicitly queued for human review and a
+    /// later ordered pass may advance past it.
+    pub fn resolve_current_mail_engine_processing_as_review(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE mail_engine_decisions
+             SET status = 'review', route = 'review', urgency = 'not_urgent',
+                 route_probability = NULL, route_confidence = NULL,
+                 notify_user_probability = NULL,
+                 requires_reply_probability = NULL,
+                 bulk_or_subscription_probability = NULL,
+                 decision_json = '{\"error_code\":\"processing_recovered_for_review\"}',
+                 execution_status = 'not_requested', executed_action = NULL,
+                 last_error = 'processing_recovered_for_review',
+                 updated_at = datetime('now')
+             WHERE account_id = ?1 AND folder = ?2 AND uid = ?3
+               AND status = 'processing'
+               AND uidvalidity = (
+                   SELECT uidvalidity FROM mail_engine_mailboxes
+                   WHERE account_id = ?1 AND folder = ?2
+               )",
+            params![account_id, folder, i64::from(uid)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Park stale pre-request claims for human review without issuing another
+    /// paid request. A late worker cannot finalize because finalization requires
+    /// status='processing'.
+    pub fn recover_stale_mail_engine_processing(&self, stale_after_seconds: u64) -> Result<usize> {
+        if !(60..=86_400).contains(&stale_after_seconds) {
+            return Err(StoreError::Config(
+                "mail engine stale-claim threshold must be between 60 and 86400 seconds".into(),
+            ));
+        }
+        let cutoff = format!("-{stale_after_seconds} seconds");
+        let changed = self.conn().execute(
+            "UPDATE mail_engine_decisions
+             SET status = 'review', route = 'review', urgency = 'not_urgent',
+                 route_probability = NULL, route_confidence = NULL,
+                 notify_user_probability = NULL,
+                 requires_reply_probability = NULL,
+                 bulk_or_subscription_probability = NULL,
+                 decision_json = '{\"error_code\":\"decision_interrupted\"}',
+                 execution_status = 'not_requested', executed_action = NULL,
+                 last_error = 'decision_interrupted', updated_at = datetime('now')
+             WHERE status = 'processing'
+               AND updated_at <= datetime('now', ?1)",
+            [cutoff],
+        )?;
+        Ok(changed)
+    }
+
+    /// Prepare a retry only when the stored failure proves that no model
+    /// request was dispatched. Atomically transitions the existing durable row
+    /// back to `processing`; it never deletes the decision or rewinds the mailbox
+    /// watermark. The caller must immediately fetch and reclassify this exact
+    /// identity using the already-owned claim.
+    pub fn prepare_current_mail_engine_safe_retry(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<u32>> {
+        let tx = self.conn().unchecked_transaction()?;
+        let uidvalidity: Option<i64> = tx
+            .query_row(
+                "SELECT d.uidvalidity
+                 FROM mail_engine_decisions d
+                 JOIN mail_engine_mailboxes m
+                   ON m.account_id = d.account_id AND m.folder = d.folder
+                  AND m.uidvalidity = d.uidvalidity
+                 WHERE d.account_id = ?1 AND d.folder = ?2 AND d.uid = ?3
+                   AND d.status = 'review' AND d.route = 'review'
+                   AND json_extract(d.decision_json, '$.error_code') = 'openrouter_api_key_missing'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM mail_engine_decision_corrections c
+                       WHERE c.account_id = d.account_id AND c.folder = d.folder
+                         AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+                   )",
+                params![account_id, folder, i64::from(uid)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(uidvalidity) = uidvalidity else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE mail_engine_decisions
+             SET status = 'processing', route = 'review', urgency = 'not_urgent',
+                 route_probability = NULL, route_confidence = NULL,
+                 notify_user_probability = NULL,
+                 requires_reply_probability = NULL,
+                 bulk_or_subscription_probability = NULL,
+                 decision_json = '{\"status\":\"processing\",\"retry\":\"openrouter_key_restored\"}',
+                 execution_status = 'not_requested', executed_action = NULL,
+                 last_error = NULL, updated_at = datetime('now')
+             WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
+               AND status = 'review' AND route = 'review'
+               AND json_extract(decision_json, '$.error_code') = 'openrouter_api_key_missing'
+               AND NOT EXISTS (
+                   SELECT 1 FROM mail_engine_decision_corrections c
+                   WHERE c.account_id = mail_engine_decisions.account_id
+                     AND c.folder = mail_engine_decisions.folder
+                     AND c.uidvalidity = mail_engine_decisions.uidvalidity
+                     AND c.uid = mail_engine_decisions.uid
+               )",
+            params![account_id, folder, uidvalidity, i64::from(uid)],
+        )?;
+        tx.commit()?;
+        Ok((changed == 1).then_some(uidvalidity as u32))
+    }
+
     pub fn claim_mail_engine_execution(
         &self,
         account_id: &str,
@@ -476,7 +680,20 @@ impl Database {
             "UPDATE mail_engine_decisions
              SET execution_status = 'executing', updated_at = datetime('now')
              WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
-               AND execution_status = 'pending'",
+               AND execution_status = 'pending'
+               AND COALESCE(
+                   (
+                       SELECT c.route
+                       FROM mail_engine_decision_corrections c
+                       WHERE c.account_id = mail_engine_decisions.account_id
+                         AND c.folder = mail_engine_decisions.folder
+                         AND c.uidvalidity = mail_engine_decisions.uidvalidity
+                         AND c.uid = mail_engine_decisions.uid
+                       ORDER BY c.revision DESC
+                       LIMIT 1
+                   ),
+                   route
+               ) = 'junk'",
             params![account_id, folder, i64::from(uidvalidity), i64::from(uid)],
         )?;
         Ok(changed == 1)
@@ -526,10 +743,19 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<u32>> {
         let mut stmt = self.conn().prepare(
-            "SELECT uid FROM mail_engine_decisions
-             WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3
-               AND route = 'junk' AND execution_status = 'pending'
-             ORDER BY uid ASC LIMIT ?4",
+            "SELECT d.uid FROM mail_engine_decisions d
+             LEFT JOIN mail_engine_decision_corrections c
+               ON c.account_id = d.account_id AND c.folder = d.folder
+              AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+              AND c.revision = (
+                  SELECT MAX(c2.revision) FROM mail_engine_decision_corrections c2
+                  WHERE c2.account_id = d.account_id AND c2.folder = d.folder
+                    AND c2.uidvalidity = d.uidvalidity AND c2.uid = d.uid
+              )
+             WHERE d.account_id = ?1 AND d.folder = ?2 AND d.uidvalidity = ?3
+               AND COALESCE(c.route, d.route) = 'junk'
+               AND d.execution_status = 'pending'
+             ORDER BY d.uid ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
             params![account_id, folder, i64::from(uidvalidity), limit as i64],
@@ -550,14 +776,26 @@ impl Database {
         }
         let mut stmt = self.conn().prepare(
             "SELECT d.account_id, d.folder, d.uidvalidity, d.uid,
-                    d.route_probability, d.route_confidence, d.urgency,
+                    d.route_probability, d.route_confidence, COALESCE(r.urgency, d.urgency),
                     d.requires_reply_probability, d.bulk_or_subscription_probability,
                     d.updated_at
              FROM mail_engine_decisions d
              JOIN mail_engine_mailboxes m
                ON m.account_id = d.account_id AND m.folder = d.folder
               AND m.uidvalidity = d.uidvalidity
-             WHERE d.route = 'digest_news' AND d.status = 'decided'
+             LEFT JOIN mail_engine_digest_consumptions c
+               ON c.account_id = d.account_id AND c.folder = d.folder
+              AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+             LEFT JOIN mail_engine_decision_corrections r
+               ON r.account_id = d.account_id AND r.folder = d.folder
+              AND r.uidvalidity = d.uidvalidity AND r.uid = d.uid
+              AND r.revision = (
+                  SELECT MAX(r2.revision) FROM mail_engine_decision_corrections r2
+                  WHERE r2.account_id = d.account_id AND r2.folder = d.folder
+                    AND r2.uidvalidity = d.uidvalidity AND r2.uid = d.uid
+              )
+             WHERE COALESCE(r.route, d.route) = 'digest_news' AND d.status = 'decided'
+               AND c.uid IS NULL
                AND (?1 IS NULL OR d.account_id = ?1)
              ORDER BY d.updated_at DESC, d.account_id ASC, d.folder ASC,
                       d.uidvalidity DESC, d.uid DESC
@@ -581,6 +819,281 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn consume_mail_engine_digest(&self, keys: &[MailEngineDigestKey]) -> Result<usize> {
+        if keys.len() > 100 {
+            return Err(StoreError::Config(
+                "mail engine digest consumption is limited to 100 items".into(),
+            ));
+        }
+        let unique = keys.iter().collect::<HashSet<_>>();
+        let tx = self.conn().unchecked_transaction()?;
+        let mut consumed = 0usize;
+        for key in unique {
+            consumed += tx.execute(
+                "INSERT OR IGNORE INTO mail_engine_digest_consumptions
+                 (account_id, folder, uidvalidity, uid)
+                 SELECT d.account_id, d.folder, d.uidvalidity, d.uid
+                 FROM mail_engine_decisions d
+                 JOIN mail_engine_mailboxes m
+                   ON m.account_id = d.account_id AND m.folder = d.folder
+                  AND m.uidvalidity = d.uidvalidity
+                 LEFT JOIN mail_engine_decision_corrections r
+                   ON r.account_id = d.account_id AND r.folder = d.folder
+                  AND r.uidvalidity = d.uidvalidity AND r.uid = d.uid
+                  AND r.revision = (
+                      SELECT MAX(r2.revision) FROM mail_engine_decision_corrections r2
+                      WHERE r2.account_id = d.account_id AND r2.folder = d.folder
+                        AND r2.uidvalidity = d.uidvalidity AND r2.uid = d.uid
+                  )
+                 WHERE d.account_id = ?1 AND d.folder = ?2
+                   AND d.uidvalidity = ?3 AND d.uid = ?4
+                   AND d.status = 'decided'
+                   AND COALESCE(r.route, d.route) = 'digest_news'",
+                params![
+                    key.account_id,
+                    key.folder,
+                    i64::from(key.uidvalidity),
+                    i64::from(key.uid),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(consumed)
+    }
+
+    pub fn count_pending_mail_engine_digest(&self, account_id: Option<&str>) -> Result<usize> {
+        let count = self.conn().query_row(
+            "SELECT COUNT(*)
+             FROM mail_engine_decisions d
+             JOIN mail_engine_mailboxes m
+               ON m.account_id = d.account_id AND m.folder = d.folder
+              AND m.uidvalidity = d.uidvalidity
+             LEFT JOIN mail_engine_digest_consumptions c
+               ON c.account_id = d.account_id AND c.folder = d.folder
+              AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+             LEFT JOIN mail_engine_decision_corrections r
+               ON r.account_id = d.account_id AND r.folder = d.folder
+              AND r.uidvalidity = d.uidvalidity AND r.uid = d.uid
+              AND r.revision = (
+                  SELECT MAX(r2.revision) FROM mail_engine_decision_corrections r2
+                  WHERE r2.account_id = d.account_id AND r2.folder = d.folder
+                    AND r2.uidvalidity = d.uidvalidity AND r2.uid = d.uid
+              )
+             WHERE COALESCE(r.route, d.route) = 'digest_news' AND d.status = 'decided'
+               AND c.uid IS NULL
+               AND (?1 IS NULL OR d.account_id = ?1)",
+            [account_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn list_mail_engine_decisions(
+        &self,
+        account_id: Option<&str>,
+        route: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailEngineDecisionSummary>> {
+        if !(1..=200).contains(&limit) {
+            return Err(StoreError::Config(
+                "mail engine decision limit must be between 1 and 200".into(),
+            ));
+        }
+        if let Some(route) = route {
+            validate_token(route, "route")?;
+        }
+        if let Some(status) = status {
+            validate_token(status, "status")?;
+        }
+        let mut stmt = self.conn().prepare(
+            "SELECT d.account_id, d.folder, d.uidvalidity, d.uid,
+                    d.status,
+                    CASE WHEN c.revision IS NOT NULL THEN 'decided' ELSE d.status END,
+                    d.route, COALESCE(c.route, d.route),
+                    d.route_probability, d.route_confidence,
+                    d.urgency, COALESCE(c.urgency, d.urgency),
+                    d.notify_user_probability,
+                    d.requires_reply_probability, d.bulk_or_subscription_probability,
+                    d.execution_status, d.executed_action,
+                    COALESCE(d.last_error, json_extract(d.decision_json, '$.error_code')),
+                    CASE WHEN c.revision IS NULL
+                         THEN COALESCE(d.last_error, json_extract(d.decision_json, '$.error_code'))
+                         ELSE NULL END,
+                    COALESCE(c.revision, 0), d.updated_at
+             FROM mail_engine_decisions d
+             JOIN mail_engine_mailboxes m
+               ON m.account_id = d.account_id AND m.folder = d.folder
+              AND m.uidvalidity = d.uidvalidity
+             LEFT JOIN mail_engine_decision_corrections c
+               ON c.account_id = d.account_id AND c.folder = d.folder
+              AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+              AND c.revision = (
+                  SELECT MAX(c2.revision)
+                  FROM mail_engine_decision_corrections c2
+                  WHERE c2.account_id = d.account_id AND c2.folder = d.folder
+                    AND c2.uidvalidity = d.uidvalidity AND c2.uid = d.uid
+              )
+             WHERE (?1 IS NULL OR d.account_id = ?1)
+               AND (?2 IS NULL OR COALESCE(c.route, d.route) = ?2)
+               AND (?3 IS NULL OR (CASE WHEN c.revision IS NOT NULL THEN 'decided' ELSE d.status END) = ?3)
+             ORDER BY d.updated_at DESC, d.account_id ASC, d.folder ASC, d.uid DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![account_id, route, status, limit as i64], |row| {
+            Ok(MailEngineDecisionSummary {
+                account_id: row.get(0)?,
+                folder: row.get(1)?,
+                uidvalidity: row.get::<_, i64>(2)? as u32,
+                uid: row.get::<_, i64>(3)? as u32,
+                model_status: row.get(4)?,
+                status: row.get(5)?,
+                route: row.get(6)?,
+                effective_route: row.get(7)?,
+                route_probability: row.get(8)?,
+                route_confidence: row.get(9)?,
+                urgency: row.get(10)?,
+                effective_urgency: row.get(11)?,
+                notify_user_probability: row.get(12)?,
+                requires_reply_probability: row.get(13)?,
+                bulk_or_subscription_probability: row.get(14)?,
+                execution_status: row.get(15)?,
+                executed_action: row.get(16)?,
+                model_error_code: row.get(17)?,
+                error_code: row.get(18)?,
+                correction_revision: row.get::<_, i64>(19)? as u64,
+                decided_at: row.get(20)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_mail_engine_decision_display(
+        &self,
+        account_id: Option<&str>,
+        route: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailEngineDecisionDisplay>> {
+        let decisions = self.list_mail_engine_decisions(account_id, route, status, limit)?;
+        decisions
+            .into_iter()
+            .map(|decision| {
+                let metadata: Option<(String, String, Option<String>)> = self
+                    .conn()
+                    .query_row(
+                        "SELECT from_addr, subject, date
+                         FROM indexed_message_summaries
+                         WHERE account_id = ?1 AND folder = ?2
+                           AND uidvalidity = ?3 AND uid = ?4",
+                        params![
+                            decision.account_id,
+                            decision.folder,
+                            i64::from(decision.uidvalidity),
+                            i64::from(decision.uid),
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let (metadata_state, from_addr, subject, date) = match metadata {
+                    Some((from_addr, subject, date)) => (
+                        "available".to_string(),
+                        Some(from_addr),
+                        Some(subject),
+                        date,
+                    ),
+                    None => ("unavailable".to_string(), None, None, None),
+                };
+                Ok(MailEngineDecisionDisplay {
+                    decision,
+                    metadata_state,
+                    from_addr,
+                    subject,
+                    date,
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn correct_current_mail_engine_decision(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        expected_revision: u64,
+        route: &str,
+        urgency: &str,
+        actor: &str,
+    ) -> Result<Option<u64>> {
+        validate_mail_engine_route(route)?;
+        validate_mail_engine_urgency(urgency)?;
+        validate_token(actor, "actor")?;
+        let tx = self.conn().unchecked_transaction()?;
+        let row: Option<(i64, String, String, i64)> = tx
+            .query_row(
+                "SELECT d.uidvalidity, d.status, d.execution_status,
+                        COALESCE(MAX(c.revision), 0)
+                 FROM mail_engine_decisions d
+                 JOIN mail_engine_mailboxes m
+                   ON m.account_id = d.account_id AND m.folder = d.folder
+                  AND m.uidvalidity = d.uidvalidity
+                 LEFT JOIN mail_engine_decision_corrections c
+                   ON c.account_id = d.account_id AND c.folder = d.folder
+                  AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+                 WHERE d.account_id = ?1 AND d.folder = ?2 AND d.uid = ?3
+                 GROUP BY d.uidvalidity, d.status, d.execution_status",
+                params![account_id, folder, i64::from(uid)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((uidvalidity, status, execution_status, current_revision)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if current_revision as u64 != expected_revision
+            || !matches!(status.as_str(), "decided" | "review")
+            || execution_status == "executing"
+        {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let next_revision = current_revision + 1;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO mail_engine_decision_corrections
+             (account_id, folder, uidvalidity, uid, revision, route, urgency, actor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                account_id,
+                folder,
+                uidvalidity,
+                i64::from(uid),
+                next_revision,
+                route,
+                urgency,
+                actor,
+            ],
+        )?;
+        if inserted != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if route != "junk" {
+            tx.execute(
+                "UPDATE mail_engine_decisions
+                 SET execution_status = 'cancelled',
+                     executed_action = 'cancelled_by_human_correction',
+                     updated_at = datetime('now')
+                 WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
+                   AND route = 'junk' AND execution_status = 'pending'",
+                params![account_id, folder, uidvalidity, i64::from(uid)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(next_revision as u64))
+    }
+
     pub fn mail_engine_decision_exists(
         &self,
         account_id: &str,
@@ -594,6 +1107,33 @@ impl Database {
                 "SELECT 1 FROM mail_engine_decisions
                  WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4",
                 params![account_id, folder, i64::from(uidvalidity), i64::from(uid)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn mail_engine_processing_claim_matches(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uidvalidity: u32,
+        uid: u32,
+        input_hash: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM mail_engine_decisions
+                 WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
+                   AND input_hash = ?5 AND status = 'processing'",
+                params![
+                    account_id,
+                    folder,
+                    i64::from(uidvalidity),
+                    i64::from(uid),
+                    input_hash,
+                ],
                 |_| Ok(()),
             )
             .optional()?
@@ -833,18 +1373,29 @@ impl Database {
             "SELECT m.account_id, m.folder, m.uidvalidity, m.last_seen_uid,
                     m.baseline_reason,
                     COUNT(d.uid) AS decision_count,
-                    SUM(CASE WHEN d.route = 'review' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN d.route = 'follow_up' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN d.route = 'important' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN d.route = 'digest_news' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN d.route = 'unsubscribe_candidate' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'review' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN d.status = 'processing' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'junk' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'follow_up' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'important' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'routine' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'digest_news' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(c.route, d.route) = 'unsubscribe_candidate' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN COALESCE(d.notify_user_probability, 0) >= 0.9
-                             AND d.urgency IN ('urgent', 'critical') THEN 1 ELSE 0 END),
+                             AND COALESCE(c.urgency, d.urgency) IN ('urgent', 'critical') THEN 1 ELSE 0 END),
                     m.last_error
              FROM mail_engine_mailboxes m
              LEFT JOIN mail_engine_decisions d
                ON d.account_id = m.account_id AND d.folder = m.folder
               AND d.uidvalidity = m.uidvalidity
+             LEFT JOIN mail_engine_decision_corrections c
+               ON c.account_id = d.account_id AND c.folder = d.folder
+              AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
+              AND c.revision = (
+                  SELECT MAX(c2.revision) FROM mail_engine_decision_corrections c2
+                  WHERE c2.account_id = d.account_id AND c2.folder = d.folder
+                    AND c2.uidvalidity = d.uidvalidity AND c2.uid = d.uid
+              )
              WHERE (?1 IS NULL OR m.account_id = ?1)
              GROUP BY m.account_id, m.folder
              ORDER BY m.account_id, m.folder",
@@ -858,12 +1409,15 @@ impl Database {
                 baseline_reason: row.get(4)?,
                 decision_count: row.get::<_, i64>(5)? as u64,
                 review_count: row.get::<_, i64>(6)? as u64,
-                follow_up_count: row.get::<_, i64>(7)? as u64,
-                important_count: row.get::<_, i64>(8)? as u64,
-                digest_news_count: row.get::<_, i64>(9)? as u64,
-                unsubscribe_candidate_count: row.get::<_, i64>(10)? as u64,
-                notification_count: row.get::<_, i64>(11)? as u64,
-                last_error: row.get(12)?,
+                processing_count: row.get::<_, i64>(7)? as u64,
+                junk_count: row.get::<_, i64>(8)? as u64,
+                follow_up_count: row.get::<_, i64>(9)? as u64,
+                important_count: row.get::<_, i64>(10)? as u64,
+                routine_count: row.get::<_, i64>(11)? as u64,
+                digest_news_count: row.get::<_, i64>(12)? as u64,
+                unsubscribe_candidate_count: row.get::<_, i64>(13)? as u64,
+                notification_count: row.get::<_, i64>(14)? as u64,
+                last_error: row.get(15)?,
             })
         })?;
         Ok(rows.filter_map(|row| row.ok()).collect())
@@ -951,6 +1505,31 @@ fn validate_token(value: &str, field: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_mail_engine_route(value: &str) -> Result<()> {
+    if matches!(
+        value,
+        "junk"
+            | "follow_up"
+            | "important"
+            | "routine"
+            | "digest_news"
+            | "unsubscribe_candidate"
+            | "review"
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::Config("invalid mail engine route".into()))
+    }
+}
+
+fn validate_mail_engine_urgency(value: &str) -> Result<()> {
+    if matches!(value, "not_urgent" | "urgent" | "critical") {
+        Ok(())
+    } else {
+        Err(StoreError::Config("invalid mail engine urgency".into()))
+    }
 }
 
 fn validate_optional_probability(value: Option<f64>, field: &str) -> Result<()> {
@@ -1089,6 +1668,156 @@ mod tests {
     }
 
     #[test]
+    fn operator_can_release_or_explicitly_retry_current_held_decisions() {
+        let db = db();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 110).unwrap();
+        let claim = MailEngineDecisionClaim {
+            account_id: "acct",
+            folder: "INBOX",
+            uidvalidity: 10,
+            uid: 111,
+            input_hash: "held-input",
+            model: "typesafe/jev-1.13",
+        };
+        assert!(db.claim_mail_engine_decision(&claim).unwrap());
+        assert!(
+            db.resolve_current_mail_engine_processing_as_review("acct", "INBOX", 111)
+                .unwrap()
+        );
+        let released = db
+            .list_mail_engine_decisions(Some("acct"), Some("review"), Some("review"), 10)
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            released[0].error_code.as_deref(),
+            Some("processing_recovered_for_review")
+        );
+        assert!(
+            !db.resolve_current_mail_engine_processing_as_review("acct", "INBOX", 111)
+                .unwrap()
+        );
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 111)
+                .unwrap(),
+            None
+        );
+
+        let mut safe_review = decision();
+        safe_review.uid = 112;
+        safe_review.status = "review";
+        safe_review.route = "review";
+        safe_review.route_probability = None;
+        safe_review.route_confidence = None;
+        safe_review.notify_user_probability = None;
+        safe_review.requires_reply_probability = None;
+        safe_review.bulk_or_subscription_probability = None;
+        safe_review.decision_json = r#"{"error_code":"openrouter_api_key_missing"}"#;
+        assert!(
+            db.insert_mail_engine_decision_if_absent(&safe_review)
+                .unwrap()
+        );
+        db.advance_mail_engine_watermark("acct", "INBOX", 10, 112)
+            .unwrap();
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 112)
+                .unwrap(),
+            Some(10)
+        );
+        assert!(
+            db.mail_engine_decision_exists("acct", "INBOX", 10, 112)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_mail_engine_decision_execution("acct", "INBOX", 10, 112)
+                .unwrap()
+                .unwrap()
+                .status,
+            "processing"
+        );
+        assert_eq!(
+            db.plan_mail_engine_scan("acct", "INBOX", 10, 112).unwrap(),
+            MailboxScanPlan::Current
+        );
+
+        safe_review.uid = 113;
+        assert!(
+            db.insert_mail_engine_decision_if_absent(&safe_review)
+                .unwrap()
+        );
+        assert_eq!(
+            db.correct_current_mail_engine_decision(
+                "acct",
+                "INBOX",
+                113,
+                0,
+                "important",
+                "urgent",
+                "dashboard",
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 113)
+                .unwrap(),
+            None,
+            "a human-corrected review must never be deleted for model retry"
+        );
+        let corrected_review = db
+            .list_mail_engine_decisions(Some("acct"), Some("important"), None, 20)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.uid == 113)
+            .unwrap();
+        assert_eq!(corrected_review.model_status, "review");
+        assert_eq!(corrected_review.status, "decided");
+        assert_eq!(
+            corrected_review.model_error_code.as_deref(),
+            Some("openrouter_api_key_missing")
+        );
+        assert_eq!(corrected_review.error_code, None);
+        assert!(
+            db.mail_engine_decision_exists("acct", "INBOX", 10, 113)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_processing_claims_park_once_without_another_request() {
+        let db = db();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 100).unwrap();
+        assert!(
+            db.claim_mail_engine_decision(&MailEngineDecisionClaim {
+                account_id: "acct",
+                folder: "INBOX",
+                uidvalidity: 10,
+                uid: 101,
+                input_hash: "interrupted",
+                model: "typesafe/jev-1.13",
+            })
+            .unwrap()
+        );
+        assert_eq!(db.recover_stale_mail_engine_processing(600).unwrap(), 0);
+        db.conn()
+            .execute(
+                "UPDATE mail_engine_decisions SET updated_at = datetime('now', '-11 minutes')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.recover_stale_mail_engine_processing(600).unwrap(), 1);
+        assert_eq!(db.recover_stale_mail_engine_processing(600).unwrap(), 0);
+        let review = db
+            .list_mail_engine_decisions(Some("acct"), Some("review"), Some("review"), 10)
+            .unwrap();
+        assert_eq!(review.len(), 1);
+        assert_eq!(
+            review[0].error_code.as_deref(),
+            Some("decision_interrupted")
+        );
+        assert!(db.recover_stale_mail_engine_processing(59).is_err());
+    }
+
+    #[test]
     fn pending_junk_is_available_for_later_apply_pass() {
         let db = db();
         for uid in [3_u32, 1, 2] {
@@ -1162,8 +1891,182 @@ mod tests {
             db.list_mail_engine_digest_queue(None, 100).unwrap().len(),
             3
         );
+        assert_eq!(
+            db.count_pending_mail_engine_digest(Some("acct")).unwrap(),
+            2
+        );
+        let consumed = db
+            .consume_mail_engine_digest(&[
+                MailEngineDigestKey {
+                    account_id: "acct".into(),
+                    folder: "INBOX".into(),
+                    uidvalidity: 10,
+                    uid: 4,
+                },
+                MailEngineDigestKey {
+                    account_id: "acct".into(),
+                    folder: "INBOX".into(),
+                    uidvalidity: 10,
+                    uid: 2,
+                },
+            ])
+            .unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            db.count_pending_mail_engine_digest(Some("acct")).unwrap(),
+            1
+        );
+        assert_eq!(
+            db.list_mail_engine_digest_queue(Some("acct"), 100).unwrap()[0].uid,
+            1
+        );
+        assert_eq!(
+            db.consume_mail_engine_digest(&[MailEngineDigestKey {
+                account_id: "acct".into(),
+                folder: "INBOX".into(),
+                uidvalidity: 10,
+                uid: 4,
+            }])
+            .unwrap(),
+            0
+        );
         assert!(db.list_mail_engine_digest_queue(None, 0).is_err());
         assert!(db.list_mail_engine_digest_queue(None, 101).is_err());
+    }
+
+    #[test]
+    fn decision_list_is_current_filterable_and_privacy_minimized() {
+        let db = db();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 100).unwrap();
+        for (uid, route, uidvalidity) in [
+            (1_u32, "follow_up", 10_u32),
+            (2, "important", 10),
+            (3, "junk", 10),
+            (4, "important", 9),
+        ] {
+            let mut item = decision();
+            item.uid = uid;
+            item.route = route;
+            item.uidvalidity = uidvalidity;
+            assert!(db.insert_mail_engine_decision_if_absent(&item).unwrap());
+        }
+
+        let decisions = db
+            .list_mail_engine_decisions(Some("acct"), Some("important"), Some("decided"), 20)
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].uid, 2);
+        assert_eq!(decisions[0].route, "important");
+        let rendered = serde_json::to_string(&decisions).unwrap();
+        for forbidden in [
+            "decision_json",
+            "input_hash",
+            "typesafe/jev-1.13",
+            "subject",
+            "sender",
+            "private.sender",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO indexed_message_summaries
+                 (account_id, folder, uidvalidity, uid, from_addr, subject,
+                  flags_json, size, indexed_at)
+                 VALUES ('acct', 'INBOX', 10, 2, 'sender@example.test',
+                         'Human-visible subject', '[]', 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let display = db
+            .list_mail_engine_decision_display(Some("acct"), Some("important"), Some("decided"), 20)
+            .unwrap();
+        assert_eq!(display[0].metadata_state, "available");
+        assert_eq!(display[0].subject.as_deref(), Some("Human-visible subject"));
+        assert_eq!(
+            db.correct_current_mail_engine_decision(
+                "acct",
+                "INBOX",
+                1,
+                0,
+                "important",
+                "critical",
+                "cli",
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.correct_current_mail_engine_decision(
+                "acct",
+                "INBOX",
+                1,
+                0,
+                "routine",
+                "not_urgent",
+                "cli",
+            )
+            .unwrap(),
+            None,
+            "a stale revision must not overwrite a human correction"
+        );
+        let corrected = db
+            .list_mail_engine_decisions(Some("acct"), Some("important"), None, 20)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.uid == 1)
+            .unwrap();
+        assert_eq!(corrected.route, "follow_up");
+        assert_eq!(corrected.effective_route, "important");
+        assert_eq!(corrected.urgency, "not_urgent");
+        assert_eq!(corrected.effective_urgency, "critical");
+        assert_eq!(corrected.correction_revision, 1);
+        assert_eq!(
+            db.correct_current_mail_engine_decision(
+                "acct",
+                "INBOX",
+                3,
+                0,
+                "routine",
+                "not_urgent",
+                "dashboard",
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.get_mail_engine_decision_execution("acct", "INBOX", 10, 3)
+                .unwrap()
+                .unwrap()
+                .execution_status,
+            "cancelled"
+        );
+        db.set_mail_engine_execution("acct", "INBOX", 10, 3, "pending", None, None)
+            .unwrap();
+        let recovery = db
+            .get_mail_engine_decision_execution("acct", "INBOX", 10, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.status, "decided");
+        assert_eq!(recovery.route, "routine");
+        assert_eq!(recovery.urgency, "not_urgent");
+        assert_eq!(recovery.execution_status, "pending");
+        assert!(
+            !db.claim_mail_engine_execution("acct", "INBOX", 10, 3)
+                .unwrap(),
+            "the execution claim itself must reject a corrected-away-from-junk decision"
+        );
+        assert!(
+            !db.list_pending_mail_engine_junk("acct", "INBOX", 10, 20)
+                .unwrap()
+                .contains(&3),
+            "the executor must use the effective corrected route even if legacy state says pending"
+        );
+        assert!(db.list_mail_engine_decisions(None, None, None, 0).is_err());
+        assert!(
+            db.list_mail_engine_decisions(None, None, None, 201)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1211,12 +2114,30 @@ mod tests {
     fn status_is_aggregate_and_contains_no_message_content() {
         let db = db();
         db.plan_mail_engine_scan("acct", "INBOX", 10, 100).unwrap();
-        db.insert_mail_engine_decision_if_absent(&decision())
-            .unwrap();
+        for (uid, route) in [(101_u32, "follow_up"), (102, "junk"), (103, "routine")] {
+            let mut item = decision();
+            item.uid = uid;
+            item.route = route;
+            db.insert_mail_engine_decision_if_absent(&item).unwrap();
+        }
+        assert!(
+            db.claim_mail_engine_decision(&MailEngineDecisionClaim {
+                account_id: "acct",
+                folder: "INBOX",
+                uidvalidity: 10,
+                uid: 104,
+                input_hash: "processing-hash",
+                model: "typesafe/jev-1.13",
+            })
+            .unwrap()
+        );
         let status = db.list_mail_engine_status(Some("acct")).unwrap();
         let rendered = serde_json::to_string(&status).unwrap();
-        assert_eq!(status[0].decision_count, 1);
+        assert_eq!(status[0].decision_count, 4);
+        assert_eq!(status[0].processing_count, 1);
+        assert_eq!(status[0].junk_count, 1);
         assert_eq!(status[0].follow_up_count, 1);
+        assert_eq!(status[0].routine_count, 1);
         for forbidden in [
             "private.sender",
             "subject-sentinel",

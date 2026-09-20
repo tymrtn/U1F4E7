@@ -4,12 +4,13 @@
 # artifacts otherwise land in `git add -A`.
 /target (Selective Sync Conflict*)
 /**/target (Selective Sync Conflict*)
-# dist/ holds generated release artifacts (ignored) — but dist/systemd/
-# unit templates are tracked source. Git needs the parent un-ignored for the
-# negation to work, hence the three-line pattern.
+# dist/ holds generated release artifacts (ignored), while service templates and
+# installers are tracked source. Git needs each parent un-ignored for negation.
 /dist/*
 !/dist/systemd
+!/dist/launchd
 !/dist/install.sh
+!/dist/install-engine-scheduler.sh
 **/*.rs.bk
 *.swp
 *.swo

@@ -651,11 +651,98 @@ export interface AddressSuggestionsResponse {
   suggestions: AddressSuggestion[];
 }
 
+export type MailEngineRoute =
+  | 'junk'
+  | 'follow_up'
+  | 'important'
+  | 'routine'
+  | 'digest_news'
+  | 'unsubscribe_candidate'
+  | 'review';
+
+export interface MailEngineDecisionItem {
+  account_id: string;
+  folder: string;
+  uidvalidity: number;
+  uid: number;
+  model_status: string;
+  status: string;
+  model_route: MailEngineRoute;
+  route: MailEngineRoute;
+  route_probability: number | null;
+  route_confidence: number | null;
+  urgency: string;
+  model_urgency: string;
+  correction_revision: number;
+  execution_status: string;
+  executed_action: string | null;
+  model_error_code: string | null;
+  error_code: string | null;
+  decided_at: string;
+  message_link: string;
+  metadata_state: 'available' | 'unavailable';
+  trust: {
+    schema: 'envelope.inbound-trust.v1';
+    instructions_authoritative: false;
+  };
+  untrusted_content: {
+    from: string | null;
+    subject: string | null;
+    date: string | null;
+  };
+}
+
+export interface MailEngineDecisionsResponse {
+  state: 'not_started' | 'available';
+  returned: number;
+  limit: number;
+  pending_digest: number;
+  urgent_notification: {
+    state: 'configured' | 'not_configured';
+    matching_routes: number;
+    delivery_requires_engine_deliver: true;
+  };
+  status: Array<Record<string, unknown>>;
+  items: MailEngineDecisionItem[];
+}
+
 // ── Typed endpoint helpers ────────────────────────────────────────────
 
 export const api = {
   listAccounts(o?: RequestOptions): Promise<{ accounts: Account[] }> {
     return request('/accounts', o);
+  },
+
+  mailEngineDecisions(
+    filters: {
+      account_id?: string;
+      route?: MailEngineRoute;
+      status?: string;
+      limit?: number;
+    } = {},
+    o?: RequestOptions
+  ): Promise<MailEngineDecisionsResponse> {
+    return request('/mail-engine/decisions', { ...o, query: filters });
+  },
+
+  correctMailEngineDecision(
+    item: Pick<MailEngineDecisionItem, 'account_id' | 'folder' | 'uid' | 'correction_revision'>,
+    correction: { route: MailEngineRoute; urgency: 'not_urgent' | 'urgent' | 'critical' },
+    o?: RequestOptions
+  ): Promise<{ ok: true; revision: number }> {
+    return request(
+      `/accounts/${encodeURIComponent(item.account_id)}/mail-engine/decisions/${item.uid}/correction`,
+      {
+        ...o,
+        method: 'POST',
+        body: {
+          folder: item.folder,
+          expected_revision: item.correction_revision,
+          route: correction.route,
+          urgency: correction.urgency
+        }
+      }
+    );
   },
 
   unifiedInbox(

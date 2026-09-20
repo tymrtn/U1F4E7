@@ -328,6 +328,15 @@ pub fn dashboard_router(state: AppState) -> Router {
         )
         // Review queue: the operator's daily decision queue (read-only aggregate).
         .route("/review", get(handlers::review::get))
+        // Jev mail-engine cockpit (local SQLite/cache only; no live probes).
+        .route(
+            "/mail-engine/decisions",
+            get(handlers::mail_engine::decisions),
+        )
+        .route(
+            "/accounts/{id}/mail-engine/decisions/{uid}/correction",
+            post(handlers::mail_engine::correct),
+        )
         // Per-agent attribution feed + approval queue (read-only aggregate).
         .route("/agents", get(handlers::agents::get))
         // Scheduled sends + Governor verdict visibility (read-only aggregate).
