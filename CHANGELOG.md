@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Jev mail engine preview:** new-mail-only five-minute classification through the pinned
+  `typesafe/jev-1.13` Decisions API, with bounded sender and interaction history, durable
+  idempotency, inspectable decisions, revision-guarded human corrections, recoverable urgent
+  events, a consumable header-only news digest, and an observe-only dashboard cockpit.
+- **Engine service packaging:** opt-in systemd and launchd assets run the engine every five
+  minutes with configured urgent delivery but never enable automatic junk moves by default.
+
 ### rShield
 
 - **ClamAV (optional, off by default):** `threat.clamd.address` (`unix:/path` or

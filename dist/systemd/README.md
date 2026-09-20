@@ -1,13 +1,14 @@
 # Envelope systemd user units
 
-Two units ship in this directory:
+Three units ship in this directory:
 
 | Unit | Purpose |
 |------|---------|
 | `envelope-watch@.service` | IMAP IDLE watcher (one instance per account) |
 | `envelope-dashboard.service` | Local dashboard on `127.0.0.1:3141` |
+| `envelope-engine.service` | New-mail-only Jev classification every five minutes |
 
-Both use **systemd credentials** for the master passphrase — the kernel enforces 0600 on the credential file and strips the trailing newline before presenting it to the service.
+All three use **systemd credentials** for the master passphrase — the kernel enforces 0600 on the credential file and strips the trailing newline before presenting it to the service.
 
 ## 1. Passphrase file
 
@@ -56,7 +57,25 @@ systemctl --user status envelope-dashboard.service
 curl -s http://localhost:3141/health
 ```
 
-## 4. Linger (boot-start on servers without an active login session)
+## 4. Enable the Jev mail engine
+
+The engine requires an OpenRouter API key. Keep it in the owner-only environment
+file created by `dist/install-engine-scheduler.sh`:
+
+```bash
+chmod 600 ~/.config/envelope-email/engine.env
+# Edit OPENROUTER_API_KEY in that file, then:
+systemctl --user daemon-reload
+systemctl --user enable --now envelope-engine.service
+envelope engine status
+```
+
+The packaged service runs `engine run --interval-seconds 300 --deliver --json`.
+It does not include `--apply`, so it cannot move junk automatically. External
+urgent delivery occurs only when an enabled event route matches
+`mail_engine_urgent`; otherwise the redacted event remains local.
+
+## 5. Linger (boot-start on servers without an active login session)
 
 By default, user services start only after a user logs in and stop when the last session ends. On servers or headless machines you want the services to start at boot and persist without a logged-in session:
 
@@ -71,14 +90,15 @@ loginctl show-user $USER | grep Linger
 # Linger=yes
 ```
 
-## 5. Logs
+## 6. Logs
 
 ```bash
 journalctl --user -u envelope-watch@you@example.com.service -f
 journalctl --user -u envelope-dashboard.service -f
+journalctl --user -u envelope-engine.service -f
 ```
 
-## 6. Multiple accounts
+## 7. Multiple accounts
 
 Enable one watcher instance per configured account:
 

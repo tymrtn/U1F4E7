@@ -1486,7 +1486,7 @@ enum EngineCmd {
         /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
         #[arg(long)]
         apply: bool,
-        /// Enqueue urgent events to matching routes and drain due webhook deliveries
+        /// Attempt external delivery of persisted urgent events through configured routes
         #[arg(long)]
         deliver: bool,
     },
@@ -1501,7 +1501,7 @@ enum EngineCmd {
         /// Apply bounded recoverable actions (currently confident junk -> detected spam folder)
         #[arg(long)]
         apply: bool,
-        /// Enqueue urgent events to matching routes and drain due webhook deliveries
+        /// Attempt external delivery of persisted urgent events through configured routes
         #[arg(long)]
         deliver: bool,
         /// Poll interval in seconds (minimum 60)
@@ -1513,6 +1513,58 @@ enum EngineCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+    },
+    /// List current per-message decisions without fetching message content
+    Decisions {
+        /// Account ID or email (all configured accounts when omitted)
+        #[arg(long)]
+        account: Option<String>,
+        /// Filter by route
+        #[arg(long, value_parser = parse_engine_route)]
+        route: Option<String>,
+        /// Filter by processing state
+        #[arg(long, value_parser = parse_engine_decision_status)]
+        status: Option<String>,
+        /// Maximum decisions to return (1..=200)
+        #[arg(long, default_value = "50", value_parser = parse_engine_decision_limit)]
+        limit: usize,
+    },
+    /// Correct a stored decision locally without creating a mailbox rule
+    Correct {
+        /// Mailbox UID shown by `engine decisions`
+        uid: u32,
+        /// Account ID or email
+        #[arg(long)]
+        account: String,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Corrected route
+        #[arg(long, value_parser = parse_engine_route)]
+        route: String,
+        /// Corrected urgency
+        #[arg(long, value_parser = parse_engine_urgency)]
+        urgency: String,
+        /// Revision shown by `engine decisions`; prevents overwriting a newer correction
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Recover one held/review decision without skipping later mail
+    Recover {
+        /// Mailbox UID shown by `engine decisions`
+        uid: u32,
+        /// Account ID or email
+        #[arg(long)]
+        account: String,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Authorize a fresh Jev request only for a missing-key failure proven before dispatch
+        #[arg(long)]
+        retry_jev: bool,
+        /// Confirm the possible additional paid request
+        #[arg(long, requires = "retry_jev")]
+        confirm_new_jev_call: bool,
     },
     /// List privacy-minimized handles queued for news-digest compilation
     DigestQueue {
@@ -1531,6 +1583,9 @@ enum EngineCmd {
         /// Maximum queued messages to include (1..=100)
         #[arg(long, default_value = "25", value_parser = parse_engine_digest_limit)]
         limit: usize,
+        /// Remove successfully compiled items from future digests; does not change mailbox read state
+        #[arg(long)]
+        consume: bool,
     },
 }
 
@@ -1955,6 +2010,43 @@ fn parse_engine_digest_limit(value: &str) -> Result<usize, String> {
         return Err("--limit must be between 1 and 100 for the engine digest queue".into());
     }
     Ok(parsed)
+}
+
+fn parse_engine_decision_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("--limit invalid integer: {error}"))?;
+    if !(1..=200).contains(&parsed) {
+        return Err("--limit must be between 1 and 200 for engine decisions".into());
+    }
+    Ok(parsed)
+}
+
+fn parse_engine_route(value: &str) -> Result<String, String> {
+    match value {
+        "junk"
+        | "follow_up"
+        | "important"
+        | "routine"
+        | "digest_news"
+        | "unsubscribe_candidate"
+        | "review" => Ok(value.to_string()),
+        _ => Err("--route must be junk, follow_up, important, routine, digest_news, unsubscribe_candidate, or review".into()),
+    }
+}
+
+fn parse_engine_urgency(value: &str) -> Result<String, String> {
+    match value {
+        "not_urgent" | "urgent" | "critical" => Ok(value.to_string()),
+        _ => Err("--urgency must be not_urgent, urgent, or critical".into()),
+    }
+}
+
+fn parse_engine_decision_status(value: &str) -> Result<String, String> {
+    match value {
+        "processing" | "decided" | "review" => Ok(value.to_string()),
+        _ => Err("--status must be processing, decided, or review".into()),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2979,12 +3071,63 @@ fn main() {
             EngineCmd::Status { account } => {
                 commands::engine::run_status(account.as_deref(), cli.json)
             }
+            EngineCmd::Decisions {
+                account,
+                route,
+                status,
+                limit,
+            } => commands::engine::run_decisions(
+                account.as_deref(),
+                route.as_deref(),
+                status.as_deref(),
+                limit,
+                cli.json,
+            ),
+            EngineCmd::Correct {
+                uid,
+                account,
+                folder,
+                route,
+                urgency,
+                expected_revision,
+            } => commands::engine::run_correct(
+                uid,
+                &account,
+                &folder,
+                &route,
+                &urgency,
+                expected_revision,
+                cli.json,
+            ),
+            EngineCmd::Recover {
+                uid,
+                account,
+                folder,
+                retry_jev,
+                confirm_new_jev_call,
+            } => commands::engine::run_recover(
+                uid,
+                &account,
+                &folder,
+                retry_jev,
+                confirm_new_jev_call,
+                cli.json,
+                backend,
+            ),
             EngineCmd::DigestQueue { account, limit } => {
                 commands::engine::run_digest_queue(account.as_deref(), limit, cli.json)
             }
-            EngineCmd::Digest { account, limit } => {
-                commands::engine::run_digest_preview(account.as_deref(), limit, cli.json, backend)
-            }
+            EngineCmd::Digest {
+                account,
+                limit,
+                consume,
+            } => commands::engine::run_digest_preview(
+                account.as_deref(),
+                limit,
+                consume,
+                cli.json,
+                backend,
+            ),
         },
 
         Commands::Unsubscribe {
@@ -3207,6 +3350,121 @@ mod tests {
     }
 
     #[test]
+    fn engine_decisions_parses_human_filters() {
+        let decisions = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "decisions",
+            "--account",
+            "account@example.test",
+            "--route",
+            "follow_up",
+            "--status",
+            "decided",
+            "--limit",
+            "75",
+            "--json",
+        ])
+        .expect("engine decisions should parse");
+        assert!(decisions.json);
+        assert!(matches!(
+            decisions.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Decisions {
+                    route: Some(ref route),
+                    status: Some(ref status),
+                    limit: 75,
+                    ..
+                }
+            } if route == "follow_up" && status == "decided"
+        ));
+        assert!(
+            Cli::try_parse_from(["envelope", "engine", "decisions", "--route", "magic"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["envelope", "engine", "decisions", "--limit", "201"]).is_err()
+        );
+        let correct = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "correct",
+            "42",
+            "--account",
+            "account@example.test",
+            "--route",
+            "important",
+            "--urgency",
+            "urgent",
+            "--expected-revision",
+            "0",
+        ])
+        .expect("engine correction should parse");
+        assert!(matches!(
+            correct.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Correct {
+                    uid: 42,
+                    expected_revision: 0,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "envelope",
+                "engine",
+                "correct",
+                "42",
+                "--account",
+                "account@example.test",
+                "--route",
+                "important",
+                "--urgency",
+                "immediate",
+                "--expected-revision",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn engine_recover_requires_account_and_explicit_paid_retry_confirmation() {
+        let recover = Cli::try_parse_from([
+            "envelope",
+            "engine",
+            "recover",
+            "42",
+            "--account",
+            "account@example.test",
+        ])
+        .expect("safe release-to-review recovery should parse");
+        assert!(matches!(
+            recover.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Recover {
+                    uid: 42,
+                    retry_jev: false,
+                    confirm_new_jev_call: false,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "envelope",
+                "engine",
+                "recover",
+                "42",
+                "--account",
+                "account@example.test",
+                "--confirm-new-jev-call",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn engine_digest_queue_parses_bounded_limit() {
         let queue = Cli::try_parse_from([
             "envelope",
@@ -3234,6 +3492,7 @@ mod tests {
             "account@example.test",
             "--limit",
             "10",
+            "--consume",
             "--json",
         ])
         .expect("engine digest preview should parse");
@@ -3241,7 +3500,11 @@ mod tests {
         assert!(matches!(
             preview.command,
             Commands::Engine {
-                subcommand: EngineCmd::Digest { limit: 10, .. }
+                subcommand: EngineCmd::Digest {
+                    limit: 10,
+                    consume: true,
+                    ..
+                }
             }
         ));
         assert!(

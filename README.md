@@ -129,13 +129,25 @@ envelope watch --json
 # Requires OPENROUTER_API_KEY. Each new message sends its sender/domain, subject,
 # up to 8 KiB of derived text, flags, and interaction statistics to OpenRouter.
 # Omit --account to cover every configured account; add --apply for confident junk moves.
-# Add --deliver to drain configured signed event routes for urgent notifications.
 envelope engine once --account you@example.com --json
-envelope engine run --account you@example.com --interval-seconds 300 --apply --deliver --json
-# List privacy-minimized handles queued for a later read-only news digest compiler.
+envelope engine run --account you@example.com --interval-seconds 300 --json
+# Inspect every current decision and any actionable error without fetching message content.
+envelope engine decisions --account you@example.com --limit 50
+# Correct one decision locally. This preserves the Jev result and creates no rule.
+envelope engine correct 42 --account you@example.com --route important --urgency urgent --expected-revision 0
+# Abandoned claims become human-review items after 10 minutes. Release one immediately:
+envelope engine recover 42 --account you@example.com
+# A retry is allowed only when the stored failure proves no OpenRouter request was sent.
+envelope engine recover 42 --account you@example.com --retry-jev --confirm-new-jev-call
+# List pending digest handles or compile a read-only From/Subject/Date rollup.
 envelope engine digest-queue --account you@example.com --limit 50 --json
-# Fetch a bounded subject-level digest preview with EXAMINE + BODY.PEEK headers only.
-envelope engine digest --account you@example.com --limit 25 --json
+envelope engine digest --account you@example.com --limit 25
+# Consume only successfully compiled items. This does not mark mail read or move it.
+envelope engine digest --account you@example.com --limit 25 --consume
+# Optional remote urgent delivery: add a signed route, then enable the delivery executor.
+envelope events routes add --account you@example.com --event-types mail_engine_urgent --url https://your-service.example/envelope
+# Re-run the engine with --deliver only after the route is configured and tested.
+envelope engine run --account you@example.com --interval-seconds 300 --deliver --json
 
 # Retrieve a verification-code JSON result for unattended automation (bounded and fail-closed)
 envelope --json code --account you@example.com --from otp@issuer.example --wait 60
@@ -169,6 +181,10 @@ tailscale serve --bg 3141
 # See where Envelope is storing local state
 envelope paths
 ```
+
+For the launch narrative and the exact installed-runtime proof gate, see
+[the Show HN draft](docs/show-hn-jev-draft.md) and
+[the owned-mailbox live pilot](docs/jev-live-pilot.md).
 
 The dashboard opens as a three-pane mail shell. Unified Inbox is the default
 read-only surface and loads from the local message index; explicit refreshes

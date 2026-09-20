@@ -1,0 +1,23 @@
+# Envelope Jev mail engine — persistent five-minute classification loop.
+# Install with dist/install-engine-scheduler.sh, then enable explicitly:
+#   systemctl --user enable --now envelope-engine.service
+
+[Unit]
+Description=Envelope Jev new-mail engine
+Documentation=https://github.com/tymrtn/U1F4E7
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/envelope engine run --interval-seconds 300 --deliver --json
+EnvironmentFile=-%h/.config/envelope-email/engine.env
+LoadCredential=envelope-passphrase:%h/.config/envelope-email/passphrase
+Environment=ENVELOPE_MASTER_PASSPHRASE_FILE=%d/envelope-passphrase
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

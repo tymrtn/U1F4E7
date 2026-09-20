@@ -1,0 +1,23 @@
+#!/bin/zsh
+set -euo pipefail
+
+ENGINE_ENV="$HOME/.config/envelope-email/engine.env"
+if [[ ! -f "$ENGINE_ENV" ]]; then
+  print -u2 "Envelope engine environment missing: $ENGINE_ENV"
+  exit 78
+fi
+
+set -a
+source "$ENGINE_ENV"
+set +a
+
+if [[ -x "$HOME/.local/bin/envelope" ]]; then
+  ENVELOPE_BIN="$HOME/.local/bin/envelope"
+elif command -v envelope >/dev/null 2>&1; then
+  ENVELOPE_BIN="$(command -v envelope)"
+else
+  print -u2 "Envelope binary not found"
+  exit 127
+fi
+
+exec "$ENVELOPE_BIN" engine run --interval-seconds 300 --deliver --json

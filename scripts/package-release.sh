@@ -78,7 +78,7 @@ fi
 # ---------------------------------------------------------------------------
 # Version from workspace manifest (stable via cargo pkgid)
 # ---------------------------------------------------------------------------
-VERSION="$(cargo pkgid -p envelope-email | sed -E 's/.*@([0-9]+\.[0-9]+\.[0-9]+)$/\1/')"
+VERSION="$(cargo pkgid -p envelope-email | sed -E 's/.*@([^[:space:]]+)$/\1/')"
 if [[ -z "$VERSION" ]]; then
     echo "Could not determine version from cargo pkgid." >&2
     exit 1
@@ -150,6 +150,12 @@ mkdir -p "$PACKAGE_ROOT"
 cp "$TARGET_BIN"        "$PACKAGE_ROOT/envelope"
 cp "$ROOT_DIR/LICENSE"  "$PACKAGE_ROOT/LICENSE"
 cp "$ROOT_DIR/README.md" "$PACKAGE_ROOT/README.md"
+mkdir -p "$PACKAGE_ROOT/systemd" "$PACKAGE_ROOT/launchd"
+cp "$ROOT_DIR/dist/systemd/envelope-engine.service" "$PACKAGE_ROOT/systemd/"
+cp "$ROOT_DIR/dist/launchd/com.tymrtn.envelope-engine.plist" "$PACKAGE_ROOT/launchd/"
+cp "$ROOT_DIR/dist/launchd/envelope-engine-run" "$PACKAGE_ROOT/launchd/"
+cp "$ROOT_DIR/dist/install-engine-scheduler.sh" "$PACKAGE_ROOT/"
+chmod 0755 "$PACKAGE_ROOT/install-engine-scheduler.sh" "$PACKAGE_ROOT/launchd/envelope-engine-run"
 
 # ---------------------------------------------------------------------------
 # Create tarball

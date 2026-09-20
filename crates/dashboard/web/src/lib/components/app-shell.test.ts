@@ -155,7 +155,7 @@ describe('app shell layout', () => {
     // the record of what agents and Envelope did.
     expect(screen.queryByRole('link', { name: 'Cockpit' })).toBeNull();
     const labels = Array.from(nav.querySelectorAll('a')).map((a) => a.textContent?.trim());
-    expect(labels).toEqual(['Mail', 'Review', 'Logs', 'Rules']);
+    expect(labels).toEqual(['Mail', 'Engine', 'Review', 'Logs', 'Rules']);
     // The stub page url is /v2/mail/unified, so Mail is the active tab.
     expect(screen.getByRole('link', { name: 'Mail' })).toHaveClass('is-active');
     expect(screen.getByRole('link', { name: 'Review' })).not.toHaveClass('is-active');

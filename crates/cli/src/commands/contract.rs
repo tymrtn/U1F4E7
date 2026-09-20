@@ -122,13 +122,16 @@ pub fn agent_contract() -> Value {
             }
         },
         "mail_engine": {
-            "surface": "cli_only",
+            "surface": "cli_and_dashboard",
             "commands": [
                 "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply] [--deliver]",
                 "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply] [--deliver]",
                 "envelope engine status [--account <id-or-email>]",
+                "envelope engine decisions [--account <id-or-email>] [--route <route>] [--status <status>] [--limit 50]",
+                "envelope engine correct <uid> --account <id-or-email> [--folder INBOX] --route <route> --urgency <urgency> --expected-revision <n>",
+                "envelope engine recover <uid> --account <id-or-email> [--folder INBOX] [--retry-jev --confirm-new-jev-call]",
                 "envelope engine digest-queue [--account <id-or-email>] [--limit 50]",
-                "envelope engine digest [--account <id-or-email>] [--limit 25]"
+                "envelope engine digest [--account <id-or-email>] [--limit 25] [--consume]"
             ],
             "model": "typesafe/jev-1.13",
             "endpoint": "https://openrouter.ai/api/alpha/decisions",
@@ -137,11 +140,18 @@ pub fn agent_contract() -> Value {
             "state_egress": "Each decision sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender/interaction/reply statistics to OpenRouter. Credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs are excluded.",
             "questions": ["route", "urgency", "notify_user", "requires_reply", "bulk_or_subscription"],
             "routes": ["junk", "follow_up", "important", "routine", "digest_news", "unsubscribe_candidate", "review"],
-            "action_safety": "Without --apply, mailbox decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. Urgent events and matching delivery rows are durable local state; --deliver is the separate explicit external-side-effect flag that drains the existing signed retry/dead-letter delivery pipeline. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
-            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "jev_request_failed", "imap_move_failed", "spam_folder_not_found", "notification_enqueue_failed", "decision_incomplete"],
-            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
+            "action_safety": "Without --apply, mailbox decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. --consume records only successfully compiled digest handles as locally consumed and does not change mailbox flags or move messages. Urgent events and matching delivery rows are durable local state; --deliver is the separate explicit external-side-effect flag that drains the existing signed retry/dead-letter delivery pipeline. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
+            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "openrouter_api_key_missing", "jev_request_failed", "decision_interrupted", "processing_recovered_for_review", "imap_move_failed", "spam_folder_not_found", "notification_enqueue_failed", "decision_incomplete"],
+            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs; claims older than ten minutes park once as decision_interrupted for human review without another paid call. Explicit retry is accepted only for openrouter_api_key_missing, which proves no request was dispatched, and reclassifies that exact current-UIDVALIDITY message without rewinding the mailbox watermark. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
             "urgent_delivery": "notify_user_now creates a deterministic content-free mail_engine_urgent event keyed by account/folder/UIDVALIDITY/UID and one idempotent local delivery row for every enabled matching route. A retry that finds an existing durable decision re-derives notification intent from its persisted policy output and repairs a missing event/delivery before advancing the watermark. --deliver drains due rows through the existing HMAC-signed webhook executor, bounded backoff, and dead-letter recovery. Redirects are disabled in the engine delivery client.",
-            "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time. The explicit digest command reads bounded From/Subject/Date fields for those handles, sanitizes control characters, nests them under untrusted_content with envelope.inbound-trust.v1, and excludes body, recipient, Message-ID, flags, size, and provider-spam metadata."
+            "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. The decisions command exposes current-UIDVALIDITY handles, typed decision/action state, and closed error codes without fetching message content. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time. The explicit digest command reads bounded From/Subject/Date fields for those handles, sanitizes control characters, nests them under untrusted_content with envelope.inbound-trust.v1, and excludes body, recipient, Message-ID, flags, size, and provider-spam metadata.",
+            "digest_lifecycle": "Digest items remain pending until an explicit digest --consume succeeds. Consumption is local, idempotent, current-UIDVALIDITY scoped, and applies only to items whose headers compiled successfully; failed or missing items remain queued.",
+            "human_corrections": "The CLI and CSRF-protected dashboard can append a revision-guarded local route/urgency correction without changing the immutable Jev result or creating a mailbox rule. Correcting a pending model-junk decision away from junk cancels the unstarted move. A completed mailbox action is never silently reversed; restoration remains manual.",
+            "dashboard": {
+                "decisions": "GET /api/mail-engine/decisions",
+                "correct": "POST /api/accounts/{id}/mail-engine/decisions/{uid}/correction",
+                "aggregate_boundary": "Decision/dashboard reads use local SQLite and cached headers only; they do not decrypt credentials, probe IMAP, call OpenRouter, deliver events, or mutate mail. Cached From/Subject/Date remain nested untrusted content."
+            }
         },
         "agent_identity": {
             "env": "ENVELOPE_AGENT_TOKEN",
@@ -1432,7 +1442,7 @@ mod tests {
     fn contract_advertises_jev_engine_privacy_and_action_boundaries() {
         let contract = agent_contract();
         let engine = &contract["mail_engine"];
-        assert_eq!(engine["surface"], "cli_only");
+        assert_eq!(engine["surface"], "cli_and_dashboard");
         assert_eq!(engine["model"], "typesafe/jev-1.13");
         assert_eq!(engine["polling"]["default_seconds"], 300);
         assert_eq!(engine["polling"]["minimum_seconds"], 60);
@@ -1474,6 +1484,23 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|command| command.as_str().unwrap().contains("engine digest ["))
+        );
+        assert!(
+            engine["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command.as_str().unwrap().contains("engine correct"))
+        );
+        assert!(
+            engine["human_corrections"]
+                .as_str()
+                .unwrap()
+                .contains("without changing the immutable Jev result")
+        );
+        assert_eq!(
+            engine["dashboard"]["decisions"],
+            "GET /api/mail-engine/decisions"
         );
     }
 

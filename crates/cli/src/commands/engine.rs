@@ -9,8 +9,8 @@ use envelope_email_store::credential_store::{self, CredentialBackend};
 use envelope_email_store::models::{Account, Event, Message};
 use envelope_email_store::{
     Database, MAIL_ENGINE_SCHEMA_VERSION, MailEngineDecisionClaim, MailEngineDecisionRecovery,
-    MailEngineDigestCandidate, MailEngineSenderStats, MailboxScanPlan, NewMailEngineDecision,
-    mail_engine_hash,
+    MailEngineDigestCandidate, MailEngineDigestKey, MailEngineSenderStats, MailboxScanPlan,
+    NewMailEngineDecision, mail_engine_hash,
 };
 use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
 use envelope_email_transport::folders;
@@ -40,6 +40,7 @@ struct EnginePassReport {
     mode: &'static str,
     interval_seconds: Option<u64>,
     apply: bool,
+    interrupted_decisions_recovered: usize,
     accounts: Vec<AccountReport>,
     delivery: Option<DeliveryPassReport>,
 }
@@ -68,9 +69,21 @@ struct DeliveryPassReport {
 }
 
 #[derive(Debug, Serialize)]
+struct RecoveryReport {
+    account_id: String,
+    folder: String,
+    uid: u32,
+    outcome: &'static str,
+    new_jev_call_authorized: bool,
+    route: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct DigestPreviewReport {
     items: Vec<DigestPreviewItem>,
     errors: Vec<DigestPreviewError>,
+    consumed_count: usize,
+    remaining_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,13 +135,14 @@ impl AccountReport {
 
 #[tokio::main]
 pub async fn run_once(options: EngineOptions<'_>) -> Result<()> {
-    let accounts = process_once(&options).await?;
+    let (accounts, interrupted_decisions_recovered) = process_once(&options).await?;
     let delivery = drain_due_event_deliveries(options.deliver).await?;
     print_report(
         &EnginePassReport {
             mode: "once",
             interval_seconds: None,
             apply: options.apply,
+            interrupted_decisions_recovered,
             accounts,
             delivery,
         },
@@ -142,13 +156,14 @@ pub async fn run_loop(options: EngineOptions<'_>, interval_seconds: u64) -> Resu
         bail!("engine interval must be at least 60 seconds");
     }
     loop {
-        let accounts = process_once(&options).await?;
+        let (accounts, interrupted_decisions_recovered) = process_once(&options).await?;
         let delivery = drain_due_event_deliveries(options.deliver).await?;
         print_report(
             &EnginePassReport {
                 mode: "run",
                 interval_seconds: Some(interval_seconds),
                 apply: options.apply,
+                interrupted_decisions_recovered,
                 accounts,
                 delivery,
             },
@@ -196,20 +211,308 @@ pub fn run_status(account: Option<&str>, json: bool) -> Result<()> {
     } else {
         for item in status {
             println!(
-                "{} {}: UID {} ({} decisions, {} review, {} follow-up, {} important, {} digest, {} unsubscribe candidates)",
+                "{} {}: {} decisions — {} follow-up, {} important, {} urgent, {} digest, {} junk, {} routine, {} review, {} processing, {} unsubscribe candidates",
                 item.account_id,
                 item.folder,
-                item.last_seen_uid,
                 item.decision_count,
-                item.review_count,
                 item.follow_up_count,
                 item.important_count,
+                item.notification_count,
                 item.digest_news_count,
+                item.junk_count,
+                item.routine_count,
+                item.review_count,
+                item.processing_count,
                 item.unsubscribe_candidate_count,
             );
+            println!(
+                "  New-mail watermark: UID {} (UIDVALIDITY {})",
+                item.last_seen_uid, item.uidvalidity
+            );
+            if let Some(error_code) = item.last_error.as_deref() {
+                print_engine_problem(error_code, "  ");
+            }
         }
     }
     Ok(())
+}
+
+pub fn run_decisions(
+    account: Option<&str>,
+    route: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let account_id = account
+        .map(|value| resolve_account(&db, Some(value)).map(|account| account.id))
+        .transpose()?;
+    let decisions = db.list_mail_engine_decisions(account_id.as_deref(), route, status, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&decisions)?);
+    } else if decisions.is_empty() {
+        println!("No current mail-engine decisions match those filters.");
+    } else {
+        for item in decisions {
+            let route_label = human_route_label(&item.effective_route);
+            let confidence = item
+                .route_confidence
+                .map(|value| format!("{:.0}% confidence", value * 100.0))
+                .unwrap_or_else(|| "confidence unavailable".into());
+            println!(
+                "{} · {} {} UID {} · {} · {}",
+                route_label, item.account_id, item.folder, item.uid, confidence, item.decided_at,
+            );
+            println!(
+                "  State: {} · urgency: {} · action: {}",
+                item.status,
+                item.effective_urgency,
+                item.executed_action
+                    .as_deref()
+                    .unwrap_or(item.execution_status.as_str()),
+            );
+            if item.correction_revision > 0 {
+                println!(
+                    "  Human correction r{}: model route {} / urgency {}",
+                    item.correction_revision, item.route, item.urgency
+                );
+            }
+            if let Some(error_code) = item.error_code.as_deref() {
+                print_engine_problem(error_code, "  ");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn run_correct(
+    uid: u32,
+    account: &str,
+    folder: &str,
+    route: &str,
+    urgency: &str,
+    expected_revision: u64,
+    json: bool,
+) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let account_id = resolve_account(&db, Some(account))?.id;
+    let revision = db
+        .correct_current_mail_engine_decision(
+            &account_id,
+            folder,
+            uid,
+            expected_revision,
+            route,
+            urgency,
+            "cli",
+        )?
+        .context(
+            "decision was not found, is busy, or has a newer correction; inspect `engine decisions` and retry with its current revision",
+        )?;
+    let decision = db
+        .list_mail_engine_decisions(Some(&account_id), None, None, 200)?
+        .into_iter()
+        .find(|item| item.folder == folder && item.uid == uid)
+        .context("corrected decision could not be read back")?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "revision": revision,
+                "decision": decision,
+                "mailbox_action_changed": decision.executed_action.as_deref() == Some("cancelled_by_human_correction"),
+            }))?
+        );
+    } else {
+        println!(
+            "Corrected UID {} to {} / {} at revision {}. The original Jev result remains in the audit record.",
+            uid,
+            human_route_label(&decision.effective_route),
+            decision.effective_urgency,
+            revision
+        );
+        if decision.execution_status == "completed" {
+            println!(
+                "Mailbox action already completed; classification changed, but mailbox restoration is manual."
+            );
+        } else if decision.executed_action.as_deref() == Some("cancelled_by_human_correction") {
+            println!("The pending junk action was cancelled before it could move the message.");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+pub async fn run_recover(
+    uid: u32,
+    account: &str,
+    folder: &str,
+    retry_jev: bool,
+    confirm_new_jev_call: bool,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    if retry_jev && !confirm_new_jev_call {
+        bail!(
+            "--retry-jev requires --confirm-new-jev-call because it authorizes a new paid request"
+        );
+    }
+    let db = Database::open_default().context("failed to open database")?;
+    let account_record = resolve_account(&db, Some(account))?;
+    let account_id = account_record.id.clone();
+    let route = if retry_jev {
+        match std::env::var("OPENROUTER_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => {}
+            _ => bail!("OPENROUTER_API_KEY is still missing; no retry was attempted"),
+        }
+        let candidate = db
+            .list_mail_engine_decisions(Some(&account_id), Some("review"), Some("review"), 200)?
+            .into_iter()
+            .find(|item| item.folder == folder && item.uid == uid)
+            .filter(|item| item.error_code.as_deref() == Some("openrouter_api_key_missing"))
+            .context(
+                "this decision is not safely retryable; only failures proven before dispatch can be retried",
+            )?;
+        let passphrase = credential_store::get_passphrase(backend)
+            .context("credential store is not available for safe retry")?;
+        let credentials = db
+            .get_account_with_credentials(&account_id, &passphrase)
+            .context("failed to decrypt account credentials for safe retry")?;
+        let mut client = imap::connect(&credentials)
+            .await
+            .context("failed to connect to IMAP for safe retry")?;
+        let selected = imap::examine_folder_info(&mut client, folder)
+            .await
+            .context("failed to examine mailbox for safe retry")?;
+        if selected.uid_validity != Some(candidate.uidvalidity) {
+            bail!("mailbox UIDVALIDITY changed; the historical decision was not retried");
+        }
+        let mut messages =
+            imap::fetch_raw_messages_selected_uid_set(&mut client, folder, &uid.to_string())
+                .await
+                .context("failed to fetch the exact message for safe retry")?;
+        if messages.len() != 1 {
+            bail!("the exact message is no longer available; no retry was attempted");
+        }
+        let message = imap::parse_raw_message(&messages.remove(0))
+            .context("failed to parse the exact message for safe retry")?;
+        let prepared_uidvalidity = db
+            .prepare_current_mail_engine_safe_retry(&account_id, folder, uid)?
+            .context("the decision changed before retry; no new Jev call was made")?;
+        if prepared_uidvalidity != candidate.uidvalidity {
+            bail!("the decision epoch changed before retry; no new Jev call was made");
+        }
+        let policy = classify_and_persist(
+            &db,
+            &account_id,
+            folder,
+            candidate.uidvalidity,
+            &message,
+            None,
+            true,
+        )
+        .await?
+        .context("another worker claimed the decision; no duplicate Jev call was made")?;
+        Some(route_token(policy.route).to_string())
+    } else {
+        let changed =
+            db.resolve_current_mail_engine_processing_as_review(&account_id, folder, uid)?;
+        if !changed {
+            bail!(
+                "no abandoned current-epoch processing decision for account {account_id}, folder {folder}, UID {uid}"
+            );
+        }
+        None
+    };
+    let report = RecoveryReport {
+        account_id,
+        folder: folder.to_string(),
+        uid,
+        outcome: if retry_jev {
+            "fresh_jev_decision_persisted"
+        } else {
+            "released_to_human_review"
+        },
+        new_jev_call_authorized: retry_jev,
+        route,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if retry_jev {
+        println!(
+            "UID {} was reconsidered with one explicitly authorized Jev call. Route: {}.",
+            uid,
+            report.route.as_deref().unwrap_or("review")
+        );
+    } else {
+        println!(
+            "UID {} was released from processing into human review. No new Jev call was made.",
+            uid
+        );
+    }
+    Ok(())
+}
+
+fn human_route_label(route: &str) -> &'static str {
+    match route {
+        "junk" => "Junk",
+        "follow_up" => "Needs reply",
+        "important" => "Important",
+        "routine" => "Routine",
+        "digest_news" => "News digest",
+        "unsubscribe_candidate" => "Unsubscribe candidate",
+        "review" => "Needs review",
+        _ => "Unknown decision",
+    }
+}
+
+fn print_engine_problem(error_code: &str, indent: &str) {
+    println!("{indent}Problem: {error_code}");
+    println!(
+        "{indent}Next step: {}",
+        engine_error_remediation(error_code)
+    );
+}
+
+fn engine_error_remediation(error_code: &str) -> &'static str {
+    match error_code {
+        "jev_request_failed" => {
+            "check OPENROUTER_API_KEY and connectivity, then inspect this decision before retrying"
+        }
+        "decision_incomplete" => {
+            "another pass may still be working; stale claims are moved to review after ten minutes"
+        }
+        "decision_interrupted" => {
+            "the prior worker stopped before a durable result; inspect and classify this message manually"
+        }
+        "notification_enqueue_failed" => {
+            "check event routes and delivery storage; the watermark remains held for a safe retry"
+        }
+        "credential_decrypt_failed" => "repair the Envelope credential store for this account",
+        "imap_connect_failed" => "check account credentials and IMAP connectivity",
+        "imap_examine_failed" => "check that the configured folder still exists and is readable",
+        "uidvalidity_changed" => {
+            "Envelope safely rebaselined; only newer messages will be processed"
+        }
+        "highest_uid_unavailable" => "retry after the IMAP server returns a stable UID boundary",
+        "message_fetch_failed" | "message_parse_failed" => {
+            "open the message directly and review it manually"
+        }
+        "spam_folder_not_found" => "configure or create the account's Junk/Spam folder",
+        "imap_move_failed" => "the message was not moved; retry after checking IMAP capabilities",
+        "operator_retry_requested" => {
+            "run `envelope engine once` or keep `engine run` active to issue the authorized fresh decision"
+        }
+        "processing_recovered_for_review" => {
+            "inspect the message and either leave it for human review or explicitly retry Jev"
+        }
+        "openrouter_api_key_missing" => {
+            "export OPENROUTER_API_KEY, then use `engine recover --retry-jev --confirm-new-jev-call`"
+        }
+        _ => "inspect `envelope engine decisions --status review` for the affected message",
+    }
 }
 
 pub fn run_digest_queue(account: Option<&str>, limit: usize, json: bool) -> Result<()> {
@@ -243,6 +546,7 @@ pub fn run_digest_queue(account: Option<&str>, limit: usize, json: bool) -> Resu
 pub async fn run_digest_preview(
     account: Option<&str>,
     limit: usize,
+    consume: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -256,6 +560,8 @@ pub async fn run_digest_preview(
             &DigestPreviewReport {
                 items: Vec::new(),
                 errors: Vec::new(),
+                consumed_count: 0,
+                remaining_count: 0,
             },
             json,
         );
@@ -279,6 +585,8 @@ pub async fn run_digest_preview(
     let mut report = DigestPreviewReport {
         items: Vec::new(),
         errors: Vec::new(),
+        consumed_count: 0,
+        remaining_count: 0,
     };
     for ((account_id, folder, uidvalidity), candidates) in groups {
         let credentials = match db.get_account_with_credentials(&account_id, &passphrase) {
@@ -375,6 +683,20 @@ pub async fn run_digest_preview(
     report
         .items
         .sort_by(|left, right| right.decided_at.cmp(&left.decided_at));
+    if consume && !report.items.is_empty() {
+        let keys = report
+            .items
+            .iter()
+            .map(|item| MailEngineDigestKey {
+                account_id: item.account_id.clone(),
+                folder: item.folder.clone(),
+                uidvalidity: item.uidvalidity,
+                uid: item.uid,
+            })
+            .collect::<Vec<_>>();
+        report.consumed_count = db.consume_mail_engine_digest(&keys)?;
+    }
+    report.remaining_count = db.count_pending_mail_engine_digest(account_id.as_deref())?;
     print_digest_preview(&report, json)
 }
 
@@ -467,6 +789,14 @@ fn print_digest_preview(report: &DigestPreviewReport, json: bool) -> Result<()> 
                 error.error_code,
             );
         }
+        if report.consumed_count > 0 {
+            println!(
+                "Consumed {} compiled item(s); {} remain queued. Mailbox read state was not changed.",
+                report.consumed_count, report.remaining_count
+            );
+        } else {
+            println!("{} item(s) remain queued.", report.remaining_count);
+        }
     }
     Ok(())
 }
@@ -477,8 +807,9 @@ fn display_probability(value: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>> {
+async fn process_once(options: &EngineOptions<'_>) -> Result<(Vec<AccountReport>, usize)> {
     let db = Database::open_default().context("failed to open database")?;
+    let interrupted_decisions_recovered = db.recover_stale_mail_engine_processing(600)?;
     let passphrase = credential_store::get_or_create_passphrase(options.backend)
         .context("credential store error")?;
     let accounts = selected_accounts(&db, options.account)?;
@@ -702,6 +1033,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>>
                         uidvalidity,
                         &message,
                         None,
+                        false,
                     )
                     .await?
                     else {
@@ -759,7 +1091,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<Vec<AccountReport>>
         }
         reports.push(report);
     }
-    Ok(reports)
+    Ok((reports, interrupted_decisions_recovered))
 }
 
 fn selected_accounts(db: &Database, account: Option<&str>) -> Result<Vec<Account>> {
@@ -776,6 +1108,7 @@ async fn classify_and_persist(
     uidvalidity: u32,
     message: &Message,
     client_override: Option<&JevClient>,
+    claim_already_owned: bool,
 ) -> Result<Option<PolicyDecision>> {
     let sender_address = message.from_addr.trim();
     if sender_address.is_empty() {
@@ -840,7 +1173,17 @@ async fn classify_and_persist(
     )?;
     let request = build_request(state);
     let input_hash = mail_engine_hash(&serde_json::to_string(&request)?);
-    if !db.claim_mail_engine_decision(&MailEngineDecisionClaim {
+    if claim_already_owned {
+        if !db.mail_engine_processing_claim_matches(
+            account_id,
+            folder,
+            uidvalidity,
+            message.uid,
+            &input_hash,
+        )? {
+            bail!("safe retry claim no longer matches the immutable Jev input");
+        }
+    } else if !db.claim_mail_engine_decision(&MailEngineDecisionClaim {
         account_id,
         folder,
         uidvalidity,
@@ -854,11 +1197,22 @@ async fn classify_and_persist(
         return Ok(None);
     }
     let owned_client = if client_override.is_none() {
-        let client_result = match std::env::var("OPENROUTER_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => JevClient::openrouter(key),
-            _ => Err(envelope_email_transport::jev::JevClientError::MissingApiKey),
+        let key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => key,
+            _ => {
+                persist_review_with_hash(
+                    db,
+                    account_id,
+                    folder,
+                    uidvalidity,
+                    message.uid,
+                    &input_hash,
+                    "openrouter_api_key_missing",
+                )?;
+                return Ok(Some(review_policy()));
+            }
         };
-        match client_result {
+        match JevClient::openrouter(key) {
             Ok(client) => Some(client),
             Err(_) => {
                 persist_review_with_hash(
@@ -1171,6 +1525,12 @@ fn print_report(report: &EnginePassReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(report)?);
     } else {
+        if report.interrupted_decisions_recovered > 0 {
+            println!(
+                "Recovered {} interrupted decision(s) into human review without another Jev call.",
+                report.interrupted_decisions_recovered
+            );
+        }
         for account in &report.accounts {
             println!(
                 "{}: {} — {} examined, {} decided, {} review, {} actions completed, {} blocked, {} urgent deliveries enqueued",
@@ -1183,6 +1543,9 @@ fn print_report(report: &EnginePassReport, json: bool) -> Result<()> {
                 account.actions_blocked,
                 account.notifications_enqueued,
             );
+            if let Some(error_code) = account.error_code.as_deref() {
+                print_engine_problem(error_code, "  ");
+            }
         }
         if let Some(delivery) = &report.delivery {
             println!(
@@ -1374,9 +1737,10 @@ mod tests {
             provider_spam: None,
         };
 
-        let outcome = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client))
-            .await
-            .unwrap();
+        let outcome =
+            classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client), false)
+                .await
+                .unwrap();
 
         assert!(outcome.is_none());
         let recovery = db
@@ -1422,6 +1786,7 @@ mod tests {
         .to_string();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_server = calls.clone();
+        let response_for_server = response.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             calls_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1458,10 +1823,13 @@ mod tests {
             }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response.len()
+                response_for_server.len()
             );
             socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(response.as_bytes()).await.unwrap();
+            socket
+                .write_all(response_for_server.as_bytes())
+                .await
+                .unwrap();
         });
 
         let db = Database::open_memory().unwrap();
@@ -1486,7 +1854,7 @@ mod tests {
             attachments: Vec::new(),
             provider_spam: None,
         };
-        let policy = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client))
+        let policy = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client), false)
             .await
             .unwrap()
             .expect("the uncontended fixture should return a policy");
@@ -1499,6 +1867,107 @@ mod tests {
             db.mail_engine_decision_exists("acct", "INBOX", 10, 1)
                 .unwrap()
         );
+
+        db.conn()
+            .execute(
+                "UPDATE mail_engine_decisions
+                 SET status = 'review', route = 'review', urgency = 'not_urgent',
+                     route_probability = NULL, route_confidence = NULL,
+                     notify_user_probability = NULL,
+                     requires_reply_probability = NULL,
+                     bulk_or_subscription_probability = NULL,
+                     decision_json = '{\"error_code\":\"openrouter_api_key_missing\"}',
+                     execution_status = 'not_requested', executed_action = NULL,
+                     last_error = NULL
+                 WHERE account_id = 'acct' AND folder = 'INBOX'
+                   AND uidvalidity = 10 AND uid = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 1)
+                .unwrap(),
+            Some(10)
+        );
+        assert!(
+            db.mail_engine_processing_claim_matches(
+                "acct",
+                "INBOX",
+                10,
+                1,
+                &db.conn()
+                    .query_row(
+                        "SELECT input_hash FROM mail_engine_decisions
+                         WHERE account_id = 'acct' AND folder = 'INBOX'
+                           AND uidvalidity = 10 AND uid = 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        );
+
+        let retry_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let retry_address = retry_listener.local_addr().unwrap();
+        let retry_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_calls_for_server = retry_calls.clone();
+        let retry_response = response.clone();
+        let retry_server = tokio::spawn(async move {
+            let (mut socket, _) = retry_listener.accept().await.unwrap();
+            retry_calls_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                let Some(header_end) = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if bytes.len() >= header_end + length {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                retry_response.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(retry_response.as_bytes()).await.unwrap();
+        });
+        let retry_client =
+            JevClient::loopback_fixture(&format!("http://{retry_address}/api/alpha/decisions"))
+                .unwrap();
+        let retried = classify_and_persist(
+            &db,
+            "acct",
+            "INBOX",
+            10,
+            &message,
+            Some(&retry_client),
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("the owned retry claim should finalize");
+        retry_server.await.unwrap();
+        assert_eq!(retry_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(retried.route, MailRoute::FollowUp);
+
         let status = db.list_mail_engine_status(Some("acct")).unwrap();
         assert_eq!(status[0].follow_up_count, 1);
         let rendered = serde_json::to_string(&status).unwrap();
