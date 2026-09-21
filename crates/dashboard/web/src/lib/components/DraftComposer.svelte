@@ -1742,10 +1742,24 @@
     cursor: not-allowed;
     opacity: 0.55;
   }
-  .draft-preview-toggle,
+  .draft-preview-toggle {
+    min-height: 1.875rem;
+    padding: 0 0.65rem;
+    border: 1px solid var(--env-rule);
+    background: var(--env-surface);
+    color: var(--env-muted);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+  }
   .draft-preview-toggle[aria-pressed='true'] {
+    border-color: var(--env-ink);
     background: var(--env-ink);
     color: var(--env-surface);
+  }
+  .draft-preview-toggle:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
   .draft-format-note {
     margin: 0;
