@@ -15,17 +15,17 @@ use rusqlite_migration::{M, Migrations};
 /// How many migrations past the end of [`migration_list`] this build can open
 /// without understanding them.
 ///
-/// The isolated V2/CRM line extends the V1 sequence with four migrations
+/// The isolated V2/CRM line extends the V1 sequence with five migrations
 /// verified additive-only: 17 creates `send_receipts` and its indexes, 18 the
 /// relationship/CRM tables (`persons`, `person_emails`, interactions,
-/// per-person thread states), 19 `graph_ledger_state`, 20 one new table plus
-/// its index (`link_redirects` for reader instrumentation, or
-/// `calibration_verdicts` on the governor-calibration branch — both create
-/// only). None alter or remove anything V1 reads or writes, so a database at
-/// schema versions 17–20 is opened as-is — no migrations run, no
-/// `user_version` write, nothing deleted. Any version beyond that is unknown
-/// and fails closed.
-const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 4;
+/// per-person thread states), 19 `graph_ledger_state`, 20 `link_redirects`
+/// (reader instrumentation), 21 the nullable
+/// `agent_policies.allowed_addresses` column. None alter or remove anything
+/// V1 reads or writes (V1 selects `agent_policies` columns by name), so a
+/// database at schema versions 17–21 is opened as-is — no migrations run,
+/// no `user_version` write, nothing deleted. Any version beyond that is
+/// unknown and fails closed.
+const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 5;
 
 /// Run all pending migrations on the given connection.
 ///
@@ -967,18 +967,18 @@ fn migration_list() -> Vec<M<'static>> {
     ]
 }
 
-/// Fixtures mirroring the isolated V2 line's additive migrations 17–20
+/// Fixtures mirroring the isolated V2 line's additive migrations 17–21
 /// (send receipts, relationship/CRM tables, graph ledger state, reader link
-/// redirects). The exact column shapes are irrelevant to V1, which never
-/// reads these tables; the fixtures exist to prove V1 opens alongside them
-/// without touching them.
+/// redirects, agent address scope). The exact column shapes are irrelevant
+/// to V1, which never reads these tables or the added column; the fixtures
+/// exist to prove V1 opens alongside them without touching them.
 #[cfg(test)]
 pub(crate) mod v2_fixture {
     use rusqlite::Connection;
 
     /// The schema version the live V2 runtime has advanced the shared
-    /// database to (V1's 16 migrations plus V2 migrations 17–20).
-    pub(crate) const V2_SCHEMA_VERSION: i64 = 20;
+    /// database to (V1's 16 migrations plus V2 migrations 17–21).
+    pub(crate) const V2_SCHEMA_VERSION: i64 = 21;
 
     pub(crate) fn apply(conn: &Connection) {
         conn.execute_batch(&format!(
@@ -1031,6 +1031,7 @@ pub(crate) mod v2_fixture {
             );
             CREATE UNIQUE INDEX idx_link_redirects_natural
                 ON link_redirects(account_id, message_id, original_url);
+            ALTER TABLE agent_policies ADD COLUMN allowed_addresses TEXT;
 
             INSERT INTO send_receipts (id, account_id) VALUES ('sr-1', 'acc');
             INSERT INTO persons (id, display_name) VALUES ('p-1', 'Ada');
@@ -1053,9 +1054,9 @@ mod tests {
     }
 
     /// Pins the forward-compatibility boundary: V1's sequence produces schema
-    /// version 16, and the known additive V2 level is 20. If this fails
+    /// version 16, and the known additive V2 level is 21. If this fails
     /// because a V1 migration was added, its version number collides with the
-    /// V2 line's 17–20 — reconcile with the V2 track before shipping.
+    /// V2 line's 17–21 — reconcile with the V2 track before shipping.
     #[test]
     fn forward_schema_boundary_is_pinned_to_the_v2_line() {
         assert_eq!(migration_list().len(), 16);
