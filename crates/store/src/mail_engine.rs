@@ -40,6 +40,7 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
             uidvalidity INTEGER NOT NULL,
             uid INTEGER NOT NULL,
             input_hash TEXT NOT NULL,
+            backend TEXT NOT NULL DEFAULT 'openrouter',
             model TEXT NOT NULL,
             status TEXT NOT NULL,
             route TEXT NOT NULL,
@@ -107,6 +108,17 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
             ON mail_engine_sender_stats(account_id, domain_hash);
         ",
     )?;
+    let has_backend: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('mail_engine_decisions') WHERE name = 'backend'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_backend == 0 {
+        conn.execute_batch(
+            "ALTER TABLE mail_engine_decisions
+             ADD COLUMN backend TEXT NOT NULL DEFAULT 'openrouter';",
+        )?;
+    }
     Ok(())
 }
 
@@ -153,6 +165,7 @@ pub struct NewMailEngineDecision<'a> {
     pub uidvalidity: u32,
     pub uid: u32,
     pub input_hash: &'a str,
+    pub backend: &'a str,
     pub model: &'a str,
     pub status: &'a str,
     pub route: &'a str,
@@ -173,6 +186,7 @@ pub struct MailEngineDecisionClaim<'a> {
     pub uidvalidity: u32,
     pub uid: u32,
     pub input_hash: &'a str,
+    pub backend: &'a str,
     pub model: &'a str,
 }
 
@@ -204,6 +218,8 @@ pub struct MailEngineDecisionSummary {
     pub folder: String,
     pub uidvalidity: u32,
     pub uid: u32,
+    pub backend: String,
+    pub model: String,
     pub model_status: String,
     pub status: String,
     pub route: String,
@@ -378,14 +394,15 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically claim one message before any paid model request. A competing
+    /// Atomically claim one message before any model request. A competing
     /// worker or crash retry sees the existing row and must not call Jev again.
     pub fn claim_mail_engine_decision(&self, claim: &MailEngineDecisionClaim<'_>) -> Result<bool> {
+        validate_mail_engine_identity(claim.backend, claim.model)?;
         let changed = self.conn().execute(
             "INSERT OR IGNORE INTO mail_engine_decisions (
-                account_id, folder, uidvalidity, uid, input_hash, model,
+                account_id, folder, uidvalidity, uid, input_hash, backend, model,
                 status, route, urgency, decision_json, execution_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                        'processing', 'review', 'not_urgent',
                        '{\"status\":\"processing\"}', 'not_requested')",
             params![
@@ -394,6 +411,7 @@ impl Database {
                 i64::from(claim.uidvalidity),
                 i64::from(claim.uid),
                 claim.input_hash,
+                claim.backend,
                 claim.model,
             ],
         )?;
@@ -406,6 +424,7 @@ impl Database {
         &self,
         decision: &NewMailEngineDecision<'_>,
     ) -> Result<bool> {
+        validate_mail_engine_identity(decision.backend, decision.model)?;
         for (value, field) in [
             (decision.status, "status"),
             (decision.route, "route"),
@@ -441,18 +460,19 @@ impl Database {
         }
         let changed = self.conn().execute(
             "INSERT OR IGNORE INTO mail_engine_decisions (
-                account_id, folder, uidvalidity, uid, input_hash, model,
+                account_id, folder, uidvalidity, uid, input_hash, backend, model,
                 status, route, route_probability, route_confidence, urgency,
                 notify_user_probability, requires_reply_probability,
                 bulk_or_subscription_probability, decision_json, execution_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                       CASE WHEN ?8 = 'junk' THEN 'pending' ELSE 'not_requested' END)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       CASE WHEN ?9 = 'junk' THEN 'pending' ELSE 'not_requested' END)",
             params![
                 decision.account_id,
                 decision.folder,
                 i64::from(decision.uidvalidity),
                 i64::from(decision.uid),
                 decision.input_hash,
+                decision.backend,
                 decision.model,
                 decision.status,
                 decision.route,
@@ -477,22 +497,23 @@ impl Database {
         validate_decision_for_storage(decision)?;
         let changed = self.conn().execute(
             "UPDATE mail_engine_decisions SET
-                model = ?6, status = ?7, route = ?8,
-                route_probability = ?9, route_confidence = ?10,
-                urgency = ?11, notify_user_probability = ?12,
-                requires_reply_probability = ?13,
-                bulk_or_subscription_probability = ?14,
-                decision_json = ?15,
-                execution_status = CASE WHEN ?8 = 'junk' THEN 'pending' ELSE 'not_requested' END,
+                backend = ?6, model = ?7, status = ?8, route = ?9,
+                route_probability = ?10, route_confidence = ?11,
+                urgency = ?12, notify_user_probability = ?13,
+                requires_reply_probability = ?14,
+                bulk_or_subscription_probability = ?15,
+                decision_json = ?16,
+                execution_status = CASE WHEN ?9 = 'junk' THEN 'pending' ELSE 'not_requested' END,
                 updated_at = datetime('now')
              WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
-               AND input_hash = ?5 AND status = 'processing'",
+               AND input_hash = ?5 AND backend = ?6 AND status = 'processing'",
             params![
                 decision.account_id,
                 decision.folder,
                 i64::from(decision.uidvalidity),
                 i64::from(decision.uid),
                 decision.input_hash,
+                decision.backend,
                 decision.model,
                 decision.status,
                 decision.route,
@@ -608,17 +629,20 @@ impl Database {
         Ok(changed)
     }
 
-    /// Prepare a retry only when the stored failure proves that no model
-    /// request was dispatched. Atomically transitions the existing durable row
-    /// back to `processing`; it never deletes the decision or rewinds the mailbox
-    /// watermark. The caller must immediately fetch and reclassify this exact
-    /// identity using the already-owned claim.
+    /// Prepare an explicitly authorized retry for one closed failure class and
+    /// exact backend/model identity. It never deletes the decision or rewinds
+    /// the mailbox watermark.
     pub fn prepare_current_mail_engine_safe_retry(
         &self,
         account_id: &str,
         folder: &str,
         uid: u32,
+        backend: &str,
+        model: &str,
+        error_code: &str,
     ) -> Result<Option<u32>> {
+        validate_mail_engine_identity(backend, model)?;
+        validate_token(error_code, "error_code")?;
         let tx = self.conn().unchecked_transaction()?;
         let uidvalidity: Option<i64> = tx
             .query_row(
@@ -629,13 +653,21 @@ impl Database {
                   AND m.uidvalidity = d.uidvalidity
                  WHERE d.account_id = ?1 AND d.folder = ?2 AND d.uid = ?3
                    AND d.status = 'review' AND d.route = 'review'
-                   AND json_extract(d.decision_json, '$.error_code') = 'openrouter_api_key_missing'
+                   AND d.backend = ?4 AND d.model = ?5
+                   AND json_extract(d.decision_json, '$.error_code') = ?6
                    AND NOT EXISTS (
                        SELECT 1 FROM mail_engine_decision_corrections c
                        WHERE c.account_id = d.account_id AND c.folder = d.folder
                          AND c.uidvalidity = d.uidvalidity AND c.uid = d.uid
                    )",
-                params![account_id, folder, i64::from(uid)],
+                params![
+                    account_id,
+                    folder,
+                    i64::from(uid),
+                    backend,
+                    model,
+                    error_code
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -650,12 +682,13 @@ impl Database {
                  notify_user_probability = NULL,
                  requires_reply_probability = NULL,
                  bulk_or_subscription_probability = NULL,
-                 decision_json = '{\"status\":\"processing\",\"retry\":\"openrouter_key_restored\"}',
+                 decision_json = '{\"status\":\"processing\",\"retry\":\"operator_authorized\"}',
                  execution_status = 'not_requested', executed_action = NULL,
                  last_error = NULL, updated_at = datetime('now')
              WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
                AND status = 'review' AND route = 'review'
-               AND json_extract(decision_json, '$.error_code') = 'openrouter_api_key_missing'
+               AND backend = ?5 AND model = ?6
+               AND json_extract(decision_json, '$.error_code') = ?7
                AND NOT EXISTS (
                    SELECT 1 FROM mail_engine_decision_corrections c
                    WHERE c.account_id = mail_engine_decisions.account_id
@@ -663,7 +696,15 @@ impl Database {
                      AND c.uidvalidity = mail_engine_decisions.uidvalidity
                      AND c.uid = mail_engine_decisions.uid
                )",
-            params![account_id, folder, uidvalidity, i64::from(uid)],
+            params![
+                account_id,
+                folder,
+                uidvalidity,
+                i64::from(uid),
+                backend,
+                model,
+                error_code
+            ],
         )?;
         tx.commit()?;
         Ok((changed == 1).then_some(uidvalidity as u32))
@@ -908,7 +949,7 @@ impl Database {
         }
         let mut stmt = self.conn().prepare(
             "SELECT d.account_id, d.folder, d.uidvalidity, d.uid,
-                    d.status,
+                    d.backend, d.model, d.status,
                     CASE WHEN c.revision IS NOT NULL THEN 'decided' ELSE d.status END,
                     d.route, COALESCE(c.route, d.route),
                     d.route_probability, d.route_confidence,
@@ -946,23 +987,25 @@ impl Database {
                 folder: row.get(1)?,
                 uidvalidity: row.get::<_, i64>(2)? as u32,
                 uid: row.get::<_, i64>(3)? as u32,
-                model_status: row.get(4)?,
-                status: row.get(5)?,
-                route: row.get(6)?,
-                effective_route: row.get(7)?,
-                route_probability: row.get(8)?,
-                route_confidence: row.get(9)?,
-                urgency: row.get(10)?,
-                effective_urgency: row.get(11)?,
-                notify_user_probability: row.get(12)?,
-                requires_reply_probability: row.get(13)?,
-                bulk_or_subscription_probability: row.get(14)?,
-                execution_status: row.get(15)?,
-                executed_action: row.get(16)?,
-                model_error_code: row.get(17)?,
-                error_code: row.get(18)?,
-                correction_revision: row.get::<_, i64>(19)? as u64,
-                decided_at: row.get(20)?,
+                backend: row.get(4)?,
+                model: row.get(5)?,
+                model_status: row.get(6)?,
+                status: row.get(7)?,
+                route: row.get(8)?,
+                effective_route: row.get(9)?,
+                route_probability: row.get(10)?,
+                route_confidence: row.get(11)?,
+                urgency: row.get(12)?,
+                effective_urgency: row.get(13)?,
+                notify_user_probability: row.get(14)?,
+                requires_reply_probability: row.get(15)?,
+                bulk_or_subscription_probability: row.get(16)?,
+                execution_status: row.get(17)?,
+                executed_action: row.get(18)?,
+                model_error_code: row.get(19)?,
+                error_code: row.get(20)?,
+                correction_revision: row.get::<_, i64>(21)? as u64,
+                decided_at: row.get(22)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1115,24 +1158,23 @@ impl Database {
 
     pub fn mail_engine_processing_claim_matches(
         &self,
-        account_id: &str,
-        folder: &str,
-        uidvalidity: u32,
-        uid: u32,
-        input_hash: &str,
+        claim: &MailEngineDecisionClaim<'_>,
     ) -> Result<bool> {
         Ok(self
             .conn()
             .query_row(
                 "SELECT 1 FROM mail_engine_decisions
                  WHERE account_id = ?1 AND folder = ?2 AND uidvalidity = ?3 AND uid = ?4
-                   AND input_hash = ?5 AND status = 'processing'",
+                   AND input_hash = ?5 AND backend = ?6 AND model = ?7
+                   AND status = 'processing'",
                 params![
-                    account_id,
-                    folder,
-                    i64::from(uidvalidity),
-                    i64::from(uid),
-                    input_hash,
+                    claim.account_id,
+                    claim.folder,
+                    i64::from(claim.uidvalidity),
+                    i64::from(claim.uid),
+                    claim.input_hash,
+                    claim.backend,
+                    claim.model,
                 ],
                 |_| Ok(()),
             )
@@ -1457,6 +1499,7 @@ fn observe_timestamp(stats: &mut MailEngineSenderStats, timestamp: Option<&str>)
 }
 
 fn validate_decision_for_storage(decision: &NewMailEngineDecision<'_>) -> Result<()> {
+    validate_mail_engine_identity(decision.backend, decision.model)?;
     for (value, field) in [
         (decision.status, "status"),
         (decision.route, "route"),
@@ -1491,6 +1534,56 @@ fn validate_decision_for_storage(decision: &NewMailEngineDecision<'_>) -> Result
         validate_optional_probability(value, field)?;
     }
     Ok(())
+}
+
+fn validate_mail_engine_backend(value: &str) -> Result<()> {
+    if matches!(value, "laya" | "openrouter") {
+        Ok(())
+    } else {
+        Err(StoreError::Config(
+            "mail engine backend must be laya or openrouter".into(),
+        ))
+    }
+}
+
+fn validate_model_identity(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b':' | b'-')
+        })
+    {
+        return Err(StoreError::Config(
+            "mail engine model identity contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mail_engine_identity(backend: &str, model: &str) -> Result<()> {
+    validate_mail_engine_backend(backend)?;
+    validate_model_identity(model)?;
+    let expected = match backend {
+        // The pinned local Laya checkpoint, recorded as repository:revision so a
+        // durable decision names the exact weights that produced it.
+        "laya" => model == "aac6fef/laya-mlx:047678560251f28113ee8f5df4be82102c7bf336",
+        "openrouter" => {
+            model == "typesafe/jev-1.13"
+                || model
+                    .strip_prefix("typesafe/jev-1.13-")
+                    .is_some_and(|date| {
+                        date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        }
+        _ => false,
+    };
+    if expected {
+        Ok(())
+    } else {
+        Err(StoreError::Config(
+            "mail engine backend/model identity is not supported".into(),
+        ))
+    }
 }
 
 fn validate_token(value: &str, field: &str) -> Result<()> {
@@ -1609,6 +1702,7 @@ mod tests {
             uidvalidity: 10,
             uid: 101,
             input_hash: "0123456789abcdef",
+            backend: "openrouter",
             model: "typesafe/jev-1.13",
             status: "decided",
             route: "follow_up",
@@ -1637,6 +1731,128 @@ mod tests {
             db.mail_engine_decision_exists("acct", "INBOX", 10, 101)
                 .unwrap()
         );
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 101).unwrap();
+        let stored = db
+            .list_mail_engine_decisions(Some("acct"), None, None, 10)
+            .unwrap();
+        assert_eq!(stored[0].backend, "openrouter");
+        assert_eq!(stored[0].model, "typesafe/jev-1.13");
+    }
+
+    #[test]
+    fn existing_decision_tables_gain_openrouter_backend_compatibly() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mail_engine_decisions (
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                uidvalidity INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                input_hash TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                route TEXT NOT NULL,
+                route_probability REAL,
+                route_confidence REAL,
+                urgency TEXT NOT NULL,
+                notify_user_probability REAL,
+                requires_reply_probability REAL,
+                bulk_or_subscription_probability REAL,
+                decision_json TEXT NOT NULL DEFAULT '{}',
+                execution_status TEXT NOT NULL DEFAULT 'not_requested',
+                executed_action TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, folder, uidvalidity, uid)
+             );
+             INSERT INTO mail_engine_decisions (
+                 account_id, folder, uidvalidity, uid, input_hash, model,
+                 status, route, urgency
+             ) VALUES (
+                 'acct', 'INBOX', 10, 1, 'hash', 'typesafe/jev-1.13',
+                 'review', 'review', 'not_urgent'
+             );",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let backend: String = conn
+            .query_row(
+                "SELECT backend FROM mail_engine_decisions WHERE uid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backend, "openrouter");
+    }
+
+    #[test]
+    fn laya_retry_requires_matching_backend_model_and_failure() {
+        const LAYA_MODEL: &str = "aac6fef/laya-mlx:047678560251f28113ee8f5df4be82102c7bf336";
+        let db = db();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 100).unwrap();
+        let mut laya = decision();
+        laya.uid = 101;
+        laya.backend = "laya";
+        // The OpenRouter model identity is refused under the laya backend, and
+        // the bare repository without its pinned revision is refused too.
+        assert!(db.insert_mail_engine_decision_if_absent(&laya).is_err());
+        laya.model = "aac6fef/laya-mlx";
+        assert!(db.insert_mail_engine_decision_if_absent(&laya).is_err());
+        // Unknown backend tokens remain invalid.
+        laya.backend = "unknown";
+        laya.model = LAYA_MODEL;
+        assert!(db.insert_mail_engine_decision_if_absent(&laya).is_err());
+
+        laya.backend = "laya";
+        laya.model = LAYA_MODEL;
+        laya.status = "review";
+        laya.route = "review";
+        laya.route_probability = None;
+        laya.route_confidence = None;
+        laya.notify_user_probability = None;
+        laya.requires_reply_probability = None;
+        laya.bulk_or_subscription_probability = None;
+        laya.decision_json = r#"{"error_code":"laya_jev_failed"}"#;
+        db.insert_mail_engine_decision_if_absent(&laya).unwrap();
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                101,
+                "openrouter",
+                "typesafe/jev-1.13",
+                "openrouter_api_key_missing",
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                101,
+                "laya",
+                LAYA_MODEL,
+                "laya_jev_failed",
+            )
+            .unwrap(),
+            Some(10)
+        );
+        assert!(
+            db.mail_engine_processing_claim_matches(&MailEngineDecisionClaim {
+                account_id: "acct",
+                folder: "INBOX",
+                uidvalidity: 10,
+                uid: 101,
+                input_hash: "0123456789abcdef",
+                backend: "laya",
+                model: LAYA_MODEL,
+            })
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1648,6 +1864,7 @@ mod tests {
             uidvalidity: 10,
             uid: 101,
             input_hash: "0123456789abcdef",
+            backend: "openrouter",
             model: "typesafe/jev-1.13",
         };
         assert!(db.claim_mail_engine_decision(&claim).unwrap());
@@ -1677,6 +1894,7 @@ mod tests {
             uidvalidity: 10,
             uid: 111,
             input_hash: "held-input",
+            backend: "openrouter",
             model: "typesafe/jev-1.13",
         };
         assert!(db.claim_mail_engine_decision(&claim).unwrap());
@@ -1697,8 +1915,15 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 111)
-                .unwrap(),
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                111,
+                "openrouter",
+                "typesafe/jev-1.13",
+                "openrouter_api_key_missing",
+            )
+            .unwrap(),
             None
         );
 
@@ -1719,8 +1944,15 @@ mod tests {
         db.advance_mail_engine_watermark("acct", "INBOX", 10, 112)
             .unwrap();
         assert_eq!(
-            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 112)
-                .unwrap(),
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                112,
+                "openrouter",
+                "typesafe/jev-1.13",
+                "openrouter_api_key_missing",
+            )
+            .unwrap(),
             Some(10)
         );
         assert!(
@@ -1758,8 +1990,15 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 113)
-                .unwrap(),
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                113,
+                "openrouter",
+                "typesafe/jev-1.13",
+                "openrouter_api_key_missing",
+            )
+            .unwrap(),
             None,
             "a human-corrected review must never be deleted for model retry"
         );
@@ -1793,6 +2032,7 @@ mod tests {
                 uidvalidity: 10,
                 uid: 101,
                 input_hash: "interrupted",
+                backend: "openrouter",
                 model: "typesafe/jev-1.13",
             })
             .unwrap()
@@ -1957,11 +2197,12 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].uid, 2);
         assert_eq!(decisions[0].route, "important");
+        assert_eq!(decisions[0].backend, "openrouter");
+        assert_eq!(decisions[0].model, "typesafe/jev-1.13");
         let rendered = serde_json::to_string(&decisions).unwrap();
         for forbidden in [
             "decision_json",
             "input_hash",
-            "typesafe/jev-1.13",
             "subject",
             "sender",
             "private.sender",
@@ -2127,6 +2368,7 @@ mod tests {
                 uidvalidity: 10,
                 uid: 104,
                 input_hash: "processing-hash",
+                backend: "openrouter",
                 model: "typesafe/jev-1.13",
             })
             .unwrap()

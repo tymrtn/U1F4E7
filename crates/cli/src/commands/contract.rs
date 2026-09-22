@@ -47,6 +47,7 @@ pub fn agent_contract() -> Value {
             "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval.",
             "previous_schema": AGENT_CONTRACT_SCHEMA_V2,
             "v3_changes": [
+                "Jev mail-engine calls gained an additive --jev-backend openrouter|laya selector on once, run, and fresh-call recovery, plus an additive read-only `engine laya-health` probe. OpenRouter remains the default and is unchanged. laya is an optional local provider: the pinned aac6fef/laya-mlx checkpoint at revision 047678560251f28113ee8f5df4be82102c7bf336, served by a bundled loopback-only process at the fixed IPv4 endpoint http://127.0.0.1:8791/decide with no content egress and no API key. It answers the identical typed state+questions request natively, never generates text or JSON, and never falls back to OpenRouter; durable decisions expose additive backend and model identities.",
                 "OTP JSON automation now requires account plus exact mailbox/full-domain sender binding; it waits a fixed 5-second stabilization window and fails closed with error=ambiguous_matches/candidate_count when multiple candidates are observed across polling iterations. Returned from/subject values are untrusted header/content fields, not authenticated identity.",
                 "Attribution protocol (envelope.attribution.v1): send/reply/send_draft REQUIRE a non-empty `attributes` array of factual catalog keys (enforced at the handler boundary, including draft-only outcomes). A bot-originated send with no declared attribute is rejected with attributes_required BEFORE Governor scoring even when host facts are derivable — host-derived facts never substitute for the bot's declaration. Unknown/attestation-only/contradicting/host-unverifiable/impossible declarations are rejected with attributes_invalid. Both are top-level `invalid`-status codes. A declared host-derived key counts only when Envelope independently observes it true (declaration + host corroboration); observed-false is conflicts_with_host_observation and unobservable is host_verification_unavailable.",
                 "The agent-facing Governor block narrows to {decision, state, mode, review_ticket_id}; the numeric score, allowed, block_code, and block_reason fields were removed from agent-facing and durable Envelope payloads (deliberate anti-oracle security fix).",
@@ -124,27 +125,51 @@ pub fn agent_contract() -> Value {
         "mail_engine": {
             "surface": "cli_and_dashboard",
             "commands": [
-                "envelope engine once [--account <id-or-email>] [--folder INBOX] [--apply] [--deliver]",
-                "envelope engine run [--account <id-or-email>] [--folder INBOX] [--interval-seconds 300] [--apply] [--deliver]",
+                "envelope engine once [--account <id-or-email>] [--folder INBOX] [--jev-backend openrouter|laya] [--apply] [--deliver]",
+                "envelope engine run [--account <id-or-email>] [--folder INBOX] [--jev-backend openrouter|laya] [--interval-seconds 300] [--apply] [--deliver]",
                 "envelope engine status [--account <id-or-email>]",
                 "envelope engine decisions [--account <id-or-email>] [--route <route>] [--status <status>] [--limit 50]",
                 "envelope engine correct <uid> --account <id-or-email> [--folder INBOX] --route <route> --urgency <urgency> --expected-revision <n>",
-                "envelope engine recover <uid> --account <id-or-email> [--folder INBOX] [--retry-jev --confirm-new-jev-call]",
+                "envelope engine recover <uid> --account <id-or-email> [--folder INBOX] [--jev-backend openrouter|laya] [--retry-jev --confirm-new-jev-call]",
+                "envelope engine laya-health [--json]",
                 "envelope engine digest-queue [--account <id-or-email>] [--limit 50]",
                 "envelope engine digest [--account <id-or-email>] [--limit 25] [--consume]"
             ],
             "model": "typesafe/jev-1.13",
             "endpoint": "https://openrouter.ai/api/alpha/decisions",
+            "default_backend": "openrouter",
+            "backends": {
+                "openrouter": {
+                    "model": "typesafe/jev-1.13",
+                    "endpoint": "https://openrouter.ai/api/alpha/decisions",
+                    "credential": "OPENROUTER_API_KEY is required and is never persisted",
+                    "content_egress": true
+                },
+                "laya": {
+                    "model": "aac6fef/laya-mlx",
+                    "model_revision": "047678560251f28113ee8f5df4be82102c7bf336",
+                    "durable_model_identity": "aac6fef/laya-mlx:047678560251f28113ee8f5df4be82102c7bf336",
+                    "endpoint": "http://127.0.0.1:8791/decide",
+                    "health_endpoint": "http://127.0.0.1:8791/health",
+                    "credential": "none",
+                    "content_egress": false,
+                    "proxy_policy": "disabled with reqwest no_proxy; HTTP_PROXY, ALL_PROXY, NO_PROXY, and system proxy configuration cannot redirect local decision state",
+                    "prerequisite": "the bundled provider must already be running on the fixed loopback port with the pinned revision pre-fetched: `python3 scripts/laya_jev_provider.py setup` then `serve`. Envelope never starts a process, never downloads weights, and never selects other weights",
+                    "integrity": "the provider resolves the immutable Hub revision to an absolute snapshot path and verifies pinned SHA-256 values for every runtime model, configuration, and tokenizer file before loading; relative shadow paths and modified cache files are rejected",
+                    "output_handling": "Laya answers the same typed choice/noul questions natively; no text or JSON is generated by a language model. Envelope proves the pinned model and revision, labels the answer with the durable local identity, and then applies the identical strict shared validator OpenRouter answers pass",
+                    "fallback": "none; a Laya failure is a closed laya_jev_failed review decision and never calls OpenRouter"
+                }
+            },
             "polling": {"default_seconds": 300, "minimum_seconds": 60, "non_overlapping": true},
             "new_only": "First observation and UIDVALIDITY changes baseline at the current highest UID without classifying historical messages; later passes process only higher extant UIDs.",
-            "state_egress": "Each decision sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender/interaction/reply statistics to OpenRouter. Credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs are excluded.",
+            "state_egress": "OpenRouter mode sends the normalized sender address/domain, subject, at most 8 KiB of derived plain text, received timestamp, read/unread/junk flags, attachment presence, and bounded indexed sender/interaction/reply statistics to OpenRouter. Credentials, local paths, Message-IDs, recipient lists, attachment bytes, and unsubscribe URLs are excluded. laya mode sends the identical state and questions payload only to the fixed IPv4-loopback provider endpoint and performs no content egress; engine laya-health carries no message, sender, or history content at all.",
             "questions": ["route", "urgency", "notify_user", "requires_reply", "bulk_or_subscription"],
             "routes": ["junk", "follow_up", "important", "routine", "digest_news", "unsubscribe_candidate", "review"],
             "action_safety": "Without --apply, mailbox decisions and queues are local-only. With --apply, only high-confidence junk may move to an already detected spam folder, and the automated move refuses servers without UIDPLUS rather than using mailbox-wide EXPUNGE. The digest command uses EXAMINE plus UID FETCH with BODY.PEEK header fields only, so it does not mark messages read. --consume records only successfully compiled digest handles as locally consumed and does not change mailbox flags or move messages. Urgent events and matching delivery rows are durable local state; --deliver is the separate explicit external-side-effect flag that drains the existing signed retry/dead-letter delivery pipeline. No permanent deletion or outbound email occurs. Unsubscribe remains a queued candidate for the separate governed workflow.",
-            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "openrouter_api_key_missing", "jev_request_failed", "decision_interrupted", "processing_recovered_for_review", "imap_move_failed", "spam_folder_not_found", "notification_enqueue_failed", "decision_incomplete"],
-            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim is inserted before the paid request; competing workers and crash retries do not call Jev again. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs; claims older than ten minutes park once as decision_interrupted for human review without another paid call. Explicit retry is accepted only for openrouter_api_key_missing, which proves no request was dispatched, and reclassifies that exact current-UIDVALIDITY message without rewinding the mailbox watermark. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
+            "failure_codes": ["credential_decrypt_failed", "imap_connect_failed", "imap_examine_failed", "uidvalidity_missing", "highest_uid_unavailable", "message_fetch_failed", "message_parse_failed", "sender_missing", "openrouter_api_key_missing", "jev_request_failed", "laya_jev_failed", "laya_provider_unavailable", "laya_model_mismatch", "decision_interrupted", "processing_recovered_for_review", "imap_move_failed", "spam_folder_not_found", "notification_enqueue_failed", "decision_incomplete"],
+            "idempotency": "A unique account/folder/UIDVALIDITY/UID claim records the selected backend and pinned model before the model request; competing workers and crash retries do not call Jev again or ambiguously change backend. Decisions persist before the mailbox watermark advances. A non-terminal processing claim holds the range without advancing to later UIDs; claims older than ten minutes park once as decision_interrupted for human review without another call. Explicit OpenRouter retry is accepted only for openrouter_api_key_missing, which proves no request was dispatched. Explicit laya retry is accepted only for laya_jev_failed and stays on-device. Both require the stored backend/model identity, reclassify that exact current-UIDVALIDITY message, and never rewind the mailbox watermark. There is no automatic laya-to-OpenRouter fallback. Recoverable junk moves use a separate atomic pending-to-executing claim, and later --apply passes drain pending actions for the current UIDVALIDITY.",
             "urgent_delivery": "notify_user_now creates a deterministic content-free mail_engine_urgent event keyed by account/folder/UIDVALIDITY/UID and one idempotent local delivery row for every enabled matching route. A retry that finds an existing durable decision re-derives notification intent from its persisted policy output and repairs a missing event/delivery before advancing the watermark. --deliver drains due rows through the existing HMAC-signed webhook executor, bounded backoff, and dead-letter recovery. Redirects are disabled in the engine delivery client.",
-            "redaction": "Durable decision/status output stores hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. The decisions command exposes current-UIDVALIDITY handles, typed decision/action state, and closed error codes without fetching message content. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time. The explicit digest command reads bounded From/Subject/Date fields for those handles, sanitizes control characters, nests them under untrusted_content with envelope.inbound-trust.v1, and excludes body, recipient, Message-ID, flags, size, and provider-spam metadata.",
+            "redaction": "Durable decision/status output stores backend/model identity, hashes, typed probabilities, route/urgency and coarse error/action codes only; it excludes raw sender, subject, body, Message-ID, API key and endpoint response body. The decisions command exposes current-UIDVALIDITY handles, backend/model, typed decision/action state, and closed error codes without fetching message content. Digest-queue output exposes only current-UIDVALIDITY account/folder/UID handles, typed probabilities, urgency, and decision time. The explicit digest command reads bounded From/Subject/Date fields for those handles, sanitizes control characters, nests them under untrusted_content with envelope.inbound-trust.v1, and excludes body, recipient, Message-ID, flags, size, and provider-spam metadata.",
             "digest_lifecycle": "Digest items remain pending until an explicit digest --consume succeeds. Consumption is local, idempotent, current-UIDVALIDITY scoped, and applies only to items whose headers compiled successfully; failed or missing items remain queued.",
             "human_corrections": "The CLI and CSRF-protected dashboard can append a revision-guarded local route/urgency correction without changing the immutable Jev result or creating a mailbox rule. Correcting a pending model-junk decision away from junk cancels the unstarted move. A completed mailbox action is never silently reversed; restoration remains manual.",
             "dashboard": {
@@ -1388,6 +1413,7 @@ fn message_detail_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envelope_email_transport::jev;
 
     fn limit_schema_for(surface_name: &str) -> Value {
         let s = surface(surface_name).expect("contract surface");
@@ -1444,6 +1470,30 @@ mod tests {
         let engine = &contract["mail_engine"];
         assert_eq!(engine["surface"], "cli_and_dashboard");
         assert_eq!(engine["model"], "typesafe/jev-1.13");
+        assert_eq!(engine["default_backend"], "openrouter");
+        // No ambiguous generic local backend is published.
+        assert!(engine["backends"]["local"].is_null());
+        let laya = &engine["backends"]["laya"];
+        assert_eq!(laya["model"], jev::LAYA_MODEL_REPO);
+        assert_eq!(laya["model_revision"], jev::LAYA_MODEL_REVISION);
+        assert_eq!(laya["durable_model_identity"], jev::LAYA_JEV_MODEL);
+        assert_ne!(laya["durable_model_identity"], jev::JEV_MODEL);
+        assert_eq!(laya["endpoint"], jev::LAYA_DECIDE_ENDPOINT);
+        assert_eq!(laya["health_endpoint"], jev::LAYA_HEALTH_ENDPOINT);
+        assert_eq!(laya["credential"], "none");
+        assert_eq!(laya["content_egress"], false);
+        assert!(laya["proxy_policy"].as_str().unwrap().contains("no_proxy"));
+        assert!(
+            laya["prerequisite"]
+                .as_str()
+                .unwrap()
+                .contains("laya_jev_provider.py")
+        );
+        assert!(laya["integrity"].as_str().unwrap().contains("SHA-256"));
+        assert!(laya["fallback"].as_str().unwrap().starts_with("none"));
+        let failure_codes = engine["failure_codes"].as_array().unwrap();
+        assert!(failure_codes.iter().any(|code| code == "laya_jev_failed"));
+        assert!(!failure_codes.iter().any(|code| code == "local_jev_failed"));
         assert_eq!(engine["polling"]["default_seconds"], 300);
         assert_eq!(engine["polling"]["minimum_seconds"], 60);
         assert!(engine["state_egress"].as_str().unwrap().contains("8 KiB"));
@@ -1457,7 +1507,13 @@ mod tests {
             engine["idempotency"]
                 .as_str()
                 .unwrap()
-                .contains("before the paid request")
+                .contains("before the model request")
+        );
+        assert!(
+            engine["idempotency"]
+                .as_str()
+                .unwrap()
+                .contains("no automatic laya-to-OpenRouter fallback")
         );
         assert!(
             engine["urgent_delivery"]

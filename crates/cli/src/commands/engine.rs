@@ -16,8 +16,9 @@ use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_event
 use envelope_email_transport::folders;
 use envelope_email_transport::imap;
 use envelope_email_transport::jev::{
-    JevClient, JevState, MailRoute, MessageFlags, PastInteractions, PolicyDecision, ReplyHistory,
-    SenderState, SenderStatistics, Urgency, ValidatedDecision, apply_policy, build_request,
+    self, JevBackend, JevClient, JevState, MailRoute, MessageFlags, PastInteractions,
+    PolicyDecision, ReplyHistory, SenderState, SenderStatistics, Urgency, ValidatedDecision,
+    apply_policy, build_request,
 };
 use serde::Serialize;
 
@@ -33,6 +34,7 @@ pub struct EngineOptions<'a> {
     pub deliver: bool,
     pub json: bool,
     pub backend: CredentialBackend,
+    pub jev_backend: JevBackend,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +42,8 @@ struct EnginePassReport {
     mode: &'static str,
     interval_seconds: Option<u64>,
     apply: bool,
+    backend: &'static str,
+    model: &'static str,
     interrupted_decisions_recovered: usize,
     accounts: Vec<AccountReport>,
     delivery: Option<DeliveryPassReport>,
@@ -75,6 +79,8 @@ struct RecoveryReport {
     uid: u32,
     outcome: &'static str,
     new_jev_call_authorized: bool,
+    backend: Option<&'static str>,
+    model: Option<&'static str>,
     route: Option<String>,
 }
 
@@ -142,6 +148,8 @@ pub async fn run_once(options: EngineOptions<'_>) -> Result<()> {
             mode: "once",
             interval_seconds: None,
             apply: options.apply,
+            backend: options.jev_backend.as_str(),
+            model: options.jev_backend.model(),
             interrupted_decisions_recovered,
             accounts,
             delivery,
@@ -163,6 +171,8 @@ pub async fn run_loop(options: EngineOptions<'_>, interval_seconds: u64) -> Resu
                 mode: "run",
                 interval_seconds: Some(interval_seconds),
                 apply: options.apply,
+                backend: options.jev_backend.as_str(),
+                model: options.jev_backend.model(),
                 interrupted_decisions_recovered,
                 accounts,
                 delivery,
@@ -237,6 +247,87 @@ pub fn run_status(account: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct LayaHealthReport {
+    backend: &'static str,
+    endpoint: &'static str,
+    expected_model: &'static str,
+    expected_revision: &'static str,
+    durable_model_identity: &'static str,
+    content_egress: bool,
+    fallback_to_openrouter: bool,
+    ready: bool,
+    status: Option<String>,
+    dtype: Option<String>,
+    error_code: Option<&'static str>,
+}
+
+/// Inspect the local Laya provider's readiness and model identity. It sends no
+/// message, sender, or history content.
+#[tokio::main]
+pub async fn run_laya_health(json: bool) -> Result<()> {
+    let health = jev::laya_health().await;
+    let report = match &health {
+        Ok(health) => LayaHealthReport {
+            backend: JevBackend::Laya.as_str(),
+            endpoint: jev::LAYA_HEALTH_ENDPOINT,
+            expected_model: jev::LAYA_MODEL_REPO,
+            expected_revision: jev::LAYA_MODEL_REVISION,
+            durable_model_identity: JevBackend::Laya.model(),
+            content_egress: false,
+            fallback_to_openrouter: false,
+            ready: health.ready,
+            status: Some(health.status.clone()),
+            dtype: Some(health.dtype.clone()),
+            error_code: None,
+        },
+        Err(error) => LayaHealthReport {
+            backend: JevBackend::Laya.as_str(),
+            endpoint: jev::LAYA_HEALTH_ENDPOINT,
+            expected_model: jev::LAYA_MODEL_REPO,
+            expected_revision: jev::LAYA_MODEL_REVISION,
+            durable_model_identity: JevBackend::Laya.model(),
+            content_egress: false,
+            fallback_to_openrouter: false,
+            ready: false,
+            status: None,
+            dtype: None,
+            error_code: Some(laya_health_error_code(error)),
+        },
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.ready {
+        println!(
+            "Local Laya provider is ready at {} serving {}@{} ({}).",
+            report.endpoint,
+            report.expected_model,
+            report.expected_revision,
+            report.dtype.as_deref().unwrap_or("unknown dtype"),
+        );
+        println!(
+            "  Durable model identity: {}",
+            report.durable_model_identity
+        );
+        println!("  No content egress. No fallback to OpenRouter.");
+    } else {
+        println!("Local Laya provider is not usable at {}.", report.endpoint);
+        print_engine_problem(report.error_code.unwrap_or("laya_jev_failed"), "  ");
+    }
+    if report.ready {
+        Ok(())
+    } else {
+        bail!("the local Laya provider is not serving the pinned checkpoint")
+    }
+}
+
+fn laya_health_error_code(error: &jev::JevClientError) -> &'static str {
+    match error {
+        jev::JevClientError::LayaModelMismatch => "laya_model_mismatch",
+        _ => "laya_provider_unavailable",
+    }
+}
+
 pub fn run_decisions(
     account: Option<&str>,
     route: Option<&str>,
@@ -272,6 +363,7 @@ pub fn run_decisions(
                     .as_deref()
                     .unwrap_or(item.execution_status.as_str()),
             );
+            println!("  Model: {}/{}", item.backend, item.model);
             if item.correction_revision > 0 {
                 println!(
                     "  Human correction r{}: model route {} / urgency {}",
@@ -353,28 +445,32 @@ pub async fn run_recover(
     confirm_new_jev_call: bool,
     json: bool,
     backend: CredentialBackend,
+    jev_backend: JevBackend,
 ) -> Result<()> {
     if retry_jev && !confirm_new_jev_call {
-        bail!(
-            "--retry-jev requires --confirm-new-jev-call because it authorizes a new paid request"
-        );
+        bail!("--retry-jev requires --confirm-new-jev-call because it authorizes a new model call");
     }
     let db = Database::open_default().context("failed to open database")?;
     let account_record = resolve_account(&db, Some(account))?;
     let account_id = account_record.id.clone();
     let route = if retry_jev {
-        match std::env::var("OPENROUTER_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => {}
-            _ => bail!("OPENROUTER_API_KEY is still missing; no retry was attempted"),
+        if jev_backend == JevBackend::Openrouter {
+            match std::env::var("OPENROUTER_API_KEY") {
+                Ok(key) if !key.trim().is_empty() => {}
+                _ => bail!("OPENROUTER_API_KEY is still missing; no retry was attempted"),
+            }
         }
+        let retryable_error = retryable_error_code(jev_backend);
         let candidate = db
             .list_mail_engine_decisions(Some(&account_id), Some("review"), Some("review"), 200)?
             .into_iter()
             .find(|item| item.folder == folder && item.uid == uid)
-            .filter(|item| item.error_code.as_deref() == Some("openrouter_api_key_missing"))
-            .context(
-                "this decision is not safely retryable; only failures proven before dispatch can be retried",
-            )?;
+            .filter(|item| {
+                item.backend == jev_backend.as_str()
+                    && item.model == jev_backend.model()
+                    && item.error_code.as_deref() == Some(retryable_error)
+            })
+            .context("this decision is not retryable with the selected Jev backend and model")?;
         let passphrase = credential_store::get_passphrase(backend)
             .context("credential store is not available for safe retry")?;
         let credentials = db
@@ -399,7 +495,14 @@ pub async fn run_recover(
         let message = imap::parse_raw_message(&messages.remove(0))
             .context("failed to parse the exact message for safe retry")?;
         let prepared_uidvalidity = db
-            .prepare_current_mail_engine_safe_retry(&account_id, folder, uid)?
+            .prepare_current_mail_engine_safe_retry(
+                &account_id,
+                folder,
+                uid,
+                jev_backend.as_str(),
+                jev_backend.model(),
+                retryable_error,
+            )?
             .context("the decision changed before retry; no new Jev call was made")?;
         if prepared_uidvalidity != candidate.uidvalidity {
             bail!("the decision epoch changed before retry; no new Jev call was made");
@@ -412,6 +515,7 @@ pub async fn run_recover(
             &message,
             None,
             true,
+            jev_backend,
         )
         .await?
         .context("another worker claimed the decision; no duplicate Jev call was made")?;
@@ -436,6 +540,8 @@ pub async fn run_recover(
             "released_to_human_review"
         },
         new_jev_call_authorized: retry_jev,
+        backend: retry_jev.then_some(jev_backend.as_str()),
+        model: retry_jev.then_some(jev_backend.model()),
         route,
     };
     if json {
@@ -481,6 +587,9 @@ fn engine_error_remediation(error_code: &str) -> &'static str {
         "jev_request_failed" => {
             "check OPENROUTER_API_KEY and connectivity, then inspect this decision before retrying"
         }
+        "laya_jev_failed" => {
+            "run `envelope engine laya-health` to confirm the local Laya provider is serving the pinned checkpoint, then inspect or explicitly retry this decision with --jev-backend laya"
+        }
         "decision_incomplete" => {
             "another pass may still be working; stale claims are moved to review after ten minutes"
         }
@@ -489,6 +598,12 @@ fn engine_error_remediation(error_code: &str) -> &'static str {
         }
         "notification_enqueue_failed" => {
             "check event routes and delivery storage; the watermark remains held for a safe retry"
+        }
+        "laya_provider_unavailable" => {
+            "start the local Laya provider: python3 scripts/laya_jev_provider.py serve"
+        }
+        "laya_model_mismatch" => {
+            "the local provider is serving other weights; restart it on the pinned aac6fef/laya-mlx revision"
         }
         "credential_decrypt_failed" => "repair the Envelope credential store for this account",
         "imap_connect_failed" => "check account credentials and IMAP connectivity",
@@ -993,6 +1108,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<(Vec<AccountReport>
                                 options.folder,
                                 uidvalidity,
                                 uid,
+                                options.jev_backend,
                                 "message_fetch_failed",
                             )?;
                             report.review += 1;
@@ -1014,6 +1130,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<(Vec<AccountReport>
                                 options.folder,
                                 uidvalidity,
                                 uid,
+                                options.jev_backend,
                                 "message_parse_failed",
                             )?;
                             report.review += 1;
@@ -1034,6 +1151,7 @@ async fn process_once(options: &EngineOptions<'_>) -> Result<(Vec<AccountReport>
                         &message,
                         None,
                         false,
+                        options.jev_backend,
                     )
                     .await?
                     else {
@@ -1109,6 +1227,7 @@ async fn classify_and_persist(
     message: &Message,
     client_override: Option<&JevClient>,
     claim_already_owned: bool,
+    jev_backend: JevBackend,
 ) -> Result<Option<PolicyDecision>> {
     let sender_address = message.from_addr.trim();
     if sender_address.is_empty() {
@@ -1118,6 +1237,7 @@ async fn classify_and_persist(
             folder,
             uidvalidity,
             message.uid,
+            jev_backend,
             "sender_missing",
         )?;
         return Ok(Some(review_policy()));
@@ -1173,46 +1293,51 @@ async fn classify_and_persist(
     )?;
     let request = build_request(state);
     let input_hash = mail_engine_hash(&serde_json::to_string(&request)?);
-    if claim_already_owned {
-        if !db.mail_engine_processing_claim_matches(
-            account_id,
-            folder,
-            uidvalidity,
-            message.uid,
-            &input_hash,
-        )? {
-            bail!("safe retry claim no longer matches the immutable Jev input");
-        }
-    } else if !db.claim_mail_engine_decision(&MailEngineDecisionClaim {
+    let claim = MailEngineDecisionClaim {
         account_id,
         folder,
         uidvalidity,
         uid: message.uid,
         input_hash: &input_hash,
-        model: "typesafe/jev-1.13",
-    })? {
+        backend: jev_backend.as_str(),
+        model: jev_backend.model(),
+    };
+    if claim_already_owned {
+        if !db.mail_engine_processing_claim_matches(&claim)? {
+            bail!("safe retry claim no longer matches the immutable Jev input");
+        }
+    } else if !db.claim_mail_engine_decision(&claim)? {
         // Another worker already owns or completed this immutable input. Never
         // issue a second paid request and never let this caller advance the
         // ordered watermark until a later pass observes a terminal row.
         return Ok(None);
     }
     let owned_client = if client_override.is_none() {
-        let key = match std::env::var("OPENROUTER_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => key,
-            _ => {
-                persist_review_with_hash(
-                    db,
-                    account_id,
-                    folder,
-                    uidvalidity,
-                    message.uid,
-                    &input_hash,
-                    "openrouter_api_key_missing",
-                )?;
-                return Ok(Some(review_policy()));
+        let client = match jev_backend {
+            // No fallback: a Laya failure fails closed to review below and
+            // never reaches OpenRouter.
+            JevBackend::Laya => JevClient::laya(),
+            JevBackend::Openrouter => {
+                let key = match std::env::var("OPENROUTER_API_KEY") {
+                    Ok(key) if !key.trim().is_empty() => key,
+                    _ => {
+                        persist_review_with_hash(
+                            db,
+                            account_id,
+                            folder,
+                            uidvalidity,
+                            message.uid,
+                            &input_hash,
+                            jev_backend,
+                            "openrouter_api_key_missing",
+                        )?;
+                        return Ok(Some(review_policy()));
+                    }
+                };
+                JevClient::openrouter(key)
             }
         };
-        match JevClient::openrouter(key) {
+        match client {
             Ok(client) => Some(client),
             Err(_) => {
                 persist_review_with_hash(
@@ -1222,7 +1347,8 @@ async fn classify_and_persist(
                     uidvalidity,
                     message.uid,
                     &input_hash,
-                    "jev_request_failed",
+                    jev_backend,
+                    backend_failure_code(jev_backend),
                 )?;
                 return Ok(Some(review_policy()));
             }
@@ -1233,6 +1359,9 @@ async fn classify_and_persist(
     let client = client_override
         .or(owned_client.as_ref())
         .expect("Jev client exists");
+    if client.backend() != jev_backend {
+        bail!("Jev test client backend does not match the durable claim identity");
+    }
     let decision = match client.decide(&request).await {
         Ok(decision) => decision,
         Err(_) => {
@@ -1243,7 +1372,8 @@ async fn classify_and_persist(
                 uidvalidity,
                 message.uid,
                 &input_hash,
-                "jev_request_failed",
+                jev_backend,
+                backend_failure_code(jev_backend),
             )?;
             return Ok(Some(review_policy()));
         }
@@ -1258,6 +1388,7 @@ async fn classify_and_persist(
         &input_hash,
         &decision,
         &policy,
+        jev_backend,
     )?;
     Ok(Some(policy))
 }
@@ -1271,6 +1402,7 @@ fn persist_decision(
     input_hash: &str,
     decision: &ValidatedDecision,
     policy: &PolicyDecision,
+    jev_backend: JevBackend,
 ) -> Result<()> {
     let decision_json = serde_json::to_string(decision)?;
     let finalized = db.finalize_mail_engine_decision(&NewMailEngineDecision {
@@ -1279,6 +1411,7 @@ fn persist_decision(
         uidvalidity,
         uid,
         input_hash,
+        backend: jev_backend.as_str(),
         model: &decision.model,
         status: if policy.route == MailRoute::Review {
             "review"
@@ -1306,6 +1439,7 @@ fn persist_review(
     folder: &str,
     uidvalidity: u32,
     uid: u32,
+    jev_backend: JevBackend,
     error_code: &str,
 ) -> Result<()> {
     let input_hash = mail_engine_hash(&format!("{account_id}:{folder}:{uidvalidity}:{uid}"));
@@ -1316,6 +1450,7 @@ fn persist_review(
         uidvalidity,
         uid,
         &input_hash,
+        jev_backend,
         error_code,
     )
 }
@@ -1328,6 +1463,7 @@ fn persist_review_with_hash(
     uidvalidity: u32,
     uid: u32,
     input_hash: &str,
+    jev_backend: JevBackend,
     error_code: &str,
 ) -> Result<()> {
     let decision_json = serde_json::json!({"error_code": error_code}).to_string();
@@ -1337,7 +1473,8 @@ fn persist_review_with_hash(
         uidvalidity,
         uid,
         input_hash,
-        model: "typesafe/jev-1.13",
+        backend: jev_backend.as_str(),
+        model: jev_backend.model(),
         status: "review",
         route: "review",
         route_probability: None,
@@ -1498,6 +1635,20 @@ fn review_policy() -> PolicyDecision {
         requires_reply: false,
         bulk_or_subscription: false,
         abstained: true,
+    }
+}
+
+fn backend_failure_code(backend: JevBackend) -> &'static str {
+    match backend {
+        JevBackend::Laya => "laya_jev_failed",
+        JevBackend::Openrouter => "jev_request_failed",
+    }
+}
+
+fn retryable_error_code(backend: JevBackend) -> &'static str {
+    match backend {
+        JevBackend::Laya => "laya_jev_failed",
+        JevBackend::Openrouter => "openrouter_api_key_missing",
     }
 }
 
@@ -1711,6 +1862,7 @@ mod tests {
                 uidvalidity: 10,
                 uid: 1,
                 input_hash: "claimed-by-another-worker",
+                backend: "openrouter",
                 model: "typesafe/jev-1.13",
             })
             .unwrap()
@@ -1737,10 +1889,18 @@ mod tests {
             provider_spam: None,
         };
 
-        let outcome =
-            classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client), false)
-                .await
-                .unwrap();
+        let outcome = classify_and_persist(
+            &db,
+            "acct",
+            "INBOX",
+            10,
+            &message,
+            Some(&client),
+            false,
+            JevBackend::Openrouter,
+        )
+        .await
+        .unwrap();
 
         assert!(outcome.is_none());
         let recovery = db
@@ -1854,10 +2014,19 @@ mod tests {
             attachments: Vec::new(),
             provider_spam: None,
         };
-        let policy = classify_and_persist(&db, "acct", "INBOX", 10, &message, Some(&client), false)
-            .await
-            .unwrap()
-            .expect("the uncontended fixture should return a policy");
+        let policy = classify_and_persist(
+            &db,
+            "acct",
+            "INBOX",
+            10,
+            &message,
+            Some(&client),
+            false,
+            JevBackend::Openrouter,
+        )
+        .await
+        .unwrap()
+        .expect("the uncontended fixture should return a policy");
         server.await.unwrap();
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1885,26 +2054,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            db.prepare_current_mail_engine_safe_retry("acct", "INBOX", 1)
-                .unwrap(),
-            Some(10)
-        );
-        assert!(
-            db.mail_engine_processing_claim_matches(
+            db.prepare_current_mail_engine_safe_retry(
                 "acct",
                 "INBOX",
-                10,
                 1,
-                &db.conn()
-                    .query_row(
-                        "SELECT input_hash FROM mail_engine_decisions
-                         WHERE account_id = 'acct' AND folder = 'INBOX'
-                           AND uidvalidity = 10 AND uid = 1",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .unwrap(),
+                "openrouter",
+                "typesafe/jev-1.13",
+                "openrouter_api_key_missing",
             )
+            .unwrap(),
+            Some(10)
+        );
+        let retry_input_hash = db
+            .conn()
+            .query_row(
+                "SELECT input_hash FROM mail_engine_decisions
+                 WHERE account_id = 'acct' AND folder = 'INBOX'
+                   AND uidvalidity = 10 AND uid = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            db.mail_engine_processing_claim_matches(&MailEngineDecisionClaim {
+                account_id: "acct",
+                folder: "INBOX",
+                uidvalidity: 10,
+                uid: 1,
+                input_hash: &retry_input_hash,
+                backend: "openrouter",
+                model: "typesafe/jev-1.13",
+            })
             .unwrap()
         );
 
@@ -1960,6 +2140,7 @@ mod tests {
             &message,
             Some(&retry_client),
             true,
+            JevBackend::Openrouter,
         )
         .await
         .unwrap()
@@ -1983,5 +2164,77 @@ mod tests {
             "unsubscribe_candidate"
         );
         assert_eq!(urgency_token(Urgency::NotUrgent), "not_urgent");
+    }
+
+    #[test]
+    fn laya_failures_stay_local_and_preserve_backend_model_identity() {
+        let db = Database::open_memory().unwrap();
+        db.plan_mail_engine_scan("acct", "INBOX", 10, 0).unwrap();
+        persist_review(
+            &db,
+            "acct",
+            "INBOX",
+            10,
+            1,
+            JevBackend::Laya,
+            backend_failure_code(JevBackend::Laya),
+        )
+        .unwrap();
+
+        let decisions = db
+            .list_mail_engine_decisions(Some("acct"), Some("review"), Some("review"), 10)
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].backend, "laya");
+        assert_eq!(decisions[0].model, jev::LAYA_JEV_MODEL);
+        assert_eq!(decisions[0].route, "review");
+        assert_eq!(decisions[0].error_code.as_deref(), Some("laya_jev_failed"));
+
+        // Each backend keeps its own distinct closed error code and its own
+        // retryable precondition, so a retry can never cross providers.
+        assert_eq!(backend_failure_code(JevBackend::Laya), "laya_jev_failed");
+        assert_eq!(
+            backend_failure_code(JevBackend::Openrouter),
+            "jev_request_failed"
+        );
+        assert_eq!(retryable_error_code(JevBackend::Laya), "laya_jev_failed");
+        assert_eq!(
+            retryable_error_code(JevBackend::Openrouter),
+            "openrouter_api_key_missing"
+        );
+        assert_ne!(
+            retryable_error_code(JevBackend::Laya),
+            retryable_error_code(JevBackend::Openrouter)
+        );
+
+        // A laya-backed review row is not retryable under the OpenRouter
+        // identity, and vice versa.
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                1,
+                JevBackend::Openrouter.as_str(),
+                JevBackend::Openrouter.model(),
+                retryable_error_code(JevBackend::Openrouter),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.prepare_current_mail_engine_safe_retry(
+                "acct",
+                "INBOX",
+                1,
+                JevBackend::Laya.as_str(),
+                JevBackend::Laya.model(),
+                retryable_error_code(JevBackend::Laya),
+            )
+            .unwrap(),
+            Some(10)
+        );
+
+        let client = JevClient::laya().unwrap();
+        assert_eq!(client.backend(), JevBackend::Laya);
     }
 }

@@ -5,6 +5,7 @@ mod commands;
 mod mcp;
 
 use clap::{ArgGroup, Parser, Subcommand};
+use envelope_email_transport::jev::JevBackend;
 
 #[derive(Parser)]
 #[command(
@@ -1489,6 +1490,9 @@ enum EngineCmd {
         /// Attempt external delivery of persisted urgent events through configured routes
         #[arg(long)]
         deliver: bool,
+        /// Jev inference backend: openrouter (default) or laya (local pinned Laya-MLX provider)
+        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
+        jev_backend: JevBackend,
     },
     /// Run continuously, one non-overlapping pass every five minutes by default
     Run {
@@ -1507,6 +1511,9 @@ enum EngineCmd {
         /// Poll interval in seconds (minimum 60)
         #[arg(long, default_value = "300", value_parser = parse_engine_interval)]
         interval_seconds: u64,
+        /// Jev inference backend: openrouter (default) or laya (local pinned Laya-MLX provider)
+        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
+        jev_backend: JevBackend,
     },
     /// Show redacted engine watermarks and queue counts
     Status {
@@ -1514,6 +1521,10 @@ enum EngineCmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Probe the local Laya provider's readiness and pinned model identity
+    ///
+    /// Sends no message, sender, or history content.
+    LayaHealth,
     /// List current per-message decisions without fetching message content
     Decisions {
         /// Account ID or email (all configured accounts when omitted)
@@ -1559,12 +1570,15 @@ enum EngineCmd {
         /// IMAP folder
         #[arg(long, default_value = "INBOX")]
         folder: String,
-        /// Authorize a fresh Jev request only for a missing-key failure proven before dispatch
+        /// Authorize a fresh call for the selected backend's retryable failure state
         #[arg(long)]
         retry_jev: bool,
-        /// Confirm the possible additional paid request
+        /// Confirm the additional model call (paid when using OpenRouter)
         #[arg(long, requires = "retry_jev")]
         confirm_new_jev_call: bool,
+        /// Backend/model identity to retry; must match the stored failed attempt
+        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
+        jev_backend: JevBackend,
     },
     /// List privacy-minimized handles queued for news-digest compilation
     DigestQueue {
@@ -2000,6 +2014,10 @@ fn parse_engine_interval(value: &str) -> Result<u64, String> {
         return Err("--interval-seconds must be at least 60".into());
     }
     Ok(parsed)
+}
+
+fn parse_jev_backend(value: &str) -> Result<JevBackend, String> {
+    JevBackend::parse(value).ok_or_else(|| "--jev-backend must be openrouter or laya".into())
 }
 
 fn parse_engine_digest_limit(value: &str) -> Result<usize, String> {
@@ -3043,6 +3061,7 @@ fn main() {
                 folder,
                 apply,
                 deliver,
+                jev_backend,
             } => commands::engine::run_once(commands::engine::EngineOptions {
                 account: account.as_deref(),
                 folder: &folder,
@@ -3050,6 +3069,7 @@ fn main() {
                 deliver,
                 json: cli.json,
                 backend,
+                jev_backend,
             }),
             EngineCmd::Run {
                 account,
@@ -3057,6 +3077,7 @@ fn main() {
                 apply,
                 deliver,
                 interval_seconds,
+                jev_backend,
             } => commands::engine::run_loop(
                 commands::engine::EngineOptions {
                     account: account.as_deref(),
@@ -3065,12 +3086,14 @@ fn main() {
                     deliver,
                     json: cli.json,
                     backend,
+                    jev_backend,
                 },
                 interval_seconds,
             ),
             EngineCmd::Status { account } => {
                 commands::engine::run_status(account.as_deref(), cli.json)
             }
+            EngineCmd::LayaHealth => commands::engine::run_laya_health(cli.json),
             EngineCmd::Decisions {
                 account,
                 route,
@@ -3105,6 +3128,7 @@ fn main() {
                 folder,
                 retry_jev,
                 confirm_new_jev_call,
+                jev_backend,
             } => commands::engine::run_recover(
                 uid,
                 &account,
@@ -3113,6 +3137,7 @@ fn main() {
                 confirm_new_jev_call,
                 cli.json,
                 backend,
+                jev_backend,
             ),
             EngineCmd::DigestQueue { account, limit } => {
                 commands::engine::run_digest_queue(account.as_deref(), limit, cli.json)
@@ -3300,6 +3325,7 @@ mod tests {
                         deliver,
                         account,
                         folder,
+                        jev_backend,
                         ..
                     },
             } => {
@@ -3308,6 +3334,7 @@ mod tests {
                 assert!(!deliver);
                 assert!(account.is_none());
                 assert_eq!(folder, "INBOX");
+                assert_eq!(jev_backend, JevBackend::Openrouter);
             }
             _ => panic!("expected engine run"),
         }
@@ -3336,6 +3363,34 @@ mod tests {
                     deliver: true,
                     ..
                 }
+            }
+        ));
+        let laya = Cli::try_parse_from(["envelope", "engine", "once", "--jev-backend", "laya"])
+            .expect("the laya engine backend should parse");
+        assert!(matches!(
+            laya.command,
+            Commands::Engine {
+                subcommand: EngineCmd::Once {
+                    jev_backend: JevBackend::Laya,
+                    ..
+                }
+            }
+        ));
+        // Ambiguous or automatic selection never chooses a backend.
+        for rejected in ["automatic", "local", ""] {
+            assert!(
+                Cli::try_parse_from(["envelope", "engine", "once", "--jev-backend", rejected])
+                    .is_err(),
+                "--jev-backend {rejected} must be rejected"
+            );
+        }
+        let health = Cli::try_parse_from(["envelope", "engine", "laya-health", "--json"])
+            .expect("engine laya-health should parse");
+        assert!(health.json);
+        assert!(matches!(
+            health.command,
+            Commands::Engine {
+                subcommand: EngineCmd::LayaHealth
             }
         ));
         let status = Cli::try_parse_from(["envelope", "engine", "status", "--json"])
@@ -3429,7 +3484,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_recover_requires_account_and_explicit_paid_retry_confirmation() {
+    fn engine_recover_requires_account_and_explicit_model_retry_confirmation() {
         let recover = Cli::try_parse_from([
             "envelope",
             "engine",
@@ -3446,6 +3501,7 @@ mod tests {
                     uid: 42,
                     retry_jev: false,
                     confirm_new_jev_call: false,
+                    jev_backend: JevBackend::Openrouter,
                     ..
                 }
             }

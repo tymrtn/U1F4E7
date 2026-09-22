@@ -155,6 +155,8 @@ pub async fn decisions(
                 "folder": decision.folder,
                 "uidvalidity": decision.uidvalidity,
                 "uid": decision.uid,
+                "backend": decision.backend,
+                "model": decision.model,
                 "model_status": decision.model_status,
                 "status": decision.status,
                 "model_route": decision.route,

@@ -126,19 +126,32 @@ envelope snooze set 42 --until monday --reason waiting-reply
 envelope watch --json
 
 # Establish a new-mail-only Jev baseline, then run every 5 minutes.
-# Requires OPENROUTER_API_KEY. Each new message sends its sender/domain, subject,
-# up to 8 KiB of derived text, flags, and interaction statistics to OpenRouter.
+# OpenRouter remains the compatibility default and requires OPENROUTER_API_KEY.
+# It sends bounded sender/message/history state to the pinned Decisions endpoint.
 # Omit --account to cover every configured account; add --apply for confident junk moves.
 envelope engine once --account you@example.com --json
 envelope engine run --account you@example.com --interval-seconds 300 --json
+# Optional fully local mode. It needs the bundled Laya provider already running
+# with the pinned checkpoint pre-fetched and its runtime-file checksums verified
+# (see docs/jev-laya-provider.md):
+#   python3 scripts/laya_jev_provider.py setup
+#   python3 scripts/laya_jev_provider.py serve
+# It uses only http://127.0.0.1:8791/decide, disables environment/system
+# proxies, needs no API key, performs no message, sender, or history content
+# egress, and never falls back to OpenRouter. Envelope never downloads weights.
+envelope engine laya-health --json
+envelope engine once --account you@example.com --jev-backend laya --json
+envelope engine run --account you@example.com --jev-backend laya --interval-seconds 300 --json
 # Inspect every current decision and any actionable error without fetching message content.
 envelope engine decisions --account you@example.com --limit 50
 # Correct one decision locally. This preserves the Jev result and creates no rule.
 envelope engine correct 42 --account you@example.com --route important --urgency urgent --expected-revision 0
 # Abandoned claims become human-review items after 10 minutes. Release one immediately:
 envelope engine recover 42 --account you@example.com
-# A retry is allowed only when the stored failure proves no OpenRouter request was sent.
+# Fresh-call recovery must name the same stored backend/model identity. OpenRouter
+# retries only missing-key failures; laya retries only coarse laya_jev_failed failures.
 envelope engine recover 42 --account you@example.com --retry-jev --confirm-new-jev-call
+envelope engine recover 42 --account you@example.com --jev-backend laya --retry-jev --confirm-new-jev-call
 # List pending digest handles or compile a read-only From/Subject/Date rollup.
 envelope engine digest-queue --account you@example.com --limit 50 --json
 envelope engine digest --account you@example.com --limit 25
