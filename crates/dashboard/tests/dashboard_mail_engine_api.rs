@@ -27,6 +27,7 @@ fn seeded_state() -> AppState {
         uidvalidity: 10,
         uid: 41,
         input_hash: "private-input-hash",
+        backend: "openrouter",
         model: "typesafe/jev-1.13",
         status: "decided",
         route: "follow_up",
@@ -147,6 +148,8 @@ async fn correction_is_revision_guarded_and_preserves_the_model_result() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(decisions["items"][0]["model_status"], "decided");
+    assert_eq!(decisions["items"][0]["backend"], "openrouter");
+    assert_eq!(decisions["items"][0]["model"], "typesafe/jev-1.13");
     assert_eq!(decisions["items"][0]["status"], "decided");
     assert_eq!(decisions["items"][0]["model_route"], "follow_up");
     assert_eq!(decisions["items"][0]["route"], "important");
