@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Store:** the CLI and dashboard open a shared database the isolated V2 line has advanced to
+  schema version 22 (`calibration_verdicts` and its index, additive). The known-compatible
+  ceiling was 21, so a V1 build refused such a database with
+  `database schema version 22 is newer than this envelope build supports`. As with 17–21, the
+  database is opened exactly as found: no migrations run, no `user_version` write, no V2 table
+  touched. Versions past 22 still fail closed naming the found and max supported versions.
+
 ## [1.2.7] — 2026-09-22
 
 ### Fixed
