@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.5] — 2026-09-22
+
+### Fixed
+
+- **Dashboard (draft composer):** the `Edit HTML source` / `Rich text` toggle is a real button.
+  It shipped in 1.2.3 painted ink-on-surface with no padding or border, so it read as a
+  highlighted word rather than a control. It now matches the Text/HTML segment beside it:
+  bordered and neutral at rest, inverted only while pressed, dimmed when disabled.
+
 ## [1.2.4] — 2026-09-19
 
 ### Added
