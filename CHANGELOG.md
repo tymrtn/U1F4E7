@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.8] — 2026-09-22
+
 ### Fixed
 
 - **Store:** the CLI and dashboard open a shared database the isolated V2 line has advanced to
