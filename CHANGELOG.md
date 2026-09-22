@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.7] — 2026-09-22
+
+### Fixed
+
+- **Store:** the CLI and dashboard open a shared database the isolated V2 line has advanced to
+  schema version 21 (one nullable column, `agent_policies.allowed_addresses`, for agent address
+  scope). The known-compatible ceiling was 20, so a V1 build refused such a database with
+  `database schema version 21 is newer than this envelope build supports` and neither the CLI
+  nor the managed dashboard could start. As with 17–20, the database is opened exactly as
+  found: no migrations run, no `user_version` write, no V2 table or column touched (V1 reads
+  `agent_policies` columns by name). Versions past 21 still fail closed naming the found and max
+  supported versions.
+
 ## [1.2.6] — 2026-09-22
 
 ### Fixed
