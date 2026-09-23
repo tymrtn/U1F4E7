@@ -33,6 +33,9 @@ jobs:
       - name: Check orphaned modules
         run: ./ci/check-orphans.sh
 
+      - name: Check Cursor plugin packaging
+        run: ./ci/check-cursor-plugin.sh
+
       - name: Clippy (errors only)
         # Warnings are still reported but do not fail the build for v0.3.0.
         # Tighten to -D warnings in v0.4 after cleanup pass.

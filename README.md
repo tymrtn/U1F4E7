@@ -11,6 +11,8 @@
   <a href="#travel">Travel</a> •
   <a href="#cli-reference">CLI</a> •
   <a href="#rules-engine">Rules</a> •
+  <a href="#mcp-server">MCP</a> •
+  <a href="#cursor-marketplace-plugin">Cursor plugin</a> •
   <a href="#why-not-himalaya--cloudflare--resend">vs. Alternatives</a> •
   <a href="#dashboard">Dashboard</a> •
   <a href="#commercial-licensing">Commercial licensing</a> •
@@ -38,7 +40,8 @@ envelope inbox --json
 
 ```bash
 # Homebrew (macOS) — installs the binary named `envelope`
-brew install tymrtn/u1f4e7/u1f4e7
+brew install tymrtn/u1f4e7/envelope
+# Compat alias once the tap PR lands: brew install tymrtn/u1f4e7/u1f4e7
 
 # From source (Linux or macOS)
 # 1. Install Rust if not already present:
@@ -260,11 +263,50 @@ envelope mcp --config
 # }
 ```
 
-22 tools: `inbox`, `read`, `search`, `send`, `reply`, `create_reply_draft`, `create_forward_draft`, `modify_draft`, `get_draft`, `send_draft`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`, `bulk`, `thread`, `rules_preview`, `rules_run`, `watch_status`, `snooze`. Envelope is the only MCP email server that works against any IMAP provider.
+Tools include `inbox`, `read`, `search`, `send`, `reply`, `create_reply_draft`, `create_forward_draft`, `modify_draft`, `get_draft`, `send_draft`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `accounts`, `bulk`, `thread`, `rules_preview`, `rules_run`, `watch_status`, `snooze`, plus `threat_show` and `governor_catalog`. Envelope is the only MCP email server that works against any IMAP provider.
 
 For a single, distribution-ready operating guide to hand a fresh agent, see [the Envelope agent skill](docs/agents/envelope-skill.md).
 
 For a walkthrough of running multiple agents from one shared inbox with scoped policies, see [Agents at a glance](docs/agent-fleet-shared-inbox.md).
+
+## Cursor Marketplace plugin
+
+This repo ships a Cursor Plugin that wraps the local stdio MCP server and a
+focused agent skill. The listing pitch is **BYO mailbox / any IMAP** — your
+provider and domain, not a hosted agent inbox. Copy lives in
+[MARKETPLACE.md](MARKETPLACE.md) (category: **Inbox and Collaboration**).
+
+**Prerequisite:** the `envelope` binary must be on `PATH` before Cursor starts
+the MCP server. Homebrew installs that binary:
+
+```bash
+brew install tymrtn/u1f4e7/envelope
+which envelope
+```
+
+`tymrtn/u1f4e7/u1f4e7` remains a compat alias once the tap PR lands.
+
+MCP startup requires an agent token. Create one, then paste it into the plugin
+variable `ENVELOPE_AGENT_TOKEN` (Customize → Plugins → Configure). Never commit
+the token.
+
+```bash
+envelope accounts add --email you@example.com
+envelope agent create cursor
+```
+
+The plugin layout:
+
+| Path | Role |
+|---|---|
+| `.cursor-plugin/plugin.json` | Manifest (`name`: `envelope`) |
+| `mcp.json` | stdio server: `envelope` `["mcp"]` |
+| `skills/envelope/SKILL.md` | When to use, MCP tools, quickstart |
+| `assets/logo.svg` | Marketplace logo |
+
+After the plugin is on `main`, a human submits the public repo URL at
+[cursor.com/marketplace/publish](https://cursor.com/marketplace/publish).
+Publishing is not automatic.
 
 ## Rules engine
 
