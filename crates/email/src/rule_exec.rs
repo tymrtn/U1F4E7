@@ -249,24 +249,41 @@ pub struct SkippedRule {
     pub reason: String,
 }
 
-/// Parse rules and apply the compatibility gate. Invalid JSON and
-/// unacknowledged snooze/unsubscribe rules are reported, never run.
-pub fn load_rules(rules: Vec<Rule>) -> (Vec<LoadedRule>, Vec<SkippedRule>) {
-    let mut loaded = Vec::new();
+fn skip(rule: &Rule, reason: String) -> SkippedRule {
+    SkippedRule {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        reason,
+    }
+}
+
+/// Split stored rules into those whose match can be evaluated and those that
+/// must be reported instead: an unparseable match, or one with an empty
+/// condition list. Previews and `rule test` use this directly;
+/// [`load_rules`] applies it before the action gate.
+pub fn split_evaluable_rules(rules: Vec<Rule>) -> (Vec<(Rule, MatchExpr)>, Vec<SkippedRule>) {
+    let mut evaluable = Vec::new();
     let mut skipped = Vec::new();
     for rule in rules {
-        let skip = |rule: &Rule, reason: String| SkippedRule {
-            rule_id: rule.id.clone(),
-            rule_name: rule.name.clone(),
-            reason,
-        };
-        let match_expr: MatchExpr = match serde_json::from_str(&rule.match_expr) {
-            Ok(expr) => expr,
-            Err(e) => {
-                skipped.push(skip(&rule, format!("invalid match_expr: {e}")));
-                continue;
-            }
-        };
+        match serde_json::from_str::<MatchExpr>(&rule.match_expr) {
+            Ok(expr) if expr.has_empty_condition_list() => skipped.push(skip(
+                &rule,
+                rules::EMPTY_CONDITION_LIST_SKIP_REASON.to_string(),
+            )),
+            Ok(expr) => evaluable.push((rule, expr)),
+            Err(e) => skipped.push(skip(&rule, format!("invalid match_expr: {e}"))),
+        }
+    }
+    (evaluable, skipped)
+}
+
+/// Parse rules and apply the compatibility gate. Invalid JSON, matches with
+/// an empty condition list, and unacknowledged snooze/unsubscribe rules are
+/// reported, never run.
+pub fn load_rules(rules: Vec<Rule>) -> (Vec<LoadedRule>, Vec<SkippedRule>) {
+    let (evaluable, mut skipped) = split_evaluable_rules(rules);
+    let mut loaded = Vec::new();
+    for (rule, match_expr) in evaluable {
         let stored = match StoredRuleAction::parse(&rule.action) {
             Ok(stored) => stored,
             Err(e) => {
@@ -1416,6 +1433,93 @@ mod tests {
             rules::BATCH_ACTIONS_UNACKNOWLEDGED_REASON
         );
         assert!(mbox.calls.is_empty());
+    }
+
+    #[test]
+    fn split_evaluable_rules_reports_empty_and_unparseable_matches() {
+        let db = Database::open_memory().unwrap();
+        for (priority, (name, match_expr)) in [
+            ("normal", r#"{"from":"*@airline.example"}"#),
+            ("empty-and", r#"{"and":[]}"#),
+            ("nested-or", r#"{"or":[{"from":"*@x.example"},{"or":[]}]}"#),
+            ("not-empty-or", r#"{"not":{"or":[]}}"#),
+            ("broken", "not json"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_rule(
+                ACCT,
+                name,
+                match_expr,
+                r#""delete""#,
+                priority as i64,
+                false,
+            )
+            .unwrap();
+        }
+
+        let (evaluable, skipped) = split_evaluable_rules(db.list_rules(ACCT).unwrap());
+
+        assert_eq!(evaluable.len(), 1, "{evaluable:?}");
+        assert_eq!(evaluable[0].0.name, "normal");
+        assert_eq!(
+            evaluable[0].1,
+            MatchExpr::From("*@airline.example".to_string())
+        );
+        let skipped: Vec<(&str, &str)> = skipped
+            .iter()
+            .map(|s| (s.rule_name.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            skipped[..3],
+            [
+                ("empty-and", rules::EMPTY_CONDITION_LIST_SKIP_REASON),
+                ("nested-or", rules::EMPTY_CONDITION_LIST_SKIP_REASON),
+                ("not-empty-or", rules::EMPTY_CONDITION_LIST_SKIP_REASON),
+            ]
+        );
+        assert_eq!(skipped.len(), 4, "{skipped:?}");
+        assert_eq!(skipped[3].0, "broken");
+        assert!(
+            skipped[3].1.starts_with("invalid match_expr: "),
+            "{skipped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_rule_with_empty_condition_list_is_skipped_never_applied() {
+        let db = Database::open_memory().unwrap();
+        for (name, match_expr) in [
+            ("oops", r#"{"and":[]}"#),
+            ("nested", r#"{"not":{"or":[]}}"#),
+        ] {
+            db.create_rule(ACCT, name, match_expr, r#""delete""#, 100, false)
+                .unwrap();
+        }
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[summary(5, "any@elsewhere.example", "x@elsewhere.example")],
+        )
+        .await;
+
+        assert_eq!(report.actions, 0, "{report:?}");
+        assert!(report.log.is_empty(), "{report:?}");
+        assert!(mbox.calls.is_empty(), "no message may be deleted");
+        assert!(action_rows(&db).is_empty());
+        let reasons: Vec<&str> = report
+            .skipped_rules
+            .iter()
+            .map(|s| s.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![rules::EMPTY_CONDITION_LIST_SKIP_REASON; 2],
+            "{report:?}"
+        );
     }
 
     fn confirm_rule(db: &Database) -> Rule {

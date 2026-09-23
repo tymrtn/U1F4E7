@@ -166,10 +166,6 @@ pub fn run_create(
     json: bool,
     _backend: CredentialBackend,
 ) -> Result<()> {
-    let db = envelope_email_store::Database::open_default().context("failed to open database")?;
-    let acct = super::common::resolve_account(&db, account)?;
-    let account_id = &acct.id;
-
     // Parse score filters
     let score_above: Vec<(String, f64)> = match_score_above
         .iter()
@@ -181,7 +177,7 @@ pub fn run_create(
         .collect::<Result<Vec<_>>>()?;
 
     // Build the match expression from CLI flags
-    let match_expr = rules::build_match_expr(
+    let Some(match_expr) = rules::build_match_expr(
         match_from,
         match_to,
         match_subject,
@@ -189,7 +185,16 @@ pub fn run_create(
         &score_above,
         &score_below,
         match_contact_tags,
-    );
+    ) else {
+        bail!(
+            "a rule needs at least one match condition (--match-from, --match-to, --match-subject, --match-tag, --match-score-above, --match-score-below, --match-contact-tag)"
+        );
+    };
+
+    let db = envelope_email_store::Database::open_default().context("failed to open database")?;
+    let acct = super::common::resolve_account(&db, account)?;
+    let account_id = &acct.id;
+
     let match_expr_json =
         serde_json::to_string(&match_expr).context("failed to serialize match expression")?;
 
@@ -340,13 +345,13 @@ pub async fn run_test(
         .list_enabled_rules(&account_id)
         .context("failed to list enabled rules")?;
 
+    let rules_evaluated = enabled_rules.len();
+    let (evaluable, skipped_rules) = rule_exec::split_evaluable_rules(enabled_rules);
+
     let mut matches: Vec<serde_json::Value> = Vec::new();
 
-    for rule in &enabled_rules {
-        let match_expr: rules::MatchExpr = serde_json::from_str(&rule.match_expr)
-            .with_context(|| format!("invalid match_expr in rule '{}'", rule.name))?;
-
-        let matched = rules::evaluate(&match_expr, &ctx);
+    for (rule, match_expr) in &evaluable {
+        let matched = rules::evaluate(match_expr, &ctx);
         if matched {
             matches.push(serde_json::json!({
                 "rule_id": rule.id,
@@ -373,8 +378,9 @@ pub async fn run_test(
                 "from": msg.from_addr,
                 "tags": ctx.tags,
                 "scores": ctx.scores,
-                "rules_evaluated": enabled_rules.len(),
+                "rules_evaluated": rules_evaluated,
                 "matches": matches,
+                "skipped_rules": skipped_rules,
                 "ui": ui::message_ui(&account_id, uid, folder),
             })))?
         );
@@ -405,7 +411,7 @@ pub async fn run_test(
         println!();
 
         if matches.is_empty() {
-            println!("No rules matched ({} evaluated)", enabled_rules.len());
+            println!("No rules matched ({rules_evaluated} evaluated)");
         } else {
             println!("{} rule(s) matched:", matches.len());
             for m in &matches {
@@ -416,15 +422,19 @@ pub async fn run_test(
                 println!("  - {name} -> {action}{stop_marker}");
             }
         }
+        for skipped in &skipped_rules {
+            eprintln!("skipped rule '{}': {}", skipped.rule_name, skipped.reason);
+        }
     }
 
     Ok(())
 }
 
 /// Reusable rule-preview core: resolve rules against fetched summaries and
-/// return the structured `{mode, folder, processed, matches, mutated}` Value
-/// with no mailbox mutation. Shared by the CLI `run_preview` wrapper and the
-/// MCP `rules_preview` tool so both advertise identical semantics.
+/// return the structured `{mode, folder, processed, matches, skipped_rules,
+/// mutated}` Value with no mailbox mutation. Shared by the CLI `run_preview`
+/// wrapper and the MCP `rules_preview` tool so both advertise identical
+/// semantics.
 pub async fn preview_core(
     client: &mut imap::ImapClient,
     db: &envelope_email_store::Database,
@@ -435,18 +445,16 @@ pub async fn preview_core(
     let summaries = imap::fetch_inbox(client, folder, limit)
         .await
         .context("failed to fetch messages")?;
-    let preview_rules = db.list_rules(account_id).context("failed to list rules")?;
+    let (preview_rules, skipped_rules) = rule_exec::split_evaluable_rules(
+        db.list_rules(account_id).context("failed to list rules")?,
+    );
 
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();
     for summary in &summaries {
         let ctx = rule_exec::build_summary_context(summary, db, account_id)?;
-        for rule in &preview_rules {
-            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !rules::evaluate(&match_expr, &ctx) {
+        for (rule, match_expr) in &preview_rules {
+            if !rules::evaluate(match_expr, &ctx) {
                 continue;
             }
             matches.push(serde_json::json!({
@@ -469,6 +477,7 @@ pub async fn preview_core(
         "folder": folder,
         "processed": total,
         "matches": matches,
+        "skipped_rules": skipped_rules,
         "mutated": false,
         "ui": ui::rules_ui(account_id),
     }))
@@ -573,6 +582,15 @@ pub async fn run_preview(
                 m["uid"],
                 m["rule"].as_str().unwrap_or("?"),
                 m["action"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if !json {
+        for skipped in result["skipped_rules"].as_array().into_iter().flatten() {
+            eprintln!(
+                "skipped rule '{}': {}",
+                skipped["rule_name"].as_str().unwrap_or("?"),
+                skipped["reason"].as_str().unwrap_or("?")
             );
         }
     }

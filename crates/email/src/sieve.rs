@@ -290,6 +290,23 @@ mod tests {
     }
 
     #[test]
+    fn export_skips_matches_with_an_empty_condition_list() {
+        let rules = vec![
+            make_rule("empty-and", r#"{"and":[]}"#, r#""delete""#, true),
+            make_rule("not-empty-or", r#"{"not":{"or":[]}}"#, r#""delete""#, true),
+            make_rule(
+                "nested-or",
+                r#"{"or":[{"from":"*@x.example"},{"or":[]}]}"#,
+                r#""delete""#,
+                true,
+            ),
+        ];
+        let (script, skipped) = export_sieve(&rules);
+        assert_eq!(skipped, vec!["empty-and", "not-empty-or", "nested-or"]);
+        assert!(!script.contains("discard"), "{script}");
+    }
+
+    #[test]
     fn export_from_exact_uses_is_comparator() {
         let rules = vec![make_rule(
             "Block wildcard local-part",
