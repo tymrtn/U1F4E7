@@ -49,6 +49,27 @@ pub enum MatchExpr {
     Not(Box<MatchExpr>),
 }
 
+impl MatchExpr {
+    /// True when any `and`/`or` in the tree has no children. `and []` is
+    /// vacuously true and `not (or [])` is too, so such a rule can match
+    /// every message; it is refused on save and skipped when rules run.
+    pub fn has_empty_condition_list(&self) -> bool {
+        match self {
+            MatchExpr::And(exprs) | MatchExpr::Or(exprs) => {
+                exprs.is_empty() || exprs.iter().any(MatchExpr::has_empty_condition_list)
+            }
+            MatchExpr::Not(inner) => inner.has_empty_condition_list(),
+            _ => false,
+        }
+    }
+}
+
+/// Stable skip reason for a stored rule whose match has an empty condition
+/// list. Surfaced in `skipped_rules` and previews, so the wording is part of
+/// the contract.
+pub const EMPTY_CONDITION_LIST_SKIP_REASON: &str =
+    "rule has an empty condition list and could match every message; edit it to add a condition";
+
 /// An action to execute when a rule matches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -494,7 +515,8 @@ fn glob_match_inner(pattern: &[u8], text: &[u8]) -> bool {
 /// `--match-score-above`, `--match-score-below` flags and calls this
 /// to produce the JSON-serializable expression.
 ///
-/// Multiple conditions are AND'd together.
+/// Multiple conditions are AND'd together. Returns `None` when no condition
+/// was given.
 pub fn build_match_expr(
     from: Option<&str>,
     to: Option<&str>,
@@ -503,7 +525,7 @@ pub fn build_match_expr(
     score_above: &[(String, f64)],
     score_below: &[(String, f64)],
     contact_tags: &[String],
-) -> MatchExpr {
+) -> Option<MatchExpr> {
     let mut conditions: Vec<MatchExpr> = Vec::new();
 
     if let Some(f) = from {
@@ -535,9 +557,9 @@ pub fn build_match_expr(
     }
 
     match conditions.len() {
-        0 => MatchExpr::And(vec![]), // matches nothing
-        1 => conditions.remove(0),
-        _ => MatchExpr::And(conditions),
+        0 => None,
+        1 => Some(conditions.remove(0)),
+        _ => Some(MatchExpr::And(conditions)),
     }
 }
 
@@ -703,6 +725,37 @@ mod tests {
         let expr = MatchExpr::Not(Box::new(MatchExpr::HasTag("important".to_string())));
         assert!(evaluate(&expr, &ctx_with_tags("", &[], &[])));
         assert!(!evaluate(&expr, &ctx_with_tags("", &["important"], &[])));
+    }
+
+    // ── Empty condition lists ───────────────────────────────────────
+
+    #[test]
+    fn empty_condition_list_is_detected_anywhere_in_the_tree() {
+        let from = || MatchExpr::From("*@x.example".to_string());
+        for expr in [
+            MatchExpr::And(vec![]),
+            MatchExpr::Or(vec![]),
+            MatchExpr::Or(vec![from(), MatchExpr::And(vec![])]),
+            MatchExpr::Not(Box::new(MatchExpr::Or(vec![]))),
+        ] {
+            assert!(expr.has_empty_condition_list(), "{expr:?}");
+        }
+    }
+
+    #[test]
+    fn non_empty_expressions_have_no_empty_condition_list() {
+        for expr in [
+            MatchExpr::From("*@x.example".to_string()),
+            MatchExpr::And(vec![MatchExpr::HasTag("a".to_string())]),
+            MatchExpr::Or(vec![
+                MatchExpr::Subject("*invoice*".to_string()),
+                MatchExpr::Not(Box::new(MatchExpr::And(vec![MatchExpr::To(
+                    "me@x.example".to_string(),
+                )]))),
+            ]),
+        ] {
+            assert!(!expr.has_empty_condition_list(), "{expr:?}");
+        }
     }
 
     // ── JSON serialization round-trip ───────────────────────────────
@@ -904,7 +957,7 @@ mod tests {
             &[],
         );
         // Should be And([From, HasTag, ScoreAbove])
-        if let MatchExpr::And(conditions) = &expr {
+        if let Some(MatchExpr::And(conditions)) = &expr {
             assert_eq!(conditions.len(), 3);
         } else {
             panic!("expected And, got {expr:?}");
@@ -914,7 +967,12 @@ mod tests {
     #[test]
     fn build_single_condition_unwraps() {
         let expr = build_match_expr(Some("*@github.com"), None, None, &[], &[], &[], &[]);
-        assert!(matches!(expr, MatchExpr::From(_)));
+        assert!(matches!(expr, Some(MatchExpr::From(_))));
+    }
+
+    #[test]
+    fn build_with_no_conditions_is_none() {
+        assert_eq!(build_match_expr(None, None, None, &[], &[], &[], &[]), None);
     }
 
     // ── Confirm offers ──────────────────────────────────────────────

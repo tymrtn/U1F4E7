@@ -249,8 +249,9 @@ pub struct SkippedRule {
     pub reason: String,
 }
 
-/// Parse rules and apply the compatibility gate. Invalid JSON and
-/// unacknowledged snooze/unsubscribe rules are reported, never run.
+/// Parse rules and apply the compatibility gate. Invalid JSON, matches with
+/// an empty condition list, and unacknowledged snooze/unsubscribe rules are
+/// reported, never run.
 pub fn load_rules(rules: Vec<Rule>) -> (Vec<LoadedRule>, Vec<SkippedRule>) {
     let mut loaded = Vec::new();
     let mut skipped = Vec::new();
@@ -267,6 +268,13 @@ pub fn load_rules(rules: Vec<Rule>) -> (Vec<LoadedRule>, Vec<SkippedRule>) {
                 continue;
             }
         };
+        if match_expr.has_empty_condition_list() {
+            skipped.push(skip(
+                &rule,
+                rules::EMPTY_CONDITION_LIST_SKIP_REASON.to_string(),
+            ));
+            continue;
+        }
         let stored = match StoredRuleAction::parse(&rule.action) {
             Ok(stored) => stored,
             Err(e) => {
@@ -1416,6 +1424,41 @@ mod tests {
             rules::BATCH_ACTIONS_UNACKNOWLEDGED_REASON
         );
         assert!(mbox.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stored_rule_with_empty_condition_list_is_skipped_never_applied() {
+        let db = Database::open_memory().unwrap();
+        for (name, match_expr) in [
+            ("oops", r#"{"and":[]}"#),
+            ("nested", r#"{"not":{"or":[]}}"#),
+        ] {
+            db.create_rule(ACCT, name, match_expr, r#""delete""#, 100, false)
+                .unwrap();
+        }
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[summary(5, "any@elsewhere.example", "x@elsewhere.example")],
+        )
+        .await;
+
+        assert_eq!(report.actions, 0, "{report:?}");
+        assert!(report.log.is_empty(), "{report:?}");
+        assert!(mbox.calls.is_empty(), "no message may be deleted");
+        assert!(action_rows(&db).is_empty());
+        let reasons: Vec<&str> = report
+            .skipped_rules
+            .iter()
+            .map(|s| s.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![rules::EMPTY_CONDITION_LIST_SKIP_REASON; 2],
+            "{report:?}"
+        );
     }
 
     fn confirm_rule(db: &Database) -> Rule {

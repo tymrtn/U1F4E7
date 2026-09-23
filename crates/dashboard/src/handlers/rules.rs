@@ -128,6 +128,16 @@ pub async fn test_message(
                 continue;
             }
         };
+        if expr.has_empty_condition_list() {
+            matches.push(json!({
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "priority": rule.priority,
+                "status": "skipped",
+                "reason": rules::EMPTY_CONDITION_LIST_SKIP_REASON,
+            }));
+            continue;
+        }
 
         if rules::evaluate(&expr, &ctx) {
             matches.push(json!({
@@ -200,6 +210,13 @@ pub async fn preview(
                 .into_response();
         }
     };
+    if match_expr.has_empty_condition_list() {
+        return (
+            StatusCode::BAD_REQUEST,
+            rules::EMPTY_CONDITION_LIST_SKIP_REASON,
+        )
+            .into_response();
+    }
 
     let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
         Ok(c) => c,
@@ -565,11 +582,19 @@ fn validate_write_request(
             format!("invalid match_expr JSON: {e}"),
         )
     })?;
-    if let Err(e) = serde_json::from_str::<MatchExpr>(&match_expr_json) {
-        return Err(WriteError::new(
+    let match_expr = serde_json::from_str::<MatchExpr>(&match_expr_json).map_err(|e| {
+        WriteError::new(
             StatusCode::BAD_REQUEST,
             "invalid_match_expr",
             format!("invalid match expression: {e}"),
+        )
+    })?;
+    if match_expr.has_empty_condition_list() {
+        return Err(WriteError::new(
+            StatusCode::BAD_REQUEST,
+            "empty_match_condition",
+            "match_expr has an empty condition list (an \"and\" or \"or\" with no conditions), \
+             which can match every message; add at least one condition",
         ));
     }
 
@@ -947,6 +972,60 @@ mod tests {
         let result = validate(&req);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rule_write_request_rejects_empty_condition_lists() {
+        for match_expr in [
+            serde_json::json!({ "and": [] }),
+            serde_json::json!({ "or": [{ "from": "*@x" }, { "and": [] }] }),
+        ] {
+            let req = RuleWriteRequest {
+                name: "oops".to_string(),
+                match_expr: match_expr.clone(),
+                action: serde_json::json!("delete"),
+                priority: 100,
+                stop: false,
+                enabled: true,
+            };
+            let err = validate(&req).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{match_expr}");
+            assert_eq!(err.code, "empty_match_condition", "{match_expr}");
+            assert!(err.message.contains("empty condition list"), "{match_expr}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_reports_the_skip_for_a_stored_empty_condition_rule() {
+        use axum::extract::{Json, Path, State};
+        use axum::response::IntoResponse;
+        use envelope_email_store::{CredentialBackend, Database};
+
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule("acct", "oops", r#"{"and":[]}"#, r#""delete""#, 100, false)
+            .unwrap();
+        let state = crate::state::AppState::new(db, CredentialBackend::File);
+
+        let response = super::preview(
+            State(state),
+            Path(("acct".to_string(), rule.id)),
+            Json(super::RulePreviewRequest {
+                folder: "INBOX".to_string(),
+                limit: 50,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            super::rules::EMPTY_CONDITION_LIST_SKIP_REASON
+        );
     }
 
     #[test]
