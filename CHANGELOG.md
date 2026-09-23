@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules with an unparseable match in `skipped_rules` too. `rule test` used to abort on one, and the
   dashboard test endpoint used to put it in `matches` with `status: "error"`.
 
+## [1.3.1] — 2026-09-23
+
+### Fixed
+
+- **Store:** the CLI and dashboard open a shared database the isolated V2 line has advanced to
+  schema version 23 (the Cairn install tables `cairn_link`, `cairn_streams`,
+  `cairn_account_settings`, `cairn_tokens`, `action_tokens`, `rewrite_journal` and their
+  indexes, additive). The known-compatible ceiling was 22, so a V1 build refused such a
+  database with `database schema version 23 is newer than this envelope build supports`. As
+  with 17–22, the database is opened exactly as found: no migrations run, no `user_version`
+  write, no V2 table touched. Versions past 23 still fail closed naming the found and max
+  supported versions.
+
 ## [1.3.0] — 2026-09-23
 
 ### rShield

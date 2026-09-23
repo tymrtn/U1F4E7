@@ -15,18 +15,20 @@ use rusqlite_migration::{M, Migrations};
 /// How many migrations past the end of [`migration_list`] this build can open
 /// without understanding them.
 ///
-/// The isolated V2/CRM line extends the V1 sequence with six migrations
+/// The isolated V2/CRM line extends the V1 sequence with seven migrations
 /// verified additive-only: 17 creates `send_receipts` and its indexes, 18 the
 /// relationship/CRM tables (`persons`, `person_emails`, interactions,
 /// per-person thread states), 19 `graph_ledger_state`, 20 `link_redirects`
 /// and its unique index, 21 the nullable
 /// `agent_policies.allowed_addresses` column, 22 `calibration_verdicts` and
-/// its index. None alter or remove anything V1 reads or writes (V1 selects
-/// `agent_policies` columns by name), so a database at schema versions
-/// 17–22 is opened as-is — no migrations run,
+/// its index, 23 the Cairn install tables (`cairn_link`, `cairn_streams`,
+/// `cairn_account_settings`, `cairn_tokens`, `action_tokens`,
+/// `rewrite_journal`) and their indexes. None alter or remove anything V1
+/// reads or writes (V1 selects `agent_policies` columns by name), so a
+/// database at schema versions 17–23 is opened as-is — no migrations run,
 /// no `user_version` write, nothing deleted. Any version beyond that is
 /// unknown and fails closed.
-const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 6;
+const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 7;
 
 /// Run all pending migrations on the given connection.
 ///
@@ -968,9 +970,9 @@ fn migration_list() -> Vec<M<'static>> {
     ]
 }
 
-/// Fixtures mirroring the isolated V2 line's additive migrations 17–22
+/// Fixtures mirroring the isolated V2 line's additive migrations 17–23
 /// (send receipts, relationship/CRM tables, graph ledger state, reader link
-/// redirects, agent address scope). The exact column shapes are irrelevant
+/// redirects, agent address scope, calibration verdicts, Cairn install). The exact column shapes are irrelevant
 /// to V1, which never reads these tables or the added column; the fixtures
 /// exist to prove V1 opens alongside them without touching them.
 #[cfg(test)]
@@ -978,8 +980,8 @@ pub(crate) mod v2_fixture {
     use rusqlite::Connection;
 
     /// The schema version the live V2 runtime has advanced the shared
-    /// database to (V1's 16 migrations plus V2 migrations 17–22).
-    pub(crate) const V2_SCHEMA_VERSION: i64 = 22;
+    /// database to (V1's 16 migrations plus V2 migrations 17–23).
+    pub(crate) const V2_SCHEMA_VERSION: i64 = 23;
 
     pub(crate) fn apply(conn: &Connection) {
         conn.execute_batch(&format!(
@@ -1047,6 +1049,72 @@ pub(crate) mod v2_fixture {
             );
             CREATE INDEX idx_calibration_verdicts_message
                 ON calibration_verdicts(message_id);
+            CREATE TABLE cairn_link (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_url TEXT NOT NULL,
+                install_id TEXT NOT NULL,
+                api_key_enc TEXT NOT NULL,
+                cursor INTEGER NOT NULL DEFAULT 0,
+                protocol TEXT NOT NULL DEFAULT 'v1',
+                last_sync_at TEXT,
+                last_error TEXT,
+                local_rewrite_secret_enc TEXT NOT NULL,
+                paired_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE cairn_streams (
+                account_id TEXT PRIMARY KEY,
+                stream_id TEXT NOT NULL UNIQUE,
+                kid INTEGER NOT NULL,
+                signing_key_enc TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE cairn_account_settings (
+                account_id TEXT PRIMARY KEY,
+                rewrite_inbound INTEGER NOT NULL DEFAULT 0,
+                track_sent INTEGER NOT NULL DEFAULT 0,
+                inject_actions INTEGER NOT NULL DEFAULT 0,
+                originals_folder TEXT NOT NULL DEFAULT 'Envelope/Originals',
+                poll_interval_secs INTEGER NOT NULL DEFAULT 300
+                    CHECK (poll_interval_secs >= 30),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE cairn_tokens (
+                token_hash TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('open','click','action')),
+                direction TEXT NOT NULL CHECK (direction IN ('inbound','sent')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_cairn_tokens_message
+                ON cairn_tokens(account_id, message_id);
+            CREATE TABLE action_tokens (
+                token_hash TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                rule_id TEXT,
+                prompt TEXT NOT NULL,
+                label TEXT NOT NULL,
+                action_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'offered',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                resolved_at TEXT
+            );
+            CREATE INDEX idx_action_tokens_message
+                ON action_tokens(account_id, message_id);
+            CREATE TABLE rewrite_journal (
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                state TEXT NOT NULL,
+                original_uid INTEGER,
+                rewritten_uid INTEGER,
+                original_sha256 TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, message_id)
+            );
 
             INSERT INTO send_receipts (id, account_id) VALUES ('sr-1', 'acc');
             INSERT INTO persons (id, display_name) VALUES ('p-1', 'Ada');
@@ -1069,9 +1137,9 @@ mod tests {
     }
 
     /// Pins the forward-compatibility boundary: V1's sequence produces schema
-    /// version 16, and the known additive V2 level is 22. If this fails
+    /// version 16, and the known additive V2 level is 23. If this fails
     /// because a V1 migration was added, its version number collides with the
-    /// V2 line's 17–22 — reconcile with the V2 track before shipping.
+    /// V2 line's 17–23 — reconcile with the V2 track before shipping.
     #[test]
     fn forward_schema_boundary_is_pinned_to_the_v2_line() {
         assert_eq!(migration_list().len(), 16);
