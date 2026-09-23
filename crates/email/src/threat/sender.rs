@@ -90,7 +90,12 @@ mod tests {
     fn lookalike_of_the_mailbox_own_domain_is_flagged_without_ledger_rows() {
         // Account is me@example.org (see test_support).
         let input = input_from(&["From: IT Desk <it@examp1e.org>"], "x");
-        assert_eq!(codes(&analyze(&input)), vec!["lookalike_domain"]);
+        let signals = analyze(&input);
+        assert_eq!(codes(&signals), vec!["lookalike_domain"]);
+        assert_eq!(
+            signals[0].evidence,
+            "sender domain examp1e.org imitates example.org"
+        );
     }
 
     #[test]

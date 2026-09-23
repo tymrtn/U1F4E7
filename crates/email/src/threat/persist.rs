@@ -782,6 +782,13 @@ mod tests {
             scan_raw(&db, ACCT, EMAIL, &phish("p1@x"), &ThreatConfig::default());
         assert_eq!(verdict.level, Level::Dangerous);
         assert!(verdict.is_malware());
+        assert!(
+            super::super::explain(&verdict)
+                .iter()
+                .any(|l| l.contains("sender domain examp1e.org imitates example.org")),
+            "{:?}",
+            super::super::explain(&verdict)
+        );
         record_verdict(
             &db,
             &VerdictTarget {

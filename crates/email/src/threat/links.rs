@@ -280,6 +280,13 @@ mod tests {
             codes(&signals),
             vec!["lookalike_link", "script_link", "ip_link", "punycode_link"]
         );
+        assert!(
+            signals[0]
+                .evidence
+                .contains("paypa1.com imitates paypal.com"),
+            "{}",
+            signals[0].evidence
+        );
     }
 
     #[test]
