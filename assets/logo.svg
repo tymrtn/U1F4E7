@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Envelope">
+  <rect width="256" height="256" rx="48" fill="#f7f6f3"/>
+  <rect x="48" y="72" width="160" height="112" rx="10" fill="none" stroke="#0a0a0a" stroke-width="14"/>
+  <path d="M56 80L128 144L200 80" fill="none" stroke="#1a6b4a" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

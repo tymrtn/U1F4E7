@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cursor plugin
+
+- **Marketplace packaging:** repo-root Cursor Plugin (`.cursor-plugin/plugin.json`,
+  `mcp.json`, `skills/envelope/SKILL.md`, `assets/logo.svg`) so Envelope's existing
+  stdio MCP server can be submitted at cursor.com/marketplace/publish. Listing
+  copy is in `MARKETPLACE.md`. Does not change the Rust MCP implementation.
+
 ## [1.3.2] — 2026-09-23
 
 ### Fixed

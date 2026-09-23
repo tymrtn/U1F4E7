@@ -1,0 +1,26 @@
+{
+  "name": "envelope",
+  "version": "1.0.0",
+  "description": "BYO-mailbox email for Cursor agents. Read, search, draft, and organize mail in the user's existing IMAP/SMTP inbox. Agents draft; humans send.",
+  "author": {
+    "name": "Tyler Martin"
+  },
+  "homepage": "https://github.com/tymrtn/U1F4E7",
+  "repository": "https://github.com/tymrtn/U1F4E7",
+  "license": "FSL-1.1-ALv2",
+  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "draft"],
+  "logo": "assets/logo.svg",
+  "skills": "skills/",
+  "mcpServers": "mcp.json",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "ENVELOPE_AGENT_TOKEN": {
+        "type": "string",
+        "title": "Envelope agent token",
+        "description": "Bearer token from `envelope agent create <name>`. Printed once at creation. Required for MCP startup; never commit the value."
+      }
+    },
+    "required": ["ENVELOPE_AGENT_TOKEN"]
+  }
+}
