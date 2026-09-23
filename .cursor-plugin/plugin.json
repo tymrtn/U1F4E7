@@ -8,7 +8,7 @@
   "homepage": "https://github.com/tymrtn/U1F4E7",
   "repository": "https://github.com/tymrtn/U1F4E7",
   "license": "FSL-1.1-ALv2",
-  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "draft"],
+  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "mailbox"],
   "logo": "assets/logo.svg",
   "skills": "skills/",
   "mcpServers": "mcp.json",
