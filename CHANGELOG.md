@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Store:** reads on another client (phone, Apple Mail) are now detected. The message-index
+  refresh used to delete a folder's rows before re-inserting them, so a `\Seen` set elsewhere
+  was lost. It now reads prior flags first and emits a `message_seen` event (idempotency key
+  `seen:<account>:<folder>:<uidvalidity>:<uid>`, payload `{uid, message_id, observed_at,
+  source}`) when a message it held unseen comes back seen. Both flag spellings (`Seen`,
+  `\Seen`) count. `message_seen` joins the event catalog.
+- **Watch:** `envelope watch` seeds a FLAGS map for the newest 200 messages at SELECT and runs a
+  bounded `UID FETCH (UID FLAGS)` after each IDLE wake (`CHANGEDSINCE` when the server
+  advertises CONDSTORE), so installs without the dashboard index detect reads too. The fetch
+  requests no body and cannot set `\Seen`.
+- **CLI:** `envelope analytics show <uid> [--folder] [--account] [--json]` prints observed reads
+  as "seen by <time>". The time is when Envelope observed the flag, an upper bound on the read.
+  New contract surface `analytics_show` (CLI only).
+
+### Changed
+
+- Envelope's own flag writes (`envelope flag`, MCP `flag`, `bulk` flag ops, rule flag actions,
+  the dashboard flags endpoint) patch the local index after the server STORE succeeds, so they
+  never read as another client's read. A failed index patch is reported as an error.
+
 ### Fixed
 
 - **Egress:** every outbound HTTP request now goes through one guarded client

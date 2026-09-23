@@ -3,8 +3,11 @@
 
 //! Local indexed message-summary read model for dashboard first paint.
 
+use std::collections::HashMap;
+
 use crate::db::Database;
 use crate::errors::Result;
+use crate::flag_transitions::{ObservedFlags, SEEN_SOURCE_INDEX_REFRESH};
 use crate::models::{
     IndexedMessageInput, IndexedMessageSummary, MessageIndexAccountFreshness, MessageSummary,
 };
@@ -39,6 +42,10 @@ const STALE_AFTER_SECONDS: i64 = 15 * 60;
 impl Database {
     /// Upsert cached message summaries for a mailbox. This is only local state;
     /// callers are responsible for using read-only IMAP fetches to populate it.
+    ///
+    /// The folder's rows are replaced wholesale, so prior flags are read first:
+    /// a UID that was indexed unseen and now arrives `\Seen` emits a
+    /// `message_seen` event (see [`crate::flag_transitions`]).
     pub fn upsert_indexed_message_summaries(
         &self,
         account_id: &str,
@@ -47,6 +54,11 @@ impl Database {
         messages: &[IndexedMessageInput],
     ) -> Result<()> {
         let indexed_at = chrono::Utc::now().to_rfc3339();
+        let prior: HashMap<u32, Vec<String>> = self
+            .load_indexed_flags(account_id, folder, uidvalidity)?
+            .into_iter()
+            .map(|(uid, (_, flags))| (uid, flags))
+            .collect();
         self.conn().execute(
             "DELETE FROM indexed_message_summaries WHERE account_id = ?1 AND folder = ?2",
             params![account_id, folder],
@@ -101,6 +113,23 @@ impl Database {
                 indexed_at = excluded.indexed_at,
                 last_error = NULL",
             params![account_id, folder, uidvalidity as i64, indexed_at],
+        )?;
+
+        let observed: Vec<ObservedFlags> = messages
+            .iter()
+            .map(|message| ObservedFlags {
+                uid: message.uid,
+                message_id: message.message_id.clone(),
+                flags: message.flags.clone(),
+            })
+            .collect();
+        self.emit_seen_transitions(
+            account_id,
+            folder,
+            uidvalidity,
+            &prior,
+            &observed,
+            SEEN_SOURCE_INDEX_REFRESH,
         )?;
 
         Ok(())

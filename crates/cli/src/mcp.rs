@@ -1826,11 +1826,37 @@ async fn handle_flag(
             envelope_email_transport::imap::set_flag(&mut client, folder, uid, flag)
                 .await
                 .map_err(|e| e.to_string())?;
+            envelope_email_transport::imap::record_own_flag_change(
+                &db,
+                &creds.account.id,
+                folder,
+                &[uid],
+                flag,
+                true,
+            )
+            .map_err(|e| {
+                format!(
+                    "flag changed on the server, but updating the local message index failed: {e}"
+                )
+            })?;
         }
         "remove" => {
             envelope_email_transport::imap::remove_flag(&mut client, folder, uid, flag)
                 .await
                 .map_err(|e| e.to_string())?;
+            envelope_email_transport::imap::record_own_flag_change(
+                &db,
+                &creds.account.id,
+                folder,
+                &[uid],
+                flag,
+                false,
+            )
+            .map_err(|e| {
+                format!(
+                    "flag changed on the server, but updating the local message index failed: {e}"
+                )
+            })?;
         }
         _ => return Err("action must be 'add' or 'remove'".to_string()),
     }

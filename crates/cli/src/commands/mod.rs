@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod actions;
 pub mod agent;
 pub mod agent_context;
+pub mod analytics;
 pub mod attachments;
 pub mod authored_body;
 pub mod backup;

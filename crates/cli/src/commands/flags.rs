@@ -15,13 +15,22 @@ pub async fn run_add(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
 
     envelope_email_transport::imap::set_flag(&mut client, folder, uid, flag).await?;
+    envelope_email_transport::imap::record_own_flag_change(
+        &db,
+        &creds.account.id,
+        folder,
+        &[uid],
+        flag,
+        true,
+    )
+    .context("flag changed on the server, but updating the local message index failed")?;
 
     if json {
         println!(
@@ -49,13 +58,22 @@ pub async fn run_remove(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
 
     envelope_email_transport::imap::remove_flag(&mut client, folder, uid, flag).await?;
+    envelope_email_transport::imap::record_own_flag_change(
+        &db,
+        &creds.account.id,
+        folder,
+        &[uid],
+        flag,
+        false,
+    )
+    .context("flag changed on the server, but updating the local message index failed")?;
 
     if json {
         println!(

@@ -382,6 +382,12 @@ enum Commands {
         subcommand: ActionsCmd,
     },
 
+    /// What this install has observed about a message (local reads only)
+    Analytics {
+        #[command(subcommand)]
+        subcommand: AnalyticsCmd,
+    },
+
     /// View and acknowledge redacted events
     Events {
         #[command(subcommand)]
@@ -1090,6 +1096,22 @@ enum ActionsCmd {
 enum ActionsExecCmd {
     /// Record an event as handled locally without mutating the mailbox
     MarkHandled,
+}
+
+#[derive(Subcommand)]
+enum AnalyticsCmd {
+    /// Show reads observed on other clients: "seen by <time>" is when Envelope
+    /// saw \Seen appear, an upper bound on the read time
+    Show {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2378,6 +2400,13 @@ fn main() {
                     commands::actions::run_exec_mark_handled(&event_id, &actor, cli.json, backend)
                 }
             },
+        },
+        Commands::Analytics { subcommand } => match subcommand {
+            AnalyticsCmd::Show {
+                uid,
+                folder,
+                account,
+            } => commands::analytics::run_show(uid, &folder, account.as_deref(), cli.json),
         },
         Commands::Events { subcommand } => match subcommand {
             EventsCmd::List { account, limit } => {
