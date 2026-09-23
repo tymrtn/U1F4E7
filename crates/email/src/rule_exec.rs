@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use crate::http::Allowance;
 use crate::imap::{self, ImapClient};
 use crate::rules::{self, Action, ConfirmableAction, MatchExpr, MessageContext, StoredRuleAction};
 
@@ -500,10 +501,12 @@ async fn perform<M: RuleMailbox, D: ExecDb>(
         }
         Action::Flag(flag) => {
             mbox.set_flag(folder, uid, flag).await?;
+            record_own_flag(db, target, flag, true).await?;
             Ok(format!("flagged {flag}"))
         }
         Action::Unflag(flag) => {
             mbox.remove_flag(folder, uid, flag).await?;
+            record_own_flag(db, target, flag, false).await?;
             Ok(format!("unflagged {flag}"))
         }
         Action::Delete => {
@@ -601,11 +604,13 @@ async fn perform<M: RuleMailbox, D: ExecDb>(
             });
             let body = serde_json::to_vec(&payload)
                 .map_err(|e| anyhow!("failed to serialize webhook payload: {e}"))?;
-            let resp = reqwest::Client::new()
-                .post(url.as_str())
+            let (http, target_url) = crate::http::client_for(url, &Allowance::Public)
+                .await
+                .map_err(|e| anyhow!("egress refused: {e}"))?;
+            let resp = http
+                .post(target_url)
                 .header("Content-Type", "application/json")
                 .body(body)
-                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await
                 .map_err(|_| anyhow!("webhook delivery failed"))?;
@@ -616,6 +621,25 @@ async fn perform<M: RuleMailbox, D: ExecDb>(
         }
         Action::Confirm { .. } => bail!("confirm offers are recorded, never performed directly"),
     }
+}
+
+/// Patch the local index after Envelope's own flag STORE succeeded, so the
+/// change never reads as another client's read.
+async fn record_own_flag<D: ExecDb>(
+    db: &D,
+    target: &MessageTarget<'_>,
+    flag: &str,
+    add: bool,
+) -> Result<()> {
+    let (folder, uid) = (target.folder, target.uid);
+    db.with_db(|d| imap::record_own_flag_change(d, target.account_id, folder, &[uid], flag, add))
+        .await
+        .with_context(|| {
+            format!(
+                "flag '{flag}' changed on UID {uid}, but updating the local message index failed"
+            )
+        })?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1268,6 +1292,82 @@ mod tests {
         assert_eq!(db.get_rule(&r.id).unwrap().unwrap().hit_count, 1);
         let audits = db.list_rule_runs(Some(ACCT), 10).unwrap();
         assert_eq!(audits.len(), 2, "rule_run_audit keeps recording every pass");
+    }
+
+    #[tokio::test]
+    async fn rule_flag_patches_the_local_index() {
+        let db = Database::open_memory().unwrap();
+        db.upsert_indexed_message_summaries(
+            ACCT,
+            "INBOX",
+            1,
+            &[envelope_email_store::models::IndexedMessageInput {
+                uid: 3,
+                message_id: Some("<a@airline.example>".into()),
+                from_addr: "x@airline.example".into(),
+                to_addr: EMAIL.into(),
+                subject: "Your flight itinerary".into(),
+                date: None,
+                flags: vec![],
+                size: 100,
+                snippet: None,
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+        rule(&db, "reader", r#"{"flag":"seen"}"#);
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[summary(3, "a@airline.example", "x@airline.example")],
+        )
+        .await;
+
+        assert_eq!(report.actions, 1, "{report:?}");
+        let seen = imap::index_flag_name("seen");
+        assert_eq!(
+            db.patch_indexed_message_flags(ACCT, "INBOX", &[3], &seen, true)
+                .unwrap(),
+            0,
+            "the executor already patched the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_webhook_to_loopback_is_refused_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let db = Database::open_memory().unwrap();
+        rule(
+            &db,
+            "hook",
+            &serde_json::to_string(&json!({"webhook": format!("http://{addr}/hook")})).unwrap(),
+        );
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[summary(4, "w@airline.example", "x@airline.example")],
+        )
+        .await;
+
+        assert_eq!(report.actions, 0, "{report:?}");
+        assert_eq!(report.log[0]["status"], "error");
+        let err = report.log[0]["error"].as_str().unwrap();
+        assert!(err.contains("egress refused"), "{err}");
+        assert!(
+            action_rows(&db).is_empty(),
+            "a refused webhook is not a completed action"
+        );
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "no connection may reach the private target"
+        );
     }
 
     #[tokio::test]
