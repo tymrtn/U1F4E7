@@ -298,7 +298,7 @@ The plugin layout:
 |---|---|
 | `.cursor-plugin/plugin.json` | Manifest (`name`: `envelope`) |
 | `mcp.json` | stdio server: `envelope` `["mcp"]` |
-| `skills/envelope/SKILL.md` | When to use, draft-vs-send, quickstart |
+| `skills/envelope/SKILL.md` | When to use, MCP tools, quickstart |
 | `assets/logo.svg` | Marketplace logo |
 
 After the plugin is on `main`, a human submits the public repo URL at
