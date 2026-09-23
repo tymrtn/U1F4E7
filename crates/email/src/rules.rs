@@ -67,8 +67,7 @@ impl MatchExpr {
 /// Stable skip reason for a stored rule whose match has an empty condition
 /// list. Surfaced in `skipped_rules` and previews, so the wording is part of
 /// the contract.
-pub const EMPTY_CONDITION_LIST_SKIP_REASON: &str =
-    "rule has an empty condition list and could match every message; edit it to add a condition";
+pub const EMPTY_CONDITION_LIST_SKIP_REASON: &str = "rule has an empty condition list and could match every message; delete it, or edit it in the dashboard to add a condition";
 
 /// An action to execute when a rule matches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

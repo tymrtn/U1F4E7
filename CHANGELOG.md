@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `code: empty_match_condition`). Rules already stored that way are skipped when rules run and
   listed in `skipped_rules` with a stable reason, and `rule test`/`rule preview` report the skip
   instead of a match.
+- Rule previews (`rule test`, `rule preview`, MCP `rules_preview`, the dashboard rule test) now list
+  rules with an unparseable match in `skipped_rules` too. `rule test` used to abort on one, and the
+  dashboard test endpoint used to put it in `matches` with `status: "error"`.
 
 ## [1.3.0] — 2026-09-23
 

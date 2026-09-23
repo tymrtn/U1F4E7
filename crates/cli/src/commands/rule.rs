@@ -345,18 +345,13 @@ pub async fn run_test(
         .list_enabled_rules(&account_id)
         .context("failed to list enabled rules")?;
 
+    let rules_evaluated = enabled_rules.len();
+    let (evaluable, skipped_rules) = rule_exec::split_evaluable_rules(enabled_rules);
+
     let mut matches: Vec<serde_json::Value> = Vec::new();
-    let mut skipped_rules: Vec<rule_exec::SkippedRule> = Vec::new();
 
-    for rule in &enabled_rules {
-        let match_expr: rules::MatchExpr = serde_json::from_str(&rule.match_expr)
-            .with_context(|| format!("invalid match_expr in rule '{}'", rule.name))?;
-        if match_expr.has_empty_condition_list() {
-            skipped_rules.push(empty_condition_skip(rule));
-            continue;
-        }
-
-        let matched = rules::evaluate(&match_expr, &ctx);
+    for (rule, match_expr) in &evaluable {
+        let matched = rules::evaluate(match_expr, &ctx);
         if matched {
             matches.push(serde_json::json!({
                 "rule_id": rule.id,
@@ -383,7 +378,7 @@ pub async fn run_test(
                 "from": msg.from_addr,
                 "tags": ctx.tags,
                 "scores": ctx.scores,
-                "rules_evaluated": enabled_rules.len(),
+                "rules_evaluated": rules_evaluated,
                 "matches": matches,
                 "skipped_rules": skipped_rules,
                 "ui": ui::message_ui(&account_id, uid, folder),
@@ -416,7 +411,7 @@ pub async fn run_test(
         println!();
 
         if matches.is_empty() {
-            println!("No rules matched ({} evaluated)", enabled_rules.len());
+            println!("No rules matched ({rules_evaluated} evaluated)");
         } else {
             println!("{} rule(s) matched:", matches.len());
             for m in &matches {
@@ -435,16 +430,6 @@ pub async fn run_test(
     Ok(())
 }
 
-/// The `skipped_rules` entry for a stored rule whose match has an empty
-/// condition list; previews report it instead of a match.
-fn empty_condition_skip(rule: &envelope_email_store::Rule) -> rule_exec::SkippedRule {
-    rule_exec::SkippedRule {
-        rule_id: rule.id.clone(),
-        rule_name: rule.name.clone(),
-        reason: rules::EMPTY_CONDITION_LIST_SKIP_REASON.to_string(),
-    }
-}
-
 /// Reusable rule-preview core: resolve rules against fetched summaries and
 /// return the structured `{mode, folder, processed, matches, skipped_rules,
 /// mutated}` Value with no mailbox mutation. Shared by the CLI `run_preview`
@@ -460,18 +445,9 @@ pub async fn preview_core(
     let summaries = imap::fetch_inbox(client, folder, limit)
         .await
         .context("failed to fetch messages")?;
-    let mut preview_rules = Vec::new();
-    let mut skipped_rules = Vec::new();
-    for rule in db.list_rules(account_id).context("failed to list rules")? {
-        let Ok(match_expr) = serde_json::from_str::<rules::MatchExpr>(&rule.match_expr) else {
-            continue;
-        };
-        if match_expr.has_empty_condition_list() {
-            skipped_rules.push(empty_condition_skip(&rule));
-        } else {
-            preview_rules.push((rule, match_expr));
-        }
-    }
+    let (preview_rules, skipped_rules) = rule_exec::split_evaluable_rules(
+        db.list_rules(account_id).context("failed to list rules")?,
+    );
 
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();

@@ -4018,6 +4018,13 @@
           "processed": {
             "description": "Messages evaluated",
             "type": "integer"
+          },
+          "skipped_rules": {
+            "items": {
+              "description": "{rule_id, rule_name, reason}: rules skipped instead of evaluated (unparseable match, or an empty condition list that could match every message); reason is a stable string",
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],
@@ -4088,6 +4095,13 @@
           "processed": {
             "description": "Messages processed",
             "type": "integer"
+          },
+          "skipped_rules": {
+            "items": {
+              "description": "{rule_id, rule_name, reason}: rules skipped instead of evaluated (unparseable match, or an empty condition list that could match every message); reason is a stable string",
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],
