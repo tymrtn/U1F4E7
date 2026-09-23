@@ -845,11 +845,16 @@ async fn execute_action(
                     "subject": ctx.map(|c| c.subject.as_str()).unwrap_or(""),
                 }
             });
-            let http = reqwest::Client::new();
+            let (http, target) = envelope_email_transport::http::client_for(
+                url,
+                &envelope_email_transport::http::Allowance::Public,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("webhook delivery failed: {e}"))?;
             let body = serde_json::to_vec(&payload)
                 .map_err(|e| anyhow::anyhow!("failed to serialize webhook payload: {e}"))?;
             match http
-                .post(url.as_str())
+                .post(target)
                 .header("Content-Type", "application/json")
                 .body(body)
                 .timeout(std::time::Duration::from_secs(10))

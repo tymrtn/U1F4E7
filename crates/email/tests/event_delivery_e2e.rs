@@ -17,6 +17,7 @@ use envelope_email_store::models::Event;
 use envelope_email_transport::event_delivery::{
     DeliveryLimits, MAX_ATTEMPTS, deliver_due_events, hmac_sha256_hex,
 };
+use envelope_email_transport::http::Allowance;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -148,9 +149,8 @@ async fn success_records_delivered_at_snippet_and_signs_body() {
     let db = Database::open_memory().unwrap();
     let (secret, delivery_id, _route) = seed(&db, &server.url);
 
-    let http = reqwest::Client::new();
     let now = Utc.with_ymd_and_hms(2026, 7, 8, 1, 0, 0).unwrap();
-    let report = deliver_due_events(&db, &http, now, DeliveryLimits::default())
+    let report = deliver_due_events(&db, &Allowance::Loopback, now, DeliveryLimits::default())
         .await
         .unwrap();
 
@@ -195,15 +195,45 @@ async fn success_records_delivered_at_snippet_and_signs_body() {
 }
 
 #[tokio::test]
+async fn stored_private_url_is_refused_at_delivery_time() {
+    // A route URL that slipped past write-time validation (older build, direct
+    // DB edit) must still never be reached: delivery re-checks it.
+    let server = MockServer::start().await;
+    let db = Database::open_memory().unwrap();
+    let (_secret, delivery_id, _route) = seed(&db, &server.url);
+
+    let now = Utc.with_ymd_and_hms(2026, 7, 8, 1, 0, 0).unwrap();
+    let report = deliver_due_events(&db, &Allowance::Public, now, DeliveryLimits::default())
+        .await
+        .unwrap();
+
+    assert_eq!(report.delivered, 0);
+    assert_eq!(report.retried, 1);
+    assert!(
+        server.requests().await.is_empty(),
+        "no request may reach a loopback URL"
+    );
+    let d = db.get_delivery(&delivery_id).unwrap().unwrap();
+    assert!(d.delivered_at.is_none());
+    assert!(
+        d.last_error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("egress refused"),
+        "{:?}",
+        d.last_error
+    );
+}
+
+#[tokio::test]
 async fn server_error_schedules_backoff_and_increments_attempts() {
     let server = MockServer::start().await;
     server.set_status(500);
     let db = Database::open_memory().unwrap();
     let (_secret, delivery_id, _route) = seed(&db, &server.url);
 
-    let http = reqwest::Client::new();
     let now = Utc.with_ymd_and_hms(2026, 7, 8, 1, 0, 0).unwrap();
-    let report = deliver_due_events(&db, &http, now, DeliveryLimits::default())
+    let report = deliver_due_events(&db, &Allowance::Loopback, now, DeliveryLimits::default())
         .await
         .unwrap();
 
@@ -232,8 +262,6 @@ async fn repeated_failures_dead_letter_after_max_attempts() {
     let db = Database::open_memory().unwrap();
     let (_secret, delivery_id, _route) = seed(&db, &server.url);
 
-    let http = reqwest::Client::new();
-
     // Drive one attempt per backoff step, advancing the clock past each
     // scheduled next_attempt_at so the delivery is due again.
     // MAX_ATTEMPTS backed-off retries follow the initial attempt, so the
@@ -241,7 +269,7 @@ async fn repeated_failures_dead_letter_after_max_attempts() {
     let total_failures = MAX_ATTEMPTS + 1;
     let mut now = Utc.with_ymd_and_hms(2026, 7, 8, 1, 0, 0).unwrap();
     for _ in 0..total_failures {
-        deliver_due_events(&db, &http, now, DeliveryLimits::default())
+        deliver_due_events(&db, &Allowance::Loopback, now, DeliveryLimits::default())
             .await
             .unwrap();
         // Jump the clock a full day so the next attempt is always due.
@@ -273,10 +301,9 @@ async fn retry_clears_dead_letter_and_redelivers() {
     let db = Database::open_memory().unwrap();
     let (_secret, delivery_id, _route) = seed(&db, &server.url);
 
-    let http = reqwest::Client::new();
     let mut now = Utc.with_ymd_and_hms(2026, 7, 8, 1, 0, 0).unwrap();
     for _ in 0..(MAX_ATTEMPTS + 1) {
-        deliver_due_events(&db, &http, now, DeliveryLimits::default())
+        deliver_due_events(&db, &Allowance::Loopback, now, DeliveryLimits::default())
             .await
             .unwrap();
         now += chrono::Duration::days(1);
@@ -302,7 +329,7 @@ async fn retry_clears_dead_letter_and_redelivers() {
     );
 
     server.set_status(200);
-    let report = deliver_due_events(&db, &http, now, DeliveryLimits::default())
+    let report = deliver_due_events(&db, &Allowance::Loopback, now, DeliveryLimits::default())
         .await
         .unwrap();
     assert_eq!(report.delivered, 1);

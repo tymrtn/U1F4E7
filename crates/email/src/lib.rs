@@ -20,6 +20,7 @@ pub mod event_types;
 pub mod evidence;
 pub mod folders;
 pub mod governor_catalog;
+pub mod http;
 pub mod idle;
 pub mod imap;
 pub mod ingress;

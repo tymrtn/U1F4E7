@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::errors::SmtpError;
+use crate::http::{Allowance, client_for};
 
 /// An async mailto-unsubscribe SMTP sender: given the unsubscribe address, it
 /// returns a future that runs any gate and performs the actual SMTP send. It is
@@ -110,13 +111,19 @@ pub async fn execute_unsubscribe(
             }
 
             debug!("unsubscribing via HTTPS POST: {url}");
-            match reqwest::Client::new()
-                .post(url)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body("List-Unsubscribe=One-Click")
-                .send()
-                .await
-            {
+            // The URL comes from the sender's List-Unsubscribe header: public
+            // targets only, and a redirect is reported, never followed.
+            let response = match client_for(url, &Allowance::Public).await {
+                Ok((client, target)) => client
+                    .post(target)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("List-Unsubscribe=One-Click")
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("refused by egress guard: {e}")),
+            };
+            match response {
                 Ok(resp) => {
                     let status_code = resp.status();
                     if status_code.is_success() || status_code.as_u16() == 302 {
@@ -323,6 +330,28 @@ mod tests {
             result.message.contains("gate refused"),
             "the sender error surfaces: {}",
             result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn one_click_post_to_private_address_is_never_sent() {
+        // List-Unsubscribe is sender-controlled: a loopback URL must be refused
+        // before any connection is made.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info = UnsubscribeInfo {
+            https_urls: vec![format!("http://{addr}/unsub")],
+            mailto_urls: vec![],
+            one_click_post: true,
+            raw_header: String::new(),
+        };
+        let result = execute_unsubscribe(&info, true, None).await;
+        assert_eq!(result.status, "failed");
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "no connection may reach the private target"
         );
     }
 }

@@ -11,6 +11,7 @@ use envelope_email_transport::code_extractor::{
     OtpPatternId, extract_code_with_pattern, parse_expiry_hint, redact_codes,
 };
 use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
+use envelope_email_transport::http::{Allowance, client_for};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
@@ -30,11 +31,13 @@ pub async fn run(
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
 
-    let http_client = if webhook.is_some() || deliver {
-        Some(reqwest::Client::new())
-    } else {
-        None
-    };
+    // Refuse a private or unresolvable --webhook up front. Each POST re-checks
+    // the host, since DNS can change over a long-running watch.
+    if let Some(url) = webhook {
+        client_for(url, &Allowance::Public)
+            .await
+            .with_context(|| format!("--webhook {url} refused"))?;
+    }
 
     if !json {
         eprintln!(
@@ -119,7 +122,7 @@ pub async fn run(
 
                     match db.insert_event_idempotent(&event) {
                         Ok(true) => {
-                            emit_event(&event, webhook, http_client.as_ref());
+                            emit_event(&event, webhook);
                             if deliver {
                                 enqueue_deliveries_for_event(&db, &event);
                             }
@@ -149,7 +152,7 @@ pub async fn run(
                             );
                             match db.insert_event_idempotent(&otp_event) {
                                 Ok(true) => {
-                                    emit_event(&otp_event, webhook, http_client.as_ref());
+                                    emit_event(&otp_event, webhook);
                                     if deliver {
                                         enqueue_deliveries_for_event(&db, &otp_event);
                                     }
@@ -163,25 +166,23 @@ pub async fn run(
 
                 // Opportunistically drain any due deliveries after this batch.
                 if deliver {
-                    if let Some(client) = http_client.as_ref() {
-                        match deliver_due_events(
-                            &db,
-                            client,
-                            chrono::Utc::now(),
-                            DeliveryLimits::default(),
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                if report.examined > 0 {
-                                    info!(
-                                        "deliveries: {} delivered, {} retried, {} dead-lettered",
-                                        report.delivered, report.retried, report.dead_lettered
-                                    );
-                                }
+                    match deliver_due_events(
+                        &db,
+                        &Allowance::Public,
+                        chrono::Utc::now(),
+                        DeliveryLimits::default(),
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            if report.examined > 0 {
+                                info!(
+                                    "deliveries: {} delivered, {} retried, {} dead-lettered",
+                                    report.delivered, report.retried, report.dead_lettered
+                                );
                             }
-                            Err(e) => warn!("delivery executor error: {e}"),
                         }
+                        Err(e) => warn!("delivery executor error: {e}"),
                     }
                 }
 
@@ -365,20 +366,26 @@ fn route_matches(route: &EventRoute, event_type: &str) -> bool {
     }
 }
 
-fn emit_event(event: &Event, webhook: Option<&str>, http_client: Option<&reqwest::Client>) {
+fn emit_event(event: &Event, webhook: Option<&str>) {
     // A watch is notification, not an instruction channel. The legacy event
     // fields are retained inside the additive safe event representation.
     let json_line =
         serde_json::to_string(&provenance::event_json(event)).unwrap_or_else(|_| "{}".to_string());
     println!("{json_line}");
 
-    if let (Some(url), Some(client)) = (webhook, http_client) {
+    if let Some(url) = webhook {
         let url = url.to_string();
-        let client = client.clone();
         let body = json_line;
         tokio::spawn(async move {
+            let (client, target) = match client_for(&url, &Allowance::Public).await {
+                Ok(guarded) => guarded,
+                Err(e) => {
+                    warn!("webhook POST refused: {e}");
+                    return;
+                }
+            };
             if client
-                .post(&url)
+                .post(target)
                 .header("Content-Type", "application/json")
                 .body(body)
                 .send()
