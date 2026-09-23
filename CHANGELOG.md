@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-09-23
+
 ### Fixed
 
 - `envelope rule create` with no `--match-*` flag is refused. It used to save a rule with an
