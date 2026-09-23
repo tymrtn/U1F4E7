@@ -110,8 +110,10 @@ else:
 readme = (root / "README.md").read_text()
 if "Cursor Marketplace plugin" not in readme:
     err("README.md must document Cursor Marketplace plugin usage")
-if "brew install tymrtn/u1f4e7/u1f4e7" not in readme:
+if "brew install tymrtn/u1f4e7/envelope" not in readme:
     err("README.md must document the brew/PATH prerequisite")
+if "tymrtn/u1f4e7/u1f4e7" not in readme:
+    err("README.md must note the u1f4e7 brew compat alias")
 
 marketplace = root / "MARKETPLACE.md"
 if not marketplace.is_file():
@@ -122,6 +124,8 @@ else:
         err("MARKETPLACE.md must name the Inbox category")
     if "cursor.com/marketplace/publish" not in listing:
         err("MARKETPLACE.md must point at the human publish URL")
+    if "brew install tymrtn/u1f4e7/envelope" not in listing:
+        err("MARKETPLACE.md must prefer brew install tymrtn/u1f4e7/envelope")
 
 variables = manifest.get("variables")
 if not isinstance(variables, dict) or "ENVELOPE_AGENT_TOKEN" not in (

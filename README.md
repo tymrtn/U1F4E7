@@ -40,7 +40,8 @@ envelope inbox --json
 
 ```bash
 # Homebrew (macOS) — installs the binary named `envelope`
-brew install tymrtn/u1f4e7/u1f4e7
+brew install tymrtn/u1f4e7/envelope
+# Compat alias once the tap PR lands: brew install tymrtn/u1f4e7/u1f4e7
 
 # From source (Linux or macOS)
 # 1. Install Rust if not already present:
@@ -279,9 +280,11 @@ provider and domain, not a hosted agent inbox. Copy lives in
 the MCP server. Homebrew installs that binary:
 
 ```bash
-brew install tymrtn/u1f4e7/u1f4e7
+brew install tymrtn/u1f4e7/envelope
 which envelope
 ```
+
+`tymrtn/u1f4e7/u1f4e7` remains a compat alias once the tap PR lands.
 
 MCP startup requires an agent token. Create one, then paste it into the plugin
 variable `ENVELOPE_AGENT_TOKEN` (Customize → Plugins → Configure). Never commit

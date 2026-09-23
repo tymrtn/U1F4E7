@@ -16,15 +16,17 @@ there. Packaging in this repo does not publish the listing.
 
 - Bring your own mailbox: Gmail, Fastmail, Migadu, iCloud, Outlook, or any IMAP/SMTP account — not a rented AgentMail-style inbox
 - Local stdio MCP (`envelope mcp`) with agent-native tools to read, search, draft, send, and organize mail
-- Requires the `envelope` CLI on `PATH` (`brew install tymrtn/u1f4e7/u1f4e7`) and an `ENVELOPE_AGENT_TOKEN` from `envelope agent create`
+- Requires the `envelope` CLI on `PATH` (`brew install tymrtn/u1f4e7/envelope`; `tymrtn/u1f4e7/u1f4e7` stays a compat alias once the tap PR lands) and an `ENVELOPE_AGENT_TOKEN` from `envelope agent create`
 
 ## Install (what reviewers and users need)
 
 1. Install the CLI so `envelope` is on `PATH`:
 
    ```bash
-   brew install tymrtn/u1f4e7/u1f4e7
+   brew install tymrtn/u1f4e7/envelope
    ```
+
+   `tymrtn/u1f4e7/u1f4e7` remains a compat alias once the tap PR lands.
 
 2. Add a mailbox, then create an agent identity (token is printed once):
 

@@ -35,8 +35,10 @@ hosted agent inbox.
 The MCP server runs the `envelope` binary from `PATH`. Install it first:
 
 ```bash
-brew install tymrtn/u1f4e7/u1f4e7
+brew install tymrtn/u1f4e7/envelope
 ```
+
+`tymrtn/u1f4e7/u1f4e7` remains a compat alias once the tap PR lands.
 
 From source: build `target/release/envelope` and put it on `PATH`. Then add a
 mailbox and create an agent token (printed once):
