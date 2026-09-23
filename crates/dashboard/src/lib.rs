@@ -1343,11 +1343,10 @@ fn spawn_event_delivery_sweeper() {
                         return;
                     }
                 };
-                let http = reqwest::Client::new();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    if let Err(e) = run_event_delivery_sweep(&db, &http).await {
+                    if let Err(e) = run_event_delivery_sweep(&db).await {
                         tracing::warn!("event delivery sweep error: {e}");
                     }
                 }
@@ -1363,11 +1362,11 @@ fn spawn_event_delivery_sweeper() {
 /// Logs a one-line summary only when deliveries were actually attempted
 /// (`examined > 0`), keeping quiet sweeps silent. The summary carries counts
 /// only — never URLs, bodies, signatures, or secrets.
-async fn run_event_delivery_sweep(db: &Database, http: &reqwest::Client) -> anyhow::Result<()> {
+async fn run_event_delivery_sweep(db: &Database) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     let report = envelope_email_transport::event_delivery::deliver_due_events(
         db,
-        http,
+        &envelope_email_transport::http::Allowance::Public,
         now,
         envelope_email_transport::event_delivery::DeliveryLimits::default(),
     )
@@ -2289,10 +2288,10 @@ mod tests {
 
     #[tokio::test]
     async fn event_delivery_sweep_invokes_executor_on_due_delivery() {
-        // Wiring test: a due delivery pointed at an unreachable loopback URL must
-        // be picked up by run_event_delivery_sweep and advanced by the executor
-        // (connection failure -> attempt recorded + rescheduled), proving the
-        // sweep actually drives deliver_due_events. No real webhook is required.
+        // Wiring test: a due delivery pointed at a loopback URL must be picked
+        // up by run_event_delivery_sweep and advanced by the executor (egress
+        // guard refusal -> attempt recorded + rescheduled), proving the sweep
+        // actually drives deliver_due_events. No real webhook is required.
         let db = Database::open_memory().unwrap();
         db.conn()
             .execute(
@@ -2335,8 +2334,7 @@ mod tests {
         let before = db.get_delivery("del-1").unwrap().unwrap();
         assert_eq!(before.attempt_count, 0);
 
-        let http = reqwest::Client::new();
-        run_event_delivery_sweep(&db, &http).await.unwrap();
+        run_event_delivery_sweep(&db).await.unwrap();
 
         // After the sweep the executor attempted (and rescheduled) the delivery.
         let after = db.get_delivery("del-1").unwrap().unwrap();

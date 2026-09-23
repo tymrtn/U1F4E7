@@ -34,6 +34,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use crate::http::{Allowance, client_for};
+
 /// Exponential backoff schedule in seconds: 1m, 5m, 30m, 2h, 12h. Its length is
 /// [`MAX_ATTEMPTS`]; after the last entry the delivery is dead-lettered.
 pub const BACKOFF_SCHEDULE: [i64; 5] = [60, 300, 1800, 7200, 43200];
@@ -121,7 +123,7 @@ struct WebhookDelivery {
 /// a database-level failure propagates.
 pub async fn deliver_due_events(
     db: &Database,
-    http: &reqwest::Client,
+    allowance: &Allowance,
     now: DateTime<Utc>,
     limits: DeliveryLimits,
 ) -> Result<DeliveryReport, StoreError> {
@@ -211,7 +213,7 @@ pub async fn deliver_due_events(
         }
 
         let attempt_result = post_webhook(
-            http,
+            allowance,
             &webhook.url,
             &event.event_type,
             &delivery.id,
@@ -278,13 +280,26 @@ enum AttemptOutcome {
 }
 
 async fn post_webhook(
-    http: &reqwest::Client,
+    allowance: &Allowance,
     url: &str,
     event_type: &str,
     delivery_id: &str,
     signature: Option<&str>,
     body: &str,
 ) -> AttemptOutcome {
+    // The stored URL was checked when the route was written; check it again
+    // now, against what the host resolves to at delivery time.
+    let (http, url) = match client_for(url, allowance).await {
+        Ok(guarded) => guarded,
+        Err(e) => {
+            warn!("webhook delivery refused by egress guard");
+            return AttemptOutcome::Failure {
+                status: None,
+                snippet: None,
+                error: format!("egress refused: {e}"),
+            };
+        }
+    };
     let mut req = http
         .post(url)
         .timeout(REQUEST_TIMEOUT)

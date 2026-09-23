@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Egress:** every outbound HTTP request now goes through one guarded client
+  (`envelope_email_transport::http::client_for`). Before, the SSRF guard ran only when a webhook
+  URL was saved, so a host that later resolved to a private address, a stored URL written by an
+  older build, `envelope watch --webhook`, and the sender-supplied `List-Unsubscribe` POST all
+  reached any address, followed redirects, and had no total timeout. The client resolves the host,
+  checks every resolved address against the same private/reserved ranges, pins the connection to
+  those addresses, never follows redirects, and gives up after 10 s to connect or 15 s in total.
+  Rule webhooks, `watch --webhook`, and event-route deliveries are re-checked at send time; a
+  refused delivery is recorded as a failed attempt with `egress refused: …` and retried on the
+  usual schedule. `watch --webhook` now refuses a private or `localhost` URL at startup.
+
 ## [1.2.8] — 2026-09-22
 
 ### Fixed

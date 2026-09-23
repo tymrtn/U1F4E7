@@ -55,10 +55,9 @@ impl std::error::Error for UrlGuardError {}
 ///
 /// Only `http` and `https` are permitted. Literal IP addresses in loopback,
 /// link-local, private, or documentation blocks are rejected at parse time.
-/// Named hosts that are not literal IPs are accepted here; a nameserver that
-/// returns a private address (DNS rebinding) would bypass this check —
-/// operators who need defence-in-depth for that window should run Envelope
-/// behind a network egress policy.
+/// Named hosts that are not literal IPs are accepted here; outbound requests
+/// go through [`crate::http::client_for`], which re-checks every resolved
+/// address at send time and pins the connection to it.
 pub fn check_public_url(raw_url: &str) -> Result<(), UrlGuardError> {
     let parsed = Url::parse(raw_url).map_err(|_| UrlGuardError::Malformed(raw_url.to_string()))?;
 
@@ -82,6 +81,16 @@ pub fn check_public_url(raw_url: &str) -> Result<(), UrlGuardError> {
     }
 
     Ok(())
+}
+
+/// Apply the same private/reserved-range rules to one resolved address.
+/// [`crate::http::client_for`] runs this against every address a named host
+/// resolves to, closing the DNS-rebinding window [`check_public_url`] leaves.
+pub fn check_public_ip(ip: std::net::IpAddr) -> Result<(), UrlGuardError> {
+    match ip {
+        std::net::IpAddr::V4(v4) => check_ipv4_ssrf(v4),
+        std::net::IpAddr::V6(v6) => check_ipv6_ssrf(v6),
+    }
 }
 
 /// Return `Err` for IPv4 addresses in ranges that must not receive outbound
