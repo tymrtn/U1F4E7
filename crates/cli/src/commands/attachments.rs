@@ -248,53 +248,92 @@ pub async fn run_list(
     Ok(())
 }
 
+/// Refuse malware-flagged bytes (the CLI download chokepoint) unless the
+/// operator passed `--unsafe`, then write them. The gate runs before any
+/// byte reaches the filesystem.
+fn write_checked_download(
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    attachment: &envelope_email_transport::imap::DownloadedAttachment,
+    allow_unsafe: bool,
+    output: Option<&str>,
+) -> Result<PathBuf> {
+    let block = envelope_email_transport::threat::persist::attachment_block(
+        db,
+        account_id,
+        attachment.message_id.as_deref(),
+        &attachment.filename,
+        &attachment.content_type,
+        &attachment.bytes,
+    )
+    .context("threat check for the attachment failed")?;
+    if let Some(block) = block {
+        if !allow_unsafe {
+            bail!(
+                "{}: {}. Nothing was written. Pass --unsafe to save it anyway, or \
+                 `envelope threat mark-safe` if the message is legitimate.",
+                block.code,
+                block.reason
+            );
+        }
+        eprintln!(
+            "warning: writing a blocked attachment because --unsafe was passed ({})",
+            block.reason
+        );
+    }
+
+    // An implicit destination is a sanitized basename published
+    // descriptor-relatively under a dedicated root. `--output` is an explicit
+    // operator path and only receives its local no-symlink/create-new checks;
+    // it does not use the implicit-root guarantee.
+    match output {
+        Some(p) => {
+            let dest = explicit_download_path(p)?;
+            write_new_download(&dest, &attachment.bytes)?;
+            Ok(dest)
+        }
+        None => write_implicit_download(&attachment.filename, &attachment.bytes),
+    }
+}
+
 /// Download an attachment by filename from a message, saving to disk.
 #[tokio::main]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_download(
     uid: u32,
     filename: &str,
     output: Option<&str>,
     folder: &str,
     account: Option<&str>,
+    allow_unsafe: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
 
-    let (name, bytes) =
+    let attachment =
         envelope_email_transport::imap::download_attachment(&mut client, uid, filename, folder)
             .await
             .context("failed to download attachment")?;
-
-    // An implicit destination is a sanitized basename published
-    // descriptor-relatively under a dedicated root. `--output` is an explicit
-    // operator path and only receives its local no-symlink/create-new checks;
-    // it does not use the implicit-root guarantee.
-    let dest = match output {
-        Some(p) => {
-            let dest = explicit_download_path(p)?;
-            write_new_download(&dest, &bytes)?;
-            dest
-        }
-        None => write_implicit_download(&name, &bytes)?,
-    };
+    let dest = write_checked_download(&db, &creds.account.id, &attachment, allow_unsafe, output)?;
+    let name = &attachment.filename;
+    let size = attachment.bytes.len();
 
     if json {
         let info = serde_json::json!({
             "filename": name,
-            "size": bytes.len(),
+            "size": size,
             "path": dest.display().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
         println!(
             "Saved {name} ({size} bytes) to {path}",
-            size = bytes.len(),
-            path = dest.display(),
+            path = dest.display()
         );
     }
 
@@ -305,6 +344,71 @@ pub async fn run_download(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn downloaded(
+        name: &str,
+        bytes: &[u8],
+        mid: Option<&str>,
+    ) -> envelope_email_transport::imap::DownloadedAttachment {
+        envelope_email_transport::imap::DownloadedAttachment {
+            filename: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            bytes: bytes.to_vec(),
+            message_id: mid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cli_download_refuses_malware_before_writing() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // macOS temp dirs sit behind the /var symlink, which --output refuses.
+        let base = dir.path().canonicalize().unwrap();
+        let dest = base.join("invoice.pdf.exe");
+        let err = write_checked_download(
+            &db,
+            "acct",
+            &downloaded("invoice.pdf.exe", b"MZ\x90", None),
+            false,
+            Some(dest.to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("attachment_blocked"), "{err:#}");
+        assert!(!dest.exists(), "no bytes may reach disk");
+
+        // A message tagged threat:malware blocks even a clean-looking file.
+        db.add_tag(
+            "acct",
+            "m@x",
+            envelope_email_transport::threat::TAG_MALWARE,
+            Some(1),
+            Some("INBOX"),
+        )
+        .unwrap();
+        let pdf = base.join("r.pdf");
+        assert!(
+            write_checked_download(
+                &db,
+                "acct",
+                &downloaded("r.pdf", b"%PDF", Some("m@x")),
+                false,
+                Some(pdf.to_str().unwrap())
+            )
+            .is_err()
+        );
+        assert!(!pdf.exists());
+
+        // --unsafe is the only override.
+        let written = write_checked_download(
+            &db,
+            "acct",
+            &downloaded("invoice.pdf.exe", b"MZ\x90", None),
+            true,
+            Some(dest.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(written).unwrap(), b"MZ\x90");
+    }
 
     #[test]
     fn implicit_attachment_filename_normalizes_traversal_and_controls() {

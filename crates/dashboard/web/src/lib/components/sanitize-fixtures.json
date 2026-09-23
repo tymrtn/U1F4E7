@@ -1,0 +1,112 @@
+{
+  "_comment": "Shared by rich-html.test.ts (browser sanitizer) and crates/email/src/sanitize.rs (server sanitizer). Assertions are substring/regex so both serializers can differ in attribute order.",
+  "cases": [
+    {
+      "name": "active elements, handlers, embeds and navigation attributes are removed",
+      "input": "<p onmouseover=\"evil()\" autofocus tabindex=\"0\">Safe</p><script>alert(1)</script><form action=\"/send\"><input></form><object data=\"https://evil.example\"></object><embed src=\"https://evil.example\"><svg><a xlink:href=\"javascript:evil()\">vector</a></svg><template shadowrootmode=\"open\"><script>evil()</script><img src=\"https://tracker.example/t\"></template><p style=\"background-image:image-set(&quot;https://tracker.example/pixel&quot; 1x)\">css</p><p style='background-image:\\69 mage-set(\"\\68 \\74 \\74 \\70 \\73 \\3a \\2f \\2f tracker.example/pixel.png\" 1x)'>escaped-css</p><a xlink:href=\"https://example.com/safe\">safe-vector</a><a href=\"java&#x0A;script:evil()\" download ping=\"https://tracker.example\">bad</a>",
+      "must_contain": [
+        "<p>Safe</p>",
+        "css</p>",
+        "escaped-css</p>",
+        "safe-vector",
+        "bad</a>"
+      ],
+      "must_not_match": [
+        "<script",
+        "<form",
+        "<object",
+        "<embed",
+        "<svg",
+        "xlink",
+        "<template",
+        "image-set",
+        "onmouseover",
+        "autofocus",
+        "tabindex",
+        "download",
+        "ping=",
+        "javascript:",
+        "evil\\.example",
+        "tracker\\.example"
+      ]
+    },
+    {
+      "name": "links use a parsed protocol allowlist",
+      "input": "<a href=\"https://example.com/path\">h</a><a href=\"mailto:p@example.com\">m</a><a href=\"tel:+15551212\">t</a><a href=\"#section\">s</a><a href=\"vbscript:msgbox(1)\">v</a><a href=\"data:text/html,x\">d</a><a href=\"/relative/navigation\">r</a>",
+      "must_contain": [
+        "href=\"https://example.com/path\"",
+        "href=\"mailto:p@example.com\"",
+        "href=\"tel:+15551212\"",
+        "href=\"#section\""
+      ],
+      "must_not_match": [
+        "vbscript",
+        "data:text",
+        "/relative/navigation"
+      ]
+    },
+    {
+      "name": "only body markup survives and svg data images are dropped",
+      "input": "<html><head><title>not body</title></head><body><p>Body</p><img src=\"data:image/svg+xml,%3Csvg%20onload=evil()%3E\"><img src=\"cid:logo\"></body></html>",
+      "must_contain": [
+        "<p>Body</p>",
+        "src=\"cid:logo\""
+      ],
+      "must_not_match": [
+        "<html",
+        "<head",
+        "<body",
+        "<title",
+        "not body",
+        "data:image/svg",
+        "onload"
+      ]
+    },
+    {
+      "name": "remote images do not load",
+      "input": "<img src=\"https://tracker.example/pixel.gif\" alt=\"remote\"><img src=\"data:image/png;base64,iVBORw0KGgo=\">",
+      "must_contain": [
+        "alt=\"remote\"",
+        "src=\"data:image/png;base64,iVBORw0KGgo=\""
+      ],
+      "must_not_match": [
+        "(^|\\s)src=\"https?:"
+      ]
+    },
+    {
+      "name": "benign inline css is kept",
+      "input": "<p style=\"color: red\">styled</p>",
+      "must_contain": [
+        "color: red",
+        "styled</p>"
+      ],
+      "must_not_match": []
+    },
+    {
+      "name": "image error handlers are removed",
+      "input": "<img src=\"cid:a\" onerror=\"evil()\"><div onclick=\"evil()\">div</div>",
+      "must_contain": [
+        "src=\"cid:a\"",
+        "div</div>"
+      ],
+      "must_not_match": [
+        "onerror",
+        "onclick",
+        "evil"
+      ]
+    },
+    {
+      "name": "frames, meta refresh and base are removed",
+      "input": "<iframe src=\"https://evil.example/\"></iframe><meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\"><base href=\"https://evil.example/\"><p>ok</p>",
+      "must_contain": [
+        "<p>ok</p>"
+      ],
+      "must_not_match": [
+        "<iframe",
+        "<meta",
+        "<base",
+        "evil"
+      ]
+    }
+  ]
+}

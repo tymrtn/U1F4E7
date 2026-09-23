@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### rShield
+
+- **Threat engine:** every message gets a local verdict, score 0-100 from six analyzers
+  (`auth_results`, `sender`, `links`, `content`, `attachments`, `ledger`), each behind
+  `threat.analyzers.<name>`. 30 and up is `suspicious`, 70 and up `dangerous`. If a required
+  analyzer fails, the verdict is `unavailable` and Envelope does not call the message clean.
+  Signal codes include `ar_forged`, `dmarc_fail`, `lookalike_domain`, `display_name_spoof`,
+  `anchor_mismatch`, `ip_link`, `punycode_link`, `double_extension`, `executable_disguised`,
+  `macro_office`, `archive_dangerous_member`, `known_name_new_address`. Evidence holds hosts,
+  extensions and hashes only.
+- **Authentication-Results:** only the topmost A-R header from the receiving host's domain,
+  sitting above that host's lowest `Received` line, is trusted. Any other A-R that claims the
+  receiving domain scores `ar_forged` (+40).
+- **Storage:** verdicts are the `threat` score dimension (so `score_above threat N` rules work),
+  tags `threat:suspicious|dangerous|malware|quarantined|false_positive`, and a `threat_verdict`
+  event per scan. `threat_verdict` and `label_applied` join the event catalog.
+- **When scans run:** `envelope watch` scans each new UID before `--run-rules`, the dashboard scans
+  INBOX on each account's `sync.poll_interval_secs` timer (default 300), and the reader scans on
+  open when no current verdict exists (`threat.on_read`). All fetches are `EXAMINE` +
+  `BODY.PEEK[]`.
+- **Attachments:** malware-grade attachments are refused at `envelope attachment download`
+  (override: `--unsafe`), the dashboard download, and draft upload (HTTP 403,
+  `code: attachment_blocked`).
+- **Quarantine:** `threat.quarantine = none|tag|move` (default `tag`). `move` installs the
+  editable rule "Envelope threat quarantine" (`score_above threat 70 -> move
+  Envelope/Quarantine`), run through the rule executor as agent `envelope:threat`. Suspicious
+  mail never moves.
+- **CLI:** `envelope threat scan|show|explain|mark-safe|release|report|stats`. `report` builds a
+  draft to `threat.report_to` (default `reportphishing@apwg.org`) with the original attached as
+  `message/rfc822`, and sends nothing.
+- **Read:** CLI and MCP `read` serve `dangerous` HTML through a new server-side sanitizer
+  (ammonia, same policy as the reader, shared fixtures) and add `sanitized` and `threat` fields.
+- **MCP:** read-only `threat_show` returns the stored verdict and never scans.
+- **Reader:** a verdict banner with "Why?" (the score arithmetic), "Mark safe" and "Report".
+
 ### Added
 
 - **Store:** reads on another client (phone, Apple Mail) are now detected. The message-index

@@ -27,6 +27,7 @@
   import BodyFrame from '$lib/components/BodyFrame.svelte';
   import ThreadStrip from '$lib/components/ThreadStrip.svelte';
   import AttachmentList from '$lib/components/AttachmentList.svelte';
+  import ThreatBanner from '$lib/components/ThreatBanner.svelte';
   import Avatar from '$lib/components/Avatar.svelte';
   import {
     fetchMessageDetail,
@@ -34,7 +35,8 @@
     postFlags,
     isSeen,
     type MessageDetailFull,
-    type ThreadMessage
+    type ThreadMessage,
+    type ThreatView
   } from '$lib/reader-api';
   import { api, bulkClient, EnvelopeApiError } from '$lib/api';
   import { looksLikeTrash } from '$lib/folder-kinds';
@@ -76,6 +78,8 @@
   // ── Message state ─────────────────────────────────────────────────────
 
   let message = $state<MessageDetailFull | null>(null);
+  // Threat verdict from the read (scanned on open when none is stored).
+  let threat = $state<ThreatView | null>(null);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadKey = $state('');
@@ -178,6 +182,7 @@
     loading = true;
     error = null;
     message = null;
+    threat = null;
     threadMessages = [];
     localSeen = null;
     localFlagged = null;
@@ -197,6 +202,7 @@
     try {
       const res = await fetchMessageDetail(acct, u, f);
       message = res.message;
+      threat = res.threat ?? null;
 
       // Read-on-open: the successful load is the operator's explicit read
       // action. Fire an intentional \Seen STORE (not a BODY[] side effect).
@@ -743,6 +749,16 @@
           </button>
         {/snippet}
       </Modal>
+
+      {#if threat}
+        <ThreatBanner
+          {threat}
+          {accountId}
+          uid={message.uid}
+          {folder}
+          onchange={(next) => (threat = next)}
+        />
+      {/if}
 
       <!-- ── Thread strip ───────────────────────────────────────────── -->
       {#if threadLoading || threadMessages.length > 1}

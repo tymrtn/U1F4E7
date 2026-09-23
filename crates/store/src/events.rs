@@ -282,6 +282,70 @@ impl Database {
         Ok(stmt.query_row(params![event_id], map_event).optional()?)
     }
 
+    /// Newest `event_type` event about one message (by canonical Message-ID).
+    pub fn latest_event_for_message(
+        &self,
+        account_id: &str,
+        event_type: &str,
+        message_id: &str,
+    ) -> Result<Option<Event>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
+                    snippet, payload, idempotency_key, secure_pending, acked_at, created_at
+             FROM events
+             WHERE account_id = ?1 AND event_type = ?2 AND message_id = ?3
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![account_id, event_type, message_id], map_event)
+            .optional()?)
+    }
+
+    /// Newest `event_type` event recorded for a folder/UID.
+    pub fn latest_event_for_uid(
+        &self,
+        account_id: &str,
+        event_type: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<Event>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
+                    snippet, payload, idempotency_key, secure_pending, acked_at, created_at
+             FROM events
+             WHERE account_id = ?1 AND event_type = ?2 AND folder = ?3 AND uid = ?4
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(
+                params![account_id, event_type, folder, i64::from(uid)],
+                map_event,
+            )
+            .optional()?)
+    }
+
+    /// Payload of the newest `event_type` event per message (keyed by
+    /// Message-ID, else folder/UID). SQLite takes the bare `payload` column
+    /// from the `MAX(created_at)` row of each group.
+    pub fn latest_event_payloads_per_message(
+        &self,
+        account_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT payload, MAX(created_at)
+             FROM events
+             WHERE account_id = ?1 AND event_type = ?2 AND payload IS NOT NULL
+             GROUP BY COALESCE(message_id, folder || ':' || uid)",
+        )?;
+        let rows = stmt.query_map(params![account_id, event_type], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Fetch the event recorded under an idempotency key, if any.
     pub fn get_event_by_idempotency_key(&self, key: &str) -> Result<Option<Event>> {
         let mut stmt = self.conn().prepare(

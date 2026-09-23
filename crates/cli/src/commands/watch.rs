@@ -17,6 +17,8 @@ use envelope_email_transport::http::{Allowance, client_for};
 use envelope_email_transport::rule_exec::{
     self, ActionAttribution, ActionSource, ImapRuleMailbox, RuleMailbox, RuleRunReport, RunAccount,
 };
+use envelope_email_transport::threat::ThreatConfig;
+use envelope_email_transport::threat::persist::{self, QuarantineOutcome, RawFetch};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
@@ -51,14 +53,22 @@ pub async fn run(
         );
     }
 
-    // Rule actions run on their own connection so the IDLE session keeps its
-    // SELECTed state. Log in once up front so bad credentials fail loudly;
-    // each batch then opens a fresh connection, because an idle side
+    // Threat scanning (threat.enabled, default on) runs on every new UID
+    // before --run-rules, so `score_above threat` rules see the verdict. An
+    // invalid threat config stops watch rather than silently not scanning.
+    let threat_config = {
+        let config = ThreatConfig::load().context("threat configuration is invalid")?;
+        config.enabled.then_some(config)
+    };
+
+    // Rule actions and scans run on their own connection so the IDLE session
+    // keeps its SELECTed state. Log in once up front so bad credentials fail
+    // loudly; each batch then opens a fresh connection, because an idle side
     // connection is dropped by the server long before the next new mail.
-    if run_rules {
+    if run_rules || threat_config.is_some() {
         envelope_email_transport::imap::connect(&creds)
             .await
-            .context("IMAP connection for --run-rules failed")?;
+            .context("IMAP connection for the new-mail pass failed")?;
     }
 
     // Graceful shutdown via Ctrl-C
@@ -198,7 +208,7 @@ pub async fn run(
                     }
                 }
 
-                if run_rules && !new_msgs.is_empty() {
+                if (run_rules || threat_config.is_some()) && !new_msgs.is_empty() {
                     match envelope_email_transport::imap::connect(&creds).await {
                         Ok(mut client) => {
                             let mut mbox = ImapRuleMailbox {
@@ -210,16 +220,23 @@ pub async fn run(
                                 id: &account_id,
                                 email: &creds.account.username,
                             };
-                            match run_rules_on_new_messages(
-                                &mut mbox, &db, &account, folder, &new_msgs,
+                            match new_mail_pass(
+                                &mut mbox,
+                                &db,
+                                &account,
+                                folder,
+                                &new_msgs,
+                                threat_config.as_ref(),
+                                run_rules,
                             )
                             .await
                             {
-                                Ok(report) => log_rule_report(&report),
+                                Ok(Some(report)) => log_rule_report(&report),
+                                Ok(None) => {}
                                 Err(e) => warn!("--run-rules failed for this batch: {e:#}"),
                             }
                         }
-                        Err(e) => warn!("--run-rules could not connect for this batch: {e}"),
+                        Err(e) => warn!("new-mail pass could not connect for this batch: {e}"),
                     }
                 }
 
@@ -534,6 +551,7 @@ async fn sync_flags(
 }
 
 /// A minimal representation of a newly fetched message.
+#[derive(Clone)]
 struct NewMessage {
     uid: u32,
     message_id: Option<String>,
@@ -541,6 +559,52 @@ struct NewMessage {
     to_addr: Option<String>,
     subject: Option<String>,
     snippet: Option<String>,
+}
+
+/// The new-mail pass for one batch: threat scan first, then `--run-rules`
+/// on the messages quarantine did not move away. Scan failures are logged
+/// per UID and never stop the rules.
+async fn new_mail_pass<M: RuleMailbox + RawFetch>(
+    mbox: &mut M,
+    db: &envelope_email_store::Database,
+    account: &RunAccount<'_>,
+    folder: &str,
+    msgs: &[NewMessage],
+    threat_config: Option<&ThreatConfig>,
+    run_rules: bool,
+) -> Result<Option<RuleRunReport>> {
+    let mut moved = std::collections::HashSet::new();
+    if let Some(config) = threat_config {
+        let uids: Vec<u32> = msgs.iter().map(|m| m.uid).collect();
+        for (uid, result) in persist::scan_new_mail(mbox, db, account, folder, &uids, config).await
+        {
+            match result {
+                Ok(entry) => {
+                    info!(
+                        "threat: UID {uid} {} ({}), quarantine {:?}",
+                        entry.level.as_str(),
+                        entry.score,
+                        entry.quarantine
+                    );
+                    if entry.quarantine == QuarantineOutcome::Moved {
+                        moved.insert(uid);
+                    }
+                }
+                Err(e) => warn!("threat scan failed for UID {uid}: {e:#}"),
+            }
+        }
+    }
+    if !run_rules {
+        return Ok(None);
+    }
+    let remaining: Vec<NewMessage> = msgs
+        .iter()
+        .filter(|m| !moved.contains(&m.uid))
+        .cloned()
+        .collect();
+    run_rules_on_new_messages(mbox, db, account, folder, &remaining)
+        .await
+        .map(Some)
 }
 
 /// Run enabled rules over one batch of new messages through the unified
@@ -1275,5 +1339,116 @@ mod tests {
                 .unwrap();
         assert_eq!(again.actions, 0);
         assert_eq!(session.calls.len(), 1);
+    }
+
+    impl RawFetch for FakeSession {
+        async fn fetch_raw(&mut self, _folder: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+            self.calls.push(format!("peek {uid}"));
+            Ok(Some(
+                b"Message-ID: <fixture@example.com>\r\n\
+                  From: IT Desk <noreply@examp1e.com>\r\n\
+                  To: me@example.com\r\nSubject: Your verification code is 482910\r\n\
+                  MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+                  --b\r\nContent-Type: text/plain\r\n\r\nverify your account\r\n\
+                  --b\r\nContent-Type: application/octet-stream\r\n\
+                  Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\
+                  Content-Transfer-Encoding: base64\r\n\r\nTVqQAAMAAAAEAAAA\r\n--b--\r\n"
+                    .to_vec(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn threat_scan_runs_before_rules_so_score_above_threat_matches() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.create_rule(
+            "acc-1",
+            "tag-threats",
+            r#"{"score_above":{"dimension":"threat","threshold":50.0}}"#,
+            r#"{"add_tag":"looked-at"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        let account = RunAccount {
+            id: "acc-1",
+            email: "me@example.com",
+        };
+        let mut session = FakeSession::default();
+        let config = ThreatConfig::default();
+
+        let report = new_mail_pass(
+            &mut session,
+            &db,
+            &account,
+            "INBOX",
+            &[fixture_message()],
+            Some(&config),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.calls[0], "peek 42", "scan fetches first, read-only");
+        assert_eq!(report.actions, 1, "{report:?}");
+        let mut tags: Vec<String> = db
+            .get_tags("acc-1", "fixture@example.com")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.tag)
+            .collect();
+        tags.sort();
+        assert_eq!(
+            tags,
+            vec![
+                "looked-at",
+                "threat:dangerous",
+                "threat:malware",
+                "threat:quarantined"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn move_quarantine_keeps_rules_off_the_moved_message() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.create_rule(
+            "acc-1",
+            "flag-everything",
+            r#"{"from":"*"}"#,
+            r#"{"flag":"flagged"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        let account = RunAccount {
+            id: "acc-1",
+            email: "me@example.com",
+        };
+        let mut session = FakeSession::default();
+        let config = ThreatConfig {
+            quarantine: envelope_email_transport::threat::Quarantine::Move,
+            ..ThreatConfig::default()
+        };
+        new_mail_pass(
+            &mut session,
+            &db,
+            &account,
+            "INBOX",
+            &[fixture_message()],
+            Some(&config),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session.calls,
+            vec![
+                "peek 42".to_string(),
+                "create Envelope/Quarantine".to_string(),
+                "move INBOX/42 -> Envelope/Quarantine".to_string(),
+            ]
+        );
     }
 }

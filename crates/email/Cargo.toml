@@ -54,6 +54,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
 futures-util.workspace = true
+ammonia = "4.2.0"
+idna = "1"
 
 [dev-dependencies]
 tempfile = "3"

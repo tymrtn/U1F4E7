@@ -8,6 +8,7 @@ pub mod agent_cockpit;
 pub mod agent_identity;
 pub mod build_info;
 pub mod contacts;
+pub mod correspondents;
 pub mod credential_store;
 pub mod crypto;
 pub mod db;

@@ -211,10 +211,11 @@ fn parse_allow_list(raw: &str) -> anyhow::Result<Vec<String>> {
 /// | move_message          | move             |
 /// | flag                  | flag             |
 /// | tag                   | tag              |
+/// | threat_show           | inbox.read       |
 pub fn tool_action(tool_name: &str) -> Option<&'static str> {
     Some(match tool_name {
         "accounts" => "accounts.list",
-        "inbox" | "read" | "search" => "inbox.read",
+        "inbox" | "read" | "search" | "threat_show" => "inbox.read",
         "folders" => "folders.list",
         "contacts" => "contacts.read",
         "send" | "reply" | "send_draft" => "send",

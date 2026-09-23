@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
+use envelope_email_transport::threat::Level;
 
 use super::common::setup_credentials;
 use super::provenance;
@@ -22,20 +23,30 @@ pub async fn run(
         .await
         .context("IMAP connection failed")?;
 
-    let message = envelope_email_transport::imap::fetch_message(&mut client, folder, uid).await?;
+    let message =
+        envelope_email_transport::imap::fetch_message_with_raw(&mut client, folder, uid).await?;
 
     match message {
-        Some(msg) => {
+        Some((msg, raw)) => {
+            let verdict = super::threat::verdict_for_read(&db, &creds, folder, uid, &raw)?;
             if json {
-                let value = ui::with_ui(
+                let mut value = ui::with_ui(
                     &msg,
                     ui::message_or_draft_ui(&db, &creds.account.id, msg.uid, folder),
                 );
+                super::threat::apply_read_policy(&mut value, verdict.as_ref());
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&provenance::annotate_inbound(value))?
                 );
             } else {
+                if let Some(v) = verdict.as_ref().filter(|v| v.level != Level::Clean) {
+                    println!(
+                        "Threat: {} ({}/100) - see `envelope threat explain {uid} --folder {folder}`",
+                        v.level.as_str(),
+                        v.score
+                    );
+                }
                 println!("From: {}", msg.from_addr);
                 let to_line = if msg.to_addrs.is_empty() {
                     msg.to_addr.clone()
@@ -59,7 +70,17 @@ pub async fn run(
                     println!("{text}");
                 } else if let Some(ref html) = msg.html_body {
                     println!("[HTML body — use --json for full content]");
-                    println!("{html}");
+                    if verdict
+                        .as_ref()
+                        .is_some_and(|v| v.level == Level::Dangerous)
+                    {
+                        println!(
+                            "{}",
+                            envelope_email_transport::sanitize::sanitize_email_html(html)
+                        );
+                    } else {
+                        println!("{html}");
+                    }
                 } else {
                     println!("[no body]");
                 }

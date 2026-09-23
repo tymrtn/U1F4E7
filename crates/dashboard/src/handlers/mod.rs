@@ -27,4 +27,5 @@ pub mod scheduled;
 pub mod snoozed;
 pub mod stats;
 pub mod threads;
+pub mod threat;
 pub mod watches;

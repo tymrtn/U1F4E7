@@ -31,6 +31,7 @@ pub mod provider;
 pub mod reply;
 pub mod rule_exec;
 pub mod rules;
+pub mod sanitize;
 pub mod secure_output;
 pub mod send_policy;
 pub mod sent_proof;
@@ -38,6 +39,7 @@ pub mod sieve;
 pub mod smtp;
 pub mod snooze_time;
 pub mod threading;
+pub mod threat;
 pub mod unsubscribe;
 pub mod url_guard;
 

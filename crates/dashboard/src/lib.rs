@@ -212,6 +212,19 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             }
         });
 
+        // Threat scan of new INBOX mail on each account's
+        // `sync.poll_interval_secs` timer (default 300s), checked every tick.
+        println!("Background threat scan: per-account timer (sync.poll_interval_secs)");
+        let threat_state = state.clone();
+        tokio::spawn(async move {
+            let mut last_run = std::collections::HashMap::new();
+            let mut interval = tokio::time::interval(handlers::threat::SWEEP_TICK);
+            loop {
+                interval.tick().await;
+                handlers::threat::run_sweep(&threat_state, &mut last_run).await;
+            }
+        });
+
         // The durable webhook delivery executor interleaves DB reads/writes with
         // HTTP awaits and holds a non-Send rusqlite handle across those awaits,
         // so it cannot run on the multi-threaded runtime's `tokio::spawn` (which
@@ -377,6 +390,19 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route(
             "/accounts/{id}/messages/{uid}/snooze",
             post(handlers::messages::snooze),
+        )
+        // Threat verdict: banner data (stored only), Mark safe, Report draft.
+        .route(
+            "/accounts/{id}/messages/{uid}/threat",
+            get(handlers::threat::show),
+        )
+        .route(
+            "/accounts/{id}/messages/{uid}/threat/mark-safe",
+            post(handlers::threat::mark_safe),
+        )
+        .route(
+            "/accounts/{id}/messages/{uid}/threat/report",
+            post(handlers::threat::report_draft),
         )
         .route("/accounts/{id}/search", get(handlers::messages::search))
         // Rules — read

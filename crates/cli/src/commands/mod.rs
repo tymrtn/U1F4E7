@@ -45,6 +45,7 @@ pub mod serve;
 pub mod snooze;
 pub mod tag;
 pub mod thread;
+pub mod threat;
 pub mod ui;
 pub mod unsubscribe_cmd;
 pub mod watch;

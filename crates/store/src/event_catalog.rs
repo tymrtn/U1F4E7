@@ -30,6 +30,13 @@ pub const MESSAGE_SEEN: &str = "message_seen";
 /// `envelope actions confirm <event_id>`.
 pub const ACTION_OFFERED: &str = "action_offered";
 
+/// The threat engine scored a message. The payload is the verdict (score,
+/// level, signals with host/hash evidence, analyzers); never bodies.
+pub const THREAT_VERDICT: &str = "threat_verdict";
+/// A label (tag) was applied to a message by a person or agent, e.g.
+/// `threat:false_positive` from `envelope threat mark-safe`.
+pub const LABEL_APPLIED: &str = "label_applied";
+
 /// All catalog event types, for validation and documentation.
 pub const ALL_EVENT_TYPES: &[&str] = &[
     NEW_MESSAGE,
@@ -41,6 +48,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_ACTION,
     MESSAGE_SEEN,
     ACTION_OFFERED,
+    THREAT_VERDICT,
+    LABEL_APPLIED,
 ];
 
 /// Is `event_type` a known catalog event? Unknown types are still deliverable
@@ -100,6 +109,8 @@ mod tests {
         assert!(is_known_event_type(GOVERNOR_BLOCKED));
         assert!(is_known_event_type(MESSAGE_SEEN));
         assert!(is_known_event_type(ACTION_OFFERED));
+        assert!(is_known_event_type(THREAT_VERDICT));
+        assert!(is_known_event_type(LABEL_APPLIED));
         assert!(!is_known_event_type("totally_made_up"));
     }
 

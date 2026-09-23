@@ -10,6 +10,8 @@
 use crate::ConfigCmd;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::app_data_dir;
+use envelope_email_transport::threat::config as threat_config;
+use envelope_email_transport::threat::{ThreatConfig, persist as threat_persist};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::ErrorKind;
@@ -38,6 +40,9 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
     let key = cmd_key(&cmd).to_string();
     if key == DASHBOARD_AUTH_TOKEN_KEY || key == DASHBOARD_TAILSCALE_ALLOW_KEY {
         return run_generic_dashboard_field(cmd, &key, json_output);
+    }
+    if threat_config::is_threat_key(&key) {
+        return run_threat_field(cmd, &key, json_output);
     }
     match cmd {
         ConfigCmd::Get { key } => {
@@ -161,7 +166,9 @@ fn require_supported_key(key: &str) -> Result<()> {
         DASHBOARD_BASE_URL_KEY | DASHBOARD_AUTH_TOKEN_KEY | DASHBOARD_TAILSCALE_ALLOW_KEY => Ok(()),
         _ => bail!(
             "unknown config key `{key}`; supported keys: {DASHBOARD_BASE_URL_KEY}, \
-             {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}"
+             {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}, threat.enabled, \
+             threat.quarantine, threat.on_read, threat.report_to, threat.analyzers.<name>, \
+             sync.poll_interval_secs"
         ),
     }
 }
@@ -243,6 +250,154 @@ fn run_generic_dashboard_field(cmd: ConfigCmd, key: &str, json_output: bool) -> 
             }
             Ok(())
         }
+    }
+}
+
+/// The effective value of a threat/sync key (stored or default).
+fn effective_threat_value(key: &str, config: &ThreatConfig) -> Value {
+    match key {
+        "threat.enabled" => json!(config.enabled),
+        "threat.quarantine" => json!(config.quarantine.as_str()),
+        "threat.on_read" => json!(config.on_read),
+        "threat.report_to" => json!(config.report_to),
+        "sync.poll_interval_secs" => json!(config.poll_interval_secs),
+        _ => key
+            .strip_prefix("threat.analyzers.")
+            .map(|name| json!(config.analyzer_enabled(name)))
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn set_nested(config: &mut Value, key: &str, value: Value) -> Result<()> {
+    let parts: Vec<&str> = key.split('.').collect();
+    let (leaf, parents) = parts.split_last().expect("dotted key has a leaf");
+    let mut cursor = config;
+    for part in parents {
+        cursor = config_object(cursor)?
+            .entry(part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    config_object(cursor)?.insert(leaf.to_string(), value);
+    Ok(())
+}
+
+fn unset_nested(config: &mut Value, key: &str) -> Result<()> {
+    fn remove(value: &mut Value, parts: &[&str]) -> Result<()> {
+        let map = config_object(value)?;
+        match parts {
+            [leaf] => {
+                map.remove(*leaf);
+            }
+            [head, rest @ ..] => {
+                if let Some(child) = map.get_mut(*head) {
+                    remove(child, rest)?;
+                    if child.as_object().is_some_and(Map::is_empty) {
+                        map.remove(*head);
+                    }
+                }
+            }
+            [] => {}
+        }
+        Ok(())
+    }
+    let parts: Vec<&str> = key.split('.').collect();
+    remove(config, &parts)
+}
+
+/// Install the quarantine rule for every account when `threat.quarantine`
+/// becomes `move`, so it is visible and editable before the first move.
+fn install_quarantine_rules() -> Result<Vec<String>> {
+    let db = envelope_email_store::Database::open_default()
+        .context("open the database to install the quarantine rule")?;
+    let mut installed = Vec::new();
+    for account in db.list_accounts().context("list accounts")? {
+        threat_persist::ensure_quarantine_rule(&db, &account.id)
+            .with_context(|| format!("install the quarantine rule for {}", account.username))?;
+        installed.push(account.username);
+    }
+    Ok(installed)
+}
+
+/// get/set/unset for typed `threat.*` and `sync.*` keys.
+fn run_threat_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> {
+    let path = config_file_path();
+    let mut config = read_config_value(&path)?;
+    match cmd {
+        ConfigCmd::Get { .. } => {
+            let stored = config.pointer(&threat_config::pointer_for(key)).cloned();
+            let effective = effective_threat_value(key, &ThreatConfig::from_config_value(&config)?);
+            if json_output {
+                let obj = json!({
+                    "key": key,
+                    "value": effective,
+                    "configured": stored.is_some(),
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                let suffix = if stored.is_some() { "" } else { " (default)" };
+                println!("{key}={}{suffix}", display_value(&effective));
+            }
+        }
+        ConfigCmd::Set { value, .. } => {
+            let typed = threat_config::parse_value(key, &value)?;
+            set_nested(&mut config, key, typed.clone())?;
+            // Refuse to write a file the engine would then reject.
+            ThreatConfig::from_config_value(&config)?;
+            write_config_value(&path, &config)?;
+            let installed = if key == "threat.quarantine" && typed == json!("move") {
+                Some(install_quarantine_rules()?)
+            } else {
+                None
+            };
+            if json_output {
+                let mut obj = json!({
+                    "status": "set",
+                    "key": key,
+                    "value": typed,
+                    "config_path": display_config_path(),
+                });
+                if let Some(accounts) = &installed {
+                    obj["quarantine_rule"] = json!({
+                        "name": threat_persist::QUARANTINE_RULE_NAME,
+                        "accounts": accounts,
+                    });
+                }
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("Set {key}={}", display_value(&typed));
+                if let Some(accounts) = installed {
+                    println!(
+                        "Rule '{}' (score_above threat 70 -> move {}) is installed for {} account(s); edit it with `envelope rule`.",
+                        threat_persist::QUARANTINE_RULE_NAME,
+                        threat_persist::QUARANTINE_FOLDER,
+                        accounts.len()
+                    );
+                }
+            }
+        }
+        ConfigCmd::Unset { .. } => {
+            unset_nested(&mut config, key)?;
+            write_config_value(&path, &config)?;
+            if json_output {
+                let obj = json!({
+                    "status": "unset",
+                    "key": key,
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("Unset {key}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -546,6 +701,25 @@ mod tests {
 
         let allow = resolved_dashboard_tailscale_allow();
         assert_eq!(allow, vec!["skippy@tail.ts.net", "tyler@tail.ts.net"]);
+    }
+
+    #[test]
+    fn threat_keys_are_typed_nested_and_keep_other_keys() {
+        let mut config = json!({"dashboard": {"base_url": "https://x"}});
+        set_nested(&mut config, "threat.analyzers.links", json!(false)).unwrap();
+        set_nested(&mut config, "sync.poll_interval_secs", json!(120)).unwrap();
+        assert_eq!(config["dashboard"]["base_url"], "https://x");
+        let parsed = ThreatConfig::from_config_value(&config).unwrap();
+        assert!(!parsed.analyzer_enabled("links"));
+        assert_eq!(parsed.poll_interval_secs, 120);
+        assert_eq!(
+            effective_threat_value("threat.quarantine", &parsed),
+            json!("tag")
+        );
+
+        unset_nested(&mut config, "threat.analyzers.links").unwrap();
+        unset_nested(&mut config, "sync.poll_interval_secs").unwrap();
+        assert_eq!(config, json!({"dashboard": {"base_url": "https://x"}}));
     }
 
     #[test]
