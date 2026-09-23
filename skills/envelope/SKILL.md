@@ -55,16 +55,16 @@ harness HOME drift is the usual "no accounts" failure.
 
 ## Send policy
 
-Sending is allowed. Agent/MCP sessions apply a send-mode policy (`draft-only`,
-`confirm-send`, `allowlisted-send`, `autonomous-send`) that makes the send
-contextual — policy around the send, not a ban on sending.
+Sending is allowed. Agent/MCP sessions attach a send-mode policy (`draft-only`,
+`confirm-send`, `allowlisted-send`, `autonomous-send`) as context around each
+send.
 
 - Inspect the thread (`thread` / `read`) before composing a reply.
 - Draft tools (`create_reply_draft`, `create_forward_draft`, CLI
   `envelope draft create`) produce a reviewable message. Never write a loose
   `.eml` as a draft.
-- `send`, `reply`, and `send_draft` are real tools. The active agent policy
-  decides whether a call parks a draft, asks for confirmation, or sends.
+- `send`, `reply`, and `send_draft` are available. Honor the active send-mode
+  policy on the agent token as context for the send.
 - Discover accounts with `accounts` / `envelope accounts list --json`. Pass
   explicit `--account` / `account`. Never invent a From/CC.
 
@@ -94,8 +94,8 @@ The stdio server exposes the same contract as the CLI, including `inbox`,
 `reply`, `rules_preview`, `rules_run`, `watch_status`, `threat_show`, and
 `governor_catalog`.
 
-`send`, `reply`, and `send_draft` are available; honor the active send-mode
-policy on the agent token rather than assuming send is blocked.
+`send`, `reply`, and `send_draft` are available. Apply the active send-mode
+policy on the agent token as context for the send.
 
 ## Safety
 
