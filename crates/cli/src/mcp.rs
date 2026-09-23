@@ -449,6 +449,7 @@ async fn dispatch_tool_call(
         "rules_run" => handle_rules_run(params, backend, ctx).await,
         "watch_status" => handle_watch_status(params, backend).await,
         "snooze" => handle_snooze(params, backend, ctx).await,
+        "threat_show" => handle_threat_show(params),
         _ => Err(format!("unknown tool: {tool_name}")),
     }
 }
@@ -537,15 +538,53 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
         .await
         .map_err(|e| e.to_string())?;
 
-    let message = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
+    let (message, raw) =
+        envelope_email_transport::imap::fetch_message_with_raw(&mut client, folder, uid)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
+    let verdict = crate::commands::threat::verdict_for_read(&db, &creds, folder, uid, &raw)
+        .map_err(|e| format!("{e:#}"))?;
 
-    Ok(wrap_untrusted(ui::with_ui(
+    let mut value = ui::with_ui(
         &message,
         ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
-    )))
+    );
+    crate::commands::threat::apply_read_policy(&mut value, verdict.as_ref());
+    Ok(wrap_untrusted(value))
+}
+
+/// Read-only threat verdict lookup: local store only, no IMAP, no scan.
+fn handle_threat_show(params: &Value) -> Result<Value, String> {
+    let uid = params
+        .get("uid")
+        .and_then(|v| v.as_u64())
+        .ok_or("uid is required")? as u32;
+    let folder = optional_str(params, "folder").unwrap_or("INBOX");
+    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let account = crate::commands::common::resolve_account(&db, optional_str(params, "account"))
+        .map_err(|e| format!("{e:#}"))?;
+    let stored = envelope_email_transport::threat::persist::stored_verdict_for_uid(
+        &db,
+        &account.id,
+        folder,
+        uid,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    match stored {
+        Some(stored) => {
+            let mut value = crate::commands::threat::verdict_json(&db, &account.id, &stored)
+                .map_err(|e| format!("{e:#}"))?;
+            value["status"] = json!("verdict");
+            Ok(value)
+        }
+        None => Ok(json!({
+            "status": "not_scanned",
+            "account_id": account.id,
+            "folder": folder,
+            "uid": uid,
+        })),
+    }
 }
 
 async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Value, String> {

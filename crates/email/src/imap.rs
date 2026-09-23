@@ -770,6 +770,18 @@ pub async fn fetch_message(
     folder: &str,
     uid: u32,
 ) -> Result<Option<Message>, ImapError> {
+    Ok(fetch_message_with_raw(client, folder, uid)
+        .await?
+        .map(|(message, _)| message))
+}
+
+/// [`fetch_message`] plus the raw RFC822 bytes it parsed, for callers that
+/// also scan the message (the threat engine). Same `BODY.PEEK[]` fetch.
+pub async fn fetch_message_with_raw(
+    client: &mut ImapClient,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<(Message, Vec<u8>)>, ImapError> {
     validate_imap_input(folder)?;
 
     client
@@ -849,24 +861,43 @@ pub async fn fetch_message(
         })
         .collect();
 
-    Ok(Some(Message {
-        uid,
-        message_id,
-        from_addr,
-        to_addr,
-        cc_addr,
-        to_addrs,
-        cc_addrs,
-        subject,
-        date,
-        text_body,
-        html_body,
-        in_reply_to,
-        references,
-        flags,
-        attachments,
-        provider_spam,
-    }))
+    Ok(Some((
+        Message {
+            uid,
+            message_id,
+            from_addr,
+            to_addr,
+            cc_addr,
+            to_addrs,
+            cc_addrs,
+            subject,
+            date,
+            text_body,
+            html_body,
+            in_reply_to,
+            references,
+            flags,
+            attachments,
+            provider_spam,
+        },
+        body.to_vec(),
+    )))
+}
+
+/// Raw RFC822 bytes of one message, opened with `EXAMINE` and fetched with
+/// `BODY.PEEK[]`: scanning never sets `\Seen` or mutates the mailbox.
+pub async fn fetch_raw_message(
+    client: &mut ImapClient,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<Vec<u8>>, ImapError> {
+    examine_folder_info(client, folder).await?;
+    let mut messages =
+        fetch_raw_messages_selected_uid_set(client, folder, &uid.to_string()).await?;
+    Ok(messages
+        .iter()
+        .position(|m| m.uid == uid)
+        .map(|i| messages.swap_remove(i).rfc822))
 }
 
 /// Append a message to a folder with the given flags.
@@ -1997,13 +2028,24 @@ pub async fn remove_flag(
     Ok(())
 }
 
-/// Fetch a specific attachment by filename from a message, returning (filename, raw bytes).
+/// One attachment fetched for download, with the identity of the message it
+/// came from (the threat gate checks that message's verdict tags).
+#[derive(Debug, Clone)]
+pub struct DownloadedAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    /// Canonical (unbracketed) Message-ID of the containing message.
+    pub message_id: Option<String>,
+}
+
+/// Fetch a specific attachment by filename from a message.
 pub async fn download_attachment(
     client: &mut ImapClient,
     uid: u32,
     filename: &str,
     folder: &str,
-) -> Result<(String, Vec<u8>), ImapError> {
+) -> Result<DownloadedAttachment, ImapError> {
     validate_imap_input(folder)?;
 
     client
@@ -2055,7 +2097,18 @@ pub async fn download_attachment(
                     att_name
                 ))
             })?;
-            return Ok((att_name, attachment.contents().to_vec()));
+            let content_type = attachment
+                .content_type()
+                .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            return Ok(DownloadedAttachment {
+                filename: att_name,
+                content_type: ingress::normalize_content_type(&content_type),
+                bytes: attachment.contents().to_vec(),
+                message_id: parsed
+                    .message_id()
+                    .map(|m| envelope_email_store::canonical_message_id(m).to_string()),
+            });
         }
     }
     Err(ImapError::Protocol(format!(

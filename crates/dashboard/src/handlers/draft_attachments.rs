@@ -31,7 +31,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::handlers::attachments::attachment_disposition;
+use crate::handlers::attachments::{attachment_disposition, blocked_response};
 use crate::handlers::drafts::{draft_error, draft_json, ensure_draft_account};
 use crate::state::AppState;
 
@@ -192,6 +192,26 @@ pub async fn upload(
                 ),
             )
                 .into_response();
+        }
+
+        let content_type_hint = incoming.content_type.trim();
+        match envelope_email_transport::threat::persist::attachment_block(
+            &db,
+            &account_id,
+            None,
+            &filename,
+            content_type_hint,
+            &data,
+        ) {
+            Ok(None) => {}
+            Ok(Some(block)) => return blocked_response(&block),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("threat check failed: {e:#}"),
+                )
+                    .into_response();
+            }
         }
 
         let taken: Vec<String> = merged

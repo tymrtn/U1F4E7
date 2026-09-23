@@ -426,8 +426,9 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
     );
     let tools = read_message(&mut stdout);
     let tool_entries = tools["result"]["tools"].as_array().expect("tools array");
-    // 22 mailbox tools + the read-only governor_catalog discovery tool (v2).
-    assert_eq!(tool_entries.len(), 23);
+    // 23 mailbox tools (incl. read-only threat_show) + the read-only
+    // governor_catalog discovery tool (v2).
+    assert_eq!(tool_entries.len(), 24);
     for name in [
         "bulk",
         "thread",
@@ -436,6 +437,7 @@ fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
         "watch_status",
         "snooze",
         "governor_catalog",
+        "threat_show",
     ] {
         assert!(
             tool_entries.iter().any(|tool| tool["name"] == name),
@@ -527,7 +529,7 @@ fn mcp_stdio_speaks_newline_delimited_json_rpc_per_spec() {
             .as_array()
             .expect("tools array")
             .len(),
-        23
+        24
     );
 
     drop(stdin);
@@ -1278,6 +1280,7 @@ fn contract_export_declares_wave3_tools_and_gates() {
     assert_eq!(map["rules_run"], "rules.run");
     assert_eq!(map["watch_status"], "watch.read");
     assert_eq!(map["snooze"], "snooze");
+    assert_eq!(map["threat_show"], "inbox.read");
 
     let ai = &contract["agent_identity"];
     assert!(ai["bulk_two_action_gate"].is_string());

@@ -382,6 +382,12 @@ enum Commands {
         subcommand: ActionsCmd,
     },
 
+    /// rShield threat engine: scan, show, explain, mark-safe, release, report, stats
+    Threat {
+        #[command(subcommand)]
+        subcommand: ThreatCmd,
+    },
+
     /// What this install has observed about a message (local reads only)
     Analytics {
         #[command(subcommand)]
@@ -800,6 +806,9 @@ enum AttachmentCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Write the bytes even when the threat engine flags them as malware
+        #[arg(long = "unsafe")]
+        allow_unsafe: bool,
     },
 }
 
@@ -1107,6 +1116,88 @@ enum ActionsCmd {
 enum ActionsExecCmd {
     /// Record an event as handled locally without mutating the mailbox
     MarkHandled,
+}
+
+#[derive(Subcommand)]
+enum ThreatCmd {
+    /// Scan the newest messages in a folder (read-only fetch; records verdicts
+    /// and applies threat.quarantine)
+    Scan {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Newest N messages to scan
+        #[arg(long, default_value = "50")]
+        limit: u32,
+    },
+    /// Show a message's verdict (scans it when none is stored)
+    Show {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show the signal arithmetic behind a verdict
+    Explain {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Mark a message safe (tag threat:false_positive; releases attachment blocks)
+    MarkSafe {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Move a quarantined message back (attributed in the action log)
+    Release {
+        /// Message UID in the quarantine folder
+        uid: u32,
+        /// Folder the message is in
+        #[arg(long, default_value = "Envelope/Quarantine")]
+        folder: String,
+        /// Destination folder
+        #[arg(long, default_value = "INBOX")]
+        to: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Draft a phishing report to threat.report_to with the original attached
+    /// (draft only; send it yourself with `envelope draft send`)
+    Report {
+        /// Message UID
+        uid: u32,
+        /// IMAP folder
+        #[arg(long, default_value = "INBOX")]
+        folder: String,
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Verdict counts with non-clean and unavailable rates
+    Stats {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2196,12 +2287,14 @@ fn main() {
                 output,
                 folder,
                 account,
+                allow_unsafe,
             } => commands::attachments::run_download(
                 uid,
                 &filename,
                 output.as_deref(),
                 &folder,
                 account.as_deref(),
+                allow_unsafe,
                 cli.json,
                 backend,
             ),
@@ -2426,6 +2519,51 @@ fn main() {
                     commands::actions::run_exec_mark_handled(&event_id, &actor, cli.json, backend)
                 }
             },
+        },
+        Commands::Threat { subcommand } => match subcommand {
+            ThreatCmd::Scan {
+                account,
+                folder,
+                limit,
+            } => commands::threat::run_scan(account.as_deref(), &folder, limit, cli.json, backend),
+            ThreatCmd::Show {
+                uid,
+                folder,
+                account,
+            } => commands::threat::run_show(uid, &folder, account.as_deref(), cli.json, backend),
+            ThreatCmd::Explain {
+                uid,
+                folder,
+                account,
+            } => commands::threat::run_explain(uid, &folder, account.as_deref(), cli.json, backend),
+            ThreatCmd::MarkSafe {
+                uid,
+                folder,
+                account,
+            } => {
+                commands::threat::run_mark_safe(uid, &folder, account.as_deref(), cli.json, backend)
+            }
+            ThreatCmd::Release {
+                uid,
+                folder,
+                to,
+                account,
+            } => commands::threat::run_release(
+                uid,
+                &folder,
+                &to,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
+            ThreatCmd::Report {
+                uid,
+                folder,
+                account,
+            } => commands::threat::run_report(uid, &folder, account.as_deref(), cli.json, backend),
+            ThreatCmd::Stats { account } => {
+                commands::threat::run_stats(account.as_deref(), cli.json)
+            }
         },
         Commands::Analytics { subcommand } => match subcommand {
             AnalyticsCmd::Show {

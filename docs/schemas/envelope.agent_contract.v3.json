@@ -65,6 +65,7 @@
       "snooze": "snooze",
       "tag": "tag",
       "thread": "inbox.read",
+      "threat_show": "inbox.read",
       "watch_status": "watch.read"
     }
   },
@@ -1156,6 +1157,33 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v3",
+      "description": "Read-only: the stored rShield threat verdict for a message (score 0-100, level clean/suspicious/dangerous/unavailable, signals with host/hash evidence, and the score arithmetic). Never scans and never opens IMAP; returns status=not_scanned when no verdict exists.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address; default account if omitted",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "name": "threat_show"
+    },
+    {
+      "contractSchema": "envelope.agent_contract.v3",
       "description": "Snooze, list, or cancel snoozed messages. action=set moves a message to the Snoozed folder until a return time; action=list returns snoozed records; action=cancel returns a message to its original folder. Requires the snooze policy action.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1432,6 +1460,10 @@
             "description": "References header when available",
             "type": "string"
           },
+          "sanitized": {
+            "description": "true when the message's threat verdict is dangerous and html_body was served through the server-side sanitizer",
+            "type": "boolean"
+          },
           "subject": {
             "description": "Subject",
             "type": "string"
@@ -1439,6 +1471,13 @@
           "text_body": {
             "description": "Plain-text body",
             "type": "string"
+          },
+          "threat": {
+            "description": "Threat verdict summary {level, score, engine_version}; null when the message has no verdict",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "to_addr": {
             "description": "First recipient address (compat; see to_addrs for full list)",
@@ -1655,6 +1694,166 @@
           "uid",
           "seen",
           "note"
+        ],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
+        "command": "envelope threat show <uid> --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "MCP threat_show is read-only: it returns the stored verdict and never opens IMAP; status=not_scanned when none exists.",
+        "The CLI scans (EXAMINE + BODY.PEEK[]) when no current verdict is stored."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address; default account if omitted",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": true,
+        "tool": "threat_show"
+      },
+      "name": "threat_show",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "description": "Resolved account id",
+            "type": "string"
+          },
+          "explain": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "folder": {
+            "description": "IMAP folder the verdict was recorded for",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "Message-ID when known",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recorded_at": {
+            "description": "RFC 3339 time the verdict was recorded",
+            "type": "string"
+          },
+          "status": {
+            "description": "verdict, or not_scanned when no verdict is stored (MCP never scans)",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          },
+          "verdict": {
+            "additionalProperties": false,
+            "properties": {
+              "analyzers_run": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "analyzers_skipped": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "computed_at": {
+                "description": "RFC 3339 time of the scan",
+                "type": "string"
+              },
+              "engine_version": {
+                "description": "Threat engine version",
+                "type": "string"
+              },
+              "level": {
+                "description": "clean, suspicious (>= 30), dangerous (>= 70), or unavailable (a required analyzer failed)",
+                "type": "string"
+              },
+              "score": {
+                "description": "0..100, the capped sum of signal weights",
+                "type": "integer"
+              },
+              "signals": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "description": "Stable signal code, e.g. lookalike_domain, ar_forged, double_extension",
+                      "type": "string"
+                    },
+                    "evidence": {
+                      "description": "Hosts, domains, extensions and hashes only; never bodies",
+                      "type": "string"
+                    },
+                    "malware": {
+                      "description": "Malware-grade: attachments refuse download",
+                      "type": "boolean"
+                    },
+                    "weight": {
+                      "description": "Points added to the score",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "weight",
+                    "evidence"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "score",
+              "level",
+              "signals",
+              "analyzers_run",
+              "analyzers_skipped",
+              "engine_version",
+              "computed_at"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "account_id",
+          "uid"
         ],
         "type": "object"
       },

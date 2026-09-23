@@ -612,6 +612,26 @@ async fn append_draft_required(
     Ok((folder, uid))
 }
 
+/// Build, APPEND and record a threat report draft (`envelope threat report`).
+/// Draft only: sending it is a separate `envelope draft send`, which runs the
+/// Governor gate like every other send.
+pub(crate) async fn create_threat_report_draft(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    report: &envelope_email_transport::threat::report::ReportDraft,
+) -> Result<(envelope_email_store::Draft, String, Option<u32>)> {
+    use envelope_email_transport::threat::report;
+    let (rfc822, message_id) = report::report_rfc822(
+        creds.account.display_name.as_deref(),
+        &creds.account.username,
+        report,
+    )?;
+    let (folder, uid) = append_draft_required(db, creds, &rfc822, &message_id).await?;
+    let draft =
+        report::record_report_draft(db, &creds.account.id, report, &folder, uid, &message_id)?;
+    Ok((draft, folder, uid))
+}
+
 /// All the resolved fields needed to instantiate a contextual draft.
 ///
 /// Built once by [`run_reply`]/[`run_forward`] and consumed by
@@ -839,11 +859,12 @@ async fn snapshot_source_attachments(
         .context("failed to connect to IMAP for source attachments")?;
     let mut snapshots = Vec::with_capacity(source_attachments.len());
     for meta in source_attachments {
-        let (filename, data) = imap::download_attachment(&mut client, uid, &meta.filename, folder)
+        let downloaded = imap::download_attachment(&mut client, uid, &meta.filename, folder)
             .await
             .with_context(|| format!("failed to download source attachment: {}", meta.filename))?;
+        let data = downloaded.bytes;
         snapshots.push(serde_json::json!({
-            "filename": filename,
+            "filename": downloaded.filename,
             "content_type": meta.content_type,
             "size": data.len(),
             "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),

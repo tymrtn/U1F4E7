@@ -1,6 +1,29 @@
 import { describe, expect, it } from 'vitest';
 
 import { isSafeLinkUrl, sanitizeEmailHtml } from './rich-html';
+import fixtures from './sanitize-fixtures.json';
+
+interface SanitizeFixture {
+  name: string;
+  input: string;
+  must_contain: string[];
+  must_not_match: string[];
+}
+
+// The same cases run against the server-side sanitizer
+// (crates/email/src/sanitize.rs), so the two policies cannot drift apart.
+describe('shared sanitizer fixtures', () => {
+  for (const fixture of fixtures.cases as SanitizeFixture[]) {
+    it(fixture.name, () => {
+      const html = sanitizeEmailHtml(fixture.input, {
+        remoteImages: false,
+        externalLinkTargets: false
+      }).html;
+      for (const needle of fixture.must_contain) expect(html).toContain(needle);
+      for (const pattern of fixture.must_not_match) expect(html).not.toMatch(new RegExp(pattern, 'i'));
+    });
+  }
+});
 
 describe('rich HTML policy', () => {
   it('removes active elements, event handlers, embeds, and navigation attributes', () => {

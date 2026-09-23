@@ -1133,7 +1133,7 @@ pub async fn read(
     // connection before surfacing a 502. Bounded to a single retry.
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+        let (client_arc, creds) = match state.get_or_create_imap(&account_id).await {
             Ok(c) => c,
             Err(e) => {
                 return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
@@ -1141,19 +1141,36 @@ pub async fn read(
         };
         let fetched = {
             let mut client = client_arc.lock().await;
-            envelope_email_transport::imap::fetch_message(&mut client, &q.folder, uid).await
+            envelope_email_transport::imap::fetch_message_with_raw(&mut client, &q.folder, uid)
+                .await
         };
 
         match fetched {
-            Ok(Some(msg)) => {
+            Ok(Some((msg, raw))) => {
                 let thread_context =
                     thread_context_for_uid(&state, &account_id, &q.folder, uid).await;
+                // Scan on open when there is no current verdict. A failed scan
+                // is reported to the reader, never shown as a clean message.
+                let threat = {
+                    let db = state.db.lock().await;
+                    match crate::handlers::threat::verdict_for_open(
+                        &db,
+                        &account_id,
+                        &creds.account.username,
+                        &q.folder,
+                        uid,
+                        &raw,
+                    ) {
+                        Ok(view) => json!(view),
+                        Err(e) => json!({"level": "unavailable", "error": format!("{e:#}")}),
+                    }
+                };
                 let message = DashboardMessage {
                     unread: message_is_unread(&msg),
                     message: msg,
                     thread_context,
                 };
-                return Json(json!({ "message": message })).into_response();
+                return Json(json!({ "message": message, "threat": threat })).into_response();
             }
             Ok(None) => return (StatusCode::NOT_FOUND, "message not found").into_response(),
             Err(e) => {

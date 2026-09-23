@@ -398,10 +398,18 @@ impl ExecDb for DashboardDb<'_> {
 /// [`RuleMailbox`] over the dashboard's pooled client. Canonical sentinels
 /// resolve through `resolve_canonical_folder`, which keeps the dashboard's
 /// no-guard-across-await discipline.
-struct DashboardMailbox<'a> {
-    state: &'a AppState,
-    client: &'a mut envelope_email_transport::ImapClient,
-    account_id: &'a str,
+pub(crate) struct DashboardMailbox<'a> {
+    pub(crate) state: &'a AppState,
+    pub(crate) client: &'a mut envelope_email_transport::ImapClient,
+    pub(crate) account_id: &'a str,
+}
+
+impl envelope_email_transport::threat::persist::RawFetch for DashboardMailbox<'_> {
+    async fn fetch_raw(&mut self, folder: &str, uid: u32) -> anyhow::Result<Option<Vec<u8>>> {
+        envelope_email_transport::imap::fetch_raw_message(self.client, folder, uid)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to fetch UID {uid} in {folder} for scanning: {e}"))
+    }
 }
 
 impl RuleMailbox for DashboardMailbox<'_> {

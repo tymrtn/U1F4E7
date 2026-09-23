@@ -30,9 +30,49 @@ export interface MessageDetailFull extends Omit<MessageDetail, 'attachments'> {
   attachments?: AttachmentMeta[] | null;
 }
 
+// ── Threat verdict ────────────────────────────────────────────────────
+
+export type ThreatLevel = 'clean' | 'suspicious' | 'dangerous' | 'unavailable';
+
+export interface ThreatSignal {
+  code: string;
+  weight: number;
+  evidence: string;
+  malware?: boolean;
+}
+
+/**
+ * The reader's view of a threat verdict (crates/dashboard/src/handlers/threat.rs
+ * `verdict_view`). `error` is set only when the scan on open failed; the level
+ * is then `unavailable`, never `clean`.
+ */
+export interface ThreatView {
+  level: ThreatLevel;
+  score?: number;
+  signals?: ThreatSignal[];
+  explain?: string[];
+  engine_version?: string;
+  computed_at?: string;
+  marked_safe?: boolean;
+  malware?: boolean;
+  tags?: string[];
+  error?: string;
+}
+
 /** Wrapper matching GET /api/accounts/{id}/messages/{uid} response shape. */
 export interface MessageDetailFullResponse {
   message: MessageDetailFull;
+  /** Null when the threat engine is off or has no verdict. */
+  threat?: ThreatView | null;
+}
+
+export interface ThreatReportResponse {
+  status: 'drafted';
+  sent: false;
+  draft_id: string;
+  to: string;
+  subject: string;
+  imap_folder: string;
 }
 
 // ── Thread types ──────────────────────────────────────────────────────
@@ -109,6 +149,33 @@ export function postFlags(
   return request<FlagsResponse>(
     `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/flags`,
     { ...o, method: 'POST', body: { folder, add, remove } }
+  );
+}
+
+/** Tag the message threat:false_positive (and release its attachments). */
+export function postThreatMarkSafe(
+  accountId: string,
+  uid: number,
+  folder: string,
+  o?: RequestOptions
+): Promise<{ status: 'marked_safe'; threat: ThreatView }> {
+  return request(`/accounts/${encodeURIComponent(accountId)}/messages/${uid}/threat/mark-safe`, {
+    ...o,
+    method: 'POST',
+    query: { folder }
+  });
+}
+
+/** Draft a phishing report with the original attached. Never sends. */
+export function postThreatReport(
+  accountId: string,
+  uid: number,
+  folder: string,
+  o?: RequestOptions
+): Promise<ThreatReportResponse> {
+  return request<ThreatReportResponse>(
+    `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/threat/report`,
+    { ...o, method: 'POST', query: { folder } }
   );
 }
 

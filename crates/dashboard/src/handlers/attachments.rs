@@ -3,11 +3,14 @@
 
 //! Attachment download handler.
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use envelope_email_transport::threat::persist::AttachmentBlock;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::state::AppState;
 
@@ -48,6 +51,20 @@ pub(crate) fn attachment_disposition(
     format!("{disposition}; filename=\"{safe_filename}\"")
 }
 
+/// 403 with the stable `attachment_blocked` code, shared by the message and
+/// draft attachment chokepoints.
+pub(crate) fn blocked_response(block: &AttachmentBlock) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "code": block.code,
+            "error": block.reason,
+            "signals": block.signals,
+        })),
+    )
+        .into_response()
+}
+
 pub async fn download(
     State(state): State<AppState>,
     Path((account_id, uid, filename)): Path<(String, u32, String)>,
@@ -59,37 +76,58 @@ pub async fn download(
             return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response();
         }
     };
-    let mut client = client_arc.lock().await;
-
-    match envelope_email_transport::imap::download_attachment(
-        &mut client,
-        uid,
-        &filename,
-        &q.folder,
-    )
-    .await
-    {
-        Ok((fname, data)) => {
-            let guessed_content_type = mime_guess::from_path(&fname)
-                .first_or_octet_stream()
-                .to_string();
-            let content_type =
-                envelope_email_transport::ingress::normalize_content_type(&guessed_content_type);
-            Response::builder()
-                .header(header::CONTENT_TYPE, content_type.clone())
-                .header("X-Content-Type-Options", "nosniff")
-                .header(
-                    header::CONTENT_DISPOSITION,
-                    attachment_disposition(&fname, q.inline, &content_type, &data),
-                )
-                .body(Body::from(data))
-                .unwrap()
-        }
+    let fetched = {
+        let mut client = client_arc.lock().await;
+        envelope_email_transport::imap::download_attachment(&mut client, uid, &filename, &q.folder)
+            .await
+    };
+    let attachment = match fetched {
+        Ok(attachment) => attachment,
         Err(e) => {
             state.evict_imap(&account_id).await;
-            (StatusCode::BAD_GATEWAY, format!("download: {e}")).into_response()
+            return (StatusCode::BAD_GATEWAY, format!("download: {e}")).into_response();
+        }
+    };
+
+    let block = {
+        let db = state.db.lock().await;
+        envelope_email_transport::threat::persist::attachment_block(
+            &db,
+            &account_id,
+            attachment.message_id.as_deref(),
+            &attachment.filename,
+            &attachment.content_type,
+            &attachment.bytes,
+        )
+    };
+    match block {
+        Ok(None) => {}
+        Ok(Some(block)) => return blocked_response(&block),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("threat check failed: {e:#}"),
+            )
+                .into_response();
         }
     }
+
+    let fname = attachment.filename;
+    let data = attachment.bytes;
+    let guessed_content_type = mime_guess::from_path(&fname)
+        .first_or_octet_stream()
+        .to_string();
+    let content_type =
+        envelope_email_transport::ingress::normalize_content_type(&guessed_content_type);
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type.clone())
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            header::CONTENT_DISPOSITION,
+            attachment_disposition(&fname, q.inline, &content_type, &data),
+        )
+        .body(Body::from(data))
+        .unwrap()
 }
 
 #[cfg(test)]

@@ -156,7 +156,8 @@ pub fn agent_contract() -> Value {
                 "rules_preview": "rules.read",
                 "rules_run": "rules.run",
                 "watch_status": "watch.read",
-                "snooze": "snooze"
+                "snooze": "snooze",
+                "threat_show": "inbox.read"
             },
             "always_allowed_readonly_tools": ["governor_catalog"],
             "always_allowed_note": "governor_catalog is a read-only discovery tool authorized for every agent even under a deny-by-default policy (it exposes public catalog names/descriptions only, no mailbox access), so a restricted agent can always learn how to comply. This never widens any other policy action.",
@@ -305,6 +306,56 @@ fn surfaces() -> Value {
             super::analytics::SEEN_BY_NOTE,
             "Local read only: no IMAP connection, never sets \\Seen.",
             "A message_seen is emitted only when Envelope held the message unseen and later observed \\Seen; Envelope's own flag writes are excluded.",
+        ],
+    ));
+    items.push(surface_entry(
+        "threat_show",
+        "envelope threat show <uid> --json",
+        Some("threat_show"),
+        object(
+            json!({
+                "uid": integer("Message UID"),
+                "folder": string_default("IMAP folder", "INBOX"),
+                "account": string("Account ID or email address; default account if omitted")
+            }),
+            json!(["uid"]),
+        ),
+        object(
+            json!({
+                "status": string("verdict, or not_scanned when no verdict is stored (MCP never scans)"),
+                "account_id": string("Resolved account id"),
+                "folder": string("IMAP folder the verdict was recorded for"),
+                "uid": integer("Message UID"),
+                "message_id": json!({"type": ["string", "null"], "description": "Message-ID when known"}),
+                "recorded_at": string("RFC 3339 time the verdict was recorded"),
+                "tags": array_of(json!({"type": "string"})),
+                "verdict": object(
+                    json!({
+                        "score": integer("0..100, the capped sum of signal weights"),
+                        "level": string("clean, suspicious (>= 30), dangerous (>= 70), or unavailable (a required analyzer failed)"),
+                        "signals": array_of(object(
+                            json!({
+                                "code": string("Stable signal code, e.g. lookalike_domain, ar_forged, double_extension"),
+                                "weight": integer("Points added to the score"),
+                                "evidence": string("Hosts, domains, extensions and hashes only; never bodies"),
+                                "malware": json!({"type": "boolean", "description": "Malware-grade: attachments refuse download"})
+                            }),
+                            json!(["code", "weight", "evidence"]),
+                        )),
+                        "analyzers_run": array_of(json!({"type": "string"})),
+                        "analyzers_skipped": array_of(json!({"type": "object"})),
+                        "engine_version": string("Threat engine version"),
+                        "computed_at": string("RFC 3339 time of the scan")
+                    }),
+                    json!(["score", "level", "signals", "analyzers_run", "analyzers_skipped", "engine_version", "computed_at"]),
+                ),
+                "explain": array_of(json!({"type": "string"}))
+            }),
+            json!(["account_id", "uid"]),
+        ),
+        vec![
+            "MCP threat_show is read-only: it returns the stored verdict and never opens IMAP; status=not_scanned when none exists.",
+            "The CLI scans (EXAMINE + BODY.PEEK[]) when no current verdict is stored.",
         ],
     ));
     items.push(surface_entry(
@@ -636,6 +687,10 @@ fn mcp_tool_entries() -> Value {
         (
             "watch_status",
             "Read-only summary of watch registry entries and durable event-delivery health: delivery counts by status (delivered/pending/dead_letter) and the last successful delivery timestamp. Requires the watch.read policy action.",
+        ),
+        (
+            "threat_show",
+            "Read-only: the stored rShield threat verdict for a message (score 0-100, level clean/suspicious/dangerous/unavailable, signals with host/hash evidence, and the score arithmetic). Never scans and never opens IMAP; returns status=not_scanned when no verdict exists.",
         ),
         (
             "snooze",
@@ -1285,7 +1340,9 @@ fn message_detail_schema() -> Value {
             "attachments": array_of(json!({"type": "object"})),
             "message_id": string("Message-ID header when available"),
             "in_reply_to": string("In-Reply-To header when available"),
-            "references": string("References header when available")
+            "references": string("References header when available"),
+            "sanitized": json!({"type": "boolean", "description": "true when the message's threat verdict is dangerous and html_body was served through the server-side sanitizer"}),
+            "threat": json!({"type": ["object", "null"], "description": "Threat verdict summary {level, score, engine_version}; null when the message has no verdict"})
         }),
         json!([]),
     )
