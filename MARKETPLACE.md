@@ -10,12 +10,12 @@ there. Packaging in this repo does not publish the listing.
 
 **Category:** Inbox and Collaboration
 
-**One-liner:** BYO-mailbox email for Cursor agents — read, search, and draft in the user's existing IMAP/SMTP inbox.
+**One-liner:** BYO-mailbox email for Cursor agents — your IMAP/SMTP, your domain, any provider.
 
 **Bullets:**
 
-- Connects Cursor to the user's own mailbox (Gmail, Fastmail, Migadu, iCloud, Outlook, or any IMAP/SMTP account), not a hosted agent inbox
-- Local stdio MCP (`envelope mcp`) plus a draft-first skill: agents compose, humans send
+- Bring your own mailbox: Gmail, Fastmail, Migadu, iCloud, Outlook, or any IMAP/SMTP account — not a rented AgentMail-style inbox
+- Local stdio MCP (`envelope mcp`) with agent-native tools to read, search, draft, send, and organize mail
 - Requires the `envelope` CLI on `PATH` (`brew install tymrtn/u1f4e7/u1f4e7`) and an `ENVELOPE_AGENT_TOKEN` from `envelope agent create`
 
 ## Install (what reviewers and users need)

@@ -271,8 +271,9 @@ For a walkthrough of running multiple agents from one shared inbox with scoped p
 ## Cursor Marketplace plugin
 
 This repo ships a Cursor Plugin that wraps the local stdio MCP server and a
-focused agent skill. Listing copy lives in [MARKETPLACE.md](MARKETPLACE.md)
-(category: **Inbox and Collaboration**).
+focused agent skill. The listing pitch is **BYO mailbox / any IMAP** — your
+provider and domain, not a hosted agent inbox. Copy lives in
+[MARKETPLACE.md](MARKETPLACE.md) (category: **Inbox and Collaboration**).
 
 **Prerequisite:** the `envelope` binary must be on `PATH` before Cursor starts
 the MCP server. Homebrew installs that binary:

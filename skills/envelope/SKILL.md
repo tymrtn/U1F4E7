@@ -2,8 +2,8 @@
 name: envelope
 description: >-
   BYO-mailbox IMAP/SMTP email for Cursor agents. Use when reading, searching,
-  drafting, organizing, or watching mail in the user's existing inbox. Agents
-  draft; humans own send. Not a hosted agent inbox (unlike AgentMail).
+  drafting, sending, organizing, or watching mail in the user's existing inbox
+  — any provider, your domain. Not a hosted AgentMail-style inbox.
 ---
 
 # Envelope
@@ -18,10 +18,10 @@ hosted agent inbox.
 
 ## When to use
 
-- Read, search, thread, flag, move, tag, or snooze mail
-- Draft replies or new messages for human review
+- Read, search, thread, flag, move, tag, snooze, or send mail
+- Draft or send replies and new messages
 - List accounts/folders, contacts, or watch status
-- Inbox work during a session ("what's unread?", "draft a reply to …")
+- Inbox work during a session ("what's unread?", "reply to …")
 
 ## When not to use
 
@@ -53,21 +53,20 @@ passwords in this skill, the plugin files, or chat logs.
 `envelope paths --json` shows which HOME/database the binary will use. Agent
 harness HOME drift is the usual "no accounts" failure.
 
-## Draft vs send
+## Send policy
 
-Agent and MCP sessions default to **draft-only**.
+Sending is allowed. Agent/MCP sessions apply a send-mode policy (`draft-only`,
+`confirm-send`, `allowlisted-send`, `autonomous-send`) that makes the send
+contextual — policy around the send, not a ban on sending.
 
-- Compose with `create_reply_draft`, `create_forward_draft`, or CLI
-  `envelope draft create` / `draft reply`. Never write a loose `.eml` as a draft.
-- Inspect the thread (`thread` / `read`) before drafting a reply.
-- Do not send unless the human explicitly approved. Escalation modes
-  (`confirm-send`, `allowlisted-send`, `autonomous-send`) require a separately
-  approved agent policy. Do not assume one exists.
-- After approval, the human (or an approved policy) sends with `send_draft` or
-  `envelope draft send <id>`.
-
-Discover accounts with `accounts` / `envelope accounts list --json`. Pass
-explicit `--account` / `account`. Never invent a From/CC.
+- Inspect the thread (`thread` / `read`) before composing a reply.
+- Draft tools (`create_reply_draft`, `create_forward_draft`, CLI
+  `envelope draft create`) produce a reviewable message. Never write a loose
+  `.eml` as a draft.
+- `send`, `reply`, and `send_draft` are real tools. The active agent policy
+  decides whether a call parks a draft, asks for confirmation, or sends.
+- Discover accounts with `accounts` / `envelope accounts list --json`. Pass
+  explicit `--account` / `account`. Never invent a From/CC.
 
 ## Quickstart
 
@@ -78,6 +77,8 @@ envelope folders --account you@example.com --json
 envelope inbox --account you@example.com --limit 20 --json
 envelope read 42 --account you@example.com --json
 envelope draft create --account you@example.com \
+  --to recipient@example.com --subject "Subject" --body "…" --json
+envelope send --account you@example.com \
   --to recipient@example.com --subject "Subject" --body "…" --json
 ```
 
@@ -93,14 +94,13 @@ The stdio server exposes the same contract as the CLI, including `inbox`,
 `reply`, `rules_preview`, `rules_run`, `watch_status`, `threat_show`, and
 `governor_catalog`.
 
-Prefer draft tools over `send` / `reply`. Treat `send_draft` as a human-owned
-step unless an approved policy says otherwise.
+`send`, `reply`, and `send_draft` are available; honor the active send-mode
+policy on the agent token rather than assuming send is blocked.
 
 ## Safety
 
 - Never print, log, or transmit passwords, agent tokens, OTP codes, or
   credential-store contents.
-- Read-only by default. No flag changes, deletes, rule runs, or sends without
-  explicit operator authorization.
+- Don't mutate a mailbox you weren't asked to change. Don't leak secrets.
 - Confirm `envelope paths` before concluding accounts are missing.
 - Full operating guide: `docs/agents/envelope-skill.md`.

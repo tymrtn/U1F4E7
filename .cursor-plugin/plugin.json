@@ -1,7 +1,7 @@
 {
   "name": "envelope",
   "version": "1.0.0",
-  "description": "BYO-mailbox email for Cursor agents. Read, search, draft, and organize mail in the user's existing IMAP/SMTP inbox. Agents draft; humans send.",
+  "description": "BYO-mailbox email for Cursor agents. Read, search, draft, send, and organize mail against any IMAP/SMTP provider — your mailbox, your domain, not a hosted agent inbox.",
   "author": {
     "name": "Tyler Martin"
   },
