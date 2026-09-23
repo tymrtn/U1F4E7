@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::imap;
+use envelope_email_transport::rule_exec::{self, ActionAttribution, ImapRuleMailbox, RunAccount};
 use envelope_email_transport::rules::{self, Action, MessageContext};
-use tracing::info;
 
 use super::common::setup_credentials;
 use super::provenance;
@@ -70,13 +70,32 @@ fn parse_action(s: &str) -> Result<Action> {
     }
 }
 
+/// Parse `--action`: the `type=arg` shorthand, or a JSON action. JSON is how
+/// a `confirm` offer is authored; its `{"rule": "<name or id>"}` steps are
+/// flattened into concrete allowlisted actions here, at save time.
+fn parse_authored_action_str(
+    s: &str,
+    db: &envelope_email_store::Database,
+    account_id: &str,
+) -> Result<Action> {
+    if !s.trim_start().starts_with('{') {
+        return parse_action(s);
+    }
+    let raw: serde_json::Value =
+        serde_json::from_str(s).context("--action looks like JSON but does not parse")?;
+    let action = rule_exec::flatten_authored_action(db, account_id, &raw)
+        .map_err(|e| anyhow::anyhow!("invalid --action: {e}"))?;
+    if let Action::Webhook(url) = &action {
+        envelope_email_transport::url_guard::check_public_url(url)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("webhook action URL rejected")?;
+    }
+    Ok(action)
+}
+
 fn sanitize_action_display(action: &str) -> String {
-    match serde_json::from_str::<Action>(action) {
-        Ok(Action::Webhook(_)) => serde_json::to_string(&Action::Webhook("[redacted]".to_string()))
-            .unwrap_or_else(|_| "{\"webhook\":\"[redacted]\"}".to_string()),
-        Ok(parsed) => {
-            serde_json::to_string(&parsed).unwrap_or_else(|_| "[invalid action]".to_string())
-        }
+    match rules::StoredRuleAction::parse(action) {
+        Ok(stored) => rule_exec::sanitized_action(&stored.action).to_string(),
         Err(_) => "[invalid action]".to_string(),
     }
 }
@@ -122,56 +141,6 @@ fn build_message_context(
         from_addr: msg.from_addr.clone(),
         to_addr: msg.to_addr.clone(),
         subject: msg.subject.clone(),
-        tags,
-        scores,
-        contact_tags,
-    })
-}
-
-/// Build a `MessageContext` from a fetched message summary + its tags/scores in the store.
-///
-/// This avoids downloading full RFC822 bodies during batch rule preview/run. Header-only
-/// rules only need fields already present in `MessageSummary` from the initial batch FETCH.
-fn build_message_context_from_summary(
-    summary: &envelope_email_store::MessageSummary,
-    db: &envelope_email_store::Database,
-    account_id: &str,
-) -> Result<MessageContext> {
-    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
-    // arrive bracketed; persisted scores/tags use the bare id).
-    let message_id =
-        envelope_email_store::canonical_message_id(summary.message_id.as_deref().unwrap_or(""));
-
-    let tags: Vec<String> = if !message_id.is_empty() {
-        db.get_tags(account_id, message_id)
-            .context("failed to get tags")?
-            .into_iter()
-            .map(|t| t.tag)
-            .collect()
-    } else {
-        vec![]
-    };
-
-    let mut scores: HashMap<String, f64> = if !message_id.is_empty() {
-        db.get_scores(account_id, message_id)
-            .context("failed to get scores")?
-            .into_iter()
-            .map(|s| (s.dimension, s.value))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    // Seed the header-derived provider_spam signal; a persisted score wins.
-    rules::merge_provider_spam(&mut scores, summary.provider_spam);
-
-    let contact_tags = db
-        .get_contact_tags(account_id, &summary.from_addr)
-        .context("failed to get contact tags")?;
-
-    Ok(MessageContext {
-        from_addr: summary.from_addr.clone(),
-        to_addr: summary.to_addr.clone(),
-        subject: summary.subject.clone(),
         tags,
         scores,
         contact_tags,
@@ -224,8 +193,8 @@ pub fn run_create(
     let match_expr_json =
         serde_json::to_string(&match_expr).context("failed to serialize match expression")?;
 
-    // Parse and serialize the action
-    let action = parse_action(action_str)?;
+    // Parse and serialize the action (confirm rule references are flattened now)
+    let action = parse_authored_action_str(action_str, &db, account_id)?;
     let action_json = serde_json::to_string(&action).context("failed to serialize action")?;
 
     // Check for duplicate name
@@ -263,7 +232,14 @@ pub fn run_create(
             if rule.sieve_exportable { "yes" } else { "no" }
         );
         println!("  Match:    {match_expr_json}");
-        println!("  Action:   {action_json}");
+        println!("  Action:   {}", sanitize_action_display(&action_json));
+        if action.requires_batch_acknowledgement() {
+            println!(
+                "  Note:     {} actions are skipped until you run `envelope rule enable {} --acknowledge-batch-actions`",
+                action.kind(),
+                rule.name
+            );
+        }
     }
 
     Ok(())
@@ -464,7 +440,7 @@ pub async fn preview_core(
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();
     for summary in &summaries {
-        let ctx = build_message_context_from_summary(summary, db, account_id)?;
+        let ctx = rule_exec::build_summary_context(summary, db, account_id)?;
         for rule in &preview_rules {
             let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
                 Ok(e) => e,
@@ -498,102 +474,63 @@ pub async fn preview_core(
     }))
 }
 
-/// Reusable rule-run core: apply enabled rules against fetched summaries,
-/// mutating the mailbox, and return the structured `{processed, actions, log}`
+/// Reusable rule-run core: apply enabled rules against fetched summaries
+/// through the unified executor, mutating the mailbox, and return the
+/// structured `{processed, actions, log, skipped_rules, newly_live_actions}`
 /// Value. Shared by the CLI `run_apply` wrapper and the MCP `rules_run` tool.
 /// The caller is responsible for the confirm/dry-run gate — this always mutates.
 pub async fn apply_core(
     client: &mut imap::ImapClient,
     db: &envelope_email_store::Database,
-    account_id: &str,
+    account: &envelope_email_store::Account,
     folder: &str,
     limit: u32,
+    attribution: &ActionAttribution,
 ) -> Result<serde_json::Value> {
+    let account_id = account.id.as_str();
     let summaries = imap::fetch_inbox(client, folder, limit)
         .await
         .context("failed to fetch messages")?;
+    let newly_live = rule_exec::newly_live_actions(
+        &db.list_enabled_rules(account_id)
+            .context("failed to list enabled rules")?,
+    );
 
-    let enabled_rules = db
-        .list_enabled_rules(account_id)
-        .context("failed to list enabled rules")?;
+    let mut mbox = ImapRuleMailbox {
+        client,
+        db,
+        account_id,
+    };
+    let report = rule_exec::apply_rules_to_summaries(
+        &mut mbox,
+        db,
+        &RunAccount {
+            id: account_id,
+            email: &account.username,
+        },
+        folder,
+        &summaries,
+        attribution,
+    )
+    .await?;
 
-    if enabled_rules.is_empty() {
-        return Ok(serde_json::json!({
-            "processed": 0,
-            "actions": 0,
-            "log": [],
-            "message": "no enabled rules",
-            "ui": ui::rules_ui(account_id),
-        }));
-    }
-
-    let total = summaries.len();
-    let mut actions_taken = 0u32;
-    let mut action_log: Vec<serde_json::Value> = Vec::new();
-
-    for summary in summaries.iter() {
-        let uid = summary.uid;
-        let ctx = build_message_context_from_summary(summary, db, account_id)?;
-
-        for rule in &enabled_rules {
-            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !rules::evaluate(&match_expr, &ctx) {
-                continue;
-            }
-            let action: Action = match serde_json::from_str(&rule.action) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let action_result = execute_action(
-                client,
-                db,
-                account_id,
-                &action,
-                uid,
-                folder,
-                Some(&rule.name),
-                Some(&ctx),
-            )
-            .await;
-            match &action_result {
-                Ok(desc) => {
-                    info!("rule '{}' fired on UID {uid}: {desc}", rule.name);
-                    db.increment_rule_hit(&rule.id).ok();
-                    actions_taken += 1;
-                    action_log.push(serde_json::json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "action": desc,
-                        "status": "ok",
-                    }));
-                }
-                Err(e) => {
-                    action_log.push(serde_json::json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "error": format!("{e}"),
-                        "status": "error",
-                    }));
-                }
-            }
-            if matches!(action, Action::Move(_) | Action::Delete) {
-                break;
-            }
-            if rule.stop {
-                break;
-            }
-        }
-    }
-
-    Ok(serde_json::json!({
-        "processed": total,
-        "actions": actions_taken,
-        "log": action_log,
+    let mut value = serde_json::json!({
+        "processed": report.processed,
+        "actions": report.actions,
+        "log": report.log,
+        "skipped_rules": report.skipped_rules,
+        "newly_live_actions": newly_live,
         "ui": ui::rules_ui(account_id),
-    }))
+    });
+    let no_rules = db
+        .list_enabled_rules(account_id)
+        .context("failed to list enabled rules")?
+        .is_empty();
+    if no_rules && let Some(obj) = value.as_object_mut() {
+        obj.insert("processed".to_string(), serde_json::json!(0));
+        obj.insert("message".to_string(), serde_json::json!("no enabled rules"));
+    }
+    Ok(value)
 }
 
 /// `envelope rule preview` — batch preview rules without mailbox mutation.
@@ -654,18 +591,40 @@ pub async fn run_apply(
     backend: CredentialBackend,
 ) -> Result<()> {
     if !confirm {
+        // Name the actions that used to be batch no-ops before asking for
+        // --confirm, so an upgrade never arms them silently.
+        if let Ok(db) = envelope_email_store::Database::open_default()
+            && let Ok(acct) = super::common::resolve_account(&db, account)
+            && let Ok(rules) = db.list_enabled_rules(&acct.id)
+        {
+            print_newly_live_actions(&rule_exec::newly_live_actions(&rules));
+        }
         bail!(
             "rule run mutates the mailbox; preview first with `envelope rule preview`, then rerun with --confirm"
         );
     }
     let (db, creds) = setup_credentials(account, backend)?;
-    let account_id = creds.account.id.clone();
+    if !json {
+        let rules = db
+            .list_enabled_rules(&creds.account.id)
+            .context("failed to list enabled rules")?;
+        print_newly_live_actions(&rule_exec::newly_live_actions(&rules));
+    }
 
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
 
-    let result = apply_core(&mut client, &db, &account_id, folder, limit).await?;
+    let attribution = ActionAttribution::new(rule_exec::ActionSource::Cli);
+    let result = apply_core(
+        &mut client,
+        &db,
+        &creds.account,
+        folder,
+        limit,
+        &attribution,
+    )
+    .await?;
 
     if json {
         println!(
@@ -678,136 +637,44 @@ pub async fn run_apply(
         let total = result["processed"].as_u64().unwrap_or(0);
         let actions_taken = result["actions"].as_u64().unwrap_or(0);
         println!("processed {total}/{total}, {actions_taken} action(s) taken");
+        for skipped in result["skipped_rules"].as_array().into_iter().flatten() {
+            eprintln!(
+                "skipped rule '{}': {}",
+                skipped["rule_name"].as_str().unwrap_or("?"),
+                skipped["reason"].as_str().unwrap_or("?")
+            );
+        }
     }
 
     Ok(())
 }
 
-/// Execute a single rule action against a message.
-///
-/// Server-side Sieve actions (`reject`, `ereject`) are export-only: when
-/// encountered here they record a stable non-mutating skip instead of
-/// trying to fabricate a bounce on already-delivered mail.
-async fn execute_action(
-    client: &mut imap::ImapClient,
-    db: &envelope_email_store::Database,
-    account_id: &str,
-    action: &Action,
-    uid: u32,
-    folder: &str,
-    rule_name: Option<&str>,
-    ctx: Option<&MessageContext>,
-) -> Result<String> {
-    if let Some(skip) = action.local_execution_skip_reason() {
-        return Ok(format!("skipped: {skip}"));
+/// Print (to stderr) the enabled rules whose actions were batch no-ops before
+/// the unified executor and now run.
+fn print_newly_live_actions(newly_live: &[serde_json::Value]) {
+    if newly_live.is_empty() {
+        return;
     }
-    match action {
-        Action::Move(dest) => {
-            // A canonical sentinel (`\Junk`/`\Archive`/`\Trash`) is resolved to
-            // this account's real provider folder before moving; a literal folder
-            // passes through unchanged. An unresolved sentinel fails loudly rather
-            // than misfiling into a literal `\Junk` mailbox.
-            let real = envelope_email_transport::folders::resolve_move_destination(
-                client, db, account_id, dest,
-            )
-            .await
-            .with_context(|| format!("failed to resolve move target {dest} for UID {uid}"))?
-            .with_context(|| {
-                format!(
-                    "no provider folder for canonical move target {dest} (UID {uid}); \
-                     not moving into a literal {dest}"
-                )
-            })?;
-            imap::move_message(client, uid, folder, &real)
-                .await
-                .with_context(|| format!("failed to move UID {uid} to {real}"))?;
-            Ok(format!("moved to {real}"))
-        }
-        Action::Flag(flag) => {
-            imap::set_flag(client, folder, uid, flag)
-                .await
-                .with_context(|| format!("failed to set flag '{flag}' on UID {uid}"))?;
-            imap::record_own_flag_change(db, account_id, folder, &[uid], flag, true)
-                .with_context(|| {
-                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
-                })?;
-            Ok(format!("flagged {flag}"))
-        }
-        Action::Unflag(flag) => {
-            imap::remove_flag(client, folder, uid, flag)
-                .await
-                .with_context(|| format!("failed to remove flag '{flag}' from UID {uid}"))?;
-            imap::record_own_flag_change(db, account_id, folder, &[uid], flag, false)
-                .with_context(|| {
-                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
-                })?;
-            Ok(format!("unflagged {flag}"))
-        }
-        Action::Delete => {
-            imap::delete_message(client, folder, uid)
-                .await
-                .with_context(|| format!("failed to delete UID {uid}"))?;
-            Ok("deleted".to_string())
-        }
-        Action::AddTag(_tag) => {
-            // Tag actions are metadata-only; they don't touch IMAP.
-            // The tag was already set during context building in a production
-            // pipeline, but in batch mode we skip this for now.
-            Ok(format!("add_tag:{_tag} (metadata-only, skipped in batch)"))
-        }
-        Action::Snooze(_until) => {
-            // Snooze requires full snooze machinery; log as unsupported in batch.
-            Ok(format!(
-                "snooze:{_until} (use 'envelope snooze set' instead)"
-            ))
-        }
-        Action::Unsubscribe => {
-            // Unsubscribe requires HTTP/SMTP; log as unsupported in batch.
-            Ok("unsubscribe (use 'envelope unsubscribe' instead)".to_string())
-        }
-        Action::Webhook(url) => {
-            let payload = serde_json::json!({
-                "event": "rule_matched",
-                "rule": rule_name.unwrap_or("unknown"),
-                "uid": uid,
-                "folder": folder,
-                "message": {
-                    "from": ctx.map(|c| c.from_addr.as_str()).unwrap_or(""),
-                    "to": ctx.map(|c| c.to_addr.as_str()).unwrap_or(""),
-                    "subject": ctx.map(|c| c.subject.as_str()).unwrap_or(""),
-                }
-            });
-            let (http, target) = envelope_email_transport::http::client_for(
-                url,
-                &envelope_email_transport::http::Allowance::Public,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("webhook failed: {e}"))?;
-            let body = serde_json::to_vec(&payload)
-                .map_err(|e| anyhow::anyhow!("failed to serialize webhook payload: {e}"))?;
-            match http
-                .post(target)
-                .header("Content-Type", "application/json")
-                .body(body)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-            {
-                Ok(resp) => Ok(format!("webhook: {}", resp.status())),
-                Err(_) => Err(anyhow::anyhow!("webhook failed")),
+    eprintln!("These rule actions now run in batch (they were no-ops before):");
+    for entry in newly_live {
+        let gated = entry["gated"].as_bool().unwrap_or(false);
+        eprintln!(
+            "  - {} -> {}{}",
+            entry["rule"].as_str().unwrap_or("?"),
+            entry["action"].as_str().unwrap_or("?"),
+            if gated {
+                " (skipped until `envelope rule enable <name> --acknowledge-batch-actions`)"
+            } else {
+                ""
             }
-        }
-        // Server-side Sieve actions are intercepted at the top of this
-        // function — these arms are unreachable but kept exhaustive.
-        Action::Reject(_) | Action::Ereject(_) => {
-            Ok(format!("skipped: {}", rules::SERVER_SIDE_ONLY_SKIP_REASON))
-        }
+        );
     }
 }
 
 /// `envelope rule enable <name>` — enable a rule by name.
 pub fn run_enable(
     name: &str,
+    acknowledge_batch_actions: bool,
     account: Option<&str>,
     json: bool,
     _backend: CredentialBackend,
@@ -820,7 +687,14 @@ pub fn run_enable(
         .context("database error")?
         .ok_or_else(|| anyhow::anyhow!("rule '{name}' not found"))?;
 
+    let stored = if acknowledge_batch_actions {
+        rule_exec::acknowledge_batch_actions(&db, &rule.id)?
+    } else {
+        rules::StoredRuleAction::parse(&rule.action)
+            .with_context(|| format!("rule '{name}' has an invalid action"))?
+    };
     db.enable_rule(&rule.id).context("failed to enable rule")?;
+    let gated = stored.gate_skip_reason();
 
     if json {
         println!(
@@ -829,11 +703,16 @@ pub fn run_enable(
                 "action": "enable",
                 "name": name,
                 "id": rule.id,
+                "acknowledged_batch_actions": stored.acknowledged_batch_actions,
+                "skipped_reason": gated,
                 "ui": ui::rules_ui(&acct.id),
             })
         );
     } else {
         println!("Enabled rule: {name}");
+        if let Some(reason) = gated {
+            eprintln!("Batch runs will still skip it: {reason}");
+        }
     }
 
     Ok(())
@@ -1038,7 +917,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
 
         assert_eq!(ctx.from_addr, "alice@example.com");
         assert_eq!(ctx.to_addr, "bob@example.com");
@@ -1063,7 +942,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
         let expr = rules::MatchExpr::Subject("*Test*".to_string());
 
         assert!(rules::evaluate(&expr, &ctx));
@@ -1084,7 +963,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
         let expr = rules::MatchExpr::From("*@spam.com".to_string());
 
         assert!(rules::evaluate(&expr, &ctx));
@@ -1105,7 +984,7 @@ mod tests {
             provider_spam: Some(6.5),
         };
 
-        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
 
         assert_eq!(
             ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
@@ -1147,7 +1026,7 @@ mod tests {
             provider_spam: Some(9.9),
         };
 
-        let ctx = build_message_context_from_summary(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
 
         assert_eq!(
             ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),

@@ -422,7 +422,7 @@ fn surfaces() -> Value {
                 "folder": string_default("IMAP folder to watch", "INBOX"),
                 "account": string("Account ID or email address"),
                 "webhook": string("Optional URL receiving the same JSON event"),
-                "run_rules": json!({"type": "boolean", "description": "Run rules against new messages when implemented", "default": false})
+                "run_rules": json!({"type": "boolean", "description": "Run enabled rules against each new message through the unified executor (compatibility gate and action_log attribution source=rule, same as rule run)", "default": false})
             }),
             json!([]),
         ),
@@ -470,7 +470,7 @@ fn surfaces() -> Value {
     ));
     items.push(surface_entry(
         "rules",
-        "envelope rule create/list/test/run/export --json",
+        "envelope rule create/list/test/run/enable/export --json",
         None,
         object(
             json!({
@@ -493,11 +493,18 @@ fn surfaces() -> Value {
                 "matches": array_of(json!({"type": "object"})),
                 "processed": integer("Messages processed by run"),
                 "actions": integer("Actions taken by run"),
-                "log": array_of(json!({"type": "object"}))
+                "log": array_of(json!({"type": "object"})),
+                "skipped_rules": array_of(json!({"type": "object", "description": "{rule_id, rule_name, reason}: rules the unified executor refused to load; reason is a stable string"})),
+                "newly_live_actions": array_of(json!({"type": "object", "description": "{rule, rule_id, action, gated}: enabled add_tag/snooze/unsubscribe rules that were batch no-ops before the unified executor"}))
             }),
             json!([]),
         ),
-        vec!["Webhook actions must redact secrets in display, logs, docs, and tests."],
+        vec![
+            "Webhook actions must redact secrets in display, logs, docs, and tests.",
+            "Every executed rule action writes one action_log row keyed (event_id, action_type); replaying a rule on the same message reports status=already_applied and mutates nothing.",
+            "Snooze/unsubscribe rules are skipped (skipped_rules reason starting 'needs_review:') until `envelope rule enable <name> --acknowledge-batch-actions`.",
+            "A confirm rule records an action_offered event instead of acting; `envelope actions confirm|dismiss <event_id>` resolves it. There is no MCP confirm tool.",
+        ],
     ));
     items.push(surface_entry(
         "evidence",

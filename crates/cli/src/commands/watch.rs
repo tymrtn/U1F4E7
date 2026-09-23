@@ -14,6 +14,9 @@ use envelope_email_transport::code_extractor::{
 };
 use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
 use envelope_email_transport::http::{Allowance, client_for};
+use envelope_email_transport::rule_exec::{
+    self, ActionAttribution, ActionSource, ImapRuleMailbox, RuleMailbox, RuleRunReport, RunAccount,
+};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
@@ -25,7 +28,7 @@ pub async fn run(
     folder: &str,
     account: Option<&str>,
     webhook: Option<&str>,
-    _run_rules: bool,
+    run_rules: bool,
     deliver: bool,
     json: bool,
     backend: CredentialBackend,
@@ -46,6 +49,16 @@ pub async fn run(
             "Watching {} on {}... (Ctrl-C to stop)",
             folder, creds.account.username
         );
+    }
+
+    // Rule actions run on their own connection so the IDLE session keeps its
+    // SELECTed state. Log in once up front so bad credentials fail loudly;
+    // each batch then opens a fresh connection, because an idle side
+    // connection is dropped by the server long before the next new mail.
+    if run_rules {
+        envelope_email_transport::imap::connect(&creds)
+            .await
+            .context("IMAP connection for --run-rules failed")?;
     }
 
     // Graceful shutdown via Ctrl-C
@@ -182,6 +195,31 @@ pub async fn run(
                                 Err(e) => warn!("failed to persist OTP event: {e}"),
                             }
                         }
+                    }
+                }
+
+                if run_rules && !new_msgs.is_empty() {
+                    match envelope_email_transport::imap::connect(&creds).await {
+                        Ok(mut client) => {
+                            let mut mbox = ImapRuleMailbox {
+                                client: &mut client,
+                                db: &db,
+                                account_id: &account_id,
+                            };
+                            let account = RunAccount {
+                                id: &account_id,
+                                email: &creds.account.username,
+                            };
+                            match run_rules_on_new_messages(
+                                &mut mbox, &db, &account, folder, &new_msgs,
+                            )
+                            .await
+                            {
+                                Ok(report) => log_rule_report(&report),
+                                Err(e) => warn!("--run-rules failed for this batch: {e:#}"),
+                            }
+                        }
+                        Err(e) => warn!("--run-rules could not connect for this batch: {e}"),
                     }
                 }
 
@@ -500,8 +538,56 @@ struct NewMessage {
     uid: u32,
     message_id: Option<String>,
     from_addr: Option<String>,
+    to_addr: Option<String>,
     subject: Option<String>,
     snippet: Option<String>,
+}
+
+/// Run enabled rules over one batch of new messages through the unified
+/// executor, attributed as `source: rule`.
+async fn run_rules_on_new_messages<M: RuleMailbox>(
+    mbox: &mut M,
+    db: &envelope_email_store::Database,
+    account: &RunAccount<'_>,
+    folder: &str,
+    msgs: &[NewMessage],
+) -> Result<RuleRunReport> {
+    let summaries: Vec<envelope_email_store::MessageSummary> = msgs
+        .iter()
+        .map(|m| envelope_email_store::MessageSummary {
+            uid: m.uid,
+            message_id: m.message_id.clone(),
+            from_addr: m.from_addr.clone().unwrap_or_default(),
+            to_addr: m.to_addr.clone().unwrap_or_default(),
+            subject: m.subject.clone().unwrap_or_default(),
+            date: None,
+            flags: vec![],
+            size: 0,
+            provider_spam: None,
+        })
+        .collect();
+    rule_exec::apply_rules_to_summaries(
+        mbox,
+        db,
+        account,
+        folder,
+        &summaries,
+        &ActionAttribution::new(ActionSource::Rule),
+    )
+    .await
+}
+
+fn log_rule_report(report: &RuleRunReport) {
+    for skipped in &report.skipped_rules {
+        warn!("rule '{}' skipped: {}", skipped.rule_name, skipped.reason);
+    }
+    for entry in &report.log {
+        if entry["status"] == "error" {
+            warn!("rule run: {entry}");
+        } else {
+            info!("rule run: {entry}");
+        }
+    }
 }
 
 fn redacted_watch_event(
@@ -716,33 +802,37 @@ async fn fetch_new_messages(
                     continue;
                 }
 
-                let (message_id, from_addr, subject) = if let Some(env) = fetch.envelope() {
+                let (message_id, from_addr, to_addr, subject) = if let Some(env) = fetch.envelope()
+                {
                     let mid = env
                         .message_id
                         .as_ref()
                         .map(|m| String::from_utf8_lossy(m).to_string());
-                    let from = env.from.as_ref().and_then(|addrs| {
-                        addrs.first().map(|a| {
-                            let mailbox = a
-                                .mailbox
-                                .as_ref()
-                                .map(|m| String::from_utf8_lossy(m).to_string())
-                                .unwrap_or_default();
-                            let host = a
-                                .host
-                                .as_ref()
-                                .map(|h| String::from_utf8_lossy(h).to_string())
-                                .unwrap_or_default();
-                            format!("{mailbox}@{host}")
-                        })
-                    });
+                    let first_address =
+                        |addrs: &Vec<async_imap::imap_proto::types::Address<'_>>| {
+                            addrs.first().map(|a| {
+                                let mailbox = a
+                                    .mailbox
+                                    .as_ref()
+                                    .map(|m| String::from_utf8_lossy(m).to_string())
+                                    .unwrap_or_default();
+                                let host = a
+                                    .host
+                                    .as_ref()
+                                    .map(|h| String::from_utf8_lossy(h).to_string())
+                                    .unwrap_or_default();
+                                format!("{mailbox}@{host}")
+                            })
+                        };
+                    let from = env.from.as_ref().and_then(first_address);
+                    let to = env.to.as_ref().and_then(first_address);
                     let subj = env
                         .subject
                         .as_ref()
                         .map(|s| String::from_utf8_lossy(s).to_string());
-                    (mid, from, subj)
+                    (mid, from, to, subj)
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 };
 
                 let snippet = fetch.text().map(|t| snippet_preview(t, 150));
@@ -751,6 +841,7 @@ async fn fetch_new_messages(
                     uid,
                     message_id,
                     from_addr,
+                    to_addr,
                     subject,
                     snippet,
                 });
@@ -773,6 +864,7 @@ mod tests {
             uid: 42,
             message_id: Some("<fixture@example.com>".to_string()),
             from_addr: Some("noreply@example.com".to_string()),
+            to_addr: Some("me@example.com".to_string()),
             subject: Some("Your verification code is 482910".to_string()),
             snippet: Some("Use code 482910 to finish signing in.".to_string()),
         }
@@ -1092,5 +1184,96 @@ mod tests {
         assert!(!uid_validity_changed(Some(10), Some(10)));
         assert!(!uid_validity_changed(None, Some(10)));
         assert!(!uid_validity_changed(Some(10), None));
+    }
+
+    /// Records mailbox calls; never opens a socket.
+    #[derive(Default)]
+    struct FakeSession {
+        calls: Vec<String>,
+    }
+
+    impl RuleMailbox for FakeSession {
+        async fn resolve_folder(&mut self, dest: &str) -> Result<String> {
+            Ok(dest.to_string())
+        }
+        async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<()> {
+            self.calls.push(format!("move {folder}/{uid} -> {dest}"));
+            Ok(())
+        }
+        async fn set_flag(&mut self, folder: &str, uid: u32, flag: &str) -> Result<()> {
+            self.calls.push(format!("flag {folder}/{uid} {flag}"));
+            Ok(())
+        }
+        async fn remove_flag(&mut self, folder: &str, uid: u32, flag: &str) -> Result<()> {
+            self.calls.push(format!("unflag {folder}/{uid} {flag}"));
+            Ok(())
+        }
+        async fn delete_message(&mut self, folder: &str, uid: u32) -> Result<()> {
+            self.calls.push(format!("delete {folder}/{uid}"));
+            Ok(())
+        }
+        async fn ensure_folder(&mut self, name: &str) -> Result<()> {
+            self.calls.push(format!("create {name}"));
+            Ok(())
+        }
+        async fn list_unsubscribe_headers(
+            &mut self,
+            _folder: &str,
+            _uid: u32,
+        ) -> Result<(Option<String>, Option<String>)> {
+            Ok((None, None))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rules_executes_enabled_rules_on_new_messages() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.create_rule(
+            "acc-1",
+            "tag-noreply",
+            r#"{"from":"noreply@example.com"}"#,
+            r#"{"add_tag":"automated"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        db.create_rule(
+            "acc-1",
+            "flag-noreply",
+            r#"{"from":"noreply@example.com"}"#,
+            r#"{"flag":"flagged"}"#,
+            20,
+            false,
+        )
+        .unwrap();
+        let account = RunAccount {
+            id: "acc-1",
+            email: "me@example.com",
+        };
+        let mut session = FakeSession::default();
+
+        let report =
+            run_rules_on_new_messages(&mut session, &db, &account, "INBOX", &[fixture_message()])
+                .await
+                .unwrap();
+
+        assert_eq!(report.actions, 2, "{report:?}");
+        assert_eq!(session.calls, vec!["flag INBOX/42 flagged".to_string()]);
+        let tags = db.get_tags("acc-1", "fixture@example.com").unwrap();
+        assert_eq!(tags[0].tag, "automated");
+        let rows = db.list_actions("acc-1", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|r| r.action_taken.contains("\"source\":\"rule\""))
+        );
+
+        // A second IDLE wake that re-sees the same UID mutates nothing.
+        let again =
+            run_rules_on_new_messages(&mut session, &db, &account, "INBOX", &[fixture_message()])
+                .await
+                .unwrap();
+        assert_eq!(again.actions, 0);
+        assert_eq!(session.calls.len(), 1);
     }
 }

@@ -282,6 +282,17 @@ impl Database {
         Ok(stmt.query_row(params![event_id], map_event).optional()?)
     }
 
+    /// Fetch the event recorded under an idempotency key, if any.
+    pub fn get_event_by_idempotency_key(&self, key: &str) -> Result<Option<Event>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
+                    snippet, payload, idempotency_key, secure_pending, acked_at, created_at
+             FROM events
+             WHERE idempotency_key = ?1",
+        )?;
+        Ok(stmt.query_row(params![key], map_event).optional()?)
+    }
+
     /// Prune events older than N days.
     pub fn prune_events(&self, days: i64) -> Result<usize> {
         let deleted = self.conn().execute(

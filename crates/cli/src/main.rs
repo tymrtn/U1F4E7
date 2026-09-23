@@ -493,7 +493,8 @@ enum Commands {
         /// POST event JSON to this URL on each new message
         #[arg(long)]
         webhook: Option<String>,
-        /// Run mail rules against new messages (not yet implemented)
+        /// Run enabled rules against each new message through the unified
+        /// executor (same gate and action log as `envelope rule run`)
         #[arg(long)]
         run_rules: bool,
         /// Enqueue route-matched deliveries for each event and run the durable
@@ -1079,6 +1080,16 @@ enum ActionsCmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Execute the actions of a pending `action_offered` event (idempotent)
+    Confirm {
+        /// The action_offered event id
+        event_id: String,
+    },
+    /// Dismiss a pending `action_offered` event without executing it
+    Dismiss {
+        /// The action_offered event id
+        event_id: String,
+    },
     /// Execute a local audit action for an event
     Exec {
         /// Event ID
@@ -1381,7 +1392,11 @@ enum RuleCmd {
         /// Require sender's contact to have this tag (repeatable)
         #[arg(long)]
         match_contact_tag: Vec<String>,
-        /// Action: move=Folder, flag=name, unflag=name, delete, unsubscribe, tag=name, webhook=url
+        /// Action: move=Folder, flag=name, unflag=name, snooze=1d, delete, unsubscribe, tag=name,
+        /// webhook=url, or JSON such as
+        /// '{"confirm":{"prompt":"Trip?","then":[{"add_tag":"travel"},{"rule":"<name>"}]}}'
+        /// (confirm offers allow add_tag, flag, and move never to Trash/Junk; rule
+        /// references are flattened when the rule is saved)
         #[arg(long)]
         action: String,
         /// Priority (lower runs first)
@@ -1445,6 +1460,11 @@ enum RuleCmd {
     Enable {
         /// Rule name
         name: String,
+        /// Let a snooze/unsubscribe rule run in batch. These actions were
+        /// no-ops in batch runs before the unified executor, so existing
+        /// rules carrying them are skipped until acknowledged.
+        #[arg(long)]
+        acknowledge_batch_actions: bool,
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
@@ -2391,6 +2411,12 @@ fn main() {
                 cli.json,
                 backend,
             ),
+            ActionsCmd::Confirm { event_id } => {
+                commands::actions::run_confirm(&event_id, cli.json, backend)
+            }
+            ActionsCmd::Dismiss { event_id } => {
+                commands::actions::run_dismiss(&event_id, cli.json, backend)
+            }
             ActionsCmd::Exec {
                 event_id,
                 actor,
@@ -2640,9 +2666,17 @@ fn main() {
                 cli.json,
                 backend,
             ),
-            RuleCmd::Enable { name, account } => {
-                commands::rule::run_enable(&name, account.as_deref(), cli.json, backend)
-            }
+            RuleCmd::Enable {
+                name,
+                acknowledge_batch_actions,
+                account,
+            } => commands::rule::run_enable(
+                &name,
+                acknowledge_batch_actions,
+                account.as_deref(),
+                cli.json,
+                backend,
+            ),
             RuleCmd::Disable { name, account } => {
                 commands::rule::run_disable(&name, account.as_deref(), cli.json, backend)
             }
@@ -3113,6 +3147,49 @@ mod tests {
         .expect("evidence verify should parse");
 
         assert!(matches!(cli.command, Commands::Evidence { .. }));
+    }
+
+    #[test]
+    fn rule_enable_accepts_acknowledge_batch_actions() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "rule",
+            "enable",
+            "later",
+            "--acknowledge-batch-actions",
+        ])
+        .expect("rule enable --acknowledge-batch-actions should parse");
+        match cli.command {
+            Commands::Rule {
+                subcommand:
+                    RuleCmd::Enable {
+                        ref name,
+                        acknowledge_batch_actions,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "later");
+                assert!(acknowledge_batch_actions);
+            }
+            _ => panic!("expected rule enable"),
+        }
+    }
+
+    #[test]
+    fn actions_confirm_and_dismiss_parse() {
+        for (sub, expect_confirm) in [("confirm", true), ("dismiss", false)] {
+            let cli = Cli::try_parse_from(["envelope", "actions", sub, "evt-1"])
+                .expect("actions confirm/dismiss should parse");
+            match cli.command {
+                Commands::Actions {
+                    subcommand: ActionsCmd::Confirm { ref event_id },
+                } if expect_confirm => assert_eq!(event_id, "evt-1"),
+                Commands::Actions {
+                    subcommand: ActionsCmd::Dismiss { ref event_id },
+                } if !expect_confirm => assert_eq!(event_id, "evt-1"),
+                _ => panic!("expected actions {sub}"),
+            }
+        }
     }
 
     #[test]

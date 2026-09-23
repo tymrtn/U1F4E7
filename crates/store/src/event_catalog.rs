@@ -26,6 +26,9 @@ pub const AGENT_ACTION: &str = "agent_action";
 /// `\Seen` appeared on a message Envelope had observed unseen: another client
 /// read it. `created_at` is the observation time, an upper bound on the read.
 pub const MESSAGE_SEEN: &str = "message_seen";
+/// A `confirm` rule offered allowlisted actions; they run only after
+/// `envelope actions confirm <event_id>`.
+pub const ACTION_OFFERED: &str = "action_offered";
 
 /// All catalog event types, for validation and documentation.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -37,6 +40,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GOVERNOR_BLOCKED,
     AGENT_ACTION,
     MESSAGE_SEEN,
+    ACTION_OFFERED,
 ];
 
 /// Is `event_type` a known catalog event? Unknown types are still deliverable
@@ -95,6 +99,7 @@ mod tests {
         assert!(is_known_event_type(SEND_QUEUED));
         assert!(is_known_event_type(GOVERNOR_BLOCKED));
         assert!(is_known_event_type(MESSAGE_SEEN));
+        assert!(is_known_event_type(ACTION_OFFERED));
         assert!(!is_known_event_type("totally_made_up"));
     }
 

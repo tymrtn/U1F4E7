@@ -10,7 +10,7 @@ use uuid::Uuid;
 fn is_sieve_exportable(match_expr: &str, action: &str) -> bool {
     const LOCAL_MATCH_KEYS: [&str; 4] =
         ["has_tag", "score_above", "score_below", "contact_has_tag"];
-    const LOCAL_ACTION_KEYS: [&str; 4] = ["webhook", "snooze", "unsubscribe", "add_tag"];
+    const LOCAL_ACTION_KEYS: [&str; 5] = ["webhook", "snooze", "unsubscribe", "add_tag", "confirm"];
 
     !LOCAL_MATCH_KEYS.iter().any(|key| match_expr.contains(key))
         && !LOCAL_ACTION_KEYS.iter().any(|key| action.contains(key))
@@ -196,6 +196,31 @@ impl Database {
         self.get_rule(id)
     }
 
+    /// Rewrite only a rule's stored action JSON (used to record a batch-action
+    /// acknowledgement). `sieve_exportable` is re-derived from the new action.
+    pub fn set_rule_action(&self, id: &str, action: &str) -> Result<bool> {
+        let match_expr: Option<String> = {
+            use rusqlite::OptionalExtension;
+            self.conn()
+                .query_row(
+                    "SELECT match_expr FROM rules WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let Some(match_expr) = match_expr else {
+            return Ok(false);
+        };
+        let sieve_exportable = is_sieve_exportable(&match_expr, action);
+        let rows = self.conn().execute(
+            "UPDATE rules SET action = ?1, sieve_exportable = ?2, updated_at = datetime('now')
+             WHERE id = ?3",
+            params![action, sieve_exportable as i32, id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn increment_rule_hit(&self, id: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE rules SET hit_count = hit_count + 1, last_hit_at = datetime('now') WHERE id = ?1",
@@ -229,6 +254,44 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
+
+    #[test]
+    fn confirm_rule_is_never_sieve_exportable() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "offer",
+                r#"{"from":"*@x.com"}"#,
+                r#"{"confirm":{"prompt":"p","then":[{"flag":"flagged"}]}}"#,
+                100,
+                false,
+            )
+            .unwrap();
+        assert!(!rule.sieve_exportable);
+    }
+
+    #[test]
+    fn set_rule_action_rewrites_action_only() {
+        let db = Database::open_memory().unwrap();
+        let rule = db
+            .create_rule(
+                "acct1",
+                "snz",
+                r#"{"from":"*@x.com"}"#,
+                r#"{"snooze":"1d"}"#,
+                7,
+                true,
+            )
+            .unwrap();
+        let acked = r#"{"action":{"snooze":"1d"},"acknowledged_batch_actions":true}"#;
+        assert!(db.set_rule_action(&rule.id, acked).unwrap());
+        let after = db.get_rule(&rule.id).unwrap().unwrap();
+        assert_eq!(after.action, acked);
+        assert_eq!(after.priority, 7);
+        assert!(after.stop);
+        assert!(!db.set_rule_action("missing", acked).unwrap());
+    }
 
     #[test]
     fn rule_crud() {

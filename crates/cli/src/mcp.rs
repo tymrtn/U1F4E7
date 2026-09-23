@@ -446,7 +446,7 @@ async fn dispatch_tool_call(
         "bulk" => handle_bulk(params, backend, ctx).await,
         "thread" => handle_thread(params, backend).await,
         "rules_preview" => handle_rules_preview(params, backend).await,
-        "rules_run" => handle_rules_run(params, backend).await,
+        "rules_run" => handle_rules_run(params, backend, ctx).await,
         "watch_status" => handle_watch_status(params, backend).await,
         "snooze" => handle_snooze(params, backend, ctx).await,
         _ => Err(format!("unknown tool: {tool_name}")),
@@ -2343,7 +2343,11 @@ async fn handle_rules_preview(params: &Value, backend: CredentialBackend) -> Res
         .map_err(|e| e.to_string())
 }
 
-async fn handle_rules_run(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
+async fn handle_rules_run(
+    params: &Value,
+    backend: CredentialBackend,
+    ctx: Option<&AgentContext>,
+) -> Result<Value, String> {
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let folder = params
         .get("folder")
@@ -2378,10 +2382,20 @@ async fn handle_rules_run(params: &Value, backend: CredentialBackend) -> Result<
         return Ok(preview);
     }
 
-    let mut result =
-        crate::commands::rule::apply_core(&mut client, &db, &creds.account.id, folder, limit)
-            .await
-            .map_err(|e| e.to_string())?;
+    let attribution = envelope_email_transport::rule_exec::ActionAttribution::new(
+        envelope_email_transport::rule_exec::ActionSource::Mcp,
+    )
+    .with_agent(agent_context::agent_id_of(ctx));
+    let mut result = crate::commands::rule::apply_core(
+        &mut client,
+        &db,
+        &creds.account,
+        folder,
+        limit,
+        &attribution,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if let Some(obj) = result.as_object_mut() {
         obj.insert("dry_run".to_string(), json!(false));
     }
