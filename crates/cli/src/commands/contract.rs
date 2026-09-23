@@ -1051,7 +1051,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "processed": integer("Messages processed"),
                     "actions": integer("Actions taken (0 on dry run)"),
                     "log": array_of(json!({"type": "object"})),
-                    "skipped_rules": array_of(json!({"type": "object", "description": "{rule_id, rule_name, reason}: rules skipped instead of evaluated (unparseable match, or an empty condition list that could match every message); reason is a stable string"})),
+                    "skipped_rules": array_of(json!({"type": "object", "description": "{rule_id, rule_name, reason}: why a stored rule was not run: an unparseable match or action, an empty condition list (it could match every message), or a rule awaiting review (reason starting 'needs_review:'); reason is a stable string"})),
                     "dry_run": json!({"type": "boolean", "description": "Whether this was a dry run"}),
                     "note": string("Present on a dry run explaining how to apply")
                 }),

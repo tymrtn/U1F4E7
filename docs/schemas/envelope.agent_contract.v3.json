@@ -4098,7 +4098,7 @@
           },
           "skipped_rules": {
             "items": {
-              "description": "{rule_id, rule_name, reason}: rules skipped instead of evaluated (unparseable match, or an empty condition list that could match every message); reason is a stable string",
+              "description": "{rule_id, rule_name, reason}: why a stored rule was not run: an unparseable match or action, an empty condition list (it could match every message), or a rule awaiting review (reason starting 'needs_review:'); reason is a stable string",
               "type": "object"
             },
             "type": "array"
