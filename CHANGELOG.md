@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-23
+
 ### rShield
 
 - **Threat engine:** every message gets a local verdict, score 0-100 from six analyzers
