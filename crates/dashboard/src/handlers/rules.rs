@@ -5,16 +5,17 @@
 
 use std::collections::HashMap;
 
-use anyhow::Context;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use envelope_email_store::{Database, Message, MessageSummary, Rule};
+use envelope_email_store::{Database, Message, Rule};
+use envelope_email_transport::rule_exec::{
+    self, ActionAttribution, ActionSource, ExecDb, RuleMailbox, RunAccount,
+};
 use envelope_email_transport::rules::{self, Action, MatchExpr, MessageContext};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::info;
 
 use crate::state::AppState;
 use crate::ui_paths::message_dashboard_path;
@@ -34,14 +35,7 @@ fn default_run_limit() -> u32 {
 }
 
 pub(crate) fn sanitized_action_json(action: &str) -> String {
-    match serde_json::from_str::<Action>(action) {
-        Ok(Action::Webhook(_)) => serde_json::to_string(&Action::Webhook("[redacted]".to_string()))
-            .unwrap_or_else(|_| "{\"webhook\":\"[redacted]\"}".to_string()),
-        Ok(parsed) => {
-            serde_json::to_string(&parsed).unwrap_or_else(|_| "\"[invalid action]\"".to_string())
-        }
-        Err(_) => "\"[invalid action]\"".to_string(),
-    }
+    rule_exec::sanitized_stored_action(action).to_string()
 }
 
 fn dashboard_rule_json(rule: &Rule) -> serde_json::Value {
@@ -235,7 +229,7 @@ pub async fn preview(
     {
         let db = state.db.lock().await;
         for summary in &summaries {
-            let ctx = match build_summary_context(summary, &db, &account_id) {
+            let ctx = match rule_exec::build_summary_context(summary, &db, &account_id) {
                 Ok(ctx) => ctx,
                 Err(_) => continue,
             };
@@ -316,17 +310,17 @@ pub async fn run_enabled(
             .into_response();
     }
 
-    let enabled_rules = {
+    let no_enabled_rules = {
         let db = state.db.lock().await;
         match db.list_enabled_rules(&account_id) {
-            Ok(rules) => rules,
+            Ok(rules) => rules.is_empty(),
             Err(e) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("rules: {e}")).into_response();
             }
         }
     };
 
-    if enabled_rules.is_empty() {
+    if no_enabled_rules {
         return Json(json!({
             "processed": 0,
             "actions": 0,
@@ -336,133 +330,140 @@ pub async fn run_enabled(
         .into_response();
     }
 
-    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
+    let (client_arc, creds) = match state.get_or_create_imap(&account_id).await {
         Ok(c) => c,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("IMAP: {e}")).into_response(),
     };
 
-    let summaries = {
-        let mut client = client_arc.lock().await;
+    // Lock order is client -> db (the same order resolve_canonical_folder
+    // uses); the executor takes the db guard only inside each with_db call.
+    let mut client = client_arc.lock().await;
+    let summaries =
         match envelope_email_transport::imap::fetch_inbox(&mut client, &folder, req.limit).await {
             Ok(msgs) => msgs,
             Err(e) => {
+                drop(client);
                 state.evict_imap(&account_id).await;
                 return (StatusCode::BAD_GATEWAY, format!("fetch: {e}")).into_response();
             }
-        }
-    };
-
-    let total = summaries.len();
-    let mut actions_taken = 0u32;
-    let mut action_log: Vec<serde_json::Value> = Vec::new();
-
-    // Evaluate from the header-only summaries fetched above — matches the CLI
-    // `envelope rule run` (apply_core) path and keeps the batch run body-free:
-    // no per-UID full RFC822 fetch/parse. `execute_action` needs only
-    // uid/folder/ctx, so the full message is never required here.
-    for summary in &summaries {
-        let uid = summary.uid;
-
-        // Build message context from the summary + local tags/scores/contacts.
-        let ctx = {
-            let db = state.db.lock().await;
-            match build_summary_context(summary, &db, &account_id) {
-                Ok(ctx) => ctx,
-                Err(_) => continue,
-            }
         };
 
-        for rule in &enabled_rules {
-            let match_expr: rules::MatchExpr = match serde_json::from_str(&rule.match_expr) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+    // Evaluate from the header-only summaries fetched above — the same unified
+    // executor as `envelope rule run`: no per-UID full RFC822 fetch/parse.
+    let mut mbox = DashboardMailbox {
+        state: &state,
+        client: &mut client,
+        account_id: &account_id,
+    };
+    let report = rule_exec::apply_rules_to_summaries(
+        &mut mbox,
+        &DashboardDb(&state),
+        &RunAccount {
+            id: &account_id,
+            email: &creds.account.username,
+        },
+        &folder,
+        &summaries,
+        &ActionAttribution::new(ActionSource::Reader),
+    )
+    .await;
 
-            if !rules::evaluate(&match_expr, &ctx) {
-                continue;
-            }
+    match report {
+        Ok(report) => Json(json!({
+            "processed": report.processed,
+            "actions": report.actions,
+            "log": report.log,
+            "skipped_rules": report.skipped_rules,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rules run: {e:#}"),
+        )
+            .into_response(),
+    }
+}
 
-            let action: Action = match serde_json::from_str(&rule.action) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
+/// [`ExecDb`] over the dashboard's shared handle: the guard is held only for
+/// the synchronous closure, never across an IMAP await.
+pub(crate) struct DashboardDb<'a>(pub(crate) &'a AppState);
 
-            let action_result = {
-                let mut client = client_arc.lock().await;
-                execute_action(
-                    &state,
-                    &account_id,
-                    &mut client,
-                    &action,
-                    uid,
-                    &folder,
-                    Some(&rule.name),
-                    Some(&ctx),
-                )
-                .await
-            };
+impl ExecDb for DashboardDb<'_> {
+    async fn with_db<R>(&self, f: impl FnOnce(&Database) -> R) -> R {
+        let db = self.0.db.lock().await;
+        f(&db)
+    }
+}
 
-            match &action_result {
-                Ok(desc) => {
-                    info!("rule '{}' fired on UID {uid}: {desc}", rule.name);
-                    actions_taken += 1;
-                    {
-                        let db = state.db.lock().await;
-                        let _ = db.increment_rule_hit(&rule.id);
-                        let _ = db.record_rule_run(envelope_email_store::RuleRunAuditInput {
-                            account_id: &account_id,
-                            rule_id: Some(&rule.id),
-                            rule_name: Some(&rule.name),
-                            uid: Some(uid as i64),
-                            folder: Some(&folder),
-                            action: Some(desc),
-                            status: "ok",
-                            error: None,
-                        });
-                    }
-                    action_log.push(json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "action": desc,
-                        "status": "ok",
-                    }));
-                }
-                Err(e) => {
-                    {
-                        let db = state.db.lock().await;
-                        let err = format!("{e}");
-                        let _ = db.record_rule_run(envelope_email_store::RuleRunAuditInput {
-                            account_id: &account_id,
-                            rule_id: Some(&rule.id),
-                            rule_name: Some(&rule.name),
-                            uid: Some(uid as i64),
-                            folder: Some(&folder),
-                            action: None,
-                            status: "error",
-                            error: Some(&err),
-                        });
-                    }
-                    action_log.push(json!({
-                        "uid": uid,
-                        "rule": rule.name,
-                        "error": format!("{e}"),
-                        "status": "error",
-                    }));
-                }
-            }
+/// [`RuleMailbox`] over the dashboard's pooled client. Canonical sentinels
+/// resolve through `resolve_canonical_folder`, which keeps the dashboard's
+/// no-guard-across-await discipline.
+struct DashboardMailbox<'a> {
+    state: &'a AppState,
+    client: &'a mut envelope_email_transport::ImapClient,
+    account_id: &'a str,
+}
 
-            if matches!(action, Action::Move(_) | Action::Delete) || rule.stop {
-                break;
-            }
-        }
+impl RuleMailbox for DashboardMailbox<'_> {
+    async fn resolve_folder(&mut self, dest: &str) -> anyhow::Result<String> {
+        let Some(canonical_type) = envelope_email_transport::folders::canonical_move_key(dest)
+        else {
+            return Ok(dest.to_string());
+        };
+        super::messages::resolve_canonical_folder(
+            self.state,
+            self.client,
+            self.account_id,
+            canonical_type,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve move target {dest}: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider folder for canonical move target {dest}; not moving into a literal {dest}"
+            )
+        })
     }
 
-    Json(json!({
-        "processed": total,
-        "actions": actions_taken,
-        "log": action_log,
-    }))
-    .into_response()
+    async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> anyhow::Result<()> {
+        envelope_email_transport::imap::move_message(self.client, uid, folder, dest)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to move UID {uid} to {dest}: {e}"))
+    }
+
+    async fn set_flag(&mut self, folder: &str, uid: u32, flag: &str) -> anyhow::Result<()> {
+        envelope_email_transport::imap::set_flag(self.client, folder, uid, flag)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to set flag '{flag}' on UID {uid}: {e}"))
+    }
+
+    async fn remove_flag(&mut self, folder: &str, uid: u32, flag: &str) -> anyhow::Result<()> {
+        envelope_email_transport::imap::remove_flag(self.client, folder, uid, flag)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to remove flag '{flag}' from UID {uid}: {e}"))
+    }
+
+    async fn delete_message(&mut self, folder: &str, uid: u32) -> anyhow::Result<()> {
+        envelope_email_transport::imap::delete_message(self.client, folder, uid)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to delete UID {uid}: {e}"))
+    }
+
+    async fn ensure_folder(&mut self, name: &str) -> anyhow::Result<()> {
+        envelope_email_transport::imap::create_folder(self.client, name)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create folder {name}: {e}"))
+    }
+
+    async fn list_unsubscribe_headers(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        envelope_email_transport::imap::fetch_list_unsubscribe_headers(self.client, folder, uid)
+            .await
+            .map_err(|e| anyhow::anyhow!("List-Unsubscribe headers for UID {uid}: {e}"))
+    }
 }
 
 // ── Write endpoints ────────────────────────────────────────────────────────
@@ -527,7 +528,11 @@ impl IntoResponse for WriteError {
     }
 }
 
-fn validate_write_request(req: &RuleWriteRequest) -> Result<(String, String), WriteError> {
+fn validate_write_request(
+    req: &RuleWriteRequest,
+    db: &Database,
+    account_id: &str,
+) -> Result<(String, String), WriteError> {
     let name = req.name.trim().to_string();
     if name.is_empty() {
         return Err(WriteError::new(
@@ -560,19 +565,21 @@ fn validate_write_request(req: &RuleWriteRequest) -> Result<(String, String), Wr
         ));
     }
 
-    // Validate action round-trips through Action.
-    let action_json = serde_json::to_string(&req.action).map_err(|e| {
+    // Validate the action; a confirm offer's rule references are flattened
+    // into concrete allowlisted actions here, at save time.
+    let action: Action =
+        rule_exec::flatten_authored_action(db, account_id, &req.action).map_err(|e| {
+            WriteError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_action",
+                format!("invalid action: {e}"),
+            )
+        })?;
+    let action_json = serde_json::to_string(&action).map_err(|e| {
         WriteError::new(
             StatusCode::BAD_REQUEST,
             "invalid_action",
             format!("invalid action JSON: {e}"),
-        )
-    })?;
-    let action: Action = serde_json::from_str(&action_json).map_err(|e| {
-        WriteError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_action",
-            format!("invalid action: {e}"),
         )
     })?;
 
@@ -598,12 +605,11 @@ pub async fn create(
     Path(account_id): Path<String>,
     Json(req): Json<RuleWriteRequest>,
 ) -> impl IntoResponse {
-    let (match_expr_json, action_json) = match validate_write_request(&req) {
+    let db = state.db.lock().await;
+    let (match_expr_json, action_json) = match validate_write_request(&req, &db, &account_id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-
-    let db = state.db.lock().await;
 
     // Duplicate-name guard (mirrors CLI behaviour).
     match db.find_rule_by_name(&account_id, req.name.trim()) {
@@ -650,12 +656,11 @@ pub async fn update(
     Path((account_id, rule_id)): Path<(String, String)>,
     Json(req): Json<RuleWriteRequest>,
 ) -> impl IntoResponse {
-    let (match_expr_json, action_json) = match validate_write_request(&req) {
+    let db = state.db.lock().await;
+    let (match_expr_json, action_json) = match validate_write_request(&req, &db, &account_id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-
-    let db = state.db.lock().await;
 
     match db.update_rule(
         &rule_id,
@@ -766,141 +771,6 @@ pub async fn disable(
     }
 }
 
-async fn execute_action(
-    state: &AppState,
-    account_id: &str,
-    client: &mut envelope_email_transport::ImapClient,
-    action: &Action,
-    uid: u32,
-    folder: &str,
-    rule_name: Option<&str>,
-    ctx: Option<&MessageContext>,
-) -> anyhow::Result<String> {
-    if let Some(skip) = action.local_execution_skip_reason() {
-        return Ok(format!("skipped: {skip}"));
-    }
-    match action {
-        Action::Move(dest) => {
-            // A canonical sentinel (`\Junk`/`\Archive`/`\Trash`) is a
-            // provider-aware SEMANTIC target: resolve it to this account's real
-            // folder before moving so an exact-sender junk rule reaches
-            // Gmail's Spam / Outlook's Junk Email / the detected special-use
-            // folder rather than a literal `\Junk`. A literal folder name passes
-            // through unchanged. An unresolved sentinel FAILS the move loudly —
-            // never a silent misfile into a literal `\Junk` mailbox.
-            let real = match envelope_email_transport::folders::canonical_move_key(dest) {
-                Some(canonical_type) => super::messages::resolve_canonical_folder(
-                    state,
-                    client,
-                    account_id,
-                    canonical_type,
-                )
-                .await
-                .with_context(|| format!("failed to resolve move target {dest} for UID {uid}"))?
-                .with_context(|| {
-                    format!(
-                        "no provider folder for canonical move target {dest} (UID {uid}); \
-                         not moving into a literal {dest}"
-                    )
-                })?,
-                None => dest.clone(),
-            };
-            envelope_email_transport::imap::move_message(client, uid, folder, &real)
-                .await
-                .with_context(|| format!("failed to move UID {uid} to {real}"))?;
-            Ok(format!("moved to {real}"))
-        }
-        Action::Flag(flag) => {
-            envelope_email_transport::imap::set_flag(client, folder, uid, flag)
-                .await
-                .with_context(|| format!("failed to set flag '{flag}' on UID {uid}"))?;
-            {
-                let db = state.db.lock().await;
-                envelope_email_transport::imap::record_own_flag_change(
-                    &db,
-                    account_id,
-                    folder,
-                    &[uid],
-                    flag,
-                    true,
-                )
-                .with_context(|| {
-                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
-                })?;
-            }
-            Ok(format!("flagged {flag}"))
-        }
-        Action::Unflag(flag) => {
-            envelope_email_transport::imap::remove_flag(client, folder, uid, flag)
-                .await
-                .with_context(|| format!("failed to remove flag '{flag}' from UID {uid}"))?;
-            {
-                let db = state.db.lock().await;
-                envelope_email_transport::imap::record_own_flag_change(
-                    &db,
-                    account_id,
-                    folder,
-                    &[uid],
-                    flag,
-                    false,
-                )
-                .with_context(|| {
-                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
-                })?;
-            }
-            Ok(format!("unflagged {flag}"))
-        }
-        Action::Delete => {
-            envelope_email_transport::imap::delete_message(client, folder, uid)
-                .await
-                .with_context(|| format!("failed to delete UID {uid}"))?;
-            Ok("deleted".to_string())
-        }
-        Action::AddTag(tag) => Ok(format!("add_tag:{tag} (metadata-only, skipped in batch)")),
-        Action::Snooze(until) => Ok(format!(
-            "snooze:{until} (use 'envelope snooze set' instead)"
-        )),
-        Action::Unsubscribe => Ok("unsubscribe (use 'envelope unsubscribe' instead)".to_string()),
-        Action::Webhook(url) => {
-            let payload = serde_json::json!({
-                "event": "rule_matched",
-                "rule": rule_name.unwrap_or("unknown"),
-                "uid": uid,
-                "folder": folder,
-                "message": {
-                    "from": ctx.map(|c| c.from_addr.as_str()).unwrap_or(""),
-                    "to": ctx.map(|c| c.to_addr.as_str()).unwrap_or(""),
-                    "subject": ctx.map(|c| c.subject.as_str()).unwrap_or(""),
-                }
-            });
-            let (http, target) = envelope_email_transport::http::client_for(
-                url,
-                &envelope_email_transport::http::Allowance::Public,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("webhook delivery failed: {e}"))?;
-            let body = serde_json::to_vec(&payload)
-                .map_err(|e| anyhow::anyhow!("failed to serialize webhook payload: {e}"))?;
-            match http
-                .post(target)
-                .header("Content-Type", "application/json")
-                .body(body)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-            {
-                Ok(resp) => Ok(format!("webhook delivered: {}", resp.status())),
-                Err(_) => Err(anyhow::anyhow!("webhook delivery failed")),
-            }
-        }
-        // Server-side Sieve actions are intercepted at the top of this
-        // function — these arms are unreachable but kept exhaustive.
-        Action::Reject(_) | Action::Ereject(_) => {
-            Ok(format!("skipped: {}", rules::SERVER_SIDE_ONLY_SKIP_REASON))
-        }
-    }
-}
-
 fn build_message_context(
     msg: &Message,
     db: &Database,
@@ -943,51 +813,14 @@ fn build_message_context(
     })
 }
 
-fn build_summary_context(
-    summary: &MessageSummary,
-    db: &Database,
-    account_id: &str,
-) -> anyhow::Result<MessageContext> {
-    // Canonicalize so summary/full/persistence keys agree (IMAP ENVELOPE ids
-    // arrive bracketed; persisted scores/tags use the bare id).
-    let message_id =
-        envelope_email_store::canonical_message_id(summary.message_id.as_deref().unwrap_or(""));
-
-    let tags: Vec<String> = if message_id.is_empty() {
-        Vec::new()
-    } else {
-        db.get_tags(account_id, message_id)?
-            .into_iter()
-            .map(|t| t.tag)
-            .collect()
-    };
-
-    let mut scores: HashMap<String, f64> = if message_id.is_empty() {
-        HashMap::new()
-    } else {
-        db.get_scores(account_id, message_id)?
-            .into_iter()
-            .map(|s| (s.dimension, s.value))
-            .collect()
-    };
-    // Seed the header-derived provider_spam signal; a persisted score wins.
-    rules::merge_provider_spam(&mut scores, summary.provider_spam);
-
-    let contact_tags = db.get_contact_tags(account_id, &summary.from_addr)?;
-
-    Ok(MessageContext {
-        from_addr: summary.from_addr.clone(),
-        to_addr: summary.to_addr.clone(),
-        subject: summary.subject.clone(),
-        tags,
-        scores,
-        contact_tags,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{RuleRunRequest, RuleWriteRequest, sanitized_action_json, validate_write_request};
+
+    fn validate(req: &RuleWriteRequest) -> Result<(String, String), super::WriteError> {
+        let db = super::Database::open_memory().unwrap();
+        validate_write_request(req, &db, "acct")
+    }
     use axum::http::StatusCode;
 
     #[test]
@@ -1010,7 +843,9 @@ mod tests {
 
     #[test]
     fn summary_context_seeds_provider_spam_and_uses_canonical_id() {
-        use super::{Database, MessageSummary, build_summary_context, rules};
+        use super::{Database, rules};
+        use envelope_email_store::MessageSummary;
+        use envelope_email_transport::rule_exec::build_summary_context;
 
         fn summary(uid: u32, message_id: &str, provider_spam: Option<f64>) -> MessageSummary {
             MessageSummary {
@@ -1083,7 +918,7 @@ mod tests {
             stop: false,
             enabled: true,
         };
-        let result = validate_write_request(&req);
+        let result = validate(&req);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
@@ -1101,7 +936,7 @@ mod tests {
             stop: false,
             enabled: true,
         };
-        let result = validate_write_request(&req);
+        let result = validate(&req);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST);
     }
@@ -1117,7 +952,7 @@ mod tests {
             stop: false,
             enabled: true,
         };
-        let result = validate_write_request(&req);
+        let result = validate(&req);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().status, StatusCode::BAD_REQUEST);
     }
@@ -1132,7 +967,7 @@ mod tests {
             stop: true,
             enabled: false,
         };
-        let result = validate_write_request(&req);
+        let result = validate(&req);
         assert!(result.is_ok());
         let (match_json, action_json) = result.unwrap();
         assert!(match_json.contains("notifications.github.com"));
@@ -1150,7 +985,7 @@ mod tests {
             stop: false,
             enabled: true,
         };
-        let err = validate_write_request(&req).unwrap_err();
+        let err = validate(&req).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.code, "webhook_url_rejected");
     }
@@ -1173,7 +1008,7 @@ mod tests {
                 stop: false,
                 enabled: true,
             };
-            let err = validate_write_request(&req).unwrap_err();
+            let err = validate(&req).unwrap_err();
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "url {url}");
             assert_eq!(err.code, "webhook_url_rejected", "url {url}");
         }
@@ -1189,7 +1024,7 @@ mod tests {
             stop: false,
             enabled: true,
         };
-        let (_, action_json) = validate_write_request(&req).unwrap();
+        let (_, action_json) = validate(&req).unwrap();
         assert!(action_json.contains("hooks.example.com"));
     }
 
@@ -1205,9 +1040,147 @@ mod tests {
                 enabled: true,
             };
             assert!(
-                validate_write_request(&req).is_ok(),
+                validate(&req).is_ok(),
                 "action {action_json} should be valid"
             );
         }
+    }
+
+    /// Records mailbox calls; never opens a socket.
+    #[derive(Default)]
+    struct FakeMailbox {
+        calls: Vec<String>,
+    }
+
+    impl super::RuleMailbox for FakeMailbox {
+        async fn resolve_folder(&mut self, dest: &str) -> anyhow::Result<String> {
+            Ok(dest.to_string())
+        }
+        async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> anyhow::Result<()> {
+            self.calls.push(format!("move {folder}/{uid} -> {dest}"));
+            Ok(())
+        }
+        async fn set_flag(&mut self, folder: &str, uid: u32, flag: &str) -> anyhow::Result<()> {
+            self.calls.push(format!("flag {folder}/{uid} {flag}"));
+            Ok(())
+        }
+        async fn remove_flag(&mut self, folder: &str, uid: u32, flag: &str) -> anyhow::Result<()> {
+            self.calls.push(format!("unflag {folder}/{uid} {flag}"));
+            Ok(())
+        }
+        async fn delete_message(&mut self, folder: &str, uid: u32) -> anyhow::Result<()> {
+            self.calls.push(format!("delete {folder}/{uid}"));
+            Ok(())
+        }
+        async fn ensure_folder(&mut self, name: &str) -> anyhow::Result<()> {
+            self.calls.push(format!("create {name}"));
+            Ok(())
+        }
+        async fn list_unsubscribe_headers(
+            &mut self,
+            _folder: &str,
+            _uid: u32,
+        ) -> anyhow::Result<(Option<String>, Option<String>)> {
+            Ok((None, None))
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_run_uses_the_unified_executor_through_the_locked_db() {
+        use super::{ActionAttribution, ActionSource, DashboardDb, RunAccount, rule_exec};
+        use envelope_email_store::{CredentialBackend, Database, MessageSummary};
+
+        let db = Database::open_memory().unwrap();
+        db.create_rule(
+            "acct",
+            "trips",
+            r#"{"from":"*@airline.example"}"#,
+            r#"{"add_tag":"travel"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        db.create_rule(
+            "acct",
+            "later",
+            r#"{"from":"*@airline.example"}"#,
+            r#"{"snooze":"1d"}"#,
+            20,
+            false,
+        )
+        .unwrap();
+        let state = crate::state::AppState::new(db, CredentialBackend::File);
+        let summaries = [MessageSummary {
+            uid: 11,
+            message_id: Some("<trip@airline.example>".to_string()),
+            from_addr: "desk@airline.example".to_string(),
+            to_addr: "me@example.com".to_string(),
+            subject: "Itinerary".to_string(),
+            date: None,
+            flags: vec![],
+            size: 1,
+            provider_spam: None,
+        }];
+        let mut mbox = FakeMailbox::default();
+
+        let report = rule_exec::apply_rules_to_summaries(
+            &mut mbox,
+            &DashboardDb(&state),
+            &RunAccount {
+                id: "acct",
+                email: "me@example.com",
+            },
+            "INBOX",
+            &summaries,
+            &ActionAttribution::new(ActionSource::Reader),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.actions, 1, "{report:?}");
+        assert_eq!(report.skipped_rules.len(), 1, "snooze rule is gated");
+        assert!(mbox.calls.is_empty());
+        let db = state.db.lock().await;
+        assert_eq!(
+            db.get_tags("acct", "trip@airline.example").unwrap()[0].tag,
+            "travel"
+        );
+        let rows = db.list_actions("acct", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].action_taken.contains("\"source\":\"reader\""));
+    }
+
+    #[test]
+    fn write_request_flattens_confirm_rule_reference() {
+        let db = super::Database::open_memory().unwrap();
+        db.create_rule(
+            "acct",
+            "travel-tag",
+            r#"{"from":"*@x.com"}"#,
+            r#"{"add_tag":"travel"}"#,
+            100,
+            false,
+        )
+        .unwrap();
+        let req = RuleWriteRequest {
+            name: "offer".to_string(),
+            match_expr: serde_json::json!({ "from": "*@x.com" }),
+            action: serde_json::json!({"confirm": {"prompt": "Trip?", "then": [{"rule": "travel-tag"}]}}),
+            priority: 100,
+            stop: false,
+            enabled: true,
+        };
+        let (_, action_json) = validate_write_request(&req, &db, "acct").unwrap();
+        assert_eq!(
+            action_json,
+            r#"{"confirm":{"prompt":"Trip?","then":[{"add_tag":"travel"}]}}"#
+        );
+
+        let bad = RuleWriteRequest {
+            action: serde_json::json!({"confirm": {"prompt": "p", "then": [{"move": "Trash"}]}}),
+            ..req
+        };
+        let err = validate_write_request(&bad, &db, "acct").unwrap_err();
+        assert_eq!(err.code, "invalid_action");
     }
 }

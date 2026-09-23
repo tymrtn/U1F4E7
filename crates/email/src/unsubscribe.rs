@@ -87,6 +87,50 @@ pub fn parse_list_unsubscribe(header: &str, post_header: Option<&str>) -> Option
     })
 }
 
+/// Execute only the RFC 8058 one-click HTTPS POST, if the headers offer it.
+///
+/// Returns `Some(success)` when the POST was accepted and `None` when there is
+/// no one-click URL or the POST failed. This path sends no email, so it needs
+/// no Governor gate; it is what batch rule runs use. Its future is `Send`.
+pub async fn one_click_post(info: &UnsubscribeInfo) -> Option<UnsubscribeResult> {
+    if !info.one_click_post {
+        return None;
+    }
+    let url = info.https_urls.first()?;
+    debug!("unsubscribing via HTTPS POST: {url}");
+    // The URL comes from the sender's List-Unsubscribe header: public
+    // targets only, and a redirect is reported, never followed.
+    let response = match client_for(url, &Allowance::Public).await {
+        Ok((client, target)) => client
+            .post(target)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("List-Unsubscribe=One-Click")
+            .send()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(format!("refused by egress guard: {e}")),
+    };
+    match response {
+        Ok(resp) => {
+            let status_code = resp.status();
+            if status_code.is_success() || status_code.as_u16() == 302 {
+                info!("unsubscribed via HTTPS POST: {url} → {status_code}");
+                return Some(UnsubscribeResult {
+                    method: "https_post".to_string(),
+                    url: Some(url.clone()),
+                    status: "success".to_string(),
+                    message: format!("Unsubscribed via POST ({status_code})"),
+                });
+            }
+            warn!("HTTPS POST returned {status_code} for {url}");
+        }
+        Err(e) => {
+            warn!("HTTPS POST failed for {url}: {e}");
+        }
+    }
+    None
+}
+
 /// Execute an unsubscribe action.
 ///
 /// Priority: HTTPS POST (RFC 8058) → mailto → error.
@@ -109,39 +153,9 @@ pub async fn execute_unsubscribe(
                     message: format!("Would POST to {url} with List-Unsubscribe=One-Click"),
                 };
             }
-
-            debug!("unsubscribing via HTTPS POST: {url}");
-            // The URL comes from the sender's List-Unsubscribe header: public
-            // targets only, and a redirect is reported, never followed.
-            let response = match client_for(url, &Allowance::Public).await {
-                Ok((client, target)) => client
-                    .post(target)
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body("List-Unsubscribe=One-Click")
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(format!("refused by egress guard: {e}")),
-            };
-            match response {
-                Ok(resp) => {
-                    let status_code = resp.status();
-                    if status_code.is_success() || status_code.as_u16() == 302 {
-                        info!("unsubscribed via HTTPS POST: {url} → {status_code}");
-                        return UnsubscribeResult {
-                            method: "https_post".to_string(),
-                            url: Some(url.clone()),
-                            status: "success".to_string(),
-                            message: format!("Unsubscribed via POST ({status_code})"),
-                        };
-                    } else {
-                        warn!("HTTPS POST returned {status_code} for {url}");
-                    }
-                }
-                Err(e) => {
-                    warn!("HTTPS POST failed for {url}: {e}");
-                }
-            }
+        }
+        if let Some(result) = one_click_post(info).await {
+            return result;
         }
     }
 

@@ -22,12 +22,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI:** `envelope analytics show <uid> [--folder] [--account] [--json]` prints observed reads
   as "seen by <time>". The time is when Envelope observed the flag, an upper bound on the read.
   New contract surface `analytics_show` (CLI only).
+- **Rules:** `envelope watch --run-rules` runs enabled rules on each new message. The flag was
+  previously accepted but did nothing.
+- **Rules:** a `confirm` action, authored as JSON in `envelope rule create --action` or the
+  dashboard, e.g.
+  `{"confirm":{"prompt":"Trip?","then":[{"add_tag":"travel"},{"rule":"<name>"}]}}`. `then`
+  accepts only `add_tag`, `flag`, and `move` (never to Trash or Junk); a rule reference is
+  replaced by that rule's action when the rule is saved. Running the rule records an
+  `action_offered` event and executes nothing; `envelope actions confirm <event_id>` runs the
+  actions once and `envelope actions dismiss <event_id>` closes the offer. MCP has no confirm
+  tool.
 
 ### Changed
 
 - Envelope's own flag writes (`envelope flag`, MCP `flag`, `bulk` flag ops, rule flag actions,
   the dashboard flags endpoint) patch the local index after the server STORE succeeds, so they
   never read as another client's read. A failed index patch is reported as an error.
+- **Rules:** one executor now runs rule actions for `envelope rule run`, MCP `rules_run`, the
+  dashboard's run-enabled endpoint, and `envelope watch --run-rules`. The dashboard's separate
+  copy is gone. Each executed action writes an `action_log` row (visible in
+  `envelope actions tail`) with its source (`rule`, `cli`, `mcp`, `reader`), and
+  `rule_run_audit` keeps its rows. Running a rule twice over the same message mutates it once;
+  the second pass logs `already_applied`.
+- **Rules, behaviour change:** `add_tag` rules now add the tag. Before this release a batch run
+  logged them and did nothing, so existing tag rules start tagging mail on the next run.
+- **Rules, behaviour change:** snooze and unsubscribe rules now execute in batch runs, where
+  before they were logged no-ops. An existing rule carrying either action is skipped with a
+  reason starting `needs_review:` until you run
+  `envelope rule enable <name> --acknowledge-batch-actions`. `envelope rule run` lists these
+  newly live actions before its `--confirm` gate. Batch unsubscribe only does RFC 8058 one-click
+  HTTPS POSTs and then moves the message to Junk; a mailto unsubscribe still goes through
+  `envelope unsubscribe --confirm --attr ...`.
 
 ### Fixed
 

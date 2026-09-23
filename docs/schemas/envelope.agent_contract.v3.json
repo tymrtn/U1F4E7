@@ -2190,7 +2190,7 @@
           },
           "run_rules": {
             "default": false,
-            "description": "Run rules against new messages when implemented",
+            "description": "Run enabled rules against each new message through the unified executor (compatibility gate and action_log attribution source=rule, same as rule run)",
             "type": "boolean"
           },
           "webhook": {
@@ -2312,11 +2312,14 @@
     },
     {
       "cli": {
-        "command": "envelope rule create/list/test/run/export --json",
+        "command": "envelope rule create/list/test/run/enable/export --json",
         "json_output": true
       },
       "compatibility_notes": [
-        "Webhook actions must redact secrets in display, logs, docs, and tests."
+        "Webhook actions must redact secrets in display, logs, docs, and tests.",
+        "Every executed rule action writes one action_log row keyed (event_id, action_type); replaying a rule on the same message reports status=already_applied and mutates nothing.",
+        "Snooze/unsubscribe rules are skipped (skipped_rules reason starting 'needs_review:') until `envelope rule enable <name> --acknowledge-batch-actions`.",
+        "A confirm rule records an action_offered event instead of acting; `envelope actions confirm|dismiss <event_id>` resolves it. There is no MCP confirm tool."
       ],
       "input_schema": {
         "additionalProperties": false,
@@ -2389,6 +2392,13 @@
             },
             "type": "array"
           },
+          "newly_live_actions": {
+            "items": {
+              "description": "{rule, rule_id, action, gated}: enabled add_tag/snooze/unsubscribe rules that were batch no-ops before the unified executor",
+              "type": "object"
+            },
+            "type": "array"
+          },
           "processed": {
             "description": "Messages processed by run",
             "type": "integer"
@@ -2400,6 +2410,13 @@
           "rule_name": {
             "description": "Rule name",
             "type": "string"
+          },
+          "skipped_rules": {
+            "items": {
+              "description": "{rule_id, rule_name, reason}: rules the unified executor refused to load; reason is a stable string",
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],

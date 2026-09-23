@@ -76,6 +76,109 @@ pub enum Action {
     /// where supported because it refuses the message at SMTP time and
     /// avoids generating a backscatter MDN. Sieve/export-only.
     Ereject(String),
+    /// Offer a closed, reversible set of actions for a human to confirm.
+    /// Executing the rule records an `action_offered` event; `then` runs only
+    /// after `envelope actions confirm <event_id>`. Local-only (never Sieve).
+    Confirm {
+        prompt: String,
+        then: Vec<ConfirmableAction>,
+    },
+}
+
+/// The closed allowlist an offer may carry: reversible, local, no egress.
+///
+/// Serde rejects every other action shape, and a `move` into Trash or Junk
+/// (canonical sentinel or a provider folder name) is rejected at parse time,
+/// so an offer can never smuggle a destructive action past a human tap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", try_from = "RawConfirmableAction")]
+pub enum ConfirmableAction {
+    AddTag(String),
+    Flag(String),
+    Move(String),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RawConfirmableAction {
+    AddTag(String),
+    Flag(String),
+    Move(String),
+}
+
+impl TryFrom<RawConfirmableAction> for ConfirmableAction {
+    type Error = String;
+
+    fn try_from(raw: RawConfirmableAction) -> Result<Self, Self::Error> {
+        let action = match raw {
+            RawConfirmableAction::AddTag(t) => ConfirmableAction::AddTag(t),
+            RawConfirmableAction::Flag(f) => ConfirmableAction::Flag(f),
+            RawConfirmableAction::Move(m) => ConfirmableAction::Move(m),
+        };
+        action.validate()?;
+        Ok(action)
+    }
+}
+
+impl ConfirmableAction {
+    /// Re-check the allowlist invariants. Serde already ran this at parse;
+    /// the executor runs it again before recording or executing an offer.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            ConfirmableAction::AddTag(v) | ConfirmableAction::Flag(v) if v.trim().is_empty() => {
+                Err("confirmable action argument must not be empty".to_string())
+            }
+            ConfirmableAction::Move(dest) if dest.trim().is_empty() => {
+                Err("confirmable move destination must not be empty".to_string())
+            }
+            ConfirmableAction::Move(dest) if is_trash_or_junk_folder(dest) => Err(format!(
+                "confirmable move may not target Trash or Junk (got {dest:?})"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn into_action(self) -> Action {
+        match self {
+            ConfirmableAction::AddTag(t) => Action::AddTag(t),
+            ConfirmableAction::Flag(f) => Action::Flag(f),
+            ConfirmableAction::Move(m) => Action::Move(m),
+        }
+    }
+
+    /// Narrow a plain action into the allowlist, or explain why it cannot be.
+    pub fn from_action(action: &Action) -> Result<Self, String> {
+        let candidate = match action {
+            Action::AddTag(t) => ConfirmableAction::AddTag(t.clone()),
+            Action::Flag(f) => ConfirmableAction::Flag(f.clone()),
+            Action::Move(m) => ConfirmableAction::Move(m.clone()),
+            other => {
+                return Err(format!(
+                    "action {} is not confirmable; offers allow only add_tag, flag, and move (never to Trash/Junk)",
+                    other.kind()
+                ));
+            }
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+}
+
+/// True when `dest` names Trash or Junk: a canonical sentinel (`\Trash`,
+/// `\Junk`, `\Spam`) or a provider folder the provider map classifies as
+/// trash/spam, including hierarchy-prefixed leaves like `INBOX.Trash`.
+pub fn is_trash_or_junk_folder(dest: &str) -> bool {
+    use crate::provider::canonical;
+    let is_bad =
+        |kind: Option<&str>| kind == Some(canonical::TRASH) || kind == Some(canonical::SPAM);
+    let trimmed = dest.trim();
+    if is_bad(crate::folders::canonical_move_key(trimmed))
+        || is_bad(crate::provider::classify_folder(trimmed))
+    {
+        return true;
+    }
+    let leaf = trimmed.rsplit(['/', '.']).next().unwrap_or(trimmed);
+    is_bad(crate::provider::classify_folder(leaf))
 }
 
 /// Stable skip reason emitted when a server-side-only action is encountered
@@ -85,6 +188,39 @@ pub const SERVER_SIDE_ONLY_SKIP_REASON: &str = "server-side Sieve action; export
      not executed locally to avoid post-delivery fake bounces";
 
 impl Action {
+    /// Stable snake_case kind name (matches the serde tag), used as the
+    /// `action_log.action_type` and in human-facing listings.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Action::Move(_) => "move",
+            Action::Flag(_) => "flag",
+            Action::Unflag(_) => "unflag",
+            Action::Snooze(_) => "snooze",
+            Action::Delete => "delete",
+            Action::Unsubscribe => "unsubscribe",
+            Action::AddTag(_) => "add_tag",
+            Action::Webhook(_) => "webhook",
+            Action::Reject(_) => "reject",
+            Action::Ereject(_) => "ereject",
+            Action::Confirm { .. } => "confirm",
+        }
+    }
+
+    /// Actions that were logged no-ops in batch rule runs before the unified
+    /// executor and now mutate mail or local state.
+    pub fn became_live_in_unified_executor(&self) -> bool {
+        matches!(
+            self,
+            Action::AddTag(_) | Action::Snooze(_) | Action::Unsubscribe
+        )
+    }
+
+    /// Whether this action needs `--acknowledge-batch-actions` before a batch
+    /// run may execute it (it moves mail or contacts a sender).
+    pub fn requires_batch_acknowledgement(&self) -> bool {
+        matches!(self, Action::Snooze(_) | Action::Unsubscribe)
+    }
+
     /// Whether this action can only be executed by the mail server via
     /// Sieve. Local rule execution must skip these — Envelope never
     /// fabricates a bounce or MDN for already-delivered mail.
@@ -101,6 +237,139 @@ impl Action {
             None
         }
     }
+}
+
+/// Stable skip reason for a snooze/unsubscribe rule that has not been
+/// acknowledged since those actions became live in batch runs. Part of the
+/// JSON contract: do not reword.
+pub const BATCH_ACTIONS_UNACKNOWLEDGED_REASON: &str = "needs_review: snooze/unsubscribe rule predates unified execution; \
+     re-enable with 'envelope rule enable <name> --acknowledge-batch-actions' to let it run";
+
+/// A rule's action as stored in `rules.action`.
+///
+/// Legacy and ordinary rows are a bare [`Action`] JSON value. Acknowledging a
+/// snooze/unsubscribe rule rewrites the row to
+/// `{"action": <Action>, "acknowledged_batch_actions": true}`, so the gate
+/// needs no schema migration and any rule edit (which writes a bare action)
+/// drops the acknowledgement again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRuleAction {
+    pub action: Action,
+    pub acknowledged_batch_actions: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgedEnvelope {
+    action: Action,
+    acknowledged_batch_actions: bool,
+}
+
+impl StoredRuleAction {
+    pub fn parse(raw: &str) -> Result<Self, serde_json::Error> {
+        match serde_json::from_str::<Action>(raw) {
+            Ok(action) => Ok(StoredRuleAction {
+                action,
+                acknowledged_batch_actions: false,
+            }),
+            Err(bare_err) => match serde_json::from_str::<AcknowledgedEnvelope>(raw) {
+                Ok(env) => Ok(StoredRuleAction {
+                    action: env.action,
+                    acknowledged_batch_actions: env.acknowledged_batch_actions,
+                }),
+                Err(_) => Err(bare_err),
+            },
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        if self.acknowledged_batch_actions {
+            serde_json::to_string(&AcknowledgedEnvelope {
+                action: self.action.clone(),
+                acknowledged_batch_actions: true,
+            })
+        } else {
+            serde_json::to_string(&self.action)
+        }
+    }
+
+    /// `Some(reason)` when the compatibility gate must skip this rule.
+    pub fn gate_skip_reason(&self) -> Option<&'static str> {
+        (self.action.requires_batch_acknowledgement() && !self.acknowledged_batch_actions)
+            .then_some(BATCH_ACTIONS_UNACKNOWLEDGED_REASON)
+    }
+}
+
+/// One step of an authored `confirm` offer: an allowlisted action, or a
+/// reference to another rule (by id or name) that is flattened at save time.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AuthoredConfirmStep {
+    RuleRef { rule: String },
+    Action(ConfirmableAction),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoredConfirm {
+    prompt: String,
+    then: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoredConfirmWrapper {
+    confirm: AuthoredConfirm,
+}
+
+/// Parse an action as a human authors it, flattening `confirm` rule
+/// references into concrete [`ConfirmableAction`]s.
+///
+/// `resolve_rule` maps a rule id or name to that rule's stored action JSON.
+/// The flattened list is what gets stored, so editing the referenced rule
+/// later can never change (or escalate) what an existing offer executes.
+pub fn parse_authored_action(
+    raw: &serde_json::Value,
+    resolve_rule: impl Fn(&str) -> Option<String>,
+) -> Result<Action, String> {
+    let is_confirm = raw.as_object().is_some_and(|o| o.contains_key("confirm"));
+    if !is_confirm {
+        return serde_json::from_value::<Action>(raw.clone()).map_err(|e| e.to_string());
+    }
+    let wrapper: AuthoredConfirmWrapper =
+        serde_json::from_value(raw.clone()).map_err(|e| format!("invalid confirm action: {e}"))?;
+    let AuthoredConfirm { prompt, then } = wrapper.confirm;
+    if prompt.trim().is_empty() {
+        return Err("confirm prompt must not be empty".to_string());
+    }
+    let mut flat = Vec::new();
+    for step in then {
+        let step: AuthoredConfirmStep = serde_json::from_value(step.clone()).map_err(|_| {
+            format!(
+                "confirm step {step} is not allowed; use add_tag, flag, move (never to Trash/Junk), or {{\"rule\": \"<name or id>\"}}"
+            )
+        })?;
+        match step {
+            AuthoredConfirmStep::Action(a) => flat.push(a),
+            AuthoredConfirmStep::RuleRef { rule } => {
+                let stored = resolve_rule(&rule)
+                    .ok_or_else(|| format!("confirm references unknown rule {rule:?}"))?;
+                let stored = StoredRuleAction::parse(&stored)
+                    .map_err(|e| format!("rule {rule:?} has an invalid action: {e}"))?;
+                match stored.action {
+                    Action::Confirm { then, .. } => flat.extend(then),
+                    other => flat.push(
+                        ConfirmableAction::from_action(&other)
+                            .map_err(|e| format!("rule {rule:?}: {e}"))?,
+                    ),
+                }
+            }
+        }
+    }
+    if flat.is_empty() {
+        return Err("confirm needs at least one action in then".to_string());
+    }
+    Ok(Action::Confirm { prompt, then: flat })
 }
 
 /// Stable score dimension derived from a provider's spam-scoring headers.
@@ -646,5 +915,175 @@ mod tests {
     fn build_single_condition_unwraps() {
         let expr = build_match_expr(Some("*@github.com"), None, None, &[], &[], &[], &[]);
         assert!(matches!(expr, MatchExpr::From(_)));
+    }
+
+    // ── Confirm offers ──────────────────────────────────────────────
+
+    #[test]
+    fn confirm_json_roundtrips_with_allowlisted_actions() {
+        let action = Action::Confirm {
+            prompt: "Looks like a trip".to_string(),
+            then: vec![
+                ConfirmableAction::AddTag("travel".to_string()),
+                ConfirmableAction::Flag("flagged".to_string()),
+                ConfirmableAction::Move("Travel".to_string()),
+            ],
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            json,
+            r#"{"confirm":{"prompt":"Looks like a trip","then":[{"add_tag":"travel"},{"flag":"flagged"},{"move":"Travel"}]}}"#
+        );
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
+    }
+
+    #[test]
+    fn confirm_json_rejects_delete_webhook_and_other_actions() {
+        for step in [
+            r#""delete""#,
+            r#"{"webhook":"https://attacker.example/x"}"#,
+            r#""unsubscribe""#,
+            r#"{"snooze":"1d"}"#,
+            r#"{"unflag":"seen"}"#,
+            r#"{"reject":"no"}"#,
+            r#"{"confirm":{"prompt":"x","then":[]}}"#,
+        ] {
+            let json = format!(r#"{{"confirm":{{"prompt":"p","then":[{step}]}}}}"#);
+            assert!(
+                serde_json::from_str::<Action>(&json).is_err(),
+                "confirm must reject {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_json_rejects_move_to_trash_or_junk() {
+        for dest in [
+            "\\Trash",
+            "\\Junk",
+            "\\Spam",
+            "Trash",
+            "[Gmail]/Trash",
+            "[Gmail]/Spam",
+            "Junk",
+            "Deleted Items",
+            "INBOX.Trash",
+            "INBOX/Junk",
+        ] {
+            let json = serde_json::json!({"confirm": {"prompt": "p", "then": [{"move": dest}]}});
+            assert!(
+                serde_json::from_value::<Action>(json).is_err(),
+                "move to {dest} must be rejected"
+            );
+        }
+        let ok = serde_json::json!({"confirm": {"prompt": "p", "then": [{"move": "\\Archive"}]}});
+        assert!(serde_json::from_value::<Action>(ok).is_ok());
+    }
+
+    #[test]
+    fn authored_confirm_flattens_rule_reference_at_save_time() {
+        let authored = serde_json::json!({"confirm": {
+            "prompt": "Trip?",
+            "then": [{"flag": "flagged"}, {"rule": "travel-tag"}]
+        }});
+        let action = parse_authored_action(&authored, |r| {
+            (r == "travel-tag").then(|| r#"{"add_tag":"travel"}"#.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::Confirm {
+                prompt: "Trip?".to_string(),
+                then: vec![
+                    ConfirmableAction::Flag("flagged".to_string()),
+                    ConfirmableAction::AddTag("travel".to_string()),
+                ],
+            }
+        );
+        // The stored JSON carries no rule reference to dereference later.
+        assert!(!serde_json::to_string(&action).unwrap().contains("rule"));
+    }
+
+    #[test]
+    fn authored_confirm_rejects_reference_to_non_confirmable_rule() {
+        let authored = serde_json::json!({"confirm": {"prompt": "p", "then": [{"rule": "nuke"}]}});
+        for stored in [
+            r#""delete""#,
+            r#"{"webhook":"https://x.example"}"#,
+            r#"{"move":"Trash"}"#,
+        ] {
+            let err = parse_authored_action(&authored, |_| Some(stored.to_string())).unwrap_err();
+            assert!(err.contains("nuke"), "{err}");
+        }
+        let err = parse_authored_action(&authored, |_| None).unwrap_err();
+        assert!(err.contains("unknown rule"), "{err}");
+    }
+
+    #[test]
+    fn authored_plain_action_passes_through() {
+        let action =
+            parse_authored_action(&serde_json::json!({"move": "Archive"}), |_| None).unwrap();
+        assert_eq!(action, Action::Move("Archive".to_string()));
+    }
+
+    #[test]
+    fn confirm_is_local_only_not_server_side() {
+        let a = Action::Confirm {
+            prompt: "p".to_string(),
+            then: vec![ConfirmableAction::AddTag("t".to_string())],
+        };
+        assert!(!a.is_server_side_only());
+        assert_eq!(a.kind(), "confirm");
+    }
+
+    // ── Stored action + compatibility gate ──────────────────────────
+
+    #[test]
+    fn stored_action_parses_bare_legacy_json() {
+        let stored = StoredRuleAction::parse(r#"{"snooze":"1d"}"#).unwrap();
+        assert_eq!(stored.action, Action::Snooze("1d".to_string()));
+        assert!(!stored.acknowledged_batch_actions);
+        assert_eq!(
+            stored.gate_skip_reason(),
+            Some(BATCH_ACTIONS_UNACKNOWLEDGED_REASON)
+        );
+        assert_eq!(
+            StoredRuleAction::parse(r#""unsubscribe""#)
+                .unwrap()
+                .gate_skip_reason(),
+            Some(BATCH_ACTIONS_UNACKNOWLEDGED_REASON)
+        );
+    }
+
+    #[test]
+    fn acknowledged_stored_action_roundtrips_and_passes_gate() {
+        let stored = StoredRuleAction {
+            action: Action::Unsubscribe,
+            acknowledged_batch_actions: true,
+        };
+        let json = stored.to_json().unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"unsubscribe","acknowledged_batch_actions":true}"#
+        );
+        let parsed = StoredRuleAction::parse(&json).unwrap();
+        assert_eq!(parsed, stored);
+        assert_eq!(parsed.gate_skip_reason(), None);
+    }
+
+    #[test]
+    fn gate_ignores_actions_that_do_not_need_acknowledgement() {
+        for raw in [r#"{"add_tag":"t"}"#, r#"{"move":"Archive"}"#, r#""delete""#] {
+            assert_eq!(
+                StoredRuleAction::parse(raw).unwrap().gate_skip_reason(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn gate_reason_is_stable() {
+        assert!(BATCH_ACTIONS_UNACKNOWLEDGED_REASON.starts_with("needs_review:"));
+        assert!(BATCH_ACTIONS_UNACKNOWLEDGED_REASON.contains("--acknowledge-batch-actions"));
     }
 }

@@ -17,7 +17,7 @@
 
 use envelope_email_store::models::Rule;
 
-use crate::rules::{Action, MatchExpr};
+use crate::rules::{Action, MatchExpr, StoredRuleAction};
 
 /// Export a set of rules as a Sieve script string.
 ///
@@ -45,8 +45,8 @@ pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
             }
         };
 
-        let action: Action = match serde_json::from_str(&rule.action) {
-            Ok(a) => a,
+        let action: Action = match StoredRuleAction::parse(&rule.action) {
+            Ok(stored) => stored.action,
             Err(_) => {
                 skipped.push(rule.name.clone());
                 continue;
@@ -220,8 +220,12 @@ fn action_to_sieve<'a>(
                 sieve_string(&sanitize_reason(reason))
             ))
         }
-        // Snooze, Unsubscribe, AddTag, Webhook are local-only
-        Action::Snooze(_) | Action::Unsubscribe | Action::AddTag(_) | Action::Webhook(_) => None,
+        // Snooze, Unsubscribe, AddTag, Webhook, and Confirm offers are local-only
+        Action::Snooze(_)
+        | Action::Unsubscribe
+        | Action::AddTag(_)
+        | Action::Webhook(_)
+        | Action::Confirm { .. } => None,
     }
 }
 
@@ -507,5 +511,19 @@ mod tests {
             "
 # injected"
         ));
+    }
+
+    #[test]
+    fn confirm_rule_is_skipped_on_export_even_if_flagged_exportable() {
+        // A stale/incorrect exportable flag must still never emit an offer.
+        let rule = make_rule(
+            "Trip offer",
+            r#"{"from":"*@airline.example"}"#,
+            r#"{"confirm":{"prompt":"Trip?","then":[{"flag":"flagged"}]}}"#,
+            true,
+        );
+        let (script, skipped) = export_sieve(&[rule]);
+        assert_eq!(skipped, vec!["Trip offer".to_string()]);
+        assert!(!script.contains("addflag"), "{script}");
     }
 }

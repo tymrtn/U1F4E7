@@ -273,7 +273,13 @@ impl Database {
         Ok(stmt.query_row(params![id], map_action_log)?)
     }
 
-    fn get_action_by_event(&self, event_id: &str, action_type: &str) -> Result<Option<ActionLog>> {
+    /// The action recorded for `(event_id, action_type)`, if any. The pair is
+    /// UNIQUE, so this is the idempotency probe for event-linked actions.
+    pub fn get_action_by_event(
+        &self,
+        event_id: &str,
+        action_type: &str,
+    ) -> Result<Option<ActionLog>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
                     message_id, draft_id, event_id, action_status, created_at
