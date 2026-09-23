@@ -270,6 +270,44 @@ fn surfaces() -> Value {
         ],
     ));
     items.push(surface_entry(
+        "analytics_show",
+        "envelope analytics show <uid> --json",
+        None,
+        object(
+            json!({
+                "uid": integer("Message UID"),
+                "folder": string_default("IMAP folder", "INBOX"),
+                "account": string("Account ID or email address; default account if omitted")
+            }),
+            json!(["uid"]),
+        ),
+        object(
+            json!({
+                "account_id": string("Resolved account id"),
+                "folder": string("IMAP folder"),
+                "uid": integer("Message UID"),
+                "seen": array_of(object(
+                    json!({
+                        "event_id": string("message_seen event id"),
+                        "observed_at": string("RFC 3339 time Envelope observed \\Seen set by another client"),
+                        "source": string("index_refresh or watch"),
+                        "message_id": json!({"type": ["string", "null"], "description": "Message-ID when known"}),
+                        "uidvalidity": integer("Mailbox UIDVALIDITY the UID belongs to"),
+                        "label": string("Human wording: seen by <local time>")
+                    }),
+                    json!(["event_id", "observed_at", "source", "uidvalidity", "label"]),
+                )),
+                "note": string("Reminder that observed_at is an observation time, not the read time")
+            }),
+            json!(["account_id", "folder", "uid", "seen", "note"]),
+        ),
+        vec![
+            super::analytics::SEEN_BY_NOTE,
+            "Local read only: no IMAP connection, never sets \\Seen.",
+            "A message_seen is emitted only when Envelope held the message unseen and later observed \\Seen; Envelope's own flag writes are excluded.",
+        ],
+    ));
+    items.push(surface_entry(
         "send",
         "envelope send --to --subject --json",
         Some("send"),

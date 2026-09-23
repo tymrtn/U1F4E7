@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_imap::extensions::idle::IdleResponse;
 use envelope_email_store::CredentialBackend;
+use envelope_email_store::flag_transitions::{ObservedFlags, SEEN_SOURCE_WATCH};
 use envelope_email_store::models::{Event, EventRoute};
 use envelope_email_transport::code_extractor::{
     OtpPatternId, extract_code_with_pattern, parse_expiry_hint, redact_codes,
@@ -62,6 +64,25 @@ pub async fn run(
 
     // Track highest UID we've seen so we only fetch genuinely new messages
     let mut last_uid: u32 = highest_uid(&mut session, folder).await.unwrap_or(0);
+
+    let condstore = match session.capabilities().await {
+        Ok(caps) => caps.has_str("CONDSTORE"),
+        Err(e) => {
+            warn!("CAPABILITY failed ({e}); tracking flags without CONDSTORE");
+            false
+        }
+    };
+    let mut flag_watch = FlagWatch::new(condstore);
+    sync_flags(
+        &mut flag_watch,
+        &mut session,
+        &db,
+        &account_id,
+        folder,
+        current_uid_validity,
+        selected_mailbox.exists,
+    )
+    .await;
 
     loop {
         // Enter IDLE
@@ -187,6 +208,17 @@ pub async fn run(
                 }
 
                 info!("processed {} new message(s)", new_msgs.len());
+
+                sync_flags(
+                    &mut flag_watch,
+                    &mut session,
+                    &db,
+                    &account_id,
+                    folder,
+                    uid_validity,
+                    selected_mailbox.exists,
+                )
+                .await;
             }
             IdleResponse::Timeout => {
                 // Re-IDLE after timeout (keeps connection alive)
@@ -207,6 +239,16 @@ pub async fn run(
                     current_uid_validity = selected_mailbox.uid_validity;
                     last_uid = 0;
                 }
+                sync_flags(
+                    &mut flag_watch,
+                    &mut session,
+                    &db,
+                    &account_id,
+                    folder,
+                    selected_mailbox.uid_validity,
+                    selected_mailbox.exists,
+                )
+                .await;
             }
             IdleResponse::ManualInterrupt => {
                 let _ = handle.done().await;
@@ -224,6 +266,233 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// How many of the newest messages `watch` tracks for `\Seen` transitions.
+const FLAG_WATCH_WINDOW: u32 = 200;
+
+/// One bounded FLAGS fetch. Only FLAGS (plus UID and MODSEQ) are requested,
+/// never a body, so the fetch itself cannot set `\Seen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlagFetch {
+    /// First pass after SELECT: the newest [`FLAG_WATCH_WINDOW`] messages by
+    /// sequence number (`exists` is the SELECT's EXISTS count).
+    Seed { exists: u32 },
+    /// After an IDLE wake: every UID from the oldest tracked one up, narrowed
+    /// to changed messages when the server supports CONDSTORE.
+    Since {
+        from_uid: u32,
+        changed_since: Option<u64>,
+    },
+}
+
+impl FlagFetch {
+    /// `(uid_command, set, query)` for this fetch.
+    fn command(&self, condstore: bool) -> (bool, String, String) {
+        let items = if condstore {
+            "(UID FLAGS MODSEQ)"
+        } else {
+            "(UID FLAGS)"
+        };
+        match self {
+            FlagFetch::Seed { exists } => {
+                let start = exists.saturating_sub(FLAG_WATCH_WINDOW - 1).max(1);
+                (false, format!("{start}:{exists}"), items.to_string())
+            }
+            FlagFetch::Since {
+                from_uid,
+                changed_since,
+            } => {
+                let query = match (condstore, changed_since) {
+                    (true, Some(modseq)) => format!("{items} (CHANGEDSINCE {modseq})"),
+                    _ => items.to_string(),
+                };
+                (true, format!("{}:*", from_uid.max(&1)), query)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FetchedFlags {
+    uid: u32,
+    flags: Vec<String>,
+    modseq: Option<u64>,
+}
+
+/// Where FLAGS come from: the live IMAP session, or a fake in tests.
+trait FlagSource {
+    async fn fetch_flags(
+        &mut self,
+        fetch: &FlagFetch,
+        condstore: bool,
+    ) -> Result<Vec<FetchedFlags>>;
+}
+
+impl FlagSource for envelope_email_transport::imap::ImapSession {
+    async fn fetch_flags(
+        &mut self,
+        fetch: &FlagFetch,
+        condstore: bool,
+    ) -> Result<Vec<FetchedFlags>> {
+        let (uid_command, set, query) = fetch.command(condstore);
+        let context = format!(
+            "{}FETCH {set} {query}",
+            if uid_command { "UID " } else { "" }
+        );
+        if uid_command {
+            let stream = self
+                .uid_fetch(&set, &query)
+                .await
+                .map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+            collect_fetched_flags(stream, &context).await
+        } else {
+            let stream = self
+                .fetch(&set, &query)
+                .await
+                .map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+            collect_fetched_flags(stream, &context).await
+        }
+    }
+}
+
+async fn collect_fetched_flags(
+    stream: impl futures_util::Stream<Item = async_imap::error::Result<async_imap::types::Fetch>>,
+    context: &str,
+) -> Result<Vec<FetchedFlags>> {
+    let mut stream = std::pin::pin!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let fetch = item.map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+        let Some(uid) = fetch.uid else { continue };
+        out.push(FetchedFlags {
+            uid,
+            flags: fetch.flags().map(|f| format!("{f:?}")).collect(),
+            modseq: fetch.modseq,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-folder `uid -> flags` memory for `watch`, so a server with no dashboard
+/// index still yields `message_seen` events when another client reads mail.
+struct FlagWatch {
+    condstore: bool,
+    uidvalidity: Option<u32>,
+    seeded: bool,
+    known: BTreeMap<u32, Vec<String>>,
+    highest_modseq: Option<u64>,
+}
+
+impl FlagWatch {
+    fn new(condstore: bool) -> Self {
+        Self {
+            condstore,
+            uidvalidity: None,
+            seeded: false,
+            known: BTreeMap::new(),
+            highest_modseq: None,
+        }
+    }
+
+    fn next_fetch(&self, exists: u32) -> FlagFetch {
+        if !self.seeded {
+            return FlagFetch::Seed { exists };
+        }
+        FlagFetch::Since {
+            from_uid: self.known.keys().next().copied().unwrap_or(1),
+            changed_since: self.highest_modseq,
+        }
+    }
+
+    /// Fetch FLAGS, persist them through the message index, and emit
+    /// `message_seen` for tracked UIDs that gained `\Seen`. The seeding pass
+    /// emits only what the index itself can prove (a row it held unseen).
+    /// Returns the number of new events.
+    async fn sync<S: FlagSource>(
+        &mut self,
+        source: &mut S,
+        db: &envelope_email_store::Database,
+        account_id: &str,
+        folder: &str,
+        uidvalidity: Option<u32>,
+        exists: u32,
+    ) -> Result<usize> {
+        let uidvalidity = uidvalidity.context(
+            "server reported no UIDVALIDITY; cannot key message_seen events for this folder",
+        )?;
+        if self.uidvalidity != Some(uidvalidity) {
+            *self = Self::new(self.condstore);
+            self.uidvalidity = Some(uidvalidity);
+        }
+        if !self.seeded && exists == 0 {
+            self.seeded = true;
+            return Ok(0);
+        }
+
+        let fetch = self.next_fetch(exists);
+        let rows = source.fetch_flags(&fetch, self.condstore).await?;
+
+        let prior: HashMap<u32, Vec<String>> = if self.seeded {
+            self.known
+                .iter()
+                .map(|(uid, flags)| (*uid, flags.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let observed: Vec<ObservedFlags> = rows
+            .iter()
+            .map(|row| ObservedFlags {
+                uid: row.uid,
+                message_id: None,
+                flags: row.flags.clone(),
+            })
+            .collect();
+        let emitted = db
+            .record_observed_flags(
+                account_id,
+                folder,
+                u64::from(uidvalidity),
+                &prior,
+                &observed,
+                SEEN_SOURCE_WATCH,
+            )
+            .context("failed to record observed flags")?;
+
+        for row in rows {
+            if let Some(modseq) = row.modseq {
+                self.highest_modseq = Some(self.highest_modseq.map_or(modseq, |m| m.max(modseq)));
+            }
+            self.known.insert(row.uid, row.flags);
+        }
+        while self.known.len() > FLAG_WATCH_WINDOW as usize {
+            self.known.pop_first();
+        }
+        self.seeded = true;
+        Ok(emitted)
+    }
+}
+
+/// Run one flag sync; a failure is logged and the watch carries on, since
+/// new-mail notification must not stop over read tracking.
+async fn sync_flags(
+    flag_watch: &mut FlagWatch,
+    session: &mut envelope_email_transport::imap::ImapSession,
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    folder: &str,
+    uidvalidity: Option<u32>,
+    exists: u32,
+) {
+    match flag_watch
+        .sync(session, db, account_id, folder, uidvalidity, exists)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!("observed {n} message(s) read on another client in {folder}"),
+        Err(e) => warn!("flag sync for {folder} failed: {e:#}"),
+    }
 }
 
 /// A minimal representation of a newly fetched message.
@@ -584,6 +853,237 @@ mod tests {
         let body = "é".repeat(151);
         let preview = snippet_preview(body.as_bytes(), 150);
         assert_eq!(preview, format!("{}...", "é".repeat(150)));
+    }
+
+    /// Scripted FLAGS responses, one per sync, recording each fetch asked for.
+    struct FakeFlagSource {
+        responses: std::collections::VecDeque<Vec<FetchedFlags>>,
+        fetches: Vec<(FlagFetch, bool)>,
+    }
+
+    impl FakeFlagSource {
+        fn new(responses: Vec<Vec<FetchedFlags>>) -> Self {
+            Self {
+                responses: responses.into(),
+                fetches: Vec::new(),
+            }
+        }
+    }
+
+    impl FlagSource for FakeFlagSource {
+        async fn fetch_flags(
+            &mut self,
+            fetch: &FlagFetch,
+            condstore: bool,
+        ) -> Result<Vec<FetchedFlags>> {
+            self.fetches.push((fetch.clone(), condstore));
+            Ok(self.responses.pop_front().expect("unscripted fetch"))
+        }
+    }
+
+    fn row(uid: u32, flags: &[&str], modseq: Option<u64>) -> FetchedFlags {
+        FetchedFlags {
+            uid,
+            flags: flags.iter().map(|f| f.to_string()).collect(),
+            modseq,
+        }
+    }
+
+    fn seen_events(db: &envelope_email_store::Database) -> Vec<Event> {
+        db.list_events(None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "message_seen")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn first_wake_seeds_and_second_wake_emits_one_seen() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let mut source = FakeFlagSource::new(vec![
+            vec![row(7, &[], None), row(8, &["Seen"], None)],
+            vec![row(7, &["Seen"], None), row(8, &["Seen"], None)],
+            vec![row(7, &["Seen"], None), row(8, &["Seen"], None)],
+        ]);
+        let mut watch = FlagWatch::new(false);
+
+        let seeded = watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(42), 2)
+            .await
+            .unwrap();
+        assert_eq!(seeded, 0, "seeding never emits without an index prior");
+        assert!(seen_events(&db).is_empty());
+
+        let emitted = watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(42), 2)
+            .await
+            .unwrap();
+        assert_eq!(emitted, 1);
+        let events = seen_events(&db);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, Some(7));
+        assert_eq!(
+            events[0].idempotency_key.as_deref(),
+            Some("seen:acc:INBOX:42:7")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(events[0].payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["source"], "watch");
+
+        let again = watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(42), 2)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(seen_events(&db).len(), 1);
+
+        assert_eq!(source.fetches[0].0, FlagFetch::Seed { exists: 2 });
+        assert_eq!(
+            source.fetches[1].0,
+            FlagFetch::Since {
+                from_uid: 7,
+                changed_since: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn own_mark_seen_in_the_index_is_not_a_foreign_read() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        db.upsert_indexed_message_summaries(
+            "acc",
+            "INBOX",
+            42,
+            &[envelope_email_store::models::IndexedMessageInput {
+                uid: 7,
+                message_id: Some("<7@x>".into()),
+                from_addr: "p@example.test".into(),
+                to_addr: "me@example.test".into(),
+                subject: "s".into(),
+                date: None,
+                flags: vec![],
+                size: 1,
+                snippet: None,
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+        let mut source =
+            FakeFlagSource::new(vec![vec![row(7, &[], None)], vec![row(7, &["Seen"], None)]]);
+        let mut watch = FlagWatch::new(false);
+        watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(42), 1)
+            .await
+            .unwrap();
+        envelope_email_transport::imap::record_own_flag_change(
+            &db,
+            "acc",
+            "INBOX",
+            &[7],
+            "\\Seen",
+            true,
+        )
+        .unwrap();
+        let emitted = watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(42), 1)
+            .await
+            .unwrap();
+        assert_eq!(emitted, 0);
+        assert!(seen_events(&db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn condstore_narrows_wakes_to_changed_since_the_highest_modseq() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let mut source = FakeFlagSource::new(vec![
+            vec![row(300, &[], Some(10)), row(301, &[], Some(12))],
+            vec![row(301, &["Seen"], Some(15))],
+            vec![],
+        ]);
+        let mut watch = FlagWatch::new(true);
+        for _ in 0..3 {
+            watch
+                .sync(&mut source, &db, "acc", "INBOX", Some(1), 500)
+                .await
+                .unwrap();
+        }
+        assert_eq!(seen_events(&db).len(), 1);
+        assert_eq!(
+            source.fetches[1].0,
+            FlagFetch::Since {
+                from_uid: 300,
+                changed_since: Some(12)
+            }
+        );
+        assert_eq!(
+            source.fetches[2].0,
+            FlagFetch::Since {
+                from_uid: 300,
+                changed_since: Some(15)
+            }
+        );
+        assert!(source.fetches.iter().all(|(_, condstore)| *condstore));
+    }
+
+    #[tokio::test]
+    async fn uidvalidity_change_reseeds_without_emitting() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let mut source =
+            FakeFlagSource::new(vec![vec![row(7, &[], None)], vec![row(7, &["Seen"], None)]]);
+        let mut watch = FlagWatch::new(false);
+        watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(1), 1)
+            .await
+            .unwrap();
+        let emitted = watch
+            .sync(&mut source, &db, "acc", "INBOX", Some(2), 1)
+            .await
+            .unwrap();
+        assert_eq!(emitted, 0);
+        assert_eq!(source.fetches[1].0, FlagFetch::Seed { exists: 1 });
+    }
+
+    #[test]
+    fn flag_fetch_commands_are_bounded_and_body_free() {
+        assert_eq!(
+            FlagFetch::Seed { exists: 1000 }.command(false),
+            (false, "801:1000".to_string(), "(UID FLAGS)".to_string())
+        );
+        assert_eq!(
+            FlagFetch::Seed { exists: 5 }.command(true),
+            (false, "1:5".to_string(), "(UID FLAGS MODSEQ)".to_string())
+        );
+        assert_eq!(
+            FlagFetch::Since {
+                from_uid: 90,
+                changed_since: Some(7)
+            }
+            .command(true),
+            (
+                true,
+                "90:*".to_string(),
+                "(UID FLAGS MODSEQ) (CHANGEDSINCE 7)".to_string()
+            )
+        );
+        assert_eq!(
+            FlagFetch::Since {
+                from_uid: 90,
+                changed_since: Some(7)
+            }
+            .command(false),
+            (true, "90:*".to_string(), "(UID FLAGS)".to_string())
+        );
+        for (_, _, query) in [
+            FlagFetch::Seed { exists: 3 }.command(true),
+            FlagFetch::Since {
+                from_uid: 1,
+                changed_since: None,
+            }
+            .command(false),
+        ] {
+            assert!(!query.contains("BODY"), "{query}");
+            assert!(!query.contains("RFC822"), "{query}");
+        }
     }
 
     #[test]

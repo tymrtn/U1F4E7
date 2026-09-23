@@ -396,6 +396,23 @@ pub async fn execute(
         }
     }
 
+    // Envelope's own flag writes must not read as another client's read.
+    let own_flag_change = match &req.op {
+        BulkOp::FlagAdd { flag } => Some((flag, true)),
+        BulkOp::FlagRemove { flag } => Some((flag, false)),
+        _ => None,
+    };
+    if let Some((flag, add)) = own_flag_change {
+        imap::record_own_flag_change(db, account_id, &req.folder, &succeeded, flag, add).map_err(
+            |e| {
+                BulkError::Store(format!(
+                    "flags changed on the server for {} UID(s), but updating the local message index failed: {e}",
+                    succeeded.len()
+                ))
+            },
+        )?;
+    }
+
     Ok(BulkResult {
         requested: uids.len(),
         resolved_uids: uids,

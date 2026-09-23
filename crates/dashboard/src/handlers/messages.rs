@@ -1205,6 +1205,24 @@ pub async fn flags(
             state.evict_imap(&account_id).await;
             return (StatusCode::BAD_GATEWAY, format!("set_flag {flag}: {e}")).into_response();
         }
+        let patched = {
+            let db = state.db.lock().await;
+            envelope_email_transport::imap::record_own_flag_change(
+                &db,
+                &account_id,
+                &req.folder,
+                &[uid],
+                flag,
+                true,
+            )
+        };
+        if let Err(e) = patched {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("set_flag {flag}: changed on the server, but updating the local message index failed: {e}"),
+            )
+                .into_response();
+        }
     }
     for flag in &req.remove {
         if let Err(e) =
@@ -1212,6 +1230,24 @@ pub async fn flags(
         {
             state.evict_imap(&account_id).await;
             return (StatusCode::BAD_GATEWAY, format!("remove_flag {flag}: {e}")).into_response();
+        }
+        let patched = {
+            let db = state.db.lock().await;
+            envelope_email_transport::imap::record_own_flag_change(
+                &db,
+                &account_id,
+                &req.folder,
+                &[uid],
+                flag,
+                false,
+            )
+        };
+        if let Err(e) = patched {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("remove_flag {flag}: changed on the server, but updating the local message index failed: {e}"),
+            )
+                .into_response();
         }
     }
     Json(json!({ "ok": true, "uid": uid, "added": req.add, "removed": req.remove })).into_response()

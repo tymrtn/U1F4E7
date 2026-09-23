@@ -23,6 +23,9 @@ pub const SEND_COMPLETED: &str = "send_completed";
 pub const GOVERNOR_BLOCKED: &str = "governor_blocked";
 /// An agent-attributed action was recorded to the action log.
 pub const AGENT_ACTION: &str = "agent_action";
+/// `\Seen` appeared on a message Envelope had observed unseen: another client
+/// read it. `created_at` is the observation time, an upper bound on the read.
+pub const MESSAGE_SEEN: &str = "message_seen";
 
 /// All catalog event types, for validation and documentation.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -33,6 +36,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SEND_COMPLETED,
     GOVERNOR_BLOCKED,
     AGENT_ACTION,
+    MESSAGE_SEEN,
 ];
 
 /// Is `event_type` a known catalog event? Unknown types are still deliverable
@@ -90,6 +94,7 @@ mod tests {
     fn known_event_types_round_trip() {
         assert!(is_known_event_type(SEND_QUEUED));
         assert!(is_known_event_type(GOVERNOR_BLOCKED));
+        assert!(is_known_event_type(MESSAGE_SEEN));
         assert!(!is_known_event_type("totally_made_up"));
     }
 

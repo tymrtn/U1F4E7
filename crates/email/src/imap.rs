@@ -1668,6 +1668,27 @@ pub fn map_flag_name(flag: &str) -> String {
     }
 }
 
+/// A flag name in the local index spelling: async-imap's `Debug` of the
+/// parsed flag (`"Seen"`, `"Flagged"`, `Custom("$Label")`), which is how every
+/// FETCH summary stores flags.
+pub fn index_flag_name(flag: &str) -> String {
+    format!("{:?}", async_imap::types::Flag::from(map_flag_name(flag)))
+}
+
+/// Patch the local message index after Envelope itself added or removed
+/// `flag` on the server, so the change never reads as another client's read.
+/// Call only after the server STORE succeeded.
+pub fn record_own_flag_change(
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    folder: &str,
+    uids: &[u32],
+    flag: &str,
+    add: bool,
+) -> Result<usize, envelope_email_store::StoreError> {
+    db.patch_indexed_message_flags(account_id, folder, uids, &index_flag_name(flag), add)
+}
+
 /// Search messages in a folder using IMAP SEARCH.
 pub async fn search(
     client: &mut ImapClient,
@@ -2558,6 +2579,19 @@ Subject: hi\r\n\r\nbody\r\n";
     fn evidence_header_search_query_rejects_subject_fallback_and_crlf() {
         assert!(evidence_header_search_query("Subject", "Contract").is_err());
         assert!(evidence_header_search_query("Message-ID", "<a@example.com>\r\nALL").is_err());
+    }
+
+    #[test]
+    fn index_flag_name_matches_the_fetch_summary_spelling() {
+        assert_eq!(index_flag_name("seen"), "Seen");
+        assert_eq!(index_flag_name("\\Seen"), "Seen");
+        assert_eq!(index_flag_name("flagged"), "Flagged");
+        assert_eq!(index_flag_name("$Label"), "Custom(\"$Label\")");
+        let fetched: Vec<String> = [async_imap::types::Flag::Seen]
+            .iter()
+            .map(|f| format!("{f:?}"))
+            .collect();
+        assert_eq!(fetched, vec![index_flag_name("seen")]);
     }
 
     #[test]

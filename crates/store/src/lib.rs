@@ -17,6 +17,7 @@ pub mod event_catalog;
 pub mod event_deliveries;
 pub mod event_routes;
 pub mod events;
+pub mod flag_transitions;
 pub mod license_store;
 pub mod message_index;
 pub mod migration;

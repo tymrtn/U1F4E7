@@ -73,6 +73,7 @@ The v3 contract covers:
 - rule execution MCP tools: `rules_preview`, `rules_run`
 - delivery/watch health: `watch_status`
 - snooze management: `snooze`
+- read observation (CLI only): `analytics_show`
 
 ## Authored bodies and literal escape sequences (`input_normalization`)
 
@@ -233,6 +234,10 @@ The `bulk` tool applies one operation (`move`, `copy`, `flag_add`, `flag_remove`
 ### Delivery/watch health (`watch_status`) and snooze (`snooze`)
 
 `watch_status` is a read-only summary (action `watch.read`) of watch-registry entries plus durable event-delivery counts by status (`delivered`/`pending`/`dead_letter`) and the last successful delivery timestamp. `snooze` (action `snooze`) maps `action=set|list|cancel` to the snooze internals: `set` moves a message to the `Snoozed` folder until a return time, `list` returns snoozed records, `cancel` restores a message to its original folder.
+
+### Read observation (`analytics_show`)
+
+`envelope analytics show <uid> [--folder] [--account] --json` lists `message_seen` events for one message. Envelope emits `message_seen` when a message it held unseen (in the local index, or in `envelope watch`'s FLAGS window) is later observed with `\Seen`, which means another client read it. Envelope's own flag writes patch the index and never count. `observed_at` is the observation time, an upper bound on the read, so the human wording is "seen by <time>". The command reads only the local database and never opens IMAP. Not exposed over MCP yet.
 
 ## Evidence
 

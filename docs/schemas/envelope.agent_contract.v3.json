@@ -1551,6 +1551,117 @@
     },
     {
       "cli": {
+        "command": "envelope analytics show <uid> --json",
+        "json_output": true
+      },
+      "compatibility_notes": [
+        "observed_at is when Envelope saw \\Seen set by another client; the read happened at or before that time, never after. It is not the read time.",
+        "Local read only: no IMAP connection, never sets \\Seen.",
+        "A message_seen is emitted only when Envelope held the message unseen and later observed \\Seen; Envelope's own flag writes are excluded."
+      ],
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "description": "Account ID or email address; default account if omitted",
+            "type": "string"
+          },
+          "folder": {
+            "default": "INBOX",
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid"
+        ],
+        "type": "object"
+      },
+      "mcp": {
+        "implemented": false,
+        "tool": null
+      },
+      "name": "analytics_show",
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "description": "Resolved account id",
+            "type": "string"
+          },
+          "folder": {
+            "description": "IMAP folder",
+            "type": "string"
+          },
+          "note": {
+            "description": "Reminder that observed_at is an observation time, not the read time",
+            "type": "string"
+          },
+          "seen": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "event_id": {
+                  "description": "message_seen event id",
+                  "type": "string"
+                },
+                "label": {
+                  "description": "Human wording: seen by <local time>",
+                  "type": "string"
+                },
+                "message_id": {
+                  "description": "Message-ID when known",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "observed_at": {
+                  "description": "RFC 3339 time Envelope observed \\Seen set by another client",
+                  "type": "string"
+                },
+                "source": {
+                  "description": "index_refresh or watch",
+                  "type": "string"
+                },
+                "uidvalidity": {
+                  "description": "Mailbox UIDVALIDITY the UID belongs to",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "event_id",
+                "observed_at",
+                "source",
+                "uidvalidity",
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "uid": {
+            "description": "Message UID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "folder",
+          "uid",
+          "seen",
+          "note"
+        ],
+        "type": "object"
+      },
+      "stability": "stable-v1"
+    },
+    {
+      "cli": {
         "command": "envelope send --to --subject --json",
         "json_output": true
       },

@@ -814,12 +814,40 @@ async fn execute_action(
             envelope_email_transport::imap::set_flag(client, folder, uid, flag)
                 .await
                 .with_context(|| format!("failed to set flag '{flag}' on UID {uid}"))?;
+            {
+                let db = state.db.lock().await;
+                envelope_email_transport::imap::record_own_flag_change(
+                    &db,
+                    account_id,
+                    folder,
+                    &[uid],
+                    flag,
+                    true,
+                )
+                .with_context(|| {
+                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
+                })?;
+            }
             Ok(format!("flagged {flag}"))
         }
         Action::Unflag(flag) => {
             envelope_email_transport::imap::remove_flag(client, folder, uid, flag)
                 .await
                 .with_context(|| format!("failed to remove flag '{flag}' from UID {uid}"))?;
+            {
+                let db = state.db.lock().await;
+                envelope_email_transport::imap::record_own_flag_change(
+                    &db,
+                    account_id,
+                    folder,
+                    &[uid],
+                    flag,
+                    false,
+                )
+                .with_context(|| {
+                    format!("flag '{flag}' changed on UID {uid}, but updating the local message index failed")
+                })?;
+            }
             Ok(format!("unflagged {flag}"))
         }
         Action::Delete => {
