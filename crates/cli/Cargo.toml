@@ -8,6 +8,15 @@ edition.workspace = true
 authors.workspace = true
 description = "BYO mailbox email client with agent-native primitives"
 
+[features]
+# Build the Governor send gate into the `envelope` binary:
+#   cargo build --release --bin envelope --features governor
+#   cargo install --path crates/cli --features governor
+governor = [
+    "envelope-email-transport/governor",
+    "envelope-email-dashboard/governor",
+]
+
 [[bin]]
 name = "envelope"
 path = "src/main.rs"

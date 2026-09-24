@@ -8,6 +8,10 @@ edition.workspace = true
 authors.workspace = true
 description = "Localhost email client dashboard — inbox, read, compose, reply, drafts, snooze, threads"
 
+[features]
+# Forwards the transport crate's build-time Governor send gate.
+governor = ["envelope-email-transport/governor"]
+
 [dependencies]
 envelope-email-store = { path = "../store" }
 envelope-email-transport = { path = "../email" }

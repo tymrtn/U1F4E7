@@ -839,6 +839,8 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
         // queued mail, so it must run the Governor gate against the reloaded,
         // claimed row. When Governor is required and missing/errors/denies/
         // reviews, the send is refused and the claim is released per reason.
+        // A build without the `governor` feature runs the same gate in `off`
+        // mode: attribution is still enforced, nothing is scored.
         let gov_outcome = run_governor_gate(
             state,
             draft,
@@ -1675,8 +1677,9 @@ pub(crate) fn scheduled_send_context(
 /// revision-bound approval, and **no bot declaration is fabricated**
 /// (`declared_attrs` stays empty for a human-originated send). The real Governor
 /// decision runs later at the scheduled-send sweep, so the block is deferred
-/// (`governor: null`, `governor_decision_pending` set) — matching the CLI/MCP
-/// queued success block. Sanitized: never a score, weight, threshold, body, raw
+/// (`governor: null`, `governor_decision_pending` set; the off verdict in a
+/// build without the `governor` feature) — matching the CLI/MCP queued success
+/// block. Sanitized: never a score, weight, threshold, body, raw
 /// recipient, secret, or attachment byte.
 ///
 /// Reflects the same origin/attestation logic the sweep enforces via
@@ -1798,6 +1801,9 @@ pub fn dashboard_human_send_authorized(draft: &envelope_email_store::Draft) -> b
 /// unattributed/invalid request BEFORE Governor is ever spawned. A bot-originated
 /// draft with no valid current declaration therefore fails closed here even when
 /// the derived set is rich; host facts never substitute for the bot's attribution.
+/// The gate mode is `GovernorConfig::smtp()`: built without the `governor`
+/// feature it is `off`, so an attributed draft is sent unscored and the audit
+/// event records `mode: "off"`.
 async fn run_governor_gate(
     state: &AppState,
     draft: &envelope_email_store::Draft,
@@ -1887,7 +1893,7 @@ async fn run_governor_gate(
         require_declaration,
     );
 
-    let config = GovernorConfig::smtp_required();
+    let config = GovernorConfig::smtp();
     let outcome = gate_with_attribution(&config, &req);
 
     // Record a sanitized audit event (no bodies, no full addresses, no bytes).
@@ -3387,8 +3393,17 @@ mod tests {
                 .any(|a| a == "tyler_approved"),
             "the durable human attestation is derived: {block}"
         );
-        assert_eq!(block["governor"], serde_json::Value::Null);
-        assert!(block.get("governor_decision_pending").is_some());
+        #[cfg(feature = "governor")]
+        {
+            assert_eq!(block["governor"], serde_json::Value::Null);
+            assert!(block.get("governor_decision_pending").is_some());
+        }
+        #[cfg(not(feature = "governor"))]
+        {
+            assert_eq!(block["governor"]["mode"], "off");
+            assert_eq!(block["governor"]["decision"], "disabled");
+            assert!(block.get("governor_decision_pending").is_none());
+        }
         let text = block.to_string();
         for banned in ["\"score\"", "weight", "threshold"] {
             assert!(!text.contains(banned), "block leaked {banned}");

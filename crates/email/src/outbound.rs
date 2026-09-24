@@ -14,6 +14,9 @@
 //! 2. Before any real SMTP send, the caller runs [`gate`]. When Governor is
 //!    configured as `required` it fails closed: missing/errored/denied/review
 //!    all block the send. Only an explicit `allow` from Governor permits SMTP.
+//!    Whether SMTP paths use Governor at all is fixed at build time by the
+//!    `governor` Cargo feature (see [`GovernorConfig::smtp`]); without it the
+//!    gate still enforces the attribution precondition but scores nothing.
 //!
 //! Nothing in this module logs message bodies, full recipient addresses,
 //! attachment bytes, or secrets. Governor receives only the sanitized attribute
@@ -48,12 +51,14 @@ pub const OUTBOX_COOLDOWN_REASON: &str = "queued in the Envelope outbox for the 
 /// Environment variable that overrides the default actual-send cooldown.
 pub const ENV_COOLDOWN_SECONDS: &str = "ENVELOPE_SEND_COOLDOWN_SECONDS";
 
-/// Canonical Governor executable for SMTP-capable Envelope processes.
+/// Canonical Governor executable for SMTP-capable Envelope processes built with
+/// the `governor` feature (see [`GovernorConfig::smtp`]).
 ///
 /// This is deliberately an absolute path, not a PATH lookup or an environment
 /// override. A missing executable fails the SMTP gate closed rather than allowing
-/// a caller to substitute a permissive binary. Operators must provision this
-/// trusted path before enabling SMTP-capable processes.
+/// a caller to substitute a permissive binary. Operators who build with the
+/// feature must provision this trusted path before enabling SMTP-capable
+/// processes.
 pub const SMTP_GOVERNOR_BIN: &str =
     "/Users/tylermartin/Dropbox/Code/governor/governor2/target/release/governor";
 
@@ -142,7 +147,8 @@ pub enum GovernorMode {
     Required,
     /// Run Governor and record its verdict, but never block the send.
     Warn,
-    /// Skip the Governor gate entirely.
+    /// Skip Governor scoring: nothing is spawned. [`gate_with_attribution`]
+    /// still refuses a missing or invalid declaration.
     Off,
 }
 
@@ -175,13 +181,38 @@ pub struct GovernorConfig {
 }
 
 impl GovernorConfig {
-    /// Configuration for every SMTP-capable Envelope path.
+    /// The gate configuration every SMTP-capable Envelope path uses in this
+    /// build: CLI, MCP, scheduled sweeps, and dashboard workers.
     ///
-    /// Do not read a mode or executable from the process environment here. CLI,
-    /// MCP, scheduled sweeps, and dashboard workers all inherit caller-controlled
-    /// environments; accepting overrides at this boundary lets an agent disable
-    /// the Governor gate or replace its decision engine. A missing trusted binary
-    /// therefore produces the existing fail-closed `governor_unavailable` result.
+    /// Built with the `governor` Cargo feature, this is [`Self::smtp_required`]:
+    /// the trusted absolute binary, failing closed. Built without it (the
+    /// default, and what Homebrew and the release archives ship), SMTP sends are
+    /// not scored by Governor: the mode is [`GovernorMode::Off`], no Governor
+    /// binary is named or spawned, and the send outcome records `mode: "off"`.
+    /// Attribution validation still runs in both builds.
+    ///
+    /// This is a build-time decision, so no runtime input can change it. Do not
+    /// read a mode or executable from the process environment, a CLI flag, or a
+    /// config key here: those processes inherit caller-controlled inputs, and
+    /// accepting overrides at this boundary would let an agent disable the gate
+    /// or replace its decision engine.
+    pub fn smtp() -> Self {
+        #[cfg(feature = "governor")]
+        {
+            Self::smtp_required()
+        }
+        #[cfg(not(feature = "governor"))]
+        {
+            Self {
+                mode: GovernorMode::Off,
+                bin: String::new(),
+            }
+        }
+    }
+
+    /// The fail-closed Governor configuration: required mode with the trusted
+    /// absolute binary. A missing binary produces `governor_unavailable`.
+    /// [`Self::smtp`] selects this when built with the `governor` feature.
     pub fn smtp_required() -> Self {
         Self {
             mode: GovernorMode::Required,
@@ -190,11 +221,11 @@ impl GovernorConfig {
     }
 
     /// Back-compatible name retained for callers compiled against the transport
-    /// crate. It intentionally has SMTP-required semantics and ignores the
-    /// environment; diagnostics must exercise `gate` with an explicit in-memory
-    /// [`GovernorConfig`] and must not be wired to SMTP.
+    /// crate. It returns [`Self::smtp`] and ignores the environment; diagnostics
+    /// must exercise `gate` with an explicit in-memory [`GovernorConfig`] and
+    /// must not be wired to SMTP.
     pub fn from_env() -> Self {
-        Self::smtp_required()
+        Self::smtp()
     }
 }
 
@@ -599,18 +630,23 @@ impl GovernorOutcome {
     }
 
     /// The additive `attribution` block for a **successful** outbound result: the
-    /// resolved sets/rejections/state plus the Governor decision/route that
-    /// permitted this send. `None` on legacy paths that never resolved
+    /// resolved sets/rejections/state plus the Governor decision/route/mode that
+    /// permitted this send (`mode: "off"`, `decision: "disabled"` when the gate
+    /// did not score it). `None` on legacy paths that never resolved
     /// attribution. Never carries a score, weight, threshold, body, raw
     /// recipient, secret, or attachment byte.
     pub fn success_attribution(&self) -> Option<Value> {
         self.resolution.as_ref().map(|res| {
-            crate::attribution_persist::success_attribution_block(
+            let mut block = crate::attribution_persist::success_attribution_block(
                 res,
                 Some(self.decision.as_str()),
                 self.route.as_deref(),
                 false,
-            )
+            );
+            if let Some(Value::Object(governor)) = block.get_mut("governor") {
+                governor.insert("mode".into(), json!(self.mode.as_str()));
+            }
+            block
         })
     }
 
@@ -1085,14 +1121,12 @@ pub fn gate(config: &GovernorConfig, req: &GovernorRequest) -> GovernorOutcome {
 /// requires `req.resolution` to be set (via
 /// [`GovernorRequest::from_context_with_declared`]); without it, it falls back to
 /// the legacy raw [`gate`].
+///
+/// `off` skips only the Governor scoring step. The attribution precondition is
+/// Envelope's own protocol and still refuses a missing or invalid declaration,
+/// so a build without the `governor` feature validates and records attribution
+/// exactly as a governed build does.
 pub fn gate_with_attribution(config: &GovernorConfig, req: &GovernorRequest) -> GovernorOutcome {
-    if config.mode == GovernorMode::Off {
-        // Off explicitly disables both the gate and the attribution requirement.
-        let mut o = off_outcome();
-        o.surface = Some(req.surface);
-        o.resolution = req.resolution.clone();
-        return o;
-    }
     let Some(resolution) = req.resolution.clone() else {
         return gate(config, req);
     };
@@ -1102,7 +1136,11 @@ pub fn gate_with_attribution(config: &GovernorConfig, req: &GovernorRequest) -> 
         return attribution_failure_outcome(config.mode, req, resolution);
     }
 
-    let mut outcome = spawn_and_interpret(config, &resolution.governor_attrs, &req.justification());
+    let mut outcome = if config.mode == GovernorMode::Off {
+        off_outcome()
+    } else {
+        spawn_and_interpret(config, &resolution.governor_attrs, &req.justification())
+    };
     outcome.surface = Some(req.surface);
     outcome.action_echo = Some(req.action_echo());
     outcome.resolution = Some(resolution);
@@ -1367,8 +1405,17 @@ mod tests {
     }
 
     #[test]
-    fn smtp_config_is_required_and_uses_the_trusted_absolute_binary() {
+    fn smtp_required_is_the_pinned_required_config_in_every_build() {
         let config = GovernorConfig::smtp_required();
+        assert_eq!(config.mode, GovernorMode::Required);
+        assert_eq!(config.bin, SMTP_GOVERNOR_BIN);
+        assert!(std::path::Path::new(&config.bin).is_absolute());
+    }
+
+    #[cfg(feature = "governor")]
+    #[test]
+    fn smtp_config_is_required_and_uses_the_trusted_absolute_binary() {
+        let config = GovernorConfig::smtp();
         assert_eq!(config.mode, GovernorMode::Required);
         assert_eq!(config.bin, SMTP_GOVERNOR_BIN);
         assert!(std::path::Path::new(&config.bin).is_absolute());
@@ -1376,6 +1423,94 @@ mod tests {
         // SMTP configuration, not a caller-environment parser.
         assert_eq!(GovernorConfig::from_env().mode, GovernorMode::Required);
         assert_eq!(GovernorConfig::from_env().bin, SMTP_GOVERNOR_BIN);
+    }
+
+    #[cfg(not(feature = "governor"))]
+    #[test]
+    fn smtp_config_is_off_and_names_no_binary_without_the_governor_feature() {
+        for config in [GovernorConfig::smtp(), GovernorConfig::from_env()] {
+            assert_eq!(config.mode, GovernorMode::Off);
+            assert!(
+                config.bin.is_empty(),
+                "the default build must name no Governor binary: {}",
+                config.bin
+            );
+            assert_ne!(config.bin, SMTP_GOVERNOR_BIN);
+        }
+    }
+
+    #[cfg(not(feature = "governor"))]
+    #[test]
+    fn smtp_gate_without_the_governor_feature_sends_unscored_and_says_so() {
+        let req = attributed_req(&["financial_content"], true);
+        let outcome = gate_with_attribution(&GovernorConfig::smtp(), &req);
+        assert!(outcome.allowed);
+        assert_eq!(outcome.mode, GovernorMode::Off);
+        // `disabled`, not `unavailable`: nothing was spawned.
+        assert_eq!(outcome.decision, "disabled");
+        assert!(outcome.block_code.is_none());
+
+        let audit = outcome.audit_json();
+        assert_eq!(audit["mode"], "off");
+        assert_eq!(audit["decision"], "disabled");
+        assert_eq!(audit["attribution_state"], "attributed");
+
+        let success = outcome.success_attribution().expect("attribution block");
+        assert_eq!(success["governor"]["mode"], "off");
+        assert_eq!(success["governor"]["decision"], "disabled");
+    }
+
+    #[cfg(not(feature = "governor"))]
+    #[test]
+    fn smtp_gate_without_the_governor_feature_still_refuses_undeclared_sends() {
+        let outcome = gate_with_attribution(&GovernorConfig::smtp(), &attributed_req(&[], true));
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.block_code.as_deref(), Some("attributes_required"));
+        assert_eq!(outcome.status_str(), "invalid");
+
+        let invalid = gate_with_attribution(
+            &GovernorConfig::smtp(),
+            &attributed_req(&["informationl"], true),
+        );
+        assert!(!invalid.allowed);
+        assert_eq!(invalid.block_code.as_deref(), Some("attributes_invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn off_mode_never_runs_governor_and_keeps_the_attribution_precondition() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let bin = dir.path().join("governor-stub");
+        {
+            let mut f = std::fs::File::create(&bin).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "touch '{}'", marker.display()).unwrap();
+            writeln!(f, "echo '{{\"decision\": \"allow\"}}'").unwrap();
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = GovernorConfig {
+            mode: GovernorMode::Off,
+            bin: bin.to_string_lossy().into_owned(),
+        };
+
+        let allowed = gate_with_attribution(&config, &attributed_req(&["financial_content"], true));
+        assert!(allowed.allowed);
+        assert_eq!(allowed.decision, "disabled");
+        assert!(allowed.resolution.is_some());
+
+        let missing = gate_with_attribution(&config, &attributed_req(&[], true));
+        assert!(!missing.allowed, "off does not waive the declaration");
+        assert_eq!(missing.block_code.as_deref(), Some("attributes_required"));
+
+        let invalid = gate_with_attribution(&config, &attributed_req(&["informationl"], true));
+        assert!(!invalid.allowed);
+        assert_eq!(invalid.block_code.as_deref(), Some("attributes_invalid"));
+
+        assert!(!marker.exists(), "off mode must never execute Governor");
     }
 
     #[test]

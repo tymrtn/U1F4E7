@@ -163,9 +163,10 @@ pub(crate) fn unsubscribe_request(
 /// missing or invalid; returns `None` when the request is attributed and may
 /// proceed to its normal send-policy disposition.
 ///
-/// SMTP-capable Envelope processes always use the required trusted Governor
-/// configuration. A missing/invalid declaration on a bot-originated action
-/// therefore always blocks here, before any draft is created or any wire send
+/// SMTP-capable Envelope processes use [`GovernorConfig::smtp`], fixed at build
+/// time by the `governor` feature. The attribution precondition holds in every
+/// build and gate mode, so a missing/invalid declaration on a bot-originated
+/// action always blocks here, before any draft is created or any wire send
 /// happens.
 ///
 /// This runs at queue time on every agent surface so a bot learns about a
@@ -178,14 +179,14 @@ pub(crate) fn precheck_attribution(
     req: &GovernorRequest,
     agent_id: Option<&str>,
 ) -> Option<GovernorOutcome> {
-    let config = GovernorConfig::smtp_required();
+    let config = GovernorConfig::smtp();
     let resolution = req.resolution.as_ref()?;
     if resolution.is_attributed() {
         return None;
     }
     // Unattributed / invalid on a bot-originated surface. Produce the canonical
     // refusal via the gate (it does not spawn Governor for a non-attributed
-    // request), record it, and block — in required and warn alike.
+    // request), record it, and block — in required, warn, and off alike.
     let outcome = gate_with_attribution(&config, &req.clone().with_agent_id(agent_id));
     record_governor_event(db, account_id, req, &outcome, agent_id);
     Some(outcome)
@@ -210,7 +211,7 @@ pub(crate) fn gate_and_record_with_agent(
     req: &GovernorRequest,
     agent_id: Option<&str>,
 ) -> GovernorOutcome {
-    let config = GovernorConfig::smtp_required();
+    let config = GovernorConfig::smtp();
     let req = req.clone().with_agent_id(agent_id);
     let outcome = gate_with_attribution(&config, &req);
     record_governor_event(db, account_id, &req, &outcome, agent_id);
@@ -285,6 +286,70 @@ mod tests {
             mode: GovernorMode::Required,
             bin: "/nonexistent/governor-binary-xyz".to_string(),
         }
+    }
+
+    fn cli_request(db: &Database, declared: &[&str]) -> GovernorRequest {
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        governor_request(
+            db,
+            "acc1",
+            Some("example.com".into()),
+            "subject",
+            "to@example.net",
+            None,
+            None,
+            SendSurface::Cli,
+            None,
+            &[],
+            false,
+            Some("a short body"),
+            None,
+            &declared,
+        )
+    }
+
+    fn gate_event_payload(db: &Database, event_type: &str) -> serde_json::Value {
+        let event = db
+            .list_events(Some("acc1"), 10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == event_type)
+            .unwrap_or_else(|| panic!("no {event_type} event recorded"));
+        serde_json::from_str(event.payload.as_deref().expect("event payload")).unwrap()
+    }
+
+    #[test]
+    fn precheck_refuses_an_undeclared_send_in_every_build() {
+        let db = Database::open_memory().unwrap();
+        let refusal = precheck_attribution(&db, "acc1", &cli_request(&db, &[]), None)
+            .expect("an undeclared bot send is refused before any side effect");
+        assert!(!refusal.allowed);
+        assert_eq!(refusal.block_code.as_deref(), Some("attributes_required"));
+        let payload = gate_event_payload(&db, "send_governor.attribution_refused");
+        assert_eq!(payload["outcome"]["block_code"], "attributes_required");
+    }
+
+    #[cfg(not(feature = "governor"))]
+    #[test]
+    fn gated_send_without_the_governor_feature_records_the_off_verdict() {
+        let db = Database::open_memory().unwrap();
+        let req = cli_request(&db, &["informational"]);
+        assert!(precheck_attribution(&db, "acc1", &req, None).is_none());
+
+        let outcome = gate_and_record(&db, "acc1", &req);
+        assert!(outcome.allowed, "attributed send proceeds unscored");
+        assert_eq!(outcome.mode, GovernorMode::Off);
+        // `disabled`, not `unavailable`: no Governor binary was spawned.
+        assert_eq!(outcome.decision, "disabled");
+
+        let payload = gate_event_payload(&db, "send_governor.allowed");
+        assert_eq!(payload["outcome"]["mode"], "off");
+        assert_eq!(payload["outcome"]["decision"], "disabled");
+        assert_eq!(payload["outcome"]["attribution_state"], "attributed");
+        assert_eq!(
+            outcome.success_attribution().unwrap()["governor"]["mode"],
+            "off"
+        );
     }
 
     #[test]

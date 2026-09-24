@@ -328,7 +328,7 @@ fn tool_call_env(
 
 /// Write an executable mock Governor binary that prints a fixed verdict and exits
 /// 0. Returns its path. Unix-only (the dev/CI target).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "governor"))]
 fn write_mock_governor(dir: &std::path::Path, decision: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("mock-governor.sh");
@@ -1452,7 +1452,8 @@ fn mcp_send_without_attributes_is_attributes_required_then_recovers() {
 
     // Gap 3: a SUCCESSFUL (queued) result carries the additive `attribution`
     // block. The real Governor decision runs later at the sweep, so governor is
-    // null and governor_decision_pending marks the deferral. No score ever.
+    // null and governor_decision_pending marks the deferral; a build without the
+    // `governor` feature reports the off verdict instead. No score ever.
     let attribution = &resp2["attribution"];
     assert_eq!(attribution["attribution_state"], "attributed");
     assert_eq!(attribution["protocol"], "envelope.attribution.v1");
@@ -1467,12 +1468,24 @@ fn mcp_send_without_attributes_is_attributes_required_then_recovers() {
     assert!(attribution["governor_attrs"].is_array());
     assert!(attribution.get("accepted_redundant").is_some());
     assert!(attribution.get("rejected_attrs").is_some());
-    assert_eq!(
-        attribution["governor"],
-        Value::Null,
-        "verdict deferred to sweep"
-    );
-    assert!(attribution.get("governor_decision_pending").is_some());
+    #[cfg(feature = "governor")]
+    {
+        assert_eq!(
+            attribution["governor"],
+            Value::Null,
+            "verdict deferred to sweep"
+        );
+        assert!(attribution.get("governor_decision_pending").is_some());
+    }
+    #[cfg(not(feature = "governor"))]
+    {
+        assert_eq!(
+            attribution["governor"],
+            json!({"decision": "disabled", "route": null, "mode": "off"}),
+            "a build without the governor feature says the send is not scored"
+        );
+        assert!(attribution.get("governor_decision_pending").is_none());
+    }
     assert!(
         !serde_json::to_string(attribution)
             .unwrap()
@@ -1516,7 +1529,8 @@ fn mcp_stateless_attribution_failure_never_claims_a_draft_was_parked() {
     );
 }
 
-#[cfg(unix)]
+// Needs a Governor block, which only a `--features governor` build can produce.
+#[cfg(all(unix, feature = "governor"))]
 #[test]
 fn mcp_stateless_immediate_review_never_claims_a_draft_was_parked() {
     // Block 4: a direct/stateless immediate send (send_now + confirm_send_now,
@@ -1560,7 +1574,8 @@ fn mcp_stateless_immediate_review_never_claims_a_draft_was_parked() {
     assert_eq!(draft_count, 0, "a stateless review must create no draft");
 }
 
-#[cfg(unix)]
+// Needs a Governor block, which only a `--features governor` build can produce.
+#[cfg(all(unix, feature = "governor"))]
 #[test]
 fn mcp_draft_backed_immediate_review_does_not_falsely_park() {
     // Block 4: a draft-backed immediate send (send_draft) that Governor reviews

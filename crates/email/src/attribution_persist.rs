@@ -34,6 +34,7 @@ use crate::attribution_provenance::{Provenance, provenance_of};
 use crate::governor_catalog::{
     ATTRIBUTION_PROTOCOL, CATALOG_NAME, catalog_version, declarable_keys,
 };
+use crate::outbound::{GovernorConfig, GovernorMode};
 
 /// Draft-metadata key under which the persisted declaration lives.
 pub const ATTRIBUTION_METADATA_KEY: &str = "attribution";
@@ -466,14 +467,18 @@ pub fn attribution_failure_action(
 /// and, when a Governor verdict actually ran (immediate sends), its
 /// decision/route. Queue/scheduled acceptances have no verdict yet, so
 /// `governor` is `null` and a `pending` marker records that the real decision
-/// happens at the scheduled-send sweep. Never a score/weight/threshold, body,
-/// raw recipient, secret, or attachment byte.
+/// happens at the scheduled-send sweep. In a build without the `governor`
+/// feature no sweep will score the send, so a queued acceptance instead carries
+/// the off verdict (`mode: "off"`, `decision: "disabled"`) and no pending
+/// marker. Never a score/weight/threshold, body, raw recipient, secret, or
+/// attachment byte.
 pub fn success_attribution_block(
     resolution: &AttributionResolution,
     governor_decision: Option<&str>,
     governor_route: Option<&str>,
     deferred_to_sweep: bool,
 ) -> Value {
+    let gate_off = GovernorConfig::smtp().mode == GovernorMode::Off;
     let mut block = resolution.to_json();
     if let Value::Object(map) = &mut block {
         let governor = match governor_decision {
@@ -481,10 +486,15 @@ pub fn success_attribution_block(
                 "decision": decision,
                 "route": governor_route,
             }),
+            None if deferred_to_sweep && gate_off => json!({
+                "decision": "disabled",
+                "route": null,
+                "mode": GovernorMode::Off.as_str(),
+            }),
             None => Value::Null,
         };
         map.insert("governor".into(), governor);
-        if deferred_to_sweep {
+        if deferred_to_sweep && !gate_off {
             map.insert(
                 "governor_decision_pending".into(),
                 json!("the Governor decision runs at the scheduled-send sweep, just before SMTP"),
@@ -801,11 +811,24 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "governor")]
     #[test]
     fn success_block_marks_pending_for_deferred_queue_acceptance() {
         let res = resolve(&["financial_content".into()], &sample_ctx(), true);
         let block = success_attribution_block(&res, None, None, true);
         assert_eq!(block["governor"], Value::Null);
         assert!(block.get("governor_decision_pending").is_some());
+    }
+
+    #[cfg(not(feature = "governor"))]
+    #[test]
+    fn success_block_reports_governor_off_for_deferred_queue_acceptance() {
+        // Without the `governor` feature no sweep will score this send, so the
+        // queued acceptance must not promise a pending Governor decision.
+        let res = resolve(&["financial_content".into()], &sample_ctx(), true);
+        let block = success_attribution_block(&res, None, None, true);
+        assert_eq!(block["governor"]["mode"], "off");
+        assert_eq!(block["governor"]["decision"], "disabled");
+        assert!(block.get("governor_decision_pending").is_none());
     }
 }

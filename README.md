@@ -52,6 +52,7 @@ git clone https://github.com/tymrtn/U1F4E7
 cd U1F4E7
 cargo build --release
 # binary: target/release/envelope
+# Add `--features governor` to build in the Governor send gate (see below).
 
 # 3. Install the binary somewhere on PATH:
 cp target/release/envelope ~/.local/bin/envelope
@@ -129,9 +130,20 @@ or account/folder selections are what touch live IMAP mailboxes.
 
 Actual sends are outbox-first. By default, an allowed send queues with a safety
 cooldown and the scheduled-send sweep performs the SMTP transmission later.
-Immediately before SMTP, Envelope derives sanitized contextual attributes and
-asks Governor to score them with `governor score --catalog envelope`; only an
-opaque Governor `allow` sends in required mode. Message bodies, full recipient
+Every agent send must declare factual attributes, and Envelope checks them
+against what it can observe before anything is queued or sent.
+
+Governor scoring is a build-time Cargo feature, off by default. Homebrew and the
+release archives are built without it, so their sends are not scored by
+Governor, and send results and audit events record the gate as
+`mode: "off"`. Builds made with
+`cargo build --release --bin envelope --features governor` (or
+`cargo install --path crates/cli --features governor`) derive sanitized
+contextual attributes immediately before SMTP and ask Governor to score them
+with `governor score --catalog envelope`; only an opaque Governor `allow` sends.
+Those builds expect the Governor binary at the path pinned in
+`SMTP_GOVERNOR_BIN` (`crates/email/src/outbound.rs`), and every send fails
+closed when it is missing. Message bodies, full recipient
 addresses, attachment bytes, and secrets never enter the Governor request.
 
 Dashboard URL metadata in `--json` output is discovered fresh for each UI
@@ -453,7 +465,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope inbox [--folder] [--limit]` | List messages |
 | `envelope read <uid>` | Read a message (BODY.PEEK — no auto-mark-read) |
 | `envelope search "<query>"` | IMAP search |
-| `envelope send --to --subject --body [--attach]` | Queue/send email through the outbox and Governor gate |
+| `envelope send --to --subject --body [--attach]` | Queue/send email through the outbox (and the Governor gate in `governor` builds) |
 | `envelope move/copy/delete <uid>` | Message management |
 | `envelope flag add/remove <uid> <flag>` | IMAP flags |
 | `envelope attachment list/download <uid>` | Attachments |
@@ -496,6 +508,7 @@ Every command supports `--json` for agent consumption.
 ```bash
 cargo build                # Build all crates
 cargo build --release      # Optimized release binary
+cargo test --all --features governor   # Also test with the Governor gate built in
 cargo test                 # 194 tests, 0 failures
 cargo clippy               # Lint
 ./ci/check-orphans.sh      # Verify every .rs file is reachable via mod

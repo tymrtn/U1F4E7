@@ -8,6 +8,12 @@ edition.workspace = true
 authors.workspace = true
 description = "IMAP/SMTP transport, auto-discovery, and MIME building for Envelope Email"
 
+[features]
+# Build the Governor send gate into every SMTP-capable path. Off by default:
+# without it, SMTP sends are not scored by Governor. This is a build-time choice
+# so no environment variable, CLI flag, or config key can change it at runtime.
+governor = []
+
 [dependencies]
 envelope-email-store = { path = "../store" }
 

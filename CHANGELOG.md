@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Governor scoring is now a build-time feature, off by default. Public builds (Homebrew,
+  release archives) send without Governor scoring; send modes and attribution records still
+  apply, and a send that was not scored says so (`governor.mode: "off"` in the result's
+  `attribution` block and in the `send_governor.*` audit event). Build with
+  `--features governor` to enforce the gate
+  (`cargo build --release --bin envelope --features governor` or
+  `cargo install --path crates/cli --features governor`); the Governor binary must exist at the
+  pinned path. Why: the gate pointed at a path only one machine has, so every other install
+  failed closed on every send. `envelope contract` reports the compiled-in mode as
+  `outbound_safety.governor_gate.smtp_mode`.
+
 ### Cursor plugin
 
 - **Marketplace packaging:** repo-root Cursor Plugin (`.cursor-plugin/plugin.json`,

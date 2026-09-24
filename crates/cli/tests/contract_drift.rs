@@ -11,6 +11,10 @@
 //!   b) The schema file was edited without updating the code — regenerate with
 //!      `envelope contract > docs/schemas/envelope.agent_contract.v3.json`
 //!      after verifying the change is intentional.
+//!
+//! Regenerate from a default build (no `--features governor`): the committed
+//! schema documents the public build, and a governor build differs only in
+//! `outbound_safety.governor_gate.smtp_mode`.
 
 use std::path::Path;
 use std::process::Command;
@@ -67,12 +71,21 @@ fn contract_output_matches_committed_schema() {
         )
     });
 
-    let committed: Value = serde_json::from_slice(&schema_bytes).unwrap_or_else(|e| {
+    #[cfg_attr(not(feature = "governor"), allow(unused_mut))]
+    let mut committed: Value = serde_json::from_slice(&schema_bytes).unwrap_or_else(|e| {
         panic!(
             "Schema file {} is not valid JSON: {e}",
             schema_file.display()
         )
     });
+
+    // The committed schema documents the default (public) build. The one value
+    // that differs in a `--features governor` build is the compiled-in gate mode.
+    #[cfg(feature = "governor")]
+    {
+        committed["outbound_safety"]["governor_gate"]["smtp_mode"] =
+            Value::String("required".to_string());
+    }
 
     if live != committed {
         // Emit a diff-friendly report: each top-level key where the values diverge.
