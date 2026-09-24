@@ -104,7 +104,7 @@ envelope draft send <draft-id>
 
 **What the viewer sees**: the dashboard cockpit (`crates/dashboard/src/handlers/cockpit.rs`,
 `drafts.rs`) lists the draft tagged with the authoring agent's name and a pending
-state; clicking through to send fires the Governor-gated actual send path
+state; clicking through to send fires the actual send path (Governor-gated in builds with the `governor` feature)
 (`crates/cli/src/commands/governor_gate.rs`), so the recording shows both "agent
 proposed" and "human executed" as visually distinct steps.
 

@@ -80,11 +80,11 @@ envelope mcp --config
 - Rust, 4 crates: `cli`, `email`, `store`, `dashboard`
 - Credentials: AES-256-GCM encrypted file by default (`~/.config/envelope-email/credentials.json`, mode 0600); optional OS keychain backend (macOS Keychain, Linux Secret Service via `--credential-store keychain`)
 - State in local SQLite (`envelope paths` shows the exact location for your platform)
-- Sends queue into an outbox with a cooldown (default 60s) and go out via a scheduled-send sweep after a Governor attribution gate; immediate transmission requires explicit `--send-now --confirm-send-now`
+- Sends queue into an outbox with a cooldown (default 60s) and go out via a scheduled-send sweep after attribution checks (plus a Governor gate in builds with the `governor` feature, which Homebrew builds leave off); immediate transmission requires explicit `--send-now --confirm-send-now`
 - Localhost dashboard via Axum (`envelope serve`, Agent Cockpit for reviewing/approving drafts)
 - Install: `brew install tymrtn/u1f4e7/u1f4e7` (macOS) or `cargo install --git https://github.com/tymrtn/U1F4E7 --bin envelope` (from source)
 
-**What it's not:** Envelope doesn't do content scoring or spam classification — that's a separate layer it hooks into (Governor). Envelope's job is identity, policy, and attribution on top of a plain IMAP/SMTP client.
+**What it's not:** Envelope doesn't do content scoring or spam classification — that's a separate layer it can hook into (Governor, an optional build feature). Envelope's job is identity, policy, and attribution on top of a plain IMAP/SMTP client.
 
 License is FSL-1.1-ALv2 — each release converts to Apache 2.0 two years after it ships.
 
