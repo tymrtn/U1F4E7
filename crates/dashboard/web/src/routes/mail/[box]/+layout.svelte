@@ -5,6 +5,7 @@
   // + keyboard 'c'), UndoToast for queued sends, and the rail-footer connection indicator.
   import { base } from '$app/paths';
   import { page } from '$app/state';
+  import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import type { Snippet } from 'svelte';
   import { Rail, Spinner, EmptyState, MonoTag } from '$lib/components';
@@ -1010,6 +1011,8 @@
 <ComposerDrawer
   accounts={allAccounts}
   onsent={(res, accountId) => handleSent(res, accountId)}
+  onsaved={(accountId, draftId) =>
+    goto(`${base}/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}`)}
 />
 
 <!-- Undo toast: shown only when a compose queued with cooldown. -->

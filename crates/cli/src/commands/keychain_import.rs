@@ -482,7 +482,7 @@ fn read_keychain_password(email: &str, server: &str, protocol: MailProtocol) -> 
     }
 }
 
-fn account_with_credentials(
+pub(crate) fn account_with_credentials(
     email: &str,
     imap_host: &str,
     imap_port: u16,

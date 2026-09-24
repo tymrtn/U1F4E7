@@ -2,7 +2,8 @@
 # install.sh — Envelope curl-pipe installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/dist/install.sh | bash
+#   curl -fsSL https://u1f4e7.com/install.sh | bash
+#   (same file as https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh)
 #   curl -fsSL ... | bash -s -- --version v1.2.3
 #   curl -fsSL ... | bash -s -- --bin-dir ~/.local/bin
 #
@@ -86,21 +87,19 @@ ARCH="$(uname -m)"
 
 case "$OS" in
     Darwin)
-        # macOS: point at Homebrew and exit. The Homebrew tap keeps pace with
-        # releases, handles upgrades gracefully, and puts the binary on PATH.
-        echo ""
-        echo "  Envelope on macOS is installed via Homebrew:"
-        echo ""
-        echo "    brew install tymrtn/u1f4e7/u1f4e7"
-        echo ""
-        echo "  If you already have it:"
-        echo ""
-        echo "    brew upgrade tymrtn/u1f4e7/u1f4e7"
-        echo ""
-        echo "  After installing, run:  envelope accounts add"
-        echo "  Then:                   envelope quickstart"
-        echo ""
-        exit 0
+        case "$ARCH" in
+            arm64|aarch64)
+                TARGET="aarch64-apple-darwin"
+                ;;
+            x86_64)
+                TARGET="x86_64-apple-darwin"
+                ;;
+            *)
+                echo "ERROR: Unsupported architecture: ${ARCH}" >&2
+                echo "       Envelope provides macOS arm64 and x86_64 binaries." >&2
+                exit 1
+                ;;
+        esac
         ;;
     Linux)
         case "$ARCH" in
@@ -120,7 +119,7 @@ case "$OS" in
         ;;
     *)
         echo "ERROR: Unsupported OS: ${OS}" >&2
-        echo "       Envelope supports macOS (Homebrew) and Linux (x86_64, aarch64)." >&2
+        echo "       Envelope provides macOS (arm64, x86_64) and Linux (x86_64, aarch64) binaries." >&2
         exit 1
         ;;
 esac
@@ -287,9 +286,9 @@ echo ""
 echo "  Envelope ${VERSION} installed to ${BIN_DIR}/${BINARY_NAME}"
 echo ""
 echo "  Next steps:"
-echo "    1. Add an account:  envelope accounts add"
-echo "    2. Run quickstart:  envelope quickstart"
-echo "    3. Check your inbox: envelope inbox"
+echo "    1. Add an account:   envelope accounts add --email you@example.com"
+echo "    2. Check the setup:  envelope quickstart"
+echo "    3. Open the inbox:   envelope serve   (then http://localhost:3141)"
 echo ""
 echo "  Docs: https://github.com/${REPO}#readme"
 echo ""

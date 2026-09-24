@@ -447,7 +447,10 @@ pub fn dashboard_router(state: AppState) -> Router {
             post(handlers::compose::reply),
         )
         // Drafts
-        .route("/accounts/{id}/drafts", get(handlers::drafts::list))
+        .route(
+            "/accounts/{id}/drafts",
+            get(handlers::drafts::list).post(handlers::drafts::create),
+        )
         .route(
             "/accounts/{id}/drafts/by-imap-uid/{imap_uid}",
             get(handlers::drafts::show_by_imap_uid),

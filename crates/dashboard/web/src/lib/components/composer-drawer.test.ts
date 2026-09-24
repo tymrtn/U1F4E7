@@ -5,7 +5,19 @@
 // To. Blank stays valid.
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { apiMock } = vi.hoisted(() => ({
+  apiMock: {
+    createDraft: vi.fn(),
+    uploadDraftAttachments: vi.fn()
+  }
+}));
+
+vi.mock('$lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/api')>();
+  return { ...actual, api: { ...actual.api, ...apiMock } };
+});
 
 import ComposerDrawer from './ComposerDrawer.svelte';
 import { getComposerStore, __resetComposerStore } from '$lib/composer.svelte';
@@ -37,10 +49,17 @@ const sendButton = () => screen.getByRole('button', { name: /^human-only send$/i
 
 beforeEach(() => {
   __resetComposerStore();
+  apiMock.createDraft.mockResolvedValue({
+    ok: true,
+    status: 'draft',
+    draft: { id: 'd-1', account_id: 'acc1', revision: 1 }
+  });
+  apiMock.uploadDraftAttachments.mockResolvedValue({ draft: { id: 'd-1', revision: 2 } });
 });
 
 afterEach(() => {
   __resetComposerStore();
+  vi.clearAllMocks();
 });
 
 describe('ComposerDrawer names the send action Human-only Send', () => {
@@ -107,9 +126,92 @@ describe('ComposerDrawer recipient gating', () => {
   });
 });
 
+// ── Save draft ────────────────────────────────────────────────────────
+// A fresh message can be kept as a local draft without sending. Files go up
+// through the draft attachment route so they get its size and threat checks.
+
+describe('ComposerDrawer Save draft', () => {
+  const saveButton = () => screen.getByRole('button', { name: /^save draft$/i });
+
+  it('saves the typed message as a draft and closes', async () => {
+    const onsaved = vi.fn();
+    getComposerStore().open('compose', { accountId: 'acc1' });
+    render(ComposerDrawer, { accounts: ACCOUNTS, onsaved });
+    await waitFor(() => expect(screen.getByLabelText('To')).toBeInTheDocument());
+    await fireEvent.input(screen.getByLabelText('To'), { target: { value: 'buyer@example.com' } });
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Hello' } });
+    await fireEvent.input(screen.getByLabelText('Message'), { target: { value: 'Half done' } });
+
+    await fireEvent.click(saveButton());
+
+    await waitFor(() => expect(getComposerStore().isOpen).toBe(false));
+    expect(apiMock.createDraft).toHaveBeenCalledWith('acc1', {
+      to: 'buyer@example.com',
+      subject: 'Hello',
+      text: 'Half done',
+      html: null,
+      cc: null,
+      bcc: null
+    });
+    expect(apiMock.uploadDraftAttachments).not.toHaveBeenCalled();
+    expect(onsaved).toHaveBeenCalledWith('acc1', 'd-1');
+  });
+
+  it('saves without a recipient', async () => {
+    getComposerStore().open('compose', { accountId: 'acc1' });
+    render(ComposerDrawer, { accounts: ACCOUNTS });
+    await waitFor(() => expect(screen.getByLabelText('Subject')).toBeInTheDocument());
+    await fireEvent.input(screen.getByLabelText('Subject'), { target: { value: 'Idea' } });
+    expect(sendButton()).toBeDisabled();
+    expect(saveButton()).toBeEnabled();
+  });
+
+  it('uploads attachments against the saved revision', async () => {
+    await renderCompose();
+    const input = document.getElementById('composer-attachments') as HTMLInputElement;
+    const file = new File(['hello'], 'note.txt', { type: 'text/plain' });
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    await fireEvent.change(input);
+    await waitFor(() => expect(screen.getByText('note.txt')).toBeInTheDocument());
+
+    await fireEvent.click(saveButton());
+
+    await waitFor(() => expect(apiMock.uploadDraftAttachments).toHaveBeenCalledTimes(1));
+    const [accountId, draftId, body] = apiMock.uploadDraftAttachments.mock.calls[0];
+    expect([accountId, draftId]).toEqual(['acc1', 'd-1']);
+    expect(body.expected_revision).toBe(1);
+    expect(body.attachments[0]).toMatchObject({ filename: 'note.txt', content_type: 'text/plain' });
+  });
+
+  it('keeps the composer open and says why when the save fails', async () => {
+    const { EnvelopeApiError } = await import('$lib/api');
+    apiMock.createDraft.mockRejectedValueOnce(new EnvelopeApiError(500, 'db_error', 'disk full', null));
+    await renderCompose();
+    await fireEvent.click(saveButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(/disk full/);
+    expect(getComposerStore().isOpen).toBe(true);
+  });
+
+  it('is offered in the close prompt', async () => {
+    await renderCompose();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    const buttons = await screen.findAllByRole('button', { name: /^save draft$/i });
+    await fireEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(apiMock.createDraft).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getComposerStore().isOpen).toBe(false));
+  });
+
+  it('is not offered on replies', async () => {
+    getComposerStore().open('reply', { accountId: 'acc1', parentUid: 7, parentFolder: 'INBOX' });
+    render(ComposerDrawer, { accounts: ACCOUNTS });
+    await waitFor(() => expect(screen.getByLabelText('Message')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /^save draft$/i })).toBeNull();
+  });
+});
+
 // ── Discard protection ────────────────────────────────────────────────
 // Esc / × / backdrop on a composer with content must not silently throw the
-// draft away: there is no autosave yet, so the only defence is a confirm.
+// draft away without asking.
 
 describe('ComposerDrawer discard protection', () => {
   it('closes immediately when nothing has been typed', async () => {

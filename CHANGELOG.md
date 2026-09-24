@@ -32,6 +32,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdio MCP server can be submitted at cursor.com/marketplace/publish. Listing
   copy is in `MARKETPLACE.md`. Does not change the Rust MCP implementation.
 
+### Launch hardening
+
+- **`accounts add` logs in before saving.** A rejected IMAP login exits non-zero, saves nothing,
+  and prints provider-specific steps. `--skip-login-check` saves without logging in, for offline
+  setup.
+- **Provider remediation:** Outlook.com, Hotmail, Live, MSN, and Microsoft 365 failures now say
+  plainly that Microsoft requires OAuth sign-in for IMAP and Envelope does not support it yet.
+  Gmail failures explain the app-password path. `quickstart` now uses the account's domain when
+  choosing the guidance (it always fell back to the generic text before).
+- **`doctor` exits 1 on an error status** (`missing_db`, `no_accounts`, decrypt or auth
+  failures). Warnings still exit 0.
+- **Dashboard:** the composer has **Save draft** for new messages and forwards, and the close
+  prompt offers it too. It stores a local draft through the new `POST
+  /api/accounts/{id}/drafts` (no queue, no send) and opens the draft page. Files are uploaded
+  through the draft attachment route, so they get its size and threat checks.
+- **Dashboard:** Digest no longer renders the eight category panels that were waiting on the
+  categorize backend, or the disabled Categorize button. The Review page no longer says
+  Envelope does not scan the inbox; rShield does.
+- **Install:** `install.sh` moved from `dist/` to the repo root and now installs the macOS
+  (arm64, x86_64) release binaries as well as Linux. README and `docs/quickstart.md` lead with
+  it, document the passphrase file that non-interactive `accounts add` needs, and state that
+  Outlook.com and Microsoft 365 are unsupported until OAuth lands.
+
 ## [1.3.2] — 2026-09-23
 
 ### Fixed

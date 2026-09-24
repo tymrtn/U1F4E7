@@ -51,6 +51,7 @@ fn seed_account(home: &Path) {
             "--json",
             "accounts",
             "add",
+            "--skip-login-check",
             "--email",
             "agent@example.test",
             "--password-stdin",

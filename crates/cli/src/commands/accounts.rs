@@ -23,6 +23,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             smtp_port,
             imap_port,
             insecure_machine_key,
+            skip_login_check,
         } => add(
             &email,
             password_stdin,
@@ -32,6 +33,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             imap_host,
             imap_port,
             insecure_machine_key,
+            skip_login_check,
             json,
             backend,
         ),
@@ -198,6 +200,7 @@ async fn add(
     imap_host: Option<String>,
     imap_port: Option<u16>,
     insecure_machine_key: bool,
+    skip_login_check: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -246,6 +249,29 @@ async fn add(
         }
     };
 
+    if skip_login_check {
+        eprintln!("Skipping the IMAP login check (--skip-login-check).");
+    } else {
+        eprintln!("Checking IMAP login at {imap_host}:{imap_port}...");
+        let probe = crate::commands::keychain_import::account_with_credentials(
+            email, &imap_host, imap_port, &smtp_host, smtp_port, &password, &password,
+        );
+        let login = tokio::time::timeout(
+            LOGIN_CHECK_TIMEOUT,
+            envelope_email_transport::imap::connect(&probe),
+        )
+        .await;
+        match login {
+            Ok(Ok(_client)) => eprintln!("IMAP login ok."),
+            Ok(Err(e)) => bail!(login_check_failure(email, &imap_host, imap_port, &e)),
+            Err(_) => bail!(
+                "IMAP login check timed out after {}s at {imap_host}:{imap_port}. Nothing was saved.\n\
+                 Check --imap-host / --imap-port, or pass --skip-login-check to save the account without checking.",
+                LOGIN_CHECK_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
     let passphrase = if insecure_machine_key {
         credential_store::get_or_create_passphrase_insecure_machine(backend)
             .context("failed to access credential store for encryption")?
@@ -277,6 +303,36 @@ async fn add(
     }
 
     Ok(())
+}
+
+const LOGIN_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The error `accounts add` fails with when the IMAP login check does not pass.
+/// Auth failures carry the provider-specific remediation `quickstart` uses.
+fn login_check_failure(
+    email: &str,
+    imap_host: &str,
+    imap_port: u16,
+    err: &envelope_email_transport::errors::ImapError,
+) -> String {
+    let detail = crate::commands::quickstart::sanitize_error(err.to_string());
+    let mut lines = vec![format!(
+        "IMAP login check failed for {email} at {imap_host}:{imap_port}. Nothing was saved."
+    )];
+    lines.push(detail.clone());
+    if matches!(err, envelope_email_transport::errors::ImapError::Auth(_)) {
+        lines.extend(crate::commands::quickstart::auth_remediation(
+            Some(email),
+            &err.to_string(),
+        ));
+    } else {
+        lines.push("Check --imap-host / --imap-port and your network connection.".to_string());
+    }
+    lines.push(
+        "To save the account without checking (offline setup), re-run with --skip-login-check."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn list(json: bool) -> Result<()> {

@@ -152,7 +152,17 @@ pub fn run(opts: DoctorOptions<'_>) -> Result<()> {
     } else {
         print_human(&report);
     }
+    let code = exit_code(&report);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
+}
+
+/// 1 when the report's status is an error, so scripts and agents can gate on
+/// `envelope doctor` without parsing its output. Warnings exit 0.
+fn exit_code(report: &DoctorReport) -> i32 {
+    if report.severity == "error" { 1 } else { 0 }
 }
 
 fn diagnose(opts: &DoctorOptions<'_>) -> DoctorReport {

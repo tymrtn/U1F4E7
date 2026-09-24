@@ -1,6 +1,6 @@
 // Digest board (design plan rev 3, §4a): capture bucket is real data from
-// the unified inbox; category sections are honest awaiting-backend states —
-// nothing categorized client-side, Categorize disabled with the reason.
+// the unified inbox. Category sections and the Categorize control render only
+// once a backend assigns threads to them; until then the page shows none.
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -92,26 +92,15 @@ describe('Digest board', () => {
     expect(tally.textContent).toContain('2 threads');
   });
 
-  it('renders every category section as an honest awaiting-backend state', async () => {
+  it('renders no unwired category section and no Categorize control', async () => {
     render(DigestPage);
     await screen.findByTestId('digest-tally');
-    for (const section of DIGEST_SECTIONS) {
-      expect(screen.getByText(section.label)).toBeInTheDocument();
+    for (const section of DIGEST_SECTIONS.filter((s) => !s.wired)) {
+      expect(screen.queryByText(section.label)).toBeNull();
+      expect(document.querySelector(`[data-section="${section.key}"]`)).toBeNull();
     }
-    expect(screen.getAllByText('awaiting categorize backend')).toHaveLength(DIGEST_SECTIONS.length);
-    // Nothing is categorized client-side: no category section contains rows.
-    for (const section of DIGEST_SECTIONS) {
-      const el = document.querySelector(`[data-section="${section.key}"]`)!;
-      expect(el.querySelectorAll('.dg-row')).toHaveLength(0);
-    }
-  });
-
-  it('disables Categorize and says why', async () => {
-    render(DigestPage);
-    await screen.findByTestId('digest-tally');
-    const categorize = screen.getByRole('button', { name: 'Categorize' });
-    expect(categorize).toBeDisabled();
-    expect(categorize.closest('[title]')?.getAttribute('title')).toMatch(/backend/i);
+    expect(screen.queryByText('awaiting categorize backend')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Categorize' })).toBeNull();
   });
 
   it('Refresh reloads through the refresh endpoint', async () => {

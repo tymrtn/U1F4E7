@@ -350,7 +350,7 @@ fn run_network_phases(options: &QuickstartOptions<'_>, account: &Account) -> Vec
         let connect = tokio::time::timeout(timeout, envelope_email_transport::imap::connect(&creds)).await;
         let mut client = match connect {
             Ok(Ok(client)) => client,
-            Ok(Err(e)) => return vec![classify_imap_error(PhaseName::ImapAuth, auth_started, e)],
+            Ok(Err(e)) => return vec![classify_imap_error(PhaseName::ImapAuth, auth_started, &account_snapshot.username, e)],
             Err(_) => return vec![error_phase(PhaseName::ImapAuth, auth_started, "imap_timeout", "IMAP authentication timed out.".to_string(), vec![])],
         };
 
@@ -424,13 +424,14 @@ fn error_phase(
 fn classify_imap_error(
     name: PhaseName,
     started: Instant,
+    account_email: &str,
     err: envelope_email_transport::errors::ImapError,
 ) -> QuickstartPhase {
     let text = sanitize_error(err.to_string());
     let (code, remediation) = match &err {
-        envelope_email_transport::errors::ImapError::Auth(_) => (
+        envelope_email_transport::errors::ImapError::Auth(raw) => (
             "imap_auth_failed",
-            auth_remediation_for_account_domain(None),
+            auth_remediation(Some(account_email), raw),
         ),
         envelope_email_transport::errors::ImapError::Connection(_)
             if text.to_lowercase().contains("tls") =>
@@ -449,17 +450,51 @@ fn classify_imap_error(
     error_phase(name, started, code, text, remediation)
 }
 
-/// Return static app-password guidance keyed off a known provider domain.
-/// `domain` is the host portion of the account email (e.g. "gmail.com").
-/// When None or unrecognized, returns generic guidance.
-pub fn auth_remediation_for_account_domain(domain: Option<&str>) -> Vec<String> {
-    match domain.unwrap_or("").to_lowercase().as_str() {
-        d if d == "gmail.com" || d.ends_with("@gmail.com") => vec![
-            "Gmail requires an app password, not your Google account password.".to_string(),
-            "1. Enable 2-Step Verification: https://myaccount.google.com/security".to_string(),
+/// Providers the README provider table lists as working with a password or
+/// app password. Kept to that table so remediation never promises more.
+const WORKING_PROVIDERS: &str = "Providers that work today with a password or app password: Fastmail, iCloud Mail, Migadu, self-hosted Dovecot, and most IMAP hosts (see the provider table in the README).";
+
+/// Outlook.com-family domains, including country variants (hotmail.co.uk).
+/// Microsoft 365 mailboxes on custom domains are caught by the server text.
+fn is_microsoft_consumer_domain(domain: &str) -> bool {
+    let label = domain.split('.').next().unwrap_or_default();
+    matches!(label, "outlook" | "hotmail" | "live" | "msn")
+}
+
+/// Provider-specific guidance for an IMAP authentication failure.
+///
+/// `account` is the account email (or bare domain); `server_text` is the IMAP
+/// server's error. The server text catches cases the domain cannot, such as a
+/// Google Workspace mailbox on a custom domain.
+pub fn auth_remediation(account: Option<&str>, server_text: &str) -> Vec<String> {
+    let domain = account
+        .map(|a| a.rsplit_once('@').map(|(_, d)| d).unwrap_or(a))
+        .unwrap_or("")
+        .to_lowercase();
+    let text = server_text.to_lowercase();
+
+    if is_microsoft_consumer_domain(&domain)
+        || text.contains("authentication mechanism is not supported")
+    {
+        return vec![
+            "Microsoft mailboxes (Outlook.com, Hotmail, Live, MSN, and Microsoft 365) only accept Microsoft's OAuth sign-in over IMAP, and Envelope does not support OAuth sign-in yet. These accounts cannot be added today, with or without an app password.".to_string(),
+            WORKING_PROVIDERS.to_string(),
+        ];
+    }
+    if domain == "gmail.com"
+        || domain == "googlemail.com"
+        || text.contains("application-specific password required")
+    {
+        return vec![
+            "Envelope does not support Google sign-in (OAuth) yet, so Gmail needs an app password, not your Google account password.".to_string(),
+            "1. Turn on 2-Step Verification: https://myaccount.google.com/security".to_string(),
             "2. Create an app password: https://myaccount.google.com/apppasswords".to_string(),
             "3. Re-run: envelope accounts add --email you@gmail.com".to_string(),
-        ],
+            "If Google does not offer app passwords on your account (some Workspace and Advanced Protection accounts), the account cannot be added today.".to_string(),
+            WORKING_PROVIDERS.to_string(),
+        ];
+    }
+    match domain.as_str() {
         d if d == "fastmail.com" || d.ends_with(".fastmail.com") => vec![
             "Fastmail requires an app password, not your Fastmail login password.".to_string(),
             "Create one at: https://app.fastmail.com/settings/security/devicekeys".to_string(),
@@ -471,15 +506,9 @@ pub fn auth_remediation_for_account_domain(domain: Option<&str>) -> Vec<String> 
             "2FA must be enabled on your Apple ID first.".to_string(),
             "Re-run: envelope accounts add --email you@icloud.com".to_string(),
         ],
-        d if d == "outlook.com" || d == "hotmail.com" || d == "live.com" || d.ends_with(".outlook.com") => vec![
-            "Outlook/Hotmail requires an app password when 2FA is enabled.".to_string(),
-            "Create one at: https://account.microsoft.com/security (Advanced security → App passwords).".to_string(),
-            "Re-run: envelope accounts add --email you@outlook.com".to_string(),
-        ],
         _ => vec![
-            "Use an app password, not your email login password.".to_string(),
-            "Most providers (Gmail, Fastmail, iCloud, Outlook) require an app password when 2FA is enabled.".to_string(),
-            "Check your provider's security settings to generate an app password, then re-run:".to_string(),
+            "Check the password. Many providers require an app password when two-factor sign-in is on.".to_string(),
+            "Generate one in your provider's security settings, then re-run:".to_string(),
             "  envelope accounts add --email you@example.com".to_string(),
         ],
     }
@@ -718,57 +747,94 @@ mod tests {
 
     #[test]
     fn auth_remediation_gmail_domain_present() {
-        let rem = auth_remediation_for_account_domain(Some("gmail.com"));
-        assert!(!rem.is_empty(), "gmail should produce remediation");
-        let joined = rem.join(" ");
-        assert!(
-            joined.contains("myaccount.google.com/apppasswords"),
-            "gmail remediation should include app passwords URL"
-        );
+        let joined = auth_remediation(Some("you@gmail.com"), "Invalid credentials").join(" ");
+        assert!(joined.contains("myaccount.google.com/apppasswords"));
+        assert!(joined.contains("OAuth"));
+    }
+
+    #[test]
+    fn auth_remediation_detects_google_workspace_by_server_text() {
+        let joined = auth_remediation(
+            Some("me@company.example"),
+            "[ALERT] Application-specific password required: https://support.google.com/accounts/answer/185833 (Failure)",
+        )
+        .join(" ");
+        assert!(joined.contains("myaccount.google.com/apppasswords"));
     }
 
     #[test]
     fn auth_remediation_unknown_domain_generic() {
-        let rem = auth_remediation_for_account_domain(Some("example.com"));
-        assert!(
-            !rem.is_empty(),
-            "unknown domain should still produce generic guidance"
-        );
-        let joined = rem.join(" ");
-        assert!(
-            joined.contains("app password"),
-            "generic guidance should mention app password"
-        );
+        let joined = auth_remediation(Some("example.com"), "").join(" ");
+        assert!(joined.contains("app password"));
     }
 
     #[test]
     fn auth_remediation_none_domain_generic() {
-        let rem = auth_remediation_for_account_domain(None);
-        assert!(
-            !rem.is_empty(),
-            "None domain should produce generic guidance"
-        );
+        assert!(!auth_remediation(None, "").is_empty());
     }
 
     #[test]
     fn auth_remediation_fastmail() {
-        let rem = auth_remediation_for_account_domain(Some("fastmail.com"));
-        let joined = rem.join(" ");
+        let joined = auth_remediation(Some("fastmail.com"), "").join(" ");
         assert!(joined.contains("fastmail.com/settings/security"));
     }
 
     #[test]
     fn auth_remediation_icloud() {
-        let rem = auth_remediation_for_account_domain(Some("icloud.com"));
-        let joined = rem.join(" ");
+        let joined = auth_remediation(Some("you@icloud.com"), "").join(" ");
         assert!(joined.contains("appleid.apple.com"));
     }
 
     #[test]
-    fn auth_remediation_outlook() {
-        let rem = auth_remediation_for_account_domain(Some("outlook.com"));
-        let joined = rem.join(" ");
-        assert!(joined.contains("account.microsoft.com"));
+    fn auth_remediation_outlook_says_oauth_is_unsupported() {
+        for account in [
+            "you@outlook.com",
+            "you@hotmail.co.uk",
+            "you@live.com",
+            "you@msn.com",
+        ] {
+            let joined = auth_remediation(Some(account), "").join(" ");
+            assert!(
+                joined.contains("does not support OAuth"),
+                "{account}: {joined}"
+            );
+            assert!(joined.contains("cannot be added today"), "{account}");
+            assert!(
+                !joined.contains("account.microsoft.com"),
+                "no app-password promise"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_remediation_detects_microsoft_by_server_text() {
+        let joined = auth_remediation(
+            Some("me@custom.example"),
+            "AUTHENTICATE failed. Provided authentication mechanism is not supported.",
+        )
+        .join(" ");
+        assert!(joined.contains("does not support OAuth"));
+    }
+
+    #[test]
+    fn classify_imap_error_uses_the_account_domain() {
+        let phase = classify_imap_error(
+            PhaseName::ImapAuth,
+            Instant::now(),
+            "probe@outlook.com",
+            envelope_email_transport::errors::ImapError::Auth(
+                "AUTHENTICATE failed. Provided authentication mechanism is not supported."
+                    .to_string(),
+            ),
+        );
+        let error = phase.error.unwrap();
+        assert_eq!(error.code, "imap_auth_failed");
+        assert!(
+            error
+                .remediation
+                .join(" ")
+                .contains("does not support OAuth")
+        );
     }
 
     #[test]

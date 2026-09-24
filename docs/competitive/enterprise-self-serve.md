@@ -91,7 +91,7 @@ permanent leverage:
 | Threat model | Signals maturity faster than any certification |
 | SBOM per release + dependency policy | Increasingly a hard procurement gate |
 | CVE response SLA + security contact | `security.txt`, a published disclosure policy, a real response window |
-| Signed releases + checksums | Already partly there via `dist/install.sh` sha256 verification |
+| Signed releases + checksums | Already partly there via `install.sh` sha256 verification |
 | Third-party pen test report | ~$15–30k once. The single highest-ROI artifact on this list |
 | Zero-telemetry statement | "We collect nothing" is only credible if it's testable — document how to verify with a packet capture |
 

@@ -515,7 +515,7 @@ enum Commands {
 
     /// Diagnose Envelope auth/state health and offer bounded, safe repair
     #[command(
-        after_help = "Classifies why mailbox ops can fail even when account metadata reads fine (e.g. credential_decrypt_failed vs decrypted_but_imap_auth_failed). --repair performs an always-safe backup; riskier repairs are reported as not-available. Never prints secrets; never sends email."
+        after_help = "Classifies why mailbox ops can fail even when account metadata reads fine (e.g. credential_decrypt_failed vs decrypted_but_imap_auth_failed). --repair performs an always-safe backup; riskier repairs are reported as not-available. Never prints secrets; never sends email.\n\nEXIT CODES\n  0 ok or warning\n  1 error status (the report is still printed)"
     )]
     Doctor {
         /// Account ID or email to diagnose (defaults to the default account)
@@ -613,6 +613,10 @@ enum AccountsCmd {
         /// where no passphrase can be provided. Prefer a passphrase.
         #[arg(long)]
         insecure_machine_key: bool,
+        /// Save the account without first logging in to IMAP. For offline
+        /// setup only: a wrong password is not caught until first use.
+        #[arg(long)]
+        skip_login_check: bool,
     },
     /// Re-encrypt the file credential store under a new passphrase
     Rekey,

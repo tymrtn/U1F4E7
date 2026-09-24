@@ -179,7 +179,7 @@ instead of the demo looking like a cron job.
 On a fresh Linux box (a disposable cloud VM, not a machine with real state):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/dist/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh | bash
 which envelope
 
 envelope accounts add --email you@example.com --password <app-password>
@@ -234,7 +234,7 @@ dashboard is where a non-technical human actually lives day to day.
 
 ## Unverified / needs a live check before recording
 
-- **`dist/install.sh` one-liner path**: the script exists and its `--version` /
+- **`install.sh` one-liner path**: the script exists and its `--version` /
   `--bin-dir` / `--allow-root` flags are read from its own header, but it has not
   been run end-to-end against a real GitHub release in this session — confirm a
   tagged release with matching tarball assets exists before recording Scene 7, or

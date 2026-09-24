@@ -323,16 +323,17 @@ describe('Review page groups', () => {
     );
   });
 
-  it('shows truthful empty states, including the no-classifier disclosure', async () => {
+  it('shows truthful empty states, naming what files messages into triage', async () => {
     reviewMock.get.mockResolvedValue(emptyResponse());
     render(ReviewPage);
     await waitFor(() => expect(screen.getByText('Nothing to decide')).toBeInTheDocument());
 
     expect(screen.getByText('Nothing waiting')).toBeInTheDocument();
     expect(screen.getByText('No flagged messages')).toBeInTheDocument();
-    expect(
-      screen.getByText(/Envelope does not scan or classify your inbox/)
-    ).toBeInTheDocument();
+    // rShield (1.3.0) scans every message, so the page must not deny scanning.
+    // Its verdicts are recorded pre-acked and show in the reader, not here.
+    expect(screen.queryByText(/does not scan/i)).toBeNull();
+    expect(screen.getByText(/threat scan results show in the reader/i)).toBeInTheDocument();
     expect(screen.getByText('All clear')).toBeInTheDocument();
   });
 

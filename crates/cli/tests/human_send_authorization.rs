@@ -49,6 +49,7 @@ fn seed_account(home: &std::path::Path) {
         .args([
             "accounts",
             "add",
+            "--skip-login-check",
             "--email",
             "test@example.test",
             "--password-stdin",

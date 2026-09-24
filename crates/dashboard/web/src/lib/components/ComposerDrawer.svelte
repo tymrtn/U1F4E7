@@ -18,10 +18,12 @@
 
   let {
     accounts = [],
-    onsent
+    onsent,
+    onsaved
   }: {
     accounts?: Account[];
     onsent?: (res: ComposeResponse, accountId: string) => void;
+    onsaved?: (accountId: string, draftId: string) => void;
   } = $props();
 
   const composer = getComposerStore();
@@ -36,12 +38,13 @@
   let showBcc = $state(false);
   let attachments = $state<PendingAttachment[]>([]);
   let sending = $state(false);
+  let saving = $state(false);
   let readingAttachments = $state(false);
   let sendError = $state<{ code: string; message: string } | null>(null);
   let openSession = $state('');
   // Discard protection: Esc / × / backdrop on a composer with content asks
-  // first. There is no autosave yet, so a stray Escape would otherwise throw
-  // typed work away with zero network calls.
+  // first, offering Save draft, so a stray Escape never throws typed work
+  // away silently.
   let discardConfirmOpen = $state(false);
   const isDirty = $derived(
     toRaw.trim().length > 0 ||
@@ -52,7 +55,7 @@
       attachments.length > 0
   );
   function requestClose() {
-    if (sending) return;
+    if (sending || saving) return;
     // Escape while the confirm is showing means "keep editing".
     if (discardConfirmOpen) {
       discardConfirmOpen = false;
@@ -146,6 +149,54 @@
     sendError = null;
     discardConfirmOpen = false;
   });
+
+  // Save draft is offered on fresh messages only. A reply draft needs the
+  // parent's threading headers, which only the reply send path fetches.
+  const canSave = $derived(
+    isFreshMessage && !sending && !saving && !readingAttachments && deliveryReady && isDirty
+  );
+
+  async function saveDraft() {
+    if (!canSave) return;
+    saving = true;
+    sendError = null;
+    const accountId = fromAccountId;
+    try {
+      const { draft } = await api.createDraft(accountId, {
+        to: toRaw.trim(),
+        subject: subject.trim() || null,
+        text: bodyFormat === 'text' ? (body || null) : null,
+        html: bodyFormat === 'html' ? (body || null) : null,
+        cc: ccRaw.trim() || null,
+        bcc: bccRaw.trim() || null
+      });
+      if (attachments.length > 0) {
+        try {
+          await api.uploadDraftAttachments(accountId, draft.id, {
+            expected_revision: draft.revision,
+            attachments: attachmentPayloads()
+          });
+        } catch (e) {
+          const err = e as EnvelopeApiError;
+          discardConfirmOpen = false;
+          sendError = {
+            code: err.code ?? 'unknown',
+            message: `Draft saved without its attachments: ${err.message ?? 'upload failed.'} Close this window and attach the files on the draft page.`
+          };
+          return;
+        }
+      }
+      discardConfirmOpen = false;
+      composer.close();
+      onsaved?.(accountId, draft.id);
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      discardConfirmOpen = false;
+      sendError = { code: err.code ?? 'unknown', message: err.message ?? 'Could not save the draft.' };
+    } finally {
+      saving = false;
+    }
+  }
 
   function attachmentPayloads(): ComposeAttachment[] {
     return attachments.map(({ filename, content_type, data_b64 }) => ({
@@ -245,6 +296,12 @@
 </script>
 
 {#snippet headerActions()}
+  {#if isFreshMessage}
+    <Button variant="ghost" type="button" onclick={saveDraft} disabled={!canSave}>
+      {#if saving}<Spinner label="Saving" />{/if}
+      {saving ? 'Saving' : 'Save draft'}
+    </Button>
+  {/if}
   <Button variant="primary" type="submit" form="composer-form" disabled={!canSend}>
     {#if sending}<Spinner label="Queueing" />{/if}
     {sending ? 'Queueing' : 'Human-only Send'}
@@ -409,9 +466,16 @@
   title="Discard this draft?"
   onclose={() => (discardConfirmOpen = false)}
 >
-  <p class="discard-warn">Nothing has been saved yet — closing now throws away what you typed.</p>
+  <p class="discard-warn">
+    {isFreshMessage
+      ? 'This message has not been saved. Save it as a draft or discard it.'
+      : 'This reply has not been saved. Closing now discards it.'}
+  </p>
   {#snippet footer()}
     <button type="button" class="modal-keep" onclick={() => (discardConfirmOpen = false)}>Keep editing</button>
+    {#if isFreshMessage}
+      <button type="button" class="modal-keep" onclick={saveDraft} disabled={!canSave}>Save draft</button>
+    {/if}
     <button type="button" class="modal-discard" onclick={discardDraft}>Discard draft</button>
   {/snippet}
 </Modal>
