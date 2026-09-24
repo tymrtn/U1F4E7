@@ -490,7 +490,7 @@ pub fn auth_remediation(account: Option<&str>, server_text: &str) -> Vec<String>
             "1. Turn on 2-Step Verification: https://myaccount.google.com/security".to_string(),
             "2. Create an app password: https://myaccount.google.com/apppasswords".to_string(),
             "3. Re-run: envelope accounts add --email you@gmail.com".to_string(),
-            "If Google does not offer app passwords on your account (some Workspace and Advanced Protection accounts), the account cannot be added today.".to_string(),
+            "If Google won't let you create an app password for your account, Gmail can't connect to Envelope yet (OAuth sign-in isn't supported).".to_string(),
             WORKING_PROVIDERS.to_string(),
         ];
     }
@@ -750,6 +750,7 @@ mod tests {
         let joined = auth_remediation(Some("you@gmail.com"), "Invalid credentials").join(" ");
         assert!(joined.contains("myaccount.google.com/apppasswords"));
         assert!(joined.contains("OAuth"));
+        assert!(joined.contains("Gmail can't connect to Envelope yet"));
     }
 
     #[test]

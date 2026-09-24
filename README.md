@@ -68,7 +68,9 @@ no OAuth sign-in yet, and that decides which mailboxes work today:
   security settings.
 - **Gmail:** create an [app password](https://support.google.com/accounts/answer/185833).
   Google only offers them once 2-Step Verification is on, and some Workspace
-  and Advanced Protection accounts cannot create one.
+  and Advanced Protection accounts cannot create one. If Google won't let you
+  create an app password for your account, Gmail can't connect to Envelope yet
+  (OAuth sign-in isn't supported).
 - **Migadu, self-hosted Dovecot, and most other IMAP hosts:** your normal
   mailbox password.
 - **Outlook.com, Hotmail, Live, and Microsoft 365:** not supported yet.

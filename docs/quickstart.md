@@ -14,7 +14,7 @@ no OAuth sign-in yet.
 |---|---|
 | **Fastmail** | App password: [app.fastmail.com/settings/security/devicekeys](https://app.fastmail.com/settings/security/devicekeys) |
 | **iCloud Mail** | App-specific password: [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords |
-| **Gmail** | App password: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Google requires 2-Step Verification first, and [some accounts cannot create one](https://support.google.com/accounts/answer/185833). |
+| **Gmail** | App password: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Google requires 2-Step Verification first, and [some accounts cannot create one](https://support.google.com/accounts/answer/185833). If Google won't let you create an app password for your account, Gmail can't connect to Envelope yet (OAuth sign-in isn't supported). |
 | **Migadu / self-hosted** | Your regular mailbox password |
 | **Outlook.com, Hotmail, Live, Microsoft 365** | Not supported yet. Microsoft turned off password sign-in for IMAP on [Outlook.com](https://support.microsoft.com/en-us/office/modern-authentication-methods-now-needed-to-continue-syncing-outlook-email-in-non-microsoft-email-apps-c5d65390-9676-4763-b41f-d7986499a90d) and [Exchange Online](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online), and Envelope cannot do the OAuth sign-in Microsoft requires. |
 
