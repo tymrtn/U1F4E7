@@ -59,6 +59,12 @@ cargo build --release
 cp target/release/envelope ~/.local/bin/envelope
 ```
 
+The release workflow signs and notarizes the macOS binaries once its Apple
+credentials are configured ([docs/release-signing.md](docs/release-signing.md));
+until then macOS release binaries are unsigned. If macOS refuses to run an
+unsigned tarball you downloaded in a browser, clear the quarantine flag:
+`xattr -d com.apple.quarantine ~/.local/bin/envelope`.
+
 ## Quick start
 
 Envelope signs in to IMAP and SMTP with a password or an app password. It has

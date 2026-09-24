@@ -48,8 +48,130 @@ jobs:
       - name: Build release binary
         run: cargo build --release --bin envelope --target ${{ matrix.target }}
 
+      # Signing + notarization run only when every secret is present. With
+      # none set the release still ships (unsigned, with a warning); a partial
+      # set fails the job so a misconfiguration never ships silently unsigned.
+      # One-time setup: docs/release-signing.md.
+      - name: Check signing secrets
+        id: signing
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          present=()
+          missing=()
+          for name in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD APPLE_API_KEY_P8_BASE64 \
+                      APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_TEAM_ID; do
+            if [[ -n "${!name}" ]]; then present+=("$name"); else missing+=("$name"); fi
+          done
+          if [[ ${#present[@]} -eq 0 ]]; then
+            echo "::warning title=Unsigned macOS build::No signing secrets configured; shipping an unsigned, unnotarized binary. See docs/release-signing.md."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error title=Incomplete signing secrets::Missing: ${missing[*]}. Set all six or none (docs/release-signing.md)."
+            exit 1
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/envelope-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          CERT="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -t cert -f pkcs12 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          existing=()
+          while IFS= read -r kc; do existing+=("$kc"); done \
+            < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+          security list-keychains -d user -s "$KEYCHAIN" "${existing[@]}"
+          rm -f "$CERT"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -v team="($APPLE_TEAM_ID)" '/Developer ID Application/ && index($0, team) { print $2; exit }')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No 'Developer ID Application' identity for team $APPLE_TEAM_ID in the imported .p12."
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      # package-release.sh signs the binary (after strip, before tar/sha256)
+      # when MACOS_SIGN_IDENTITY is set, so the checksum covers what ships.
       - name: Package release
         run: bash scripts/package-release.sh --target ${{ matrix.target }}
+
+      # Bare CLI binaries cannot be stapled; Gatekeeper looks the notarization
+      # ticket up online on first run. Notarizing after packaging is safe
+      # because notarytool does not modify the binary.
+      - name: Notarize binary
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="$(find dist -mindepth 2 -maxdepth 2 -type f -name envelope -path "dist/envelope-*-${TARGET}/*")"
+          if [[ -z "$BIN" ]]; then
+            echo "::error::Packaged binary for $TARGET not found under dist/."
+            exit 1
+          fi
+          codesign -dvv "$BIN"
+
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$KEY"
+          ZIP="$RUNNER_TEMP/envelope-notarize.zip"
+          ditto -c -k --keepParent "$BIN" "$ZIP"
+
+          RESULT="$RUNNER_TEMP/notarize.json"
+          # notarytool may exit non-zero on Invalid; keep going so the log prints.
+          rc=0
+          xcrun notarytool submit "$ZIP" \
+            --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$RESULT" || rc=$?
+          cat "$RESULT"
+
+          STATUS="$(plutil -extract status raw -o - "$RESULT" 2>/dev/null || echo unknown)"
+          SUBMISSION_ID="$(plutil -extract id raw -o - "$RESULT" 2>/dev/null || true)"
+          if [[ -z "$SUBMISSION_ID" ]]; then
+            echo "::error title=Notarization submit failed::notarytool exited $rc with no submission id (check API key secrets)."
+            rm -f "$KEY"
+            exit 1
+          fi
+          if [[ "$STATUS" != "Accepted" ]]; then
+            echo "::error title=Notarization $STATUS::Submission $SUBMISSION_ID was not accepted."
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID"
+            rm -f "$KEY"
+            exit 1
+          fi
+          rm -f "$KEY"
+          echo "Notarization accepted: $SUBMISSION_ID"
+          spctl -a -vvv -t install "$BIN" \
+            || echo "::warning::spctl did not yet report 'Notarized Developer ID' (ticket propagation can lag)."
+
+      - name: Remove signing keychain
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/envelope-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/developer-id.p12"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

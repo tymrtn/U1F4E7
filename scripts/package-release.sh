@@ -120,6 +120,21 @@ elif command -v llvm-strip >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# macOS code signing (optional).  Must run after strip (strip invalidates a
+# signature) and before tar/sha256 so the checksum covers the signed binary.
+# MACOS_SIGN_IDENTITY is set by release.yml only when signing secrets exist.
+# ---------------------------------------------------------------------------
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+    if [[ "$TARGET" != *-apple-darwin ]]; then
+        echo "MACOS_SIGN_IDENTITY is set but target ${TARGET} is not macOS." >&2
+        exit 1
+    fi
+    codesign --force --options runtime --timestamp \
+        --sign "$MACOS_SIGN_IDENTITY" "$TARGET_BIN"
+    codesign --verify --strict --verbose=2 "$TARGET_BIN"
+fi
+
+# ---------------------------------------------------------------------------
 # Size guard (25 MiB binary, 20 MiB tarball)
 # ---------------------------------------------------------------------------
 BIN_BYTES="$(binary_size "$TARGET_BIN")"
@@ -172,3 +187,4 @@ echo "Tarball:       ${TARBALL}"
 echo "SHA256:        ${SHA256_FILE}"
 echo "Binary size:   ${BIN_BYTES} bytes"
 echo "Tarball size:  ${TARBALL_BYTES} bytes"
+echo "Signed by:     ${MACOS_SIGN_IDENTITY:-unsigned}"
