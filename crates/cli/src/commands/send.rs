@@ -6,8 +6,9 @@ use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::SmtpSender;
 use envelope_email_transport::attribution_persist::success_attribution_block;
 use envelope_email_transport::outbound::{
-    IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
-    SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
+    GovernorConfig, GovernorMode, IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON,
+    OUTBOX_COOLDOWN_REASON_CODE, SendDisposition, SendSurface, resolve_cooldown_seconds,
+    resolve_disposition,
 };
 use envelope_email_transport::smtp::Attachment;
 use envelope_email_transport::{
@@ -225,7 +226,8 @@ pub async fn run(
 
     // The validated resolution for the additive success `attribution` block. On
     // queued/scheduled acceptance the real Governor decision runs later at the
-    // sweep, so the block is marked deferred (governor null).
+    // sweep, so the block is marked deferred (governor null; the off verdict in
+    // a build without the `governor` feature).
     let queued_attribution = precheck_req
         .resolution
         .as_ref()
@@ -394,9 +396,15 @@ pub async fn run(
                     draft.id
                 );
                 println!("Reason: {OUTBOX_COOLDOWN_REASON}");
-                println!(
-                    "Real send happens via the scheduled-send sweep, after the Governor gate."
-                );
+                if GovernorConfig::smtp().mode == GovernorMode::Off {
+                    println!(
+                        "Real send happens via the scheduled-send sweep. Governor gate: not built in (sends are not scored)."
+                    );
+                } else {
+                    println!(
+                        "Real send happens via the scheduled-send sweep, after the Governor gate."
+                    );
+                }
             }
             return Ok(());
         }

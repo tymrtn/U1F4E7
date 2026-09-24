@@ -1461,7 +1461,10 @@ mod tests {
                 .any(|a| a == "tyler_approved"),
             "response advertises the durable human attestation: {v}"
         );
+        #[cfg(feature = "governor")]
         assert_eq!(attr["governor"], serde_json::Value::Null);
+        #[cfg(not(feature = "governor"))]
+        assert_eq!(attr["governor"]["mode"], "off");
         assert!(!v.to_string().contains("\"score\""), "no score leaked");
     }
 

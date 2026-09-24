@@ -41,11 +41,19 @@ jobs:
         # Tighten to -D warnings in v0.4 after cleanup pass.
         run: cargo clippy --all-targets
 
+      - name: Clippy with the Governor gate (errors only)
+        run: cargo clippy --all-targets --features governor
+
       - name: Build release binary
         run: cargo build --release --bin envelope
 
       - name: Test all crates
         run: cargo test --all
+
+      - name: Test all crates with the Governor gate
+        # The governor feature compiles in the fail-closed send gate. Its
+        # per-feature tests only run in this configuration.
+        run: cargo test --all --features governor
 
   linux-smoke:
     name: Linux smoke test
