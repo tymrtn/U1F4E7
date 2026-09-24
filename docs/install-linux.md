@@ -13,8 +13,8 @@ tar -xzf "envelope-${VERSION}-${ARCH}.tar.gz"
 install -m 755 envelope ~/.local/bin/envelope
 ```
 
-> Note: an `install.sh` script that automates tarball download and PATH setup ships
-> with releases. Check the release notes for `dist/install.sh` once available.
+> `install.sh` at the repo root does the same steps and checks the tarball's
+> SHA-256: `curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh | bash`
 
 ## Option B — `cargo install` from source (requires Rust)
 

@@ -279,11 +279,11 @@
       {#if data.needs_triage.count === 0}
         <EmptyState
           title="No flagged messages"
-          hint="Only durable mailbox events land here — Envelope does not scan or classify your inbox."
+          hint="A message lands here when a watch or rule records an event about it. Threat scan results show in the reader, on the message."
         />
       {:else}
         <p class="group-note">
-          Messages flagged by watches and rules. Envelope does not scan or classify your inbox.
+          Messages flagged by watches and rules. Threat scan results show in the reader, on the message.
         </p>
         <ul class="rows">
           {#each data.needs_triage.items as item (item.id)}

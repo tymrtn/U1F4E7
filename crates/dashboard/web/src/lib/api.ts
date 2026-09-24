@@ -441,6 +441,26 @@ export interface DraftEditBody {
   html_content?: string;
 }
 
+/**
+ * Body for POST /api/accounts/{id}/drafts (the composer's Save draft). Mirrors
+ * `DraftCreateRequest`, which is `deny_unknown_fields` and takes no files:
+ * attachments go through `uploadDraftAttachments` after the save.
+ */
+export interface DraftCreateBody {
+  to: string;
+  subject: string | null;
+  text: string | null;
+  html: string | null;
+  cc: string | null;
+  bcc: string | null;
+}
+
+export interface DraftCreateResponse {
+  ok: boolean;
+  status: 'draft';
+  draft: Draft;
+}
+
 export interface DraftEditResponse {
   draft: Draft;
   status: string;
@@ -729,6 +749,15 @@ export const api = {
 
   drafts(accountId: string, o?: RequestOptions): Promise<DraftsResponse> {
     return request(`/accounts/${encodeURIComponent(accountId)}/drafts`, o);
+  },
+
+  /** POST /api/accounts/{id}/drafts — store a local draft; queues nothing. */
+  createDraft(accountId: string, body: DraftCreateBody, o?: RequestOptions): Promise<DraftCreateResponse> {
+    return request(`/accounts/${encodeURIComponent(accountId)}/drafts`, {
+      ...o,
+      method: 'POST',
+      body
+    });
   },
 
   draft(accountId: string, draftId: string, o?: RequestOptions): Promise<DraftResponse> {

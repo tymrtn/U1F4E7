@@ -6,10 +6,9 @@
 /**/target (Selective Sync Conflict*)
 # dist/ holds generated release artifacts (ignored) — but dist/systemd/
 # unit templates are tracked source. Git needs the parent un-ignored for the
-# negation to work, hence the three-line pattern.
+# negation to work, hence the two-line pattern.
 /dist/*
 !/dist/systemd
-!/dist/install.sh
 **/*.rs.bk
 *.swp
 *.swo

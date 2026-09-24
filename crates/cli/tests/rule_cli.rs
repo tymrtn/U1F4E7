@@ -30,6 +30,7 @@ fn seed_account(home: &Path) {
         .args([
             "accounts",
             "add",
+            "--skip-login-check",
             "--email",
             "test@example.test",
             "--password-stdin",

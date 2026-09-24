@@ -98,3 +98,13 @@ h2 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
 @media (max-width: 640px) {
   .five-up, .six-up, .pricing-grid { grid-template-columns: 1fr; }
 }
+/* Grid items default to min-width:auto, which lets the nowrap install commands
+   widen the hero column past a phone screen. */
+.hero-grid > * { min-width: 0; }
+.install { margin: 0 0 1rem; max-width: 40rem; }
+.install-label { margin: 0 0 0.4rem; font-size: 0.82rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-2); }
+.install-line { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem; padding: 0.55rem 0.6rem 0.55rem 0.9rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(7, 12, 27, 0.85); }
+.install-line code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--good); font-size: 0.92rem; }
+.copy-button { flex: none; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--text); padding: 0.3rem 0.8rem; font: inherit; font-size: 0.85rem; cursor: pointer; }
+.copy-button:hover { border-color: var(--accent); }
+.install-note { margin: 0.25rem 0 0; font-size: 0.88rem; }

@@ -461,6 +461,77 @@ pub async fn list(
     }
 }
 
+/// Body for `POST /api/accounts/{id}/drafts`: the composer's Save draft.
+/// Attachments are not accepted here. The composer uploads them through
+/// [`crate::handlers::draft_attachments::upload`] after the save so they get
+/// the same size, filename, and threat checks as every other draft file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftCreateRequest {
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub html: Option<String>,
+    #[serde(default)]
+    pub cc: Option<String>,
+    #[serde(default)]
+    pub bcc: Option<String>,
+}
+
+fn blank(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `POST /api/accounts/{id}/drafts` stores a local draft and queues nothing.
+/// Sending it later is a separate Human-only Send from the draft page.
+pub async fn create(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(req): Json<DraftCreateRequest>,
+) -> impl IntoResponse {
+    let db = state.db.lock().await;
+    let account = match resolve_account(&db, &account_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => return (StatusCode::NOT_FOUND, "account not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response();
+        }
+    };
+    let draft = match db.create_draft(
+        &account.id,
+        req.to.trim(),
+        blank(&req.subject),
+        req.text.as_deref().filter(|s| !s.is_empty()),
+        req.html.as_deref().filter(|s| !s.is_empty()),
+        None,
+        blank(&req.cc),
+        blank(&req.bcc),
+        Some("human:dashboard"),
+    ) {
+        Ok(draft) => draft,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("save draft: {e}"),
+            )
+                .into_response();
+        }
+    };
+    drop(db);
+    state
+        .events
+        .publish(crate::events::DashboardEvent::DraftStatusChanged {
+            account_id: account.id.clone(),
+            draft_id: draft.id.clone(),
+            status: "draft".to_string(),
+        });
+    Json(json!({ "ok": true, "status": "draft", "draft": draft_json(&draft) })).into_response()
+}
+
 pub async fn show(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -2,13 +2,14 @@
   // Digest board — the GTD clarify surface and the shell's landing route
   // (design plan rev 3, §4a). The agent categorizes; the human decides in
   // bulk. Until the categorize backend lands (Phase E spike), only the
-  // capture bucket is real: category sections render honest awaiting-backend
-  // states and the Categorize controls are disabled with the reason on them.
+  // capture bucket is real, so it is the only section rendered. The
+  // category catalog in $lib/digest stays unrendered (and Categorize stays
+  // off the page) until a backend assigns threads to it.
   import { base } from '$app/paths';
   import { api, EnvelopeApiError, type UnifiedInboxResponse } from '$lib/api';
-  import { DIGEST_SECTIONS, groupIntoThreads } from '$lib/digest';
+  import { groupIntoThreads } from '$lib/digest';
   import { SelectionStore } from '$lib/selection.svelte';
-  import { Button, EmptyState, Icon, Spinner } from '$lib/components';
+  import { Button, EmptyState, Spinner } from '$lib/components';
   import BulkToolbar from '$lib/components/BulkToolbar.svelte';
 
   let resp = $state<UnifiedInboxResponse | null>(null);
@@ -106,7 +107,6 @@
       : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
 
-  const CATEGORIZE_HINT = 'Agent categorization lands with the digest backend (Phase E spike).';
 </script>
 
 <svelte:head>
@@ -121,9 +121,6 @@
       <Button variant="ghost" onclick={refresh} disabled={loading || refreshing}>
         {refreshing ? 'Refreshing…' : 'Refresh'}
       </Button>
-      <span title={CATEGORIZE_HINT}>
-        <Button variant="ghost" disabled>Categorize</Button>
-      </span>
       <a class="dg-rules" href="{base}/rules">Settings &amp; rules →</a>
     </div>
   </header>
@@ -189,23 +186,6 @@
       {/if}
     </section>
 
-    {#each DIGEST_SECTIONS as section (section.key)}
-      <section class="dg-section" data-section={section.key}>
-        <header class="dg-sec-head tone-{section.tone}">
-          <h2>{section.label}</h2>
-          <span class="dg-sec-meta">awaiting categorize backend</span>
-          {#if section.bulk}
-            <span class="dg-smart" title={CATEGORIZE_HINT}>
-              <Icon name="archive" size={12} /> smart all
-            </span>
-          {/if}
-        </header>
-        <p class="dg-awaiting">
-          The agent will file threads here once categorization is wired. Nothing is guessed
-          client-side.
-        </p>
-      </section>
-    {/each}
   {/if}
 </div>
 
@@ -273,15 +253,6 @@
   .dg-sec-head.tone-capture {
     border-left-color: var(--env-accent);
   }
-  .dg-sec-head.tone-do {
-    border-left-color: var(--env-warn);
-  }
-  .dg-sec-head.tone-wait {
-    border-left-color: var(--env-pending);
-  }
-  .dg-sec-head.tone-noise {
-    border-left-color: var(--env-muted);
-  }
   .dg-sec-head h2 {
     margin: 0;
     font-size: 0.9375rem;
@@ -291,26 +262,6 @@
     font-family: var(--font-mono);
     font-size: 0.6875rem;
     color: var(--env-muted);
-  }
-  .dg-smart {
-    margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    font-family: var(--font-mono);
-    font-size: 0.6875rem;
-    color: var(--env-muted);
-    border: 1px solid var(--env-rule);
-    border-radius: 999px;
-    padding: 0.1rem 0.55rem;
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-  .dg-awaiting {
-    margin: 0.4rem 0 0 0.95rem;
-    font-size: 0.8125rem;
-    color: var(--env-muted);
-    font-style: italic;
   }
   .dg-rows {
     list-style: none;

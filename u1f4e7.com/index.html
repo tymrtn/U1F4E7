@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Envelope — BYO email for agents</title>
-  <meta name="description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, agent cockpit, CLI + JSON + MCP.">
+  <meta name="description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
   <link rel="canonical" href="https://u1f4e7.com/">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
   <meta name="theme-color" content="#0b1020">
@@ -13,12 +13,12 @@
   <meta property="og:site_name" content="Envelope">
   <meta property="og:url" content="https://u1f4e7.com/">
   <meta property="og:title" content="Envelope — BYO email for agents">
-  <meta property="og:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, agent cockpit, CLI + JSON + MCP.">
+  <meta property="og:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
   <meta property="og:image" content="https://u1f4e7.com/og-card.png">
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Envelope — BYO email for agents">
-  <meta name="twitter:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, agent cockpit, CLI + JSON + MCP.">
+  <meta name="twitter:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
   <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
   <link rel="stylesheet" href="styles.css">
   <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
@@ -34,7 +34,7 @@
         <a href="#control">Human control</a>
         <a href="#why-not">Why not hosted</a>
         <a href="#pricing">Pricing</a>
-        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7">Repo</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-nav" data-umami-event="github-nav">Repo</a>
       </nav>
     </div>
   </header>
@@ -49,10 +49,16 @@
             Envelope connects to the mailbox you already use — same address, same folders, same habits. Your agent reads OTPs, handles replies, runs rules, and drafts for your approval. Nothing moves until you say so.
           </p>
           <div class="cta-row">
-            <a class="button" href="https://github.com/tymrtn/U1F4E7">Get the repo</a>
+            <a class="button" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-cta" data-umami-event="github-cta">Get the repo</a>
             <a class="button button-secondary" href="#pricing">Buy an annual license</a>
           </div>
-          <p class="muted" style="margin-top:1rem"><a href="envelope-1-1-0.html">New: Envelope 1.1.0 — a calmer human/agent mail workflow →</a></p>
+          <div class="install" id="install">
+            <p class="install-label">Install on macOS or Linux</p>
+            <div class="install-line"><code id="install-curl">curl -fsSL https://u1f4e7.com/install.sh | bash</code><button type="button" class="copy-button" data-copy-target="install-curl" data-umami-event="install-copy-curl">Copy</button></div>
+            <div class="install-line"><code id="install-brew">brew install tymrtn/u1f4e7/envelope</code><button type="button" class="copy-button" data-copy-target="install-brew" data-umami-event="install-copy-brew">Copy</button></div>
+            <p class="muted install-note">The script checks the release's SHA-256 and installs to ~/.local/bin without sudo. Homebrew builds from source, so it installs Rust first.</p>
+          </div>
+          <p class="muted" style="margin-top:1rem"><a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.4?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner" data-umami-event="release-banner">Current release: Envelope 1.3.4</a>. Since <a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.0?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner-rshield" data-umami-event="release-banner-rshield">1.3.0</a>, rShield gives every incoming message a local phishing and malware score from six analyzers.</p>
           <ul class="hero-points">
             <li>Bring your own mailbox</li>
             <li>Claude Code, Codex, OpenHands, Hermes</li>
@@ -118,8 +124,8 @@ envelope mcp --config</code></pre>
           </article>
 
           <article class="card feature-card">
-            <h3>Dashboard + Agent Cockpit</h3>
-            <p>A local dashboard that is both a full mail client and an agent control plane. Read, search, star, archive, and triage with Gmail-style keyboard shortcuts (<code>j/k</code>, <code>r</code>, <code>e</code>, <code>?</code>), while the cockpit strip surfaces drafts queued for approval, rule-run history, watch state, failed auth, and an event timeline. Approve, edit, or discard agent work from one place.</p>
+            <h3>Local dashboard</h3>
+            <p>A mail client and an agent control plane on localhost. Read, search, star, archive, and triage mail, with keyboard shortcuts on the message list (<code>c</code> compose, <code>x</code> select, <code>e</code> archive, <code>s</code> star). The Review page collects drafts waiting for approval, scheduled sends, and failed auth; the Logs page keeps the history of what each agent did. Approve, edit, or discard agent work from one place.</p>
           </article>
 
           <article class="card feature-card">
@@ -140,13 +146,6 @@ envelope mcp --config</code></pre>
                 <img src="assets/screenshots/inbox-reader.webp" width="1440" height="900" alt="Envelope unified inbox with message list, thread reader, and attachment details">
               </a>
               <figcaption><strong>Unified inbox + reader.</strong> Multiple mailboxes, one view, with thread context and attachments.</figcaption>
-            </figure>
-
-            <figure class="product-shot">
-              <a href="assets/screenshots/agent-cockpit.webp">
-                <img src="assets/screenshots/agent-cockpit.webp" width="1440" height="900" alt="Envelope Agent Cockpit with named agents, approval queue, scheduled sends, and Governor verdicts">
-              </a>
-              <figcaption><strong>Agent Cockpit.</strong> Attribution, draft approvals, watch health, and allow/review/block decisions.</figcaption>
             </figure>
 
             <figure class="product-shot">
@@ -173,7 +172,7 @@ envelope mcp --config</code></pre>
           <p class="eyebrow">Human control</p>
           <h2>The agent doesn't send anything you haven't approved.</h2>
           <p>
-            By default, every draft goes into a review queue. Rule runs preview affected messages before anything moves. The cockpit shows the full history. You can pause, override, or stop any workflow.
+            By default, every draft goes into a review queue. Rule runs preview affected messages before anything moves. The Logs page shows the full history. You can pause, override, or stop any workflow.
           </p>
           <p>
             This isn't a safety flag bolted on at the end. Agent contexts default to <code>draft-only</code> mode. Autonomous send is an option, but you have to opt in explicitly — and every action is logged either way.
@@ -195,8 +194,8 @@ envelope mcp --config</code></pre>
     <section class="section section-dark">
       <div class="wrap">
         <p class="eyebrow">Works with your existing stack</p>
-        <h2>Any harness. Any IMAP provider.</h2>
-        <p class="lede" style="margin-bottom:1.5rem">If it can run a CLI command or speak MCP, it works with Envelope. The same JSON surface works from a shell script, a Hermes pipeline, a Claude Code tool call, or a Codex exec loop.</p>
+        <h2>Any harness. Most IMAP mailboxes.</h2>
+        <p class="lede" style="margin-bottom:1.5rem">If it can run a CLI command or speak MCP, it works with Envelope. Mailboxes that sign in with a password or app password work today, including Gmail, Fastmail, iCloud Mail, and Migadu; Outlook.com and Microsoft 365 need OAuth sign-in, which Envelope does not support yet. The same JSON surface works from a shell script, a Hermes pipeline, a Claude Code tool call, or a Codex exec loop.</p>
         <div class="cards six-up">
           <article class="card"><h3>Claude Code</h3><p>Drop in via MCP. Full inbox access as a tool call.</p></article>
           <article class="card"><h3>OpenAI Codex</h3><p>CLI + JSON surface for terminal-native autonomous loops.</p></article>
@@ -252,7 +251,7 @@ envelope mcp --config</code></pre>
               <li>Up to 2 active agent identities (a third asks for a license key)</li>
               <li>Community support via GitHub issues</li>
             </ul>
-            <a class="button button-secondary full" href="https://github.com/tymrtn/U1F4E7">Get the repo</a>
+            <a class="button button-secondary full" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-cta" data-umami-event="github-cta">Get the repo</a>
           </article>
 
           <article class="card pricing-card">
@@ -266,7 +265,7 @@ envelope mcp --config</code></pre>
               <li>Email support, best-effort next-business-day response</li>
               <li>Annual renewal, invoiced</li>
             </ul>
-            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Team%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20">Request annual license</a>
+            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Team%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20" data-umami-event="license-team-pricing">Request annual license</a>
           </article>
 
           <article class="card pricing-card">
@@ -280,7 +279,7 @@ envelope mcp --config</code></pre>
               <li>Priority email support, next-business-day response target</li>
               <li>Annual renewal, invoiced</li>
             </ul>
-            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Growth%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20">Request annual license</a>
+            <a class="button full" href="mailto:ty@tmrtn.com?subject=Envelope%20Growth%20license%20request&amp;body=Domain%3A%20%0AMailbox%20users%3A%20%0ABilling%20contact%3A%20%0ANotes%3A%20" data-umami-event="license-growth-pricing">Request annual license</a>
           </article>
 
           <article class="card pricing-card">
@@ -292,7 +291,7 @@ envelope mcp --config</code></pre>
               <li>Embedded/OEM and reseller terms available</li>
               <li>Custom support agreement and security review</li>
             </ul>
-            <a class="button full button-secondary" href="mailto:ty@tmrtn.com?subject=Envelope%20Enterprise%20licensing&amp;body=Company%3A%20%0ADomains%3A%20%0AApprox%20mailbox%20users%3A%20%0AUse%20case%3A%20">Talk to sales</a>
+            <a class="button full button-secondary" href="mailto:ty@tmrtn.com?subject=Envelope%20Enterprise%20licensing&amp;body=Company%3A%20%0ADomains%3A%20%0AApprox%20mailbox%20users%3A%20%0AUse%20case%3A%20" data-umami-event="license-enterprise-pricing">Talk to sales</a>
           </article>
         </div>
 
@@ -305,8 +304,8 @@ envelope mcp --config</code></pre>
     <div class="wrap footer-row">
       <p>Envelope — BYO email for agents.</p>
       <div class="footer-links">
-        <a href="https://github.com/tymrtn/U1F4E7">GitHub</a>
-        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing">Licensing</a>
+        <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-footer" data-umami-event="github-footer">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing" data-umami-event="license-licensing-footer">Licensing</a>
       </div>
     </div>
   </footer>

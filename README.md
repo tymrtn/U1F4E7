@@ -21,7 +21,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-1.1.0-green.svg" alt="v1.1.0">
+  <img src="https://img.shields.io/badge/version-1.3.2-green.svg" alt="v1.3.2">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -39,33 +39,61 @@ envelope inbox --json
 ## Install
 
 ```bash
-# Homebrew (macOS) — installs the binary named `envelope`
+# macOS or Linux: downloads the release binary for your OS and CPU, checks it
+# against the release's SHA-256 file, and installs it to ~/.local/bin (no sudo).
+curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh | bash
+
+# Homebrew (macOS). The formula builds from source, so Homebrew installs Rust
+# as a build dependency and the first install takes a few minutes.
 brew install tymrtn/u1f4e7/envelope
-# Compat alias once the tap PR lands: brew install tymrtn/u1f4e7/u1f4e7
+```
 
-# From source (Linux or macOS)
-# 1. Install Rust if not already present:
+To build it yourself instead:
+
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && source "$HOME/.cargo/env"
-
-# 2. Clone and build:
 git clone https://github.com/tymrtn/U1F4E7
 cd U1F4E7
 cargo build --release
-# binary: target/release/envelope
 # Add `--features governor` to build in the Governor send gate (see below).
-
-# 3. Install the binary somewhere on PATH:
 cp target/release/envelope ~/.local/bin/envelope
 ```
 
 ## Quick start
 
-> **Provider prerequisite:** Gmail, Fastmail, iCloud, and Outlook all require an *app password* — not your login password — before adding an account. Generate one in your provider's security settings first. If you skip this and get an auth error, run `envelope quickstart` and check the `remediation` field for provider-specific URLs.
+Envelope signs in to IMAP and SMTP with a password or an app password. It has
+no OAuth sign-in yet, and that decides which mailboxes work today:
+
+- **Fastmail and iCloud Mail:** create an app password in the provider's
+  security settings.
+- **Gmail:** create an [app password](https://support.google.com/accounts/answer/185833).
+  Google only offers them once 2-Step Verification is on, and some Workspace
+  and Advanced Protection accounts cannot create one. If Google won't let you
+  create an app password for your account, Gmail can't connect to Envelope yet
+  (OAuth sign-in isn't supported).
+- **Migadu, self-hosted Dovecot, and most other IMAP hosts:** your normal
+  mailbox password.
+- **Outlook.com, Hotmail, Live, and Microsoft 365:** not supported yet.
+  Microsoft turned off password sign-in for IMAP on
+  [Outlook.com accounts](https://support.microsoft.com/en-us/office/modern-authentication-methods-now-needed-to-continue-syncing-outlook-email-in-non-microsoft-email-apps-c5d65390-9676-4763-b41f-d7986499a90d)
+  and [Exchange Online](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online),
+  so an app password does not help.
+
+Envelope encrypts saved credentials with a passphrase. In a terminal it asks
+you for one. Scripts, agents, and the piped command below have no terminal to
+ask from, so give Envelope a passphrase file first:
 
 ```bash
-# Add an account — Envelope auto-discovers IMAP/SMTP from the email domain.
-# Interactive input is hidden. For non-interactive use, opt into stdin.
-printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@gmail.com --password-stdin
+# Create a random passphrase readable only by you, and point Envelope at it.
+# Add the export line to your shell profile, and back the file up: without it
+# the saved credentials cannot be decrypted.
+(umask 077 && openssl rand -base64 32 > "$HOME/.envelope-passphrase")
+export ENVELOPE_MASTER_PASSPHRASE_FILE="$HOME/.envelope-passphrase"
+
+# Add an account. Envelope finds the IMAP/SMTP servers from the email domain
+# and logs in before saving; a rejected login fails here and prints what to fix.
+# (--skip-login-check saves without logging in, for offline setup.)
+printf '%s\n' "$APP_PASSWORD" | envelope accounts add --email you@fastmail.com --password-stdin
 
 # Verify setup end-to-end (paths → account → IMAP auth → inbox peek)
 envelope quickstart
@@ -109,7 +137,7 @@ envelope rule run --confirm
 # Unsubscribe from a mailing list (dry-run by default)
 envelope unsubscribe 99
 
-# Open the local dashboard (loopback, no auth — single-user local trust)
+# Open the local dashboard at http://localhost:3141 (loopback, no auth — single-user local trust)
 envelope serve
 
 # Expose it to agents/devices on your tailnet — REQUIRES auth first.
@@ -229,7 +257,7 @@ Cloudflare's [Email Service](https://blog.cloudflare.com/email-for-agents/) (pub
 | Agent-native | ✅ CLI + JSON | ✅ Workers SDK |
 | Rules engine | ✅ Local + Sieve | Workers AI |
 | Works offline | ✅ | ❌ Cloud-only |
-| Any provider | ✅ Gmail, Outlook, Migadu, any IMAP | ❌ Cloudflare only |
+| Any provider | ✅ Gmail, Fastmail, iCloud, Migadu, any password-based IMAP host | ❌ Cloudflare only |
 | Open source | ✅ FSL-1.1-ALv2 | Reference app only |
 
 ### vs. Resend / Mailgun / SendGrid
@@ -250,10 +278,10 @@ Envelope auto-discovers IMAP/SMTP from your email domain via DNS. Tested with:
 | Provider | Auth | Notes |
 |---|---|---|
 | **Gmail** | App password | `[Gmail]/` folder prefix handled automatically |
-| **Outlook.com / Office 365** | App password | Exchange IMAP quirks handled |
-| **Microsoft Workmail** | App password | Exchange-style folders |
+| **Outlook.com / Microsoft 365** | Not supported yet | Microsoft requires OAuth sign-in for IMAP; Envelope has no OAuth yet |
 | **Migadu** | Password | Standard folders |
 | **Fastmail** | App password | Standard folders |
+| **iCloud Mail** | App-specific password | Standard folders |
 | **Self-hosted Dovecot** | Password | `INBOX.` dot-separator detected |
 | **Generic IMAP** | Password | Anything RFC 3501 |
 

@@ -98,7 +98,7 @@ Envelope is not a mail server. It's not a webmail interface. It doesn't replace 
 
 **Repo:** [https://github.com/tymrtn/U1F4E7](https://github.com/tymrtn/U1F4E7)
 **Install (macOS):** `brew install tymrtn/u1f4e7/u1f4e7`
-**Install (Linux):** `curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/dist/install.sh | bash` (downloads a release tarball, verifies the sha256 checksum, no sudo) — or build from source, see [docs/install-linux.md](https://github.com/tymrtn/U1F4E7/blob/main/docs/install-linux.md)
+**Install (Linux):** `curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh | bash` (downloads a release tarball, verifies the sha256 checksum, no sudo) — or build from source, see [docs/install-linux.md](https://github.com/tymrtn/U1F4E7/blob/main/docs/install-linux.md)
 **License:** FSL-1.1-ALv2 (each release converts to Apache 2.0 two years after it ships)
 
 Would love to hear from anyone running Dovecot/Postfix, Stalwart, Mailcow, or similar — curious if auto-discovery works cleanly with your setup, and whether the multi-agent policy model maps to how you're running agents against your own mail.
