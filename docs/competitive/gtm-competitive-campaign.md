@@ -31,7 +31,7 @@ descriptions:
 | Send-mode ceiling (`draft-only`) | Your agent can write email. It can't send it. |
 | Recipient allowlist | It can only email people you've named. |
 | Send cooldown + undo | There's a window to catch it before it goes out. |
-| Governor gate | Every send gets checked, and a failed check means no send. |
+| Governor gate (opt-in build) | In builds with the Governor feature, every send gets checked and a failed check means no send. Homebrew builds leave it off. |
 | `actions tail --agent` | You can see exactly which agent did what, after the fact. |
 | Per-agent token + revoke | Kill one agent's access without touching the others. |
 
@@ -75,7 +75,7 @@ the README intro, and the demo voiceover.
 
 | Pillar | What we say | Proof |
 |---|---|---|
-| **Brakes** | Your agent drafts; you approve. Or clamp it tighter. | Draft-only ceiling, allowlists, cooldown, Governor gate |
+| **Brakes** | Your agent drafts; you approve. Or clamp it tighter. | Draft-only ceiling, allowlists, cooldown, Governor gate (opt-in build) |
 | **Receipts** | Every action traced to a named agent, after the fact | `actions tail --agent`, signed event stream |
 | **Your address** | Send from the address people already recognize | Any IMAP provider, no DNS setup, no new domain |
 | **$0 a message** | Flat annual license. Your agent looping isn't a billing event. | Licensing table + calculator |

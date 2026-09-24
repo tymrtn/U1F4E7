@@ -85,7 +85,7 @@ gap in their offering.
 | Send-mode ladder (draft → confirm → allowlist → autonomous) | ✅ | ❌ | ❌ |
 | Recipient allowlist enforced pre-send | ✅ | ⚠️ allowlists doc'd, scope unclear | ❌ |
 | Human approval queue | ✅ Agent Cockpit | ❌ | ❌ |
-| Fail-closed send gate | ✅ Governor | ❌ | ❌ |
+| Fail-closed send gate | ⚠️ Governor, opt-in build | ❌ | ❌ |
 | Per-agent attributed audit trail | ✅ `actions tail --agent` | ❌ | ❌ |
 | Revoke one agent, not the fleet | ✅ | ❌ | ❌ |
 | Spend ceiling / runaway-loop stop | ✅ n/a (flat) | ❌ | ❌ |

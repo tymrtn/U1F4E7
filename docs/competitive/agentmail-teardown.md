@@ -240,7 +240,7 @@ Where we beat them, and they cannot easily copy:
 | Message bodies never leave your infra | ✅ | ❌ |
 | Per-agent identity, policy clamp, send-mode ceiling | ✅ | ❌ |
 | Attributed audit trail per agent action | ✅ `actions tail --agent` | ❌ |
-| Fail-closed send gate (Governor) | ✅ | ❌ |
+| Fail-closed send gate (Governor, opt-in build) | ⚠️ off in Homebrew builds | ❌ |
 | Human-in-the-loop draft approval queue | ✅ Agent Cockpit | ❌ |
 | Deterministic rules engine + Sieve export | ✅ | ⚠️ managed labeling |
 | Read-only forensic evidence bundles | ✅ `envelope evidence` | ❌ |
