@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.4] — 2026-09-24
+
 ### Launch hardening
 
 - **`accounts add` logs in before saving.** A rejected IMAP login exits non-zero, saves nothing,
@@ -14,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   setup.
 - **Provider remediation:** Outlook.com, Hotmail, Live, MSN, and Microsoft 365 failures now say
   plainly that Microsoft requires OAuth sign-in for IMAP and Envelope does not support it yet.
-  Gmail failures explain the app-password path. `quickstart` now uses the account's domain when
+  Gmail failures explain the app-password path, and say that a Google account which can't
+  create an app password can't connect to Envelope yet. `quickstart` now uses the account's domain when
   choosing the guidance (it always fell back to the generic text before).
 - **`doctor` exits 1 on an error status** (`missing_db`, `no_accounts`, decrypt or auth
   failures). Warnings still exit 0.
@@ -29,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (arm64, x86_64) release binaries as well as Linux. README and `docs/quickstart.md` lead with
   it, document the passphrase file that non-interactive `accounts add` needs, and state that
   Outlook.com and Microsoft 365 are unsupported until OAuth lands.
+- **Site:** the u1f4e7.com banner names the current release, install commands sit above the
+  fold, `/install.sh` and `/pricing` redirect, and the Cockpit copy and unimplemented shortcut
+  claims are gone.
+
+### Release signing
+
+- **macOS signing and notarization:** `release.yml` signs the macOS binaries with a Developer ID
+  and notarizes them when all six signing secrets are set (see `docs/release-signing.md`). With
+  none set, the release ships unsigned and the macOS jobs log a warning. A partial set fails the
+  job. The secrets are not configured yet, so the 1.3.4 macOS binaries are unsigned.
 
 ## [1.3.3] — 2026-09-24
 
