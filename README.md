@@ -136,7 +136,10 @@ against what it can observe before anything is queued or sent.
 Governor scoring is a build-time Cargo feature, off by default. Homebrew and the
 release archives are built without it, so their sends are not scored by
 Governor, and send results and audit events record the gate as
-`mode: "off"`. Builds made with
+`mode: "off"`. In those builds the draft-only ceiling still binds MCP sessions
+that carry an agent token, but an agent with shell access can send through
+`envelope send` (which defaults to `autonomous-send`), so give agents MCP with
+an agent token rather than a shell. Builds made with
 `cargo build --release --bin envelope --features governor` (or
 `cargo install --path crates/cli --features governor`) derive sanitized
 contextual attributes immediately before SMTP and ask Governor to score them

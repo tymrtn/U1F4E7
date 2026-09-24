@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo install --path crates/cli --features governor`); the Governor binary must exist at the
   pinned path. Why: the gate pointed at a path only one machine has, so every other install
   failed closed on every send. `envelope contract` reports the compiled-in mode as
-  `outbound_safety.governor_gate.smtp_mode`.
+  `outbound_safety.governor_gate.smtp_mode`. Without Governor, the draft-only ceiling still
+  binds MCP sessions that carry an agent token, but an agent with shell access can send
+  through `envelope send`, which defaults to `autonomous-send`, after declaring any one valid
+  attribute. Keep agents on MCP with an agent token, or build with the `governor` feature.
 
 ### Cursor plugin
 
