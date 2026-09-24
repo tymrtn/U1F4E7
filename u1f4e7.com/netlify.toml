@@ -32,3 +32,16 @@ status = 302
 from = "/github"
 to = "https://github.com/tymrtn/U1F4E7"
 status = 302
+
+# The pricing section lives on the homepage.
+[[redirects]]
+from = "/pricing"
+to = "/#pricing"
+status = 301
+
+# `curl -fsSL https://u1f4e7.com/install.sh | bash` follows this to the
+# installer at the root of the product repo's main branch.
+[[redirects]]
+from = "/install.sh"
+to = "https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh"
+status = 302
