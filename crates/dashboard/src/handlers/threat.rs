@@ -201,26 +201,24 @@ pub async fn report_draft(
         }
     };
 
-    let (stored, impersonated, cached_folder) = {
+    let (stored, targets, cached_folder) = {
         let db = state.db.lock().await;
         let stored = persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid)
             .ok()
             .flatten();
-        let impersonated = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
-            .ok()
-            .and_then(|input| {
-                report::impersonated_domain(&input, stored.as_ref().map(|s| &s.verdict))
-            });
+        let targets = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
+            .map(|input| report::report_targets(&input, stored.as_ref().map(|s| &s.verdict)))
+            .unwrap_or_default();
         (
             stored,
-            impersonated,
+            targets,
             db.get_drafts_folder(&account_id).ok().flatten(),
         )
     };
     // RDAP runs without the database lock held.
-    let (abuse, lookups) = report::resolve_abuse_contact(
+    let (abuse, lookups) = report::resolve_abuse_contacts(
         &envelope_email_transport::threat::rdap::PublicRdap,
-        impersonated,
+        &targets,
     )
     .await;
     if !lookups.is_empty() {

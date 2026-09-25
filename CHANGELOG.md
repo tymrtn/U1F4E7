@@ -23,10 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switches to the Spamhaus Data Query Service zone. Answers are cached for an hour in
   `threat-reputation-cache.json` in the data directory. DNS uses the system resolver through
   `hickory-resolver`, already a dependency. Spamhaus usage terms apply; see `docs/rshield.md`.
-- **Report:** `envelope threat report` and the dashboard's Report button add the impersonated
-  domain's RDAP abuse contact as a second recipient when the sender analyzer found a look-alike
-  of a known domain. If RDAP fails, the draft goes to `threat.report_to` only and the output
-  says why (`abuse_contact` in JSON). RDAP goes through the guarded public HTTP client.
+- **Report:** `envelope threat report` and the dashboard's Report button address the draft to
+  `threat.report_to` plus two RDAP abuse contacts: the sending domain's registrar (takedown) and,
+  when the sender analyzer found a look-alike of a known domain, the imitated domain's
+  registrar (brand protection). Duplicate addresses appear once. A failed lookup leaves out
+  only its own recipient, and the output names it (`abuse_contact` in JSON, one entry per
+  domain with `role`, `status`, and `email` or `reason`). RDAP goes through the guarded public
+  HTTP client.
 - **Audit:** every outside lookup is a `lookup_performed` event (new in the event catalog) on the
   message, payload `{provider, domain, result}`. No URLs, addresses or content.
 - **Scans:** the watch and dashboard new-mail pass now runs analyzers outside the database lock

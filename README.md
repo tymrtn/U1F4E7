@@ -400,7 +400,7 @@ Two optional analyzers are off until you enable them:
 | ClamAV | `brew install clamav`, start clamd, then `envelope config set threat.clamd.address unix:/path/to/clamd.sock` | Attachment bytes, to the clamd you configured |
 | Spamhaus DBL | `envelope config set threat.reputation.provider spamhaus-dbl` (optionally `threat.reputation.dqs_key`) | Sender and link domain names, as DNS queries to Spamhaus |
 
-`threat report` also looks up the abuse contact of an impersonated domain over RDAP, sending that domain name to its registry. Every outside lookup is logged as a `lookup_performed` event. Spamhaus restricts free and commercial use of its blocklists; read their [usage terms](https://www.spamhaus.org/blocklists/dnsbl-fair-use-policy/) first. Setup details, weights and the clamd walkthrough are in [docs/rshield.md](docs/rshield.md).
+`threat report` also looks up abuse contacts over RDAP for the sending domain and, when there is one, the imitated domain, sending those domain names to their registries. Every outside lookup is logged as a `lookup_performed` event. Spamhaus restricts free and commercial use of its blocklists; read their [usage terms](https://www.spamhaus.org/blocklists/dnsbl-fair-use-policy/) first. Setup details, weights and the clamd walkthrough are in [docs/rshield.md](docs/rshield.md).
 
 ## Dashboard
 

@@ -1192,9 +1192,9 @@ enum ThreatCmd {
         account: Option<String>,
     },
     /// Draft a phishing report to threat.report_to with the original attached,
-    /// copied to the impersonated domain's RDAP abuse contact when the sender
-    /// imitates a known domain (draft only; send it yourself with
-    /// `envelope draft send`)
+    /// copied to the RDAP abuse contacts of the sending domain and, when the
+    /// sender imitates a known domain, the imitated domain (draft only; send
+    /// it yourself with `envelope draft send`)
     Report {
         /// Message UID
         uid: u32,

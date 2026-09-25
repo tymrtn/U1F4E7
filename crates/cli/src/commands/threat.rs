@@ -17,7 +17,7 @@ use envelope_email_transport::rule_exec::{
 use envelope_email_transport::rules::{Action, MessageContext};
 use envelope_email_transport::threat::persist::{self, StoredVerdict, VerdictTarget};
 use envelope_email_transport::threat::rdap;
-use envelope_email_transport::threat::report::{self, AbuseContact};
+use envelope_email_transport::threat::report::{self, AbuseOutcome};
 use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig, ThreatInput};
 use serde_json::json;
 
@@ -444,10 +444,10 @@ pub async fn run_report(
         }
         None => None,
     };
-    let impersonated = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
-        .ok()
-        .and_then(|input| report::impersonated_domain(&input, verdict.as_ref()));
-    let (abuse, lookups) = report::resolve_abuse_contact(&rdap::PublicRdap, impersonated).await;
+    let targets = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
+        .map(|input| report::report_targets(&input, verdict.as_ref()))
+        .unwrap_or_default();
+    let (abuse, lookups) = report::resolve_abuse_contacts(&rdap::PublicRdap, &targets).await;
     persist::record_lookups(&db, &target, &lookups)?;
     let report = report::build_report(&raw, verdict.as_ref(), &config.report_to, &abuse);
     let (draft, drafts_folder, imap_uid) =
@@ -473,15 +473,17 @@ pub async fn run_report(
     } else {
         println!("Report draft created (not sent): {}", draft.id);
         println!("  To:      {}", report.to);
-        match &abuse {
-            AbuseContact::Found { domain, email } => {
-                println!("  Abuse:   {email} (RDAP abuse contact for {domain})")
+        for contact in &abuse {
+            let role = contact.role.as_str();
+            let domain = &contact.domain;
+            match &contact.outcome {
+                AbuseOutcome::Found { email } => {
+                    println!("  Abuse:   {email} (RDAP, {role} domain {domain})")
+                }
+                AbuseOutcome::Failed { reason } => println!(
+                    "  Abuse:   no abuse contact for {role} domain {domain} ({reason}); left out"
+                ),
             }
-            AbuseContact::Failed { domain, reason } => println!(
-                "  Abuse:   no abuse contact for {domain} ({reason}); reporting to {} only",
-                config.report_to
-            ),
-            AbuseContact::NotApplicable => {}
         }
         println!("  Subject: {}", report.subject);
         println!("  Review:  {review_url}");

@@ -69,9 +69,15 @@ What leaves the machine: domain names, sent as DNS queries through your system r
 
 ## Reporting
 
-`envelope threat report <uid>` creates a draft (it never sends) to `threat.report_to` (default `reportphishing@apwg.org`) with the original message attached as `message/rfc822`. When the sender analyzer found that the sender imitates a domain you know, Envelope also looks up that domain's abuse contact in its registration data (RDAP) and adds it as a second recipient. If the RDAP lookup fails, the draft goes to `threat.report_to` only and the command says why.
+`envelope threat report <uid>` creates a draft (it never sends) with the original message attached as `message/rfc822`. It goes to up to three recipients:
 
-What leaves the machine: the impersonated domain name, sent over HTTPS to IANA's RDAP bootstrap file and then to that domain's registry (and registrar) RDAP servers.
+1. `threat.report_to` (default `reportphishing@apwg.org`).
+2. The abuse contact of the sending domain's registrar, found in its registration data (RDAP). That registrar can take the domain down.
+3. When the sender analyzer found that the sender imitates a domain you know, the abuse contact of the imitated domain's registrar, which usually handles brand protection.
+
+If two of these are the same address, it appears once. If an RDAP lookup fails, that recipient is left out, the others stay, and the command names the lookup that failed (`abuse_contact` in `--json` output).
+
+What leaves the machine: the sending domain name and, when there is one, the imitated domain name, sent over HTTPS to IANA's RDAP bootstrap file and then to each domain's registry (and registrar) RDAP servers.
 
 ## Audit log
 

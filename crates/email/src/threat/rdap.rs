@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-//! RDAP abuse contact for `threat report`.
+//! RDAP abuse contacts for `threat report`.
 //!
 //! IANA's DNS bootstrap file names the registry RDAP server for a TLD; the
 //! registry's domain answer usually embeds the registrar entity with its
