@@ -389,8 +389,11 @@ enum Commands {
     /// threat.clamd.address unix:/path/to/clamd.sock` streams attachments to a
     /// local clamd; `envelope config set threat.reputation.provider
     /// spamhaus-dbl` asks Spamhaus DBL about the sender and link domains
-    /// (domains only). Every outside lookup is logged as a `lookup_performed`
-    /// event.
+    /// (domains only); `envelope config set threat.analyzers.jev true` asks
+    /// the `decisions.provider` model (OpenRouter by default) about phishing
+    /// risk, which sends the message's subject and text off the machine (see
+    /// docs/decisions.md). Every outside lookup is logged as a
+    /// `lookup_performed` event.
     Threat {
         #[command(subcommand)]
         subcommand: ThreatCmd,
@@ -1490,9 +1493,10 @@ enum EngineCmd {
         /// Attempt external delivery of persisted urgent events through configured routes
         #[arg(long)]
         deliver: bool,
-        /// Jev inference backend: openrouter (default) or laya (local pinned Laya-MLX provider)
-        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
-        jev_backend: JevBackend,
+        /// Decisions provider for this run (openrouter, laya, custom);
+        /// defaults to `decisions.provider` in config.json. Never falls back.
+        #[arg(long, value_parser = parse_jev_backend)]
+        jev_backend: Option<JevBackend>,
     },
     /// Run continuously, one non-overlapping pass every five minutes by default
     Run {
@@ -1511,9 +1515,10 @@ enum EngineCmd {
         /// Poll interval in seconds (minimum 60)
         #[arg(long, default_value = "300", value_parser = parse_engine_interval)]
         interval_seconds: u64,
-        /// Jev inference backend: openrouter (default) or laya (local pinned Laya-MLX provider)
-        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
-        jev_backend: JevBackend,
+        /// Decisions provider for this run (openrouter, laya, custom);
+        /// defaults to `decisions.provider` in config.json. Never falls back.
+        #[arg(long, value_parser = parse_jev_backend)]
+        jev_backend: Option<JevBackend>,
     },
     /// Show redacted engine watermarks and queue counts
     Status {
@@ -1577,8 +1582,10 @@ enum EngineCmd {
         #[arg(long, requires = "retry_jev")]
         confirm_new_jev_call: bool,
         /// Backend/model identity to retry; must match the stored failed attempt
-        #[arg(long, default_value = "openrouter", value_parser = parse_jev_backend)]
-        jev_backend: JevBackend,
+        /// Decisions provider for this run (openrouter, laya, custom);
+        /// defaults to `decisions.provider` in config.json. Never falls back.
+        #[arg(long, value_parser = parse_jev_backend)]
+        jev_backend: Option<JevBackend>,
     },
     /// List privacy-minimized handles queued for news-digest compilation
     DigestQueue {
@@ -2017,7 +2024,8 @@ fn parse_engine_interval(value: &str) -> Result<u64, String> {
 }
 
 fn parse_jev_backend(value: &str) -> Result<JevBackend, String> {
-    JevBackend::parse(value).ok_or_else(|| "--jev-backend must be openrouter or laya".into())
+    JevBackend::parse(value)
+        .ok_or_else(|| "--jev-backend must be openrouter, laya or custom".into())
 }
 
 fn parse_engine_digest_limit(value: &str) -> Result<usize, String> {
@@ -3334,7 +3342,7 @@ mod tests {
                 assert!(!deliver);
                 assert!(account.is_none());
                 assert_eq!(folder, "INBOX");
-                assert_eq!(jev_backend, JevBackend::Openrouter);
+                assert_eq!(jev_backend, None, "config decides the provider");
             }
             _ => panic!("expected engine run"),
         }
@@ -3371,7 +3379,7 @@ mod tests {
             laya.command,
             Commands::Engine {
                 subcommand: EngineCmd::Once {
-                    jev_backend: JevBackend::Laya,
+                    jev_backend: Some(JevBackend::Laya),
                     ..
                 }
             }
@@ -3501,7 +3509,7 @@ mod tests {
                     uid: 42,
                     retry_jev: false,
                     confirm_new_jev_call: false,
-                    jev_backend: JevBackend::Openrouter,
+                    jev_backend: None,
                     ..
                 }
             }

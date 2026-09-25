@@ -10,6 +10,7 @@ pub mod backup;
 pub mod bulk;
 pub mod code_extractor;
 pub mod compose;
+pub mod decisions;
 pub mod discovery;
 pub mod draft_cleanup;
 pub mod errors;

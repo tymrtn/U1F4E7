@@ -46,6 +46,8 @@ pub enum ActionSource {
     Reader,
     Cli,
     Mcp,
+    /// A decision-model proposal (`decisions.propose_actions`).
+    Jev,
 }
 
 impl ActionSource {
@@ -56,6 +58,7 @@ impl ActionSource {
             ActionSource::Reader => "reader",
             ActionSource::Cli => "cli",
             ActionSource::Mcp => "mcp",
+            ActionSource::Jev => "jev",
         }
     }
 }
@@ -716,6 +719,44 @@ async fn record_action<D: ExecDb>(
     })
     .await
     .context("action ran but writing the action log failed")
+}
+
+/// Record a Confirm offer that no rule authored, such as a Jev route
+/// proposal. Nothing runs and no mailbox is touched: the offer waits for a
+/// human to confirm it (`envelope actions confirm`). With an
+/// `attribution.event_id`, a replay returns [`ExecStatus::AlreadyApplied`]
+/// and mints no second offer.
+pub async fn propose<D: ExecDb>(
+    db: &D,
+    target: &MessageTarget<'_>,
+    prompt: &str,
+    then: &[ConfirmableAction],
+    attribution: &ActionAttribution,
+) -> Result<ExecOutcome> {
+    if let Some(event_id) = &attribution.event_id {
+        let existing = db
+            .with_db(|d| d.get_action_by_event(event_id, "confirm"))
+            .await
+            .context("failed to check action log")?;
+        if let Some(existing) = existing
+            && existing.action_status == "completed"
+        {
+            return Ok(ExecOutcome::new(
+                ExecStatus::AlreadyApplied,
+                format!("already offered ({})", existing.id),
+            ));
+        }
+    }
+    record_offer(
+        db,
+        target,
+        prompt,
+        then,
+        None,
+        attribution,
+        attribution.event_id.clone(),
+    )
+    .await
 }
 
 async fn record_offer<D: ExecDb>(
@@ -1602,6 +1643,55 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:#}").contains("allowlist"), "{err:#}");
         assert!(db.list_events(Some(ACCT), 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn propose_records_one_offer_and_never_runs_it() {
+        let db = Database::open_memory().unwrap();
+        let ctx = build_summary_context(&summary(7, "j@x", "a@b"), &db, ACCT).unwrap();
+        let target = MessageTarget {
+            account_id: ACCT,
+            account_email: EMAIL,
+            folder: "INBOX",
+            uid: 7,
+            message_id: Some("j@x"),
+            ctx: &ctx,
+        };
+        let attribution = ActionAttribution {
+            source: ActionSource::Jev,
+            agent_id: None,
+            event_id: Some("jev:acct:INBOX:1:7".to_string()),
+        };
+        let then = vec![ConfirmableAction::AddTag("travel".to_string())];
+        let first = propose(&db, &target, "Add travel?", &then, &attribution)
+            .await
+            .unwrap();
+        assert_eq!(first.status, ExecStatus::Offered);
+        let again = propose(&db, &target, "Add travel?", &then, &attribution)
+            .await
+            .unwrap();
+        assert_eq!(again.status, ExecStatus::AlreadyApplied);
+
+        let offers = db.list_events(Some(ACCT), 10).unwrap();
+        let offers: Vec<_> = offers
+            .iter()
+            .filter(|e| e.event_type == ACTION_OFFERED)
+            .collect();
+        assert_eq!(offers.len(), 1);
+        let payload: OfferPayload =
+            serde_json::from_str(offers[0].payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload.actions, then);
+        assert_eq!(payload.rule_id, None);
+        // Offered, not applied: the tag is not on the message.
+        assert!(db.get_tags(ACCT, "j@x").unwrap().is_empty());
+        assert_eq!(serde_json::to_value(ActionSource::Jev).unwrap(), "jev");
+
+        let trash = vec![ConfirmableAction::Move("Trash".to_string())];
+        let refused = ActionAttribution {
+            event_id: Some("jev:acct:INBOX:1:8".to_string()),
+            ..attribution
+        };
+        assert!(propose(&db, &target, "p", &trash, &refused).await.is_err());
     }
 
     async fn mint_offer(db: &Database, mbox: &mut FakeMailbox) -> String {

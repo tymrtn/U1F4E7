@@ -360,7 +360,7 @@ fn text_to_html(s: &str) -> String {
 /// Extremely small HTML-to-text reducer used only for preview fallback when a
 /// message has no text body. Drops tags and collapses whitespace; it is not a
 /// general-purpose renderer.
-fn strip_html(html: &str) -> String {
+pub(crate) fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     for c in html.chars() {

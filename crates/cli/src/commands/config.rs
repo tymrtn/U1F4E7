@@ -10,6 +10,7 @@
 use crate::ConfigCmd;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::app_data_dir;
+use envelope_email_transport::decisions::{self, DecisionsConfig};
 use envelope_email_transport::threat::config as threat_config;
 use envelope_email_transport::threat::{ThreatConfig, persist as threat_persist};
 use serde_json::{Map, Value, json};
@@ -43,6 +44,9 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
     }
     if threat_config::is_threat_key(&key) {
         return run_threat_field(cmd, &key, json_output);
+    }
+    if decisions::is_decisions_key(&key) {
+        return run_decisions_field(cmd, &key, json_output);
     }
     match cmd {
         ConfigCmd::Get { key } => {
@@ -169,7 +173,9 @@ fn require_supported_key(key: &str) -> Result<()> {
              {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}, threat.enabled, \
              threat.quarantine, threat.on_read, threat.report_to, threat.analyzers.<name>, \
              threat.reputation.provider, threat.reputation.dqs_key, threat.clamd.address, \
-             threat.clamd.required, sync.poll_interval_secs"
+             threat.clamd.required, threat.analyzers.jev, threat.jev.required, \
+             sync.poll_interval_secs, decisions.provider, decisions.base_url, decisions.model, \
+             decisions.key_env, decisions.propose_actions, decisions.route_actions.<route>"
         ),
     }
 }
@@ -275,6 +281,7 @@ fn effective_threat_value(key: &str, config: &ThreatConfig) -> Value {
             .map(|a| json!(a.display()))
             .unwrap_or(json!("off")),
         "threat.clamd.required" => json!(config.clamd_required),
+        "threat.jev.required" => json!(config.jev_required),
         _ => key
             .strip_prefix("threat.analyzers.")
             .map(|name| json!(config.analyzer_enabled(name)))
@@ -393,6 +400,84 @@ fn run_threat_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> 
                         accounts.len()
                     );
                 }
+            }
+        }
+        ConfigCmd::Unset { .. } => {
+            unset_nested(&mut config, key)?;
+            write_config_value(&path, &config)?;
+            if json_output {
+                let obj = json!({
+                    "status": "unset",
+                    "key": key,
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("Unset {key}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn effective_decisions_value(key: &str, config: &DecisionsConfig) -> Value {
+    let provider = &config.provider;
+    match key {
+        "decisions.provider" => json!(provider.backend.as_str()),
+        "decisions.base_url" => json!(provider.base_url),
+        "decisions.model" => json!(provider.model),
+        // The variable's name, never its value.
+        "decisions.key_env" => json!(provider.key_env.as_deref().unwrap_or("none")),
+        "decisions.propose_actions" => json!(config.propose_actions),
+        _ => key
+            .strip_prefix("decisions.route_actions.")
+            .map(|route| {
+                json!(decisions::route_action_label(
+                    config.route_actions.get(route).and_then(Option::as_ref)
+                ))
+            })
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn run_decisions_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> {
+    let path = config_file_path();
+    let mut config = read_config_value(&path)?;
+    match cmd {
+        ConfigCmd::Get { .. } => {
+            let stored = config.pointer(&threat_config::pointer_for(key)).cloned();
+            let effective =
+                effective_decisions_value(key, &DecisionsConfig::from_config_value(&config)?);
+            if json_output {
+                let obj = json!({
+                    "key": key,
+                    "value": effective,
+                    "configured": stored.is_some(),
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                let suffix = if stored.is_some() { "" } else { " (default)" };
+                println!("{key}={}{suffix}", display_value(&effective));
+            }
+        }
+        ConfigCmd::Set { value, .. } => {
+            let typed = decisions::parse_value(key, &value)?;
+            set_nested(&mut config, key, typed.clone())?;
+            // Refuse to write a file the engine or rShield would then reject.
+            DecisionsConfig::from_config_value(&config)?;
+            ThreatConfig::from_config_value(&config)?;
+            write_config_value(&path, &config)?;
+            if json_output {
+                let obj = json!({
+                    "status": "set",
+                    "key": key,
+                    "value": typed,
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("Set {key}={}", display_value(&typed));
             }
         }
         ConfigCmd::Unset { .. } => {

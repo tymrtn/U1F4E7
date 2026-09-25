@@ -126,8 +126,9 @@ envelope snooze set 42 --until monday --reason waiting-reply
 envelope watch --json
 
 # Establish a new-mail-only Jev baseline, then run every 5 minutes.
-# OpenRouter remains the compatibility default and requires OPENROUTER_API_KEY.
-# It sends bounded sender/message/history state to the pinned Decisions endpoint.
+# The provider is `decisions.provider` (OpenRouter by default, which needs
+# OPENROUTER_API_KEY); it receives bounded sender/message/history state.
+# What is sent and how to change providers: docs/decisions.md.
 # Omit --account to cover every configured account; add --apply for confident junk moves.
 envelope engine once --account you@example.com --json
 envelope engine run --account you@example.com --interval-seconds 300 --json
@@ -435,12 +436,13 @@ envelope threat explain 4812      # the signals and arithmetic behind a verdict
 envelope threat report 4812       # draft a report to APWG (never sends)
 ```
 
-Two optional analyzers are off until you enable them:
+Three optional analyzers are off until you enable them:
 
 | Analyzer | Enable | What leaves the machine |
 |---|---|---|
 | ClamAV | `brew install clamav`, start clamd, then `envelope config set threat.clamd.address unix:/path/to/clamd.sock` | Attachment bytes, to the clamd you configured |
 | Spamhaus DBL | `envelope config set threat.reputation.provider spamhaus-dbl` (optionally `threat.reputation.dqs_key`) | Sender and link domain names, as DNS queries to Spamhaus |
+| Jev | `envelope config set threat.analyzers.jev true` with `OPENROUTER_API_KEY` set | Subject, up to 8 KiB of message text, sender address and history counts, to the decisions provider (OpenRouter unless you choose [Laya locally](docs/decisions.md#running-locally-with-laya)) |
 
 `threat report` also looks up abuse contacts over RDAP for the sending domain and, when there is one, the imitated domain, sending those domain names to their registries. Every outside lookup is logged as a `lookup_performed` event. Spamhaus restricts free and commercial use of its blocklists; read their [usage terms](https://www.spamhaus.org/blocklists/dnsbl-fair-use-policy/) first. Setup details, weights and the clamd walkthrough are in [docs/rshield.md](docs/rshield.md).
 

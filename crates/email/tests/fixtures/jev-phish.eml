@@ -1,0 +1,21 @@
+Return-Path: <security@paypa1-account-review.com>
+Received: from mail.paypa1-account-review.com by mx.example.org with ESMTPS id abc; Mon, 21 Sep 2026 08:12:00 +0000
+Message-ID: <alert-7731@paypa1-account-review.com>
+Date: Mon, 21 Sep 2026 08:11:58 +0000
+From: "PayPal Security" <security@paypa1-account-review.com>
+To: me@example.org
+Subject: Your account has been limited - action required
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Dear Customer,
+
+We noticed unusual sign-in activity on your PayPal account and have limited it.
+To restore access, confirm your identity within 24 hours:
+
+https://paypa1-account-review.com/signin/confirm
+
+You will need your email, password and the card on file. If you do not
+confirm, your account will be permanently suspended.
+
+PayPal Security Team

@@ -9,12 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Jev mail engine preview:** new-mail-only five-minute classification through the pinned
-  `typesafe/jev-1.13` Decisions API, with bounded sender and interaction history, durable
+- **Jev mail engine preview:** new-mail-only five-minute classification through the
+  `typesafe/jev-1.13` Decisions API (or any configured decisions provider), with bounded sender and interaction history, durable
   idempotency, inspectable decisions, revision-guarded human corrections, recoverable urgent
   events, a consumable header-only news digest, and an observe-only dashboard cockpit.
 - **Engine service packaging:** opt-in systemd and launchd assets run the engine every five
   minutes with configured urgent delivery but never enable automatic junk moves by default.
+- **Decisions provider config:** `decisions.provider` (`openrouter` default, `laya`,
+  `custom`), `decisions.base_url`, `decisions.model` and `decisions.key_env` replace the
+  hardcoded endpoint and model. Hosted calls go through the guarded egress client (public
+  addresses, no redirects); Laya stays on its loopback port. Keys are read at call time with
+  whitespace stripped and never logged. `--jev-backend` now overrides the config for one run
+  and accepts `custom`. There is still no fallback between providers. See `docs/decisions.md`.
+- **Jev proposals (off by default):** with `decisions.propose_actions`, an engine route that
+  clears the policy thresholds records one `action_offered` event (source `jev`) mapped
+  through the editable `decisions.route_actions.<route>` table. Offers never run until
+  `envelope actions confirm`.
 
 ### rShield
 
@@ -39,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only its own recipient, and the output names it (`abuse_contact` in JSON, one entry per
   domain with `role`, `status`, and `email` or `reason`). RDAP goes through the guarded public
   HTTP client.
+- **Jev typed questions (optional, off by default):** `threat.analyzers.jev` asks the decisions
+  provider `phishing_risk`, `impersonation` and `requested_action`. Risk >= 0.90 adds 40,
+  >= 0.70 adds 15, a confident impersonation at elevated risk adds 10, and Jev's total is
+  capped at 69 so it alone never reaches `dangerous`. A failure skips the analyzer unless
+  `threat.jev.required`. Hosted calls send the subject, up to 8 KiB of text and sender history
+  counts, and each is a `lookup_performed` event `{provider, model, bytes_out, result}`.
 - **Audit:** every outside lookup is a `lookup_performed` event (new in the event catalog) on the
   message, payload `{provider, domain, result}`. No URLs, addresses or content.
 - **Scans:** the watch and dashboard new-mail pass now runs analyzers outside the database lock

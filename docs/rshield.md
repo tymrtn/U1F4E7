@@ -67,6 +67,12 @@ Answers are cached for an hour in `threat-reputation-cache.json` in Envelope's d
 
 What leaves the machine: domain names, sent as DNS queries through your system resolver to Spamhaus. Full URLs, paths, query strings, addresses and message content are never sent.
 
+### Jev typed questions
+
+`envelope config set threat.analyzers.jev true` asks the configured decisions provider (OpenRouter's `typesafe/jev-1.13` unless you change it) three typed questions: `phishing_risk`, `impersonation` and `requested_action`. A risk of 0.90 or more adds 40, 0.70 or more adds 15, and a confident impersonation at elevated risk adds 10. Jev's signals are capped at 69, so Jev alone never makes a message `dangerous`. A failed call skips the analyzer with its reason; `threat.jev.required = true` makes it `unavailable` instead.
+
+What leaves the machine: the subject, up to 8 KiB of message text, the sender's address and domain, and counts of your past mail with that sender, sent to the provider over HTTPS. With `decisions.provider laya` nothing leaves the machine. Provider settings and the local Laya setup are in [decisions.md](decisions.md).
+
 ## Reporting
 
 `envelope threat report <uid>` creates a draft (it never sends) with the original message attached as `message/rfc822`. It goes to up to three recipients:
@@ -81,4 +87,4 @@ What leaves the machine: the sending domain name and, when there is one, the imi
 
 ## Audit log
 
-Every outside lookup (Spamhaus or RDAP) is stored as a `lookup_performed` event on the message that caused it, with the payload `{provider, domain, result}`. Cache hits are not lookups and are not logged.
+Every outside lookup (Spamhaus or RDAP) is stored as a `lookup_performed` event on the message that caused it, with the payload `{provider, domain, result}`. Cache hits are not lookups and are not logged. A hosted Jev call is stored the same way with `{provider, model, bytes_out, result}`; it carries no message content, and a call refused before sending (no API key) is not logged because nothing left the machine.

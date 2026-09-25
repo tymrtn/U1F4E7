@@ -15,6 +15,8 @@
 //! | `threat.reputation.dqs_key` | unset (env `ENVELOPE_REPUTATION_API_KEY`) |
 //! | `threat.clamd.address` | unset = off (`unix:/path` or `tcp:host:port`) |
 //! | `threat.clamd.required` | `false` |
+//! | `threat.analyzers.jev` | `false` (sends message text to `decisions.provider`) |
+//! | `threat.jev.required` | `false` |
 //! | `sync.poll_interval_secs` | `300` |
 //!
 //! A present-but-invalid value is an error, never a silent default.
@@ -26,6 +28,11 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::ANALYZER_NAMES;
+use crate::decisions::DecisionsConfig;
+use crate::jev::DecisionsProvider;
+
+/// Opt-in analyzers switched by `threat.analyzers.<name>`, default off.
+pub const OPT_IN_ANALYZER_FLAGS: &[&str] = &[super::jev_questions::NAME];
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const DEFAULT_REPORT_TO: &str = "reportphishing@apwg.org";
@@ -153,6 +160,12 @@ pub struct ThreatConfig {
     /// A clamd error makes the verdict `unavailable` instead of being
     /// recorded as a skipped analyzer.
     pub clamd_required: bool,
+    /// `threat.analyzers.jev`: ask the decisions provider typed questions.
+    pub jev: bool,
+    /// A Jev failure makes the verdict `unavailable`.
+    pub jev_required: bool,
+    /// The `decisions.*` provider, resolved only when `jev` is on.
+    pub jev_provider: Option<DecisionsProvider>,
 }
 
 impl Default for ThreatConfig {
@@ -168,6 +181,9 @@ impl Default for ThreatConfig {
             dqs_key: None,
             clamd: None,
             clamd_required: false,
+            jev: false,
+            jev_required: false,
+            jev_provider: None,
         }
     }
 }
@@ -184,10 +200,11 @@ pub fn is_threat_key(key: &str) -> bool {
             | "threat.reputation.dqs_key"
             | "threat.clamd.address"
             | "threat.clamd.required"
+            | "threat.jev.required"
             | "sync.poll_interval_secs"
     ) || key
         .strip_prefix("threat.analyzers.")
-        .is_some_and(|name| ANALYZER_NAMES.contains(&name))
+        .is_some_and(|name| ANALYZER_NAMES.contains(&name) || OPT_IN_ANALYZER_FLAGS.contains(&name))
 }
 
 /// JSON pointer for a dotted key (`threat.analyzers.links` →
@@ -207,7 +224,9 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
         }
     };
     match key {
-        "threat.enabled" | "threat.on_read" | "threat.clamd.required" => parse_bool(),
+        "threat.enabled" | "threat.on_read" | "threat.clamd.required" | "threat.jev.required" => {
+            parse_bool()
+        }
         "threat.reputation.provider" => Ok(Value::String(
             ReputationProvider::parse(raw)?.as_str().to_string(),
         )),
@@ -245,6 +264,9 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
 
 impl ThreatConfig {
     pub fn analyzer_enabled(&self, name: &str) -> bool {
+        if name == super::jev_questions::NAME {
+            return self.jev;
+        }
         self.analyzers.get(name).copied().unwrap_or(true)
     }
 
@@ -331,17 +353,29 @@ impl ThreatConfig {
                 .as_object()
                 .context("threat.analyzers must be an object in config.json")?;
             for (name, value) in map {
-                if !ANALYZER_NAMES.contains(&name.as_str()) {
+                let opt_in = OPT_IN_ANALYZER_FLAGS.contains(&name.as_str());
+                if !ANALYZER_NAMES.contains(&name.as_str()) && !opt_in {
                     bail!(
-                        "threat.analyzers.{name} is not an analyzer; known: {}",
-                        ANALYZER_NAMES.join(", ")
+                        "threat.analyzers.{name} is not an analyzer; known: {}, {}",
+                        ANALYZER_NAMES.join(", "),
+                        OPT_IN_ANALYZER_FLAGS.join(", ")
                     );
                 }
                 let enabled = value
                     .as_bool()
                     .with_context(|| format!("threat.analyzers.{name} must be a boolean"))?;
-                out.analyzers.insert(name.clone(), enabled);
+                if opt_in {
+                    out.jev = enabled;
+                } else {
+                    out.analyzers.insert(name.clone(), enabled);
+                }
             }
+        }
+        if let Some(v) = bool_at("threat.jev.required")? {
+            out.jev_required = v;
+        }
+        if out.jev {
+            out.jev_provider = Some(DecisionsConfig::from_config_value(config)?.provider);
         }
         match config.pointer("/sync/poll_interval_secs") {
             None | Some(Value::Null) => {}
@@ -475,12 +509,41 @@ mod tests {
     }
 
     #[test]
+    fn jev_is_off_by_default_and_resolves_the_decisions_provider_when_on() {
+        let c = ThreatConfig::default();
+        assert!(!c.jev && !c.analyzer_enabled("jev") && c.jev_provider.is_none());
+
+        let c = ThreatConfig::from_config_value(&json!({"threat": {
+            "analyzers": {"jev": true}, "jev": {"required": true}
+        }}))
+        .unwrap();
+        assert!(c.jev && c.jev_required && c.analyzer_enabled("jev"));
+        assert_eq!(c.jev_provider, Some(DecisionsProvider::openrouter()));
+
+        let c = ThreatConfig::from_config_value(&json!({
+            "threat": {"analyzers": {"jev": true}},
+            "decisions": {"provider": "laya"}
+        }))
+        .unwrap();
+        assert_eq!(c.jev_provider, Some(DecisionsProvider::laya()));
+
+        // A bad decisions section is an error only once Jev would use it.
+        let bad = json!({"decisions": {"provider": "nope"}});
+        assert!(ThreatConfig::from_config_value(&bad).is_ok());
+        let mut bad_on = bad.clone();
+        bad_on["threat"] = json!({"analyzers": {"jev": true}});
+        assert!(ThreatConfig::from_config_value(&bad_on).is_err());
+    }
+
+    #[test]
     fn key_catalog() {
         assert!(is_threat_key("threat.analyzers.ledger"));
         assert!(is_threat_key("sync.poll_interval_secs"));
         assert!(is_threat_key("threat.clamd.address"));
         assert!(is_threat_key("threat.reputation.provider"));
         assert!(!is_threat_key("threat.analyzers.clamd"));
+        assert!(is_threat_key("threat.analyzers.jev"));
+        assert!(is_threat_key("threat.jev.required"));
         assert!(!is_threat_key("dashboard.base_url"));
         assert_eq!(
             pointer_for("threat.analyzers.links"),

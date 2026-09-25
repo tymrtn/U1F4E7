@@ -11,8 +11,9 @@
 //! for a message.
 //!
 //! Analyzers plug in through [`Analyzer`]. The local six always run; clamd
-//! ([`clamd`]) and domain reputation ([`reputation`]) are opt-in, may do I/O,
-//! and declare whether their failure is fatal through [`Analyzer::required`].
+//! ([`clamd`]), domain reputation ([`reputation`]) and Jev typed questions
+//! ([`jev_questions`]) are opt-in, may do I/O, and declare whether their
+//! failure is fatal through [`Analyzer::required`].
 //! [`configured_analyzers`] assembles the set a config asks for.
 //!
 //! Signal evidence carries hosts, domains, extensions and hashes only — never
@@ -25,6 +26,7 @@ pub mod clamd;
 pub mod config;
 pub mod content;
 pub mod domains;
+pub mod jev_questions;
 pub mod ledger;
 pub mod links;
 pub mod persist;
@@ -370,11 +372,18 @@ pub const ANALYZER_NAMES: &[&str] = &[
 ];
 
 /// One question an analyzer or `threat report` asked an outside service,
-/// stored as a `lookup_performed` event. Domain only.
+/// stored as a `lookup_performed` event. Reputation and RDAP rows name a
+/// domain; decision-model rows name the model and the request size. Never
+/// content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupRecord {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
     pub result: String,
 }
 
@@ -383,7 +392,21 @@ impl LookupRecord {
         LookupRecord {
             provider: provider.to_string(),
             domain: domain.to_string(),
+            model: None,
+            bytes_out: None,
             result: result.into(),
+        }
+    }
+
+    /// A call to a decisions provider: which provider and model, and how many
+    /// bytes of request left the machine.
+    pub fn decision(provider: &str, model: &str, bytes_out: u64, result: &str) -> Self {
+        LookupRecord {
+            provider: provider.to_string(),
+            domain: String::new(),
+            model: Some(model.to_string()),
+            bytes_out: Some(bytes_out),
+            result: result.to_string(),
         }
     }
 }
@@ -392,7 +415,7 @@ impl LookupRecord {
 pub type LookupLog = std::sync::Arc<std::sync::Mutex<Vec<LookupRecord>>>;
 
 /// The local analyzers plus whichever opt-in analyzers `config` enables.
-/// Reputation lookups land in `log`.
+/// Reputation lookups and hosted decision calls land in `log`.
 pub fn configured_analyzers(
     config: &ThreatConfig,
     log: &LookupLog,
@@ -415,6 +438,14 @@ pub fn configured_analyzers(
                 log.clone(),
             )));
         }
+    }
+    if config.jev {
+        analyzers.push(Box::new(jev_questions::JevAnalyzer::new(
+            config.jev_provider.clone().unwrap_or_default(),
+            Box::new(jev_questions::ProviderTransport),
+            config.jev_required,
+            log.clone(),
+        )));
     }
     Ok(analyzers)
 }
@@ -677,8 +708,12 @@ mod tests {
         config.clamd = Some(config::ClamdAddress::Tcp("127.0.0.1:3310".into()));
         config.reputation_provider = ReputationProvider::SpamhausDbl;
         config.dqs_key = Some("k3y".into());
+        config.jev = true;
         let with = names(&config);
-        assert_eq!(&with[ANALYZER_NAMES.len()..], ["clamd", "reputation"]);
+        assert_eq!(
+            &with[ANALYZER_NAMES.len()..],
+            ["clamd", "reputation", "jev"]
+        );
     }
 
     #[test]

@@ -14,9 +14,9 @@
 //! ```
 
 use envelope_email_transport::jev::{
-    JevBackend, JevClient, JevState, LAYA_JEV_MODEL, LAYA_MODEL_REPO, LAYA_MODEL_REVISION,
-    MessageFlags, PastInteractions, ReplyHistory, SenderState, SenderStatistics, apply_policy,
-    build_request, laya_health,
+    DecisionsProvider, JevBackend, JevClient, JevState, LAYA_JEV_MODEL, LAYA_MODEL_REPO,
+    LAYA_MODEL_REVISION, MessageFlags, PastInteractions, ReplyHistory, SenderState,
+    SenderStatistics, apply_policy, build_request, laya_health,
 };
 
 fn sender() -> SenderState {
@@ -76,10 +76,12 @@ async fn a_real_local_laya_inference_produces_a_validated_decision() {
     )
     .unwrap();
 
-    let client = JevClient::laya().expect("the pinned Laya client builds");
+    let client = JevClient::for_provider(&DecisionsProvider::laya())
+        .await
+        .expect("the pinned Laya client builds");
     assert_eq!(client.backend(), JevBackend::Laya);
     let decision = client
-        .decide(&build_request(state))
+        .decide(&build_request(state, LAYA_JEV_MODEL))
         .await
         .expect("a real local Laya inference returns a validated decision");
 
