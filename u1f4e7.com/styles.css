@@ -108,3 +108,15 @@ h2 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
 .copy-button { flex: none; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--text); padding: 0.3rem 0.8rem; font: inherit; font-size: 0.85rem; cursor: pointer; }
 .copy-button:hover { border-color: var(--accent); }
 .install-note { margin: 0.25rem 0 0; font-size: 0.88rem; }
+/* On phones the install commands fell below the fold; lift them above the CTA
+   buttons and trim the hero's top padding. Desktop order is unchanged. */
+@media (max-width: 640px) {
+  .hero { padding-top: 1.5rem; }
+  .hero-grid > div:first-child { display: flex; flex-direction: column; }
+  .hero-grid > div:first-child > * { order: 2; }
+  .hero-grid > div:first-child > .eyebrow,
+  .hero-grid > div:first-child > h1,
+  .hero-grid > div:first-child > .lede,
+  .hero-grid > div:first-child > .install { order: 1; }
+  .hero-grid > div:first-child > .install { margin-top: 0.5rem; }
+}
