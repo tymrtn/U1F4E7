@@ -383,6 +383,25 @@ envelope rule export
 
 The LLM teaches Envelope what to look for. Envelope applies those patterns deterministically. The LLM only re-engages when something new appears.
 
+## rShield
+
+rShield scores every message for phishing and malware on your machine: `clean`, `suspicious`, `dangerous`, or `unavailable` when an analyzer that had to answer could not. Six local analyzers are on by default and send nothing anywhere.
+
+```bash
+envelope threat scan              # score the newest INBOX messages
+envelope threat explain 4812      # the signals and arithmetic behind a verdict
+envelope threat report 4812       # draft a report to APWG (never sends)
+```
+
+Two optional analyzers are off until you enable them:
+
+| Analyzer | Enable | What leaves the machine |
+|---|---|---|
+| ClamAV | `brew install clamav`, start clamd, then `envelope config set threat.clamd.address unix:/path/to/clamd.sock` | Attachment bytes, to the clamd you configured |
+| Spamhaus DBL | `envelope config set threat.reputation.provider spamhaus-dbl` (optionally `threat.reputation.dqs_key`) | Sender and link domain names, as DNS queries to Spamhaus |
+
+`threat report` also looks up the abuse contact of an impersonated domain over RDAP, sending that domain name to its registry. Every outside lookup is logged as a `lookup_performed` event. Spamhaus restricts free and commercial use of its blocklists; read their [usage terms](https://www.spamhaus.org/blocklists/dnsbl-fair-use-policy/) first. Setup details, weights and the clamd walkthrough are in [docs/rshield.md](docs/rshield.md).
+
 ## Dashboard
 
 `envelope serve` starts a localhost web UI at [http://localhost:3141](http://localhost:3141).

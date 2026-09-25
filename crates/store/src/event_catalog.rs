@@ -36,6 +36,10 @@ pub const THREAT_VERDICT: &str = "threat_verdict";
 /// A label (tag) was applied to a message by a person or agent, e.g.
 /// `threat:false_positive` from `envelope threat mark-safe`.
 pub const LABEL_APPLIED: &str = "label_applied";
+/// An opt-in analyzer or `threat report` asked an outside service about a
+/// domain (Spamhaus DBL, RDAP). Payload `{provider, domain, result}`: the
+/// domain only, never a URL, address or message content.
+pub const LOOKUP_PERFORMED: &str = "lookup_performed";
 
 /// All catalog event types, for validation and documentation.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -50,6 +54,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     ACTION_OFFERED,
     THREAT_VERDICT,
     LABEL_APPLIED,
+    LOOKUP_PERFORMED,
 ];
 
 /// Is `event_type` a known catalog event? Unknown types are still deliverable
@@ -111,6 +116,7 @@ mod tests {
         assert!(is_known_event_type(ACTION_OFFERED));
         assert!(is_known_event_type(THREAT_VERDICT));
         assert!(is_known_event_type(LABEL_APPLIED));
+        assert!(is_known_event_type(LOOKUP_PERFORMED));
         assert!(!is_known_event_type("totally_made_up"));
     }
 

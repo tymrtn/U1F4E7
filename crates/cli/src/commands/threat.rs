@@ -16,6 +16,8 @@ use envelope_email_transport::rule_exec::{
 };
 use envelope_email_transport::rules::{Action, MessageContext};
 use envelope_email_transport::threat::persist::{self, StoredVerdict, VerdictTarget};
+use envelope_email_transport::threat::rdap;
+use envelope_email_transport::threat::report::{self, AbuseContact};
 use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig, ThreatInput};
 use serde_json::json;
 
@@ -424,26 +426,30 @@ pub async fn run_report(
     let raw = fetch_raw(&mut client, folder, uid).await?;
     drop(client);
 
+    let message_id = message_id_of(&raw);
+    let target = VerdictTarget {
+        account_id: &account_id,
+        folder,
+        uid,
+        message_id: message_id.as_deref(),
+    };
     let verdict = match persist::stored_verdict_for_uid(&db, &account_id, folder, uid)? {
         Some(stored) => Some(stored.verdict),
         None if config.enabled => {
             let (verdict, scanned) =
                 persist::scan_raw(&db, &account_id, &creds.account.username, &raw, &config);
-            persist::record_verdict(
-                &db,
-                &VerdictTarget {
-                    account_id: &account_id,
-                    folder,
-                    uid,
-                    message_id: scanned.message_id.as_deref(),
-                },
-                &verdict,
-            )?;
+            persist::record_verdict(&db, &target, &verdict)?;
+            persist::record_lookups(&db, &target, &scanned.lookups)?;
             Some(verdict)
         }
         None => None,
     };
-    let report = threat::report::build_report(&raw, verdict.as_ref(), &config.report_to);
+    let impersonated = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
+        .ok()
+        .and_then(|input| report::impersonated_domain(&input, verdict.as_ref()));
+    let (abuse, lookups) = report::resolve_abuse_contact(&rdap::PublicRdap, impersonated).await;
+    persist::record_lookups(&db, &target, &lookups)?;
+    let report = report::build_report(&raw, verdict.as_ref(), &config.report_to, &abuse);
     let (draft, drafts_folder, imap_uid) =
         super::drafts::create_threat_report_draft(&db, &creds, &report).await?;
     let review_url = super::drafts::draft_dashboard_url(&account_id, &draft.id);
@@ -456,6 +462,7 @@ pub async fn run_report(
                 "sent": false,
                 "draft_id": draft.id,
                 "to": report.to,
+                "abuse_contact": abuse,
                 "subject": report.subject,
                 "imap_folder": drafts_folder,
                 "imap_uid": imap_uid,
@@ -466,6 +473,16 @@ pub async fn run_report(
     } else {
         println!("Report draft created (not sent): {}", draft.id);
         println!("  To:      {}", report.to);
+        match &abuse {
+            AbuseContact::Found { domain, email } => {
+                println!("  Abuse:   {email} (RDAP abuse contact for {domain})")
+            }
+            AbuseContact::Failed { domain, reason } => println!(
+                "  Abuse:   no abuse contact for {domain} ({reason}); reporting to {} only",
+                config.report_to
+            ),
+            AbuseContact::NotApplicable => {}
+        }
         println!("  Subject: {}", report.subject);
         println!("  Review:  {review_url}");
         println!(

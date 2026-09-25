@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### rShield
+
+- **ClamAV (optional, off by default):** `threat.clamd.address` (`unix:/path` or
+  `tcp:host:port`) streams each attachment up to 20 MB to clamd with `INSTREAM`, 5 s per
+  attachment. `FOUND` adds `malware_detected` (+100, malware-grade: `threat:malware`, download
+  blocked). A clamd error is a skipped analyzer, or an `unavailable` verdict with
+  `threat.clamd.required = true`.
+- **Domain reputation (optional, off by default):** `threat.reputation.provider = spamhaus-dbl`
+  asks the Spamhaus DBL over DNS about the From domain and link domains (registrable domains
+  only, deduped, at most 10 per message). Listed domains add `domain_blocklisted`: +60
+  phish/malware/botnet, +25 spam, +15 abused redirector. A refused answer (`127.255.255.x`,
+  for example through a public resolver), an unexpected answer or a DNS error makes the verdict
+  `unavailable`, never clean. `threat.reputation.dqs_key` (or `ENVELOPE_REPUTATION_API_KEY`)
+  switches to the Spamhaus Data Query Service zone. Answers are cached for an hour in
+  `threat-reputation-cache.json` in the data directory. DNS uses the system resolver through
+  `hickory-resolver`, already a dependency. Spamhaus usage terms apply; see `docs/rshield.md`.
+- **Report:** `envelope threat report` and the dashboard's Report button add the impersonated
+  domain's RDAP abuse contact as a second recipient when the sender analyzer found a look-alike
+  of a known domain. If RDAP fails, the draft goes to `threat.report_to` only and the output
+  says why (`abuse_contact` in JSON). RDAP goes through the guarded public HTTP client.
+- **Audit:** every outside lookup is a `lookup_performed` event (new in the event catalog) on the
+  message, payload `{provider, domain, result}`. No URLs, addresses or content.
+- **Scans:** the watch and dashboard new-mail pass now runs analyzers outside the database lock
+  and off the async workers, so clamd and DNS waits do not stall the dashboard.
+- **Docs:** README rShield section and `docs/rshield.md`: what each optional analyzer sends,
+  how to enable it, and the clamd setup.
+
 ## [1.3.4] — 2026-09-24
 
 ### Launch hardening

@@ -10,10 +10,10 @@
 //! `unavailable`, never `clean` — an engine that could not look must not vouch
 //! for a message.
 //!
-//! Analyzers plug in through [`Analyzer`]. The local six ship here; clamd and
-//! domain reputation (A5) and the Jev decision model (A6) implement the same
-//! trait, may do I/O, and declare whether their failure is fatal through
-//! [`Analyzer::required`].
+//! Analyzers plug in through [`Analyzer`]. The local six always run; clamd
+//! ([`clamd`]) and domain reputation ([`reputation`]) are opt-in, may do I/O,
+//! and declare whether their failure is fatal through [`Analyzer::required`].
+//! [`configured_analyzers`] assembles the set a config asks for.
 //!
 //! Signal evidence carries hosts, domains, extensions and hashes only — never
 //! bodies, subjects or full URLs — because verdicts are stored in the
@@ -21,19 +21,22 @@
 
 pub mod attachments;
 pub mod auth_results;
+pub mod clamd;
 pub mod config;
 pub mod content;
 pub mod domains;
 pub mod ledger;
 pub mod links;
 pub mod persist;
+pub mod rdap;
 pub mod report;
+pub mod reputation;
 pub mod sender;
 
 use mail_parser::MimeHeaders;
 use serde::{Deserialize, Serialize};
 
-pub use config::{Quarantine, ThreatConfig};
+pub use config::{Quarantine, ReputationProvider, ThreatConfig};
 pub use envelope_email_store::correspondents::CorrespondentFacts;
 
 /// Bumped whenever an analyzer or weight changes; a stored verdict from an
@@ -366,6 +369,56 @@ pub const ANALYZER_NAMES: &[&str] = &[
     "ledger",
 ];
 
+/// One question an analyzer or `threat report` asked an outside service,
+/// stored as a `lookup_performed` event. Domain only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupRecord {
+    pub provider: String,
+    pub domain: String,
+    pub result: String,
+}
+
+impl LookupRecord {
+    pub fn new(provider: &str, domain: &str, result: impl Into<String>) -> Self {
+        LookupRecord {
+            provider: provider.to_string(),
+            domain: domain.to_string(),
+            result: result.into(),
+        }
+    }
+}
+
+/// Where I/O analyzers leave their [`LookupRecord`]s for the caller to store.
+pub type LookupLog = std::sync::Arc<std::sync::Mutex<Vec<LookupRecord>>>;
+
+/// The local analyzers plus whichever opt-in analyzers `config` enables.
+/// Reputation lookups land in `log`.
+pub fn configured_analyzers(
+    config: &ThreatConfig,
+    log: &LookupLog,
+) -> Result<Vec<Box<dyn Analyzer>>, String> {
+    let mut analyzers = default_analyzers();
+    if let Some(address) = &config.clamd {
+        analyzers.push(Box::new(clamd::ClamdAnalyzer {
+            address: address.clone(),
+            required: config.clamd_required,
+        }));
+    }
+    match config.reputation_provider {
+        ReputationProvider::Off => {}
+        ReputationProvider::SpamhausDbl => {
+            let key = config.dqs_key().map_err(|e| format!("{e:#}"))?;
+            analyzers.push(Box::new(reputation::ReputationAnalyzer::new(
+                Box::new(reputation::SystemDns),
+                key,
+                reputation::ReputationCache::new(reputation::ReputationCache::default_path()),
+                log.clone(),
+            )));
+        }
+    }
+    Ok(analyzers)
+}
+
 /// The shipped local analyzers.
 pub fn default_analyzers() -> Vec<Box<dyn Analyzer>> {
     vec![
@@ -606,6 +659,26 @@ mod tests {
             v.analyzers_skipped[0].reason,
             "disabled by threat.analyzers.ledger"
         );
+    }
+
+    #[test]
+    fn opt_in_analyzers_join_only_when_configured() {
+        let log = LookupLog::default();
+        let names = |c: &ThreatConfig| -> Vec<&'static str> {
+            configured_analyzers(c, &log)
+                .unwrap()
+                .iter()
+                .map(|a| a.name())
+                .collect()
+        };
+        let mut config = ThreatConfig::default();
+        assert_eq!(names(&config), ANALYZER_NAMES.to_vec());
+
+        config.clamd = Some(config::ClamdAddress::Tcp("127.0.0.1:3310".into()));
+        config.reputation_provider = ReputationProvider::SpamhausDbl;
+        config.dqs_key = Some("k3y".into());
+        let with = names(&config);
+        assert_eq!(&with[ANALYZER_NAMES.len()..], ["clamd", "reputation"]);
     }
 
     #[test]

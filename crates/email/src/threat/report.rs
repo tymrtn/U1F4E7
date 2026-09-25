@@ -2,7 +2,9 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 //! `threat report`: a draft to `threat.report_to` with the original message
-//! attached unmodified as `message/rfc822`.
+//! attached unmodified as `message/rfc822`, copied to the RDAP abuse contact
+//! of the domain the sender impersonates when the sender analyzer named one
+//! and RDAP answered.
 //!
 //! Draft only. Nothing here sends; the draft goes out through
 //! `envelope draft send` (or the dashboard's send), which runs the Governor
@@ -10,9 +12,12 @@
 
 use anyhow::{Context, Result, anyhow};
 use envelope_email_store::{Database, Draft};
+use serde::Serialize;
 use serde_json::json;
 
-use super::{ThreatInput, ThreatVerdict};
+use super::domains::registrable;
+use super::rdap::{self, RdapFetch};
+use super::{LookupRecord, ThreatInput, ThreatVerdict, sender};
 use crate::imap::{self, ImapClient};
 
 /// Local draft `created_by` for report drafts.
@@ -28,10 +33,72 @@ pub struct ReportDraft {
     pub attachment: serde_json::Value,
 }
 
+/// What the report learned about the impersonated domain's abuse contact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AbuseContact {
+    /// The sender analyzer named no impersonated domain; nothing was asked.
+    NotApplicable,
+    Found {
+        domain: String,
+        email: String,
+    },
+    /// RDAP was asked and gave no usable answer; the report goes to
+    /// `threat.report_to` only.
+    Failed {
+        domain: String,
+        reason: String,
+    },
+}
+
+/// The registrable domain to look up: only when the verdict carries the
+/// sender analyzer's `lookalike_domain` signal, recomputed from the message
+/// and ledger rather than parsed out of evidence text.
+pub fn impersonated_domain(input: &ThreatInput, verdict: Option<&ThreatVerdict>) -> Option<String> {
+    let named = verdict?
+        .signals
+        .iter()
+        .any(|s| s.code == "lookalike_domain");
+    if !named {
+        return None;
+    }
+    sender::impersonated_domain(input)
+        .map(|d| registrable(&d))
+        .filter(|d| !d.is_empty())
+}
+
+/// Ask RDAP for `domain`'s abuse contact. The records are for
+/// `persist::record_lookups`.
+pub async fn resolve_abuse_contact<F: RdapFetch>(
+    fetch: &F,
+    domain: Option<String>,
+) -> (AbuseContact, Vec<LookupRecord>) {
+    let Some(domain) = domain else {
+        return (AbuseContact::NotApplicable, Vec::new());
+    };
+    let found = rdap::abuse_contact(fetch, &domain).await;
+    let contact = match found.result {
+        Ok(email) => AbuseContact::Found { domain, email },
+        Err(reason) => AbuseContact::Failed { domain, reason },
+    };
+    (contact, found.lookups)
+}
+
+/// Recipients of a report draft, comma-separated as drafts store them.
+fn recipients(report_to: &str, abuse: &AbuseContact) -> String {
+    match abuse {
+        AbuseContact::Found { email, .. } if !email.eq_ignore_ascii_case(report_to) => {
+            format!("{report_to}, {email}")
+        }
+        _ => report_to.to_string(),
+    }
+}
+
 pub fn build_report(
     original: &[u8],
     verdict: Option<&ThreatVerdict>,
     report_to: &str,
+    abuse: &AbuseContact,
 ) -> ReportDraft {
     use base64::Engine as _;
     let mut body = String::from(
@@ -49,6 +116,12 @@ pub fn build_report(
             body.push_str(&format!("- {}: {}\n", s.code, s.evidence));
         }
     }
+    if let AbuseContact::Found { domain, email } = abuse {
+        body.push_str(&format!(
+            "\nThis message impersonates {domain}. {email} is that domain's abuse contact \
+             in its registration data (RDAP).\n"
+        ));
+    }
     let subject = ThreatInput::from_raw(original, "")
         .ok()
         .and_then(|i| {
@@ -65,7 +138,7 @@ pub fn build_report(
         })
         .unwrap_or_else(|| "Phishing report".to_string());
     ReportDraft {
-        to: report_to.to_string(),
+        to: recipients(report_to, abuse),
         subject,
         body,
         attachment: json!({
@@ -101,7 +174,12 @@ pub fn report_rfc822(
     let message_id = format!("{}@envelope.threat", uuid::Uuid::new_v4());
     let rfc822 = mail_builder::MessageBuilder::new()
         .from(from)
-        .to(report.to.as_str())
+        .to(report
+            .to
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<&str>>())
         .subject(report.subject.as_str())
         .message_id(message_id.as_str())
         .text_body(report.body.as_str())
@@ -207,7 +285,12 @@ mod tests {
 
     #[test]
     fn report_attaches_the_original_unmodified_and_lists_evidence() {
-        let report = build_report(RAW, Some(&verdict()), "reportphishing@apwg.org");
+        let report = build_report(
+            RAW,
+            Some(&verdict()),
+            "reportphishing@apwg.org",
+            &AbuseContact::NotApplicable,
+        );
         assert_eq!(report.to, "reportphishing@apwg.org");
         assert_eq!(report.subject, "Phishing report: Password expiry");
         assert_eq!(report.attachment["content_type"], "message/rfc822");
@@ -221,7 +304,12 @@ mod tests {
 
     #[test]
     fn report_rfc822_carries_a_message_rfc822_part() {
-        let report = build_report(RAW, None, "reportphishing@apwg.org");
+        let report = build_report(
+            RAW,
+            None,
+            "reportphishing@apwg.org",
+            &AbuseContact::NotApplicable,
+        );
         let (bytes, mid) = report_rfc822(Some("Me"), "me@example.org", &report).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("message/rfc822"));
@@ -232,6 +320,96 @@ mod tests {
         assert!(mid.starts_with('<') && mid.ends_with("@envelope.threat>"));
         let parsed = mail_parser::MessageParser::default().parse(&bytes).unwrap();
         assert_eq!(parsed.attachment_count(), 1);
+    }
+
+    #[test]
+    fn found_abuse_contact_is_a_second_recipient_on_the_draft() {
+        let abuse = AbuseContact::Found {
+            domain: "example.org".into(),
+            email: "abuse@registrar.example".into(),
+        };
+        let report = build_report(RAW, Some(&verdict()), "reportphishing@apwg.org", &abuse);
+        assert_eq!(
+            report.to,
+            "reportphishing@apwg.org, abuse@registrar.example"
+        );
+        assert!(report.body.contains("impersonates example.org"));
+
+        let (bytes, _) = report_rfc822(None, "me@example.org", &report).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+        let to: Vec<&str> = parsed
+            .to()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.address.as_deref())
+            .collect();
+        assert_eq!(
+            to,
+            vec!["reportphishing@apwg.org", "abuse@registrar.example"]
+        );
+
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-1', 'Me', 'me@example.org', 'example.org',
+                         'smtp.example.org', 587, 'imap.example.org', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        let draft = record_report_draft(&db, "acct-1", &report, "Drafts", None, "<r@x>").unwrap();
+        assert_eq!(
+            draft.to_addr,
+            "reportphishing@apwg.org, abuse@registrar.example"
+        );
+        assert!(draft.sent_at.is_none());
+    }
+
+    #[test]
+    fn failed_or_absent_rdap_keeps_apwg_only() {
+        for abuse in [
+            AbuseContact::NotApplicable,
+            AbuseContact::Failed {
+                domain: "example.org".into(),
+                reason: "registry RDAP: HTTP 503".into(),
+            },
+        ] {
+            let report = build_report(RAW, Some(&verdict()), "reportphishing@apwg.org", &abuse);
+            assert_eq!(report.to, "reportphishing@apwg.org");
+            assert!(!report.body.contains("impersonates"));
+        }
+    }
+
+    #[test]
+    fn rdap_is_asked_only_when_the_sender_analyzer_named_a_domain() {
+        let mut input = ThreatInput::from_raw(RAW, "me@example.org").unwrap();
+        input.ledger = Ok(Default::default());
+        assert_eq!(
+            impersonated_domain(&input, Some(&verdict())).as_deref(),
+            Some("example.org")
+        );
+        let no_lookalike = combine(
+            vec![Signal::new("dmarc_fail", 30, "dmarc=fail")],
+            vec![],
+            vec![],
+            false,
+        );
+        assert_eq!(impersonated_domain(&input, Some(&no_lookalike)), None);
+        assert_eq!(impersonated_domain(&input, None), None);
+    }
+
+    #[tokio::test]
+    async fn no_impersonated_domain_asks_nothing() {
+        struct Panics;
+        impl RdapFetch for Panics {
+            async fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
+                panic!("fetched {url}")
+            }
+        }
+        let (contact, lookups) = resolve_abuse_contact(&Panics, None).await;
+        assert_eq!(contact, AbuseContact::NotApplicable);
+        assert!(lookups.is_empty());
     }
 
     #[test]
@@ -246,7 +424,12 @@ mod tests {
                 [],
             )
             .unwrap();
-        let report = build_report(RAW, Some(&verdict()), "reportphishing@apwg.org");
+        let report = build_report(
+            RAW,
+            Some(&verdict()),
+            "reportphishing@apwg.org",
+            &AbuseContact::NotApplicable,
+        );
         let draft =
             record_report_draft(&db, "acct-1", &report, "Drafts", Some(12), "<r@x>").unwrap();
         assert_eq!(draft.status, DraftStatus::Draft);

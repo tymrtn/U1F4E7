@@ -201,17 +201,50 @@ pub async fn report_draft(
         }
     };
 
-    let (report, cached_folder) = {
+    let (stored, impersonated, cached_folder) = {
         let db = state.db.lock().await;
-        let verdict = persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid)
+        let stored = persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid)
             .ok()
-            .flatten()
-            .map(|s| s.verdict);
+            .flatten();
+        let impersonated = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
+            .ok()
+            .and_then(|input| {
+                report::impersonated_domain(&input, stored.as_ref().map(|s| &s.verdict))
+            });
         (
-            report::build_report(&raw, verdict.as_ref(), &config.report_to),
+            stored,
+            impersonated,
             db.get_drafts_folder(&account_id).ok().flatten(),
         )
     };
+    // RDAP runs without the database lock held.
+    let (abuse, lookups) = report::resolve_abuse_contact(
+        &envelope_email_transport::threat::rdap::PublicRdap,
+        impersonated,
+    )
+    .await;
+    if !lookups.is_empty() {
+        let db = state.db.lock().await;
+        let recorded = persist::record_lookups(
+            &db,
+            &VerdictTarget {
+                account_id: &account_id,
+                folder: &q.folder,
+                uid,
+                message_id: stored.as_ref().and_then(|s| s.message_id.as_deref()),
+            },
+            &lookups,
+        );
+        if let Err(e) = recorded {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audit_failed",
+                format!("{e:#}"),
+            );
+        }
+    }
+    let verdict = stored.map(|s| s.verdict);
+    let report = report::build_report(&raw, verdict.as_ref(), &config.report_to, &abuse);
     let built = report::report_rfc822(
         creds.account.display_name.as_deref(),
         &creds.account.username,
@@ -257,6 +290,7 @@ pub async fn report_draft(
             "sent": false,
             "draft_id": draft.id,
             "to": report.to,
+            "abuse_contact": abuse,
             "subject": report.subject,
             "imap_folder": folder,
         }))
