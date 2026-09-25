@@ -14,6 +14,7 @@ use envelope_email_store::{
 };
 use envelope_email_transport::event_delivery::{DeliveryLimits, deliver_due_events};
 use envelope_email_transport::folders;
+use envelope_email_transport::http::Allowance;
 use envelope_email_transport::imap;
 use envelope_email_transport::jev::{
     self, JevBackend, JevClient, JevState, MailRoute, MessageFlags, PastInteractions,
@@ -192,13 +193,14 @@ async fn drain_due_event_deliveries(deliver: bool) -> Result<Option<DeliveryPass
         return Ok(None);
     }
     let db = Database::open_default().context("failed to open database for event delivery")?;
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build event delivery client")?;
-    let report = deliver_due_events(&db, &http, chrono::Utc::now(), DeliveryLimits::default())
-        .await
-        .context("event delivery executor failed")?;
+    let report = deliver_due_events(
+        &db,
+        &Allowance::Public,
+        chrono::Utc::now(),
+        DeliveryLimits::default(),
+    )
+    .await
+    .context("event delivery executor failed")?;
     Ok(Some(DeliveryPassReport {
         examined: report.examined,
         delivered: report.delivered,
