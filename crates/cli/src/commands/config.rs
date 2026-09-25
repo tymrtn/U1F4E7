@@ -168,7 +168,8 @@ fn require_supported_key(key: &str) -> Result<()> {
             "unknown config key `{key}`; supported keys: {DASHBOARD_BASE_URL_KEY}, \
              {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}, threat.enabled, \
              threat.quarantine, threat.on_read, threat.report_to, threat.analyzers.<name>, \
-             sync.poll_interval_secs"
+             threat.reputation.provider, threat.reputation.dqs_key, threat.clamd.address, \
+             threat.clamd.required, sync.poll_interval_secs"
         ),
     }
 }
@@ -261,6 +262,19 @@ fn effective_threat_value(key: &str, config: &ThreatConfig) -> Value {
         "threat.on_read" => json!(config.on_read),
         "threat.report_to" => json!(config.report_to),
         "sync.poll_interval_secs" => json!(config.poll_interval_secs),
+        "threat.reputation.provider" => json!(config.reputation_provider.as_str()),
+        // Never echo the key itself.
+        "threat.reputation.dqs_key" => json!(if config.dqs_key.is_some() {
+            "set"
+        } else {
+            "unset"
+        }),
+        "threat.clamd.address" => config
+            .clamd
+            .as_ref()
+            .map(|a| json!(a.display()))
+            .unwrap_or(json!("off")),
+        "threat.clamd.required" => json!(config.clamd_required),
         _ => key
             .strip_prefix("threat.analyzers.")
             .map(|name| json!(config.analyzer_enabled(name)))
@@ -345,6 +359,11 @@ fn run_threat_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> 
             // Refuse to write a file the engine would then reject.
             ThreatConfig::from_config_value(&config)?;
             write_config_value(&path, &config)?;
+            let shown = if key == "threat.reputation.dqs_key" {
+                json!("set")
+            } else {
+                typed.clone()
+            };
             let installed = if key == "threat.quarantine" && typed == json!("move") {
                 Some(install_quarantine_rules()?)
             } else {
@@ -354,7 +373,7 @@ fn run_threat_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> 
                 let mut obj = json!({
                     "status": "set",
                     "key": key,
-                    "value": typed,
+                    "value": shown,
                     "config_path": display_config_path(),
                 });
                 if let Some(accounts) = &installed {
@@ -365,7 +384,7 @@ fn run_threat_field(cmd: ConfigCmd, key: &str, json_output: bool) -> Result<()> 
                 }
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
-                println!("Set {key}={}", display_value(&typed));
+                println!("Set {key}={}", display_value(&shown));
                 if let Some(accounts) = installed {
                     println!(
                         "Rule '{}' (score_above threat 70 -> move {}) is installed for {} account(s); edit it with `envelope rule`.",

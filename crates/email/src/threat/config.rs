@@ -11,12 +11,16 @@
 //! | `threat.on_read` | `true` (scan on open when no current verdict) |
 //! | `threat.report_to` | `reportphishing@apwg.org` |
 //! | `threat.analyzers.<name>` | `true` |
+//! | `threat.reputation.provider` | `off` (`off`, `spamhaus-dbl`) |
+//! | `threat.reputation.dqs_key` | unset (env `ENVELOPE_REPUTATION_API_KEY`) |
+//! | `threat.clamd.address` | unset = off (`unix:/path` or `tcp:host:port`) |
+//! | `threat.clamd.required` | `false` |
 //! | `sync.poll_interval_secs` | `300` |
 //!
 //! A present-but-invalid value is an error, never a silent default.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -58,6 +62,80 @@ impl Quarantine {
     }
 }
 
+/// Env fallback for `threat.reputation.dqs_key`, so the key can stay out of
+/// `config.json`.
+pub const REPUTATION_KEY_ENV: &str = "ENVELOPE_REPUTATION_API_KEY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReputationProvider {
+    Off,
+    /// Spamhaus Domain Block List over DNS.
+    SpamhausDbl,
+}
+
+impl ReputationProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReputationProvider::Off => "off",
+            ReputationProvider::SpamhausDbl => "spamhaus-dbl",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        Ok(match raw.trim() {
+            "off" => ReputationProvider::Off,
+            "spamhaus-dbl" => ReputationProvider::SpamhausDbl,
+            other => {
+                bail!("threat.reputation.provider must be off or spamhaus-dbl (got `{other}`)")
+            }
+        })
+    }
+}
+
+/// Where clamd listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClamdAddress {
+    Unix(PathBuf),
+    /// `host:port`.
+    Tcp(String),
+}
+
+impl ClamdAddress {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if let Some(path) = raw.strip_prefix("unix:") {
+            if !path.starts_with('/') {
+                bail!("threat.clamd.address unix: needs an absolute socket path (got `{raw}`)");
+            }
+            return Ok(ClamdAddress::Unix(PathBuf::from(path)));
+        }
+        if let Some(hostport) = raw.strip_prefix("tcp:") {
+            let port_ok = hostport
+                .rsplit_once(':')
+                .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+            if !port_ok {
+                bail!("threat.clamd.address tcp: needs host:port (got `{raw}`)");
+            }
+            return Ok(ClamdAddress::Tcp(hostport.to_string()));
+        }
+        bail!(
+            "threat.clamd.address must be unix:/path/to/clamd.sock or tcp:host:port (got `{raw}`)"
+        )
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            ClamdAddress::Unix(path) => format!("unix:{}", path.display()),
+            ClamdAddress::Tcp(hostport) => format!("tcp:{hostport}"),
+        }
+    }
+}
+
+/// A Spamhaus DQS key is one DNS label.
+fn valid_dqs_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 63 && key.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreatConfig {
     pub enabled: bool,
@@ -67,6 +145,14 @@ pub struct ThreatConfig {
     /// Explicit per-analyzer switches; absent means enabled.
     pub analyzers: BTreeMap<String, bool>,
     pub poll_interval_secs: u64,
+    pub reputation_provider: ReputationProvider,
+    /// Spamhaus DQS key from config; see [`ThreatConfig::dqs_key`].
+    pub dqs_key: Option<String>,
+    /// `None` means clamd scanning is off.
+    pub clamd: Option<ClamdAddress>,
+    /// A clamd error makes the verdict `unavailable` instead of being
+    /// recorded as a skipped analyzer.
+    pub clamd_required: bool,
 }
 
 impl Default for ThreatConfig {
@@ -78,6 +164,10 @@ impl Default for ThreatConfig {
             report_to: DEFAULT_REPORT_TO.to_string(),
             analyzers: BTreeMap::new(),
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            reputation_provider: ReputationProvider::Off,
+            dqs_key: None,
+            clamd: None,
+            clamd_required: false,
         }
     }
 }
@@ -90,6 +180,10 @@ pub fn is_threat_key(key: &str) -> bool {
             | "threat.quarantine"
             | "threat.on_read"
             | "threat.report_to"
+            | "threat.reputation.provider"
+            | "threat.reputation.dqs_key"
+            | "threat.clamd.address"
+            | "threat.clamd.required"
             | "sync.poll_interval_secs"
     ) || key
         .strip_prefix("threat.analyzers.")
@@ -113,7 +207,19 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
         }
     };
     match key {
-        "threat.enabled" | "threat.on_read" => parse_bool(),
+        "threat.enabled" | "threat.on_read" | "threat.clamd.required" => parse_bool(),
+        "threat.reputation.provider" => Ok(Value::String(
+            ReputationProvider::parse(raw)?.as_str().to_string(),
+        )),
+        "threat.reputation.dqs_key" => {
+            if !valid_dqs_key(raw) {
+                bail!(
+                    "threat.reputation.dqs_key must be the letters and digits of a Spamhaus DQS key"
+                );
+            }
+            Ok(Value::String(raw.to_string()))
+        }
+        "threat.clamd.address" => Ok(Value::String(ClamdAddress::parse(raw)?.display())),
         _ if key.starts_with("threat.analyzers.") => parse_bool(),
         "threat.quarantine" => Ok(Value::String(Quarantine::parse(raw)?.as_str().to_string())),
         "threat.report_to" => {
@@ -140,6 +246,27 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
 impl ThreatConfig {
     pub fn analyzer_enabled(&self, name: &str) -> bool {
         self.analyzers.get(name).copied().unwrap_or(true)
+    }
+
+    /// The DQS key: `threat.reputation.dqs_key`, else
+    /// `ENVELOPE_REPUTATION_API_KEY`.
+    pub fn dqs_key(&self) -> Result<Option<String>> {
+        if let Some(key) = &self.dqs_key {
+            return Ok(Some(key.clone()));
+        }
+        match std::env::var(REPUTATION_KEY_ENV) {
+            Ok(key) if key.trim().is_empty() => Ok(None),
+            Ok(key) => {
+                let key = key.trim().to_string();
+                if !valid_dqs_key(&key) {
+                    bail!(
+                        "{REPUTATION_KEY_ENV} must be the letters and digits of a Spamhaus DQS key"
+                    );
+                }
+                Ok(Some(key))
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Build from the whole `config.json` object.
@@ -176,6 +303,28 @@ impl ThreatConfig {
             Some(other) => {
                 bail!("threat.report_to must be a string in config.json (found {other})")
             }
+        }
+        let string_at = |key: &str| -> Result<Option<String>> {
+            match config.pointer(&pointer_for(key)) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(
+                    parse_value(key, s)?
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )),
+                Some(other) => bail!("{key} must be a string in config.json (found {other})"),
+            }
+        };
+        if let Some(v) = string_at("threat.reputation.provider")? {
+            out.reputation_provider = ReputationProvider::parse(&v)?;
+        }
+        out.dqs_key = string_at("threat.reputation.dqs_key")?;
+        if let Some(v) = string_at("threat.clamd.address")? {
+            out.clamd = Some(ClamdAddress::parse(&v)?);
+        }
+        if let Some(v) = bool_at("threat.clamd.required")? {
+            out.clamd_required = v;
         }
         if let Some(analyzers) = config.pointer("/threat/analyzers") {
             let map = analyzers
@@ -289,9 +438,48 @@ mod tests {
     }
 
     #[test]
+    fn optional_analyzers_are_off_by_default_and_parse_when_set() {
+        let c = ThreatConfig::default();
+        assert_eq!(c.reputation_provider, ReputationProvider::Off);
+        assert_eq!(c.clamd, None);
+        assert!(!c.clamd_required);
+
+        let c = ThreatConfig::from_config_value(&json!({"threat": {
+            "reputation": {"provider": "spamhaus-dbl", "dqs_key": "abc123"},
+            "clamd": {"address": "unix:/opt/homebrew/var/run/clamav/clamd.sock", "required": true},
+        }}))
+        .unwrap();
+        assert_eq!(c.reputation_provider, ReputationProvider::SpamhausDbl);
+        assert_eq!(c.dqs_key().unwrap().as_deref(), Some("abc123"));
+        assert_eq!(
+            c.clamd,
+            Some(ClamdAddress::Unix(PathBuf::from(
+                "/opt/homebrew/var/run/clamav/clamd.sock"
+            )))
+        );
+        assert!(c.clamd_required);
+
+        assert_eq!(
+            ClamdAddress::parse("tcp:127.0.0.1:3310").unwrap(),
+            ClamdAddress::Tcp("127.0.0.1:3310".into())
+        );
+        assert!(ClamdAddress::parse("tcp:localhost").is_err());
+        assert!(ClamdAddress::parse("unix:relative.sock").is_err());
+        assert!(ClamdAddress::parse("/var/run/clamd.sock").is_err());
+        assert!(parse_value("threat.reputation.provider", "virustotal").is_err());
+        assert!(parse_value("threat.reputation.dqs_key", "a.b").is_err());
+        assert!(
+            ThreatConfig::from_config_value(&json!({"threat": {"clamd": {"required": "yes"}}}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn key_catalog() {
         assert!(is_threat_key("threat.analyzers.ledger"));
         assert!(is_threat_key("sync.poll_interval_secs"));
+        assert!(is_threat_key("threat.clamd.address"));
+        assert!(is_threat_key("threat.reputation.provider"));
         assert!(!is_threat_key("threat.analyzers.clamd"));
         assert!(!is_threat_key("dashboard.base_url"));
         assert_eq!(

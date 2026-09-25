@@ -13,16 +13,16 @@
 //! - the attachment gate every download/upload chokepoint calls.
 
 use anyhow::{Context, Result, anyhow, bail};
-use envelope_email_store::event_catalog::{LABEL_APPLIED, THREAT_VERDICT};
+use envelope_email_store::event_catalog::{LABEL_APPLIED, LOOKUP_PERFORMED, THREAT_VERDICT};
 use envelope_email_store::models::{Event, Rule};
 use envelope_email_store::{Database, canonical_message_id};
 use serde::Serialize;
 use serde_json::json;
 
 use super::{
-    Level, Quarantine, Signal, TAG_DANGEROUS, TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED,
-    TAG_SUSPICIOUS, THREAT_DIMENSION, ThreatConfig, ThreatInput, ThreatVerdict, default_analyzers,
-    evaluate,
+    Analyzer, Level, LookupLog, LookupRecord, Quarantine, Signal, TAG_DANGEROUS,
+    TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED, TAG_SUSPICIOUS, THREAT_DIMENSION,
+    ThreatConfig, ThreatInput, ThreatVerdict, configured_analyzers, evaluate,
 };
 use crate::imap::{self, ImapClient};
 use crate::rule_exec::{
@@ -56,13 +56,16 @@ impl RawFetch for ImapRuleMailbox<'_> {
     }
 }
 
-/// Headers the scan read, for the rule context and the event row.
+/// Headers the scan read, for the rule context and the event row, plus the
+/// outside lookups the scan made.
 #[derive(Debug, Clone, Default)]
 pub struct ScannedMessage {
     pub message_id: Option<String>,
     pub from_addr: String,
     pub to_addr: String,
     pub subject: String,
+    /// Store with [`record_lookups`].
+    pub lookups: Vec<LookupRecord>,
 }
 
 /// Fill the correspondent facts from the local store.
@@ -70,6 +73,77 @@ pub fn load_ledger(db: &Database, account_id: &str, input: &mut ThreatInput) {
     input.ledger = db
         .correspondent_facts(account_id, &input.from_addr, input.from_display.as_deref())
         .map_err(|e| format!("correspondent ledger unreadable: {e}"));
+}
+
+/// Parse raw bytes and load the ledger: the part of a scan that needs the
+/// database.
+pub fn prepare_input(
+    db: &Database,
+    account_id: &str,
+    account_address: &str,
+    raw: &[u8],
+) -> Result<ThreatInput, String> {
+    let mut input = ThreatInput::from_raw(raw, account_address)?;
+    load_ledger(db, account_id, &mut input);
+    Ok(input)
+}
+
+/// Run the analyzers `config` enables. With clamd or reputation on this does
+/// blocking network I/O, so async callers holding the database run it
+/// outside the lock (see `scan_one`).
+pub fn evaluate_input(
+    input: Result<ThreatInput, String>,
+    config: &ThreatConfig,
+) -> (ThreatVerdict, ScannedMessage) {
+    let log = LookupLog::default();
+    match configured_analyzers(config, &log) {
+        Ok(analyzers) => evaluate_with(input, config, &analyzers, &log),
+        Err(reason) => (
+            ThreatVerdict::unavailable(reason),
+            input.map(|i| scanned_message(&i)).unwrap_or_default(),
+        ),
+    }
+}
+
+/// [`evaluate_input`] with explicit analyzers and the log they write to.
+pub fn evaluate_with(
+    input: Result<ThreatInput, String>,
+    config: &ThreatConfig,
+    analyzers: &[Box<dyn Analyzer>],
+    log: &LookupLog,
+) -> (ThreatVerdict, ScannedMessage) {
+    let input = match input {
+        Ok(input) => input,
+        Err(reason) => {
+            return (
+                ThreatVerdict::unavailable(reason),
+                ScannedMessage::default(),
+            );
+        }
+    };
+    let verdict = evaluate(&input, analyzers, config);
+    let mut scanned = scanned_message(&input);
+    scanned.lookups = std::mem::take(&mut *log.lock().unwrap_or_else(|p| p.into_inner()));
+    (verdict, scanned)
+}
+
+fn scanned_message(input: &ThreatInput) -> ScannedMessage {
+    let header = |name: &str| {
+        input
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    ScannedMessage {
+        message_id: header("message-id")
+            .map(|m| canonical_message_id(&m).to_string())
+            .filter(|m| !m.is_empty()),
+        from_addr: input.from_addr.clone(),
+        to_addr: header("to").unwrap_or_default(),
+        subject: header("subject").unwrap_or_default(),
+        lookups: Vec::new(),
+    }
 }
 
 /// Scan raw bytes with the configured analyzers. Never fails: an unparseable
@@ -81,33 +155,7 @@ pub fn scan_raw(
     raw: &[u8],
     config: &ThreatConfig,
 ) -> (ThreatVerdict, ScannedMessage) {
-    let mut input = match ThreatInput::from_raw(raw, account_address) {
-        Ok(input) => input,
-        Err(reason) => {
-            return (
-                ThreatVerdict::unavailable(reason),
-                ScannedMessage::default(),
-            );
-        }
-    };
-    load_ledger(db, account_id, &mut input);
-    let verdict = evaluate(&input, &default_analyzers(), config);
-    let header = |name: &str| {
-        input
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
-    };
-    let scanned = ScannedMessage {
-        message_id: header("message-id")
-            .map(|m| canonical_message_id(&m).to_string())
-            .filter(|m| !m.is_empty()),
-        from_addr: input.from_addr.clone(),
-        to_addr: header("to").unwrap_or_default(),
-        subject: header("subject").unwrap_or_default(),
-    };
-    (verdict, scanned)
+    evaluate_input(prepare_input(db, account_id, account_address, raw), config)
 }
 
 /// Where a verdict is stored.
@@ -195,6 +243,37 @@ pub fn record_verdict(
     };
     db.insert_event_with_agent(&event, Some(THREAT_AGENT_ID))
         .context("failed to record threat_verdict event")?;
+    Ok(())
+}
+
+/// One pre-acked `lookup_performed` event per outside lookup, on the message
+/// that caused it. The payload is the record: provider, domain, result.
+pub fn record_lookups(
+    db: &Database,
+    target: &VerdictTarget<'_>,
+    lookups: &[LookupRecord],
+) -> Result<()> {
+    for lookup in lookups {
+        let now = chrono::Utc::now().to_rfc3339();
+        let event = Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id: target.account_id.to_string(),
+            event_type: LOOKUP_PERFORMED.to_string(),
+            folder: target.folder.to_string(),
+            uid: Some(i64::from(target.uid)),
+            message_id: target.message_id.map(str::to_string),
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(serde_json::to_string(lookup).context("serialize lookup")?),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some(now.clone()),
+            created_at: now,
+        };
+        db.insert_event_with_agent(&event, Some(THREAT_AGENT_ID))
+            .context("failed to record lookup_performed event")?;
+    }
     Ok(())
 }
 
@@ -557,22 +636,26 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
         .fetch_raw(folder, uid)
         .await?
         .ok_or_else(|| anyhow!("UID {uid} vanished from {folder} before it was scanned"))?;
-    let (verdict, scanned) = db
-        .with_db(|d| -> Result<(ThreatVerdict, ScannedMessage)> {
-            let (verdict, scanned) = scan_raw(d, account.id, account.email, &raw, config);
-            record_verdict(
-                d,
-                &VerdictTarget {
-                    account_id: account.id,
-                    folder,
-                    uid,
-                    message_id: scanned.message_id.as_deref(),
-                },
-                &verdict,
-            )?;
-            Ok((verdict, scanned))
-        })
-        .await?;
+    let input = db
+        .with_db(|d| prepare_input(d, account.id, account.email, &raw))
+        .await;
+    // Opt-in analyzers block on clamd and DNS: run them off the async
+    // workers and without holding the database.
+    let owned = config.clone();
+    let (verdict, scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
+        .await
+        .context("threat analyzers panicked")?;
+    db.with_db(|d| -> Result<()> {
+        let target = VerdictTarget {
+            account_id: account.id,
+            folder,
+            uid,
+            message_id: scanned.message_id.as_deref(),
+        };
+        record_verdict(d, &target, &verdict)?;
+        record_lookups(d, &target, &scanned.lookups)
+    })
+    .await?;
     let quarantine =
         apply_quarantine(mbox, db, account, folder, uid, &scanned, &verdict, config).await?;
     Ok(PassEntry {
@@ -609,16 +692,14 @@ pub fn verdict_on_open(
         return Ok(existing);
     }
     let (verdict, scanned) = scan_raw(db, account_id, account_address, raw, config);
-    record_verdict(
-        db,
-        &VerdictTarget {
-            account_id,
-            folder,
-            uid,
-            message_id: scanned.message_id.as_deref(),
-        },
-        &verdict,
-    )?;
+    let target = VerdictTarget {
+        account_id,
+        folder,
+        uid,
+        message_id: scanned.message_id.as_deref(),
+    };
+    record_verdict(db, &target, &verdict)?;
+    record_lookups(db, &target, &scanned.lookups)?;
     Ok(Some(verdict))
 }
 
@@ -1029,5 +1110,82 @@ mod tests {
         );
         assert!((s.non_clean_rate - 1.0 / 3.0).abs() < 1e-9);
         assert!((s.unavailable_rate - 1.0 / 3.0).abs() < 1e-9);
+    }
+    struct ListedDns;
+
+    impl super::super::reputation::DnsResolver for ListedDns {
+        fn lookup_a(&self, fqdn: &str) -> Result<super::super::reputation::DnsAnswer, String> {
+            use super::super::reputation::DnsAnswer;
+            Ok(if fqdn.starts_with("examp1e.org.") {
+                DnsAnswer::A(vec![std::net::Ipv4Addr::new(127, 0, 1, 4)])
+            } else {
+                DnsAnswer::NoRecords
+            })
+        }
+    }
+
+    #[test]
+    fn reputation_lookups_become_domain_only_lookup_performed_events() {
+        use super::super::reputation::{CACHE_FILE_NAME, ReputationAnalyzer, ReputationCache};
+        let db = Database::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = LookupLog::default();
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![Box::new(ReputationAnalyzer::new(
+            Box::new(ListedDns),
+            None,
+            ReputationCache::new(dir.path().join(CACHE_FILE_NAME)),
+            log.clone(),
+        ))];
+        let raw = "Message-ID: <l1@x>\r\nFrom: IT <it@examp1e.org>\r\nTo: me@example.org\r\n\
+                   Subject: s\r\n\r\nReset at https://portal.partner.example/reset?t=SECRET\r\n";
+        let input = prepare_input(&db, ACCT, EMAIL, raw.as_bytes());
+        let (verdict, scanned) = evaluate_with(input, &ThreatConfig::default(), &analyzers, &log);
+        assert_eq!(verdict.signals[0].code, "domain_blocklisted");
+        assert_eq!(verdict.signals[0].weight, 60);
+        assert_eq!(scanned.lookups.len(), 2);
+        assert!(log.lock().unwrap().is_empty(), "drained into the scan");
+
+        let target = VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid: 9,
+            message_id: scanned.message_id.as_deref(),
+        };
+        record_verdict(&db, &target, &verdict).unwrap();
+        record_lookups(&db, &target, &scanned.lookups).unwrap();
+
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT payload, uid, message_id, agent_id FROM events
+                 WHERE event_type = 'lookup_performed' ORDER BY rowid",
+            )
+            .unwrap();
+        let rows: Vec<(String, i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let payloads: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| serde_json::from_str(&r.0).unwrap())
+            .collect();
+        assert_eq!(
+            payloads[0],
+            json!({"provider": "spamhaus-dbl", "domain": "examp1e.org", "result": "listed:phish"})
+        );
+        assert_eq!(
+            payloads[1],
+            json!({"provider": "spamhaus-dbl", "domain": "partner.example", "result": "not_listed"})
+        );
+        for (payload, uid, mid, agent) in &rows {
+            assert!(!payload.contains("SECRET") && !payload.contains("reset"));
+            assert!(!payload.contains("portal.") && !payload.contains("it@"));
+            assert_eq!(
+                (*uid, mid.as_str(), agent.as_str()),
+                (9, "l1@x", THREAT_AGENT_ID)
+            );
+        }
     }
 }
