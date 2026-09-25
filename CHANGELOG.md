@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dashboard (Logs):** a Governor block now shows once. It showed twice, as "Blocked by Governor"
+  and "Send stopped", because the block also writes a catalog event that delivery routes subscribe
+  to. Logs leaves that event out; delivery routes still receive it. The "Send stopped" filter,
+  which could only come back empty, is gone.
+
 ## [1.3.4] — 2026-09-24
 
 ### Launch hardening
