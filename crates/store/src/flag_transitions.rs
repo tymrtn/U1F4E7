@@ -342,7 +342,7 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.uid, Some(1));
         assert_eq!(event.folder, "INBOX");
-        assert_eq!(event.message_id.as_deref(), Some("<1@x>"));
+        assert_eq!(event.message_id.as_deref(), Some("1@x"));
         assert_eq!(event.idempotency_key.as_deref(), Some("seen:acc:INBOX:7:1"));
         assert!(event.acked_at.is_some());
         let payload: serde_json::Value =
@@ -484,7 +484,7 @@ mod tests {
         let events = seen_events(&db);
         assert_eq!(
             events[0].message_id.as_deref(),
-            Some("<1@x>"),
+            Some("1@x"),
             "id from index"
         );
         let payload: serde_json::Value =

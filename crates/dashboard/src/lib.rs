@@ -182,6 +182,15 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
         );
     }
     if options.background_sweeps {
+        // Rows from before Message-IDs had one stored form, or from a build
+        // that still writes brackets into this DB.
+        match state.db.lock().await.normalize_stored_message_ids() {
+            Ok(r) => println!(
+                "Stored Message-IDs normalized: {} index rows, {} events, {} thread rows",
+                r.index_rows, r.events, r.thread_messages
+            ),
+            Err(e) => tracing::warn!("Message-ID normalization failed: {e}"),
+        }
         println!("Background unsnooze + scheduled-send + event-delivery sweep running every 60s");
         let ticker_state = state.clone();
         tokio::spawn(async move {

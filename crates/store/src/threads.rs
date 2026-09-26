@@ -157,6 +157,13 @@ impl Database {
         is_outbound: bool,
         snippet: Option<&str>,
     ) -> Result<i64> {
+        use crate::message_ids::{stored_message_id, stored_references};
+        let message_id = stored_message_id(message_id);
+        let message_id = message_id.as_deref();
+        let in_reply_to = stored_message_id(in_reply_to);
+        let in_reply_to = in_reply_to.as_deref();
+        let references = stored_references(references);
+        let references = references.as_deref();
         // Check if we already have this message (by message_id + folder, or uid + folder)
         let existing_id: Option<i64> = if let Some(mid) = message_id {
             let id: Option<i64> = self

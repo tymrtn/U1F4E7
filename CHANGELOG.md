@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Message-IDs:** the message index, the event log and the thread cache now store every
+  Message-ID in one form, bare `id@host`. IMAP summaries used to keep the angle brackets while
+  the thread cache dropped them, so lookups across those tables matched nothing. `envelope serve`
+  repairs older rows at startup. The repair changes only the `message_id` column: event payloads
+  and idempotency keys stay as written. Visible change: the top-level `message_id` in webhook
+  bodies, `/api/events` and `envelope analytics show --json` is now bare (`payload.message_id` is
+  unchanged). To build an `In-Reply-To` or `References` header from it, add the angle brackets.
+
 ## [1.3.5] — 2026-09-26
 
 ### rShield
