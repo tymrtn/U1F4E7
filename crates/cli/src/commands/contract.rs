@@ -58,11 +58,21 @@ pub fn agent_contract() -> Value {
                 "The `mailto:` compliance unsubscribe is a real SMTP surface and is now attribution-gated: `envelope unsubscribe` accepts repeatable --attr keys and requires a non-empty valid declaration before Governor/SMTP (a missing/invalid declaration fails closed with the canonical attribution error). HTTPS one-click unsubscribe is not an SMTP send and is unaffected.",
                 "Attribution fails closed in warn mode too: warn only softens a Governor VERDICT on an already-attributed send; it never waives the attribution precondition, so a bot-originated send with a missing/invalid declaration is refused in warn exactly as in required.",
                 "Governor scoring is a build-time Cargo feature (`governor`), off by default. outbound_safety.governor_gate.smtp_mode reports the gate compiled into this binary: `required` when built with the feature, `off` otherwise. In an `off` build SMTP sends are not scored by Governor, while send modes, the attribution precondition, and the attribution record still apply; the success attribution block's governor sub-object then reads {decision: disabled, route: null, mode: off}, including on queued/scheduled acceptance (no governor_decision_pending). No runtime input can change the mode.",
-                "v2 (envelope.agent_contract.v2) is retained as historical documentation at docs/schemas/envelope.agent_contract.v2.json; generic {code, reason} error handling is unaffected."
+                "v2 (envelope.agent_contract.v2) is retained as historical documentation at docs/schemas/envelope.agent_contract.v2.json; generic {code, reason} error handling is unaffected.",
+                "Crash-safe sends (additive): send/reply accept an optional idempotency key (`--idempotency-key` / `idempotency_key`); every send request is recorded as a durable intent before any network work, so an identical rerun returns the earlier outcome (idempotent_replay=true) instead of sending again; send results carry draft_id, idempotent_replay, retryable and warnings; delivery_uncertain, not_sent, sending and idempotency_key_conflict are possible send statuses; every send transition writes an `action_type=send` receipt to the action log, and action-log rows carry agent_id. See outbound_safety.crash_safety."
             ]
         },
         "consumers": ["cli", "mcp", "hermes", "codex"],
         "outbound_safety": {
+            "crash_safety": {
+                "intent": "Every send request (CLI send, MCP send/reply; immediate, queued, or scheduled) is written as a durable intent row, with its content and attachment bytes, before any network work. `draft send` / send_draft use the draft id itself as the operation id.",
+                "idempotency": "An explicit key (`--idempotency-key` / `idempotency_key`, printable ASCII up to 200 characters, stored only as a hash and scoped to the account and the requesting principal) names one message for as long as its record exists, including after discard: the same key with the same content returns the recorded outcome, and with different content returns status=idempotency_key_conflict and sends nothing. With no key, an identical request (same account, principal, sender, recipients by role, subject, bodies, threading, and attachment bytes) is matched while its intent is unresolved, queued, uncertain, or awaiting review, and for 15 minutes after it was sent; after that an identical request is a new message. Only a key guarantees exactly-one intent across retries; the fingerprint is a heuristic.",
+                "replay": "A matched request sends nothing and makes no Governor call. A sent intent returns its recorded result with idempotent_replay=true (exit 0). A queued intent returns its draft_id. A row that may have been delivered, is awaiting review, is being sent by another live process, or was discarded returns its status with retryable and error.code (exit 1).",
+                "attempts": "Each claim of a row is one attempt with its own Message-ID. An attempt commits `transmitting` after the server answers DATA and before the first body byte. A failure before that point, or a 4xx/5xx reply to any command including the body, sent nothing: the row returns to draft (status=not_sent, retryable=true unless the refusal was permanent). A failure after it without a server reply (connection lost, deadline) parks the row delivery_uncertain: it is never sent again automatically; verify delivery, then discard it to send a new copy. The result is recorded before QUIT, so a hanging QUIT cannot turn an accepted message into a failure.",
+                "recovery": "A row left `sending` by a process that died is resolved by the next send, `draft show`, `draft list`, and every scheduled-send sweep: an attempt that never reached the body returns to draft (a scheduled row comes due again); one that had started the body becomes delivery_uncertain. Liveness is an operating-system lock the sending process holds for the whole attempt, so a live but slow sender is never touched. A row whose owner cannot be checked (another host) is resolved the same way after a 15-minute lease.",
+                "receipts": "Every send transition writes one action-log row with action_type=send, draft_id (the operation id), message_id, agent_id, and action_status: the row's status after the transition in `draft show` terms (queued, drafted, sending, sent, delivery_uncertain, pending_review, blocked); a replay's receipt carries the underlying status with replay=true. action_taken is JSON (envelope.send_receipt.v1): surface, attempt_id, seq, from, to, phase, reason, replay, retryable, recipients (local only), recipient_count, payload_sha256 (envelope.payload.v1, every transmitted field), semantic_sha256 (envelope.semantic.v1: subject, lowercased recipients and normalized text, identical to the Mailroom bench's payload hash), key_kind, and evidence. The receipt commits in the same transaction as the state change; send_completed events carry the Message-ID in their message_id column. Agent webhooks (agent_action) carry identifiers and a recipient count, never recipient addresses.",
+                "durability": "SQLite runs with synchronous=FULL, so a committed intent, claim, or receipt survives power loss as well as a process crash."
+            },
             "actual_send_cooldown": {
                 "default_seconds": 60,
                 "env": "ENVELOPE_SEND_COOLDOWN_SECONDS",
@@ -367,7 +377,13 @@ fn surfaces() -> Value {
         send_input_schema(),
         object(
             json!({
-                "status": string("queued (default cooldown), sent, scheduled, drafted, denied, blocked, or invalid"),
+                "status": string("queued (default cooldown), sent, scheduled, drafted, denied, blocked, invalid, delivery_uncertain, not_sent, sending, pending_review, discarded, or idempotency_key_conflict"),
+                "idempotent_replay": json!({"type": "boolean", "description": "true when an earlier identical request (same idempotency key, or same payload with no key) answered this one and nothing new was sent or queued"}),
+                "retryable": json!({"type": "boolean", "description": "On a result that did not confirm a send: whether rerunning the same request may succeed without risking a duplicate"}),
+                "recorded": json!({"type": "boolean", "description": "On delivery_uncertain: whether Envelope recorded the uncertain state (false means recovery will record it)"}),
+                "warnings": json!({"type": "array", "items": {"type": "object"}, "description": "Present when the send succeeded but part of its record did not: [{code: audit_write_failed, detail, record_status}]. The command exits non-zero."}),
+                "imap_draft_deleted": json!({"type": "boolean", "description": "Whether a synced IMAP Drafts copy was deleted after send"}),
+                "draft_ui": json!({"type": "object", "description": "Dashboard review links for the draft row that carried the send"}),
                 "scheduled": json!({"type": "boolean", "description": "true on an `envelope send --at <time>` scheduled acceptance; the paired field is send_at (not send_after)"}),
                 "send_at": string("ISO8601 time an `envelope send --at` scheduled draft becomes due for the outbox sweep (scheduled-path field; the cooldown path uses send_after)"),
                 "sent": json!({"type": "boolean", "description": "MCP send/reply result flag when available"}),
@@ -388,7 +404,7 @@ fn surfaces() -> Value {
                 "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
                 "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. This is mailbox hygiene only — not independent delivery or legal proof."}),
                 "attribution": json!({"type": ["object", "null"], "description": "Additive sanitized attribution block on a SUCCESSFUL result (immediate send, or queued/scheduled acceptance): protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object ({decision, route, mode}) — null on queued/scheduled acceptance where governor_decision_pending marks the deferral to the scheduled-send sweep, or {decision: disabled, route: null, mode: off} in a build without the `governor` feature. Never a score, weight, threshold, body, raw recipient, secret, or attachment byte."}),
-                "draft_id": string("Local draft id when scheduled or draft-only"),
+                "draft_id": string("Local draft id: the durable record (operation id) of the send, present on every outcome"),
                 "to": string("Recipient address"),
                 "subject": string("Subject"),
                 "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view)"}),
@@ -742,8 +758,12 @@ fn sent_copy_output_schema() -> Value {
             "sent_mail": json!({"type": "object", "description": "Sent mailbox proof: folder, uid, message_url, lookup_status, lookup_error, copy_source, and ui. copy_source is provider|client_appended|unresolved|not_attempted — a client_appended copy is a local archive for mailbox hygiene, not independent delivery proof."}),
             "provider_sent_copy": json!({"type": ["object", "null"], "description": "Populated when the provider is expected to auto-file the message (e.g. Gmail). Contains the same proof fields as sent_mail. Null for generic/non-auto-save providers."}),
             "client_appended_copy": json!({"type": ["object", "null"], "description": "Populated when Envelope wrote a client-side IMAP-APPEND archive copy. Contains the same proof fields as sent_mail. Mailbox hygiene only — not independent delivery or legal proof."}),
-            "status": string("queued, sent, scheduled, drafted, or denied"),
-            "draft_id": string("Local draft id when queued or draft-only"),
+            "status": string("queued, sent, scheduled, drafted, denied, delivery_uncertain, not_sent, sending, pending_review, discarded, or idempotency_key_conflict"),
+            "draft_id": string("Local draft id: the durable record (operation id) of the send"),
+            "idempotent_replay": json!({"type": "boolean", "description": "true when an earlier identical request answered this one and nothing new was sent or queued"}),
+            "retryable": json!({"type": "boolean", "description": "On a result that did not confirm a send: whether retrying the same call may succeed without risking a duplicate"}),
+            "recorded": json!({"type": "boolean", "description": "On delivery_uncertain: whether Envelope recorded the uncertain state"}),
+            "warnings": json!({"type": "array", "items": {"type": "object"}, "description": "Present when the send succeeded but part of its record did not: [{code: audit_write_failed, detail, record_status}]"}),
             "to": string("Recipient address when sent"),
             "subject": string("Subject when sent"),
             "imap_draft_deleted": json!({"type": "boolean", "description": "Whether a synced IMAP Drafts copy was deleted after send"}),
@@ -784,6 +804,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "attach": array_of(string("File attachment path to snapshot or send")),
                     "attachments": array_of(string("File attachment path alias for attach")),
                     "folder": string_default("IMAP folder of original message", "INBOX"),
+                    "idempotency_key": idempotency_key_schema(),
                     "account": string("Account ID or email address")
                 }),
                 json!(["uid", "body", "attributes"]),
@@ -1269,10 +1290,20 @@ fn send_input_schema() -> Value {
             "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
             "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
             "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
+            "idempotency_key": idempotency_key_schema(),
             "account": string("Account ID or email address")
         }),
         json!(["to", "subject", "attributes"]),
     )
+}
+
+fn idempotency_key_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "Your own id for this message (printable ASCII, no spaces). Retrying with the same key never sends twice: it returns the earlier result, or idempotency_key_conflict if the content changed. Without a key, an identical request is recognized while the earlier one is unresolved or queued, and for 15 minutes after it was sent."
+    })
 }
 
 fn object(properties: Value, required: Value) -> Value {

@@ -6,10 +6,12 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
 use envelope_email_store::credential_store::{self, CredentialBackend};
+// The truthful persisted status for `draft show` and the draft envelope: sent,
+// pending_review, queued (a `draft` with a schedule) and drafted never collapse.
 use envelope_email_store::models::{
     AccountWithCredentials, AttachmentMeta, Draft, MessageSummary, canonical_message_id,
 };
-use envelope_email_transport::SmtpSender;
+use envelope_email_store::send_attempts::display_status as draft_display_status;
 use envelope_email_transport::compose::{
     self, ContextBlock, DEFAULT_PREVIEW_WORD_LIMIT, DraftKind,
 };
@@ -1355,33 +1357,6 @@ fn emit_draft_envelope(draft: &Draft, json: bool, authored: Option<&AuthoredBody
     }
 }
 
-/// The truthful persisted status for `draft show` / the draft envelope, derived
-/// from the durable `DraftStatus` (and `send_after` for a queued draft).
-///
-/// Previously the envelope hard-coded `"drafted"`, so `draft show` reported a
-/// SENT or PENDING-REVIEW draft as an ordinary local draft (real evidence). This
-/// distinguishes at least `sent`, `pending_review`, `queued` (a `draft` row with a
-/// `send_after` schedule), and ordinary `drafted`, and never collapses them.
-fn draft_display_status(draft: &Draft) -> &'static str {
-    use envelope_email_store::DraftStatus;
-    match draft.status {
-        DraftStatus::Sent => "sent",
-        DraftStatus::PendingReview => "pending_review",
-        DraftStatus::Blocked => "blocked",
-        DraftStatus::Sending => "sending",
-        DraftStatus::Syncing => "syncing",
-        DraftStatus::DeliveryUncertain => "delivery_uncertain",
-        DraftStatus::Discarded => "discarded",
-        DraftStatus::Draft => {
-            if draft.send_after.is_some() {
-                "queued"
-            } else {
-                "drafted"
-            }
-        }
-    }
-}
-
 /// Render the scope-defined draft envelope JSON from a stored draft + metadata.
 pub(crate) fn draft_envelope_json(draft: &Draft) -> serde_json::Value {
     let meta = draft
@@ -1724,9 +1699,11 @@ pub async fn run_edit(
 }
 
 /// `envelope draft show <id>` — print the draft envelope (metadata + abridged
-/// preview). Read-only; no IMAP access.
+/// preview). No IMAP access. Resolves `sending` rows whose owner has exited
+/// first, so the status shown is never a send that nothing is running.
 pub fn run_show(id: &str, json: bool) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
+    recover_stale_sends(&db);
     let draft = db
         .get_draft(id)
         .context("failed to get draft")?
@@ -1739,11 +1716,31 @@ pub fn run_show(id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Recovery on a read path: a failure here must not hide the drafts the
+/// reader asked for, so it is reported on stderr and the read goes on.
+fn recover_stale_sends(db: &Database) {
+    match db.reconcile_stale_sending_now() {
+        Ok(report) => {
+            for id in &report.released {
+                info!("draft {id}: its sender exited before transmitting; returned to draft");
+            }
+            for id in &report.parked {
+                warn!("draft {id}: its sender exited mid-send; parked as delivery_uncertain");
+            }
+        }
+        Err(e) => eprintln!(
+            "warning: could not recover stale sends ({e}); statuses may show `sending` for \
+             sends that are no longer running"
+        ),
+    }
+}
+
 // ─── draft list ──────────────────────────────────────────────────────────
 
 #[tokio::main]
 pub async fn run_list(account: Option<&str>, json: bool, backend: CredentialBackend) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
+    recover_stale_sends(&db);
     let passphrase =
         credential_store::get_or_create_passphrase(backend).context("credential store error")?;
     let acct = resolve_account(&db, account)?;
@@ -2162,7 +2159,18 @@ pub async fn run_send(
             // concurrent material edit conflicts rather than binding a stale
             // declaration or leaving a partial schedule; a re-queued
             // pending_review draft transitions to the due `draft` status.
-            queue_bot_draft_for_send(&db, id, precheck.revision, &send_at, &declared)?;
+            queue_bot_draft_for_send(
+                &db,
+                id,
+                precheck.revision,
+                &send_at,
+                &declared,
+                &envelope_email_store::QueueContext {
+                    surface: "cli_draft_send",
+                    agent_id: None,
+                    cooldown_seconds: Some(cd),
+                },
+            )?;
             // The additive success block is built from the SAME validated
             // resolution — no re-resolve that could observe edited content.
             let queued_attribution =
@@ -2172,18 +2180,6 @@ pub async fn run_send(
                     None,
                     true,
                 );
-            // Catalog event: a send was queued into the outbox. Payload carries
-            // only the transition metadata — no recipients, no body.
-            let _ = db.emit_catalog_event(
-                &precheck.account_id,
-                envelope_email_store::event_catalog::SEND_QUEUED,
-                Some(serde_json::json!({
-                    "draft_id": id,
-                    "send_after": send_at,
-                    "cooldown_seconds": cd,
-                })),
-                None,
-            );
             if json {
                 println!(
                     "{}",
@@ -2209,18 +2205,32 @@ pub async fn run_send(
 
     // Catalog event: the operator approved this draft for immediate send. This
     // is the human-confirmed transition (--send-now --confirm-send-now).
-    if let Ok(db) = Database::open_default()
-        && let Ok(Some(draft)) = db.get_draft(id)
     {
-        let _ = db.emit_catalog_event(
-            &draft.account_id,
-            envelope_email_store::event_catalog::DRAFT_APPROVED,
-            Some(serde_json::json!({ "draft_id": id })),
-            None,
-        );
+        let db = Database::open_default().context("failed to open database")?;
+        if let Some(draft) = db.get_draft(id).context("failed to load draft")? {
+            db.emit_catalog_event(
+                &draft.account_id,
+                envelope_email_store::event_catalog::DRAFT_APPROVED,
+                Some(serde_json::json!({ "draft_id": id })),
+                None,
+            )
+            .context("audit_unavailable: could not record the send approval; nothing was sent")?;
+        }
     }
 
-    let outcome = send_existing_draft(id, account, backend, SendSurface::Cli, &declared).await?;
+    let outcome =
+        match send_existing_draft(id, account, backend, SendSurface::Cli, &declared, None).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if json
+                    && let Some(not_confirmed) =
+                        e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
+                {
+                    println!("{}", not_confirmed.body);
+                }
+                return Err(e);
+            }
+        };
     if json {
         println!("{}", outcome.json);
     } else {
@@ -2241,6 +2251,14 @@ pub async fn run_send(
             (None, None) => println!("Sent UID: unavailable ({})", outcome.lookup_status),
             (None, Some(uid)) => println!("Sent UID: {uid}"),
         }
+    }
+    if outcome.unrecorded {
+        bail!(
+            "draft {id} was accepted by the server (message_id={}) but Envelope could not \
+             record it as sent; it is parked and will never be re-sent. Check the Sent folder \
+             or the recipient, then `envelope draft discard {id}`.",
+            outcome.message_id
+        );
     }
     Ok(())
 }
@@ -2288,56 +2306,6 @@ fn ensure_draft_account_binding(
     Ok(())
 }
 
-/// Releases an immediate-send `sending` claim back to `draft` on early exit
-/// (any pre-SMTP failure, including panics). Disarmed after SMTP acceptance —
-/// from that point the claim may only be left via `mark_draft_sent` or an
-/// explicit anti-duplicate park.
-struct SendClaimGuard<'a> {
-    db: &'a Database,
-    draft_id: String,
-    /// Opaque owner lease token from the claim; release requires it.
-    lease: String,
-    armed: bool,
-}
-
-impl<'a> SendClaimGuard<'a> {
-    fn new(db: &'a Database, draft_id: &str, lease: String) -> Self {
-        Self {
-            db,
-            draft_id: draft_id.to_string(),
-            lease,
-            armed: true,
-        }
-    }
-
-    /// SMTP was accepted: the claim must no longer be released to `draft`.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for SendClaimGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            match self.db.release_sending_draft(
-                &self.draft_id,
-                &self.lease,
-                envelope_email_store::DraftStatus::Draft,
-            ) {
-                Ok(true) => {}
-                Ok(false) => warn!(
-                    "draft {}: send-claim release matched no `sending` row",
-                    self.draft_id
-                ),
-                Err(e) => warn!(
-                    "draft {}: send-claim release failed: {e} — draft stays inert as `sending`",
-                    self.draft_id
-                ),
-            }
-        }
-    }
-}
-
 pub(crate) struct SentDraftOutcome {
     pub json: serde_json::Value,
     pub to_addr: String,
@@ -2347,6 +2315,27 @@ pub(crate) struct SentDraftOutcome {
     pub sent_uid: Option<u32>,
     pub sent_url: Option<String>,
     pub lookup_status: &'static str,
+    /// The server accepted the message but its `sent` state was not recorded.
+    pub unrecorded: bool,
+}
+
+impl SentDraftOutcome {
+    /// The recorded outcome of an already-sent draft: `draft send` of a sent
+    /// draft answers from the record and sends nothing.
+    fn replay(draft: &Draft) -> Self {
+        let json = super::send_attempt::sent_replay(draft);
+        Self {
+            to_addr: draft.to_addr.clone(),
+            subject: draft.subject.clone().unwrap_or_default(),
+            message_id: draft.message_id.clone().unwrap_or_default(),
+            sent_folder: json["sent_folder"].as_str().map(str::to_string),
+            sent_uid: json["sent_uid"].as_u64().map(|uid| uid as u32),
+            sent_url: None,
+            lookup_status: "recorded",
+            unrecorded: false,
+            json,
+        }
+    }
 }
 
 /// Attribution precheck for a draft-send **before any side effect** (queueing or
@@ -2427,7 +2416,7 @@ pub(crate) fn precheck_draft(
         anyhow::anyhow!("attribution resolution unavailable for draft {draft_id}")
     })?;
     let refusal =
-        super::governor_gate::precheck_attribution(db, &draft.account_id, &gov_req, agent_id);
+        super::governor_gate::precheck_attribution(db, &draft.account_id, &gov_req, agent_id)?;
     Ok(DraftSendPrecheck {
         revision: draft.revision,
         account_id: draft.account_id.clone(),
@@ -2476,31 +2465,47 @@ pub(crate) fn queue_bot_draft_for_send(
     expected_revision: i64,
     send_after: &str,
     declared: &[String],
+    context: &envelope_email_store::QueueContext<'_>,
 ) -> Result<()> {
     let attribution = envelope_email_transport::attribution_persist::PersistedDeclaration::new_bot(
         declared,
         expected_revision,
     )
     .to_value();
-    db.queue_draft_for_send(draft_id, expected_revision, send_after, &attribution)
-        .context("failed to atomically queue draft (declaration + schedule + due status)")
+    db.queue_draft_for_send(
+        draft_id,
+        expected_revision,
+        send_after,
+        &attribution,
+        context,
+    )
+    .context("failed to atomically queue draft (declaration + schedule + due status)")
 }
 
 /// Send an already-created draft (by local UUID or IMAP UID) without printing
-/// anything. This is the single source of truth for "send this draft": it sends
-/// over SMTP, cleans up the IMAP Drafts copy, optionally appends to Sent, and —
-/// critically — marks the local draft row as sent so the local DB can never be
-/// left at `status=draft` with no `sent_at` after a successful send.
+/// anything. The draft id is the operation key: the row is claimed for one
+/// attempt, transmitted through the shared attempt core, and left `sent`,
+/// released (nothing sent), or `delivery_uncertain`. Rerunning it on a `sent`
+/// draft answers from the record; on a `sending` row whose owner has exited,
+/// recovery resolves the row first.
 pub(crate) async fn send_existing_draft(
     id: &str,
     account: Option<&str>,
     backend: CredentialBackend,
     surface: SendSurface,
     declared: &[String],
+    agent_id: Option<&str>,
 ) -> Result<SentDraftOutcome> {
+    use super::send_attempt::{
+        AttemptSurface, SendNotConfirmed, claim_row, state_report, transmit_claimed,
+    };
+    use envelope_email_transport::smtp_submit::AccountConnector;
+
     let db = Database::open_default().context("failed to open database")?;
     let passphrase =
         credential_store::get_or_create_passphrase(backend).context("credential store error")?;
+    db.reconcile_stale_sending_now()
+        .context("could not recover stale sends before sending")?;
 
     // `id` can be either a local draft UUID or an IMAP UID (numeric).
     let is_imap_uid = id.parse::<u32>().is_ok();
@@ -2534,30 +2539,21 @@ pub(crate) async fn send_existing_draft(
         .get_account_with_credentials(&acct.id, &passphrase)
         .context("failed to decrypt credentials")?;
 
-    // Determine the IMAP UID to fetch the draft from
-    let imap_uid: Option<u32> = if let Some(ref d) = local_draft {
-        d.imap_uid
-    } else if is_imap_uid {
-        Some(id.parse::<u32>().unwrap())
-    } else {
-        None
-    };
-
     // ── Resolve raw numeric IMAP ids to the local draft record (fail closed) ──
     // Every send rides the durable claim of a LOCAL draft. A bare IMAP UID is
     // resolved through the existing account+imap_uid mapping; if no local
     // record exists there is no revision to claim and no persisted cleanup
     // identity, so the send is refused with an import/review path instead of
     // an unclaimed compose-and-guess flow.
-    let local_draft = match local_draft {
-        Some(d) => Some(d),
+    let draft = match local_draft {
+        Some(d) => d,
         None if is_imap_uid => {
             let uid: u32 = id.parse().unwrap();
             match db
                 .get_draft_by_imap_uid(&acct.id, uid)
                 .context("failed to resolve IMAP draft to a local record")?
             {
-                Some(d) => Some(d),
+                Some(d) => d,
                 None => bail!(
                     "IMAP draft UID {uid} in account {} has no local Envelope draft record \
                      and cannot be sent safely. Review it first (dashboard Drafts view or \
@@ -2567,417 +2563,198 @@ pub(crate) async fn send_existing_draft(
                 ),
             }
         }
-        None => None,
+        None => bail!("draft not found: {id}"),
     };
 
     // ── Bind credentials to the draft's account (before any network work) ──
-    if let Some(d) = &local_draft {
-        ensure_draft_account_binding(&d.id, &d.account_id, &acct.id, &acct.username)?;
-    }
+    ensure_draft_account_binding(&draft.id, &draft.account_id, &acct.id, &acct.username)?;
 
     // ── Exclusive durable send claim ──
-    // The same `sending` claim the scheduled sweep uses, acquired before any
-    // Governor/SMTP work: an in-flight sweep claim, a provider sync, a
-    // concurrent edit (stale revision), or any non-`draft` status loses here
-    // instead of double-sending or transmitting a stale snapshot. The claim
-    // returns an owner lease token: only its holder can mark-sent, park, or
-    // release. The guard releases the claim back to `draft` on every pre-SMTP
-    // failure; after SMTP acceptance the claim is left only via
-    // `mark_draft_sent`.
-    let mut claim_guard: Option<SendClaimGuard<'_>> = None;
-    let local_draft = match local_draft {
-        Some(d) => {
-            let lease = match db
-                .claim_draft_for_immediate_send(&d.id, d.revision)
-                .context("failed to claim draft for sending")?
-            {
-                Some(lease) => lease,
-                None => {
-                    let status = db
-                        .get_draft(&d.id)
-                        .ok()
-                        .flatten()
-                        .map(|cur| cur.status.as_str().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    bail!(
-                        "draft {} is not sendable right now (status '{status}'): it may be \
-                         mid-send, mid-sync, awaiting review, or just modified — re-check \
-                         with `envelope draft show {}`",
-                        d.id,
-                        d.id
-                    );
-                }
-            };
-            claim_guard = Some(SendClaimGuard::new(&db, &d.id, lease));
-            // Reload the claimed row: the authoritative send snapshot.
-            let claimed = db
-                .get_draft(&d.id)
-                .context("failed to reload claimed draft")?
-                .ok_or_else(|| anyhow::anyhow!("draft vanished after claim: {}", d.id))?;
-            Some(claimed)
+    // An in-flight claim, a provider sync, a concurrent edit (stale revision),
+    // or any non-`draft` status loses here instead of double-sending or
+    // transmitting a stale snapshot.
+    let label = match surface {
+        SendSurface::Mcp => "mcp_send_draft",
+        _ => "cli_draft_send",
+    };
+    let message_id = format!(
+        "<{}>",
+        envelope_email_transport::smtp::generate_message_id(&creds)
+    );
+    let start = envelope_email_store::AttemptStart::new(&message_id, label, agent_id);
+    let Some(held) = claim_row(&db, &draft, &start)? else {
+        let current = db
+            .get_draft(&draft.id)?
+            .ok_or_else(|| anyhow::anyhow!("draft vanished: {}", draft.id))?;
+        if current.status == envelope_email_store::DraftStatus::Sent {
+            db.record_send_replay(&current.id, agent_id, label)?;
+            return Ok(SentDraftOutcome::replay(&current));
         }
-        None => None,
+        return Err(SendNotConfirmed {
+            body: state_report(&current),
+        }
+        .into());
     };
 
-    // Threading (In-Reply-To / References) + preserved Message-ID from the
-    // local draft metadata — preferred so reply headers survive the send.
-    let (meta_in_reply_to, meta_references, _meta_message_id) = local_draft
-        .as_ref()
-        .map(threading_for_draft)
-        .unwrap_or((None, Vec::new(), None));
-
-    // ── Fetch draft content from IMAP (source of truth) ──
-    let (
-        to_addr,
-        subject,
-        text_body,
-        html_body,
-        cc_addr,
-        bcc_addr,
-        reply_to,
-        in_reply_to,
-        references,
-    ) = if let Some(uid) = imap_uid {
-        if acct.imap_host.is_empty() {
-            if let Some(ref d) = local_draft {
-                (
-                    d.to_addr.clone(),
-                    d.subject.clone().unwrap_or_default(),
-                    d.text_content.clone(),
-                    d.html_content.clone(),
-                    d.cc_addr.clone(),
-                    d.bcc_addr.clone(),
-                    d.reply_to.clone(),
-                    d.in_reply_to.clone().or(meta_in_reply_to.clone()),
-                    meta_references.clone(),
-                )
-            } else {
-                bail!("draft {id} not found locally and account has no IMAP");
-            }
-        } else {
-            let mut client = imap::connect(&creds)
-                .await
-                .context("failed to connect to IMAP to fetch draft")?;
-
-            let drafts_folder = detect_drafts_folder(&mut client, &db, &acct.id)
-                .await
-                .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
-                .unwrap_or_else(|| "Drafts".to_string());
-
-            let msg = imap::fetch_message(&mut client, &drafts_folder, uid)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to fetch draft UID {uid} from IMAP: {e}"))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("draft UID {uid} not found in IMAP {drafts_folder}")
-                })?;
-
-            // Prefer locally-stored threading metadata; fall back to the
-            // headers carried on the IMAP draft itself.
-            let in_reply_to = meta_in_reply_to.clone().or(msg.in_reply_to.clone());
-            let references = if !meta_references.is_empty() {
-                meta_references.clone()
-            } else {
-                msg.references
-                    .as_deref()
-                    .map(envelope_email_transport::threading::parse_references)
-                    .unwrap_or_default()
-            };
-
-            (
-                msg.to_addr,
-                msg.subject,
-                msg.text_body,
-                msg.html_body,
-                msg.cc_addr,
-                None::<String>,
-                None::<String>,
-                in_reply_to,
-                references,
-            )
+    // ── Content: the IMAP copy is the source of truth when one exists ──
+    let claimed = held.claim.draft.clone();
+    let outgoing = match outgoing_for_draft(&db, &creds, &claimed).await {
+        Ok(outgoing) => outgoing,
+        Err(e) => {
+            db.release_attempt(
+                &claimed.id,
+                &held.claim.token,
+                envelope_email_store::DraftStatus::Draft,
+                envelope_email_store::ReleaseBasis::NotStarted,
+                "content_unavailable",
+                None,
+                None,
+            )?;
+            return Err(e);
         }
-    } else if let Some(ref d) = local_draft {
-        (
-            d.to_addr.clone(),
-            d.subject.clone().unwrap_or_default(),
-            d.text_content.clone(),
-            d.html_content.clone(),
-            d.cc_addr.clone(),
-            d.bcc_addr.clone(),
-            d.reply_to.clone(),
-            d.in_reply_to.clone().or(meta_in_reply_to.clone()),
-            meta_references.clone(),
-        )
-    } else {
-        bail!("draft not found: {id}");
     };
 
-    // Attachments are snapshotted on the local draft at create time, so a draft
-    // created with `--attach` re-includes them on send even when content is
-    // otherwise fetched from the IMAP copy (which we do not re-parse for bytes).
-    let attachments = match local_draft.as_ref() {
-        Some(d) => {
-            decode_attachments(&d.attachments).context("failed to decode draft attachments")?
-        }
-        None => Vec::new(),
-    };
-
-    // ── Governor gate (fail-closed before any real SMTP) ──
-    //
-    // This primitive is shared by the CLI `draft send` and MCP `send_draft`
-    // surfaces, so both converge on identical blind-attribution semantics. The
-    // draft is a persisted, contextual send: threading and attachments are
-    // re-derived from what will actually be transmitted.
-    let gov_attribution = {
-        let gov_req = super::governor_gate::governor_request(
-            &db,
-            &acct.id,
-            super::governor_gate::account_domain(&creds.account.username),
-            &subject,
-            &to_addr,
-            cc_addr.as_deref(),
-            bcc_addr.as_deref(),
-            surface,
-            Some(id),
-            &attachments,
-            in_reply_to.as_deref(),
-            text_body.as_deref(),
-            html_body.as_deref(),
+    let sent = transmit_claimed(
+        &db,
+        &creds,
+        held,
+        &outgoing,
+        &AttemptSurface {
+            governor: surface,
             declared,
-        );
-        // gate_with_attribution refuses an unattributed/invalid request BEFORE
-        // Governor is spawned; the send-claim guard releases the draft on bail.
-        // The canonical `{status, error}` payload is carried as the error string
-        // so the MCP/CLI surface reports structured attribution/Governor recovery.
-        let gov_outcome = super::governor_gate::gate_and_record(&db, &acct.id, &gov_req);
-        if !gov_outcome.allowed {
-            bail!("{}", gov_outcome.response_json());
-        }
-        gov_outcome.success_attribution()
-    };
+            agent_id,
+        },
+        super::send_attempt::Gate::Run,
+        &AccountConnector::new(&creds),
+    )
+    .await?;
 
-    // ── Send via SMTP (full path so In-Reply-To / References survive) ──
-    // A reply must carry its parent in References even when neither the draft
-    // metadata nor the parent's own headers supplied a chain.
+    let mut json = super::send_attempt::sent_json(&sent, &outgoing, &acct.id);
+    json["draft_id"] = serde_json::json!(id);
+    if let Some(map) = json.as_object_mut() {
+        map.remove("sent");
+    }
+    let sent_url = sent.copy.proof.message_url(&acct.id);
+    Ok(SentDraftOutcome {
+        json,
+        to_addr: outgoing.to,
+        subject: outgoing.subject,
+        message_id: sent.message_id,
+        sent_folder: sent.copy.proof.folder.clone(),
+        sent_uid: sent.copy.proof.uid,
+        sent_url,
+        lookup_status: sent.copy.proof.lookup_status,
+        unrecorded: !sent.warnings.is_empty(),
+    })
+}
+
+/// The message to transmit for a claimed draft: fetched from the provider
+/// Drafts copy when the draft is synced there (threading from local metadata
+/// first), otherwise from the local row.
+async fn outgoing_for_draft(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    draft: &Draft,
+) -> Result<super::send_attempt::Outgoing> {
+    let local = super::send_attempt::Outgoing::of_draft(draft, creds)?;
+    let Some(uid) = draft.imap_uid else {
+        return Ok(local);
+    };
+    if creds.account.imap_host.is_empty() {
+        return Ok(local);
+    }
+    let (meta_in_reply_to, meta_references, _) = threading_for_draft(draft);
+    let mut client = imap::connect(creds)
+        .await
+        .context("failed to connect to IMAP to fetch draft")?;
+    let drafts_folder = detect_drafts_folder(&mut client, db, &draft.account_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("drafts folder detection failed: {e}"))?
+        .unwrap_or_else(|| "Drafts".to_string());
+    let msg = imap::fetch_message(&mut client, &drafts_folder, uid)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch draft UID {uid} from IMAP: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("draft UID {uid} not found in IMAP {drafts_folder}"))?;
+
+    // Prefer locally-stored threading metadata; fall back to the headers
+    // carried on the IMAP draft itself.
+    let in_reply_to = meta_in_reply_to.or(msg.in_reply_to.clone());
+    let references = if !meta_references.is_empty() {
+        meta_references
+    } else {
+        msg.references
+            .as_deref()
+            .map(envelope_email_transport::threading::parse_references)
+            .unwrap_or_default()
+    };
     let references = envelope_email_transport::reply::ensure_references_chain(
         &references,
         in_reply_to.as_deref(),
     );
-    let references_opt = if references.is_empty() {
-        None
-    } else {
-        Some(references.as_slice())
+    Ok(super::send_attempt::Outgoing {
+        to: msg.to_addr,
+        subject: msg.subject,
+        text: msg.text_body,
+        html: msg.html_body,
+        cc: msg.cc_addr,
+        bcc: None,
+        reply_to: None,
+        in_reply_to,
+        references,
+        ..local
+    })
+}
+
+/// Best-effort deletion of a sent draft's provider Drafts copy, only after its
+/// sent state is recorded. Identity is the exact detected folder plus the
+/// persisted pre-send Message-ID; only the single exact match is deleted.
+/// Skips and failures are logged, never claimed as done.
+pub(crate) async fn cleanup_provider_draft_copy(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    draft: &Draft,
+) -> bool {
+    use envelope_email_transport::draft_cleanup::{
+        ProviderDraftCleanup, delete_provider_draft_exact, resolve_draft_cleanup_target,
     };
-    let send_from = local_draft
-        .as_ref()
-        .map(|draft| from_header_for_draft(draft.metadata.as_ref(), &creds))
-        .unwrap_or_else(|| account_from_header(&creds));
-    let message_id = SmtpSender::send(
-        &creds,
-        &to_addr,
-        &subject,
-        text_body.as_deref(),
-        html_body.as_deref(),
-        Some(&send_from),
-        cc_addr.as_deref(),
-        bcc_addr.as_deref(),
-        reply_to.as_deref(),
-        in_reply_to.as_deref(),
-        references_opt,
-        &attachments,
-    )
-    .await
-    .context("failed to send draft")?;
-
-    let provider_type = db.get_provider_type(&acct.id).ok().flatten();
-
-    // ── Durable sent state FIRST (same post-SMTP discipline as the sweep) ──
-    // SMTP was accepted: disarm the claim guard (the claim must never return
-    // to `draft`) and persist the sent state via `mark_draft_sent`, which
-    // transitions only our held `sending` claim. If persistence fails, park
-    // the claim as `blocked` (or leave it inert as `sending`) and SKIP
-    // provider cleanup — never report durable success, never leave a
-    // retransmit path.
-    let lease = claim_guard.as_mut().map(|guard| {
-        guard.disarm();
-        guard.lease.clone()
-    });
-    let mut sent_recorded = local_draft.is_none();
-    if let (Some(d), Some(lease)) = (&local_draft, &lease) {
-        match db.mark_draft_sent(&d.id, lease, Some(&message_id)) {
-            Ok(()) => sent_recorded = true,
-            Err(e) => {
-                let parked = db.park_delivery_uncertain(&d.id, lease).unwrap_or(false);
+    let target = match resolve_draft_cleanup_target(db, draft) {
+        Ok(target) => target,
+        Err(reason) => {
+            if draft.imap_uid.is_some() {
                 warn!(
-                    "draft {} was transmitted (message_id={message_id}) but sent-state \
-                     persistence failed: {e} — parked as delivery_uncertain={parked}; \
-                     provider cleanup skipped. Reconcile explicitly: verify delivery \
-                     (Sent folder / recipient), then `envelope draft discard {}`. It \
-                     will never be re-sent automatically.",
-                    d.id, d.id
+                    "draft {}: provider draft cleanup skipped: {reason}",
+                    draft.id
                 );
             }
+            return false;
         }
-    }
-
-    // ── Provider draft cleanup (exact + unique, only after durable state) ──
-    // Local drafts resolve identity from the detected-folder cache + the
-    // persisted pre-send Message-ID; raw IMAP sends use the folder the content
-    // was actually fetched from + the fetched Message-ID. In both cases only
-    // the single exact Message-ID match is deleted — never a raw UID in a
-    // guessed folder. Skips and failures are logged, never claimed as done.
-    let cleanup_target = if !sent_recorded {
-        None
-    } else if let Some(d) = &local_draft {
-        // Identity needs only the exact detected folder + persisted
-        // Message-ID; a stored UID is neither required nor trusted.
-        match envelope_email_transport::draft_cleanup::resolve_draft_cleanup_target(&db, d) {
-            Ok(target) => Some(target),
-            Err(reason) => {
-                if d.imap_uid.is_some() {
-                    warn!("draft {}: provider draft cleanup skipped: {reason}", d.id);
-                }
-                None
-            }
-        }
-    } else {
-        None
     };
-    // Reported from the ACTUAL cleanup outcome — never inferred from UID
-    // presence or from the absence of local state.
-    let mut imap_draft_deleted = false;
-    if let Some(target) = cleanup_target
-        && !acct.imap_host.is_empty()
-    {
-        use envelope_email_transport::draft_cleanup::{
-            ProviderDraftCleanup, delete_provider_draft_exact,
-        };
-        match imap::connect(&creds).await {
-            Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
-                Ok(ProviderDraftCleanup::Deleted { uid }) => {
-                    imap_draft_deleted = true;
-                    info!(
-                        "removed provider draft copy (UID {uid} in {})",
-                        target.folder
-                    );
-                }
-                Ok(ProviderDraftCleanup::Skipped(reason)) => {
-                    warn!(
-                        "provider draft cleanup skipped in {}: {reason}",
-                        target.folder
-                    );
-                }
-                Err(e) => warn!("provider draft cleanup failed in {}: {e}", target.folder),
-            },
-            Err(e) => {
-                warn!("failed to connect to IMAP to clean up sent draft: {e}");
+    match imap::connect(creds).await {
+        Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
+            Ok(ProviderDraftCleanup::Deleted { uid }) => {
+                info!(
+                    "removed provider draft copy (UID {uid} in {})",
+                    target.folder
+                );
+                true
             }
+            Ok(ProviderDraftCleanup::Skipped(reason)) => {
+                warn!(
+                    "provider draft cleanup skipped in {}: {reason}",
+                    target.folder
+                );
+                false
+            }
+            Err(e) => {
+                warn!("provider draft cleanup failed in {}: {e}", target.folder);
+                false
+            }
+        },
+        Err(e) => {
+            warn!("failed to connect to IMAP to clean up sent draft: {e}");
+            false
         }
     }
-    if local_draft.is_some() && !sent_recorded {
-        bail!(
-            "draft {id} was transmitted (message_id={message_id}) but the sent state could \
-             not be recorded; the draft is parked as delivery_uncertain and will never be \
-             re-sent. Reconcile explicitly: verify delivery (Sent folder / recipient), \
-             then `envelope draft discard {id}`."
-        );
-    }
-    // Catalog event: the send completed. Payload carries only the draft id and
-    // message-id transition — never recipients or body.
-    let _ = db.emit_catalog_event(
-        &creds.account.id,
-        envelope_email_store::event_catalog::SEND_COMPLETED,
-        Some(serde_json::json!({
-            "draft_id": id,
-            "message_id": message_id,
-        })),
-        None,
-    );
-
-    // ── Resolve Sent-folder copy (pre-lookup before any client append) ──
-    let copy_result = resolve_sent_copy_after_send(
-        &db,
-        &creds,
-        provider_type.as_deref(),
-        &send_from,
-        &to_addr,
-        &subject,
-        text_body.as_deref(),
-        html_body.as_deref(),
-        cc_addr.as_deref(),
-        bcc_addr.as_deref(),
-        reply_to.as_deref(),
-        in_reply_to.as_deref(),
-        &references,
-        &message_id,
-        &attachments,
-    )
-    .await;
-
-    let sent_mail_appended = copy_result.sent_mail_appended;
-    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
-    let sent_mail_proof = copy_result.proof;
-
-    // ── Durable Sent-proof annotation (direct/scheduled parity) ──
-    // Persist the same dedicated, folder-qualified Sent proof the scheduled sweep
-    // records, so an immediate `draft send` / MCP `send_draft` no longer diverges
-    // from a scheduled send. Only a durable draft row has anything to persist;
-    // a plain direct send with no local draft does not. Strictly AFTER terminal
-    // sent persistence and best-effort — a proof failure never retransmits.
-    if let Some(d) = &local_draft
-        && sent_recorded
-    {
-        match db.record_sent_copy_proof(
-            &d.id,
-            sent_mail_proof.folder.as_deref(),
-            sent_mail_proof.uid,
-            sent_mail_proof.lookup_status,
-            sent_mail_proof.copy_source,
-        ) {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                "draft {}: Sent-copy proof not recorded (row is not `sent`)",
-                d.id
-            ),
-            Err(e) => warn!("draft {}: failed to record Sent-copy proof: {e}", d.id),
-        }
-    }
-
-    let (provider_sent_copy, client_appended_copy) =
-        sent_copy_convenience_objects(&acct.id, &sent_mail_proof);
-
-    let sent_message_url = sent_mail_proof.message_url(&acct.id);
-    let sent_ui = sent_mail_proof.ui(&acct.id);
-
-    let json = serde_json::json!({
-        "status": "sent",
-        "draft_id": id,
-        "to": to_addr.clone(),
-        "subject": subject.clone(),
-        "message_id": message_id.clone(),
-        "imap_draft_deleted": imap_draft_deleted,
-        "sent_mail_appended": sent_mail_appended,
-        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
-        "sent_folder": sent_mail_proof.folder.clone(),
-        "sent_uid": sent_mail_proof.uid,
-        "sent_message_url": sent_message_url.clone(),
-        "sent_mail": sent_mail_proof_json(&acct.id, &sent_mail_proof),
-        "provider_sent_copy": provider_sent_copy,
-        "client_appended_copy": client_appended_copy,
-        "attribution": gov_attribution,
-        "ui": sent_ui,
-        "draft_ui": ui::draft_ui(&acct.id, id),
-    });
-
-    Ok(SentDraftOutcome {
-        json,
-        to_addr,
-        subject,
-        message_id,
-        sent_folder: sent_mail_proof.folder.clone(),
-        sent_uid: sent_mail_proof.uid,
-        sent_url: sent_message_url,
-        lookup_status: sent_mail_proof.lookup_status,
-    })
 }
 
 // ─── draft discard ───────────────────────────────────────────────────────
@@ -3992,6 +3769,7 @@ mod tests {
             precheck.revision,
             "2000-01-01T00:00:00Z",
             &declared,
+            &envelope_email_store::QueueContext::STORE,
         )
         .expect("queue at the validated revision succeeds");
 
@@ -4047,6 +3825,7 @@ mod tests {
             validated_rev,
             "2000-01-01T00:00:00Z",
             &declared,
+            &envelope_email_store::QueueContext::STORE,
         )
         .expect_err("a stale-revision queue must conflict");
         assert!(
@@ -4410,7 +4189,16 @@ mod tests {
         let fn_start = src
             .find("pub(crate) async fn send_existing_draft")
             .expect("shared durable draft-send helper present");
-        let body = &src[fn_start..];
+        let fn_len = src[fn_start..].find("\n}\n").expect("function end");
+        assert!(
+            src[fn_start..fn_start + fn_len].contains("transmit_claimed("),
+            "draft send transmits through the shared attempt core"
+        );
+        let core = include_str!("send_attempt.rs");
+        let core_start = core
+            .find("pub(crate) async fn transmit_claimed")
+            .expect("shared attempt core present");
+        let body = &core[core_start..];
         let resolve_at = body
             .find("resolve_sent_copy_after_send(")
             .expect("direct path resolves the Sent copy");

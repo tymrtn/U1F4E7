@@ -37,6 +37,7 @@ pub mod send_policy;
 pub mod sent_proof;
 pub mod sieve;
 pub mod smtp;
+pub mod smtp_submit;
 pub mod snooze_time;
 pub mod threading;
 pub mod threat;

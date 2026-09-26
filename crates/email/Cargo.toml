@@ -13,6 +13,9 @@ description = "IMAP/SMTP transport, auto-discovery, and MIME building for Envelo
 # without it, SMTP sends are not scored by Governor. This is a build-time choice
 # so no environment variable, CLI flag, or config key can change it at runtime.
 governor = []
+# A scripted plaintext SMTP server and connector for tests of send paths.
+# Enabled only by dev-dependencies; release builds never compile it.
+test-support = []
 
 [dependencies]
 envelope-email-store = { path = "../store" }

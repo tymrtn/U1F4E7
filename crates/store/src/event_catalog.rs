@@ -82,6 +82,20 @@ impl Database {
         payload: Option<serde_json::Value>,
         agent_id: Option<&str>,
     ) -> Result<Event> {
+        self.emit_catalog_event_for_message(account_id, event_type, payload, agent_id, None)
+    }
+
+    /// [`Self::emit_catalog_event`] for a transition about one message: the
+    /// Message-ID goes in the event's `message_id` column, where readers
+    /// match on it, not only in the payload.
+    pub fn emit_catalog_event_for_message(
+        &self,
+        account_id: &str,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+        agent_id: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<Event> {
         let now = chrono::Utc::now().to_rfc3339();
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -89,7 +103,7 @@ impl Database {
             event_type: event_type.to_string(),
             folder: "lifecycle".to_string(),
             uid: None,
-            message_id: None,
+            message_id: message_id.map(str::to_string),
             from_addr: None,
             subject: None,
             snippet: None,
