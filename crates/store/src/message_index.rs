@@ -90,7 +90,7 @@ impl Database {
                     folder,
                     uidvalidity as i64,
                     message.uid as i64,
-                    message.message_id,
+                    crate::message_ids::stored_message_id(message.message_id.as_deref()),
                     message.from_addr,
                     message.to_addr,
                     message.subject,
