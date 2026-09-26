@@ -86,7 +86,8 @@
       "The `mailto:` compliance unsubscribe is a real SMTP surface and is now attribution-gated: `envelope unsubscribe` accepts repeatable --attr keys and requires a non-empty valid declaration before Governor/SMTP (a missing/invalid declaration fails closed with the canonical attribution error). HTTPS one-click unsubscribe is not an SMTP send and is unaffected.",
       "Attribution fails closed in warn mode too: warn only softens a Governor VERDICT on an already-attributed send; it never waives the attribution precondition, so a bot-originated send with a missing/invalid declaration is refused in warn exactly as in required.",
       "Governor scoring is a build-time Cargo feature (`governor`), off by default. outbound_safety.governor_gate.smtp_mode reports the gate compiled into this binary: `required` when built with the feature, `off` otherwise. In an `off` build SMTP sends are not scored by Governor, while send modes, the attribution precondition, and the attribution record still apply; the success attribution block's governor sub-object then reads {decision: disabled, route: null, mode: off}, including on queued/scheduled acceptance (no governor_decision_pending). No runtime input can change the mode.",
-      "v2 (envelope.agent_contract.v2) is retained as historical documentation at docs/schemas/envelope.agent_contract.v2.json; generic {code, reason} error handling is unaffected."
+      "v2 (envelope.agent_contract.v2) is retained as historical documentation at docs/schemas/envelope.agent_contract.v2.json; generic {code, reason} error handling is unaffected.",
+      "Crash-safe sends (additive): send/reply accept an optional idempotency key (`--idempotency-key` / `idempotency_key`); every send request is recorded as a durable intent before any network work, so an identical rerun returns the earlier outcome (idempotent_replay=true) instead of sending again; send results carry draft_id, idempotent_replay, retryable and warnings; delivery_uncertain, not_sent, sending and idempotency_key_conflict are possible send statuses; every send transition writes an `action_type=send` receipt to the action log, and action-log rows carry agent_id. See outbound_safety.crash_safety."
     ]
   },
   "consumers": [
@@ -299,6 +300,12 @@
             "description": "HTML body sent alongside text",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "Your own id for this message (printable ASCII, no spaces). Retrying with the same key never sends twice: it returns the earlier result, or idempotency_key_conflict if the content changed. Without a key, an identical request is recognized while the earlier one is unresolved or queued, and for 15 minutes after it was sent.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
           "reply_to": {
             "description": "Reply-To address",
             "type": "string"
@@ -435,6 +442,12 @@
           },
           "html": {
             "description": "Reply HTML body",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Your own id for this message (printable ASCII, no spaces). Retrying with the same key never sends twice: it returns the earlier result, or idempotency_key_conflict if the content changed. Without a key, an identical request is recognized while the earlier one is unresolved or queued, and for 15 minutes after it was sent.",
+            "maxLength": 200,
+            "minLength": 1,
             "type": "string"
           },
           "reply_all": {
@@ -1250,6 +1263,15 @@
       "denial_code": "immediate_send_requires_confirmation",
       "env": "ENVELOPE_SEND_COOLDOWN_SECONDS"
     },
+    "crash_safety": {
+      "attempts": "Each claim of a row is one attempt with its own Message-ID. An attempt commits `transmitting` after the server answers DATA and before the first body byte. A failure before that point, or a 4xx/5xx reply to any command including the body, sent nothing: the row returns to draft (status=not_sent, retryable=true unless the refusal was permanent). A failure after it without a server reply (connection lost, deadline) parks the row delivery_uncertain: it is never sent again automatically; verify delivery, then discard it to send a new copy. The result is recorded before QUIT, so a hanging QUIT cannot turn an accepted message into a failure.",
+      "durability": "SQLite runs with synchronous=FULL, so a committed intent, claim, or receipt survives power loss as well as a process crash.",
+      "idempotency": "An explicit key (`--idempotency-key` / `idempotency_key`, printable ASCII up to 200 characters, stored only as a hash and scoped to the account and the requesting principal) names one message for as long as its record exists, including after discard: the same key with the same content returns the recorded outcome, and with different content returns status=idempotency_key_conflict and sends nothing. With no key, an identical request (same account, principal, sender, recipients by role, subject, bodies, threading, and attachment bytes) is matched while its intent is unresolved, queued, uncertain, or awaiting review, and for 15 minutes after it was sent; after that an identical request is a new message. Only a key guarantees exactly-one intent across retries; the fingerprint is a heuristic.",
+      "intent": "Every send request (CLI send, MCP send/reply; immediate, queued, or scheduled) is written as a durable intent row, with its content and attachment bytes, before any network work. `draft send` / send_draft use the draft id itself as the operation id.",
+      "receipts": "Every send transition writes one action-log row with action_type=send, draft_id (the operation id), message_id, agent_id, and action_status: the row's status after the transition in `draft show` terms (queued, drafted, sending, sent, delivery_uncertain, pending_review, blocked); a replay's receipt carries the underlying status with replay=true. action_taken is JSON (envelope.send_receipt.v1): surface, attempt_id, seq, from, to, phase, reason, replay, retryable, recipients (local only), recipient_count, payload_sha256 (envelope.payload.v1, every transmitted field), semantic_sha256 (envelope.semantic.v1: subject, lowercased recipients and normalized text, identical to the Mailroom bench's payload hash), key_kind, and evidence. The receipt commits in the same transaction as the state change; send_completed events carry the Message-ID in their message_id column. Agent webhooks (agent_action) carry identifiers and a recipient count, never recipient addresses.",
+      "recovery": "A row left `sending` by a process that died is resolved by the next send, `draft show`, `draft list`, and every scheduled-send sweep: an attempt that never reached the body returns to draft (a scheduled row comes due again); one that had started the body becomes delivery_uncertain. Liveness is an operating-system lock the sending process holds for the whole attempt, so a live but slow sender is never touched. A row whose owner cannot be checked (another host) is resolved the same way after a 15-minute lease.",
+      "replay": "A matched request sends nothing and makes no Governor call. A sent intent returns its recorded result with idempotent_replay=true (exit 0). A queued intent returns its draft_id. A row that may have been delivered, is awaiting review, is being sent by another live process, or was discarded returns its status with retryable and error.code (exit 1)."
+    },
     "governor_gate": {
       "attribution": {
         "catalog": "envelope",
@@ -1973,6 +1995,12 @@
             "description": "HTML body sent alongside text",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "Your own id for this message (printable ASCII, no spaces). Retrying with the same key never sends twice: it returns the earlier result, or idempotency_key_conflict if the content changed. Without a key, an identical request is recognized while the earlier one is unresolved or queued, and for 15 minutes after it was sent.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
           "reply_to": {
             "description": "Reply-To address",
             "type": "string"
@@ -2046,12 +2074,24 @@
             ]
           },
           "draft_id": {
-            "description": "Local draft id when scheduled or draft-only",
+            "description": "Local draft id: the durable record (operation id) of the send, present on every outcome",
             "type": "string"
+          },
+          "draft_ui": {
+            "description": "Dashboard review links for the draft row that carried the send",
+            "type": "object"
           },
           "error": {
             "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary",
             "type": "object"
+          },
+          "idempotent_replay": {
+            "description": "true when an earlier identical request (same idempotency key, or same payload with no key) answered this one and nothing new was sent or queued",
+            "type": "boolean"
+          },
+          "imap_draft_deleted": {
+            "description": "Whether a synced IMAP Drafts copy was deleted after send",
+            "type": "boolean"
           },
           "input_normalization": {
             "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete.",
@@ -2081,6 +2121,14 @@
           "queued_reason_code": {
             "description": "Stable reason code for queued sends; safety_cooldown means Envelope intentionally delayed SMTP for review/correction time",
             "type": "string"
+          },
+          "recorded": {
+            "description": "On delivery_uncertain: whether Envelope recorded the uncertain state (false means recovery will record it)",
+            "type": "boolean"
+          },
+          "retryable": {
+            "description": "On a result that did not confirm a send: whether rerunning the same request may succeed without risking a duplicate",
+            "type": "boolean"
           },
           "scheduled": {
             "description": "true on an `envelope send --at <time>` scheduled acceptance; the paired field is send_at (not send_after)",
@@ -2139,7 +2187,7 @@
             ]
           },
           "status": {
-            "description": "queued (default cooldown), sent, scheduled, drafted, denied, blocked, or invalid",
+            "description": "queued (default cooldown), sent, scheduled, drafted, denied, blocked, invalid, delivery_uncertain, not_sent, sending, pending_review, discarded, or idempotency_key_conflict",
             "type": "string"
           },
           "subject": {
@@ -2153,6 +2201,13 @@
           "ui": {
             "description": "Dashboard navigation links (draft or account view)",
             "type": "object"
+          },
+          "warnings": {
+            "description": "Present when the send succeeded but part of its record did not: [{code: audit_write_failed, detail, record_status}]. The command exits non-zero.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],
@@ -2828,6 +2883,12 @@
             "description": "Reply HTML body",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "Your own id for this message (printable ASCII, no spaces). Retrying with the same key never sends twice: it returns the earlier result, or idempotency_key_conflict if the content changed. Without a key, an identical request is recognized while the earlier one is unresolved or queued, and for 15 minutes after it was sent.",
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
           "reply_all": {
             "default": false,
             "description": "Reply to all recipients",
@@ -2898,7 +2959,7 @@
             ]
           },
           "draft_id": {
-            "description": "Local draft id when queued or draft-only",
+            "description": "Local draft id: the durable record (operation id) of the send",
             "type": "string"
           },
           "draft_ui": {
@@ -2908,6 +2969,10 @@
           "error": {
             "description": "Stable denial/block object ({code, reason})",
             "type": "object"
+          },
+          "idempotent_replay": {
+            "description": "true when an earlier identical request answered this one and nothing new was sent or queued",
+            "type": "boolean"
           },
           "imap_draft_deleted": {
             "description": "Whether a synced IMAP Drafts copy was deleted after send",
@@ -2945,6 +3010,14 @@
           "queued_reason_code": {
             "description": "Stable queued-send reason code",
             "type": "string"
+          },
+          "recorded": {
+            "description": "On delivery_uncertain: whether Envelope recorded the uncertain state",
+            "type": "boolean"
+          },
+          "retryable": {
+            "description": "On a result that did not confirm a send: whether retrying the same call may succeed without risking a duplicate",
+            "type": "boolean"
           },
           "send_after": {
             "description": "ISO8601 time the queued send becomes due",
@@ -2995,7 +3068,7 @@
             ]
           },
           "status": {
-            "description": "queued, sent, scheduled, drafted, or denied",
+            "description": "queued, sent, scheduled, drafted, denied, delivery_uncertain, not_sent, sending, pending_review, discarded, or idempotency_key_conflict",
             "type": "string"
           },
           "subject": {
@@ -3009,6 +3082,13 @@
           "ui": {
             "description": "Dashboard navigation links",
             "type": "object"
+          },
+          "warnings": {
+            "description": "Present when the send succeeded but part of its record did not: [{code: audit_write_failed, detail, record_status}]",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],
@@ -3405,7 +3485,7 @@
             ]
           },
           "draft_id": {
-            "description": "Local draft id when queued or draft-only",
+            "description": "Local draft id: the durable record (operation id) of the send",
             "type": "string"
           },
           "draft_ui": {
@@ -3415,6 +3495,10 @@
           "error": {
             "description": "Stable denial/block object ({code, reason})",
             "type": "object"
+          },
+          "idempotent_replay": {
+            "description": "true when an earlier identical request answered this one and nothing new was sent or queued",
+            "type": "boolean"
           },
           "imap_draft_deleted": {
             "description": "Whether a synced IMAP Drafts copy was deleted after send",
@@ -3452,6 +3536,14 @@
           "queued_reason_code": {
             "description": "Stable queued-send reason code",
             "type": "string"
+          },
+          "recorded": {
+            "description": "On delivery_uncertain: whether Envelope recorded the uncertain state",
+            "type": "boolean"
+          },
+          "retryable": {
+            "description": "On a result that did not confirm a send: whether retrying the same call may succeed without risking a duplicate",
+            "type": "boolean"
           },
           "send_after": {
             "description": "ISO8601 time the queued send becomes due",
@@ -3502,7 +3594,7 @@
             ]
           },
           "status": {
-            "description": "queued, sent, scheduled, drafted, or denied",
+            "description": "queued, sent, scheduled, drafted, denied, delivery_uncertain, not_sent, sending, pending_review, discarded, or idempotency_key_conflict",
             "type": "string"
           },
           "subject": {
@@ -3516,6 +3608,13 @@
           "ui": {
             "description": "Dashboard navigation links",
             "type": "object"
+          },
+          "warnings": {
+            "description": "Present when the send succeeded but part of its record did not: [{code: audit_write_failed, detail, record_status}]",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "required": [],

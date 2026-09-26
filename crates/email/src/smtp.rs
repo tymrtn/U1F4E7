@@ -4,12 +4,12 @@
 use envelope_email_store::models::AccountWithCredentials;
 use lettre::message::header::{self, ContentType};
 use lettre::message::{Attachment as LettreAttachment, Mailbox, Mailboxes, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, Message};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::errors::SmtpError;
+use crate::smtp_submit::{AccountConnector, Deadlines, submit_once};
 
 /// A file attachment to include in a sent message.
 ///
@@ -115,49 +115,21 @@ impl SmtpSender {
             attachments,
         )?;
 
-        // Build SMTP transport
         let smtp_host = &account.account.smtp_host;
         let smtp_port = account.account.smtp_port;
-        let username = account.effective_smtp_username().to_string();
-        let password = account.effective_smtp_password().to_string();
-
-        let creds = Credentials::new(username, password);
-
-        let transport = match smtp_port {
-            465 => {
-                // Implicit TLS (SMTPS)
-                AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
-                    .map_err(|e| SmtpError::Connection(format!("{smtp_host}:{smtp_port}: {e}")))?
-                    .port(smtp_port)
-                    .credentials(creds)
-                    .build()
-            }
-            _ => {
-                // STARTTLS (typically port 587)
-                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-                    .map_err(|e| SmtpError::Connection(format!("{smtp_host}:{smtp_port}: {e}")))?
-                    .port(smtp_port)
-                    .credentials(creds)
-                    .build()
-            }
-        };
-
         info!(
             "sending email via {smtp_host}:{smtp_port} to {to} ({} attachment{})",
             attachments.len(),
             if attachments.len() == 1 { "" } else { "s" }
         );
 
-        transport.send(email).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("authentication") || msg.contains("AUTH") {
-                SmtpError::Auth(msg)
-            } else if msg.contains("rejected") || msg.contains("Recipient") {
-                SmtpError::RecipientRejected(msg)
-            } else {
-                SmtpError::Send(msg)
-            }
-        })?;
+        submit_once(
+            &AccountConnector::new(account),
+            &email,
+            Deadlines::default(),
+        )
+        .await
+        .map_err(SmtpError::from)?;
 
         info!("email sent, message-id: {message_id}");
         Ok(message_id)

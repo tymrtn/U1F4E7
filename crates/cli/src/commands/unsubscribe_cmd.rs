@@ -149,7 +149,8 @@ pub async fn run(
                 &addr,
                 declared,
             );
-            let outcome = super::governor_gate::gate_and_record(db_ref, account_id, &req);
+            let outcome = super::governor_gate::gate_and_record(db_ref, account_id, &req)
+                .map_err(|e| envelope_email_transport::SmtpError::Send(format!("{e:#}")))?;
             if !outcome.allowed {
                 *captured_error.borrow_mut() = Some(outcome.error_json());
                 return Err(envelope_email_transport::SmtpError::Send(format!(

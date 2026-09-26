@@ -35,6 +35,10 @@ pub enum StoreError {
     #[error("draft is not scheduled (no send_after set): {0}")]
     DraftNotScheduled(String),
 
+    /// A caller-supplied send idempotency key failed validation.
+    #[error("invalid idempotency key: {0}")]
+    InvalidIdempotencyKey(String),
+
     #[error("encryption error: {0}")]
     Encryption(String),
 

@@ -213,6 +213,13 @@ enum Commands {
         /// Explicit confirmation required to use --send-now (or --cooldown-seconds 0)
         #[arg(long)]
         confirm_send_now: bool,
+        /// Your own id for this message (printable ASCII, up to 200 characters).
+        /// Rerunning with the same key never sends twice: it returns the
+        /// earlier result, or refuses if the content changed. Without a key,
+        /// an identical rerun is recognized for as long as the earlier send is
+        /// unresolved or queued, and for 15 minutes after it was sent.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 
     /// Move a message to another folder
@@ -2186,6 +2193,7 @@ fn main() {
             cooldown_seconds,
             send_now,
             confirm_send_now,
+            idempotency_key,
         } => commands::send::run(
             &to,
             &subject,
@@ -2208,6 +2216,7 @@ fn main() {
             cooldown_seconds,
             send_now,
             confirm_send_now,
+            idempotency_key.as_deref(),
         ),
 
         Commands::Move {

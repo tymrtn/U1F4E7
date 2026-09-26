@@ -118,7 +118,7 @@ impl Database {
     ) -> Result<Vec<ActionLog>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE agent_id = ?1
              ORDER BY created_at DESC
@@ -160,7 +160,7 @@ impl Database {
     pub fn list_actions(&self, account_id: &str, limit: u32) -> Result<Vec<ActionLog>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE account_id = ?1
              ORDER BY created_at DESC
@@ -185,7 +185,7 @@ impl Database {
     ) -> Result<Vec<ActionLog>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE account_id = ?1 AND agent_id = ?2
              ORDER BY created_at DESC
@@ -205,7 +205,7 @@ impl Database {
     pub fn list_failed_actions(&self, account_id: &str, limit: u32) -> Result<Vec<ActionLog>> {
         let sql = format!(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE account_id = ?1 AND action_status IN ({})
              ORDER BY created_at DESC
@@ -266,7 +266,7 @@ impl Database {
 
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE id = ?1",
         )?;
@@ -282,7 +282,7 @@ impl Database {
     ) -> Result<Option<ActionLog>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, action_type, confidence, justification, action_taken,
-                    message_id, draft_id, event_id, action_status, created_at
+                    message_id, draft_id, event_id, action_status, created_at, agent_id
              FROM action_log
              WHERE event_id = ?1 AND action_type = ?2",
         )?;
@@ -330,6 +330,7 @@ fn map_action_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLog> {
         event_id: row.get(8)?,
         action_status: row.get(9)?,
         created_at: row.get(10)?,
+        agent_id: row.get(11)?,
     })
 }
 

@@ -266,6 +266,10 @@ pub struct ActionLog {
     pub event_id: Option<String>,
     pub action_status: String,
     pub created_at: String,
+    /// The agent identity that performed the action; `None` for the local
+    /// operator and for recovery by another process.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
