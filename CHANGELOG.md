@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.7] — 2026-09-26
+
+### Upgrade note: release builds refuse two declarations
+
+This release changes what release builds send, including Homebrew and the release archives,
+where Governor scoring is off. Attribution is checked in every build, and a send that makes
+either of these declarations is now refused as a whole with `attributes_invalid`:
+
+- `reply_to_thread` on a reply Envelope can't verify: the parent must resolve to one cached
+  thread in the account, with every recipient on a Sent-folder message in that thread. A reply
+  to a first-time sender, a reply that adds a recipient, or a reply whose Sent copy isn't cached
+  yet is refused.
+- `known_contact` for a contact that only MCP `contacts add`/`tag`/`untag` or
+  `envelope contacts import` wrote. CLI `contacts add` or `tag` by a person still vouches.
+
+Resubmitting without the declaration sends the mail as new mail. Scheduled drafts that stored
+`reply_to_thread` before the upgrade are refused by the sweep the same way. The full list is
+under **Release builds** at the end of the Security section.
+
 ### Security
 
 These fixes change how Envelope derives the recipient facts its send gate checks. Before them,
