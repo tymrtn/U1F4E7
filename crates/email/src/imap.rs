@@ -9,7 +9,7 @@ use chrono::{DateTime, FixedOffset};
 use envelope_email_store::models::{
     AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use mail_parser::MimeHeaders;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -387,27 +387,43 @@ pub async fn list_folders(client: &mut ImapClient) -> Result<Vec<String>, ImapEr
 pub async fn drafts_special_use_folder(
     client: &mut ImapClient,
 ) -> Result<Option<String>, ImapError> {
-    use async_imap::types::NameAttribute;
-    let mailboxes = client
-        .session
+    drafts_special_use_folder_in(&mut client.session).await
+}
+
+/// [`drafts_special_use_folder`] over any transport, so the scripted-server
+/// tests can drive it without TLS.
+async fn drafts_special_use_folder_in<T>(
+    session: &mut Session<T>,
+) -> Result<Option<String>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    use async_imap::types::{Name, NameAttribute};
+    // Read the whole reply before searching it. Stopping at the `\Drafts` line
+    // leaves the rest of the LIST reply on the connection, and APPEND, which
+    // reads exactly one response expecting its `+` continuation, gets a
+    // leftover line instead and fails.
+    let mailboxes: Vec<Name> = session
         .list(Some(""), Some("*"))
         .await
-        .map_err(|e| ImapError::Protocol(format!("LIST (special-use) failed: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("LIST (special-use) failed: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("LIST parse error: {e}")))?;
 
-    let mut stream = mailboxes;
-    while let Some(item) = stream.next().await {
-        let mailbox = item.map_err(|e| ImapError::Protocol(format!("LIST parse error: {e}")))?;
-        if mailbox
-            .attributes()
-            .iter()
-            .any(|attr| matches!(attr, NameAttribute::Drafts))
-        {
-            let name = mailbox.name().to_string();
-            debug!("SPECIAL-USE \\Drafts folder: {name}");
-            return Ok(Some(name));
-        }
+    let name = mailboxes
+        .iter()
+        .find(|mailbox| {
+            mailbox
+                .attributes()
+                .iter()
+                .any(|attr| matches!(attr, NameAttribute::Drafts))
+        })
+        .map(|mailbox| mailbox.name().to_string());
+    if let Some(name) = &name {
+        debug!("SPECIAL-USE \\Drafts folder: {name}");
     }
-    Ok(None)
+    Ok(name)
 }
 
 /// Fetch stats for a single folder via IMAP `STATUS (MESSAGES RECENT UNSEEN)`.
@@ -793,18 +809,21 @@ pub async fn fetch_message_with_raw(
     let uid_range = format!("{uid}");
     let expected_sizes =
         preflight_raw_message_sizes_selected_uid_set(client, folder, &uid_range).await?;
-    let messages = client
+    // Read through the tagged completion before using the reply; see
+    // drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = client
         .session
         .uid_fetch(&uid_range, FETCH_MESSAGE_DESCRIPTOR)
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
 
     // fetch_message expects exactly one message for the UID — take the first item.
-    let mut stream = messages;
-    let Some(item) = stream.next().await else {
+    let Some(fetch) = fetches.first() else {
         return Ok(None);
     };
-    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
     let fetched_uid = fetch
         .uid
         .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
@@ -1058,16 +1077,18 @@ pub async fn preflight_raw_message_sizes_selected_uid_set(
 ) -> Result<Vec<RawMessageSize>, ImapError> {
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
-    let messages = client
+    // Read the whole reply before validating it, so a refusal below does not
+    // leave the rest of it on the connection; see drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = client
         .session
         .uid_fetch(uid_set, "(UID RFC822.SIZE)")
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH size {folder} {uid_set}: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH size {folder} {uid_set}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH size parse error: {e}")))?;
     let mut sizes = Vec::new();
-    let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        let fetch =
-            item.map_err(|e| ImapError::Protocol(format!("UID FETCH size parse error: {e}")))?;
+    for fetch in fetches {
         let uid = fetch.uid.ok_or_else(|| {
             ImapError::Protocol("UID FETCH size response without UID".to_string())
         })?;
@@ -1114,15 +1135,20 @@ pub async fn fetch_raw_messages_selected_uid_set_preflighted(
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
 
-    let messages = client
+    // Read the whole reply before validating it, so a refusal below does not
+    // leave the rest of it on the connection; see drafts_special_use_folder_in.
+    // Consuming `fetches` by value frees each response as its copy is made, so
+    // peak memory stays at one batch of bodies.
+    let fetches: Vec<async_imap::types::Fetch> = client
         .session
         .uid_fetch(uid_set, EVIDENCE_RAW_FETCH_DESCRIPTOR)
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set}: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
     let mut out = Vec::new();
-    let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    for fetch in fetches {
         let uid = fetch
             .uid
             .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
@@ -1270,18 +1296,21 @@ pub async fn fetch_message_headers_selected_uid_set(
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
 
-    let messages = client
+    // Read the whole reply before validating it, so a refusal below does not
+    // leave the rest of it on the connection; see drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = client
         .session
         .uid_fetch(
             uid_set,
             "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
         )
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set} HEADER: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set} HEADER: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
     let mut out = Vec::new();
-    let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    for fetch in fetches {
         let uid = fetch
             .uid
             .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
@@ -1643,26 +1672,40 @@ pub async fn fetch_list_unsubscribe_headers(
     folder: &str,
     uid: u32,
 ) -> Result<(Option<String>, Option<String>), ImapError> {
+    fetch_list_unsubscribe_headers_in(&mut client.session, folder, uid).await
+}
+
+/// [`fetch_list_unsubscribe_headers`] over any transport, so the
+/// scripted-server tests can drive it without TLS.
+async fn fetch_list_unsubscribe_headers_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+) -> Result<(Option<String>, Option<String>), ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
     let uid_range = format!("{uid}");
-    let messages = client
-        .session
+    // Read through the tagged completion before using the reply; see
+    // drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = session
         .uid_fetch(&uid_range, "BODY.PEEK[HEADER]")
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid} HEADER: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid} HEADER: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
 
-    let mut stream = messages;
-    let Some(item) = stream.next().await else {
+    let Some(fetch) = fetches.first() else {
         return Ok((None, None));
     };
-    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
     let header_bytes = fetch.body().unwrap_or_default();
 
     let Some(parsed) = mail_parser::MessageParser::default().parse(header_bytes) else {
@@ -2057,17 +2100,20 @@ pub async fn download_attachment(
     let uid_range = format!("{uid}");
     let expected_sizes =
         preflight_raw_message_sizes_selected_uid_set(client, folder, &uid_range).await?;
-    let messages = client
+    // Read through the tagged completion before using the reply; see
+    // drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = client
         .session
         .uid_fetch(&uid_range, "(UID BODY.PEEK[])")
         .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?;
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
 
-    let mut stream = messages;
-    let Some(item) = stream.next().await else {
+    let Some(fetch) = fetches.first() else {
         return Err(ImapError::NotFound(uid));
     };
-    let fetch = item.map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
     let fetched_uid = fetch
         .uid
         .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
@@ -2779,5 +2825,167 @@ Subject: hi\r\n\r\nbody\r\n";
             }
             other => panic!("expected Connection error, got: {other:?}"),
         }
+    }
+
+    /// One scripted server turn: the verb the client's next command must use
+    /// and the lines to answer it with (`{tag}` becomes that command's tag).
+    /// A command ending in a `{N}` literal gets the first line (the `+`
+    /// continuation), then the server reads the N literal bytes and sends the
+    /// remaining lines.
+    struct Turn {
+        verb: &'static str,
+        reply: Vec<String>,
+    }
+
+    /// Log in over an in-memory duplex against a server that plays `turns` in
+    /// order. The server task fails if the client sends anything else.
+    async fn scripted_session(
+        turns: Vec<Turn>,
+    ) -> (
+        Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(server_io);
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"* OK scripted\r\n").await.unwrap();
+            let login = Turn {
+                verb: "LOGIN",
+                reply: vec!["{tag} OK LOGIN completed".into()],
+            };
+            for turn in std::iter::once(login).chain(turns) {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let mut words = line.split_whitespace();
+                let tag = words.next().unwrap_or_default().to_string();
+                let verb = words.next().unwrap_or_default().to_ascii_uppercase();
+                let verb = if verb == "UID" {
+                    format!(
+                        "UID {}",
+                        words.next().unwrap_or_default().to_ascii_uppercase()
+                    )
+                } else {
+                    verb
+                };
+                assert_eq!(verb, turn.verb, "unexpected client command: {line:?}");
+                let mut reply = turn.reply.iter().map(|l| l.replace("{tag}", &tag));
+                let literal_len = line
+                    .trim_end()
+                    .strip_suffix('}')
+                    .and_then(|l| l.rsplit_once('{'))
+                    .map(|(_, n)| n.parse::<usize>().unwrap());
+                if let Some(len) = literal_len {
+                    let cont = reply.next().unwrap();
+                    write_half
+                        .write_all(format!("{cont}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    let mut literal = vec![0u8; len + 2];
+                    reader.read_exact(&mut literal).await.unwrap();
+                }
+                let rest: String = reply.map(|l| format!("{l}\r\n")).collect();
+                write_half.write_all(rest.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = async_imap::Client::new(client_io);
+        read_imap_greeting(&mut client, "scripted.test")
+            .await
+            .unwrap();
+        let session = client
+            .login("user", "pass")
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+        (session, server)
+    }
+
+    fn append_turn() -> Turn {
+        Turn {
+            verb: "APPEND",
+            reply: vec![
+                "+ OK".into(),
+                "{tag} OK [APPENDUID 1 1] Append completed".into(),
+            ],
+        }
+    }
+
+    const DRAFT_RFC822: &[u8] = b"Subject: draft\r\n\r\nbody\r\n";
+
+    /// Regression: the SPECIAL-USE lookup stopped reading the LIST reply at the
+    /// `\Drafts` line. The tagged OK, plus any `* LIST` lines after Drafts,
+    /// stayed on the connection, and the next APPEND read one of them where it
+    /// expected the `+` continuation, so the first `envelope draft create` on a
+    /// fresh home failed with "could not append mail to mailbox" (Dovecot
+    /// 2.4.5). Drafts last still leaves the tagged OK behind.
+    #[tokio::test]
+    async fn drafts_special_use_lookup_leaves_connection_ready_for_append() {
+        let drafts = r#"* LIST (\HasNoChildren \Drafts) "/" Drafts"#;
+        let inbox = r#"* LIST (\HasNoChildren) "/" INBOX"#;
+        let sent = r#"* LIST (\HasNoChildren \Sent) "/" Sent"#;
+        for listing in [[drafts, inbox, sent], [inbox, sent, drafts]] {
+            let mut reply: Vec<String> = listing.iter().map(|l| l.to_string()).collect();
+            reply.push("{tag} OK List completed".into());
+            let (mut session, server) = scripted_session(vec![
+                Turn {
+                    verb: "LIST",
+                    reply,
+                },
+                append_turn(),
+            ])
+            .await;
+
+            let found = drafts_special_use_folder_in(&mut session).await.unwrap();
+            assert_eq!(found.as_deref(), Some("Drafts"), "{listing:?}");
+            session
+                .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("APPEND right after the SPECIAL-USE lookup {listing:?}: {e}")
+                });
+            server.await.unwrap();
+        }
+    }
+
+    /// Same hazard for single-UID FETCH readers: taking the one FETCH item and
+    /// dropping the stream leaves the tagged OK unread, and a later APPEND on
+    /// the same session reads it in place of `+`.
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_leaves_connection_ready_for_append() {
+        let header = "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\r\n";
+        let (mut session, server) = scripted_session(vec![
+            Turn {
+                verb: "SELECT",
+                reply: vec![
+                    "* 1 EXISTS".into(),
+                    "* OK [UIDVALIDITY 1] UIDs valid".into(),
+                    "{tag} OK [READ-WRITE] Select completed".into(),
+                ],
+            },
+            Turn {
+                verb: "UID FETCH",
+                reply: vec![
+                    format!(
+                        "* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})",
+                        header.len()
+                    ),
+                    "{tag} OK Fetch completed".into(),
+                ],
+            },
+            append_turn(),
+        ])
+        .await;
+
+        fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
+            .await
+            .expect("single-UID header FETCH");
+        session
+            .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
+            .await
+            .expect("APPEND right after a single-UID FETCH");
+        server.await.unwrap();
     }
 }
