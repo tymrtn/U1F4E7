@@ -934,10 +934,7 @@ fn gate_claimed(
 mod tests {
     use super::*;
     use envelope_email_store::models::Account;
-    use envelope_email_transport::smtp_submit::testing::{
-        AfterBody, PlainConnector, Script, ScriptedServer,
-    };
-    use std::time::Duration;
+    use envelope_email_transport::smtp_submit::testing::{PlainConnector, Script, ScriptedServer};
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -1013,203 +1010,8 @@ mod tests {
         }
     }
 
-    fn declared() -> Vec<String> {
-        vec!["informational".to_string()]
-    }
-
-    fn with_declared<'a>(mut req: SendRequest<'a>, attrs: &'a [String]) -> SendRequest<'a> {
-        req.declared = attrs;
-        req
-    }
-
-    fn status_of(err: &anyhow::Error) -> Value {
-        err.downcast_ref::<SendNotConfirmed>()
-            .map(|e| e.body.clone())
-            .unwrap_or_else(|| panic!("not a structured send outcome: {err:#}"))
-    }
-
-    async fn wait_for_body(server: &ScriptedServer) {
-        while server.bodies() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
     fn count(db: &Database, sql: &str) -> i64 {
         db.conn().query_row(sql, [], |r| r.get(0)).unwrap()
-    }
-
-    /// Pilot failure `send_now/after_data/kill`: the process died after the
-    /// server had the whole message, and the rerun of the same command sent it
-    /// again (30/30 duplicates). Dropping the send future mid-reply is that
-    /// kill: every piece of state is in SQLite, and the owner lock is released
-    /// as the kernel would release it.
-    #[tokio::test]
-    async fn a_rerun_after_a_crash_mid_body_does_not_send_again() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script {
-            after_body: AfterBody::Hang,
-            ..Script::default()
-        })
-        .await;
-        let connector = PlainConnector { addr: server.addr };
-        let req = with_declared(request(None), &attrs);
-
-        tokio::select! {
-            result = send_now(&f.db, &f.creds, &req, &connector) => {
-                panic!("the server never answers the body: {result:?}")
-            }
-            _ = wait_for_body(&server) => {}
-        }
-
-        let rerun = send_now(&f.db, &f.creds, &req, &connector).await;
-        let body = status_of(&rerun.unwrap_err());
-        assert_eq!(body["status"], "delivery_uncertain", "{body}");
-        assert_eq!(body["retryable"], false);
-        assert_eq!(server.bodies(), 1, "the rerun must not transmit again");
-        assert_eq!(count(&f.db, "SELECT COUNT(*) FROM drafts"), 1);
-    }
-
-    /// Pilot failures `send_now/after_250/kill` and `after_append/kill`: the
-    /// server accepted, the process died before or during the Sent copy, and
-    /// the rerun sent a second copy. The rerun must answer from the record.
-    #[tokio::test]
-    async fn a_rerun_after_acceptance_replays_the_recorded_send() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script::default()).await;
-        let connector = PlainConnector { addr: server.addr };
-        let req = with_declared(request(None), &attrs);
-
-        let first = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
-        assert_eq!(first["status"], "sent");
-        let rerun = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
-        assert_eq!(rerun["status"], "sent");
-        assert_eq!(rerun["idempotent_replay"], true);
-        assert_eq!(rerun["message_id"], first["message_id"]);
-        assert_eq!(rerun["draft_id"], first["draft_id"]);
-        assert_eq!(server.bodies(), 1);
-    }
-
-    /// A connection that never got to the body sent nothing: the intent is
-    /// released and the rerun sends it exactly once.
-    #[tokio::test]
-    async fn a_rerun_after_an_unreachable_server_sends_once() {
-        let f = fixture();
-        let attrs = declared();
-        let req = with_declared(request(None), &attrs);
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = PlainConnector {
-            addr: closed.local_addr().unwrap(),
-        };
-        drop(closed);
-
-        let failed = status_of(&send_now(&f.db, &f.creds, &req, &dead).await.unwrap_err());
-        assert_eq!(failed["status"], "not_sent");
-        assert_eq!(failed["retryable"], true);
-
-        let server = ScriptedServer::start(Script::default()).await;
-        let live = PlainConnector { addr: server.addr };
-        let sent = send_now(&f.db, &f.creds, &req, &live).await.unwrap();
-        assert_eq!(sent["status"], "sent");
-        assert_eq!(sent["draft_id"], failed["draft_id"]);
-        assert_eq!(server.bodies(), 1);
-        assert_eq!(count(&f.db, "SELECT COUNT(*) FROM drafts"), 1);
-    }
-
-    /// A body the server refused was not accepted: the intent goes back to
-    /// `draft`, never `delivery_uncertain`, and says whether a retry can help.
-    #[tokio::test]
-    async fn a_refused_body_is_released_with_its_reply_code() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script {
-            after_body: AfterBody::Reply("554 5.7.1 rejected"),
-            ..Script::default()
-        })
-        .await;
-        let connector = PlainConnector { addr: server.addr };
-        let req = with_declared(request(None), &attrs);
-
-        let body = status_of(
-            &send_now(&f.db, &f.creds, &req, &connector)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(body["status"], "not_sent");
-        assert_eq!(body["retryable"], false);
-        assert_eq!(body["error"]["reply_code"], 554);
-        assert_eq!(
-            count(&f.db, "SELECT COUNT(*) FROM drafts WHERE status = 'draft'"),
-            1
-        );
-    }
-
-    /// Pilot finding: no `action_log` rows at all, and `send_completed` with a
-    /// NULL `message_id`. Every transition of an immediate send leaves a
-    /// receipt tying the operation to its recipients, content and outcome.
-    #[tokio::test]
-    async fn an_immediate_send_leaves_receipts_for_every_transition() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script::default()).await;
-        let connector = PlainConnector { addr: server.addr };
-        let req = with_declared(request(None), &attrs);
-
-        let sent = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
-        let draft_id = sent["draft_id"].as_str().expect("draft_id").to_string();
-        let message_id = sent["message_id"].as_str().expect("message_id").to_string();
-
-        let mut stmt =
-            f.db.conn()
-                .prepare(
-                    "SELECT action_status, message_id, action_taken FROM action_log
-                 WHERE action_type = 'send' AND draft_id = ?1 ORDER BY rowid",
-                )
-                .unwrap();
-        let rows: Vec<(String, Option<String>, Value)> = stmt
-            .query_map([&draft_id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    serde_json::from_str(&r.get::<_, String>(2)?).unwrap(),
-                ))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        let statuses: Vec<(&str, &str)> = rows
-            .iter()
-            .map(|(s, _, t)| (s.as_str(), t["phase"].as_str().unwrap()))
-            .collect();
-        assert_eq!(
-            statuses,
-            vec![
-                ("sending", "claimed"),
-                ("sending", "transmitting"),
-                ("sent", "accepted")
-            ]
-        );
-        for (_, mid, taken) in &rows {
-            assert_eq!(mid.as_deref(), Some(message_id.as_str()));
-            assert_eq!(taken["recipients"], json!(["alice@example.test"]));
-            assert_eq!(
-                taken["semantic_sha256"],
-                "523f0d8bc7e76d999b5ce167fed8429b8e54365cd26984d1b84fc28f5594881e"
-            );
-        }
-        let completed: Option<String> =
-            f.db.conn()
-                .query_row(
-                    "SELECT message_id FROM events WHERE event_type = 'send_completed'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-        assert_eq!(
-            completed.as_deref(),
-            Some(message_id.trim_matches(|c| c == '<' || c == '>'))
-        );
     }
 
     /// The gate runs on the request before anything is recorded: a refused
@@ -1230,27 +1032,6 @@ mod tests {
         assert!(!server.saw("MAIL"));
     }
 
-    /// Two processes ran the same request: the other one claimed the intent
-    /// between this one's lookup and its claim, and finished the send. This
-    /// request reports the recorded send, as a later rerun would, instead of
-    /// failing with `draft_changed`.
-    #[tokio::test]
-    async fn losing_the_claim_to_a_finished_send_replays_it() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script::default()).await;
-        let connector = PlainConnector { addr: server.addr };
-        let req = with_declared(request(None), &attrs);
-        let first = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
-        let draft_id = first["draft_id"].as_str().expect("draft_id");
-
-        let lost = claim_lost(&f.db, &req, draft_id).expect("a sent intent is replayed");
-        assert_eq!(lost["status"], "sent", "{lost}");
-        assert_eq!(lost["idempotent_replay"], true);
-        assert_eq!(lost["message_id"], first["message_id"]);
-        assert_eq!(server.bodies(), 1);
-    }
-
     /// Without `--json` the error is all a person sees, and its advice
     /// ("discard this draft") needs the draft's id.
     #[test]
@@ -1268,24 +1049,251 @@ mod tests {
         );
     }
 
-    /// The same explicit key with different content sends nothing.
-    #[tokio::test]
-    async fn an_explicit_key_with_new_content_is_refused() {
-        let f = fixture();
-        let attrs = declared();
-        let server = ScriptedServer::start(Script::default()).await;
-        let connector = PlainConnector { addr: server.addr };
-        let first = with_declared(request(Some("op-1")), &attrs);
-        send_now(&f.db, &f.creds, &first, &connector).await.unwrap();
+    /// Sends the gate lets through. A `governor` build gates every send on the
+    /// trusted Governor binary, which a test machine may not have (CI has none),
+    /// so these run where the gate is compiled off. The attribution refusal is
+    /// covered in every build by `a_refused_request_leaves_no_row`.
+    #[cfg(not(feature = "governor"))]
+    mod allowed {
+        use super::*;
+        use envelope_email_transport::smtp_submit::testing::AfterBody;
+        use std::time::Duration;
 
-        let mut drifted = with_declared(request(Some("op-1")), &attrs);
-        drifted.text = Some("Something else");
-        let body = status_of(
-            &send_now(&f.db, &f.creds, &drifted, &connector)
-                .await
-                .unwrap_err(),
-        );
-        assert_eq!(body["status"], "idempotency_key_conflict");
-        assert_eq!(server.bodies(), 1);
+        fn declared() -> Vec<String> {
+            vec!["informational".to_string()]
+        }
+
+        fn with_declared<'a>(mut req: SendRequest<'a>, attrs: &'a [String]) -> SendRequest<'a> {
+            req.declared = attrs;
+            req
+        }
+
+        fn status_of(err: &anyhow::Error) -> Value {
+            err.downcast_ref::<SendNotConfirmed>()
+                .map(|e| e.body.clone())
+                .unwrap_or_else(|| panic!("not a structured send outcome: {err:#}"))
+        }
+
+        async fn wait_for_body(server: &ScriptedServer) {
+            while server.bodies() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Pilot failure `send_now/after_data/kill`: the process died after the
+        /// server had the whole message, and the rerun of the same command sent it
+        /// again (30/30 duplicates). Dropping the send future mid-reply is that
+        /// kill: every piece of state is in SQLite, and the owner lock is released
+        /// as the kernel would release it.
+        #[tokio::test]
+        async fn a_rerun_after_a_crash_mid_body_does_not_send_again() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script {
+                after_body: AfterBody::Hang,
+                ..Script::default()
+            })
+            .await;
+            let connector = PlainConnector { addr: server.addr };
+            let req = with_declared(request(None), &attrs);
+
+            tokio::select! {
+                result = send_now(&f.db, &f.creds, &req, &connector) => {
+                    panic!("the server never answers the body: {result:?}")
+                }
+                _ = wait_for_body(&server) => {}
+            }
+
+            let rerun = send_now(&f.db, &f.creds, &req, &connector).await;
+            let body = status_of(&rerun.unwrap_err());
+            assert_eq!(body["status"], "delivery_uncertain", "{body}");
+            assert_eq!(body["retryable"], false);
+            assert_eq!(server.bodies(), 1, "the rerun must not transmit again");
+            assert_eq!(count(&f.db, "SELECT COUNT(*) FROM drafts"), 1);
+        }
+
+        /// Pilot failures `send_now/after_250/kill` and `after_append/kill`: the
+        /// server accepted, the process died before or during the Sent copy, and
+        /// the rerun sent a second copy. The rerun must answer from the record.
+        #[tokio::test]
+        async fn a_rerun_after_acceptance_replays_the_recorded_send() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script::default()).await;
+            let connector = PlainConnector { addr: server.addr };
+            let req = with_declared(request(None), &attrs);
+
+            let first = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
+            assert_eq!(first["status"], "sent");
+            let rerun = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
+            assert_eq!(rerun["status"], "sent");
+            assert_eq!(rerun["idempotent_replay"], true);
+            assert_eq!(rerun["message_id"], first["message_id"]);
+            assert_eq!(rerun["draft_id"], first["draft_id"]);
+            assert_eq!(server.bodies(), 1);
+        }
+
+        /// A connection that never got to the body sent nothing: the intent is
+        /// released and the rerun sends it exactly once.
+        #[tokio::test]
+        async fn a_rerun_after_an_unreachable_server_sends_once() {
+            let f = fixture();
+            let attrs = declared();
+            let req = with_declared(request(None), &attrs);
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let dead = PlainConnector {
+                addr: closed.local_addr().unwrap(),
+            };
+            drop(closed);
+
+            let failed = status_of(&send_now(&f.db, &f.creds, &req, &dead).await.unwrap_err());
+            assert_eq!(failed["status"], "not_sent");
+            assert_eq!(failed["retryable"], true);
+
+            let server = ScriptedServer::start(Script::default()).await;
+            let live = PlainConnector { addr: server.addr };
+            let sent = send_now(&f.db, &f.creds, &req, &live).await.unwrap();
+            assert_eq!(sent["status"], "sent");
+            assert_eq!(sent["draft_id"], failed["draft_id"]);
+            assert_eq!(server.bodies(), 1);
+            assert_eq!(count(&f.db, "SELECT COUNT(*) FROM drafts"), 1);
+        }
+
+        /// A body the server refused was not accepted: the intent goes back to
+        /// `draft`, never `delivery_uncertain`, and says whether a retry can help.
+        #[tokio::test]
+        async fn a_refused_body_is_released_with_its_reply_code() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script {
+                after_body: AfterBody::Reply("554 5.7.1 rejected"),
+                ..Script::default()
+            })
+            .await;
+            let connector = PlainConnector { addr: server.addr };
+            let req = with_declared(request(None), &attrs);
+
+            let body = status_of(
+                &send_now(&f.db, &f.creds, &req, &connector)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(body["status"], "not_sent");
+            assert_eq!(body["retryable"], false);
+            assert_eq!(body["error"]["reply_code"], 554);
+            assert_eq!(
+                count(&f.db, "SELECT COUNT(*) FROM drafts WHERE status = 'draft'"),
+                1
+            );
+        }
+
+        /// Pilot finding: no `action_log` rows at all, and `send_completed` with a
+        /// NULL `message_id`. Every transition of an immediate send leaves a
+        /// receipt tying the operation to its recipients, content and outcome.
+        #[tokio::test]
+        async fn an_immediate_send_leaves_receipts_for_every_transition() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script::default()).await;
+            let connector = PlainConnector { addr: server.addr };
+            let req = with_declared(request(None), &attrs);
+
+            let sent = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
+            let draft_id = sent["draft_id"].as_str().expect("draft_id").to_string();
+            let message_id = sent["message_id"].as_str().expect("message_id").to_string();
+
+            let mut stmt =
+                f.db.conn()
+                    .prepare(
+                        "SELECT action_status, message_id, action_taken FROM action_log
+                     WHERE action_type = 'send' AND draft_id = ?1 ORDER BY rowid",
+                    )
+                    .unwrap();
+            let rows: Vec<(String, Option<String>, Value)> = stmt
+                .query_map([&draft_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        serde_json::from_str(&r.get::<_, String>(2)?).unwrap(),
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let statuses: Vec<(&str, &str)> = rows
+                .iter()
+                .map(|(s, _, t)| (s.as_str(), t["phase"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    ("sending", "claimed"),
+                    ("sending", "transmitting"),
+                    ("sent", "accepted")
+                ]
+            );
+            for (_, mid, taken) in &rows {
+                assert_eq!(mid.as_deref(), Some(message_id.as_str()));
+                assert_eq!(taken["recipients"], json!(["alice@example.test"]));
+                assert_eq!(
+                    taken["semantic_sha256"],
+                    "523f0d8bc7e76d999b5ce167fed8429b8e54365cd26984d1b84fc28f5594881e"
+                );
+            }
+            let completed: Option<String> =
+                f.db.conn()
+                    .query_row(
+                        "SELECT message_id FROM events WHERE event_type = 'send_completed'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(
+                completed.as_deref(),
+                Some(message_id.trim_matches(|c| c == '<' || c == '>'))
+            );
+        }
+
+        /// Two processes ran the same request: the other one claimed the intent
+        /// between this one's lookup and its claim, and finished the send. This
+        /// request reports the recorded send, as a later rerun would, instead of
+        /// failing with `draft_changed`.
+        #[tokio::test]
+        async fn losing_the_claim_to_a_finished_send_replays_it() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script::default()).await;
+            let connector = PlainConnector { addr: server.addr };
+            let req = with_declared(request(None), &attrs);
+            let first = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
+            let draft_id = first["draft_id"].as_str().expect("draft_id");
+
+            let lost = claim_lost(&f.db, &req, draft_id).expect("a sent intent is replayed");
+            assert_eq!(lost["status"], "sent", "{lost}");
+            assert_eq!(lost["idempotent_replay"], true);
+            assert_eq!(lost["message_id"], first["message_id"]);
+            assert_eq!(server.bodies(), 1);
+        }
+
+        /// The same explicit key with different content sends nothing.
+        #[tokio::test]
+        async fn an_explicit_key_with_new_content_is_refused() {
+            let f = fixture();
+            let attrs = declared();
+            let server = ScriptedServer::start(Script::default()).await;
+            let connector = PlainConnector { addr: server.addr };
+            let first = with_declared(request(Some("op-1")), &attrs);
+            send_now(&f.db, &f.creds, &first, &connector).await.unwrap();
+
+            let mut drifted = with_declared(request(Some("op-1")), &attrs);
+            drifted.text = Some("Something else");
+            let body = status_of(
+                &send_now(&f.db, &f.creds, &drifted, &connector)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(body["status"], "idempotency_key_conflict");
+            assert_eq!(server.bodies(), 1);
+        }
     }
 }
