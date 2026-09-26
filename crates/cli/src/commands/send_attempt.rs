@@ -48,7 +48,11 @@ impl std::fmt::Display for SendNotConfirmed {
             .as_str()
             .or_else(|| self.body["status"].as_str())
             .unwrap_or("send not confirmed");
-        f.write_str(reason)
+        match self.body["draft_id"].as_str() {
+            Some(id) if !reason.contains(id) => write!(f, "{reason} (draft {id})"),
+            Some(_) => f.write_str(reason),
+            None => f.write_str(reason),
+        }
     }
 }
 
@@ -393,13 +397,7 @@ pub(crate) async fn send_now<C: SmtpConnect>(
     let message_id = format!("<{}>", generate_message_id(creds));
     let start = AttemptStart::new(&message_id, req.label, req.agent_id);
     let Some(held) = claim_row(db, &draft, &start)? else {
-        let current = db
-            .get_draft(&draft.id)?
-            .ok_or_else(|| anyhow!("draft vanished: {}", draft.id))?;
-        return Err(SendNotConfirmed {
-            body: state_report(&current),
-        }
-        .into());
+        return claim_lost(db, req, &draft.id);
     };
     let outgoing = Outgoing::of_draft(&held.claim.draft, creds)?;
     let sent = transmit_claimed(
@@ -413,6 +411,22 @@ pub(crate) async fn send_now<C: SmtpConnect>(
     )
     .await?;
     Ok(sent_json(&sent, &outgoing, &creds.account.id))
+}
+
+/// The answer when another request for the same intent claimed the row
+/// between this request's lookup and its claim.
+fn claim_lost(db: &Database, req: &SendRequest<'_>, draft_id: &str) -> Result<Value> {
+    let current = db
+        .get_draft(draft_id)?
+        .ok_or_else(|| anyhow!("draft vanished: {draft_id}"))?;
+    match answer_or_resume(db, req, IntentLookup::Existing(current.clone()))? {
+        Next::Replayed(body) => Ok(body),
+        // Released again by the other request: report it rather than race it.
+        Next::Transmit(_) => Err(SendNotConfirmed {
+            body: state_report(&current),
+        }
+        .into()),
+    }
 }
 
 enum Next {
@@ -1214,6 +1228,44 @@ mod tests {
         assert!(err.downcast_ref::<GovernorRefused>().is_some(), "{err:#}");
         assert_eq!(count(&f.db, "SELECT COUNT(*) FROM drafts"), 0);
         assert!(!server.saw("MAIL"));
+    }
+
+    /// Two processes ran the same request: the other one claimed the intent
+    /// between this one's lookup and its claim, and finished the send. This
+    /// request reports the recorded send, as a later rerun would, instead of
+    /// failing with `draft_changed`.
+    #[tokio::test]
+    async fn losing_the_claim_to_a_finished_send_replays_it() {
+        let f = fixture();
+        let attrs = declared();
+        let server = ScriptedServer::start(Script::default()).await;
+        let connector = PlainConnector { addr: server.addr };
+        let req = with_declared(request(None), &attrs);
+        let first = send_now(&f.db, &f.creds, &req, &connector).await.unwrap();
+        let draft_id = first["draft_id"].as_str().expect("draft_id");
+
+        let lost = claim_lost(&f.db, &req, draft_id).expect("a sent intent is replayed");
+        assert_eq!(lost["status"], "sent", "{lost}");
+        assert_eq!(lost["idempotent_replay"], true);
+        assert_eq!(lost["message_id"], first["message_id"]);
+        assert_eq!(server.bodies(), 1);
+    }
+
+    /// Without `--json` the error is all a person sees, and its advice
+    /// ("discard this draft") needs the draft's id.
+    #[test]
+    fn a_human_readable_outcome_names_its_draft() {
+        let outcome = SendNotConfirmed {
+            body: json!({
+                "status": "delivery_uncertain",
+                "draft_id": "d-9",
+                "error": {"reason": "It may have been delivered."},
+            }),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "It may have been delivered. (draft d-9)"
+        );
     }
 
     /// The same explicit key with different content sends nothing.
