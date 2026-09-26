@@ -1665,8 +1665,9 @@ fn imap_quoted_string_arg(value: &str) -> Result<String, ImapError> {
 
 /// Fetch List-Unsubscribe and List-Unsubscribe-Post headers for a message.
 ///
-/// Returns `(list_unsubscribe, list_unsubscribe_post)` — both are None if
-/// the headers are absent.
+/// Returns `(list_unsubscribe, list_unsubscribe_post)` as unfolded raw field
+/// text — each is None if that header is absent. A UID the server does not
+/// return is [`ImapError::NotFound`].
 pub async fn fetch_list_unsubscribe_headers(
     client: &mut ImapClient,
     folder: &str,
@@ -1704,29 +1705,39 @@ where
         .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
 
     let Some(fetch) = fetches.first() else {
+        return Err(ImapError::NotFound(uid));
+    };
+    // A `BODY[HEADER]` reply lands in `header()`; `body()` only holds `BODY[]`.
+    let header_bytes = fetch.header().ok_or_else(|| {
+        ImapError::Protocol(format!(
+            "UID FETCH {uid} HEADER: reply has no header section"
+        ))
+    })?;
+    // `parse_headers` returns None only when the section holds no fields.
+    let Some(parsed) = mail_parser::MessageParser::default().parse_headers(header_bytes) else {
         return Ok((None, None));
     };
-    let header_bytes = fetch.body().unwrap_or_default();
 
-    let Some(parsed) = mail_parser::MessageParser::default().parse(header_bytes) else {
-        return Ok((None, None));
+    // Take the raw field text: mail-parser parses List-Unsubscribe as an
+    // address list, so its parsed value is not the `<URI>, <URI>` text
+    // (RFC 2369) that `unsubscribe::parse_list_unsubscribe` reads.
+    let raw_field = |name: &str| {
+        parsed
+            .headers()
+            .iter()
+            .find(|h| h.name.as_str().eq_ignore_ascii_case(name))
+            .map(|h| {
+                let raw = String::from_utf8_lossy(&header_bytes[h.offset_start..h.offset_end]);
+                // Unfold (RFC 5322 §2.2.3): drop the line breaks, keep the
+                // whitespace that followed them.
+                raw.replace(['\r', '\n'], "").trim().to_string()
+            })
     };
 
-    let list_unsub = parsed
-        .header_values("List-Unsubscribe")
-        .find_map(|v| match v {
-            mail_parser::HeaderValue::Text(t) => Some(t.to_string()),
-            _ => None,
-        });
-
-    let list_unsub_post = parsed
-        .header_values("List-Unsubscribe-Post")
-        .find_map(|v| match v {
-            mail_parser::HeaderValue::Text(t) => Some(t.to_string()),
-            _ => None,
-        });
-
-    Ok((list_unsub, list_unsub_post))
+    Ok((
+        raw_field("List-Unsubscribe"),
+        raw_field("List-Unsubscribe-Post"),
+    ))
 }
 
 /// Map human-readable flag names to IMAP flag format.
@@ -2838,12 +2849,13 @@ Subject: hi\r\n\r\nbody\r\n";
     }
 
     /// Log in over an in-memory duplex against a server that plays `turns` in
-    /// order. The server task fails if the client sends anything else.
+    /// order. The server task fails if the client sends anything else, and
+    /// returns the command lines it received.
     async fn scripted_session(
         turns: Vec<Turn>,
     ) -> (
         Session<tokio::io::DuplexStream>,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<Vec<String>>,
     ) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -2856,6 +2868,7 @@ Subject: hi\r\n\r\nbody\r\n";
                 verb: "LOGIN",
                 reply: vec!["{tag} OK LOGIN completed".into()],
             };
+            let mut received = Vec::new();
             for turn in std::iter::once(login).chain(turns) {
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
@@ -2888,7 +2901,9 @@ Subject: hi\r\n\r\nbody\r\n";
                 }
                 let rest: String = reply.map(|l| format!("{l}\r\n")).collect();
                 write_half.write_all(rest.as_bytes()).await.unwrap();
+                received.push(line);
             }
+            received
         });
 
         let mut client = async_imap::Client::new(client_io);
@@ -2956,7 +2971,29 @@ Subject: hi\r\n\r\nbody\r\n";
     #[tokio::test]
     async fn list_unsubscribe_fetch_leaves_connection_ready_for_append() {
         let header = "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\r\n";
-        let (mut session, server) = scripted_session(vec![
+        let mut turns = header_fetch_turns(&[&format!(
+            "* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})",
+            header.len()
+        )]);
+        turns.push(append_turn());
+        let (mut session, server) = scripted_session(turns).await;
+
+        fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
+            .await
+            .expect("single-UID header FETCH");
+        session
+            .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
+            .await
+            .expect("APPEND right after a single-UID FETCH");
+        server.await.unwrap();
+    }
+
+    /// The SELECT and `UID FETCH` turns of a List-Unsubscribe lookup, with
+    /// `fetch_lines` as the untagged FETCH reply.
+    fn header_fetch_turns(fetch_lines: &[&str]) -> Vec<Turn> {
+        let mut fetch_reply: Vec<String> = fetch_lines.iter().map(|l| l.to_string()).collect();
+        fetch_reply.push("{tag} OK Fetch completed".into());
+        vec![
             Turn {
                 verb: "SELECT",
                 reply: vec![
@@ -2967,25 +3004,143 @@ Subject: hi\r\n\r\nbody\r\n";
             },
             Turn {
                 verb: "UID FETCH",
-                reply: vec![
-                    format!(
-                        "* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})",
-                        header.len()
-                    ),
-                    "{tag} OK Fetch completed".into(),
-                ],
+                reply: fetch_reply,
             },
-            append_turn(),
-        ])
-        .await;
+        ]
+    }
 
-        fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
+    /// Serve `header` as UID 7's `BODY[HEADER]` and return what the
+    /// List-Unsubscribe lookup made of it, asserting the FETCH used
+    /// `BODY.PEEK` so the lookup never marks the message read.
+    async fn list_unsubscribe_headers_from(header: &str) -> (Option<String>, Option<String>) {
+        let (mut session, server) = scripted_session(header_fetch_turns(&[&format!(
+            "* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})",
+            header.len()
+        )]))
+        .await;
+        let found = fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
             .await
-            .expect("single-UID header FETCH");
-        session
-            .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
+            .expect("List-Unsubscribe header FETCH");
+        let commands = server.await.unwrap();
+        let fetch = commands
+            .iter()
+            .find(|c| c.contains("UID FETCH"))
+            .expect("client sent a UID FETCH");
+        assert!(fetch.contains("BODY.PEEK[HEADER]"), "{fetch:?}");
+        found
+    }
+
+    /// What `envelope unsubscribe` (dry run) would do with fetched headers.
+    async fn dry_run_action(found: &(Option<String>, Option<String>)) -> (String, Option<String>) {
+        let header = found.0.as_deref().expect("List-Unsubscribe header");
+        let info = crate::unsubscribe::parse_list_unsubscribe(header, found.1.as_deref())
+            .expect("parseable List-Unsubscribe header");
+        let result = crate::unsubscribe::execute_unsubscribe(&info, false, None).await;
+        assert_eq!(result.status, "dry_run");
+        (result.method, result.url)
+    }
+
+    /// Regression: the lookup read `fetch.body()`, which holds only a
+    /// `BODY[]` reply, so the `BODY[HEADER]` bytes were never seen and every
+    /// message looked like it had no List-Unsubscribe header. mail-parser
+    /// also parses List-Unsubscribe as an address list, so matching a Text
+    /// value missed the field even when the bytes were there.
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_returns_both_headers() {
+        let header = "From: News <news@example.com>\r\n\
+            Subject: This week\r\n\
+            List-Unsubscribe: <mailto:unsub@example.com?subject=unsubscribe>, <https://example.com/unsub?id=123>\r\n\
+            List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+            \r\n";
+        let found = list_unsubscribe_headers_from(header).await;
+        assert_eq!(
+            found,
+            (
+                Some(
+                    "<mailto:unsub@example.com?subject=unsubscribe>, <https://example.com/unsub?id=123>"
+                        .to_string()
+                ),
+                Some("List-Unsubscribe=One-Click".to_string()),
+            )
+        );
+        assert_eq!(
+            dry_run_action(&found).await,
+            (
+                "https_post".to_string(),
+                Some("https://example.com/unsub?id=123".to_string())
+            )
+        );
+    }
+
+    /// Folded fields come back unfolded (RFC 5322 §2.2.3: drop the CRLF, keep
+    /// the whitespace), field names match in any case, and every URI in the
+    /// list survives.
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_unfolds_multi_uri_header() {
+        let header = "Subject: digest\r\n\
+            list-unsubscribe: <mailto:leave@lists.example.com>,\r\n \
+            <https://lists.example.com/u?a=1&b=2>,\r\n\t<http://lists.example.com/legacy>\r\n\
+            LIST-UNSUBSCRIBE-POST:\r\n List-Unsubscribe=One-Click\r\n\
+            \r\n";
+        let found = list_unsubscribe_headers_from(header).await;
+        assert_eq!(
+            found,
+            (
+                Some(
+                    "<mailto:leave@lists.example.com>, <https://lists.example.com/u?a=1&b=2>,\t<http://lists.example.com/legacy>"
+                        .to_string()
+                ),
+                Some("List-Unsubscribe=One-Click".to_string()),
+            )
+        );
+        let info = crate::unsubscribe::parse_list_unsubscribe(
+            found.0.as_deref().unwrap(),
+            found.1.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(info.mailto_urls, ["mailto:leave@lists.example.com"]);
+        assert_eq!(
+            info.https_urls,
+            [
+                "https://lists.example.com/u?a=1&b=2",
+                "http://lists.example.com/legacy"
+            ]
+        );
+        assert_eq!(
+            dry_run_action(&found).await,
+            (
+                "https_post".to_string(),
+                Some("https://lists.example.com/u?a=1&b=2".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_without_the_headers_returns_none() {
+        let header = "From: a@example.com\r\nSubject: hi\r\n\r\n";
+        assert_eq!(list_unsubscribe_headers_from(header).await, (None, None));
+    }
+
+    /// A reply that never carries the header section is an error, so a
+    /// broken FETCH cannot pass for "this sender has no unsubscribe header".
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_without_header_section_is_an_error() {
+        let (mut session, server) =
+            scripted_session(header_fetch_turns(&[r"* 1 FETCH (UID 7 FLAGS (\Seen))"])).await;
+        let err = fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
             .await
-            .expect("APPEND right after a single-UID FETCH");
+            .expect_err("a FETCH reply with no BODY[HEADER] must not read as no header");
+        assert!(matches!(err, ImapError::Protocol(_)), "{err:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_unsubscribe_fetch_of_missing_uid_is_not_found() {
+        let (mut session, server) = scripted_session(header_fetch_turns(&[])).await;
+        let err = fetch_list_unsubscribe_headers_in(&mut session, "INBOX", 7)
+            .await
+            .expect_err("an empty FETCH reply must not read as no header");
+        assert!(matches!(err, ImapError::NotFound(7)), "{err:?}");
         server.await.unwrap();
     }
 }
