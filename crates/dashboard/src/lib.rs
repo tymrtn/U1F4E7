@@ -1652,7 +1652,18 @@ pub(crate) fn scheduled_send_context(
             draft.bcc_addr.as_deref(),
         )
         .unwrap_or_default();
-    let is_reply = draft.in_reply_to.is_some() || scheduled_threading(draft).0.is_some();
+    // Reply credit is earned against the account's own Sent history, never
+    // taken from the draft's `In-Reply-To`; a store error withholds it.
+    let is_reply = scheduled_threading(draft).0.is_some_and(|parent| {
+        db.is_verified_reply(
+            &draft.account_id,
+            &parent,
+            &draft.to_addr,
+            draft.cc_addr.as_deref(),
+            draft.bcc_addr.as_deref(),
+        )
+        .unwrap_or(false)
+    });
     AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
@@ -2485,6 +2496,43 @@ mod tests {
             bin: "/nonexistent/governor-binary-xyz".to_string(),
         };
         gate_with_attribution(&config, &req)
+    }
+
+    /// Cache the account's own message `message_id` to `recipient` in its
+    /// detected Sent folder, so a reply to it earns verified reply credit.
+    fn seed_sent_parent(
+        db: &Database,
+        account_id: &str,
+        from: &str,
+        recipient: &str,
+        message_id: &str,
+    ) {
+        db.set_detected_folder(account_id, "sent", "Sent").unwrap();
+        let thread = db
+            .create_thread(
+                "thread",
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+                account_id,
+            )
+            .unwrap();
+        db.upsert_thread_message(
+            &thread.thread_id,
+            1,
+            Some(message_id),
+            None,
+            None,
+            "Sent",
+            from,
+            recipient,
+            None,
+            None,
+            "2026-09-01T00:00:00Z",
+            "thread",
+            true,
+            None,
+        )
+        .unwrap();
     }
 
     fn sweep_test_db() -> Database {
@@ -3729,6 +3777,14 @@ mod tests {
             )
             .unwrap();
 
+        seed_sent_parent(
+            &db,
+            "acc1",
+            "agent@martin.fm",
+            "counterparty@gmail.com",
+            "parent@martin.fm",
+        );
+
         let attachments = vec![Attachment {
             filename: "Master-Services-Agreement.pdf".to_string(),
             content_type: "application/pdf".to_string(),
@@ -3747,9 +3803,35 @@ mod tests {
         assert!(!attrs.contains(&"internal_domain"), "{attrs:?}");
     }
 
+    /// Injection path: a queued draft carrying an `In-Reply-To` that resolves
+    /// to nothing the account took part in must score as a fresh compose.
+    #[test]
+    fn scheduled_context_gives_no_reply_credit_for_an_unverified_in_reply_to() {
+        let db = sweep_test_db();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
+        let draft = db
+            .create_draft(
+                "acc1",
+                "fresh@stranger.test",
+                Some("Re: invoice"),
+                Some("body"),
+                None,
+                Some("forged@nowhere.test"),
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let attrs = scheduled_send_context(&db, &draft, Some("example.com".to_string()), &[])
+            .to_governor_attrs();
+        assert!(!attrs.contains(&"reply_to_thread"), "{attrs:?}");
+        assert!(attrs.contains(&"cold_email"), "{attrs:?}");
+    }
+
     #[test]
     fn scheduled_context_uses_shared_relationship_history_derivation() {
         let db = sweep_test_db();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
         let draft = db
             .create_draft(
                 "acc1",
@@ -3914,6 +3996,13 @@ mod tests {
             &serde_json::json!({"in_reply_to": "parent@example.net"}),
         )
         .unwrap();
+        seed_sent_parent(
+            &db,
+            "acc1",
+            "agent@example.com",
+            "recipient@example.net",
+            "parent@example.net",
+        );
 
         let unapproved = db.get_draft(&draft.id).unwrap().unwrap();
         let attrs = scheduled_send_context(&db, &unapproved, Some("example.com".to_string()), &[])

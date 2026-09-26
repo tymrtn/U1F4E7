@@ -17,6 +17,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bodies, `/api/events` and `envelope analytics show --json` is now bare (`payload.message_id` is
   unchanged). To build an `In-Reply-To` or `References` header from it, add the angle brackets.
 
+### Security
+
+These fixes change how the Governor send gate (built with `--features governor`) derives
+relationship facts about recipients. Release builds ship with Governor off. Before them, mail an
+attacker controls, or an agent acting on it, could lift a send to a stranger out of
+first-contact scoring:
+
+- **Spoofed self-From.** A message counted as the account's own outbound whenever its From
+  matched the account address, in any folder. An inbound "From: you, To: attacker" in INBOX made
+  the attacker a known contact, and a frequent one after five. Only a copy in the detected Sent
+  folder counts now, both when the thread index is built and when facts are derived, so rows an
+  earlier index stored are covered too.
+- **Agent-added contacts.** MCP `contacts add`, `tag` and `untag` wrote curated rows, and a
+  curated row made a recipient a known contact. Those rows are now marked agent-curated
+  (`contacts.history_derived = 2`): the address book keeps and suggests them, and the gate
+  ignores them. `envelope contacts import`, which copies inbox senders, writes them the same
+  way. `contacts add` from the CLI still vouches for the address, and an agent write never
+  downgrades a contact a person added. Contacts an agent added before this release can't be
+  told apart and still count.
+- **Unverified `In-Reply-To`.** Any draft with an `In-Reply-To`, including a made-up one, got
+  `reply_to_thread` and had `cold_email` switched off. Reply credit now requires the parent to
+  resolve to one cached thread in the account, with every recipient on a Sent-folder message
+  in that thread. Otherwise the send is scored as new mail. This applies to CLI and MCP sends,
+  draft sends and the scheduled sweep.
+- **Replies to a stranger's thread.** Replying to an attacker's own message used to count as a
+  warm reply. The account has never written to that sender, so the reply keeps `cold_email`.
+- **New Cc on a known thread.** A recipient set that mixed known and unknown addresses switched
+  `cold_email` and `unknown_domain` off for the whole send. Now `cold_email` fires when any
+  recipient has no verified history, `unknown_domain` fires when any recipient's domain is
+  unseen, and the added address costs the reply its `reply_to_thread` credit.
+
+Honest replies keep their credit: answering a thread in which you already wrote to every
+recipient still scores `reply_to_thread`.
+
 ## [1.3.5] — 2026-09-26
 
 ### rShield

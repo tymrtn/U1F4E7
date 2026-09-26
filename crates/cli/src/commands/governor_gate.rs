@@ -33,6 +33,10 @@ use envelope_email_transport::smtp::Attachment;
 /// remain unknown (omitted); they are never fabricated. Bot-originated surfaces
 /// (CLI/MCP) require at least one factual declaration — host facts never
 /// substitute.
+///
+/// `in_reply_to` is the parent Message-ID the send will carry. It earns reply
+/// credit only through [`Database::is_verified_reply`]; otherwise the send is
+/// scored as a fresh compose.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn governor_request(
     db: &Database,
@@ -45,7 +49,7 @@ pub(crate) fn governor_request(
     surface: SendSurface,
     draft_id: Option<&str>,
     attachments: &[Attachment],
-    is_reply: bool,
+    in_reply_to: Option<&str>,
     text_body: Option<&str>,
     html_body: Option<&str>,
     declared: &[String],
@@ -66,6 +70,11 @@ pub(crate) fn governor_request(
     let relationship = db
         .derive_outbound_relationship_facts(account_id, to, cc, bcc)
         .unwrap_or_default();
+    // A store error withholds reply credit: the send then scores as new mail.
+    let is_reply = in_reply_to.is_some_and(|parent| {
+        db.is_verified_reply(account_id, parent, to, cc, bcc)
+            .unwrap_or(false)
+    });
     let ctx = AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
@@ -77,8 +86,9 @@ pub(crate) fn governor_request(
         calendar_invitation,
         known_contact: relationship.known_contact,
         frequent_contact: relationship.frequent_contact,
-        // A reply has a definitive structural relationship and cannot be a first
-        // contact, regardless of a bounded cache lookup.
+        // A verified reply continues a thread the account wrote to every
+        // recipient in, so it cannot be a first contact, whatever a bounded
+        // cache lookup finds.
         cold_email: if is_reply {
             Some(false)
         } else {
@@ -301,7 +311,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("a short body"),
             None,
             &declared,
@@ -409,7 +419,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some(short),
             None,
             &["short_body".to_string()],
@@ -427,6 +437,7 @@ mod tests {
     #[test]
     fn direct_governor_request_derives_known_contact_from_shared_store_history() {
         let db = Database::open_memory().unwrap();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
         let thread = db
             .create_thread(
                 "prior correspondence",
@@ -464,7 +475,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("short body"),
             None,
             &["known_contact".to_string()],
@@ -509,7 +520,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             None,
             Some("<html><body><p>a short html-only note</p></body></html>"),
             &["short_body".to_string()],
@@ -539,7 +550,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some(&long),
             None,
             &["short_body".to_string()],
@@ -571,7 +582,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("a short body"),
             None,
             &["agent_drafted".to_string()],
@@ -595,5 +606,228 @@ mod tests {
         let outcome = gate_with_attribution(&nonexistent_required(), &req);
         assert!(!outcome.allowed);
         assert_eq!(outcome.block_code.as_deref(), Some("attributes_invalid"));
+    }
+
+    // ── Injection-safe relationship derivation ──────────────────────────
+    //
+    // Each test below reproduces a path by which content an attacker controls
+    // (an inbound message, or an agent acting on one) could lift a send to a
+    // stranger out of first-contact scoring.
+
+    fn relationship_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Me', 'me@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
+        db
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cache_message(
+        db: &Database,
+        thread_id: Option<&str>,
+        message_id: &str,
+        folder: &str,
+        from: &str,
+        to: &str,
+        cc: Option<&str>,
+        is_outbound: bool,
+    ) -> String {
+        let thread_id = match thread_id {
+            Some(id) => id.to_string(),
+            None => {
+                db.create_thread(
+                    "project",
+                    "2026-09-01T00:00:00Z",
+                    "2026-09-01T00:00:00Z",
+                    "acc1",
+                )
+                .unwrap()
+                .thread_id
+            }
+        };
+        let uid = db
+            .conn()
+            .query_row("SELECT COUNT(*) + 1 FROM thread_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32;
+        db.upsert_thread_message(
+            &thread_id,
+            uid,
+            Some(message_id),
+            None,
+            None,
+            folder,
+            from,
+            to,
+            cc,
+            None,
+            "2026-09-01T00:00:00Z",
+            "project",
+            is_outbound,
+            None,
+        )
+        .unwrap();
+        thread_id
+    }
+
+    /// A thread the account really took part in: its own message to
+    /// `known@example.net` in Sent, then that contact's answer in INBOX.
+    fn verified_thread(db: &Database) {
+        let thread = cache_message(
+            db,
+            None,
+            "<mine-1@example.test>",
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            None,
+            true,
+        );
+        cache_message(
+            db,
+            Some(&thread),
+            "<theirs-2@example.net>",
+            "INBOX",
+            "known@example.net",
+            "me@example.test",
+            None,
+            false,
+        );
+    }
+
+    /// Resolve attribution for a stored draft exactly as CLI `draft send` /
+    /// MCP `send_draft` do before transmission.
+    fn draft_resolution(
+        db: &Database,
+        to: &str,
+        cc: Option<&str>,
+        in_reply_to: Option<&str>,
+        declared: &[&str],
+    ) -> envelope_email_transport::attribution::AttributionResolution {
+        let draft = db
+            .create_draft(
+                "acc1",
+                to,
+                Some("Re: project"),
+                Some("a short body"),
+                None,
+                in_reply_to,
+                cc,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        crate::commands::drafts::precheck_draft(db, &draft.id, SendSurface::Cli, &declared, None)
+            .unwrap()
+            .resolution
+    }
+
+    fn has(attrs: &[String], key: &str) -> bool {
+        attrs.iter().any(|a| a == key)
+    }
+
+    #[test]
+    fn spoofed_self_from_in_inbox_does_not_corroborate_known_contact() {
+        let db = relationship_db();
+        cache_message(
+            &db,
+            None,
+            "<spoof@evil.test>",
+            "INBOX",
+            "me@example.test",
+            "attacker@evil.test",
+            None,
+            true,
+        );
+        let res = draft_resolution(&db, "attacker@evil.test", None, None, &["known_contact"]);
+        assert!(
+            res.rejected_attrs
+                .iter()
+                .any(|r| r.key == "known_contact" && r.code == "conflicts_with_host_observation"),
+            "a forged self-From in INBOX must not vouch: {res:?}"
+        );
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    #[test]
+    fn forged_in_reply_to_earns_no_reply_credit() {
+        let db = relationship_db();
+        let res = draft_resolution(
+            &db,
+            "fresh@stranger.test",
+            None,
+            Some("<forged@nowhere.test>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+        assert!(has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    #[test]
+    fn replying_to_a_strangers_thread_keeps_cold_email() {
+        let db = relationship_db();
+        cache_message(
+            &db,
+            None,
+            "<attack@evil.test>",
+            "INBOX",
+            "attacker@evil.test",
+            "me@example.test",
+            None,
+            false,
+        );
+        let res = draft_resolution(
+            &db,
+            "attacker@evil.test",
+            None,
+            Some("<attack@evil.test>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    #[test]
+    fn a_reply_that_adds_a_new_cc_keeps_first_contact_signals() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            Some("attacker@evil.test"),
+            Some("<theirs-2@example.net>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+        assert!(has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    #[test]
+    fn a_reply_in_a_verified_thread_keeps_reply_credit() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            None,
+            Some("<theirs-2@example.net>"),
+            &["reply_to_thread"],
+        );
+        assert!(res.is_attributed(), "{res:?}");
+        assert!(has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "known_contact"), "{res:?}");
+        assert!(!has(&res.derived_attrs, "cold_email"), "{res:?}");
     }
 }

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use envelope_email_store::Curator;
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_store::models::Contact;
 use envelope_email_transport::imap;
@@ -191,7 +192,7 @@ pub fn run_tag(
     let acct = super::common::resolve_account(&db, account)?;
 
     let found = db
-        .add_contact_tag(&acct.id, email, tag)
+        .add_contact_tag(&acct.id, email, tag, Curator::Human)
         .context("failed to add tag")?;
 
     if !found {
@@ -222,7 +223,7 @@ pub fn run_untag(
     let acct = super::common::resolve_account(&db, account)?;
 
     let found = db
-        .remove_contact_tag(&acct.id, email, tag)
+        .remove_contact_tag(&acct.id, email, tag, Curator::Human)
         .context("failed to remove tag")?;
 
     if !found {
@@ -332,7 +333,9 @@ pub async fn run_import_inbox(
             }
         };
 
-        db.upsert_contact(&contact)
+        // Inbox senders are inbound mail, which anyone can send: importing them
+        // records the contacts without vouching for them to the Governor gate.
+        db.upsert_contact_by(&contact, Curator::Agent)
             .with_context(|| format!("failed to upsert contact {email}"))?;
     }
 

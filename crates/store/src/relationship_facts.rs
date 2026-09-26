@@ -7,6 +7,14 @@
 //! cached thread headers. It never opens IMAP, reconciles address history, or
 //! inspects message subjects, snippets, or bodies. An exhausted bounded scan is
 //! *unknown*, not evidence that a recipient or domain is new.
+//!
+//! Every favorable fact here must come from evidence an inbound message cannot
+//! mint. Outbound history counts only from the account's detected Sent-role
+//! folder: a cached row whose From merely equals the account address anywhere
+//! else (a spoofed inbound in INBOX, say) is not the account's mail. A contact
+//! vouches only when a person curated it (`history_derived = 0`); rows an agent
+//! wrote over MCP, or an inbox import copied, carry
+//! [`crate::contacts::AGENT_CURATED`] and never do.
 
 use std::collections::HashSet;
 
@@ -24,6 +32,15 @@ pub const RELATIONSHIP_FACT_RECIPIENT_LIMIT: usize = 8;
 /// Thread-header rows examined per recipient. The extra row detects truncation;
 /// a missing match after a truncated scan remains unknown.
 const RELATIONSHIP_FACT_THREAD_SCAN_LIMIT: usize = 256;
+
+/// Rows that are the account's own verified outbound mail: flagged outbound
+/// *and* cached from the folder detected as its Sent mailbox. `?1` is the
+/// account id; callers append further predicates.
+const VERIFIED_OUTBOUND_ROWS: &str = "FROM thread_messages tm
+     JOIN threads t ON t.thread_id = tm.thread_id
+     JOIN detected_folders df
+       ON df.account_id = t.account_id AND df.folder_type = 'sent' AND df.folder_name = tm.folder
+     WHERE t.account_id = ?1 AND tm.is_outbound = 1";
 
 /// Sanitized, tri-state relationship observations suitable for
 /// `AttributedSendContext`. This type deliberately carries no addresses, header
@@ -49,13 +66,14 @@ impl Database {
     /// Derive relationship facts for an outbound recipient set from this
     /// account's actual contact rows and cached correspondence headers.
     ///
-    /// `known_contact` is true only when every recipient is curated or observed
-    /// in outbound correspondence. Inbound-only mail, unverified header links,
-    /// and display names never establish a favorable relationship fact.
-    /// `cold_email` is true only when every
-    /// recipient has no contact/history evidence *and* every bounded history scan
-    /// completed. Mixed sets resolve both facts false; this prevents contradictory
-    /// relationship labels. `unknown_domain` follows the same complete-scan rule.
+    /// `known_contact` is true only when every recipient is human-curated or
+    /// observed in verified outbound correspondence. Inbound-only mail, a
+    /// self-From outside the Sent folder, agent-curated contacts, unverified
+    /// header links, and display names never establish a favorable fact.
+    /// `cold_email` is true when any recipient has no such evidence and the
+    /// bounded history scan completed, so a stranger added beside a known
+    /// recipient keeps its first-contact signal; it is false only when every
+    /// recipient is known. `unknown_domain` follows the same rule per domain.
     ///
     /// The scan is intentionally bounded. If a recipient/domain is not found
     /// before the cap, absence is not asserted and its facts remain `None`.
@@ -77,12 +95,11 @@ impl Database {
         }
 
         let all_history_complete = observations.iter().all(|o| o.history_complete);
-        let any_known = observations.iter().any(|o| o.known);
         let all_known = observations.iter().all(|o| o.known);
-        let all_unknown = observations.iter().all(|o| !o.known);
+        let any_unknown = !all_known;
         let all_domains_complete = observations.iter().all(|o| o.domain_complete);
-        let any_domain_seen = observations.iter().any(|o| o.domain_seen);
-        let all_domains_unseen = observations.iter().all(|o| !o.domain_seen);
+        let all_domains_seen = observations.iter().all(|o| o.domain_seen);
+        let any_domain_unseen = !all_domains_seen;
         let all_frequent = observations.iter().all(|o| o.recent_messages >= 5);
 
         Ok(RelationshipFacts {
@@ -97,21 +114,103 @@ impl Database {
             // `known_contact`; absence is intentionally unknown rather than a
             // claim about incomplete or malformed timestamp coverage.
             frequent_contact: all_frequent.then_some(true),
-            cold_email: if all_unknown && all_history_complete {
-                Some(true)
-            } else if any_known {
+            cold_email: if all_known {
                 Some(false)
+            } else if any_unknown && all_history_complete {
+                Some(true)
             } else {
                 None
             },
-            unknown_domain: if all_domains_unseen && all_domains_complete {
-                Some(true)
-            } else if any_domain_seen {
+            unknown_domain: if all_domains_seen {
                 Some(false)
+            } else if any_domain_unseen && all_domains_complete {
+                Some(true)
             } else {
                 None
             },
         })
+    }
+
+    /// Whether a send answering `in_reply_to` earns reply credit
+    /// (`reply_to_thread`, which also rules out `cold_email`).
+    ///
+    /// The header is caller-supplied, and the parent may be an attacker's own
+    /// message, so neither its presence nor its resolving proves a
+    /// relationship. Credit needs both: the parent's Message-ID resolves to
+    /// exactly one cached thread in this account, and every recipient already
+    /// appears on a verified outbound message (see [`VERIFIED_OUTBOUND_ROWS`])
+    /// in that thread. Being in the thread through inbound mail never counts,
+    /// and a recipient new to the thread (an added Cc) forfeits the credit.
+    /// Anything unresolved, ambiguous, or past the scan bound is `false`, and
+    /// the send is then scored as a fresh compose.
+    pub fn is_verified_reply(
+        &self,
+        account_id: &str,
+        in_reply_to: &str,
+        to: &str,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> Result<bool> {
+        let parent = crate::threads::normalize_message_id(
+            in_reply_to.split_whitespace().next().unwrap_or_default(),
+        );
+        if parent.is_empty() {
+            return Ok(false);
+        }
+        let recipients = recipient_addresses(to, cc, bcc);
+        if recipients.is_empty() || recipients.len() > RELATIONSHIP_FACT_RECIPIENT_LIMIT {
+            return Ok(false);
+        }
+
+        let mut stmt = self.conn().prepare(
+            "SELECT DISTINCT tm.thread_id
+             FROM thread_messages tm
+             JOIN threads t ON t.thread_id = tm.thread_id
+             WHERE t.account_id = ?1 AND trim(trim(tm.message_id), '<>') = ?2
+             LIMIT 2",
+        )?;
+        let threads = stmt
+            .query_map(params![account_id, parent], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let [thread_id] = threads.as_slice() else {
+            return Ok(false);
+        };
+
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT tm.from_address, tm.to_addresses, tm.cc_addresses, tm.bcc_addresses
+             {VERIFIED_OUTBOUND_ROWS} AND tm.thread_id = ?2
+             LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    account_id,
+                    thread_id,
+                    (RELATIONSHIP_FACT_THREAD_SCAN_LIMIT + 1) as i64
+                ],
+                |row| {
+                    Ok([
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ])
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > RELATIONSHIP_FACT_THREAD_SCAN_LIMIT {
+            return Ok(false);
+        }
+        let correspondents: HashSet<String> = rows
+            .iter()
+            .flatten()
+            .flatten()
+            .flat_map(|header| parse_address_list(header))
+            .map(|address| address.email)
+            .collect();
+        Ok(recipients
+            .iter()
+            .all(|recipient| correspondents.contains(recipient)))
     }
 
     fn observe_recipient_relationship(
@@ -139,14 +238,12 @@ impl Database {
             ..Default::default()
         };
 
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare(&format!(
             "SELECT tm.from_address, tm.to_addresses, tm.cc_addresses, tm.bcc_addresses, tm.date
-             FROM thread_messages tm
-             JOIN threads t ON t.thread_id = tm.thread_id
-             WHERE t.account_id = ?1 AND tm.is_outbound = 1
+             {VERIFIED_OUTBOUND_ROWS}
              ORDER BY tm.id DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
         let rows = stmt.query_map(
             params![account_id, (RELATIONSHIP_FACT_THREAD_SCAN_LIMIT + 1) as i64],
             |row| {
@@ -247,7 +344,61 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.set_detected_folder("acc", "sent", "Sent").unwrap();
         db
+    }
+
+    /// Cache one message in `thread_id`, or in a new thread. `is_outbound` is
+    /// written as given, so a test can reproduce rows an earlier indexer
+    /// stored for any folder.
+    #[allow(clippy::too_many_arguments)]
+    fn store_message(
+        db: &Database,
+        thread_id: Option<&str>,
+        message_id: &str,
+        folder: &str,
+        from: &str,
+        to: &str,
+        cc: Option<&str>,
+        is_outbound: bool,
+    ) -> String {
+        let thread_id = match thread_id {
+            Some(id) => id.to_string(),
+            None => {
+                db.create_thread(
+                    "relationship test",
+                    "2026-09-01T00:00:00Z",
+                    "2026-09-01T00:00:00Z",
+                    "acc",
+                )
+                .expect("create thread")
+                .thread_id
+            }
+        };
+        let uid = db
+            .conn()
+            .query_row("SELECT COUNT(*) + 1 FROM thread_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32;
+        db.upsert_thread_message(
+            &thread_id,
+            uid,
+            Some(message_id),
+            None,
+            None,
+            folder,
+            from,
+            to,
+            cc,
+            None,
+            &chrono::Utc::now().to_rfc3339(),
+            "subject",
+            is_outbound,
+            None,
+        )
+        .expect("insert thread message");
+        thread_id
     }
 
     fn add_thread_message(db: &Database, recipient: &str, is_outbound: bool, date: &str) {
@@ -260,7 +411,7 @@ mod tests {
             Some("message-id@example.test"),
             None,
             None,
-            "INBOX",
+            if is_outbound { "Sent" } else { "INBOX" },
             if is_outbound {
                 "me@example.test"
             } else {
@@ -354,7 +505,7 @@ mod tests {
                 Some(&format!("unrelated-{index}@example.test")),
                 None,
                 None,
-                "INBOX",
+                "Sent",
                 "other@example.test",
                 "me@example.test",
                 None,
@@ -372,5 +523,245 @@ mod tests {
         assert_eq!(bounded.known_contact, None);
         assert_eq!(bounded.cold_email, None);
         assert_eq!(bounded.unknown_domain, None);
+    }
+
+    /// Injection path: an inbound message forging `From: <account>` and
+    /// addressed to the attacker was indexed as outbound because its From
+    /// matched. Outside the Sent-role folder it must never vouch for anyone.
+    #[test]
+    fn spoofed_self_from_outside_the_sent_folder_never_makes_a_recipient_known() {
+        let db = db_with_account();
+        for index in 0..5 {
+            for folder in ["INBOX", "Junk"] {
+                store_message(
+                    &db,
+                    None,
+                    &format!("spoof-{folder}-{index}@evil.test"),
+                    folder,
+                    "me@example.test",
+                    "attacker@evil.test",
+                    None,
+                    true,
+                );
+            }
+        }
+        let facts = db
+            .derive_outbound_relationship_facts("acc", "attacker@evil.test", None, None)
+            .unwrap();
+        assert_eq!(facts.known_contact, Some(false), "{facts:?}");
+        assert_ne!(facts.frequent_contact, Some(true), "{facts:?}");
+        assert_eq!(facts.cold_email, Some(true), "{facts:?}");
+        assert_eq!(facts.unknown_domain, Some(true), "{facts:?}");
+    }
+
+    /// The same self-From row in the Sent-role folder is the account's own
+    /// outbound mail and does count.
+    #[test]
+    fn self_from_in_the_sent_folder_is_verified_outbound_history() {
+        let db = db_with_account();
+        store_message(
+            &db,
+            None,
+            "real@example.test",
+            "Sent",
+            "me@example.test",
+            "friend@example.net",
+            None,
+            true,
+        );
+        let facts = db
+            .derive_outbound_relationship_facts("acc", "friend@example.net", None, None)
+            .unwrap();
+        assert_eq!(facts.known_contact, Some(true), "{facts:?}");
+        assert_eq!(facts.cold_email, Some(false), "{facts:?}");
+        assert_eq!(facts.unknown_domain, Some(false), "{facts:?}");
+    }
+
+    /// Injection path: adding a stranger beside a known recipient used to clear
+    /// `cold_email` and `unknown_domain` for the whole send. The unknown
+    /// recipient keeps its first-contact signals.
+    #[test]
+    fn a_mixed_recipient_set_keeps_first_contact_signals_for_the_unknown_recipient() {
+        let db = db_with_account();
+        add_thread_message(&db, "known@example.net", true, "2026-09-01T00:00:00Z");
+
+        let new_domain = db
+            .derive_outbound_relationship_facts(
+                "acc",
+                "known@example.net",
+                Some("attacker@evil.test"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(new_domain.known_contact, Some(false), "{new_domain:?}");
+        assert_eq!(new_domain.cold_email, Some(true), "{new_domain:?}");
+        assert_eq!(new_domain.unknown_domain, Some(true), "{new_domain:?}");
+
+        let seen_domain = db
+            .derive_outbound_relationship_facts(
+                "acc",
+                "known@example.net",
+                None,
+                Some("stranger@example.net"),
+            )
+            .unwrap();
+        assert_eq!(seen_domain.cold_email, Some(true), "{seen_domain:?}");
+        assert_eq!(seen_domain.unknown_domain, Some(false), "{seen_domain:?}");
+    }
+
+    /// A thread the account took part in: its own message to
+    /// `known@example.net` in Sent, then that contact's answer in INBOX.
+    fn verified_thread(db: &Database) -> String {
+        let thread = store_message(
+            db,
+            None,
+            "<mine-1@example.test>",
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            None,
+            true,
+        );
+        store_message(
+            db,
+            Some(&thread),
+            "<theirs-2@example.net>",
+            "INBOX",
+            "known@example.net",
+            "me@example.test",
+            None,
+            false,
+        );
+        thread
+    }
+
+    #[test]
+    fn a_reply_to_a_thread_the_account_wrote_to_is_verified() {
+        let db = db_with_account();
+        verified_thread(&db);
+        for parent in [
+            "<theirs-2@example.net>",
+            "theirs-2@example.net",
+            "<mine-1@example.test>",
+        ] {
+            assert!(
+                db.is_verified_reply("acc", parent, "known@example.net", None, None)
+                    .unwrap(),
+                "{parent}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_in_reply_to_is_not_a_verified_reply() {
+        let db = db_with_account();
+        verified_thread(&db);
+        for parent in ["<forged@nowhere.test>", "", "   "] {
+            assert!(
+                !db.is_verified_reply("acc", parent, "known@example.net", None, None)
+                    .unwrap(),
+                "{parent:?}"
+            );
+        }
+        // Another account's thread never counts.
+        assert!(
+            !db.is_verified_reply(
+                "other",
+                "<theirs-2@example.net>",
+                "known@example.net",
+                None,
+                None
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_reply_to_a_strangers_thread_is_not_verified() {
+        let db = db_with_account();
+        let thread = store_message(
+            &db,
+            None,
+            "<attack@evil.test>",
+            "INBOX",
+            "attacker@evil.test",
+            "me@example.test",
+            None,
+            false,
+        );
+        // Nor does a forged self-From the attacker threaded in with it.
+        store_message(
+            &db,
+            Some(&thread),
+            "<spoof@evil.test>",
+            "INBOX",
+            "me@example.test",
+            "attacker@evil.test",
+            None,
+            true,
+        );
+        assert!(
+            !db.is_verified_reply(
+                "acc",
+                "<attack@evil.test>",
+                "attacker@evil.test",
+                None,
+                None
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_recipient_new_to_the_thread_forfeits_reply_credit() {
+        let db = db_with_account();
+        let thread = verified_thread(&db);
+        // The attacker joined the thread only through inbound mail.
+        store_message(
+            &db,
+            Some(&thread),
+            "<poison@evil.test>",
+            "INBOX",
+            "attacker@evil.test",
+            "me@example.test",
+            Some("known@example.net"),
+            false,
+        );
+        for (to, cc) in [
+            ("known@example.net", Some("attacker@evil.test")),
+            ("attacker@evil.test", None),
+        ] {
+            assert!(
+                !db.is_verified_reply("acc", "<theirs-2@example.net>", to, cc, None)
+                    .unwrap(),
+                "{to} {cc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_id_cached_in_two_threads_is_ambiguous() {
+        let db = db_with_account();
+        verified_thread(&db);
+        store_message(
+            &db,
+            None,
+            "<theirs-2@example.net>",
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            None,
+            true,
+        );
+        assert!(
+            !db.is_verified_reply(
+                "acc",
+                "<theirs-2@example.net>",
+                "known@example.net",
+                None,
+                None
+            )
+            .unwrap()
+        );
     }
 }

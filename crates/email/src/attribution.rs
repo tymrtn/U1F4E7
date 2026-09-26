@@ -91,9 +91,9 @@ pub struct AttributedSendContext {
     pub known_contact: Option<bool>,
     /// The recipient exchanged 5+ messages in 30 days (store lookup).
     pub frequent_contact: Option<bool>,
-    /// First-ever contact with this recipient (store history empty).
+    /// First-ever contact with at least one recipient (no verified history).
     pub cold_email: Option<bool>,
-    /// The recipient domain has never been contacted (store history).
+    /// At least one recipient domain has never been contacted (store history).
     pub unknown_domain: Option<bool>,
     /// The message is purely informational (heuristic classifier).
     pub informational: Option<bool>,
@@ -904,7 +904,9 @@ mod resolve_tests {
 /// Human-readable detail for a host-observation contradiction.
 fn contradiction_detail(key: &str) -> String {
     match key {
-        "reply_to_thread" => "the message has no In-Reply-To/References; it is not a reply".into(),
+        "reply_to_thread" => "the message does not answer a cached thread in which the account \
+                              already wrote to every recipient; it is scored as new mail"
+            .into(),
         "has_attachment" => "the message has no attachments".into(),
         "has_bcc" => "the message has no BCC recipients".into(),
         "bulk_send" => "the message has fewer than 6 recipients".into(),

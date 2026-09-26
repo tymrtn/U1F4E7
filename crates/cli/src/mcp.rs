@@ -771,7 +771,7 @@ async fn handle_send(
         SendSurface::Mcp,
         None,
         &attachments_meta(&attachment_snapshots),
-        false,
+        None,
         body,
         html,
         &declared,
@@ -873,7 +873,7 @@ async fn handle_send(
         SendSurface::Mcp,
         None,
         &attachments,
-        false,
+        None,
         body,
         html,
         &declared,
@@ -1255,7 +1255,7 @@ async fn handle_reply(
         SendSurface::Mcp,
         None,
         &attachments_meta(&attachment_snapshots),
-        true,
+        headers.in_reply_to.as_deref(),
         Some(body),
         html,
         &declared,
@@ -1367,7 +1367,7 @@ async fn handle_reply(
         SendSurface::Mcp,
         None,
         &attachments,
-        true,
+        headers.in_reply_to.as_deref(),
         Some(body),
         html,
         &declared,
@@ -2037,17 +2037,25 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
+    contacts_action(&db, &creds.account.id, action, params)
+}
 
+fn contacts_action(
+    db: &Database,
+    account_id: &str,
+    action: &str,
+    params: &Value,
+) -> Result<Value, String> {
     match action {
         "list" => {
             let tag_filter = params.get("tag").and_then(|v| v.as_str());
             let contacts = db
-                .list_contacts(&creds.account.id, tag_filter)
+                .list_contacts(account_id, tag_filter)
                 .map_err(|e| e.to_string())?;
             Ok(Value::Array(
                 contacts
                     .iter()
-                    .map(|contact| ui::with_ui(contact, ui::account_ui(&creds.account.id)))
+                    .map(|contact| ui::with_ui(contact, ui::account_ui(account_id)))
                     .collect(),
             ))
         }
@@ -2057,9 +2065,9 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 .and_then(|v| v.as_str())
                 .ok_or("email is required for show")?;
             let contact = db
-                .get_contact(&creds.account.id, email)
+                .get_contact(account_id, email)
                 .map_err(|e| e.to_string())?;
-            Ok(ui::with_ui(&contact, ui::account_ui(&creds.account.id)))
+            Ok(ui::with_ui(&contact, ui::account_ui(account_id)))
         }
         "add" => {
             let email = params
@@ -2078,7 +2086,7 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
             let now = chrono::Utc::now().to_rfc3339();
             let contact = envelope_email_store::Contact {
                 id: uuid::Uuid::new_v4().to_string(),
-                account_id: creds.account.id.clone(),
+                account_id: account_id.to_string(),
                 email: email.to_string(),
                 name: name.map(|s| s.to_string()),
                 tags,
@@ -2089,8 +2097,11 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 created_at: now.clone(),
                 updated_at: now,
             };
-            db.upsert_contact(&contact).map_err(|e| e.to_string())?;
-            Ok(ui::with_ui(&contact, ui::account_ui(&creds.account.id)))
+            // An agent-written contact never vouches for the address to the
+            // Governor gate; see `envelope_email_store::Curator`.
+            db.upsert_contact_by(&contact, envelope_email_store::Curator::Agent)
+                .map_err(|e| e.to_string())?;
+            Ok(ui::with_ui(&contact, ui::account_ui(account_id)))
         }
         "tag" => {
             let email = params
@@ -2101,13 +2112,13 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 .get("tag")
                 .and_then(|v| v.as_str())
                 .ok_or("tag is required")?;
-            db.add_contact_tag(&creds.account.id, email, tag)
+            db.add_contact_tag(account_id, email, tag, envelope_email_store::Curator::Agent)
                 .map_err(|e| e.to_string())?;
             Ok(json!({
                 "tagged": true,
                 "email": email,
                 "tag": tag,
-                "ui": ui::account_ui(&creds.account.id),
+                "ui": ui::account_ui(account_id),
             }))
         }
         "untag" => {
@@ -2119,13 +2130,13 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
                 .get("tag")
                 .and_then(|v| v.as_str())
                 .ok_or("tag is required")?;
-            db.remove_contact_tag(&creds.account.id, email, tag)
+            db.remove_contact_tag(account_id, email, tag, envelope_email_store::Curator::Agent)
                 .map_err(|e| e.to_string())?;
             Ok(json!({
                 "untagged": true,
                 "email": email,
                 "tag": tag,
-                "ui": ui::account_ui(&creds.account.id),
+                "ui": ui::account_ui(account_id),
             }))
         }
         _ => Err(format!("unknown contacts action: {action}")),
@@ -3103,6 +3114,74 @@ mod tests {
         assert_eq!(wrapped["_envelope_trust"], "untrusted-content");
         assert_eq!(wrapped["content"], original);
         assert_eq!(wrapped["content"].as_array().unwrap().len(), 2);
+    }
+
+    fn contacts_test_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Me', 'me@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
+        db
+    }
+
+    /// Injection path: an agent told by an inbound message to "save me as a
+    /// contact" must not thereby make the address a known contact to the
+    /// Governor send gate.
+    #[test]
+    fn mcp_contacts_add_and_tag_never_vouch_for_a_recipient() {
+        let db = contacts_test_db();
+        contacts_action(
+            &db,
+            "acc1",
+            "add",
+            &json!({"email": "attacker@evil.test", "name": "Totally Legit"}),
+        )
+        .unwrap();
+        // A row the address-history derivation invented, then tagged by the agent.
+        db.conn()
+            .execute(
+                "INSERT INTO contacts (id, account_id, email, tags, message_count,
+                 created_at, updated_at, history_derived)
+                 VALUES ('derived-1', 'acc1', 'lurker@evil.test', '[]', 0,
+                         '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+        contacts_action(
+            &db,
+            "acc1",
+            "tag",
+            &json!({"email": "lurker@evil.test", "tag": "vip"}),
+        )
+        .unwrap();
+        contacts_action(
+            &db,
+            "acc1",
+            "untag",
+            &json!({"email": "lurker@evil.test", "tag": "vip"}),
+        )
+        .unwrap();
+
+        for recipient in ["attacker@evil.test", "lurker@evil.test"] {
+            let facts = db
+                .derive_outbound_relationship_facts("acc1", recipient, None, None)
+                .unwrap();
+            assert_eq!(facts.known_contact, Some(false), "{recipient}: {facts:?}");
+            assert_eq!(facts.cold_email, Some(true), "{recipient}: {facts:?}");
+        }
+        // The agent's row is still a manual contact the address book keeps.
+        assert!(
+            db.get_contact("acc1", "attacker@evil.test")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
