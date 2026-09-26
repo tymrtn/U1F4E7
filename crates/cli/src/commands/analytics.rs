@@ -117,7 +117,7 @@ mod tests {
         let seen = out["seen"].as_array().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["source"], "index_refresh");
-        assert_eq!(seen[0]["message_id"], "<3@x>");
+        assert_eq!(seen[0]["message_id"], "3@x");
         assert_eq!(seen[0]["uidvalidity"], 9);
         assert_eq!(seen[0]["observed_at"], events[0].created_at.as_str());
         assert!(seen[0]["label"].as_str().unwrap().starts_with("seen by "));
