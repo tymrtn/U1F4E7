@@ -2916,33 +2916,38 @@ Subject: hi\r\n\r\nbody\r\n";
     const DRAFT_RFC822: &[u8] = b"Subject: draft\r\n\r\nbody\r\n";
 
     /// Regression: the SPECIAL-USE lookup stopped reading the LIST reply at the
-    /// `\Drafts` line. The remaining `* LIST` lines and the tagged OK stayed on
-    /// the connection, and the next APPEND read one of them where it expected
-    /// the `+` continuation, so the first `envelope draft create` on a fresh
-    /// home failed with "could not append mail to mailbox" (Dovecot 2.4.5).
+    /// `\Drafts` line. The tagged OK, plus any `* LIST` lines after Drafts,
+    /// stayed on the connection, and the next APPEND read one of them where it
+    /// expected the `+` continuation, so the first `envelope draft create` on a
+    /// fresh home failed with "could not append mail to mailbox" (Dovecot
+    /// 2.4.5). Drafts last still leaves the tagged OK behind.
     #[tokio::test]
     async fn drafts_special_use_lookup_leaves_connection_ready_for_append() {
-        let (mut session, server) = scripted_session(vec![
-            Turn {
-                verb: "LIST",
-                reply: vec![
-                    r#"* LIST (\HasNoChildren \Drafts) "/" Drafts"#.into(),
-                    r#"* LIST (\HasNoChildren) "/" INBOX"#.into(),
-                    r#"* LIST (\HasNoChildren \Sent) "/" Sent"#.into(),
-                    "{tag} OK List completed".into(),
-                ],
-            },
-            append_turn(),
-        ])
-        .await;
+        let drafts = r#"* LIST (\HasNoChildren \Drafts) "/" Drafts"#;
+        let inbox = r#"* LIST (\HasNoChildren) "/" INBOX"#;
+        let sent = r#"* LIST (\HasNoChildren \Sent) "/" Sent"#;
+        for listing in [[drafts, inbox, sent], [inbox, sent, drafts]] {
+            let mut reply: Vec<String> = listing.iter().map(|l| l.to_string()).collect();
+            reply.push("{tag} OK List completed".into());
+            let (mut session, server) = scripted_session(vec![
+                Turn {
+                    verb: "LIST",
+                    reply,
+                },
+                append_turn(),
+            ])
+            .await;
 
-        let drafts = drafts_special_use_folder_in(&mut session).await.unwrap();
-        assert_eq!(drafts.as_deref(), Some("Drafts"));
-        session
-            .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
-            .await
-            .expect("APPEND right after the SPECIAL-USE lookup");
-        server.await.unwrap();
+            let found = drafts_special_use_folder_in(&mut session).await.unwrap();
+            assert_eq!(found.as_deref(), Some("Drafts"), "{listing:?}");
+            session
+                .append("Drafts", Some(r"(\Draft)"), None, DRAFT_RFC822)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("APPEND right after the SPECIAL-USE lookup {listing:?}: {e}")
+                });
+            server.await.unwrap();
+        }
     }
 
     /// Same hazard for single-UID FETCH readers: taking the one FETCH item and
