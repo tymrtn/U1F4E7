@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The first `envelope draft create` on a new data directory works.** It failed with "could not
+  append mail to mailbox" on servers that list the Drafts folder before other folders (seen on
+  Dovecot 2.4.5), and worked on the second try once the folder was cached. The SPECIAL-USE
+  Drafts lookup stopped reading the folder list at the Drafts line, so the APPEND that followed
+  read a leftover list line where it expected the server's `+` go-ahead. The lookup now reads
+  the whole reply. Reading one message, downloading an attachment, and fetching
+  List-Unsubscribe headers had the same flaw, as did the size, header and raw-body batch fetches
+  when they refused a response partway through; each now reads the full reply before using it.
+
 ## [1.3.5] — 2026-09-26
 
 ### rShield
