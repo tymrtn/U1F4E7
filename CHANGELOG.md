@@ -47,6 +47,14 @@ first line of output says the send was not confirmed.
   events, MCP agent actions) now stop the send before SMTP (`audit_unavailable`) or, after the
   server accepted the message, return `warnings: [{code: "audit_write_failed"}]` and exit
   non-zero. Queued `send` rows now show their body in `draft show` (`content.agent_body_text`).
+- **`envelope unsubscribe` and the rule `unsubscribe` action find the List-Unsubscribe header.**
+  Every message read as having none, so `envelope unsubscribe` printed "No List-Unsubscribe header
+  found" and rule unsubscribes failed. The header fetch looked for the reply in the part of the
+  IMAP response that only a full-message fetch fills, and the parser it used reads
+  List-Unsubscribe as an address list, so its check for a plain-text value never matched. The
+  lookup now reads the raw header section, unfolds wrapped fields and keeps every URI. It still
+  fetches with `BODY.PEEK`, so it never marks a message read. A UID the server no longer has is
+  reported as not found, and a reply without a header section is an error.
 
 ### Changed
 
