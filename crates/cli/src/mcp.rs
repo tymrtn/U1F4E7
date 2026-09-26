@@ -1084,6 +1084,38 @@ fn required_uid(params: &Value) -> Result<u32, String> {
         .ok_or_else(|| "uid is required".to_string())
 }
 
+/// The Governor request for an MCP reply. The parent's own Message-ID is the
+/// `In-Reply-To` the gate checks, so the reply earns `reply_to_thread` only in
+/// a thread where the account already wrote to every recipient.
+#[allow(clippy::too_many_arguments)]
+fn reply_governor_request(
+    db: &Database,
+    account: &envelope_email_store::models::Account,
+    headers: &envelope_email_transport::reply::ReplyHeaders,
+    cc: Option<&str>,
+    attachments: &[envelope_email_transport::smtp::Attachment],
+    body: &str,
+    html: Option<&str>,
+    declared: &[String],
+) -> envelope_email_transport::outbound::GovernorRequest {
+    governor_request(
+        db,
+        &account.id,
+        account_domain(&account.username),
+        &headers.subject,
+        &headers.to,
+        cc,
+        None,
+        SendSurface::Mcp,
+        None,
+        attachments,
+        headers.in_reply_to.as_deref(),
+        Some(body),
+        html,
+        declared,
+    )
+}
+
 async fn handle_reply(
     params: &Value,
     backend: CredentialBackend,
@@ -1244,19 +1276,13 @@ async fn handle_reply(
     let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
 
     // ── Attribution precheck (before ANY side effect) ──
-    let precheck_req = governor_request(
+    let precheck_req = reply_governor_request(
         &db,
-        &creds.account.id,
-        account_domain(&creds.account.username),
-        &headers.subject,
-        &headers.to,
+        &creds.account,
+        &headers,
         cc_str.as_deref(),
-        None,
-        SendSurface::Mcp,
-        None,
         &attachments_meta(&attachment_snapshots),
-        headers.in_reply_to.as_deref(),
-        Some(body),
+        body,
         html,
         &declared,
     );
@@ -1356,19 +1382,13 @@ async fn handle_reply(
     let attachments = decode_attachments(&attachment_snapshots).map_err(|e| e.to_string())?;
 
     // ── Governor gate (fail-closed before any real SMTP) ──
-    let gov_req = governor_request(
+    let gov_req = reply_governor_request(
         &db,
-        &creds.account.id,
-        account_domain(&creds.account.username),
-        &headers.subject,
-        &headers.to,
+        &creds.account,
+        &headers,
         cc_str.as_deref(),
-        None,
-        SendSurface::Mcp,
-        None,
         &attachments,
-        headers.in_reply_to.as_deref(),
-        Some(body),
+        body,
         html,
         &declared,
     );
@@ -1785,6 +1805,36 @@ fn log_agent_mutation(
     );
 }
 
+/// Refuse an agent move or copy into the account's Sent folder. Sent is where
+/// Envelope reads the account's own outbound history from (Governor
+/// relationship facts), so a forged "From: you" message filed there would
+/// become trusted history at the next thread index.
+async fn refuse_move_into_sent(
+    client: &mut envelope_email_transport::imap::ImapClient,
+    db: &Database,
+    account_id: &str,
+    dest: &str,
+) -> Result<(), String> {
+    let sent = envelope_email_transport::folders::detect_sent_folder(client, db, account_id)
+        .await
+        .map_err(|e| format!("could not resolve the Sent folder to check `{dest}`: {e}"))?;
+    if is_sent_destination(dest, sent.as_deref()) {
+        return Err(format!(
+            "agents cannot move or copy messages into the Sent folder (`{dest}`): it is the \
+             account's record of its own outbound mail"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `dest` names the Sent folder: the `\Sent` sentinel, or the
+/// account's detected Sent mailbox in any letter case.
+fn is_sent_destination(dest: &str, sent_folder: Option<&str>) -> bool {
+    envelope_email_transport::folders::canonical_move_key(dest)
+        == Some(envelope_email_transport::provider::canonical::SENT)
+        || sent_folder.is_some_and(|sent| sent.eq_ignore_ascii_case(dest.trim()))
+}
+
 async fn handle_move(
     params: &Value,
     backend: CredentialBackend,
@@ -1807,6 +1857,7 @@ async fn handle_move(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .map_err(|e| e.to_string())?;
+    refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
 
     envelope_email_transport::imap::move_message(&mut client, uid, from_folder, to_folder)
         .await
@@ -2272,6 +2323,11 @@ async fn handle_bulk(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .map_err(|e| e.to_string())?;
+    if let envelope_email_transport::bulk::BulkOp::Move { to_folder }
+    | envelope_email_transport::bulk::BulkOp::Copy { to_folder } = &req.op
+    {
+        refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
+    }
 
     let result = envelope_email_transport::bulk::execute(&mut client, &db, &creds.account.id, &req)
         .await
@@ -3171,7 +3227,7 @@ mod tests {
 
         for recipient in ["attacker@evil.test", "lurker@evil.test"] {
             let facts = db
-                .derive_outbound_relationship_facts("acc1", recipient, None, None)
+                .derive_outbound_relationship_facts("acc1", &[recipient.to_string()])
                 .unwrap();
             assert_eq!(facts.known_contact, Some(false), "{recipient}: {facts:?}");
             assert_eq!(facts.cold_email, Some(true), "{recipient}: {facts:?}");
@@ -3182,6 +3238,163 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn cache_thread_message(
+        db: &Database,
+        thread_id: Option<&str>,
+        message_id: &str,
+        folder: &str,
+        from: &str,
+        to: &str,
+        is_outbound: bool,
+    ) -> String {
+        let thread_id = match thread_id {
+            Some(id) => id.to_string(),
+            None => {
+                db.create_thread(
+                    "project",
+                    "2026-09-01T00:00:00Z",
+                    "2026-09-01T00:00:00Z",
+                    "acc1",
+                )
+                .unwrap()
+                .thread_id
+            }
+        };
+        let uid = db
+            .conn()
+            .query_row("SELECT COUNT(*) + 1 FROM thread_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32;
+        db.upsert_thread_message(
+            &thread_id,
+            uid,
+            Some(message_id),
+            None,
+            None,
+            folder,
+            from,
+            to,
+            None,
+            None,
+            "2026-09-01T00:00:00Z",
+            "project",
+            is_outbound,
+            None,
+        )
+        .unwrap();
+        thread_id
+    }
+
+    fn reply_parent(message_id: &str, from: &str) -> envelope_email_store::models::Message {
+        envelope_email_store::models::Message {
+            uid: 7,
+            message_id: Some(message_id.to_string()),
+            from_addr: from.to_string(),
+            to_addr: "me@example.test".to_string(),
+            cc_addr: None,
+            to_addrs: vec!["me@example.test".to_string()],
+            cc_addrs: Vec::new(),
+            subject: "project".to_string(),
+            date: None,
+            text_body: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            flags: Vec::new(),
+            attachments: Vec::new(),
+            provider_spam: None,
+        }
+    }
+
+    /// The MCP `reply` tool gates on the parent's own Message-ID. That earns
+    /// reply credit in a thread the account wrote in, and none when the parent
+    /// is a stranger's first message, however real it is.
+    #[test]
+    fn mcp_reply_gets_reply_credit_only_where_the_account_already_wrote() {
+        let db = contacts_test_db();
+        let thread = cache_thread_message(
+            &db,
+            None,
+            "<mine-1@example.test>",
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            true,
+        );
+        cache_thread_message(
+            &db,
+            Some(&thread),
+            "<theirs-2@example.net>",
+            "INBOX",
+            "Known <known@example.net>",
+            "me@example.test",
+            false,
+        );
+        cache_thread_message(
+            &db,
+            None,
+            "<attack@evil.test>",
+            "INBOX",
+            "attacker@evil.test",
+            "me@example.test",
+            false,
+        );
+        let account = db.get_account("acc1").unwrap().unwrap();
+
+        for (parent, credited) in [
+            (
+                reply_parent("<theirs-2@example.net>", "Known <known@example.net>"),
+                true,
+            ),
+            (
+                reply_parent("<attack@evil.test>", "attacker@evil.test"),
+                false,
+            ),
+        ] {
+            let headers = envelope_email_transport::reply::build_reply_headers(&parent);
+            let res = reply_governor_request(
+                &db,
+                &account,
+                &headers,
+                None,
+                &[],
+                "sounds good",
+                None,
+                &["informational".to_string()],
+            )
+            .resolution
+            .unwrap();
+            let derived = |key: &str| res.derived_attrs.iter().any(|a| a == key);
+            assert_eq!(derived("reply_to_thread"), credited, "{res:?}");
+            assert_eq!(derived("cold_email"), !credited, "{res:?}");
+        }
+    }
+
+    /// Injection path: filing a forged "From: you, To: attacker" message into
+    /// the Sent folder would make it the account's own outbound history at the
+    /// next thread index. Agents can't move or copy mail there.
+    #[test]
+    fn agent_moves_into_the_sent_folder_are_recognised() {
+        for (dest, sent) in [
+            ("Sent", Some("Sent")),
+            ("sent", Some("Sent")),
+            ("INBOX.Sent", Some("INBOX.Sent")),
+            ("\\Sent", None),
+            ("\\Sent", Some("[Gmail]/Sent Mail")),
+        ] {
+            assert!(is_sent_destination(dest, sent), "{dest} {sent:?}");
+        }
+        for (dest, sent) in [
+            ("Archive", Some("Sent")),
+            ("Sent Old", Some("Sent")),
+            ("Sent", None),
+            ("\\Archive", Some("Sent")),
+        ] {
+            assert!(!is_sent_destination(dest, sent), "{dest} {sent:?}");
+        }
     }
 
     #[tokio::test]

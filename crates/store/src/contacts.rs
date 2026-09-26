@@ -316,11 +316,13 @@ impl Database {
     /// contact is choosing to keep it; tagging one the derivation invented is
     /// the case this guards. Writes only when the flag actually flips — the
     /// ownership change is not an edit to the contact's content. An agent's
-    /// tag takes the row as [`AGENT_CURATED`], which vouches for nothing.
+    /// tag takes a derived row as [`AGENT_CURATED`], which vouches for nothing;
+    /// a person's tag makes any row theirs (`0`), confirming an agent's row
+    /// too. Neither ever moves a row a person already curated.
     fn take_contact_ownership(&self, id: &str, curator: Curator) -> Result<()> {
         self.conn().execute(
             "UPDATE contacts SET history_derived = ?2
-             WHERE id = ?1 AND history_derived = 1",
+             WHERE id = ?1 AND history_derived <> 0 AND history_derived <> ?2",
             rusqlite::params![id, curator.history_derived()],
         )?;
         Ok(())
@@ -712,19 +714,25 @@ mod tests {
             AGENT_CURATED,
             "an agent tag takes the derived row without vouching"
         );
-        db.add_contact_tag("acc-1", "bob@example.com", "friend", Curator::Human)
-            .unwrap();
-        assert_eq!(
-            derived_columns(&db, "acc-1", "bob@example.com").2,
-            AGENT_CURATED,
-            "tagging is not naming the address"
-        );
 
         // Still manual: a rebuild keeps both, the dropdown offers both.
         db.invalidate_address_history("acc-1").unwrap();
         db.reconcile_address_history("acc-1").unwrap();
         assert_eq!(row_count(&db, "acc-1"), 2);
         assert_eq!(db.suggest_addresses("acc-1", "", 10).unwrap().len(), 2);
+
+        // A person tagging an agent's row confirms it, as tagging a derived
+        // row does.
+        db.add_contact_tag("acc-1", "bob@example.com", "friend", Curator::Human)
+            .unwrap();
+        assert_eq!(derived_columns(&db, "acc-1", "bob@example.com").2, 0);
+        db.remove_contact_tag("acc-1", "bob@example.com", "friend", Curator::Agent)
+            .unwrap();
+        assert_eq!(
+            derived_columns(&db, "acc-1", "bob@example.com").2,
+            0,
+            "an agent untag never revokes a person's vouch"
+        );
 
         db.upsert_contact(&sample_contact()).unwrap();
         assert_eq!(derived_columns(&db, "acc-1", "alice@example.com").2, 0);

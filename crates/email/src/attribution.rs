@@ -905,7 +905,8 @@ mod resolve_tests {
 fn contradiction_detail(key: &str) -> String {
     match key {
         "reply_to_thread" => "the message does not answer a cached thread in which the account \
-                              already wrote to every recipient; it is scored as new mail"
+                              already wrote to every recipient, so the declaration is refused; \
+                              resubmit without `reply_to_thread` to send it as new mail"
             .into(),
         "has_attachment" => "the message has no attachments".into(),
         "has_bcc" => "the message has no BCC recipients".into(),

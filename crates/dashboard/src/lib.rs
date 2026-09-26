@@ -1641,45 +1641,34 @@ pub(crate) fn scheduled_send_context(
     let calendar_invitation = attachments
         .iter()
         .any(|a| is_calendar_invitation_content_type(&a.content_type));
-    // The shared store helper is bounded and local-only. A DB failure or
-    // exhausted scan returns no relationship claim rather than inventing a new
-    // contact/domain fact for a future scheduled transmission.
-    let relationship = db
-        .derive_outbound_relationship_facts(
-            &draft.account_id,
-            &draft.to_addr,
-            draft.cc_addr.as_deref(),
-            draft.bcc_addr.as_deref(),
-        )
-        .unwrap_or_default();
-    // Reply credit is earned against the account's own Sent history, never
-    // taken from the draft's `In-Reply-To`; a store error withholds it.
-    let is_reply = scheduled_threading(draft).0.is_some_and(|parent| {
-        db.is_verified_reply(
-            &draft.account_id,
-            &parent,
-            &draft.to_addr,
-            draft.cc_addr.as_deref(),
-            draft.bcc_addr.as_deref(),
-        )
-        .unwrap_or(false)
-    });
+    // The same shared derivation as the direct CLI/MCP gate, on the addresses
+    // SMTP will deliver to. Reply credit is earned against the account's own
+    // Sent history, never taken from the draft's `In-Reply-To`; unparseable
+    // headers or a failed lookup get no credit and keep `cold_email`.
+    let recipients = envelope_email_transport::smtp::envelope_recipients(
+        &draft.to_addr,
+        draft.cc_addr.as_deref(),
+        draft.bcc_addr.as_deref(),
+    )
+    .ok();
+    let (in_reply_to, _) = scheduled_threading(draft);
+    let relationship = db.observe_send_relationship(
+        &draft.account_id,
+        recipients.as_deref(),
+        in_reply_to.as_deref(),
+    );
     AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
         recipient_count: summary.count,
-        is_reply,
+        is_reply: relationship.verified_reply,
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
         calendar_invitation,
         known_contact: relationship.known_contact,
         frequent_contact: relationship.frequent_contact,
-        cold_email: if is_reply {
-            Some(false)
-        } else {
-            relationship.cold_email
-        },
+        cold_email: relationship.cold_email,
         unknown_domain: relationship.unknown_domain,
         human_approved: draft.human_approved(),
         // Derive `short_body` from the FINAL persisted bodies being transmitted
@@ -3826,6 +3815,54 @@ mod tests {
             .to_governor_attrs();
         assert!(!attrs.contains(&"reply_to_thread"), "{attrs:?}");
         assert!(attrs.contains(&"cold_email"), "{attrs:?}");
+    }
+
+    /// The sweep judges the same SMTP recipients and fails the same way as the
+    /// direct gate: a Cc only `Mailboxes` parses, or a failed lookup, costs a
+    /// verified reply its credit and keeps `cold_email`.
+    #[test]
+    fn scheduled_context_withholds_credit_for_unchecked_recipients() {
+        for (cc, break_store) in [
+            (Some("\"Name <extra>\" <attacker@evil.test>"), false),
+            (Some("attacker@exämple.com"), false),
+            (None, true),
+        ] {
+            let db = sweep_test_db();
+            seed_sent_parent(
+                &db,
+                "acc1",
+                "agent@example.com",
+                "counterparty@example.net",
+                "parent@example.com",
+            );
+            let draft = db
+                .create_draft(
+                    "acc1",
+                    "counterparty@example.net",
+                    Some("Re: invoice"),
+                    Some("body"),
+                    None,
+                    Some("parent@example.com"),
+                    cc,
+                    None,
+                    Some("agent"),
+                )
+                .unwrap();
+            let credited =
+                scheduled_send_context(&db, &draft, Some("example.com".to_string()), &[])
+                    .to_governor_attrs();
+            if break_store {
+                assert!(credited.contains(&"reply_to_thread"), "{credited:?}");
+                db.conn()
+                    .execute_batch("DROP TABLE detected_folders")
+                    .unwrap();
+            }
+            let attrs = scheduled_send_context(&db, &draft, Some("example.com".to_string()), &[])
+                .to_governor_attrs();
+            assert!(!attrs.contains(&"reply_to_thread"), "{cc:?}: {attrs:?}");
+            assert!(!attrs.contains(&"known_contact"), "{cc:?}: {attrs:?}");
+            assert!(attrs.contains(&"cold_email"), "{cc:?}: {attrs:?}");
+        }
     }
 
     #[test]

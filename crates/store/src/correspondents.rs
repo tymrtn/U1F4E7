@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::address_book::parse_address_list;
 use crate::db::Database;
 use crate::errors::Result;
+use crate::relationship_facts::TM_IN_SENT_FOLDER;
 
 /// Known correspondent domains returned per scan (look-alike candidates).
 const KNOWN_DOMAIN_LIMIT: i64 = 5000;
@@ -68,16 +69,20 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let pattern = format!("%{from}%");
-        let mut stmt = self.conn().prepare(
-            "SELECT tm.is_outbound, tm.from_address, tm.to_addresses, tm.cc_addresses
+        // Outbound means a copy in the detected Sent folder: rows an earlier
+        // indexer flagged outbound for a self-From elsewhere (a spoof in
+        // INBOX) are not mail the account sent.
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT tm.is_outbound = 1 AND {TM_IN_SENT_FOLDER},
+                    tm.from_address, tm.to_addresses, tm.cc_addresses
              FROM thread_messages tm
              JOIN threads t ON t.thread_id = tm.thread_id
              WHERE t.account_id = ?1
                AND (lower(tm.from_address) LIKE ?2 OR lower(tm.to_addresses) LIKE ?2
                     OR lower(tm.cc_addresses) LIKE ?2)
              ORDER BY tm.id DESC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(params![account_id, pattern, THREAD_SCAN_LIMIT], |row| {
             Ok((
                 row.get::<_, bool>(0)?,
@@ -186,5 +191,54 @@ mod tests {
             .unwrap();
         assert!(!impostor.known_contact);
         assert_eq!(impostor.name_matches, vec!["ceo@acme.example"]);
+    }
+
+    /// An earlier indexer marked any message whose From was the account as
+    /// outbound, in any folder. A spoofed "From: me, To: attacker" in INBOX
+    /// must not count as having written to the attacker; the Sent copy does.
+    #[test]
+    fn only_sent_folder_copies_count_as_prior_outbound() {
+        let db = Database::open_memory().unwrap();
+        db.set_detected_folder("acc", "sent", "Sent").unwrap();
+        for (uid, folder, to) in [
+            (1, "INBOX", "attacker@evil.example"),
+            (2, "Junk", "attacker@evil.example"),
+            (3, "Sent", "friend@good.example"),
+        ] {
+            let thread = db
+                .create_thread(
+                    "hello",
+                    "2026-09-01T00:00:00Z",
+                    "2026-09-01T00:00:00Z",
+                    "acc",
+                )
+                .unwrap();
+            db.upsert_thread_message(
+                &thread.thread_id,
+                uid,
+                Some(&format!("m{uid}@x")),
+                None,
+                None,
+                folder,
+                "me@example.org",
+                to,
+                None,
+                None,
+                "2026-09-01T00:00:00Z",
+                "hello",
+                true,
+                None,
+            )
+            .unwrap();
+        }
+
+        let attacker = db
+            .correspondent_facts("acc", "attacker@evil.example", None)
+            .unwrap();
+        assert_eq!(attacker.prior_outbound, 0);
+        let friend = db
+            .correspondent_facts("acc", "friend@good.example", None)
+            .unwrap();
+        assert_eq!(friend.prior_outbound, 1);
     }
 }
