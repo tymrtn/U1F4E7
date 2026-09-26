@@ -17,7 +17,6 @@
     'send_governor.blocked': { label: 'Blocked by Governor', tone: 'warn' },
     'send_governor.allowed': { label: 'Allowed by Governor', tone: 'ok' },
     'send_governor.attribution_refused': { label: 'Declaration refused', tone: 'warn' },
-    governor_blocked: { label: 'Send stopped', tone: 'warn' },
     send_queued: { label: 'Queued', tone: 'muted' },
     send_completed: { label: 'Sent', tone: 'ok' },
     'send.human_dashboard': { label: 'Human-only Send', tone: 'ok' },
@@ -31,7 +30,6 @@
   const TYPE_OPTIONS: { value: string; label: string }[] = [
     { value: '', label: 'All types' },
     { value: 'send_governor', label: 'Governor decisions' },
-    { value: 'governor_blocked', label: 'Send stopped' },
     { value: 'send_queued', label: 'Queued' },
     { value: 'send_completed', label: 'Sent' },
     { value: 'send.human_dashboard', label: 'Human-only Send' },

@@ -145,6 +145,12 @@ impl Database {
     /// Runs never merge across days, so "blocked again next week" stays its own
     /// entry. The bare columns ride along with `MAX(created_at)`, which SQLite
     /// guarantees come from that newest row.
+    ///
+    /// The catalog `governor_blocked` event is left out: its only writer
+    /// (`record_governor_event` in the CLI gate) writes it right after the
+    /// `send_governor.blocked` audit row for the same block, so that delivery
+    /// routes can subscribe by a stable name. Listing both showed every block
+    /// twice.
     pub fn list_event_log(&self, filter: &EventLogFilter) -> Result<Vec<EventLogEntry>> {
         let type_prefix = filter.event_type.as_ref().map(|t| format!("{t}.%"));
         let mut stmt = self.conn().prepare(
@@ -161,6 +167,7 @@ impl Database {
                AND (?2 IS NULL OR event_type = ?2 OR event_type LIKE ?3)
                AND (?4 IS NULL OR created_at >= ?4)
                AND (?5 IS NULL OR created_at < ?5)
+               AND event_type <> ?7
              GROUP BY account_id, event_type,
                       COALESCE(json_extract(payload, '$.draft_id'),
                                json_extract(payload, '$.request.draft_id'),
@@ -176,7 +183,8 @@ impl Database {
                 type_prefix,
                 filter.since,
                 filter.before,
-                filter.limit as i64
+                filter.limit as i64,
+                crate::event_catalog::GOVERNOR_BLOCKED
             ],
             |row| {
                 Ok(EventLogEntry {
@@ -419,6 +427,62 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "new_message");
         assert_eq!(events[0].uid, Some(42));
+    }
+
+    #[test]
+    fn a_governor_block_is_one_logs_entry() {
+        // The CLI/MCP gate writes the `send_governor.blocked` audit row, then
+        // the catalog `governor_blocked` row for delivery routes. Both record
+        // the same block; Logs shows it once.
+        let db = test_db();
+        let outcome = serde_json::json!({ "allowed": false, "block_code": "governor_blocked" });
+        let audit = Event {
+            id: "audit-1".to_string(),
+            account_id: "acc-1".to_string(),
+            event_type: "send_governor.blocked".to_string(),
+            folder: "policy".to_string(),
+            uid: None,
+            message_id: None,
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(
+                serde_json::json!({ "request": { "draft_id": "d1" }, "outcome": outcome })
+                    .to_string(),
+            ),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some("2026-09-17T21:17:13+00:00".to_string()),
+            created_at: "2026-09-17T21:17:13+00:00".to_string(),
+        };
+        db.insert_event_with_agent(&audit, Some("agent-skippy"))
+            .unwrap();
+        db.emit_catalog_event(
+            "acc-1",
+            crate::event_catalog::GOVERNOR_BLOCKED,
+            Some(serde_json::json!({ "outcome": outcome })),
+            Some("agent-skippy"),
+        )
+        .unwrap();
+
+        let entries = db
+            .list_event_log(&EventLogFilter {
+                limit: 10,
+                ..EventLogFilter::default()
+            })
+            .unwrap();
+        let types: Vec<&str> = entries
+            .iter()
+            .map(|e| e.event.event_type.as_str())
+            .collect();
+        assert_eq!(types, ["send_governor.blocked"]);
+        assert!(
+            db.list_events(Some("acc-1"), 10)
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == crate::event_catalog::GOVERNOR_BLOCKED),
+            "delivery routes still see the catalog event"
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] — 2026-09-26
+
 ### rShield
 
 - **ClamAV (optional, off by default):** `threat.clamd.address` (`unix:/path` or
@@ -36,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and off the async workers, so clamd and DNS waits do not stall the dashboard.
 - **Docs:** README rShield section and `docs/rshield.md`: what each optional analyzer sends,
   how to enable it, and the clamd setup.
+
+### Fixed
+
+- **Dashboard (Logs):** a Governor block now shows once. It showed twice, as "Blocked by Governor"
+  and "Send stopped", because the block also writes a catalog event that delivery routes subscribe
+  to. Logs leaves that event out; delivery routes still receive it. The "Send stopped" filter,
+  which could only come back empty, is gone.
 
 ## [1.3.4] — 2026-09-24
 
