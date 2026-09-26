@@ -13,6 +13,13 @@ pub const DISPLAY_NAME_SPOOF: u32 = 25;
 pub const PUNYCODE_SENDER: u32 = 15;
 pub const REPLY_TO_MISMATCH: u32 = 10;
 
+/// The known domain (the mailbox's own or a correspondent's) the From
+/// domain imitates, if any.
+pub fn impersonated_domain(input: &ThreatInput) -> Option<String> {
+    let from_domain = input.from_domain()?;
+    lookalike_of(&from_domain, &input.known_domains()).map(str::to_string)
+}
+
 pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
     let mut signals = Vec::new();
     let Some(from_domain) = input.from_domain() else {
@@ -44,8 +51,7 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         ));
     }
 
-    let known = input.known_domains();
-    if let Some(target) = lookalike_of(&from_domain, &known) {
+    if let Some(target) = impersonated_domain(input) {
         signals.push(Signal::new(
             "lookalike_domain",
             LOOKALIKE_DOMAIN,

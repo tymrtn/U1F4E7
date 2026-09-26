@@ -111,6 +111,19 @@ fn hash_suffix(bytes: Option<&[u8]>) -> String {
         .unwrap_or_default()
 }
 
+/// `ext=.<last> sha256=<first 16 hex>`: the evidence form for one attachment.
+pub(crate) fn fingerprint(att: &AttachmentInput) -> String {
+    let last = extensions(&att.filename)
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    format!(
+        "ext=.{}{}",
+        if last.is_empty() { "none" } else { &last },
+        hash_suffix(att.bytes.as_deref())
+    )
+}
+
 fn ooxml_has_macros(bytes: &[u8]) -> bool {
     let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return false;
@@ -178,10 +191,7 @@ pub fn analyze_attachment(att: &AttachmentInput) -> Vec<Signal> {
     let last = exts.first().cloned().unwrap_or_default();
     let bytes = att.bytes.as_deref();
     let hash = hash_suffix(bytes);
-    let fp = format!(
-        "ext=.{}{hash}",
-        if last.is_empty() { "none" } else { &last }
-    );
+    let fp = fingerprint(att);
     let mut signals = Vec::new();
 
     if DANGEROUS_EXTENSIONS.contains(&last.as_str()) {

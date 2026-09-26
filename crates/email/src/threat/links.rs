@@ -122,6 +122,23 @@ fn text_host(text: &str) -> Option<String> {
     (tld.len() >= 2 && tld.chars().all(|c| c.is_alphabetic())).then_some(host)
 }
 
+/// Hosts of every http(s) link, in order: anchors in the HTML part, then
+/// bare URLs in the text part.
+pub fn link_hosts(input: &ThreatInput) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    if let Some(html) = &input.html {
+        hosts.extend(anchors(html).iter().filter_map(|a| http_host(&a.href)));
+    }
+    if let Some(text) = &input.text {
+        hosts.extend(
+            PLAIN_URL
+                .find_iter(text)
+                .filter_map(|m| http_host(m.as_str())),
+        );
+    }
+    hosts
+}
+
 #[derive(Default)]
 struct Found {
     mismatch: BTreeSet<String>,
