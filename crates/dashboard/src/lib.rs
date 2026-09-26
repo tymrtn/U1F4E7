@@ -191,6 +191,16 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             ),
             Err(e) => tracing::warn!("Message-ID normalization failed: {e}"),
         }
+        // Sends a crashed process left mid-attempt: release the ones that never
+        // reached the body, park the rest. The first sweep tick repeats this.
+        match state.db.lock().await.reconcile_stale_sending_now() {
+            Ok(r) => println!(
+                "Stale sends recovered: {} released, {} parked delivery_uncertain",
+                r.released.len(),
+                r.parked.len()
+            ),
+            Err(e) => tracing::error!("stale send recovery failed: {e}"),
+        }
         println!("Background unsnooze + scheduled-send + event-delivery sweep running every 60s");
         let ticker_state = state.clone();
         tokio::spawn(async move {
@@ -699,6 +709,19 @@ async fn run_unsnooze_sweep(state: &AppState) -> anyhow::Result<()> {
 pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result<()> {
     let due = {
         let db = state.db.lock().await;
+        // Recover rows a crashed sender left `sending` before choosing what is
+        // due, so a released claim is sent this tick and a parked one never is.
+        let recovered = db
+            .reconcile_stale_sending_now()
+            .map_err(|e| anyhow::anyhow!("stale send recovery failed: {e}"))?;
+        for id in &recovered.released {
+            info!("scheduled send: draft {id} released after its sender exited before the body");
+        }
+        for id in &recovered.parked {
+            tracing::warn!(
+                "scheduled send: draft {id} parked delivery_uncertain after its sender exited mid-send"
+            );
+        }
         db.list_drafts_due_for_send()
             .map_err(|e| anyhow::anyhow!("db error: {e}"))?
     };
@@ -720,10 +743,10 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
         // DB failure can strand it as `sending` but never re-send it.
         let claimed = {
             let db = state.db.lock().await;
-            db.claim_draft_for_sending(&scanned.id, scanned.revision)
+            claim_due_attempt(&db, scanned)
         };
-        let lease = match claimed {
-            Ok(Some(token)) => token,
+        let (attempt, _owner_lock) = match claimed {
+            Ok(Some(claimed)) => claimed,
             Ok(None) => {
                 info!(
                     "scheduled send: draft {} not claimed (concurrent claim, edit, or \
@@ -737,32 +760,10 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
                 continue;
             }
         };
-
-        // Reload the claimed row: the authoritative snapshot for attribution
-        // and SMTP is what was claimed, not the pre-claim scan.
-        let draft = {
-            let db = state.db.lock().await;
-            db.get_draft(&scanned.id)
-        };
-        let draft = match draft {
-            Ok(Some(d)) => d,
-            Ok(None) | Err(_) => {
-                tracing::warn!(
-                    "scheduled send: claimed draft {} could not be reloaded — releasing \
-                     claim for retry",
-                    scanned.id
-                );
-                release_claim(
-                    state,
-                    &scanned.id,
-                    &lease,
-                    envelope_email_store::DraftStatus::Draft,
-                )
-                .await;
-                continue;
-            }
-        };
-        let draft = &draft;
+        let lease = attempt.token.clone();
+        // The claimed row is the authoritative snapshot for attribution and
+        // SMTP, not the pre-claim scan.
+        let draft = &attempt.draft;
 
         // Resolve credentials for the draft's account.
         let (client_arc, creds) = match state.get_or_create_imap(&draft.account_id).await {
@@ -1034,8 +1035,11 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
             continue;
         }
 
-        match envelope_email_transport::SmtpSender::send(
+        // Build with the attempt's own Message-ID, recorded at claim time.
+        let bare_id = attempt.message_id.trim_matches(|c| c == '<' || c == '>');
+        let built = envelope_email_transport::smtp::build_message(
             &creds,
+            bare_id,
             &draft.to_addr,
             subject,
             draft.text_content.as_deref(),
@@ -1043,21 +1047,36 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
             draft_from_override(draft),
             draft.cc_addr.as_deref(),
             draft.bcc_addr.as_deref(),
+            false, // real send: drop Bcc from the wire
             draft.reply_to.as_deref(),
             thread_in_reply_to.as_deref(),
             thread_references_opt,
             &attachments,
-        )
-        .await
-        {
-            Ok(message_id) => {
-                let persistence = {
-                    let db = state.db.lock().await;
-                    persist_sent_state(&db, &draft.id, &lease, &message_id)
-                };
+        );
+        let (message, message_id) = match built {
+            Ok(built) => built,
+            Err(e) => {
+                tracing::warn!(
+                    "scheduled send: draft {} cannot be built as a message: {e} — parking \
+                     it blocked",
+                    draft.id
+                );
+                release_claim(
+                    state,
+                    &draft.id,
+                    &lease,
+                    envelope_email_store::DraftStatus::Blocked,
+                )
+                .await;
+                continue;
+            }
+        };
+
+        let outcome = transmit_attempt(state, draft, &lease, &creds, &message).await;
+        match outcome {
+            SweepTransmit::Accepted { persistence } => {
                 // Honest logging: an unrecorded persistence outcome is not a
-                // durable success and must not read like one (the persistence
-                // failure itself was already logged at error level).
+                // durable success and must not read like one.
                 match persistence {
                     SentPersistence::Recorded => info!(
                         "scheduled send: sent draft {} (recipient_count={}, message_id={})",
@@ -1076,19 +1095,11 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
                         message_id
                     ),
                 }
-                // The original server-side draft copy is now stale. Clean it up
-                // strictly AFTER SMTP acceptance AND durable sent-state
-                // persistence — if the sent state did not persist, the local
-                // draft is the only record of what happened and the provider
-                // copy must be left alone. Identity needs only the exact
-                // detected folder + persisted Message-ID (a stored UID is not
-                // required and never trusted).
+                // Strictly after SMTP acceptance AND durable sent-state
+                // persistence: resolve the Sent copy, then clean up the
+                // provider Drafts copy. If the sent state did not persist, the
+                // local draft is the only record and the provider copy stays.
                 if persistence == SentPersistence::Recorded {
-                    // Sent-folder proof parity with the immediate CLI/MCP paths:
-                    // resolve (and client-append when needed) the Sent copy and
-                    // persist truthful proof/UID. Strictly after durable sent-state
-                    // persistence, and best-effort — a Sent-copy failure never
-                    // downgrades the confirmed send.
                     resolve_and_record_sent_copy(
                         creds,
                         draft,
@@ -1106,9 +1117,6 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
                     .publish(crate::events::DashboardEvent::SendStatus {
                         account_id: draft.account_id.clone(),
                         draft_id: draft.id.clone(),
-                        // Never report durable success when the sent state did
-                        // not persist — the SMTP transmission happened, but
-                        // Envelope's record of it is incomplete.
                         outcome: if persistence == SentPersistence::Recorded {
                             "sent"
                         } else {
@@ -1118,24 +1126,22 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
                         governor_block_code: None,
                     });
             }
-            Err(e) => {
-                tracing::warn!(
-                    "scheduled send: SMTP result is inconclusive for draft {} \
-                     (recipient_count={}): {e} — parking as delivery_uncertain to \
-                     prevent an automatic duplicate",
-                    draft.id,
-                    recipient_count_for_log(
-                        &draft.to_addr,
-                        draft.cc_addr.as_deref(),
-                        draft.bcc_addr.as_deref()
-                    )
-                );
-                // SMTP errors can occur after the server accepts DATA but before
-                // the client receives its final acknowledgement. No error variant
-                // proves non-delivery, so retries would risk a duplicate message.
-                // Keep the draft terminal until an operator reconciles delivery.
-                let db = state.db.lock().await;
-                park_delivery_uncertain(&db, &draft.id, &lease, "an inconclusive SMTP result");
+            SweepTransmit::NotSent { released_to } => {
+                state
+                    .events
+                    .publish(crate::events::DashboardEvent::SendStatus {
+                        account_id: draft.account_id.clone(),
+                        draft_id: draft.id.clone(),
+                        outcome: match released_to {
+                            Some(envelope_email_store::DraftStatus::Draft) => "deferred",
+                            Some(_) => "blocked",
+                            None => "transition_failed",
+                        },
+                        governor_decision: Some(gov_outcome.decision.clone()),
+                        governor_block_code: None,
+                    });
+            }
+            SweepTransmit::Uncertain => {
                 state
                     .events
                     .publish(crate::events::DashboardEvent::SendStatus {
@@ -1150,6 +1156,213 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
     }
 
     Ok(())
+}
+
+/// Take the owner lock and claim a due row for one attempt with a fresh
+/// Message-ID. The lock is held until the attempt is finished.
+fn claim_due_attempt(
+    db: &Database,
+    scanned: &envelope_email_store::Draft,
+) -> anyhow::Result<
+    Option<(
+        envelope_email_store::AttemptClaim,
+        Option<envelope_email_store::AttemptLock>,
+    )>,
+> {
+    let domain = db
+        .get_account(&scanned.account_id)?
+        .and_then(|a| a.username.rsplit_once('@').map(|(_, d)| d.to_string()))
+        .filter(|d| d.contains('.'))
+        .unwrap_or_else(|| "envelope.local".to_string());
+    let message_id = format!("<{}@{domain}>", uuid::Uuid::new_v4());
+    let start = envelope_email_store::AttemptStart::new(&message_id, "sweep", None);
+    // An in-memory database has no lock directory: no other process can see
+    // its rows, so there is no other owner to tell this one apart from.
+    let lock = db
+        .send_lock_dir()
+        .map(|dir| envelope_email_store::AttemptLock::acquire(&dir, &start.attempt_id))
+        .transpose()?;
+    Ok(db
+        .claim_send_attempt(
+            &scanned.id,
+            scanned.revision,
+            envelope_email_store::ClaimMode::Due,
+            &start,
+        )?
+        .map(|claim| (claim, lock)))
+}
+
+/// How one scheduled attempt ended.
+enum SweepTransmit {
+    Accepted {
+        persistence: SentPersistence,
+    },
+    /// Nothing was accepted; the row was released to this status (`None`
+    /// when the release itself did not persist).
+    NotSent {
+        released_to: Option<envelope_email_store::DraftStatus>,
+    },
+    Uncertain,
+}
+
+/// SMTP for a claimed scheduled row. `transmitting` is committed after DATA
+/// and before the body; failures before it release the row (a transient one
+/// comes due again, a permanent refusal is parked `blocked` so the sweep does
+/// not loop on it), failures after it park `delivery_uncertain` unless the
+/// server refused the body outright.
+async fn transmit_attempt(
+    state: &AppState,
+    draft: &envelope_email_store::Draft,
+    lease: &str,
+    creds: &envelope_email_store::models::AccountWithCredentials,
+    message: &lettre::Message,
+) -> SweepTransmit {
+    use envelope_email_transport::smtp_submit::{
+        AccountConnector, Deadlines, SubmitFailure, open_submission,
+    };
+    let body = message.formatted();
+    let open = match open_submission(
+        &AccountConnector::new(creds),
+        message.envelope(),
+        body.is_ascii(),
+        Deadlines::default(),
+    )
+    .await
+    {
+        Ok(open) => open,
+        Err(failure) => {
+            return release_refused(state, draft, lease, &failure).await;
+        }
+    };
+    let begun = {
+        let db = state.db.lock().await;
+        db.begin_transmitting(&draft.id, lease)
+    };
+    match begun {
+        Ok(true) => {}
+        Ok(false) => {
+            open.abort().await;
+            tracing::warn!(
+                "scheduled send: draft {} lost its claim before the body; nothing sent",
+                draft.id
+            );
+            return SweepTransmit::NotSent { released_to: None };
+        }
+        Err(e) => {
+            open.abort().await;
+            tracing::error!(
+                "scheduled send: draft {} could not record the transmission ({e}); nothing sent",
+                draft.id
+            );
+            let released = release_claim(
+                state,
+                &draft.id,
+                lease,
+                envelope_email_store::DraftStatus::Draft,
+            )
+            .await;
+            return SweepTransmit::NotSent {
+                released_to: released.then_some(envelope_email_store::DraftStatus::Draft),
+            };
+        }
+    }
+    match open.transmit(&body).await {
+        Ok(accepted) => {
+            let reply = accepted.reply.clone();
+            let persistence = {
+                let db = state.db.lock().await;
+                persist_sent_state(&db, &draft.id, lease, &message_id_of(message), &reply)
+            };
+            accepted.close().await;
+            SweepTransmit::Accepted { persistence }
+        }
+        Err(failure @ SubmitFailure::NotSubmitted { .. }) => {
+            release_refused(state, draft, lease, &failure).await
+        }
+        Err(failure) => {
+            tracing::warn!(
+                "scheduled send: SMTP outcome unknown for draft {} (recipient_count={}): \
+                 {failure} — parking as delivery_uncertain to prevent a duplicate",
+                draft.id,
+                recipient_count_for_log(
+                    &draft.to_addr,
+                    draft.cc_addr.as_deref(),
+                    draft.bcc_addr.as_deref()
+                )
+            );
+            let db = state.db.lock().await;
+            park_delivery_uncertain(
+                &db,
+                &draft.id,
+                lease,
+                "smtp_outcome_unknown",
+                Some(failure.evidence()),
+            );
+            SweepTransmit::Uncertain
+        }
+    }
+}
+
+fn message_id_of(message: &lettre::Message) -> String {
+    message
+        .headers()
+        .get_raw("Message-ID")
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Release a row the server refused, or that never reached it. A permanent
+/// refusal is parked `blocked` with a reason; anything else comes due again.
+async fn release_refused(
+    state: &AppState,
+    draft: &envelope_email_store::Draft,
+    lease: &str,
+    failure: &envelope_email_transport::smtp_submit::SubmitFailure,
+) -> SweepTransmit {
+    use envelope_email_store::{DraftStatus, ReleaseBasis};
+    let to = if failure.retryable() {
+        DraftStatus::Draft
+    } else {
+        DraftStatus::Blocked
+    };
+    let block = (!failure.retryable()).then(|| {
+        serde_json::json!({
+            "code": "smtp_refused",
+            "title": "The mail server refused this message",
+            "explanation": format!("{failure}. Nothing was sent. Fix the message or its recipients, then send it again."),
+            "action": "send"
+        })
+    });
+    tracing::warn!(
+        "scheduled send: draft {} not sent: {failure} — releasing to {}",
+        draft.id,
+        to.as_str()
+    );
+    let released = {
+        let db = state.db.lock().await;
+        db.release_attempt(
+            &draft.id,
+            lease,
+            to.clone(),
+            ReleaseBasis::Refused,
+            "smtp_not_submitted",
+            Some(failure.evidence()),
+            block.as_ref(),
+        )
+    };
+    match released {
+        Ok(true) => SweepTransmit::NotSent {
+            released_to: Some(to),
+        },
+        Ok(false) => SweepTransmit::NotSent { released_to: None },
+        Err(e) => {
+            tracing::error!(
+                "scheduled send: draft {} release failed: {e} — it stays claimed until recovery",
+                draft.id
+            );
+            SweepTransmit::NotSent { released_to: None }
+        }
+    }
 }
 
 /// Return the explicit sending identity persisted by draft create/edit.
@@ -1467,8 +1680,14 @@ enum SentPersistence {
 /// This is intentionally distinct from `release_claim`: `park_delivery_uncertain`
 /// atomically clears both the lease and `send_after`, ensuring an inconclusive
 /// SMTP attempt cannot remain presented as scheduled or become resendable.
-fn park_delivery_uncertain(db: &Database, draft_id: &str, lease: &str, cause: &str) -> bool {
-    match db.park_delivery_uncertain(draft_id, lease) {
+fn park_delivery_uncertain(
+    db: &Database,
+    draft_id: &str,
+    lease: &str,
+    cause: &str,
+    evidence: Option<serde_json::Value>,
+) -> bool {
+    match db.park_attempt_uncertain(draft_id, lease, cause, evidence) {
         Ok(true) => {
             tracing::error!(
                 "scheduled send: draft {draft_id} parked as delivery_uncertain after {cause}. \
@@ -1512,16 +1731,23 @@ fn persist_sent_state(
     draft_id: &str,
     lease: &str,
     message_id: &str,
+    reply: &str,
 ) -> SentPersistence {
-    match db.mark_draft_sent(draft_id, lease, Some(message_id)) {
+    let evidence = serde_json::json!({"kind": "smtp_acceptance", "reply": reply});
+    match db.finish_attempt_sent(draft_id, lease, message_id, evidence.clone()) {
         Ok(()) => SentPersistence::Recorded,
         Err(e) => {
             tracing::error!(
                 "scheduled send: draft {draft_id} was transmitted but sent-state \
                  persistence failed: {e}"
             );
-            let parked =
-                park_delivery_uncertain(db, draft_id, lease, "sent-state persistence failure");
+            let parked = park_delivery_uncertain(
+                db,
+                draft_id,
+                lease,
+                "sent_state_unrecorded",
+                Some(evidence),
+            );
             SentPersistence::Unrecorded { parked }
         }
     }
@@ -2890,8 +3116,14 @@ mod tests {
         let rev = db.get_draft(draft_id).unwrap().unwrap().revision;
         let attribution =
             PersistedDeclaration::new_bot(&["recipient_requested".to_string()], rev).to_value();
-        db.queue_draft_for_send(draft_id, rev, "2000-01-01T00:00:00Z", &attribution)
-            .unwrap();
+        db.queue_draft_for_send(
+            draft_id,
+            rev,
+            "2000-01-01T00:00:00Z",
+            &attribution,
+            &envelope_email_store::QueueContext::STORE,
+        )
+        .unwrap();
         db.get_draft(draft_id).unwrap().unwrap()
     }
 
@@ -4269,7 +4501,7 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>");
+        let outcome = persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>", "250 ok");
         assert_eq!(outcome, SentPersistence::Unrecorded { parked: true });
 
         let parked = db.get_draft(&draft.id).unwrap().unwrap();
@@ -4337,7 +4569,7 @@ mod tests {
             .unwrap()
             .expect("re-claim");
         assert_eq!(
-            persist_sent_state(&db, &fresh.id, &lease2, "<mid@example.com>"),
+            persist_sent_state(&db, &fresh.id, &lease2, "<mid@example.com>", "250 ok"),
             SentPersistence::Recorded
         );
         let sent = db.get_draft(&fresh.id).unwrap().unwrap();
@@ -4383,7 +4615,8 @@ mod tests {
             &db,
             &draft.id,
             &lease,
-            "a simulated SMTP error"
+            "a simulated SMTP error",
+            None
         ));
 
         let parked = db.get_draft(&draft.id).unwrap().unwrap();
@@ -4541,7 +4774,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>"),
+            persist_sent_state(&db, &draft.id, &lease, "<mid@example.com>", "250 ok"),
             SentPersistence::Unrecorded { parked: false }
         );
 
@@ -5315,5 +5548,97 @@ mod tests {
     #[test]
     fn diagnostic_serve_options_disable_background_sweeps() {
         assert!(!ServeOptions::without_background_sweeps().background_sweeps);
+    }
+
+    /// A due draft left `sending` by a sweeper that died: `phase` is how far
+    /// its attempt got. The owner ran on another host and claimed it 20
+    /// minutes ago, so only the lease tells recovery it may act.
+    async fn stranded_sweep_draft(state: &AppState, subject: &str, phase: &str) -> String {
+        let db = state.db.lock().await;
+        let draft = db
+            .create_draft(
+                "acc1",
+                "external@other.example",
+                Some(subject),
+                Some("body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.update_draft_send_after(&draft.id, "2000-01-01T00:00:00Z")
+            .unwrap();
+        let claimed_at = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
+        let metadata = serde_json::json!({
+            "send_attempt": {
+                "format": 1,
+                "attempt_id": uuid::Uuid::new_v4().to_string(),
+                "message_id": format!("<{}@example.com>", uuid::Uuid::new_v4()),
+                "phase": phase,
+                "owner": {"pid": 4242, "host": "another-host.invalid"},
+                "claimed_at": claimed_at,
+                "surface": "sweep",
+                "agent_id": null,
+                // sha256("lost-token")
+                "lease_sha256": "76a345a783c39b9a1d0343ab6d2fa54baab38c47dcdcda2176b260c3b635dfbe",
+                "seq": 1,
+            }
+        });
+        db.conn()
+            .execute(
+                "UPDATE drafts SET status = 'sending', operation_token = 'lost-token',
+                    metadata = ?1, updated_at = datetime('now', '-20 minutes')
+                 WHERE id = ?2",
+                [metadata.to_string().as_str(), draft.id.as_str()],
+            )
+            .unwrap();
+        draft.id
+    }
+
+    /// Pilot failure `queued_sweep/after_data/kill` and `after_intent/kill`:
+    /// every row a killed `serve` left `sending` stayed there for good, and the
+    /// restarted sweep never looked at it. A sweep tick must resolve such rows
+    /// before choosing what is due: an attempt that had started the body is
+    /// parked (never re-sent); one that had not is released and due again.
+    #[tokio::test]
+    async fn a_sweep_tick_resolves_stranded_claims_before_choosing_due_rows() {
+        let state = sweep_state();
+        let mid_body = stranded_sweep_draft(&state, "mid body", "transmitting").await;
+        let before_body = stranded_sweep_draft(&state, "before body", "claimed").await;
+
+        run_scheduled_send_sweep(&state).await.unwrap();
+
+        let db = state.db.lock().await;
+        let parked = db.get_draft(&mid_body).unwrap().unwrap();
+        assert_eq!(
+            parked.status,
+            envelope_email_store::DraftStatus::DeliveryUncertain
+        );
+        assert!(
+            parked.send_after.is_none(),
+            "a parked row is never due again"
+        );
+        let released = db.get_draft(&before_body).unwrap().unwrap();
+        assert_eq!(
+            released.status,
+            envelope_email_store::DraftStatus::Draft,
+            "released, then claimed and released again when this test account had no credentials"
+        );
+        assert!(
+            released.send_after.is_some(),
+            "a released scheduled row stays due"
+        );
+        let reason: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(action_taken, '$.reason') FROM action_log
+                 WHERE draft_id = ?1 AND action_status = 'delivery_uncertain'",
+                [&mid_body],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "lease_expired");
     }
 }

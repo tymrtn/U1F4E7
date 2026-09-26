@@ -7,16 +7,12 @@
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
 use crate::commands::agent_context::{self, AgentContext};
-use crate::commands::attachments::{
-    attachment_summaries, decode_attachments, snapshot_attachments,
-};
+use crate::commands::attachments::{attachment_summaries, snapshot_attachments};
 use crate::commands::authored_body::AuthoredBody;
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
-use crate::commands::drafts::{
-    SentMailProofUi, sent_copy_convenience_objects, sent_mail_proof_json,
-};
-use crate::commands::governor_gate::{
-    account_domain, gate_and_record_with_agent, governor_request, precheck_attribution,
+use crate::commands::governor_gate::{account_domain, governor_request, precheck_attribution};
+use crate::commands::send_attempt::{
+    GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request,
 };
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
@@ -25,6 +21,7 @@ use envelope_email_transport::outbound::{
     IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
     SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
 };
+use envelope_email_transport::smtp_submit::AccountConnector;
 use envelope_email_transport::{
     SendMode, SendPolicyDecision, SendPolicyInput, SendRuntime, audit_event_for,
     default_mode_for_runtime, evaluate,
@@ -318,31 +315,41 @@ const DISPATCH_LOGGED_TOOLS: &[&str] = &[
     "modify_draft",
 ];
 
+/// Tools whose every outcome that reaches the send pipeline (queued,
+/// scheduled, sent, released, uncertain, replayed) writes its own receipt.
+const SEND_TOOLS: &[&str] = &["send", "reply", "send_draft"];
+
 /// Record a completed draft/send tool call for the agent audit trail. No-op for
 /// anonymous sessions and for tools outside [`DISPATCH_LOGGED_TOOLS`]. Captures
-/// only the outcome status and draft id — never bodies or recipients.
+/// only the outcome status, draft id and Message-ID — never bodies or
+/// recipients. Send tools are recorded here only for outcomes that never
+/// reached the send pipeline (drafted, denied); the rest have receipts.
 fn record_tool_outcome(
     db: &Database,
     ctx: Option<&AgentContext>,
     account_id: &str,
     tool_name: &str,
     result: &Value,
-) {
+) -> Result<(), String> {
     if !DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
-        return;
+        return Ok(());
     }
     let status = result
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("completed");
+    if SEND_TOOLS.contains(&tool_name) && !matches!(status, "drafted" | "denied") {
+        return Ok(());
+    }
     let draft_id = result.get("draft_id").and_then(|v| v.as_str()).or_else(|| {
         result
             .get("draft")
             .and_then(|d| d.get("id"))
             .and_then(|v| v.as_str())
     });
+    let message_id = result.get("message_id").and_then(|v| v.as_str());
     let taken = json!({ "status": status, "draft_id": draft_id }).to_string();
-    log_agent_mutation(db, ctx, account_id, tool_name, &taken, None);
+    log_agent_mutation(db, ctx, account_id, tool_name, &taken, message_id, draft_id)
 }
 
 /// Record a tool call that policy refused. The trail must show what an agent
@@ -410,11 +417,13 @@ async fn handle_tool_call(
     // itself, centrally, so no draft-producing handler can drop the notice.
     crate::commands::authored_body::attach_tool_notice(tool_name, params, &mut result);
     if agent_context::agent_id_of(ctx).is_some() && DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
-        if let Ok(db) = Database::open_default() {
-            if let Some(acct) = audit_account_id(&db, tool_name, params) {
-                record_tool_outcome(&db, ctx, &acct, tool_name, &result);
-            }
-        }
+        let audit = Database::open_default()
+            .map_err(|e| e.to_string())
+            .and_then(|db| match audit_account_id(&db, tool_name, params) {
+                Some(acct) => record_tool_outcome(&db, ctx, &acct, tool_name, &result),
+                None => Err("no account to file the audit row under".to_string()),
+            });
+        attach_audit_warning(&mut result, audit);
     }
     Ok(result)
 }
@@ -691,6 +700,7 @@ async fn handle_send(
     if attributes_missing(&declared) {
         return Err(missing_attributes_error(SendSurface::Mcp));
     }
+    let idempotency_key = idempotency_key(params)?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -710,7 +720,7 @@ async fn handle_send(
         &decision,
         &policy_input,
         agent_context::agent_id_of(ctx),
-    );
+    )?;
 
     match decision {
         SendPolicyDecision::Allowed => {}
@@ -781,7 +791,9 @@ async fn handle_send(
         &creds.account.id,
         &precheck_req,
         agent_context::agent_id_of(ctx),
-    ) {
+    )
+    .map_err(|e| format!("{e:#}"))?
+    {
         return Err(outcome.response_json().to_string());
     }
     let queued_attribution = precheck_req
@@ -808,150 +820,88 @@ async fn handle_send(
         SendDisposition::Queue {
             cooldown_seconds: cd,
         } => {
-            let draft = db
-                .create_draft(
-                    &creds.account.id,
-                    to,
-                    Some(subject),
-                    body,
-                    html,
-                    None,
-                    cc,
-                    bcc,
-                    Some("mcp"),
-                )
-                .map_err(|e| e.to_string())?;
-            if !attachment_snapshots.is_empty() {
-                db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| e.to_string())?;
-            }
-            crate::commands::drafts::persist_from_override(&db, &draft.id, from)
-                .map_err(|e| e.to_string())?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            // Bind the validated declaration, the schedule, and the due status in
-            // ONE atomic CAS at the draft's current revision (attachments bumped
-            // it). No partial schedule; no stale declaration on a later edit.
-            let revision = db
-                .get_draft(&draft.id)
-                .map_err(|e| e.to_string())?
-                .map(|d| d.revision)
-                .ok_or_else(|| format!("draft not found: {}", draft.id))?;
-            crate::commands::drafts::queue_bot_draft_for_send(
-                &db, &draft.id, revision, &send_at, &declared,
-            )
-            .map_err(|e| e.to_string())?;
+            let request = SendRequest {
+                surface: SendSurface::Mcp,
+                label: "mcp_send",
+                principal: principal_of(ctx),
+                agent_id: agent_context::agent_id_of(ctx),
+                idempotency_key,
+                to,
+                cc,
+                bcc,
+                reply_to,
+                subject,
+                text: body,
+                html,
+                from,
+                in_reply_to: None,
+                references: &[],
+                attachments: &attachment_snapshots,
+                declared: &declared,
+                metadata: json!({}),
+                created_by: "mcp",
+            };
+            let (draft, replay) =
+                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd))
+                    .map_err(|e| send_error_text(&e))?
+                {
+                    Queued::Queued { draft, replay } => (draft, replay),
+                    Queued::Sent(body) => return Ok(body),
+                };
             return Ok(json!({
                 "sent": false,
                 "status": "queued",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
-                "send_after": send_at,
+                "send_after": draft.send_after.clone().unwrap_or(send_at),
                 "cooldown_seconds": cd,
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "attribution": queued_attribution,
+                "idempotent_replay": replay,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
         SendDisposition::Immediate => {}
     }
 
-    let attachments = decode_attachments(&attachment_snapshots).map_err(|e| e.to_string())?;
-
-    // ── Governor gate (fail-closed before any real SMTP) ──
-    let gov_req = governor_request(
-        &db,
-        &creds.account.id,
-        account_domain(&creds.account.username),
-        subject,
+    let request = SendRequest {
+        surface: SendSurface::Mcp,
+        label: "mcp_send",
+        principal: principal_of(ctx),
+        agent_id: agent_context::agent_id_of(ctx),
+        idempotency_key,
         to,
         cc,
         bcc,
-        SendSurface::Mcp,
-        None,
-        &attachments,
-        None,
-        body,
-        html,
-        &declared,
-    );
-    let gov_outcome = gate_and_record_with_agent(
-        &db,
-        &creds.account.id,
-        &gov_req,
-        agent_context::agent_id_of(ctx),
-    );
-    if !gov_outcome.allowed {
-        return Err(gov_outcome.response_json().to_string());
-    }
-
-    let message_id = envelope_email_transport::smtp::SmtpSender::send(
-        &creds,
-        to,
+        reply_to,
         subject,
-        body,
+        text: body,
         html,
         from,
-        cc,
-        bcc,
-        reply_to,
-        None,
-        None,
-        &attachments,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Resolve Sent-folder copy using pre-append lookup semantics.
-    let from_for_sent = from
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::commands::drafts::account_from_header(&creds));
-    let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
-    let copy_result = crate::commands::drafts::resolve_sent_copy_after_send(
+        in_reply_to: None,
+        references: &[],
+        attachments: &attachment_snapshots,
+        declared: &declared,
+        metadata: json!({}),
+        created_by: "mcp",
+    };
+    let mut result = crate::commands::send_attempt::send_now(
         &db,
         &creds,
-        provider_type.as_deref(),
-        &from_for_sent,
-        to,
-        subject,
-        body,
-        html,
-        cc,
-        bcc,
-        reply_to,
-        None,
-        &[],
-        &message_id,
-        &attachments,
+        &request,
+        &AccountConnector::new(&creds),
     )
-    .await;
-
-    let sent_mail_appended = copy_result.sent_mail_appended;
-    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
-    let sent_mail_proof = copy_result.proof;
-    let (provider_sent_copy, client_appended_copy) =
-        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
-    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
-    let sent_ui = sent_mail_proof.ui(&creds.account.id);
-
-    Ok(json!({
-        "sent": true,
-        "message_id": message_id,
-        "sent_mail_appended": sent_mail_appended,
-        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
-        "sent_folder": sent_mail_proof.folder.clone(),
-        "sent_uid": sent_mail_proof.uid,
-        "sent_message_url": sent_message_url,
-        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
-        "provider_sent_copy": provider_sent_copy,
-        "client_appended_copy": client_appended_copy,
-        "attribution": gov_outcome.success_attribution(),
-        "attachments": attachment_summaries(&attachment_snapshots),
-        "ui": sent_ui,
-    }))
+    .await
+    .map_err(|e| send_error_text(&e))?;
+    if let Some(map) = result.as_object_mut() {
+        map.remove("imap_draft_deleted");
+    }
+    Ok(result)
 }
 
 fn record_send_policy_event(
@@ -961,7 +911,7 @@ fn record_send_policy_event(
     decision: &SendPolicyDecision,
     input: &SendPolicyInput<'_>,
     agent_id: Option<&str>,
-) {
+) -> Result<(), String> {
     let audit = audit_event_for(mode, decision, input);
     let now = chrono::Utc::now().to_rfc3339();
     let event = Event {
@@ -980,7 +930,11 @@ fn record_send_policy_event(
         acked_at: Some(now.clone()),
         created_at: now,
     };
-    let _ = db.insert_event_with_agent(&event, agent_id);
+    db.insert_event_with_agent(&event, agent_id).map_err(|e| {
+        format!(
+            "audit_unavailable: could not record the send-policy decision; nothing was sent: {e}"
+        )
+    })
 }
 
 /// Clamp a requested send mode to the agent policy ceiling. Anonymous sessions
@@ -1179,6 +1133,7 @@ async fn handle_reply(
     if attributes_missing(&declared) {
         return Err(missing_attributes_error(SendSurface::Mcp));
     }
+    let idempotency_key = idempotency_key(params)?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
@@ -1218,7 +1173,7 @@ async fn handle_reply(
         &decision,
         &policy_input,
         agent_context::agent_id_of(ctx),
-    );
+    )?;
 
     match decision {
         SendPolicyDecision::Allowed => {}
@@ -1291,7 +1246,9 @@ async fn handle_reply(
         &creds.account.id,
         &precheck_req,
         agent_context::agent_id_of(ctx),
-    ) {
+    )
+    .map_err(|e| format!("{e:#}"))?
+    {
         return Err(outcome.response_json().to_string());
     }
     let queued_attribution = precheck_req
@@ -1318,154 +1275,117 @@ async fn handle_reply(
         SendDisposition::Queue {
             cooldown_seconds: cd,
         } => {
-            let draft = db
-                .create_draft(
-                    &creds.account.id,
-                    &headers.to,
-                    Some(&headers.subject),
-                    Some(body),
-                    html,
-                    headers.in_reply_to.as_deref(),
-                    cc_str.as_deref(),
-                    None,
-                    Some("mcp"),
-                )
-                .map_err(|e| e.to_string())?;
-            if !attachment_snapshots.is_empty() {
-                db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| e.to_string())?;
-            }
-            db.set_draft_metadata(
-                &draft.id,
-                &json!({
-                    "draft_kind": "reply",
-                    "in_reply_to": headers.in_reply_to.clone(),
-                    "references": headers.references.clone(),
-                    "source": {"folder": folder, "uid": uid},
-                }),
-            )
-            .map_err(|e| e.to_string())?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
-            // Bind the validated declaration, the schedule, and the due status in
-            // ONE atomic CAS at the draft's final revision (set_draft_metadata /
-            // update_draft_attachments bumped it), merging alongside the reply
-            // threading metadata. No partial schedule; no stale declaration.
-            let revision = db
-                .get_draft(&draft.id)
-                .map_err(|e| e.to_string())?
-                .map(|d| d.revision)
-                .ok_or_else(|| format!("draft not found: {}", draft.id))?;
-            crate::commands::drafts::queue_bot_draft_for_send(
-                &db, &draft.id, revision, &send_at, &declared,
-            )
-            .map_err(|e| e.to_string())?;
+            let request = reply_request(
+                ctx,
+                idempotency_key,
+                &headers,
+                cc_str.as_deref(),
+                body,
+                html,
+                &attachment_snapshots,
+                &declared,
+                folder,
+                uid,
+            );
+            let (draft, replay) =
+                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd))
+                    .map_err(|e| send_error_text(&e))?
+                {
+                    Queued::Queued { draft, replay } => (draft, replay),
+                    Queued::Sent(body) => return Ok(body),
+                };
             return Ok(json!({
                 "sent": false,
                 "status": "queued",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
-                "send_after": send_at,
+                "send_after": draft.send_after.clone().unwrap_or(send_at),
                 "cooldown_seconds": cd,
                 "queued_reason_code": OUTBOX_COOLDOWN_REASON_CODE,
                 "queued_reason": OUTBOX_COOLDOWN_REASON,
                 "in_reply_to": headers.in_reply_to,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "attribution": queued_attribution,
+                "idempotent_replay": replay,
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
             }));
         }
         SendDisposition::Immediate => {}
     }
 
-    let attachments = decode_attachments(&attachment_snapshots).map_err(|e| e.to_string())?;
-
-    // ── Governor gate (fail-closed before any real SMTP) ──
-    let gov_req = reply_governor_request(
-        &db,
-        &creds.account,
+    let request = reply_request(
+        ctx,
+        idempotency_key,
         &headers,
         cc_str.as_deref(),
-        &attachments,
         body,
         html,
+        &attachment_snapshots,
         &declared,
+        folder,
+        uid,
     );
-    let gov_outcome = gate_and_record_with_agent(
+    let mut result = crate::commands::send_attempt::send_now(
         &db,
-        &creds.account.id,
-        &gov_req,
-        agent_context::agent_id_of(ctx),
-    );
-    if !gov_outcome.allowed {
-        return Err(gov_outcome.response_json().to_string());
-    }
-
-    let message_id = envelope_email_transport::smtp::SmtpSender::send(
         &creds,
-        &headers.to,
-        &headers.subject,
-        Some(body),
-        html,
-        None,
-        cc_str.as_deref(),
-        None,
-        None,
-        headers.in_reply_to.as_deref(),
-        Some(&headers.references),
-        &attachments,
+        &request,
+        &AccountConnector::new(&creds),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| send_error_text(&e))?;
+    if let Some(map) = result.as_object_mut() {
+        map.remove("imap_draft_deleted");
+        map.insert("in_reply_to".into(), json!(headers.in_reply_to));
+        map.insert(
+            "parent_ui".into(),
+            ui::message_ui(&creds.account.id, uid, folder),
+        );
+    }
+    Ok(result)
+}
 
-    // Resolve Sent-folder copy using pre-append lookup semantics.
-    let from_for_sent = crate::commands::drafts::account_from_header(&creds);
-    let provider_type = db.get_provider_type(&creds.account.id).ok().flatten();
-    let copy_result = crate::commands::drafts::resolve_sent_copy_after_send(
-        &db,
-        &creds,
-        provider_type.as_deref(),
-        &from_for_sent,
-        &headers.to,
-        &headers.subject,
-        Some(body),
+/// The send request for an MCP `reply`: threaded to the parent, recorded as a
+/// reply draft of that parent.
+#[allow(clippy::too_many_arguments)]
+fn reply_request<'a>(
+    ctx: Option<&'a AgentContext>,
+    idempotency_key: Option<&'a str>,
+    headers: &'a envelope_email_transport::ReplyHeaders,
+    cc: Option<&'a str>,
+    body: &'a str,
+    html: Option<&'a str>,
+    attachments: &'a [Value],
+    declared: &'a [String],
+    folder: &str,
+    uid: u32,
+) -> SendRequest<'a> {
+    SendRequest {
+        surface: SendSurface::Mcp,
+        label: "mcp_reply",
+        principal: principal_of(ctx),
+        agent_id: agent_context::agent_id_of(ctx),
+        idempotency_key,
+        to: &headers.to,
+        cc,
+        bcc: None,
+        reply_to: None,
+        subject: &headers.subject,
+        text: Some(body),
         html,
-        cc_str.as_deref(),
-        None, // bcc — reply path carries none
-        None, // reply_to — reply path carries none
-        headers.in_reply_to.as_deref(),
-        &headers.references,
-        &message_id,
-        &attachments,
-    )
-    .await;
-
-    let sent_mail_appended = copy_result.sent_mail_appended;
-    let sent_mail_append_skipped_reason = copy_result.sent_mail_append_skipped_reason;
-    let sent_mail_proof = copy_result.proof;
-    let (provider_sent_copy, client_appended_copy) =
-        sent_copy_convenience_objects(&creds.account.id, &sent_mail_proof);
-    let sent_message_url = sent_mail_proof.message_url(&creds.account.id);
-    let sent_ui = sent_mail_proof.ui(&creds.account.id);
-
-    Ok(json!({
-        "sent": true,
-        "message_id": message_id,
-        "sent_mail_appended": sent_mail_appended,
-        "sent_mail_append_skipped_reason": sent_mail_append_skipped_reason,
-        "sent_folder": sent_mail_proof.folder.clone(),
-        "sent_uid": sent_mail_proof.uid,
-        "sent_message_url": sent_message_url,
-        "sent_mail": sent_mail_proof_json(&creds.account.id, &sent_mail_proof),
-        "provider_sent_copy": provider_sent_copy,
-        "client_appended_copy": client_appended_copy,
-        "attribution": gov_outcome.success_attribution(),
-        "attachments": attachment_summaries(&attachment_snapshots),
-        "in_reply_to": headers.in_reply_to,
-        "ui": sent_ui,
-        "parent_ui": ui::message_ui(&creds.account.id, uid, folder),
-    }))
+        from: None,
+        in_reply_to: headers.in_reply_to.as_deref(),
+        references: &headers.references,
+        attachments,
+        declared,
+        metadata: json!({
+            "draft_kind": "reply",
+            "source": {"folder": folder, "uid": uid},
+        }),
+        created_by: "mcp",
+    }
 }
 
 async fn handle_create_reply_draft(
@@ -1653,7 +1573,7 @@ async fn handle_send_draft(
             &decision,
             &policy_input,
             agent_context::agent_id_of(ctx),
-        );
+        )?;
         if matches!(decision, SendPolicyDecision::DraftOnly) {
             return Ok(crate::commands::contract::send_body::mcp_drafted(
                 json!(send_mode),
@@ -1678,7 +1598,7 @@ async fn handle_send_draft(
             &declared,
             agent_context::agent_id_of(ctx),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
         if let Some(outcome) = &precheck.refusal {
             return Err(outcome.response_json().to_string());
         }
@@ -1729,6 +1649,11 @@ async fn handle_send_draft(
                 precheck.revision,
                 &send_at,
                 &declared,
+                &envelope_email_store::QueueContext {
+                    surface: "mcp_send_draft",
+                    agent_id: agent_context::agent_id_of(ctx),
+                    cooldown_seconds: Some(cd),
+                },
             )
             .map_err(|e| e.to_string())?;
             // The additive success block is built from the SAME validated
@@ -1757,9 +1682,10 @@ async fn handle_send_draft(
         backend,
         SendSurface::Mcp,
         &declared,
+        agent_context::agent_id_of(ctx),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| send_error_text(&e))?;
     Ok(outcome.json)
 }
 
@@ -1778,31 +1704,79 @@ fn log_agent_mutation(
     action_type: &str,
     action_taken: &str,
     message_id: Option<&str>,
-) {
+    draft_id: Option<&str>,
+) -> Result<(), String> {
     let Some(agent_id) = agent_context::agent_id_of(ctx) else {
-        return;
+        return Ok(());
     };
-    let _ = db.log_action_with_agent(
+    db.log_action_with_agent(
         account_id,
         action_type,
         1.0,
         "mcp agent tool call",
         action_taken,
         message_id,
-        None,
+        draft_id,
         Some(agent_id),
-    );
+    )
+    .map_err(|e| format!("could not record the agent action: {e}"))?;
     let payload = json!({
         "action_type": action_type,
         "action": action_taken,
         "message_id": message_id,
     });
-    let _ = db.emit_catalog_event(
+    db.emit_catalog_event(
         account_id,
         envelope_email_store::event_catalog::AGENT_ACTION,
         Some(payload),
         Some(agent_id),
-    );
+    )
+    .map_err(|e| format!("could not record the agent_action event: {e}"))?;
+    Ok(())
+}
+
+/// The mutation already happened, so an audit failure cannot undo it: say so
+/// on the result instead of dropping it.
+fn attach_audit_warning(result: &mut Value, audit: Result<(), String>) {
+    let Err(detail) = audit else {
+        return;
+    };
+    tracing::warn!("MCP audit write failed: {detail}");
+    if let Some(map) = result.as_object_mut() {
+        let warnings = map
+            .entry("warnings")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(items) = warnings.as_array_mut() {
+            items.push(json!({"code": "audit_write_failed", "detail": detail}));
+        }
+    }
+}
+
+/// An MCP error text for a failed send tool: the structured result when the
+/// send path produced one.
+fn send_error_text(e: &anyhow::Error) -> String {
+    if let Some(refused) = e.downcast_ref::<GovernorRefused>() {
+        return refused.outcome.response_json().to_string();
+    }
+    if let Some(not_confirmed) = e.downcast_ref::<SendNotConfirmed>() {
+        return not_confirmed.body.to_string();
+    }
+    format!("{e:#}")
+}
+
+fn principal_of(ctx: Option<&AgentContext>) -> String {
+    agent_context::agent_id_of(ctx)
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "mcp:anonymous".to_string())
+}
+
+fn idempotency_key(params: &Value) -> Result<Option<&str>, String> {
+    let key = optional_str(params, "idempotency_key");
+    if let Some(key) = key {
+        envelope_email_store::send_attempts::validate_idempotency_key(key)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(key)
 }
 
 /// Refuse an agent move or copy into the account's Sent folder. Sent is where
@@ -1863,22 +1837,25 @@ async fn handle_move(
         .await
         .map_err(|e| e.to_string())?;
 
-    log_agent_mutation(
+    let audit = log_agent_mutation(
         &db,
         ctx,
         &creds.account.id,
         "move",
         &json!({"uid": uid, "from": from_folder, "to": to_folder}).to_string(),
         None,
+        None,
     );
 
-    Ok(json!({
+    let mut result = json!({
         "moved": true,
         "uid": uid,
         "from": from_folder,
         "to": to_folder,
         "ui": ui::message_ui(&creds.account.id, uid, to_folder),
-    }))
+    });
+    attach_audit_warning(&mut result, audit);
+    Ok(result)
 }
 
 async fn handle_flag(
@@ -1951,22 +1928,25 @@ async fn handle_flag(
         _ => return Err("action must be 'add' or 'remove'".to_string()),
     }
 
-    log_agent_mutation(
+    let audit = log_agent_mutation(
         &db,
         ctx,
         &creds.account.id,
         "flag",
         &json!({"uid": uid, "action": action, "flag": flag, "folder": folder}).to_string(),
         None,
+        None,
     );
 
-    Ok(json!({
+    let mut result = json!({
         "flagged": true,
         "uid": uid,
         "action": action,
         "flag": flag,
         "ui": ui::message_ui(&creds.account.id, uid, folder),
-    }))
+    });
+    attach_audit_warning(&mut result, audit);
+    Ok(result)
 }
 
 async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -2061,22 +2041,25 @@ async fn handle_tag(
         .get_scores(&creds.account.id, message_id)
         .map_err(|e| e.to_string())?;
 
-    log_agent_mutation(
+    let audit = log_agent_mutation(
         &db,
         ctx,
         &creds.account.id,
         "tag",
         &json!({"uid": uid, "tags": current_tags}).to_string(),
         Some(message_id),
+        None,
     );
 
-    Ok(json!({
+    let mut result = json!({
         "uid": uid,
         "message_id": message_id,
         "tags": current_tags,
         "scores": current_scores.iter().map(|s| json!({"dimension": s.dimension, "value": s.value})).collect::<Vec<_>>(),
         "ui": ui::message_ui(&creds.account.id, uid, folder),
-    }))
+    });
+    attach_audit_warning(&mut result, audit);
+    Ok(result)
 }
 
 async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
@@ -2334,7 +2317,9 @@ async fn handle_bulk(
         .map_err(|e| json!({"code": e.code(), "reason": e.to_string()}).to_string())?;
 
     // Attribute a mutation only when the bulk actually mutated (not a dry run).
-    if !result.dry_run {
+    let audit = if result.dry_run {
+        Ok(())
+    } else {
         log_agent_mutation(
             &db,
             ctx,
@@ -2348,10 +2333,12 @@ async fn handle_bulk(
             })
             .to_string(),
             None,
-        );
-    }
+            None,
+        )
+    };
 
     let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+    attach_audit_warning(&mut out, audit);
     if let (true, Some(obj)) = (forced_dry_run, out.as_object_mut()) {
         obj.insert(
             "note".to_string(),
@@ -2644,15 +2631,18 @@ async fn handle_snooze(
                 )
                 .map_err(|e| e.to_string())?;
 
-            log_agent_mutation(
+            let audit = log_agent_mutation(
                 &db,
                 ctx,
                 &creds.account.id,
                 "snooze",
                 &json!({"uid": uid, "until": return_at, "from": folder}).to_string(),
                 message_id,
+                None,
             );
-            Ok(serde_json::to_value(&snoozed).map_err(|e| e.to_string())?)
+            let mut result = serde_json::to_value(&snoozed).map_err(|e| e.to_string())?;
+            attach_audit_warning(&mut result, audit);
+            Ok(result)
         }
         "cancel" => {
             let uid = required_uid(params)?;
@@ -2677,19 +2667,22 @@ async fn handle_snooze(
             .map_err(|e| e.to_string())?;
             db.delete_snoozed(&snoozed.id).map_err(|e| e.to_string())?;
 
-            log_agent_mutation(
+            let audit = log_agent_mutation(
                 &db,
                 ctx,
                 &creds.account.id,
                 "snooze",
                 &json!({"uid": uid, "cancelled": true, "to": snoozed.original_folder}).to_string(),
                 snoozed.message_id.as_deref(),
+                None,
             );
-            Ok(json!({
+            let mut result = json!({
                 "cancelled": true,
                 "uid": uid,
                 "returned_to": snoozed.original_folder,
-            }))
+            });
+            attach_audit_warning(&mut result, audit);
+            Ok(result)
         }
         other => Err(format!(
             "unknown snooze action '{other}' (expected set, list, or cancel)"
@@ -3599,7 +3592,9 @@ mod tests {
             "move",
             &json!({"uid": 5, "to": "Archive"}).to_string(),
             None,
-        );
+            None,
+        )
+        .unwrap();
 
         // The durable agent_action catalog event landed, attributed to the agent.
         let (event_type, agent_id): (String, Option<String>) = db
@@ -3617,7 +3612,7 @@ mod tests {
     #[test]
     fn log_agent_mutation_anonymous_emits_no_agent_action_event() {
         let db = Database::open_memory().unwrap();
-        log_agent_mutation(&db, None, "acc-1", "move", "{}", None);
+        log_agent_mutation(&db, None, "acc-1", "move", "{}", None, None).unwrap();
         let count: i64 = db
             .conn()
             .query_row(
@@ -3749,27 +3744,53 @@ mod audit_trail_tests {
         let db = Database::open_memory().unwrap();
         let ctx = test_ctx("agent-42");
         let result = json!({"status": "drafted", "draft_id": "d-1", "ui": {"account_id": "acc-1"}});
-        record_tool_outcome(&db, Some(&ctx), "acc-1", "create_reply_draft", &result);
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "create_reply_draft", &result).unwrap();
+        // A send the policy downgraded to a draft never reached the send
+        // pipeline, so the dispatcher records it.
         record_tool_outcome(
             &db,
             Some(&ctx),
             "acc-1",
             "send",
-            &json!({"status": "queued"}),
-        );
+            &json!({"status": "drafted", "draft_id": "d-2"}),
+        )
+        .unwrap();
+        // A queued send wrote its own receipt; the dispatcher adds nothing.
+        record_tool_outcome(
+            &db,
+            Some(&ctx),
+            "acc-1",
+            "send",
+            &json!({"status": "queued", "draft_id": "d-3"}),
+        )
+        .unwrap();
         let rows = db.list_actions_for_agent("acc-1", "agent-42", 10).unwrap();
-        let types: Vec<&str> = rows.iter().map(|r| r.action_type.as_str()).collect();
-        assert!(types.contains(&"create_reply_draft"), "{types:?}");
-        assert!(types.contains(&"send"), "{types:?}");
+        let recorded: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|r| (r.action_type.as_str(), r.draft_id.as_deref()))
+            .collect();
+        assert!(
+            recorded.contains(&("create_reply_draft", Some("d-1"))),
+            "{recorded:?}"
+        );
+        assert!(recorded.contains(&("send", Some("d-2"))), "{recorded:?}");
+        assert!(
+            !recorded.iter().any(|(_, d)| *d == Some("d-3")),
+            "{recorded:?}"
+        );
         assert!(rows.iter().all(|r| r.action_status == "completed"));
+        assert!(
+            rows.iter()
+                .all(|r| r.agent_id.as_deref() == Some("agent-42"))
+        );
     }
 
     #[test]
     fn read_only_tools_are_not_recorded_as_actions() {
         let db = Database::open_memory().unwrap();
         let ctx = test_ctx("agent-42");
-        record_tool_outcome(&db, Some(&ctx), "acc-1", "inbox", &json!({"messages": []}));
-        record_tool_outcome(&db, Some(&ctx), "acc-1", "read", &json!({"uid": 1}));
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "inbox", &json!({"messages": []})).unwrap();
+        record_tool_outcome(&db, Some(&ctx), "acc-1", "read", &json!({"uid": 1})).unwrap();
         assert!(
             db.list_actions_for_agent("acc-1", "agent-42", 10)
                 .unwrap()
@@ -3789,7 +3810,8 @@ mod audit_trail_tests {
             "acc-1",
             "move_message",
             &json!({"ok": true}),
-        );
+        )
+        .unwrap();
         assert!(
             db.list_actions_for_agent("acc-1", "agent-42", 10)
                 .unwrap()
@@ -3817,7 +3839,7 @@ mod audit_trail_tests {
     #[test]
     fn anonymous_sessions_record_nothing() {
         let db = Database::open_memory().unwrap();
-        record_tool_outcome(&db, None, "acc-1", "send", &json!({"status": "queued"}));
+        record_tool_outcome(&db, None, "acc-1", "send", &json!({"status": "drafted"})).unwrap();
         record_tool_denial(&db, None, Some("acc-1"), "send", "x");
         assert!(db.list_actions("acc-1", 10).unwrap().is_empty());
     }

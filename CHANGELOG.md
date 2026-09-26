@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rerun after a crash no longer sends the message twice.** `send --send-now` kept no local
+  record, so rerunning the command after the process died during or after SMTP sent a second
+  copy. Every send request (CLI `send`, MCP `send`/`reply`; immediate, queued or `--at`) is now
+  written as a durable intent before any network work, and a rerun of the same request returns
+  the earlier outcome with `idempotent_replay: true`. Each attempt records its Message-ID before
+  it starts and commits `transmitting` after DATA and before the first body byte, so a failure is
+  classified by how far it got: nothing sent (the row returns to `draft`, `status: "not_sent"`) or
+  possibly accepted (`delivery_uncertain`, never re-sent). A 4xx/5xx reply to the body counts as
+  nothing sent. The result is recorded before QUIT, and each SMTP stage now has a deadline.
+- **Rows stranded in `sending` are recovered.** A process killed mid-send left its draft `sending`
+  for good, and `draft send` refused it as "not sendable". The next send, `draft show`,
+  `draft list`, `serve` start and every scheduled-send tick now resolve such rows: an attempt that
+  never reached the message body goes back to `draft` (a scheduled one comes due again), one that
+  had started it becomes `delivery_uncertain`. A still-running sender holds an OS file lock on its
+  attempt and is never touched. `draft send` on such a row reports the resolved status as JSON.
+- **Every send operation leaves a complete receipt.** Sends wrote no `action_log` rows and
+  `send_completed` events had no `message_id`. Each send transition (queued, claimed,
+  transmitting, sent, released, parked, replayed) now writes an `action_type=send` row in the same
+  transaction as the state change, with the draft id, Message-ID, agent id, recipients, payload
+  digests and outcome; `send_completed` fills its `message_id` column and is emitted by the
+  scheduled sweep and immediate sends too. `actions tail --json` rows carry `agent_id`. Audit
+  writes that used to be dropped silently (send-policy and Governor decisions, queue and approval
+  events, MCP agent actions) now stop the send before SMTP (`audit_unavailable`) or, after the
+  server accepted the message, return `warnings: [{code: "audit_write_failed"}]` and exit
+  non-zero. Queued `send` rows now show their body in `draft show` (`content.agent_body_text`).
+
+### Changed
+
+- **An identical send within 15 minutes returns the earlier result instead of sending again.**
+  Without a key, a request identical to an unresolved, queued or uncertain one is matched for as
+  long as that one exists, and to a sent one for 15 minutes. To send identical content twice on
+  purpose, give each send its own `--idempotency-key` (MCP `idempotency_key`). The same key with
+  different content is refused with `idempotency_key_conflict`.
+- An immediate send whose SMTP attempt fails before the server accepts it keeps its message as a
+  local draft, which a rerun resumes; discard it to abandon the send. A request the Governor gate
+  or the attribution check refuses still leaves nothing behind.
+- The scheduled sweep retries a send the server refused with a 4xx reply, or never reached, on the
+  next tick instead of parking it `delivery_uncertain`; a 5xx refusal parks it `blocked` with the
+  reason in `send_block`.
+
 ## [1.3.7] — 2026-09-26
 
 ### Upgrade note: release builds refuse two declarations

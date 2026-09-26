@@ -29,6 +29,7 @@ base64.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 rand.workspace = true
+lettre.workspace = true
 
 rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
