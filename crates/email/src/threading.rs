@@ -198,6 +198,7 @@ pub async fn build_threads(
         account_id,
         account_email,
         "INBOX",
+        false,
         max_messages,
     )
     .await?;
@@ -213,6 +214,7 @@ pub async fn build_threads(
             account_id,
             account_email,
             sent,
+            true,
             max_messages,
         )
         .await?;
@@ -242,13 +244,16 @@ pub async fn build_threads(
     })
 }
 
-/// Scan a single folder for threading data.
+/// Scan a single folder for threading data. `folder_is_sent` marks the
+/// account's detected Sent mailbox, the only folder whose messages can be the
+/// account's own outbound mail.
 async fn scan_folder_for_threads(
     client: &mut imap::ImapClient,
     db: &Database,
     account_id: &str,
     account_email: &str,
     folder: &str,
+    folder_is_sent: bool,
     max_messages: u32,
 ) -> Result<FolderScanResult, ImapError> {
     info!("scanning folder {folder} for threads (max {max_messages})");
@@ -317,7 +322,15 @@ async fn scan_folder_for_threads(
             .uid_fetch(&fetch_query, "(UID FLAGS BODY.PEEK[])")
             .await
             .map_err(|e| ImapError::Protocol(format!("UID FETCH {fetch_query}: {e}")))?;
-        process_fetched_messages(messages, db, account_id, account_email, folder).await?
+        process_fetched_messages(
+            messages,
+            db,
+            account_id,
+            account_email,
+            folder,
+            folder_is_sent,
+        )
+        .await?
     } else {
         // Sequence-number-based fetch for initial scan
         let messages = client
@@ -325,7 +338,15 @@ async fn scan_folder_for_threads(
             .fetch(&fetch_query, "(UID FLAGS BODY.PEEK[])")
             .await
             .map_err(|e| ImapError::Protocol(format!("FETCH {fetch_query}: {e}")))?;
-        process_fetched_messages(messages, db, account_id, account_email, folder).await?
+        process_fetched_messages(
+            messages,
+            db,
+            account_id,
+            account_email,
+            folder,
+            folder_is_sent,
+        )
+        .await?
     };
 
     // Update the last-synced UID to the highest UID we saw
@@ -351,6 +372,7 @@ async fn process_fetched_messages<S>(
     account_id: &str,
     account_email: &str,
     folder: &str,
+    folder_is_sent: bool,
 ) -> Result<FolderScanResult, ImapError>
 where
     S: futures_util::Stream<Item = Result<async_imap::types::Fetch, async_imap::error::Error>>
@@ -403,8 +425,7 @@ where
                 let cc_addr = non_empty(mp_all_addresses(parsed.cc()));
                 let bcc_addr = non_empty(mp_all_addresses(parsed.bcc()));
 
-                // Is this outbound? (sent from our account)
-                let is_outbound = from_addr.to_lowercase() == account_email.to_lowercase();
+                let is_outbound = is_own_outbound(folder_is_sent, &from_addr, account_email);
 
                 // Snippet from body
                 let snippet = parsed.body_text(0).map(|t| extract_snippet(&t, 200));
@@ -529,6 +550,14 @@ where
     Ok(result)
 }
 
+/// Whether a cached message is the account's own outbound mail. Anyone can
+/// write `From: <account>`, so a matching From proves nothing by itself: only a
+/// copy in the account's Sent-role folder counts. A spoofed self-From in INBOX
+/// stays inbound and can never vouch for its recipients.
+fn is_own_outbound(folder_is_sent: bool, from_addr: &str, account_email: &str) -> bool {
+    folder_is_sent && from_addr.to_lowercase() == account_email.to_lowercase()
+}
+
 /// Check if two sets of email addresses overlap (any shared address).
 fn addresses_overlap(from_a: &str, to_a: &str, from_b: &str, to_b: &str) -> bool {
     let mut set_a: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -622,6 +651,21 @@ pub struct ThreadBuildResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_self_from_copy_in_the_sent_folder_is_outbound() {
+        assert!(is_own_outbound(true, "Me@Example.test", "me@example.test"));
+        assert!(!is_own_outbound(
+            false,
+            "me@example.test",
+            "me@example.test"
+        ));
+        assert!(!is_own_outbound(
+            true,
+            "someone@example.test",
+            "me@example.test"
+        ));
+    }
 
     #[test]
     fn test_normalize_subject() {

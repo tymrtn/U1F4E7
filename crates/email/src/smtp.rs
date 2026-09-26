@@ -383,6 +383,35 @@ fn parse_mailboxes(value: &str, field: &str) -> Result<Mailboxes, SmtpError> {
         .map_err(|e| SmtpError::Send(format!("invalid {field} address: {e}")))
 }
 
+/// The addresses a send with these headers is delivered to: every mailbox
+/// [`build_message`] parses out of To, Cc and Bcc, lowercased, first spelling
+/// kept, duplicates dropped. Blank Cc/Bcc are skipped, as there.
+///
+/// Anything that decides based on who a send reaches (the Governor gate's
+/// relationship facts) must use this rather than its own parse of the header
+/// text. A looser parser that dropped an entry `Mailboxes` accepts would judge
+/// the send on fewer recipients than SMTP delivers to.
+pub fn envelope_recipients(
+    to: &str,
+    cc: Option<&str>,
+    bcc: Option<&str>,
+) -> Result<Vec<String>, SmtpError> {
+    let mut recipients: Vec<String> = Vec::new();
+    for (value, field) in [(Some(to), "to"), (cc, "cc"), (bcc, "bcc")] {
+        let Some(value) = value else { continue };
+        if field != "to" && value.trim().is_empty() {
+            continue;
+        }
+        for mailbox in parse_mailboxes(value, field)? {
+            let address = mailbox.email.to_string().to_lowercase();
+            if !recipients.contains(&address) {
+                recipients.push(address);
+            }
+        }
+    }
+    Ok(recipients)
+}
+
 enum BodyPart {
     Single(SinglePart),
     Multi(MultiPart),
@@ -856,6 +885,34 @@ mod tests {
             parse_mailboxes("ada@xn--exmple-cua.com", "to").is_ok(),
             "the punycode spelling the composer requires is sendable"
         );
+    }
+
+    /// Every address SMTP will deliver to, including the ones the address
+    /// book's parser drops: a `<` inside a quoted display name, a Unicode or
+    /// underscore domain, a single-label domain.
+    #[test]
+    fn envelope_recipients_lists_every_address_smtp_delivers_to() {
+        assert_eq!(
+            envelope_recipients(
+                "Known@Example.net",
+                Some("\"Name <extra>\" <attacker@evil.test>, attacker@exämple.com"),
+                Some("a@ex_ample.com, b@localhost, known@example.net"),
+            )
+            .unwrap(),
+            [
+                "known@example.net",
+                "attacker@evil.test",
+                "attacker@exämple.com",
+                "a@ex_ample.com",
+                "b@localhost",
+            ]
+        );
+        assert_eq!(
+            envelope_recipients("a@example.com", Some("  "), Some("")).unwrap(),
+            ["a@example.com"]
+        );
+        assert!(envelope_recipients("not an address", None, None).is_err());
+        assert!(envelope_recipients("a@example.com", Some("Ada <x"), None).is_err());
     }
 
     #[test]

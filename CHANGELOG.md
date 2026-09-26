@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+These fixes change how Envelope derives the recipient facts its send gate checks. Before them,
+mail an attacker controls, or an agent acting on it, could make a send to a stranger look like a
+reply to a known contact. Governor scoring stays off in release builds, but attribution runs in
+every build, so some of this reaches release builds too (see **Release builds** below).
+
+- **Spoofed self-From.** A message counted as the account's own outbound whenever its From
+  matched the account address, in any folder. An inbound "From: you, To: attacker" in INBOX made
+  the attacker a known contact, and a frequent one after five. Only a copy in the detected Sent
+  folder counts now, both when the thread index is built and when facts are derived, so rows an
+  earlier index stored are covered too. rShield's count of mail you have sent to a sender uses
+  the same rule.
+- **Filing mail into Sent.** MCP `move_message` and `bulk` `move`/`copy` now refuse the Sent
+  folder (by name or `\Sent`), so an agent can't turn a forged message into Sent history.
+- **Agent-added contacts.** MCP `contacts add`, `tag` and `untag` wrote curated rows, and a
+  curated row made a recipient a known contact. Those rows are now marked agent-curated
+  (`contacts.history_derived = 2`): the address book keeps and suggests them, and the gate
+  ignores them. `envelope contacts import`, which copies inbox senders, writes them the same
+  way. CLI `contacts add` and `tag` still vouch for an address, including one an agent added,
+  and an agent write never downgrades a contact a person added. Contacts an agent added before
+  this release can't be told apart and still count; look through `envelope contacts list` for
+  addresses you don't recognise.
+- **Unverified `In-Reply-To`.** Any draft with an `In-Reply-To`, including a made-up one, got
+  `reply_to_thread` and had `cold_email` switched off. Reply credit now requires the parent to
+  resolve to one cached thread in the account, with every recipient on a Sent-folder message
+  in that thread. This applies to CLI and MCP sends, draft sends and the scheduled sweep.
+- **Replies to a stranger's thread.** Replying to an attacker's own message used to count as a
+  warm reply. The account has never written to that sender, so the reply keeps `cold_email`.
+- **New Cc on a known thread.** A recipient set that mixed known and unknown addresses switched
+  `cold_email` and `unknown_domain` off for the whole send. Now `cold_email` fires when any
+  recipient has no verified history, `unknown_domain` fires when any recipient's domain is
+  unseen, and the added address costs the reply its `reply_to_thread` credit.
+- **Recipients the gate couldn't parse.** The gate re-read To/Cc/Bcc with the address book's
+  parser, which drops some addresses SMTP still delivers to: a `<` inside a quoted display
+  name, or a Unicode, underscore or single-label domain. Such a Cc dropped out of the check. The
+  gate now judges exactly the addresses SMTP parses.
+- **Lookups that gave up.** With more than 256 cached Sent rows, more than 8 recipients, or a
+  store error, every relationship fact came back unknown, so a stranger carried no
+  first-contact signal. Lookups now read every Sent row that mentions the address. More than 8
+  recipients, headers SMTP can't parse, or a store error (logged as a warning) count as
+  containing a first contact: no credit, and `cold_email` set.
+- **The account's own domain** never derives `unknown_domain`, so an honest `internal_domain`
+  declaration is no longer refused on an account with no cached Sent history.
+
+Honest replies keep their credit: answering a thread in which you already wrote to every
+recipient still gets `reply_to_thread`.
+
+**Release builds.** Declarations are checked in every build, and a rejected one refuses the whole
+send (`attributes_invalid`). These used to pass and are now refused:
+
+- declaring `reply_to_thread` on a reply without verified history: a reply to a first-time
+  sender, a reply to a new thread a known contact started, a reply whose earlier Sent copy isn't
+  cached yet (the thread cache refreshes when `envelope thread build` runs), or a reply that adds
+  a recipient. Resubmitting without `reply_to_thread` sends it as new mail. Scheduled drafts that
+  stored `reply_to_thread` before the upgrade are refused by the sweep the same way;
+- declaring `known_contact` for a contact only an agent added.
+
+Newly indexed messages take their direction from the Sent folder, so a self-From message outside
+Sent now shows as inbound. Rows an earlier index flagged outbound outside Sent keep that flag in
+thread views, the review page's sent history and address-suggestion counts until
+`envelope thread build --rebuild` re-reads them (up to `--limit` messages per folder). The send
+gate and rShield ignore them already.
+
+**Downgrading.** Older binaries read `history_derived = 2` as a derived row and leave agent-added
+contacts with no message history out of address suggestions.
+
 ## [1.3.6] — 2026-09-26
 
 ### Fixed

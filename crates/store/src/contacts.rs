@@ -5,14 +5,49 @@ use crate::db::Database;
 use crate::errors::Result;
 use crate::models::Contact;
 
+/// `contacts.history_derived` for a manual row nobody vouched for: an agent
+/// curated it over MCP, or a bulk import copied it from inbox senders. It is
+/// manually owned like `0` (a rebuild never deletes it and the dropdown always
+/// offers it), but only `0`, a person curating the address, makes it a known
+/// contact to the Governor send gate. `1` is the address-history derivation's.
+pub const AGENT_CURATED: i64 = 2;
+
+/// Who is curating a contact row, which decides whether the write vouches for
+/// the address. Only [`Curator::Human`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curator {
+    /// A person named this address (CLI `contacts add`/`tag`).
+    Human,
+    /// Written without a person naming the address: an agent over MCP, or a
+    /// bulk import of inbox senders.
+    Agent,
+}
+
+impl Curator {
+    fn history_derived(self) -> i64 {
+        match self {
+            Curator::Human => 0,
+            Curator::Agent => AGENT_CURATED,
+        }
+    }
+}
+
 impl Database {
+    /// Add or update a contact as a person curating it. See
+    /// [`Self::upsert_contact_by`].
+    pub fn upsert_contact(&self, contact: &Contact) -> Result<()> {
+        self.upsert_contact_by(contact, Curator::Human)
+    }
+
     /// Add or update a contact.
     ///
-    /// Either way the row comes out manually managed (`history_derived = 0`),
-    /// including when this lands on a row the address-history derivation
-    /// invented: a contact someone has chosen to curate is no longer the
-    /// derivation's to delete when its last cached source disappears. See
-    /// `crate::address_book` for the ownership split.
+    /// Either way the row comes out manually managed (`history_derived` other
+    /// than 1), including when this lands on a row the address-history
+    /// derivation invented: a contact someone has chosen to curate is no longer
+    /// the derivation's to delete when its last cached source disappears. See
+    /// `crate::address_book` for the ownership split. A [`Curator::Agent`]
+    /// write marks the row [`AGENT_CURATED`] unless a person already curated
+    /// it, so an agent can neither vouch for an address nor revoke a vouch.
     ///
     /// The row is found on `lower(email)`, not on the `UNIQUE(account_id,
     /// email)` key, because that constraint is case-sensitive and the
@@ -29,7 +64,7 @@ impl Database {
     /// their stored spelling: an address is one identity case-folded, but RFC
     /// 5321 §2.4 leaves the local part case-sensitive, so nothing here rewrites
     /// an address someone already has on file.
-    pub fn upsert_contact(&self, contact: &Contact) -> Result<()> {
+    pub fn upsert_contact_by(&self, contact: &Contact, curator: Curator) -> Result<()> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
 
@@ -40,7 +75,7 @@ impl Database {
             tx.query_row(
                 "SELECT id FROM contacts
                  WHERE account_id = ?1 AND lower(email) = lower(?2)
-                 ORDER BY history_derived ASC, message_count DESC, history_count DESC
+                 ORDER BY history_derived = 1, history_derived, message_count DESC, history_count DESC
                  LIMIT 1",
                 rusqlite::params![contact.account_id, contact.email],
                 |row| row.get(0),
@@ -72,7 +107,7 @@ impl Database {
                         message_count = ?5,
                         first_seen = COALESCE(first_seen, ?6),
                         last_seen = COALESCE(?7, last_seen),
-                        history_derived = 0,
+                        history_derived = CASE WHEN history_derived = 0 THEN 0 ELSE ?8 END,
                         updated_at = datetime('now')
                      WHERE id = ?1",
                     rusqlite::params![
@@ -83,13 +118,14 @@ impl Database {
                         contact.message_count,
                         contact.first_seen,
                         contact.last_seen,
+                        curator.history_derived(),
                     ],
                 )?;
             }
             None => {
                 tx.execute(
                     "INSERT INTO contacts (id, account_id, email, name, tags, notes, message_count, first_seen, last_seen, created_at, updated_at, history_derived)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         contact.id,
                         contact.account_id,
@@ -102,6 +138,7 @@ impl Database {
                         contact.last_seen,
                         contact.created_at,
                         contact.updated_at,
+                        curator.history_derived(),
                     ],
                 )?;
             }
@@ -125,7 +162,7 @@ impl Database {
             .query_row(
                 "SELECT id, account_id, email, name, tags, notes, message_count, first_seen, last_seen, created_at, updated_at
                  FROM contacts WHERE account_id = ?1 AND lower(email) = lower(?2)
-                 ORDER BY history_derived ASC, message_count DESC, history_count DESC
+                 ORDER BY history_derived = 1, history_derived, message_count DESC, history_count DESC
                  LIMIT 1",
                 rusqlite::params![account_id, email],
                 |row: &rusqlite::Row| {
@@ -220,14 +257,20 @@ impl Database {
     }
 
     /// Add a tag to a contact's tag list.
-    pub fn add_contact_tag(&self, account_id: &str, email: &str, tag: &str) -> Result<bool> {
+    pub fn add_contact_tag(
+        &self,
+        account_id: &str,
+        email: &str,
+        tag: &str,
+        curator: Curator,
+    ) -> Result<bool> {
         if let Some(contact) = self.get_contact(account_id, email)? {
             let mut tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
             if !tags.contains(&tag.to_string()) {
                 tags.push(tag.to_string());
                 self.write_contact_tags(&contact.id, &tags)?;
             }
-            self.take_contact_ownership(&contact.id)?;
+            self.take_contact_ownership(&contact.id, curator)?;
             Ok(true)
         } else {
             Ok(false)
@@ -235,7 +278,13 @@ impl Database {
     }
 
     /// Remove a tag from a contact's tag list.
-    pub fn remove_contact_tag(&self, account_id: &str, email: &str, tag: &str) -> Result<bool> {
+    pub fn remove_contact_tag(
+        &self,
+        account_id: &str,
+        email: &str,
+        tag: &str,
+        curator: Curator,
+    ) -> Result<bool> {
         if let Some(contact) = self.get_contact(account_id, email)? {
             let mut tags: Vec<String> = serde_json::from_str(&contact.tags).unwrap_or_default();
             let before = tags.len();
@@ -243,7 +292,7 @@ impl Database {
             if tags.len() < before {
                 self.write_contact_tags(&contact.id, &tags)?;
             }
-            self.take_contact_ownership(&contact.id)?;
+            self.take_contact_ownership(&contact.id, curator)?;
             Ok(true)
         } else {
             Ok(false)
@@ -266,12 +315,15 @@ impl Database {
     /// rebuild leaves it alone even with no cached source behind it. Curating a
     /// contact is choosing to keep it; tagging one the derivation invented is
     /// the case this guards. Writes only when the flag actually flips — the
-    /// ownership change is not an edit to the contact's content.
-    fn take_contact_ownership(&self, id: &str) -> Result<()> {
+    /// ownership change is not an edit to the contact's content. An agent's
+    /// tag takes a derived row as [`AGENT_CURATED`], which vouches for nothing;
+    /// a person's tag makes any row theirs (`0`), confirming an agent's row
+    /// too. Neither ever moves a row a person already curated.
+    fn take_contact_ownership(&self, id: &str, curator: Curator) -> Result<()> {
         self.conn().execute(
-            "UPDATE contacts SET history_derived = 0
-             WHERE id = ?1 AND history_derived = 1",
-            rusqlite::params![id],
+            "UPDATE contacts SET history_derived = ?2
+             WHERE id = ?1 AND history_derived <> 0 AND history_derived <> ?2",
+            rusqlite::params![id, curator.history_derived()],
         )?;
         Ok(())
     }
@@ -339,13 +391,13 @@ mod tests {
         let db = test_db();
         db.upsert_contact(&sample_contact()).unwrap();
 
-        db.add_contact_tag("acc-1", "alice@example.com", "vip")
+        db.add_contact_tag("acc-1", "alice@example.com", "vip", Curator::Human)
             .unwrap();
         let tags = db.get_contact_tags("acc-1", "alice@example.com").unwrap();
         assert!(tags.contains(&"vendor".to_string()));
         assert!(tags.contains(&"vip".to_string()));
 
-        db.remove_contact_tag("acc-1", "alice@example.com", "vendor")
+        db.remove_contact_tag("acc-1", "alice@example.com", "vendor", Curator::Human)
             .unwrap();
         let tags = db.get_contact_tags("acc-1", "alice@example.com").unwrap();
         assert!(!tags.contains(&"vendor".to_string()));
@@ -627,7 +679,7 @@ mod tests {
         derived_row(&db, "acc-1", "alice@example.com", 7);
 
         assert!(
-            db.add_contact_tag("acc-1", "Alice@Example.com", "vip")
+            db.add_contact_tag("acc-1", "Alice@Example.com", "vip", Curator::Human)
                 .unwrap()
         );
         assert_eq!(row_count(&db, "acc-1"), 1);
@@ -640,6 +692,57 @@ mod tests {
             derived_columns(&db, "acc-1", "alice@example.com");
         assert_eq!(history_derived, 0, "tagging claims the row");
         assert_eq!(history_count, 7, "tagging does not touch the signal");
+    }
+
+    /// An agent's writes keep the contact but never vouch for it, and never
+    /// undo a person's vouch. A person adding the address vouches for it.
+    #[test]
+    fn agent_writes_record_contacts_without_vouching_for_them() {
+        let db = test_db();
+        db.upsert_contact_by(&sample_contact(), Curator::Agent)
+            .unwrap();
+        assert_eq!(
+            derived_columns(&db, "acc-1", "alice@example.com").2,
+            AGENT_CURATED
+        );
+
+        derived_row(&db, "acc-1", "bob@example.com", 0);
+        db.add_contact_tag("acc-1", "bob@example.com", "vip", Curator::Agent)
+            .unwrap();
+        assert_eq!(
+            derived_columns(&db, "acc-1", "bob@example.com").2,
+            AGENT_CURATED,
+            "an agent tag takes the derived row without vouching"
+        );
+
+        // Still manual: a rebuild keeps both, the dropdown offers both.
+        db.invalidate_address_history("acc-1").unwrap();
+        db.reconcile_address_history("acc-1").unwrap();
+        assert_eq!(row_count(&db, "acc-1"), 2);
+        assert_eq!(db.suggest_addresses("acc-1", "", 10).unwrap().len(), 2);
+
+        // A person tagging an agent's row confirms it, as tagging a derived
+        // row does.
+        db.add_contact_tag("acc-1", "bob@example.com", "friend", Curator::Human)
+            .unwrap();
+        assert_eq!(derived_columns(&db, "acc-1", "bob@example.com").2, 0);
+        db.remove_contact_tag("acc-1", "bob@example.com", "friend", Curator::Agent)
+            .unwrap();
+        assert_eq!(
+            derived_columns(&db, "acc-1", "bob@example.com").2,
+            0,
+            "an agent untag never revokes a person's vouch"
+        );
+
+        db.upsert_contact(&sample_contact()).unwrap();
+        assert_eq!(derived_columns(&db, "acc-1", "alice@example.com").2, 0);
+        db.upsert_contact_by(&sample_contact(), Curator::Agent)
+            .unwrap();
+        assert_eq!(
+            derived_columns(&db, "acc-1", "alice@example.com").2,
+            0,
+            "an agent write never revokes a person's vouch"
+        );
     }
 
     #[test]

@@ -92,9 +92,11 @@
 //! ## Who owns a row
 //!
 //! `contacts.history_derived` says whether a row is this module's. A row a
-//! reconcile invented is marked derived; anything `envelope contacts` creates
+//! reconcile invented is marked derived (`1`); anything `envelope contacts` creates
 //! or edits — adding a contact, tagging one, annotating one, including taking
-//! over a row that started out derived — is manual from that point on.
+//! over a row that started out derived — is manual from that point on: `0` when
+//! a person curated it, [`crate::contacts::AGENT_CURATED`] when an agent or an
+//! inbox import did. Both manual values are the same to this module.
 //! Observing a manual address in a header does not change that: history writes
 //! the derived count and nothing else.
 //!
@@ -176,7 +178,7 @@ const SUGGESTION_SQL: &str = "SELECT email, name,
                 COALESCE(last_seen, '')
          FROM contacts
          WHERE account_id = ?1
-           AND (history_derived = 0
+           AND (history_derived <> 1
                 OR MAX(message_count, history_count, history_sent_count) > 0)
            AND (?2 = ''
                 OR lower(email) LIKE ?3 ESCAPE '\\'
@@ -2919,7 +2921,7 @@ mod tests {
             updated_at: "2026-05-12T12:00:00".into(),
         })
         .unwrap();
-        db.add_contact_tag("acct-a", "grace@example.test", "vip")
+        db.add_contact_tag("acct-a", "grace@example.test", "vip", crate::Curator::Human)
             .unwrap();
         assert!(!is_derived(&db, "acct-a", "ada@example.test"));
         assert!(!is_derived(&db, "acct-a", "grace@example.test"));

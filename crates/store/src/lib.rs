@@ -41,6 +41,7 @@ pub use agent_identity::{
     AgentIdentity, AgentPolicy, DEFAULT_SEND_MODE_CEILING, NewAgentToken, SendModeCeiling,
 };
 pub use build_info::{BuildInfo, VERSION};
+pub use contacts::{AGENT_CURATED, Curator};
 pub use credential_store::CredentialBackend;
 pub use db::Database;
 pub use drafts::{

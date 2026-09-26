@@ -20,7 +20,7 @@ use envelope_email_transport::attribution::{
 use envelope_email_transport::outbound::{
     GovernorConfig, GovernorOutcome, GovernorRequest, SendSurface, gate_with_attribution,
 };
-use envelope_email_transport::smtp::Attachment;
+use envelope_email_transport::smtp::{Attachment, envelope_recipients};
 
 /// Build the attributed Governor request for an actual-send attempt, resolving
 /// the bot's `declared` attribute keys against Envelope's host-derived facts.
@@ -33,6 +33,10 @@ use envelope_email_transport::smtp::Attachment;
 /// remain unknown (omitted); they are never fabricated. Bot-originated surfaces
 /// (CLI/MCP) require at least one factual declaration — host facts never
 /// substitute.
+///
+/// `in_reply_to` is the parent Message-ID the send will carry. It earns reply
+/// credit only through [`Database::is_verified_reply`]; otherwise the send
+/// derives as a fresh compose, and a declared `reply_to_thread` is refused.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn governor_request(
     db: &Database,
@@ -45,7 +49,7 @@ pub(crate) fn governor_request(
     surface: SendSurface,
     draft_id: Option<&str>,
     attachments: &[Attachment],
-    is_reply: bool,
+    in_reply_to: Option<&str>,
     text_body: Option<&str>,
     html_body: Option<&str>,
     declared: &[String],
@@ -60,30 +64,23 @@ pub(crate) fn governor_request(
     let calendar_invitation = attachments
         .iter()
         .any(|a| is_calendar_invitation_content_type(&a.content_type));
-    // Store errors and bounded/exhausted lookups deliberately produce no facts:
-    // absence is never treated as a first-contact claim without authoritative
-    // local evidence.
-    let relationship = db
-        .derive_outbound_relationship_facts(account_id, to, cc, bcc)
-        .unwrap_or_default();
+    // Judged on exactly the addresses SMTP will deliver to. Headers it can't
+    // parse, a failed lookup or an oversized set get no credit and keep
+    // `cold_email` (see `RelationshipFacts::UNVERIFIED`).
+    let recipients = envelope_recipients(to, cc, bcc).ok();
+    let relationship = db.observe_send_relationship(account_id, recipients.as_deref(), in_reply_to);
     let ctx = AttributedSendContext {
         account_domain,
         recipient_domains: summary.domains,
         recipient_count: summary.count,
-        is_reply,
+        is_reply: relationship.verified_reply,
         has_bcc: summary.has_bcc,
         attachment_count: attachments.len(),
         sensitive_attachment,
         calendar_invitation,
         known_contact: relationship.known_contact,
         frequent_contact: relationship.frequent_contact,
-        // A reply has a definitive structural relationship and cannot be a first
-        // contact, regardless of a bounded cache lookup.
-        cold_email: if is_reply {
-            Some(false)
-        } else {
-            relationship.cold_email
-        },
+        cold_email: relationship.cold_email,
         unknown_domain: relationship.unknown_domain,
         // Derive `short_body` from the FINAL bodies actually being sent via the
         // one canonical policy, so a bot's `short_body` declaration is
@@ -132,9 +129,8 @@ pub(crate) fn unsubscribe_request(
         .rsplit_once('@')
         .map(|(_, d)| d.trim().to_ascii_lowercase())
         .filter(|d| !d.is_empty());
-    let relationship = db
-        .derive_outbound_relationship_facts(account_id, mailto_addr, None, None)
-        .unwrap_or_default();
+    let recipients = envelope_recipients(mailto_addr, None, None).ok();
+    let relationship = db.observe_send_relationship(account_id, recipients.as_deref(), None);
     let ctx = AttributedSendContext {
         account_domain,
         recipient_domains: domain.into_iter().collect(),
@@ -301,7 +297,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("a short body"),
             None,
             &declared,
@@ -409,7 +405,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some(short),
             None,
             &["short_body".to_string()],
@@ -427,6 +423,7 @@ mod tests {
     #[test]
     fn direct_governor_request_derives_known_contact_from_shared_store_history() {
         let db = Database::open_memory().unwrap();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
         let thread = db
             .create_thread(
                 "prior correspondence",
@@ -464,7 +461,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("short body"),
             None,
             &["known_contact".to_string()],
@@ -509,7 +506,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             None,
             Some("<html><body><p>a short html-only note</p></body></html>"),
             &["short_body".to_string()],
@@ -539,7 +536,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some(&long),
             None,
             &["short_body".to_string()],
@@ -571,7 +568,7 @@ mod tests {
             SendSurface::Cli,
             None,
             &[],
-            false,
+            None,
             Some("a short body"),
             None,
             &["agent_drafted".to_string()],
@@ -595,5 +592,420 @@ mod tests {
         let outcome = gate_with_attribution(&nonexistent_required(), &req);
         assert!(!outcome.allowed);
         assert_eq!(outcome.block_code.as_deref(), Some("attributes_invalid"));
+    }
+
+    // ── Injection-safe relationship derivation ──────────────────────────
+    //
+    // Each test below reproduces a path by which content an attacker controls
+    // (an inbound message, or an agent acting on one) could lift a send to a
+    // stranger out of first-contact scoring.
+
+    fn relationship_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acc1', 'Me', 'me@example.test', 'example.test',
+                         'smtp.example.test', 587, 'imap.example.test', 993, 'encrypted')",
+                [],
+            )
+            .unwrap();
+        db.set_detected_folder("acc1", "sent", "Sent").unwrap();
+        db
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cache_message(
+        db: &Database,
+        thread_id: Option<&str>,
+        message_id: &str,
+        folder: &str,
+        from: &str,
+        to: &str,
+        cc: Option<&str>,
+        is_outbound: bool,
+    ) -> String {
+        let thread_id = match thread_id {
+            Some(id) => id.to_string(),
+            None => {
+                db.create_thread(
+                    "project",
+                    "2026-09-01T00:00:00Z",
+                    "2026-09-01T00:00:00Z",
+                    "acc1",
+                )
+                .unwrap()
+                .thread_id
+            }
+        };
+        let uid = db
+            .conn()
+            .query_row("SELECT COUNT(*) + 1 FROM thread_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32;
+        db.upsert_thread_message(
+            &thread_id,
+            uid,
+            Some(message_id),
+            None,
+            None,
+            folder,
+            from,
+            to,
+            cc,
+            None,
+            "2026-09-01T00:00:00Z",
+            "project",
+            is_outbound,
+            None,
+        )
+        .unwrap();
+        thread_id
+    }
+
+    /// A thread the account really took part in: its own message to
+    /// `known@example.net` in Sent, then that contact's answer in INBOX.
+    fn verified_thread(db: &Database) {
+        let thread = cache_message(
+            db,
+            None,
+            "<mine-1@example.test>",
+            "Sent",
+            "me@example.test",
+            "known@example.net",
+            None,
+            true,
+        );
+        cache_message(
+            db,
+            Some(&thread),
+            "<theirs-2@example.net>",
+            "INBOX",
+            "known@example.net",
+            "me@example.test",
+            None,
+            false,
+        );
+    }
+
+    /// Resolve attribution for a stored draft exactly as CLI `draft send` /
+    /// MCP `send_draft` do before transmission.
+    fn draft_resolution(
+        db: &Database,
+        to: &str,
+        cc: Option<&str>,
+        in_reply_to: Option<&str>,
+        declared: &[&str],
+    ) -> envelope_email_transport::attribution::AttributionResolution {
+        let draft = db
+            .create_draft(
+                "acc1",
+                to,
+                Some("Re: project"),
+                Some("a short body"),
+                None,
+                in_reply_to,
+                cc,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        crate::commands::drafts::precheck_draft(db, &draft.id, SendSurface::Cli, &declared, None)
+            .unwrap()
+            .resolution
+    }
+
+    fn has(attrs: &[String], key: &str) -> bool {
+        attrs.iter().any(|a| a == key)
+    }
+
+    #[test]
+    fn spoofed_self_from_in_inbox_does_not_corroborate_known_contact() {
+        let db = relationship_db();
+        cache_message(
+            &db,
+            None,
+            "<spoof@evil.test>",
+            "INBOX",
+            "me@example.test",
+            "attacker@evil.test",
+            None,
+            true,
+        );
+        let res = draft_resolution(&db, "attacker@evil.test", None, None, &["known_contact"]);
+        assert!(
+            res.rejected_attrs
+                .iter()
+                .any(|r| r.key == "known_contact" && r.code == "conflicts_with_host_observation"),
+            "a forged self-From in INBOX must not vouch: {res:?}"
+        );
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    #[test]
+    fn forged_in_reply_to_earns_no_reply_credit() {
+        let db = relationship_db();
+        let res = draft_resolution(
+            &db,
+            "fresh@stranger.test",
+            None,
+            Some("<forged@nowhere.test>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+        assert!(has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    #[test]
+    fn replying_to_a_strangers_thread_keeps_cold_email() {
+        let db = relationship_db();
+        cache_message(
+            &db,
+            None,
+            "<attack@evil.test>",
+            "INBOX",
+            "attacker@evil.test",
+            "me@example.test",
+            None,
+            false,
+        );
+        let res = draft_resolution(
+            &db,
+            "attacker@evil.test",
+            None,
+            Some("<attack@evil.test>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    #[test]
+    fn a_reply_that_adds_a_new_cc_keeps_first_contact_signals() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            Some("attacker@evil.test"),
+            Some("<theirs-2@example.net>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+        assert!(has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    #[test]
+    fn a_reply_in_a_verified_thread_keeps_reply_credit() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            None,
+            Some("<theirs-2@example.net>"),
+            &["reply_to_thread"],
+        );
+        assert!(res.is_attributed(), "{res:?}");
+        assert!(has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(has(&res.derived_attrs, "known_contact"), "{res:?}");
+        assert!(!has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    /// Pins a behaviour change that reaches release builds too: attribution
+    /// runs whether or not Governor does, so declaring `reply_to_thread` on a
+    /// reply the account has no verified history for refuses the send. Dropping
+    /// the key sends it as new mail.
+    #[test]
+    fn a_declared_reply_to_thread_without_verified_history_is_refused_in_every_build() {
+        let db = relationship_db();
+        cache_message(
+            &db,
+            None,
+            "<hello@newcomer.test>",
+            "INBOX",
+            "newcomer@newcomer.test",
+            "me@example.test",
+            None,
+            false,
+        );
+        let res = draft_resolution(
+            &db,
+            "newcomer@newcomer.test",
+            None,
+            Some("<hello@newcomer.test>"),
+            &["reply_to_thread", "informational"],
+        );
+        let rejected = res
+            .rejected_attrs
+            .iter()
+            .find(|r| r.key == "reply_to_thread")
+            .expect("reply_to_thread is refused");
+        assert_eq!(rejected.code, "conflicts_with_host_observation");
+        assert!(
+            rejected
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("resubmit without `reply_to_thread`")),
+            "{rejected:?}"
+        );
+        assert!(!res.is_attributed(), "{res:?}");
+
+        let res = draft_resolution(
+            &db,
+            "newcomer@newcomer.test",
+            None,
+            Some("<hello@newcomer.test>"),
+            &["informational"],
+        );
+        assert!(res.is_attributed(), "{res:?}");
+    }
+
+    /// Injection path: an address SMTP delivers to but a looser header parse
+    /// drops (a `<` inside a quoted display name, a Unicode, underscore or
+    /// single-label domain) used to vanish from the relationship check, so a
+    /// verified thread plus that Cc kept full reply credit.
+    #[test]
+    fn a_cc_only_smtp_can_parse_still_counts_as_a_recipient() {
+        for cc in [
+            "\"Name <extra>\" <attacker@evil.test>",
+            "attacker@exämple.com",
+            "attacker@ex_ample.com",
+            "attacker@localhost",
+        ] {
+            let db = relationship_db();
+            verified_thread(&db);
+            let res = draft_resolution(
+                &db,
+                "known@example.net",
+                Some(cc),
+                Some("<theirs-2@example.net>"),
+                &["informational"],
+            );
+            assert!(!has(&res.derived_attrs, "reply_to_thread"), "{cc}: {res:?}");
+            assert!(!has(&res.derived_attrs, "known_contact"), "{cc}: {res:?}");
+            assert!(has(&res.derived_attrs, "cold_email"), "{cc}: {res:?}");
+            assert!(has(&res.derived_attrs, "unknown_domain"), "{cc}: {res:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_recipient_only_smtp_can_parse_is_a_first_contact() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let res = draft_resolution(&db, "attacker@exämple.com", None, None, &["informational"]);
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+        assert!(has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    /// The first-contact signals used to give up once the account had more
+    /// than 256 cached Sent rows, so on a real mailbox a stranger scored with
+    /// no relationship facts at all.
+    #[test]
+    fn relationship_facts_hold_on_a_large_sent_history() {
+        let db = relationship_db();
+        verified_thread(&db);
+        for index in 0..300 {
+            cache_message(
+                &db,
+                None,
+                &format!("<bulk-{index}@example.test>"),
+                "Sent",
+                "me@example.test",
+                &format!("colleague-{index}@example.org"),
+                None,
+                true,
+            );
+        }
+
+        for (to, cc) in [
+            ("stranger@evil.test", None),
+            ("known@example.net", Some("stranger@evil.test")),
+        ] {
+            let res = draft_resolution(&db, to, cc, None, &["informational"]);
+            assert!(
+                has(&res.derived_attrs, "cold_email"),
+                "{to} {cc:?}: {res:?}"
+            );
+            assert!(
+                has(&res.derived_attrs, "unknown_domain"),
+                "{to} {cc:?}: {res:?}"
+            );
+        }
+
+        // The oldest verified correspondent is still found past the newest 256.
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            None,
+            Some("<theirs-2@example.net>"),
+            &["reply_to_thread", "known_contact"],
+        );
+        assert!(res.is_attributed(), "{res:?}");
+        assert!(!has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+    }
+
+    /// More recipients than the lookup checks used to leave every fact unknown,
+    /// dropping the first-contact signal. The set now counts as containing one.
+    #[test]
+    fn a_recipient_set_over_the_lookup_limit_carries_the_first_contact_signal() {
+        let db = relationship_db();
+        verified_thread(&db);
+        let many: Vec<String> = (0..envelope_email_store::RELATIONSHIP_FACT_RECIPIENT_LIMIT)
+            .map(|index| format!("stranger-{index}@evil.test"))
+            .collect();
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            Some(&many.join(", ")),
+            Some("<theirs-2@example.net>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(!has(&res.derived_attrs, "known_contact"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    /// A store error used to become "no facts": no credit, but no first-contact
+    /// signal either. It now withholds credit and keeps the signal.
+    #[test]
+    fn a_failed_relationship_lookup_keeps_the_first_contact_signal() {
+        let db = relationship_db();
+        verified_thread(&db);
+        db.conn()
+            .execute_batch("DROP TABLE detected_folders")
+            .unwrap();
+        let res = draft_resolution(
+            &db,
+            "known@example.net",
+            None,
+            Some("<theirs-2@example.net>"),
+            &["informational"],
+        );
+        assert!(!has(&res.derived_attrs, "reply_to_thread"), "{res:?}");
+        assert!(!has(&res.derived_attrs, "known_contact"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
+    }
+
+    /// With no Sent history cached yet, the account's own domain used to derive
+    /// `unknown_domain`, which then refused an honest `internal_domain`.
+    #[test]
+    fn the_account_domain_is_never_an_unknown_domain() {
+        let db = relationship_db();
+        let res = draft_resolution(
+            &db,
+            "colleague@example.test",
+            None,
+            None,
+            &["internal_domain"],
+        );
+        assert!(res.is_attributed(), "{res:?}");
+        assert!(!has(&res.derived_attrs, "unknown_domain"), "{res:?}");
+        assert!(has(&res.derived_attrs, "cold_email"), "{res:?}");
     }
 }
