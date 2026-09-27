@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.8] — 2026-09-28
+
 ### Fixed
 
 - **Reading mail over 25 MiB.** `envelope read`, `envelope attachment list` and
