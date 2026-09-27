@@ -118,7 +118,7 @@ pub(crate) fn verdict_for_read(
     creds: &envelope_email_store::AccountWithCredentials,
     folder: &str,
     uid: u32,
-    raw: &[u8],
+    raw: Option<&[u8]>,
 ) -> Result<Option<threat::ThreatVerdict>> {
     let config = load_config()?;
     persist::verdict_on_open(

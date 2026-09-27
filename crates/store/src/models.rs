@@ -427,6 +427,24 @@ pub struct Message {
     /// `envelope read` and dashboard message views.
     #[serde(skip)]
     pub provider_spam: Option<f64>,
+    /// Present only when the message was read part by part; see
+    /// [`PartialFetch`]. Absent from the JSON of every whole-message read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_fetch: Option<PartialFetch>,
+}
+
+/// Marks a message whose declared RFC822.SIZE is over the whole-message fetch
+/// cap. Envelope read its header, BODYSTRUCTURE, MIME part headers and text
+/// body parts one section at a time, and loaded no attachment bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialFetch {
+    /// Declared RFC822.SIZE of the whole message.
+    pub declared_size: u32,
+    /// The whole-message fetch cap it exceeded.
+    pub fetch_cap: u32,
+    /// Always `"encoded_octets"`: attachment `size` values are the encoded
+    /// part sizes BODYSTRUCTURE reports, not decoded byte counts.
+    pub attachment_sizes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -729,6 +747,7 @@ mod tests {
             flags: vec!["Seen".to_string()],
             attachments: vec![],
             provider_spam: None,
+            partial_fetch: None,
         };
 
         let serialized = serde_json::to_string(&msg).expect("serialize");
@@ -790,6 +809,7 @@ mod tests {
             flags: vec![],
             attachments: vec![],
             provider_spam: Some(7.5),
+            partial_fetch: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize message");
         assert!(

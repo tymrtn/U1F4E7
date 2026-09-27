@@ -28,7 +28,8 @@ pub async fn run(
 
     match message {
         Some((msg, raw)) => {
-            let verdict = super::threat::verdict_for_read(&db, &creds, folder, uid, &raw)?;
+            let verdict =
+                super::threat::verdict_for_read(&db, &creds, folder, uid, raw.as_deref())?;
             if json {
                 let mut value = ui::with_ui(
                     &msg,
@@ -64,6 +65,13 @@ pub async fn run(
                     println!("Date: {date}");
                 }
                 println!("Flags: {}", msg.flags.join(", "));
+                if let Some(partial) = &msg.partial_fetch {
+                    println!(
+                        "Partial: {} bytes, over the {}-byte fetch cap. Text parts and \
+                         attachment names only; attachment bytes were not loaded.",
+                        partial.declared_size, partial.fetch_cap
+                    );
+                }
                 println!();
 
                 if let Some(ref text) = msg.text_body {

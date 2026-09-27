@@ -543,8 +543,9 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
-    let verdict = crate::commands::threat::verdict_for_read(&db, &creds, folder, uid, &raw)
-        .map_err(|e| format!("{e:#}"))?;
+    let verdict =
+        crate::commands::threat::verdict_for_read(&db, &creds, folder, uid, raw.as_deref())
+            .map_err(|e| format!("{e:#}"))?;
 
     let mut value = ui::with_ui(
         &message,
@@ -3306,6 +3307,7 @@ mod tests {
             flags: Vec::new(),
             attachments: Vec::new(),
             provider_spam: None,
+            partial_fetch: None,
         }
     }
 

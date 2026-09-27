@@ -1159,7 +1159,7 @@ pub async fn read(
                         &creds.account.username,
                         &q.folder,
                         uid,
-                        &raw,
+                        raw.as_deref(),
                     ) {
                         Ok(view) => json!(view),
                         Err(e) => json!({"level": "unavailable", "error": format!("{e:#}")}),

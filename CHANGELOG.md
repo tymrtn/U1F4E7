@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reading mail over 25 MiB.** `envelope read`, `envelope attachment list` and
+  `envelope attachment download` refused any message whose RFC822.SIZE was over the 25 MiB
+  whole-message fetch cap, so a large message's text and attachment names could not be seen.
+  Such a message is now read part by part with `BODY.PEEK[<section>]`: header, BODYSTRUCTURE,
+  MIME part headers and the text/html body parts. `read --json` adds a `partial_fetch` object
+  (`declared_size`, `fetch_cap`, `attachment_sizes: "encoded_octets"`), attachment sizes are
+  the encoded part sizes, and no attachment bytes are loaded. `attachment download` fetches only
+  the named part and writes the same bytes a whole-message download would. The cap still
+  applies to each fetched part: a text or attachment part over 25 MiB is refused, never
+  truncated. Messages under the cap are fetched exactly as before. MCP `read` and the dashboard
+  reader get the same behavior; a part-by-part read runs no threat scan and shows only a
+  verdict already on file.
+
 ## [1.3.7] — 2026-09-26
 
 ### Upgrade note: release builds refuse two declarations

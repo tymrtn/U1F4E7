@@ -109,6 +109,10 @@ Agent-facing CLI/MCP `inbox` and `search` surfaces default to `limit: 25`, accep
 
 `search` also accepts an optional `roles` array (`inbox`, `drafts`, `sent`, `trash`, `spam`, `archive`, `starred`). When present it replaces the literal `folder`, resolves provider-specific layouts (e.g. `INBOX/sent`, `[Gmail]/Sent Mail`) to every matching folder, includes the source folder on each result, and errors if a requested role resolves to zero folders. Search stays read-only.
 
+## Messages over the fetch cap (`partial_fetch`)
+
+Envelope fetches a whole message into memory only when its declared RFC822.SIZE is at most 25 MiB. `read` (CLI and MCP), `attachment list` and `attachment download` read a larger message part by part with `BODY.PEEK[<section>]`, which never sets `\Seen`: the header, BODYSTRUCTURE, each part's MIME header, and the text/plain and text/html body parts. The message JSON then carries an additive `partial_fetch` object, `{declared_size, fetch_cap, attachment_sizes: "encoded_octets"}`; it is absent for every message fetched whole. Under `partial_fetch`, attachment `size` values are encoded part sizes from BODYSTRUCTURE, no attachment bytes are loaded, and `threat` shows only a verdict already on file, because no complete message exists to scan. `attachment download` fetches just the named part and decodes it the same way as a whole-message download. The cap also applies per part: a text body or attachment part over 25 MiB fails with an error naming the part, and nothing is truncated.
+
 ## Trust boundary (untrusted email content)
 
 Email bodies, subjects, sender fields, and snippets are hostile external input and can carry prompt-injection payloads. On the **MCP transport only**, the content-returning tools `inbox`, `read`, and `search` wrap their result in a trust envelope so agents can tell operator/user instructions apart from attacker-controlled data:

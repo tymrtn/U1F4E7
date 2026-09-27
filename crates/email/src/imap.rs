@@ -1,15 +1,17 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::Arc;
 
 use async_imap::Session;
 use chrono::{DateTime, FixedOffset};
 use envelope_email_store::models::{
-    AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary,
+    AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary, PartialFetch,
 };
 use futures_util::{StreamExt, TryStreamExt};
+use imap_proto::types::{BodyStructure, MessageSection, SectionPath};
 use mail_parser::MimeHeaders;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -793,26 +795,47 @@ pub async fn fetch_message(
 
 /// [`fetch_message`] plus the raw RFC822 bytes it parsed, for callers that
 /// also scan the message (the threat engine). Same `BODY.PEEK[]` fetch.
+///
+/// The raw bytes are `None` when the message is over the whole-message cap
+/// and was read part by part ([`Message::partial_fetch`]): there is no
+/// complete message to scan.
 pub async fn fetch_message_with_raw(
     client: &mut ImapClient,
     folder: &str,
     uid: u32,
-) -> Result<Option<(Message, Vec<u8>)>, ImapError> {
+) -> Result<Option<(Message, Option<Vec<u8>>)>, ImapError> {
+    fetch_message_with_raw_in(&mut client.session, folder, uid).await
+}
+
+/// [`fetch_message_with_raw`] over any transport, so the scripted-server
+/// tests can drive it without TLS.
+async fn fetch_message_with_raw_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<(Message, Option<Vec<u8>>)>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
     let uid_range = format!("{uid}");
-    let expected_sizes =
-        preflight_raw_message_sizes_selected_uid_set(client, folder, &uid_range).await?;
+    let expected_sizes = declared_raw_message_sizes_in(session, folder, &uid_range).await?;
+    if let Some(declared_size) = oversize_declared(&expected_sizes, uid) {
+        let message = fetch_message_parts_in(session, folder, uid, declared_size).await?;
+        return Ok(message.map(|message| (message, None)));
+    }
+    for size in &expected_sizes {
+        refuse_oversize_message(size)?;
+    }
     // Read through the tagged completion before using the reply; see
     // drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
+    let fetches: Vec<async_imap::types::Fetch> = session
         .uid_fetch(&uid_range, FETCH_MESSAGE_DESCRIPTOR)
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?
@@ -842,26 +865,40 @@ pub async fn fetch_message_with_raw(
     };
 
     let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-    let from_addr = mp_first_address(parsed.from());
-    let to_addrs = mp_all_addresses(parsed.to());
-    let cc_addrs = mp_all_addresses(parsed.cc());
+    let message = message_from_parsed(uid, flags, &parsed, body, &parsed);
+    Ok(Some((message, Some(body.to_vec()))))
+}
+
+/// Build a [`Message`] from its parsed header (`header`, whose raw bytes are
+/// `header_bytes`) and its parsed content (`content`: the text/html bodies
+/// and attachments). A whole-message read passes the same parse for both.
+fn message_from_parsed(
+    uid: u32,
+    flags: Vec<String>,
+    header: &mail_parser::Message<'_>,
+    header_bytes: &[u8],
+    content: &mail_parser::Message<'_>,
+) -> Message {
+    let from_addr = mp_first_address(header.from());
+    let to_addrs = mp_all_addresses(header.to());
+    let cc_addrs = mp_all_addresses(header.cc());
     // Keep the scalar fields as the first address for backward compatibility;
     // `to_addrs`/`cc_addrs` carry the complete recipient set.
     let to_addr = to_addrs.first().cloned().unwrap_or_default();
     let cc_addr = cc_addrs.first().cloned();
 
-    let subject = parsed.subject().unwrap_or_default().to_string();
-    let date = parsed.date().map(|d| d.to_rfc3339());
-    let text_body = parsed.body_text(0).map(|t| t.to_string());
-    let html_body = parsed.body_html(0).map(|h| h.to_string());
-    let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-    let references = crate::threading::references_header(&parsed);
-    let message_id = parsed.message_id().map(|s| s.to_string());
+    let subject = header.subject().unwrap_or_default().to_string();
+    let date = header.date().map(|d| d.to_rfc3339());
+    let text_body = content.body_text(0).map(|t| t.to_string());
+    let html_body = content.body_html(0).map(|h| h.to_string());
+    let in_reply_to = header.in_reply_to().as_text().map(|s| s.to_string());
+    let references = crate::threading::references_header(header);
+    let message_id = header.message_id().map(|s| s.to_string());
     // Read the provider spam-scoring headers straight from the raw RFC822 so a
     // single code path handles both this full fetch and the summary FETCH.
-    let provider_spam = provider_spam_from_header_bytes(body);
+    let provider_spam = provider_spam_from_header_bytes(header_bytes);
 
-    let attachments: Vec<AttachmentMeta> = parsed
+    let attachments: Vec<AttachmentMeta> = content
         .attachments()
         .map(|a| {
             let ct: Option<&mail_parser::ContentType> = a.content_type();
@@ -880,27 +917,499 @@ pub async fn fetch_message_with_raw(
         })
         .collect();
 
-    Ok(Some((
-        Message {
-            uid,
-            message_id,
-            from_addr,
-            to_addr,
-            cc_addr,
-            to_addrs,
-            cc_addrs,
-            subject,
-            date,
-            text_body,
-            html_body,
-            in_reply_to,
-            references,
-            flags,
-            attachments,
-            provider_spam,
-        },
-        body.to_vec(),
-    )))
+    Message {
+        uid,
+        message_id,
+        from_addr,
+        to_addr,
+        cc_addr,
+        to_addrs,
+        cc_addrs,
+        subject,
+        date,
+        text_body,
+        html_body,
+        in_reply_to,
+        references,
+        flags,
+        attachments,
+        provider_spam,
+        partial_fetch: None,
+    }
+}
+
+/// The declared size of `uid` when it is over the whole-message cap. Such a
+/// message is read part by part instead of being refused.
+fn oversize_declared(sizes: &[RawMessageSize], uid: u32) -> Option<u32> {
+    sizes
+        .iter()
+        .find(|s| s.uid == uid && s.size > ingress::MAX_RFC822_MESSAGE_BYTES)
+        .map(|s| s.size)
+}
+
+/// Range of every `BODY.PEEK[<section>]` a part-by-part read requests: one
+/// byte past the cap, so an item over the cap shows up as over it instead of
+/// being cut to fit.
+const PART_FETCH_RANGE: u32 = ingress::MAX_RFC822_MESSAGE_BYTES + 1;
+
+/// A message's MIME tree, owned from its BODYSTRUCTURE. A `message/rfc822`
+/// part stays one leaf: mail_parser treats it as one attachment.
+enum MimeNode {
+    Multipart {
+        subtype: String,
+        children: Vec<MimeNode>,
+    },
+    Leaf(MimeLeaf),
+}
+
+#[derive(PartialEq)]
+struct MimeLeaf {
+    /// IMAP section path: `[1, 2]` is `BODY[1.2]`.
+    section: Vec<u32>,
+    /// Encoded size BODYSTRUCTURE reports.
+    octets: u32,
+    /// `text/*`, the only parts mail_parser returns as a text or HTML body.
+    text: bool,
+}
+
+impl MimeNode {
+    fn from_bodystructure(bodystructure: &BodyStructure<'_>) -> MimeNode {
+        // A single-part message's one part is section 1.
+        let root = match bodystructure {
+            BodyStructure::Multipart { .. } => Vec::new(),
+            _ => vec![1],
+        };
+        Self::walk(bodystructure, root)
+    }
+
+    fn walk(node: &BodyStructure<'_>, section: Vec<u32>) -> MimeNode {
+        match node {
+            BodyStructure::Multipart { common, bodies, .. } => {
+                // The subtype is written back into a header: keep it a token.
+                let subtype: String = common
+                    .ty
+                    .subtype
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '+'))
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                MimeNode::Multipart {
+                    subtype: if subtype.is_empty() {
+                        "mixed".to_string()
+                    } else {
+                        subtype
+                    },
+                    children: bodies
+                        .iter()
+                        .zip(1..)
+                        .map(|(child, n)| {
+                            let mut child_section = section.clone();
+                            child_section.push(n);
+                            Self::walk(child, child_section)
+                        })
+                        .collect(),
+                }
+            }
+            BodyStructure::Text { other, .. } => MimeNode::Leaf(MimeLeaf {
+                section,
+                octets: other.octets,
+                text: true,
+            }),
+            BodyStructure::Basic { other, .. } | BodyStructure::Message { other, .. } => {
+                MimeNode::Leaf(MimeLeaf {
+                    section,
+                    octets: other.octets,
+                    text: false,
+                })
+            }
+        }
+    }
+
+    /// Parts in mail_parser's numbering: each node before its children, a
+    /// multipart container as `None`.
+    fn part_order<'a>(&'a self, out: &mut Vec<Option<&'a MimeLeaf>>) {
+        match self {
+            MimeNode::Multipart { children, .. } => {
+                out.push(None);
+                for child in children {
+                    child.part_order(out);
+                }
+            }
+            MimeNode::Leaf(leaf) => out.push(Some(leaf)),
+        }
+    }
+
+    /// Write the message back out with each leaf's real MIME header and only
+    /// the bodies in `bodies`; every other leaf is empty. The result stays
+    /// small however large the attachments are, and mail_parser picks the
+    /// text/html bodies and attachments from it exactly as it would from the
+    /// whole message.
+    fn write_skeleton(
+        &self,
+        headers: &HashMap<Vec<u32>, Vec<u8>>,
+        bodies: &HashMap<Vec<u32>, Vec<u8>>,
+        boundaries: &mut u32,
+        out: &mut Vec<u8>,
+    ) {
+        match self {
+            MimeNode::Multipart { subtype, children } => {
+                *boundaries += 1;
+                // "=_" cannot occur in base64 or quoted-printable content.
+                let boundary = format!("=_envelope_part_{boundaries}");
+                out.extend_from_slice(
+                    format!("Content-Type: multipart/{subtype}; boundary=\"{boundary}\"\r\n\r\n")
+                        .as_bytes(),
+                );
+                for child in children {
+                    out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                    child.write_skeleton(headers, bodies, boundaries, out);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            }
+            MimeNode::Leaf(leaf) => {
+                let header = headers
+                    .get(&leaf.section)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let end = header
+                    .iter()
+                    .rposition(|b| !matches!(b, b'\r' | b'\n'))
+                    .map_or(0, |i| i + 1);
+                if end > 0 {
+                    out.extend_from_slice(&header[..end]);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"\r\n");
+                if let Some(body) = bodies.get(&leaf.section) {
+                    out.extend_from_slice(body);
+                }
+            }
+        }
+    }
+}
+
+/// `1.2` for section path `[1, 2]`.
+fn section_spec(section: &[u32]) -> String {
+    section
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// What a part-by-part read learns before it fetches any body part.
+struct MessageStructure {
+    flags: Vec<String>,
+    header: Vec<u8>,
+    tree: MimeNode,
+    /// Every leaf's MIME header, by section path.
+    part_headers: HashMap<Vec<u32>, Vec<u8>>,
+}
+
+impl MessageStructure {
+    fn part_order(&self) -> Vec<Option<&MimeLeaf>> {
+        let mut order = Vec::new();
+        self.tree.part_order(&mut order);
+        order
+    }
+
+    fn skeleton(&self, bodies: &HashMap<Vec<u32>, Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.tree
+            .write_skeleton(&self.part_headers, bodies, &mut 0, &mut out);
+        out
+    }
+}
+
+/// Parse a skeleton, checking mail_parser numbered the same parts the
+/// BODYSTRUCTURE walk did so its part ids map to IMAP sections.
+fn parse_skeleton<'x>(
+    skeleton: &'x [u8],
+    order: &[Option<&MimeLeaf>],
+    uid: u32,
+) -> Result<mail_parser::Message<'x>, ImapError> {
+    let parsed = mail_parser::MessageParser::default()
+        .parse(skeleton)
+        .ok_or_else(|| {
+            ImapError::Protocol(format!(
+                "UID {uid}: the MIME structure rebuilt from BODYSTRUCTURE did not parse"
+            ))
+        })?;
+    if parsed.parts.len() != order.len() {
+        return Err(ImapError::Protocol(format!(
+            "UID {uid}: BODYSTRUCTURE lists {} MIME parts but the rebuilt structure parsed as {}",
+            order.len(),
+            parsed.parts.len()
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Refuse to fetch a part over the cap: it is neither loaded nor truncated.
+fn refuse_oversize_part(uid: u32, leaf: &MimeLeaf, what: &str) -> Result<(), ImapError> {
+    if leaf.octets > ingress::MAX_RFC822_MESSAGE_BYTES {
+        return Err(ImapError::Protocol(format!(
+            "UID {uid} is over the whole-message fetch cap, and its {what} (part {}) is {} bytes, \
+             over the {}-byte per-part cap too; refusing to load or truncate it",
+            section_spec(&leaf.section),
+            leaf.octets,
+            ingress::MAX_RFC822_MESSAGE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// UID FETCH one message and return its response, `None` if the UID is gone.
+async fn uid_fetch_one_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+    query: &str,
+) -> Result<Option<async_imap::types::Fetch>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    // Read through the tagged completion before using the reply; see
+    // drafts_special_use_folder_in.
+    let fetches: Vec<async_imap::types::Fetch> = session
+        .uid_fetch(uid.to_string(), query)
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    let Some(fetch) = fetches.into_iter().next() else {
+        return Ok(None);
+    };
+    match fetch.uid {
+        Some(fetched_uid) if fetched_uid == uid => Ok(Some(fetch)),
+        Some(fetched_uid) => Err(ImapError::Protocol(format!(
+            "UID FETCH {uid} returned unexpected UID {fetched_uid}"
+        ))),
+        None => Err(ImapError::Protocol(
+            "UID FETCH returned message without UID".into(),
+        )),
+    }
+}
+
+/// `BODY.PEEK[<spec>]` bounded to one byte past the cap. PEEK: never `\Seen`.
+fn peek_item(spec: &str) -> String {
+    format!("BODY.PEEK[{spec}]<0.{PART_FETCH_RANGE}>")
+}
+
+/// The bytes of one `BODY[<spec>]` item, refused when over the cap.
+fn section_bytes<'a>(
+    fetch: &'a async_imap::types::Fetch,
+    uid: u32,
+    spec: &str,
+    path: &SectionPath,
+) -> Result<&'a [u8], ImapError> {
+    let bytes = fetch
+        .section(path)
+        .ok_or_else(|| ImapError::Protocol(format!("UID FETCH {uid} returned no BODY[{spec}]")))?;
+    if bytes.len() > ingress::MAX_RFC822_MESSAGE_BYTES as usize {
+        return Err(ImapError::Protocol(format!(
+            "UID {uid} part {spec} is over the {}-byte per-part cap; refusing to load or truncate it",
+            ingress::MAX_RFC822_MESSAGE_BYTES
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Fetch `BODY.PEEK[<section>]` (or its `.MIME` header) for each section in
+/// one command, keyed by section path.
+async fn fetch_part_sections_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+    sections: &[&[u32]],
+    mime: bool,
+) -> Result<HashMap<Vec<u32>, Vec<u8>>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let spec = |section: &[u32]| {
+        let spec = section_spec(section);
+        if mime { format!("{spec}.MIME") } else { spec }
+    };
+    let items: Vec<String> = sections.iter().map(|s| peek_item(&spec(s))).collect();
+    let fetch = uid_fetch_one_in(session, folder, uid, &format!("(UID {})", items.join(" ")))
+        .await?
+        .ok_or_else(|| {
+            ImapError::Protocol(format!(
+                "UID {uid} left {folder} during a part-by-part read"
+            ))
+        })?;
+    sections
+        .iter()
+        .map(|section| {
+            let path = SectionPath::Part(section.to_vec(), mime.then_some(MessageSection::Mime));
+            let bytes = section_bytes(&fetch, uid, &spec(section), &path)?;
+            Ok((section.to_vec(), bytes.to_vec()))
+        })
+        .collect()
+}
+
+/// Flags, header, BODYSTRUCTURE and every leaf's MIME header of an over-cap
+/// message: everything but its bodies.
+async fn fetch_message_structure_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<MessageStructure>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let query = format!("(UID FLAGS BODYSTRUCTURE {})", peek_item("HEADER"));
+    let Some(fetch) = uid_fetch_one_in(session, folder, uid, &query).await? else {
+        return Ok(None);
+    };
+    let tree = MimeNode::from_bodystructure(fetch.bodystructure().ok_or_else(|| {
+        ImapError::Protocol(format!("UID FETCH {uid} returned no BODYSTRUCTURE"))
+    })?);
+    let header = section_bytes(
+        &fetch,
+        uid,
+        "HEADER",
+        &SectionPath::Full(MessageSection::Header),
+    )?
+    .to_vec();
+    let flags = fetch.flags().map(|f| format!("{f:?}")).collect();
+
+    let part_headers = match &tree {
+        // A single-part message's MIME header is the message header.
+        MimeNode::Leaf(leaf) => HashMap::from([(leaf.section.clone(), header.clone())]),
+        MimeNode::Multipart { .. } => {
+            let mut order = Vec::new();
+            tree.part_order(&mut order);
+            let sections: Vec<&[u32]> = order
+                .into_iter()
+                .flatten()
+                .map(|leaf| leaf.section.as_slice())
+                .collect();
+            fetch_part_sections_in(session, folder, uid, &sections, true).await?
+        }
+    };
+    Ok(Some(MessageStructure {
+        flags,
+        header,
+        tree,
+        part_headers,
+    }))
+}
+
+/// Read an over-cap message part by part: its header, BODYSTRUCTURE, MIME
+/// part headers and the text/html body parts, never an attachment's bytes.
+/// A text body part itself over the cap is refused rather than truncated.
+async fn fetch_message_parts_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+    declared_size: u32,
+) -> Result<Option<Message>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let Some(structure) = fetch_message_structure_in(session, folder, uid).await? else {
+        return Ok(None);
+    };
+    let order = structure.part_order();
+    let body_leaves: Vec<&MimeLeaf> = {
+        let skeleton = structure.skeleton(&HashMap::new());
+        let parsed = parse_skeleton(&skeleton, &order, uid)?;
+        let mut leaves: Vec<&MimeLeaf> = Vec::new();
+        for id in [parsed.text_body.first(), parsed.html_body.first()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(leaf) = order[*id].filter(|leaf| leaf.text)
+                && !leaves.contains(&leaf)
+            {
+                leaves.push(leaf);
+            }
+        }
+        leaves
+    };
+    for leaf in &body_leaves {
+        refuse_oversize_part(uid, leaf, "text body")?;
+    }
+    let bodies = if body_leaves.is_empty() {
+        HashMap::new()
+    } else {
+        let sections: Vec<&[u32]> = body_leaves.iter().map(|l| l.section.as_slice()).collect();
+        fetch_part_sections_in(session, folder, uid, &sections, false).await?
+    };
+
+    let skeleton = structure.skeleton(&bodies);
+    let content = parse_skeleton(&skeleton, &order, uid)?;
+    let Some(header) = mail_parser::MessageParser::default().parse(structure.header.as_slice())
+    else {
+        return Ok(None);
+    };
+    let mut message = message_from_parsed(
+        uid,
+        structure.flags.clone(),
+        &header,
+        &structure.header,
+        &content,
+    );
+    for (meta, id) in message.attachments.iter_mut().zip(&content.attachments) {
+        if let Some(leaf) = order[*id] {
+            meta.size = u64::from(leaf.octets);
+        }
+    }
+    message.partial_fetch = Some(PartialFetch {
+        declared_size,
+        fetch_cap: ingress::MAX_RFC822_MESSAGE_BYTES,
+        attachment_sizes: "encoded_octets".to_string(),
+    });
+    Ok(Some(message))
+}
+
+/// Download one attachment of an over-cap message: fetch only its part, and
+/// decode it through the same mail_parser path as a whole-message download.
+async fn download_attachment_part_in<T>(
+    session: &mut Session<T>,
+    uid: u32,
+    filename: &str,
+    folder: &str,
+) -> Result<DownloadedAttachment, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let Some(structure) = fetch_message_structure_in(session, folder, uid).await? else {
+        return Err(ImapError::NotFound(uid));
+    };
+    let order = structure.part_order();
+    let found = {
+        let skeleton = structure.skeleton(&HashMap::new());
+        let parsed = parse_skeleton(&skeleton, &order, uid)?;
+        parsed
+            .attachments
+            .iter()
+            .copied()
+            .find(|&id| parsed.parts[id].attachment_name().unwrap_or("unnamed") == filename)
+    };
+    let Some((id, leaf)) = found.and_then(|id| order[id].map(|leaf| (id, leaf))) else {
+        return Err(ImapError::Protocol(format!(
+            "attachment '{filename}' not found in UID {uid}"
+        )));
+    };
+    refuse_oversize_part(uid, leaf, &format!("attachment {filename:?}"))?;
+    let bodies =
+        fetch_part_sections_in(session, folder, uid, &[leaf.section.as_slice()], false).await?;
+
+    let skeleton = structure.skeleton(&bodies);
+    let parsed = parse_skeleton(&skeleton, &order, uid)?;
+    let message_id = mail_parser::MessageParser::default()
+        .parse(structure.header.as_slice())
+        .and_then(|header| {
+            header
+                .message_id()
+                .map(|m| envelope_email_store::canonical_message_id(m).to_string())
+        });
+    downloaded_attachment(uid, &parsed.parts[id], message_id)
 }
 
 /// Raw RFC822 bytes of one message, opened with `EXAMINE` and fetched with
@@ -1077,10 +1586,36 @@ pub async fn preflight_raw_message_sizes_selected_uid_set(
 ) -> Result<Vec<RawMessageSize>, ImapError> {
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
+    let sizes = declared_raw_message_sizes_in(&mut client.session, folder, uid_set).await?;
+    for size in &sizes {
+        refuse_oversize_message(size)?;
+    }
+    Ok(sizes)
+}
+
+/// Refuse a whole-message fetch whose declared RFC822.SIZE is over the cap.
+fn refuse_oversize_message(size: &RawMessageSize) -> Result<(), ImapError> {
+    ingress::validate_rfc822_size(size.size).map_err(|reason| {
+        ImapError::Protocol(format!(
+            "attachment/message fetch refused for UID {}: {reason}",
+            size.uid
+        ))
+    })
+}
+
+/// Declared RFC822.SIZE of each message in `uid_set`, before any cap is
+/// applied. A server that omits the size is refused.
+async fn declared_raw_message_sizes_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<RawMessageSize>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     // Read the whole reply before validating it, so a refusal below does not
     // leave the rest of it on the connection; see drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
+    let fetches: Vec<async_imap::types::Fetch> = session
         .uid_fetch(uid_set, "(UID RFC822.SIZE)")
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH size {folder} {uid_set}: {e}")))?
@@ -1095,11 +1630,6 @@ pub async fn preflight_raw_message_sizes_selected_uid_set(
         let size = fetch.size.ok_or_else(|| {
             ImapError::Protocol(format!(
                 "attachment/message fetch refused for UID {uid}: server omitted RFC822.SIZE"
-            ))
-        })?;
-        ingress::validate_rfc822_size(size).map_err(|reason| {
-            ImapError::Protocol(format!(
-                "attachment/message fetch refused for UID {uid}: {reason}"
             ))
         })?;
         sizes.push(RawMessageSize { uid, size });
@@ -2089,21 +2619,38 @@ pub async fn download_attachment(
     filename: &str,
     folder: &str,
 ) -> Result<DownloadedAttachment, ImapError> {
+    download_attachment_in(&mut client.session, uid, filename, folder).await
+}
+
+/// [`download_attachment`] over any transport, so the scripted-server tests
+/// can drive it without TLS.
+async fn download_attachment_in<T>(
+    session: &mut Session<T>,
+    uid: u32,
+    filename: &str,
+    folder: &str,
+) -> Result<DownloadedAttachment, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
     let uid_range = format!("{uid}");
-    let expected_sizes =
-        preflight_raw_message_sizes_selected_uid_set(client, folder, &uid_range).await?;
+    let expected_sizes = declared_raw_message_sizes_in(session, folder, &uid_range).await?;
+    if oversize_declared(&expected_sizes, uid).is_some() {
+        return download_attachment_part_in(session, uid, filename, folder).await;
+    }
+    for size in &expected_sizes {
+        refuse_oversize_message(size)?;
+    }
     // Read through the tagged completion before using the reply; see
     // drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
+    let fetches: Vec<async_imap::types::Fetch> = session
         .uid_fetch(&uid_range, "(UID BODY.PEEK[])")
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?
@@ -2131,35 +2678,46 @@ pub async fn download_attachment(
         .parse(body)
         .ok_or_else(|| ImapError::Protocol(format!("failed to parse message UID {uid}")))?;
 
+    let message_id = parsed
+        .message_id()
+        .map(|m| envelope_email_store::canonical_message_id(m).to_string());
     for attachment in parsed.attachments() {
-        let att_name = attachment
-            .attachment_name()
-            .unwrap_or("unnamed")
-            .to_string();
-        if att_name == filename {
-            ingress::validate_attachment_size(attachment.len()).map_err(|reason| {
-                ImapError::Protocol(format!(
-                    "attachment fetch refused for UID {uid}: decoded attachment {:?}: {reason}",
-                    att_name
-                ))
-            })?;
-            let content_type = attachment
-                .content_type()
-                .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            return Ok(DownloadedAttachment {
-                filename: att_name,
-                content_type: ingress::normalize_content_type(&content_type),
-                bytes: attachment.contents().to_vec(),
-                message_id: parsed
-                    .message_id()
-                    .map(|m| envelope_email_store::canonical_message_id(m).to_string()),
-            });
+        if attachment.attachment_name().unwrap_or("unnamed") == filename {
+            return downloaded_attachment(uid, attachment, message_id);
         }
     }
     Err(ImapError::Protocol(format!(
         "attachment '{filename}' not found in UID {uid}"
     )))
+}
+
+/// Copy one parsed attachment's decoded bytes out, refusing an oversize one.
+/// Both download paths end here, so the bytes written are the same.
+fn downloaded_attachment(
+    uid: u32,
+    attachment: &mail_parser::MessagePart<'_>,
+    message_id: Option<String>,
+) -> Result<DownloadedAttachment, ImapError> {
+    let att_name = attachment
+        .attachment_name()
+        .unwrap_or("unnamed")
+        .to_string();
+    ingress::validate_attachment_size(attachment.len()).map_err(|reason| {
+        ImapError::Protocol(format!(
+            "attachment fetch refused for UID {uid}: decoded attachment {:?}: {reason}",
+            att_name
+        ))
+    })?;
+    let content_type = attachment
+        .content_type()
+        .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(DownloadedAttachment {
+        filename: att_name,
+        content_type: ingress::normalize_content_type(&content_type),
+        bytes: attachment.contents().to_vec(),
+        message_id,
+    })
 }
 
 /// Extract first email address from a mail-parser Address.
@@ -2838,12 +3396,13 @@ Subject: hi\r\n\r\nbody\r\n";
     }
 
     /// Log in over an in-memory duplex against a server that plays `turns` in
-    /// order. The server task fails if the client sends anything else.
+    /// order. The server task fails if the client sends anything else, and
+    /// returns the command lines it received after LOGIN.
     async fn scripted_session(
         turns: Vec<Turn>,
     ) -> (
         Session<tokio::io::DuplexStream>,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<Vec<String>>,
     ) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -2852,6 +3411,7 @@ Subject: hi\r\n\r\nbody\r\n";
             let (read_half, mut write_half) = tokio::io::split(server_io);
             let mut reader = BufReader::new(read_half);
             write_half.write_all(b"* OK scripted\r\n").await.unwrap();
+            let mut received = Vec::new();
             let login = Turn {
                 verb: "LOGIN",
                 reply: vec!["{tag} OK LOGIN completed".into()],
@@ -2871,6 +3431,9 @@ Subject: hi\r\n\r\nbody\r\n";
                     verb
                 };
                 assert_eq!(verb, turn.verb, "unexpected client command: {line:?}");
+                if verb != "LOGIN" {
+                    received.push(line.trim_end().to_string());
+                }
                 let mut reply = turn.reply.iter().map(|l| l.replace("{tag}", &tag));
                 let literal_len = line
                     .trim_end()
@@ -2889,6 +3452,7 @@ Subject: hi\r\n\r\nbody\r\n";
                 let rest: String = reply.map(|l| format!("{l}\r\n")).collect();
                 write_half.write_all(rest.as_bytes()).await.unwrap();
             }
+            received
         });
 
         let mut client = async_imap::Client::new(client_io);
@@ -2987,5 +3551,371 @@ Subject: hi\r\n\r\nbody\r\n";
             .await
             .expect("APPEND right after a single-UID FETCH");
         server.await.unwrap();
+    }
+
+    // ── Over-cap messages: read and download part by part ────────────────
+
+    const BIG_UID: u32 = 2379;
+    /// UID 2379's real declared size: 1 MiB over the whole-message cap.
+    const BIG_DECLARED_SIZE: u32 = 27_289_641;
+    const BIG_HEADER: &str = "From: Counsel <counsel@example.com>\r\n\
+        To: Tyler <tyler@example.com>\r\n\
+        Cc: Paralegal <para@example.com>\r\n\
+        Subject: Filing packet\r\n\
+        Date: Fri, 25 Sep 2026 10:00:00 -0400\r\n\
+        Message-ID: <big-filing@example.com>\r\n\
+        References: <earlier@example.com>\r\n\
+        X-Spam-Score: 1.5\r\n\
+        MIME-Version: 1.0\r\n\
+        Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n";
+    const TEXT_MIME: &str = "Content-Type: text/plain; charset=utf-8\r\n\
+        Content-Transfer-Encoding: quoted-printable\r\n\r\n";
+    const TEXT_BODY: &str = "Hello caf=C3=A9, the exhibit is attached.=\r\n Second line.";
+    const HTML_MIME: &str =
+        "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n";
+    const HTML_BODY: &str = "<p>Hello café, the exhibit is attached.</p>";
+    const PDF_MIME: &str = "Content-Type: application/pdf; name=\"exhibit.pdf\"\r\n\
+        Content-Disposition: attachment; filename=\"exhibit.pdf\"\r\n\
+        Content-Transfer-Encoding: base64\r\n\r\n";
+    const PDF_BODY: &str = "JVBERi0xLjQKJcOkw7zDtsOfCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nPj4KZW5k\r\n\
+        b2JqCiUlRU9GCg==";
+    const CSV_MIME: &str = "Content-Type: text/csv\r\n\
+        Content-Disposition: attachment; filename=\"ledger.csv\"\r\n\r\n";
+    const CSV_BODY: &str = "item,amount\r\ncafé,12.50";
+    const EML_MIME: &str = "Content-Type: message/rfc822\r\n\
+        Content-Disposition: attachment; filename=\"forwarded.eml\"\r\n\r\n";
+    const EML_BODY: &str = "From: Old <old@example.com>\r\n\
+        To: Tyler <tyler@example.com>\r\n\
+        Subject: Earlier note\r\n\
+        Message-ID: <earlier@example.com>\r\n\r\n\
+        Earlier body.";
+
+    /// The fixture as one RFC822 message, built from the same section strings
+    /// the part-by-part server returns.
+    fn big_rfc822() -> String {
+        format!(
+            "{BIG_HEADER}--outer\r\n\
+             Content-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n\
+             --alt\r\n{TEXT_MIME}{TEXT_BODY}\r\n\
+             --alt\r\n{HTML_MIME}{HTML_BODY}\r\n\
+             --alt--\r\n\r\n\
+             --outer\r\n{PDF_MIME}{PDF_BODY}\r\n\
+             --outer\r\n{CSV_MIME}{CSV_BODY}\r\n\
+             --outer\r\n{EML_MIME}{EML_BODY}\r\n\
+             --outer--\r\n"
+        )
+    }
+
+    /// BODYSTRUCTURE for [`big_rfc822`], with `text_octets` as the declared
+    /// size of the text/plain part.
+    fn big_bodystructure(text_octets: usize) -> String {
+        let envelope = "(\"Mon, 1 Sep 2026 09:00:00 +0000\" \"Earlier note\" \
+            ((\"Old\" NIL \"old\" \"example.com\")) ((\"Old\" NIL \"old\" \"example.com\")) \
+            ((\"Old\" NIL \"old\" \"example.com\")) ((\"Tyler\" NIL \"tyler\" \"example.com\")) \
+            NIL NIL NIL \"<earlier@example.com>\")";
+        format!(
+            "(((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" {text_octets} 2 NIL NIL NIL NIL)\
+             (\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"8bit\" {} 1 NIL NIL NIL NIL) \
+             \"alternative\" (\"boundary\" \"alt\") NIL NIL NIL)\
+             (\"application\" \"pdf\" (\"name\" \"exhibit.pdf\") NIL NIL \"base64\" {} NIL \
+             (\"attachment\" (\"filename\" \"exhibit.pdf\")) NIL NIL)\
+             (\"text\" \"csv\" NIL NIL NIL \"8bit\" {} 2 NIL \
+             (\"attachment\" (\"filename\" \"ledger.csv\")) NIL NIL)\
+             (\"message\" \"rfc822\" NIL NIL NIL \"7bit\" {} {envelope} \
+             (\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 13 1 NIL NIL NIL NIL) 6 NIL \
+             (\"attachment\" (\"filename\" \"forwarded.eml\")) NIL NIL) \
+             \"mixed\" (\"boundary\" \"outer\") NIL NIL NIL)",
+            HTML_BODY.len(),
+            PDF_BODY.len(),
+            CSV_BODY.len(),
+            EML_BODY.len(),
+        )
+    }
+
+    fn literal(section: &str, data: &str) -> String {
+        format!("BODY[{section}]<0> {{{}}}\r\n{data}", data.len())
+    }
+
+    fn select_turn() -> Turn {
+        Turn {
+            verb: "SELECT",
+            reply: vec![
+                "* 3000 EXISTS".into(),
+                "* OK [UIDVALIDITY 1] UIDs valid".into(),
+                "{tag} OK [READ-WRITE] Select completed".into(),
+            ],
+        }
+    }
+
+    fn fetch_turn(line: String) -> Turn {
+        Turn {
+            verb: "UID FETCH",
+            reply: vec![line, "{tag} OK Fetch completed".into()],
+        }
+    }
+
+    fn size_turn(size: usize) -> Turn {
+        fetch_turn(format!("* 1 FETCH (UID {BIG_UID} RFC822.SIZE {size})"))
+    }
+
+    /// SELECT, the size preflight, then the structure and MIME-header fetches
+    /// every over-cap read starts with.
+    fn oversize_structure_turns(text_octets: usize) -> Vec<Turn> {
+        vec![
+            select_turn(),
+            size_turn(BIG_DECLARED_SIZE as usize),
+            fetch_turn(format!(
+                "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODYSTRUCTURE {} {})",
+                big_bodystructure(text_octets),
+                literal("HEADER", BIG_HEADER)
+            )),
+            fetch_turn(format!(
+                "* 1 FETCH (UID {BIG_UID} {} {} {} {} {})",
+                literal("1.1.MIME", TEXT_MIME),
+                literal("1.2.MIME", HTML_MIME),
+                literal("2.MIME", PDF_MIME),
+                literal("3.MIME", CSV_MIME),
+                literal("4.MIME", EML_MIME),
+            )),
+        ]
+    }
+
+    /// Every FETCH after the size preflight names `BODY.PEEK[<section>]`
+    /// items only: never the whole message, never a `\Seen`-setting `BODY[`.
+    fn assert_sections_only(commands: &[String]) {
+        for command in commands.iter().filter(|c| c.contains("FETCH")).skip(1) {
+            assert!(!command.contains("BODY[]"), "{command}");
+            assert!(!command.contains("BODY.PEEK[]"), "{command}");
+            assert!(!command.contains(" BODY["), "{command}");
+        }
+    }
+
+    async fn read_whole(rfc822: &str) -> (Message, Option<Vec<u8>>, Vec<String>) {
+        let (mut session, server) = scripted_session(vec![
+            select_turn(),
+            size_turn(rfc822.len()),
+            fetch_turn(format!(
+                "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODY[] {{{}}}\r\n{rfc822})",
+                rfc822.len()
+            )),
+        ])
+        .await;
+        let (message, raw) = fetch_message_with_raw_in(&mut session, "INBOX", BIG_UID)
+            .await
+            .expect("under-cap read")
+            .expect("message");
+        (message, raw, server.await.unwrap())
+    }
+
+    async fn download_whole(rfc822: &str, filename: &str) -> DownloadedAttachment {
+        let (mut session, server) = scripted_session(vec![
+            select_turn(),
+            size_turn(rfc822.len()),
+            fetch_turn(format!(
+                "* 1 FETCH (UID {BIG_UID} BODY[] {{{}}}\r\n{rfc822})",
+                rfc822.len()
+            )),
+        ])
+        .await;
+        let downloaded = download_attachment_in(&mut session, BIG_UID, filename, "INBOX")
+            .await
+            .expect("under-cap download");
+        server.await.unwrap();
+        downloaded
+    }
+
+    /// Regression: `envelope read` on UID 2379 (RFC822.SIZE 27289641) failed
+    /// with "declared RFC822.SIZE 27289641 exceeds 26214400 bytes", so the
+    /// text body and attachment names of a large message could not be seen.
+    #[tokio::test]
+    async fn oversize_read_loads_text_parts_and_attachment_metadata_only() {
+        let mut turns = oversize_structure_turns(TEXT_BODY.len());
+        turns.push(fetch_turn(format!(
+            "* 1 FETCH (UID {BIG_UID} {} {})",
+            literal("1.1", TEXT_BODY),
+            literal("1.2", HTML_BODY)
+        )));
+        let (mut session, server) = scripted_session(turns).await;
+
+        let (partial, raw) = fetch_message_with_raw_in(&mut session, "INBOX", BIG_UID)
+            .await
+            .expect("over-cap read must load the message part by part")
+            .expect("message");
+        let commands = server.await.unwrap();
+
+        assert!(raw.is_none(), "no complete RFC822 exists to scan");
+        let json = serde_json::to_value(&partial).unwrap();
+        assert_eq!(json["partial_fetch"]["declared_size"], BIG_DECLARED_SIZE);
+        assert_eq!(
+            partial.partial_fetch,
+            Some(envelope_email_store::PartialFetch {
+                declared_size: BIG_DECLARED_SIZE,
+                fetch_cap: ingress::MAX_RFC822_MESSAGE_BYTES,
+                attachment_sizes: "encoded_octets".into(),
+            })
+        );
+        assert_sections_only(&commands);
+        assert_eq!(
+            commands.last().map(String::as_str),
+            Some(
+                "A0006 UID FETCH 2379 (UID BODY.PEEK[1.1]<0.26214401> BODY.PEEK[1.2]<0.26214401>)"
+            ),
+            "only the text/plain and text/html parts are fetched: {commands:#?}"
+        );
+
+        // Everything but attachment sizes matches a whole-message read.
+        let (whole, whole_raw, whole_commands) = read_whole(&big_rfc822()).await;
+        assert!(whole_raw.is_some());
+        assert!(whole.partial_fetch.is_none());
+        assert!(
+            serde_json::to_value(&whole)
+                .unwrap()
+                .get("partial_fetch")
+                .is_none(),
+            "whole-message JSON keeps its shape"
+        );
+        assert_eq!(
+            whole_commands.last().map(String::as_str),
+            Some("A0004 UID FETCH 2379 (UID FLAGS BODY.PEEK[])"),
+            "an under-cap read is unchanged"
+        );
+        assert_eq!(partial.text_body, whole.text_body);
+        assert!(partial.text_body.as_deref().unwrap().contains("café"));
+        assert_eq!(partial.html_body, whole.html_body);
+        assert_eq!(partial.from_addr, whole.from_addr);
+        assert_eq!(partial.to_addrs, whole.to_addrs);
+        assert_eq!(partial.cc_addrs, whole.cc_addrs);
+        assert_eq!(partial.subject, whole.subject);
+        assert_eq!(partial.date, whole.date);
+        assert_eq!(partial.message_id, whole.message_id);
+        assert_eq!(partial.references, whole.references);
+        assert_eq!(partial.flags, whole.flags);
+        assert_eq!(partial.provider_spam, whole.provider_spam);
+        let names = |m: &Message| {
+            m.attachments
+                .iter()
+                .map(|a| (a.filename.clone(), a.content_type.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&partial), names(&whole));
+        assert_eq!(
+            names(&partial),
+            [
+                ("exhibit.pdf".to_string(), "application/pdf".to_string()),
+                ("ledger.csv".to_string(), "text/csv".to_string()),
+                ("forwarded.eml".to_string(), "message/rfc822".to_string()),
+            ]
+        );
+        let sizes: Vec<u64> = partial.attachments.iter().map(|a| a.size).collect();
+        assert_eq!(
+            sizes,
+            [PDF_BODY.len(), CSV_BODY.len(), EML_BODY.len()].map(|n| n as u64),
+            "sizes are BODYSTRUCTURE octets"
+        );
+    }
+
+    /// A text body part that is itself over the cap is refused, never truncated.
+    #[tokio::test]
+    async fn oversize_read_refuses_a_text_part_over_the_cap() {
+        let too_big = ingress::MAX_RFC822_MESSAGE_BYTES as usize + 1;
+        let (mut session, server) = scripted_session(oversize_structure_turns(too_big)).await;
+
+        let err = fetch_message_with_raw_in(&mut session, "INBOX", BIG_UID)
+            .await
+            .expect_err("a text part over the cap must fail loud");
+        drop(session);
+        let commands = server.await.unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("UID 2379"), "{msg}");
+        assert!(msg.contains("1.1"), "{msg}");
+        assert!(msg.contains(&too_big.to_string()), "{msg}");
+        assert!(msg.contains("per-part cap"), "{msg}");
+        assert!(
+            !commands.iter().any(|c| c.contains("BODY.PEEK[1.1]<")),
+            "the oversize part is never fetched: {commands:#?}"
+        );
+    }
+
+    /// Downloading from an over-cap message fetches only the named part and
+    /// writes the same bytes a whole-message download would.
+    #[tokio::test]
+    async fn oversize_download_fetches_one_part_with_identical_bytes() {
+        for (filename, section, body) in [
+            ("exhibit.pdf", "2", PDF_BODY),
+            ("ledger.csv", "3", CSV_BODY),
+            ("forwarded.eml", "4", EML_BODY),
+        ] {
+            let mut turns = oversize_structure_turns(TEXT_BODY.len());
+            turns.push(fetch_turn(format!(
+                "* 1 FETCH (UID {BIG_UID} {})",
+                literal(section, body)
+            )));
+            let (mut session, server) = scripted_session(turns).await;
+            let partial = download_attachment_in(&mut session, BIG_UID, filename, "INBOX")
+                .await
+                .unwrap_or_else(|e| panic!("over-cap download of {filename}: {e}"));
+            let commands = server.await.unwrap();
+
+            assert_sections_only(&commands);
+            assert_eq!(
+                commands.last().unwrap(),
+                &format!("A0006 UID FETCH 2379 (UID BODY.PEEK[{section}]<0.26214401>)"),
+                "{filename}"
+            );
+            let whole = download_whole(&big_rfc822(), filename).await;
+            assert!(!whole.bytes.is_empty(), "{filename}");
+            assert_eq!(partial.bytes, whole.bytes, "{filename}");
+            assert_eq!(partial.filename, whole.filename, "{filename}");
+            assert_eq!(partial.content_type, whole.content_type, "{filename}");
+            assert_eq!(partial.message_id, whole.message_id, "{filename}");
+        }
+    }
+
+    /// The per-part cap applies to a download too: an attachment part over
+    /// the cap is refused before any of its bytes are fetched.
+    #[tokio::test]
+    async fn oversize_download_refuses_a_part_over_the_cap() {
+        let big_pdf = ingress::MAX_RFC822_MESSAGE_BYTES as usize + 1;
+        let mut turns = oversize_structure_turns(TEXT_BODY.len());
+        turns[2] = fetch_turn(format!(
+            "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODYSTRUCTURE {} {})",
+            big_bodystructure(TEXT_BODY.len()).replacen(
+                &format!("\"base64\" {} NIL", PDF_BODY.len()),
+                &format!("\"base64\" {big_pdf} NIL"),
+                1
+            ),
+            literal("HEADER", BIG_HEADER)
+        ));
+        let (mut session, server) = scripted_session(turns).await;
+
+        let err = download_attachment_in(&mut session, BIG_UID, "exhibit.pdf", "INBOX")
+            .await
+            .expect_err("an attachment part over the cap must be refused");
+        drop(session);
+        let commands = server.await.unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("exhibit.pdf"), "{msg}");
+        assert!(msg.contains("per-part cap"), "{msg}");
+        assert!(
+            !commands.iter().any(|c| c.contains("BODY.PEEK[2]<")),
+            "{commands:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_download_reports_a_missing_attachment() {
+        let (mut session, server) =
+            scripted_session(oversize_structure_turns(TEXT_BODY.len())).await;
+        let err = download_attachment_in(&mut session, BIG_UID, "nope.pdf", "INBOX")
+            .await
+            .expect_err("unknown filename");
+        drop(session);
+        server.await.unwrap();
+        assert!(
+            err.to_string()
+                .contains("attachment 'nope.pdf' not found in UID 2379")
+        );
     }
 }
