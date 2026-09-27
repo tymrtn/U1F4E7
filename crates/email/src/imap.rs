@@ -11,7 +11,7 @@ use envelope_email_store::models::{
     AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary, PartialFetch,
 };
 use futures_util::{StreamExt, TryStreamExt};
-use imap_proto::types::{BodyStructure, MessageSection, SectionPath};
+use imap_proto::types::{BodyStructure, ContentEncoding, MessageSection, SectionPath};
 use mail_parser::MimeHeaders;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -947,11 +947,6 @@ fn oversize_declared(sizes: &[RawMessageSize], uid: u32) -> Option<u32> {
         .map(|s| s.size)
 }
 
-/// Range of every `BODY.PEEK[<section>]` a part-by-part read requests: one
-/// byte past the cap, so an item over the cap shows up as over it instead of
-/// being cut to fit.
-const PART_FETCH_RANGE: u32 = ingress::MAX_RFC822_MESSAGE_BYTES + 1;
-
 /// A message's MIME tree, owned from its BODYSTRUCTURE. A `message/rfc822`
 /// part stays one leaf: mail_parser treats it as one attachment.
 enum MimeNode {
@@ -970,6 +965,21 @@ struct MimeLeaf {
     octets: u32,
     /// `text/*`, the only parts mail_parser returns as a text or HTML body.
     text: bool,
+    /// Base64 transfer encoding.
+    base64: bool,
+}
+
+impl MimeLeaf {
+    /// Most bytes this part can decode to: base64 packs 3 bytes into 4
+    /// characters, and line breaks and padding only lower the real size;
+    /// every other transfer encoding decodes to at most its encoded size.
+    fn decoded_size_bound(&self) -> u64 {
+        if self.base64 {
+            u64::from(self.octets) * 3 / 4
+        } else {
+            u64::from(self.octets)
+        }
+    }
 }
 
 impl MimeNode {
@@ -1014,12 +1024,14 @@ impl MimeNode {
                 section,
                 octets: other.octets,
                 text: true,
+                base64: other.transfer_encoding == ContentEncoding::Base64,
             }),
             BodyStructure::Basic { other, .. } | BodyStructure::Message { other, .. } => {
                 MimeNode::Leaf(MimeLeaf {
                     section,
                     octets: other.octets,
                     text: false,
+                    base64: other.transfer_encoding == ContentEncoding::Base64,
                 })
             }
         }
@@ -1193,38 +1205,40 @@ where
     }
 }
 
-/// `BODY.PEEK[<spec>]` bounded to one byte past the cap. PEEK: never `\Seen`.
-fn peek_item(spec: &str) -> String {
-    format!("BODY.PEEK[{spec}]<0.{PART_FETCH_RANGE}>")
+/// `BODY.PEEK[<spec>]` ranged to one byte past `limit`, so an item over the
+/// limit shows up as over it instead of being cut to fit. PEEK: never `\Seen`.
+fn peek_item(spec: &str, limit: u32) -> String {
+    format!("BODY.PEEK[{spec}]<0.{}>", u64::from(limit) + 1)
 }
 
-/// The bytes of one `BODY[<spec>]` item, refused when over the cap.
+/// The bytes of one `BODY[<spec>]` item, refused when over `limit`.
 fn section_bytes<'a>(
     fetch: &'a async_imap::types::Fetch,
     uid: u32,
     spec: &str,
     path: &SectionPath,
+    limit: u32,
 ) -> Result<&'a [u8], ImapError> {
     let bytes = fetch
         .section(path)
         .ok_or_else(|| ImapError::Protocol(format!("UID FETCH {uid} returned no BODY[{spec}]")))?;
-    if bytes.len() > ingress::MAX_RFC822_MESSAGE_BYTES as usize {
+    if bytes.len() as u64 > u64::from(limit) {
         return Err(ImapError::Protocol(format!(
-            "UID {uid} part {spec} is over the {}-byte per-part cap; refusing to load or truncate it",
-            ingress::MAX_RFC822_MESSAGE_BYTES
+            "UID {uid} part {spec} is over its {limit}-byte fetch limit; refusing to load or truncate it"
         )));
     }
     Ok(bytes)
 }
 
 /// Fetch `BODY.PEEK[<section>]` (or its `.MIME` header) for each section in
-/// one command, keyed by section path.
+/// one command, each bounded to `limit` bytes, keyed by section path.
 async fn fetch_part_sections_in<T>(
     session: &mut Session<T>,
     folder: &str,
     uid: u32,
     sections: &[&[u32]],
     mime: bool,
+    limit: u32,
 ) -> Result<HashMap<Vec<u32>, Vec<u8>>, ImapError>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
@@ -1233,7 +1247,10 @@ where
         let spec = section_spec(section);
         if mime { format!("{spec}.MIME") } else { spec }
     };
-    let items: Vec<String> = sections.iter().map(|s| peek_item(&spec(s))).collect();
+    let items: Vec<String> = sections
+        .iter()
+        .map(|s| peek_item(&spec(s), limit))
+        .collect();
     let fetch = uid_fetch_one_in(session, folder, uid, &format!("(UID {})", items.join(" ")))
         .await?
         .ok_or_else(|| {
@@ -1245,7 +1262,7 @@ where
         .iter()
         .map(|section| {
             let path = SectionPath::Part(section.to_vec(), mime.then_some(MessageSection::Mime));
-            let bytes = section_bytes(&fetch, uid, &spec(section), &path)?;
+            let bytes = section_bytes(&fetch, uid, &spec(section), &path, limit)?;
             Ok((section.to_vec(), bytes.to_vec()))
         })
         .collect()
@@ -1261,7 +1278,10 @@ async fn fetch_message_structure_in<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
-    let query = format!("(UID FLAGS BODYSTRUCTURE {})", peek_item("HEADER"));
+    let query = format!(
+        "(UID FLAGS BODYSTRUCTURE {})",
+        peek_item("HEADER", ingress::MAX_RFC822_MESSAGE_BYTES)
+    );
     let Some(fetch) = uid_fetch_one_in(session, folder, uid, &query).await? else {
         return Ok(None);
     };
@@ -1273,6 +1293,7 @@ where
         uid,
         "HEADER",
         &SectionPath::Full(MessageSection::Header),
+        ingress::MAX_RFC822_MESSAGE_BYTES,
     )?
     .to_vec();
     let flags = fetch.flags().map(|f| format!("{f:?}")).collect();
@@ -1288,7 +1309,15 @@ where
                 .flatten()
                 .map(|leaf| leaf.section.as_slice())
                 .collect();
-            fetch_part_sections_in(session, folder, uid, &sections, true).await?
+            fetch_part_sections_in(
+                session,
+                folder,
+                uid,
+                &sections,
+                true,
+                ingress::MAX_RFC822_MESSAGE_BYTES,
+            )
+            .await?
         }
     };
     Ok(Some(MessageStructure {
@@ -1338,7 +1367,15 @@ where
         HashMap::new()
     } else {
         let sections: Vec<&[u32]> = body_leaves.iter().map(|l| l.section.as_slice()).collect();
-        fetch_part_sections_in(session, folder, uid, &sections, false).await?
+        fetch_part_sections_in(
+            session,
+            folder,
+            uid,
+            &sections,
+            false,
+            ingress::MAX_RFC822_MESSAGE_BYTES,
+        )
+        .await?
     };
 
     let skeleton = structure.skeleton(&bodies);
@@ -1369,6 +1406,11 @@ where
 
 /// Download one attachment of an over-cap message: fetch only its part, and
 /// decode it through the same mail_parser path as a whole-message download.
+///
+/// The bound is the decoded attachment limit whole-message downloads apply.
+/// A part whose encoded size could decode past it is refused before any byte
+/// is fetched; the fetch is bounded to the declared encoded size; and the
+/// decoded length is checked again after decoding.
 async fn download_attachment_part_in<T>(
     session: &mut Session<T>,
     uid: u32,
@@ -1396,9 +1438,26 @@ where
             "attachment '{filename}' not found in UID {uid}"
         )));
     };
-    refuse_oversize_part(uid, leaf, &format!("attachment {filename:?}"))?;
-    let bodies =
-        fetch_part_sections_in(session, folder, uid, &[leaf.section.as_slice()], false).await?;
+    let decoded_bound = leaf.decoded_size_bound();
+    if decoded_bound > ingress::MAX_ATTACHMENT_BYTES as u64 {
+        return Err(ImapError::Protocol(format!(
+            "attachment fetch refused for UID {uid}: {filename:?} (part {}) is {} encoded bytes, \
+             which can decode to {decoded_bound} bytes, over the {}-byte attachment limit; \
+             nothing was fetched",
+            section_spec(&leaf.section),
+            leaf.octets,
+            ingress::MAX_ATTACHMENT_BYTES
+        )));
+    }
+    let bodies = fetch_part_sections_in(
+        session,
+        folder,
+        uid,
+        &[leaf.section.as_slice()],
+        false,
+        leaf.octets,
+    )
+    .await?;
 
     let skeleton = structure.skeleton(&bodies);
     let parsed = parse_skeleton(&skeleton, &order, uid)?;
@@ -3661,12 +3720,16 @@ Subject: hi\r\n\r\nbody\r\n";
     /// SELECT, the size preflight, then the structure and MIME-header fetches
     /// every over-cap read starts with.
     fn oversize_structure_turns(text_octets: usize) -> Vec<Turn> {
+        oversize_turns_with(big_bodystructure(text_octets))
+    }
+
+    /// [`oversize_structure_turns`] serving `bodystructure` instead.
+    fn oversize_turns_with(bodystructure: String) -> Vec<Turn> {
         vec![
             select_turn(),
             size_turn(BIG_DECLARED_SIZE as usize),
             fetch_turn(format!(
-                "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODYSTRUCTURE {} {})",
-                big_bodystructure(text_octets),
+                "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODYSTRUCTURE {bodystructure} {})",
                 literal("HEADER", BIG_HEADER)
             )),
             fetch_turn(format!(
@@ -3860,7 +3923,10 @@ Subject: hi\r\n\r\nbody\r\n";
             assert_sections_only(&commands);
             assert_eq!(
                 commands.last().unwrap(),
-                &format!("A0006 UID FETCH 2379 (UID BODY.PEEK[{section}]<0.26214401>)"),
+                &format!(
+                    "A0006 UID FETCH 2379 (UID BODY.PEEK[{section}]<0.{}>)",
+                    body.len() + 1
+                ),
                 "{filename}"
             );
             let whole = download_whole(&big_rfc822(), filename).await;
@@ -3872,36 +3938,109 @@ Subject: hi\r\n\r\nbody\r\n";
         }
     }
 
-    /// The per-part cap applies to a download too: an attachment part over
-    /// the cap is refused before any of its bytes are fetched.
-    #[tokio::test]
-    async fn oversize_download_refuses_a_part_over_the_cap() {
-        let big_pdf = ingress::MAX_RFC822_MESSAGE_BYTES as usize + 1;
-        let mut turns = oversize_structure_turns(TEXT_BODY.len());
-        turns[2] = fetch_turn(format!(
-            "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODYSTRUCTURE {} {})",
-            big_bodystructure(TEXT_BODY.len()).replacen(
-                &format!("\"base64\" {} NIL", PDF_BODY.len()),
-                &format!("\"base64\" {big_pdf} NIL"),
-                1
-            ),
-            literal("HEADER", BIG_HEADER)
-        ));
-        let (mut session, server) = scripted_session(turns).await;
+    /// BODYSTRUCTURE for [`big_rfc822`] with one attachment's declared
+    /// encoded size replaced.
+    fn bodystructure_with_octets(encoding: &str, from: usize, to: usize) -> String {
+        let old = format!("\"{encoding}\" {from} ");
+        let structure = big_bodystructure(TEXT_BODY.len());
+        assert!(structure.contains(&old), "{old}");
+        structure.replacen(&old, &format!("\"{encoding}\" {to} "), 1)
+    }
 
-        let err = download_attachment_in(&mut session, BIG_UID, "exhibit.pdf", "INBOX")
+    /// An over-cap download is bounded by the decoded attachment limit, the
+    /// one whole-message downloads use. Before any byte is fetched, a part
+    /// whose encoded size could decode past it is refused: base64 decodes to at
+    /// most 3/4 of its encoded size, other encodings to at most their size.
+    #[tokio::test]
+    async fn oversize_download_refuses_a_part_that_can_decode_past_the_limit() {
+        let limit = ingress::MAX_ATTACHMENT_BYTES;
+        for (filename, section, structure) in [
+            (
+                "exhibit.pdf",
+                "2",
+                // 3/4 of this is 1 byte over the limit.
+                bodystructure_with_octets("base64", PDF_BODY.len(), limit / 3 * 4 + 4),
+            ),
+            (
+                "ledger.csv",
+                "3",
+                bodystructure_with_octets("8bit", CSV_BODY.len(), limit + 1),
+            ),
+        ] {
+            let (mut session, server) = scripted_session(oversize_turns_with(structure)).await;
+            let err = download_attachment_in(&mut session, BIG_UID, filename, "INBOX")
+                .await
+                .expect_err("a part that can decode past the limit must be refused");
+            drop(session);
+            let commands = server.await.unwrap();
+
+            let msg = err.to_string();
+            assert!(msg.contains(filename), "{msg}");
+            assert!(msg.contains(&limit.to_string()), "{msg}");
+            assert!(msg.contains("attachment limit"), "{msg}");
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| c.contains(&format!("BODY.PEEK[{section}]<"))),
+                "{commands:#?}"
+            );
+        }
+    }
+
+    /// Live case: UID 2379's PDF is 27,119,838 encoded bytes, over the 25 MiB
+    /// message cap, but base64 of that size decodes to at most 20,339,878
+    /// bytes, under the 20 MiB attachment limit. It must be fetched.
+    #[tokio::test]
+    async fn oversize_download_fetches_a_base64_part_over_the_message_cap() {
+        const LIVE_PDF_OCTETS: usize = 27_119_838;
+        let mut turns = oversize_turns_with(bodystructure_with_octets(
+            "base64",
+            PDF_BODY.len(),
+            LIVE_PDF_OCTETS,
+        ));
+        turns.push(fetch_turn(format!(
+            "* 1 FETCH (UID {BIG_UID} {})",
+            literal("2", PDF_BODY)
+        )));
+        let (mut session, server) = scripted_session(turns).await;
+        let partial = download_attachment_in(&mut session, BIG_UID, "exhibit.pdf", "INBOX")
             .await
-            .expect_err("an attachment part over the cap must be refused");
-        drop(session);
+            .expect("a base64 part that decodes under the limit is downloadable");
         let commands = server.await.unwrap();
 
-        let msg = err.to_string();
-        assert!(msg.contains("exhibit.pdf"), "{msg}");
-        assert!(msg.contains("per-part cap"), "{msg}");
-        assert!(
-            !commands.iter().any(|c| c.contains("BODY.PEEK[2]<")),
-            "{commands:#?}"
+        assert_eq!(
+            commands.last().unwrap(),
+            "A0006 UID FETCH 2379 (UID BODY.PEEK[2]<0.27119839>)",
+            "fetched in one range bounded by the declared size"
         );
+        let whole = download_whole(&big_rfc822(), "exhibit.pdf").await;
+        assert_eq!(partial.bytes, whole.bytes);
+    }
+
+    /// A server that returns more bytes than BODYSTRUCTURE declared for the
+    /// part is refused, not trusted.
+    #[tokio::test]
+    async fn oversize_download_refuses_a_part_longer_than_declared() {
+        let declared = 10;
+        let mut turns = oversize_turns_with(bodystructure_with_octets(
+            "base64",
+            PDF_BODY.len(),
+            declared,
+        ));
+        turns.push(fetch_turn(format!(
+            "* 1 FETCH (UID {BIG_UID} {})",
+            literal("2", PDF_BODY)
+        )));
+        let (mut session, server) = scripted_session(turns).await;
+        let err = download_attachment_in(&mut session, BIG_UID, "exhibit.pdf", "INBOX")
+            .await
+            .expect_err("more bytes than declared must be refused");
+        drop(session);
+        server.await.unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("part 2"), "{msg}");
+        assert!(msg.contains(&format!("{declared}-byte")), "{msg}");
     }
 
     #[tokio::test]

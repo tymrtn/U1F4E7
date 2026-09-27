@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MIME part headers and the text/html body parts. `read --json` adds a `partial_fetch` object
   (`declared_size`, `fetch_cap`, `attachment_sizes: "encoded_octets"`), attachment sizes are
   the encoded part sizes, and no attachment bytes are loaded. `attachment download` fetches only
-  the named part and writes the same bytes a whole-message download would. The cap still
-  applies to each fetched part: a text or attachment part over 25 MiB is refused, never
+  the named part and writes the same bytes a whole-message download would. Each fetch stays
+  bounded: a text body part over 25 MiB is refused, and a download is held to the same 20 MiB
+  decoded attachment limit as any other, refused before fetching when the part's encoded size
+  could decode past it (base64 decodes to at most 3/4 of its encoded size). Nothing is
   truncated. Messages under the cap are fetched exactly as before. MCP `read` and the dashboard
   reader get the same behavior; a part-by-part read runs no threat scan and shows only a
   verdict already on file.
