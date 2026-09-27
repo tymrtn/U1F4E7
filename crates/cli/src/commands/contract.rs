@@ -1346,7 +1346,8 @@ fn message_detail_schema() -> Value {
             "in_reply_to": string("In-Reply-To header when available"),
             "references": string("References header when available"),
             "sanitized": json!({"type": "boolean", "description": "true when the message's threat verdict is dangerous and html_body was served through the server-side sanitizer"}),
-            "threat": json!({"type": ["object", "null"], "description": "Threat verdict summary {level, score, engine_version}; null when the message has no verdict"})
+            "threat": json!({"type": ["object", "null"], "description": "Threat verdict summary {level, score, engine_version}; null when the message has no verdict"}),
+            "partial_fetch": json!({"type": "object", "description": "Present only when RFC822.SIZE is over the whole-message fetch cap: the message was read part by part (header, BODYSTRUCTURE, text/html parts). {declared_size, fetch_cap, attachment_sizes: \"encoded_octets\"}. No attachment bytes were loaded, attachment sizes are encoded part sizes, and no threat scan ran (threat shows a stored verdict or null)."})
         }),
         json!([]),
     )

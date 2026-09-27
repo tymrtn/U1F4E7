@@ -223,6 +223,7 @@ mod tests {
             flags: vec![],
             attachments: Vec::<AttachmentMeta>::new(),
             provider_spam: None,
+            partial_fetch: None,
         }
     }
 

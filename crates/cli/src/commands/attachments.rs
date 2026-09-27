@@ -226,6 +226,13 @@ pub async fn run_list(
 
     match message {
         Some(msg) => {
+            if let Some(partial) = &msg.partial_fetch {
+                eprintln!(
+                    "note: UID {uid} is {} bytes, over the {}-byte fetch cap. Listed from \
+                     BODYSTRUCTURE, so sizes are encoded (transfer) sizes.",
+                    partial.declared_size, partial.fetch_cap
+                );
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg.attachments)?);
             } else if msg.attachments.is_empty() {

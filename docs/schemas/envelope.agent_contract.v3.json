@@ -1457,6 +1457,10 @@
             "description": "Message-ID header when available",
             "type": "string"
           },
+          "partial_fetch": {
+            "description": "Present only when RFC822.SIZE is over the whole-message fetch cap: the message was read part by part (header, BODYSTRUCTURE, text/html parts). {declared_size, fetch_cap, attachment_sizes: \"encoded_octets\"}. No attachment bytes were loaded, attachment sizes are encoded part sizes, and no threat scan ran (threat shows a stored verdict or null).",
+            "type": "object"
+          },
           "references": {
             "description": "References header when available",
             "type": "string"

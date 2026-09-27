@@ -135,6 +135,7 @@ mod tests {
             flags: vec![],
             attachments: vec![],
             provider_spam: None,
+            partial_fetch: None,
         }
     }
 

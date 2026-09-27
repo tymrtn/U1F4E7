@@ -89,7 +89,7 @@ pub fn verdict_for_open(
     account_address: &str,
     folder: &str,
     uid: u32,
-    raw: &[u8],
+    raw: Option<&[u8]>,
 ) -> anyhow::Result<Option<Value>> {
     let config = ThreatConfig::load()?;
     let verdict =

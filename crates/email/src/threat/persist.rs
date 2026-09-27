@@ -669,15 +669,22 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
 
 /// Scan one message on open when it has no current verdict (and
 /// `threat.on_read` is on). Returns the verdict to show.
+///
+/// `raw` is `None` for a message read part by part (over the whole-message
+/// fetch cap). There is nothing complete to scan, so this returns the stored
+/// verdict, if any, and records nothing.
 pub fn verdict_on_open(
     db: &Database,
     account_id: &str,
     account_address: &str,
     folder: &str,
     uid: u32,
-    raw: &[u8],
+    raw: Option<&[u8]>,
     config: &ThreatConfig,
 ) -> Result<Option<ThreatVerdict>> {
+    let Some(raw) = raw else {
+        return latest_verdict(db, account_id, None, folder, uid);
+    };
     let message_id = ThreatInput::from_raw(raw, account_address)
         .ok()
         .and_then(|i| {
@@ -976,6 +983,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
+    }
+
+    /// A part-by-part read of an over-cap message passes no raw bytes: there
+    /// is nothing complete to scan, so the stored verdict (if any) is returned
+    /// and nothing is recorded.
+    #[test]
+    fn open_without_raw_bytes_returns_the_stored_verdict_and_never_scans() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        assert!(config.enabled && config.on_read);
+        assert!(
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            latest_verdict(&db, ACCT, None, "INBOX", 2379)
+                .unwrap()
+                .is_none(),
+            "a partial read must not record a verdict"
+        );
+
+        let target = VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid: 2379,
+            message_id: Some("big@x"),
+        };
+        let stored = ThreatVerdict::unavailable("clamd down");
+        record_verdict(&db, &target, &stored).unwrap();
+        assert_eq!(
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config).unwrap(),
+            Some(stored)
+        );
     }
 
     #[test]
