@@ -46,6 +46,7 @@ curl -fsSL https://u1f4e7.com/install.sh | bash
 # Homebrew (macOS). The formula builds from source, so Homebrew installs Rust
 # as a build dependency and the first install takes a few minutes.
 brew install tymrtn/u1f4e7/envelope
+# `tymrtn/u1f4e7/u1f4e7` is a live compat alias for the same formula.
 ```
 
 To build it yourself instead:
@@ -335,6 +336,8 @@ curl -fsSL https://u1f4e7.com/install.sh | bash
 brew install tymrtn/u1f4e7/envelope
 which envelope
 ```
+
+`tymrtn/u1f4e7/u1f4e7` is a live Homebrew compat alias for the same formula.
 
 MCP startup requires an agent token. Create one, then paste it into the plugin
 variable `ENVELOPE_AGENT_TOKEN` (Customize → Plugins → Configure). Never commit

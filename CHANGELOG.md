@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   homepage is the product site, the one-liner is "Add an agent to your email.
   Don't change your email.", install documents both
   `curl -fsSL https://u1f4e7.com/install.sh | bash` and
-  `brew install tymrtn/u1f4e7/envelope` (tap treated as live), and send modes
+  `brew install tymrtn/u1f4e7/envelope` (tap treated as live;
+  `tymrtn/u1f4e7/u1f4e7` remains a live compat alias), and send modes
   stay contextual policy rather than a send-block headline. Plugin version
   `1.0.1` is packaging metadata only.
 

@@ -33,6 +33,7 @@ Product site (homepage): [https://u1f4e7.com](https://u1f4e7.com).
    brew install tymrtn/u1f4e7/envelope
    ```
 
+   `tymrtn/u1f4e7/u1f4e7` is a live Homebrew compat alias for the same formula.
    The curl script checks the release's SHA-256 and installs to `~/.local/bin`
    without sudo. Homebrew builds from source (Rust is a build dependency).
 
