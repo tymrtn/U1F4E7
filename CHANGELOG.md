@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Cursor Marketplace packaging.** Listing copy now matches [u1f4e7.com](https://u1f4e7.com):
+  homepage is the product site, the one-liner is "Add an agent to your email.
+  Don't change your email.", install documents both
+  `curl -fsSL https://u1f4e7.com/install.sh | bash` and
+  `brew install tymrtn/u1f4e7/envelope` (tap treated as live), and send modes
+  stay contextual policy rather than a send-block headline. Plugin version
+  `1.0.1` is packaging metadata only.
+
 ## [1.3.8] — 2026-09-28
 
 ### Fixed
