@@ -15,7 +15,7 @@ use rusqlite_migration::{M, Migrations};
 /// How many migrations past the end of [`migration_list`] this build can open
 /// without understanding them.
 ///
-/// The isolated V2/CRM line extends the V1 sequence with seven migrations
+/// The isolated V2/CRM line extends the V1 sequence with eight migrations
 /// verified additive-only: 17 creates `send_receipts` and its indexes, 18 the
 /// relationship/CRM tables (`persons`, `person_emails`, interactions,
 /// per-person thread states), 19 `graph_ledger_state`, 20 `link_redirects`
@@ -23,12 +23,14 @@ use rusqlite_migration::{M, Migrations};
 /// `agent_policies.allowed_addresses` column, 22 `calibration_verdicts` and
 /// its index, 23 the Cairn install tables (`cairn_link`, `cairn_streams`,
 /// `cairn_account_settings`, `cairn_tokens`, `action_tokens`,
-/// `rewrite_journal`) and their indexes. None alter or remove anything V1
-/// reads or writes (V1 selects `agent_policies` columns by name), so a
-/// database at schema versions 17–23 is opened as-is — no migrations run,
+/// `rewrite_journal`) and their indexes, 24 the Microsoft sign-in and Graph
+/// tables (`oauth_grants`, `msgraph_folders`, `msgraph_ids`) and their index.
+/// None alter or remove anything V1 reads or writes (V1 selects
+/// `agent_policies` columns by name), so a
+/// database at schema versions 17–24 is opened as-is — no migrations run,
 /// no `user_version` write, nothing deleted. Any version beyond that is
 /// unknown and fails closed.
-const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 7;
+const KNOWN_ADDITIVE_V2_MIGRATIONS: usize = 8;
 
 /// Run all pending migrations on the given connection.
 ///
@@ -970,18 +972,18 @@ fn migration_list() -> Vec<M<'static>> {
     ]
 }
 
-/// Fixtures mirroring the isolated V2 line's additive migrations 17–23
+/// Fixtures mirroring the isolated V2 line's additive migrations 17–24
 /// (send receipts, relationship/CRM tables, graph ledger state, reader link
-/// redirects, agent address scope, calibration verdicts, Cairn install). The exact column shapes are irrelevant
-/// to V1, which never reads these tables or the added column; the fixtures
+/// redirects, agent address scope, calibration verdicts, Cairn install,
+/// Microsoft sign-in and Graph). The exact column shapes are irrelevant to V1, which never reads these tables or the added column; the fixtures
 /// exist to prove V1 opens alongside them without touching them.
 #[cfg(test)]
 pub(crate) mod v2_fixture {
     use rusqlite::Connection;
 
     /// The schema version the live V2 runtime has advanced the shared
-    /// database to (V1's 16 migrations plus V2 migrations 17–23).
-    pub(crate) const V2_SCHEMA_VERSION: i64 = 23;
+    /// database to (V1's 16 migrations plus V2 migrations 17–24).
+    pub(crate) const V2_SCHEMA_VERSION: i64 = 24;
 
     pub(crate) fn apply(conn: &Connection) {
         conn.execute_batch(&format!(
@@ -1115,6 +1117,44 @@ pub(crate) mod v2_fixture {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (account_id, message_id)
             );
+            CREATE TABLE oauth_grants (
+                account_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                authority TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                encrypted_refresh_token TEXT NOT NULL,
+                encrypted_access_token TEXT,
+                access_expires_at TEXT,
+                grant_version INTEGER NOT NULL DEFAULT 0,
+                needs_reauth INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE msgraph_folders (
+                account_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                uidvalidity INTEGER NOT NULL,
+                history_floor TEXT,
+                next_up INTEGER NOT NULL,
+                next_down INTEGER NOT NULL,
+                delta_link TEXT,
+                PRIMARY KEY (account_id, folder_id)
+            );
+            CREATE TABLE msgraph_ids (
+                account_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                immutable_id TEXT NOT NULL,
+                internet_message_id TEXT,
+                PRIMARY KEY (account_id, folder_id, uid),
+                UNIQUE (account_id, folder_id, immutable_id)
+            );
+            CREATE INDEX idx_msgraph_ids_message_id
+                ON msgraph_ids(account_id, internet_message_id);
 
             INSERT INTO send_receipts (id, account_id) VALUES ('sr-1', 'acc');
             INSERT INTO persons (id, display_name) VALUES ('p-1', 'Ada');
@@ -1137,9 +1177,9 @@ mod tests {
     }
 
     /// Pins the forward-compatibility boundary: V1's sequence produces schema
-    /// version 16, and the known additive V2 level is 23. If this fails
+    /// version 16, and the known additive V2 level is 24. If this fails
     /// because a V1 migration was added, its version number collides with the
-    /// V2 line's 17–23 — reconcile with the V2 track before shipping.
+    /// V2 line's 17–24 — reconcile with the V2 track before shipping.
     #[test]
     fn forward_schema_boundary_is_pinned_to_the_v2_line() {
         assert_eq!(migration_list().len(), 16);
