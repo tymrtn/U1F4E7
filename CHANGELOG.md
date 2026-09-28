@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.9] — 2026-09-28
+
 ### Upgrade note: exit code 0 does not mean sent; check `status`
 
 A send whose outcome is unknown (the connection or the process died after the message body
