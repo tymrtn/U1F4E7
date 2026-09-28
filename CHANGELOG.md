@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Storage:** opens a database at schema version 24 as it finds it. Envelope 2 adds migration
+  24 (the Microsoft sign-in and Graph tables: `oauth_grants`, `msgraph_folders`, `msgraph_ids`),
+  which is new tables only. This build runs no migrations on such a database, writes nothing to
+  `user_version`, and ignores those tables. Versions above 24 still refuse to open.
+
 ## [1.3.10] — 2026-09-28
 
 ### Fixed
