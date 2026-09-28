@@ -41,6 +41,7 @@ pub mod scheduled;
 pub mod search;
 pub mod secret_input;
 pub mod send;
+pub mod send_attempt;
 pub mod serve;
 pub mod snooze;
 pub mod tag;

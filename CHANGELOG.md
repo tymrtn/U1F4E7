@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade note: exit code 0 does not mean sent; check `status`
+
+A send whose outcome is unknown (the connection or the process died after the message body
+started, so the server may or may not hold it) now exits 0 and reports `status: "delivery_uncertain"` with
+`retryable: false`, `draft_id`, `message_id` and an `error` object. MCP `send`, `reply` and
+`send_draft` return it as a normal, non-error result. This applies to `send --send-now`
+(including reruns of the same request), a queued `send` rerun that finds an uncertain intent, and
+`draft send --send-now`. Scripts and agents that read exit 0 as "sent" must read `status`: only
+`sent` means the server accepted the message. A `delivery_uncertain` message must never be
+treated as sent or retried, since a retry could deliver a second copy; check the recipient or the
+Sent folder for its Message-ID, then discard the draft to send a new copy. Without `--json`, the
+first line of output says the send was not confirmed.
+
+### Fixed
+
+- **A rerun after a crash no longer sends the message twice.** `send --send-now` kept no local
+  record, so rerunning the command after the process died during or after SMTP sent a second
+  copy. Every send request (CLI `send`, MCP `send`/`reply`; immediate, queued or `--at`) is now
+  written as a durable intent before any network work, and a rerun of the same request returns
+  the earlier outcome with `idempotent_replay: true`. Each attempt records its Message-ID before
+  it starts and commits `transmitting` after DATA and before the first body byte, so a failure is
+  classified by how far it got: nothing sent (the row returns to `draft`, `status: "not_sent"`) or
+  possibly accepted (`delivery_uncertain`, never re-sent). A 4xx/5xx reply to the body counts as
+  nothing sent. The result is recorded before QUIT, and each SMTP stage now has a deadline.
+- **Rows stranded in `sending` are recovered.** A process killed mid-send left its draft `sending`
+  for good, and `draft send` refused it as "not sendable". The next send, `draft show`,
+  `draft list`, `serve` start and every scheduled-send tick now resolve such rows: an attempt that
+  never reached the message body goes back to `draft` (a scheduled one comes due again), one that
+  had started it becomes `delivery_uncertain`. A still-running sender holds an OS file lock on its
+  attempt and is never touched. `draft send` on such a row reports the resolved status as JSON.
+- **Every send operation leaves a complete receipt.** Sends wrote no `action_log` rows and
+  `send_completed` events had no `message_id`. Each send transition (queued, claimed,
+  transmitting, sent, released, parked, replayed) now writes an `action_type=send` row in the same
+  transaction as the state change, with the draft id, Message-ID, agent id, recipients, payload
+  digest and outcome; `send_completed` fills its `message_id` column and is emitted by the
+  scheduled sweep and immediate sends too. `actions tail --json` rows carry `agent_id`. Audit
+  writes that used to be dropped silently (send-policy and Governor decisions, queue and approval
+  events, MCP agent actions) now stop the send before SMTP (`audit_unavailable`) or, after the
+  server accepted the message, return `warnings: [{code: "audit_write_failed"}]` and exit
+  non-zero. Queued `send` rows now show their body in `draft show` (`content.agent_body_text`).
+
 ### Changed
 
 - **Cursor Marketplace packaging.** Listing copy now matches [u1f4e7.com](https://u1f4e7.com):
@@ -17,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tymrtn/u1f4e7/u1f4e7` remains a live compat alias), and send modes
   stay contextual policy rather than a send-block headline. Plugin version
   `1.0.1` is packaging metadata only.
+- **An identical send within 15 minutes returns the earlier result instead of sending again.**
+  Without a key, a request identical to an unresolved, queued or uncertain one is matched for as
+  long as that one exists, and to a sent one for 15 minutes. To send identical content twice on
+  purpose, give each send its own `--idempotency-key` (MCP `idempotency_key`). The same key with
+  different content is refused with `idempotency_key_conflict`.
+- An immediate send whose SMTP attempt fails before the server accepts it keeps its message as a
+  local draft, which a rerun resumes; discard it to abandon the send. A request the Governor gate
+  or the attribution check refuses still leaves nothing behind.
+- The scheduled sweep retries a send the server refused with a 4xx reply, or never reached, on the
+  next tick instead of parking it `delivery_uncertain`; a 5xx refusal parks it `blocked` with the
+  reason in `send_block`.
 
 ## [1.3.8] — 2026-09-28
 
