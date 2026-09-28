@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.10] — 2026-09-28
+
+### Fixed
+
+- **Mail delivered by Migadu and Gmail is no longer marked as carrying a forged
+  Authentication-Results header.** These providers write their Authentication-Results header below
+  their own `Received` line, and the threat check treated that position as outside the receiving
+  host's block. `ar_forged` (+40) fired on most legitimate Migadu mail, and the provider's SPF, DKIM
+  and DMARC results were never read. The check now trusts the receiving domain's topmost header
+  above the first `Received` line written by another domain. A header claiming the receiving
+  domain below another hop's `Received` line, or a second one, is still flagged `ar_forged`.
+
 ## [1.3.9] — 2026-09-28
 
 ### Upgrade note: exit code 0 does not mean sent; check `status`
