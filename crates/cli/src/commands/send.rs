@@ -23,7 +23,10 @@ use super::datetime::parse_send_at;
 use super::drafts::{persist_from_override, validate_from_override};
 use super::governor_gate::{account_domain, governor_request, precheck_attribution};
 use super::re_subject_guard::check_new_re_subject_guard;
-use super::send_attempt::{GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request};
+use super::send_attempt::{
+    GovernorRefused, Queued, SendNotConfirmed, SendRequest, print_uncertain, queue_request,
+    uncertain_outcome,
+};
 use super::ui;
 
 /// Build lightweight attachment metadata (filename + content type, no bytes) for
@@ -411,6 +414,10 @@ pub async fn run(
                 }
                 anyhow::bail!("{}", outcome.reason_string());
             }
+            if let Some(body) = uncertain_outcome(&e) {
+                report_uncertain(body, json, &authored);
+                return Ok(());
+            }
             if json && let Some(not_confirmed) = e.downcast_ref::<SendNotConfirmed>() {
                 emit_json(not_confirmed.body.clone(), &authored);
             }
@@ -440,7 +447,8 @@ pub async fn run(
 }
 
 /// Queue `request` (or find it already queued). `Ok(None)` means an earlier
-/// identical request was already sent and its record has been printed.
+/// identical request already has an outcome (sent, or delivery_uncertain)
+/// and it has been printed.
 fn queue_or_report(
     db: &Database,
     account_id: &str,
@@ -461,11 +469,25 @@ fn queue_or_report(
             Ok(None)
         }
         Err(e) => {
+            if let Some(body) = uncertain_outcome(&e) {
+                report_uncertain(body, json, authored);
+                return Ok(None);
+            }
             if json && let Some(not_confirmed) = e.downcast_ref::<SendNotConfirmed>() {
                 emit_json(not_confirmed.body.clone(), authored);
             }
             Err(e)
         }
+    }
+}
+
+/// A send whose outcome is unknown is a result, reported with exit 0: the
+/// caller reads `status`, and must not treat it as sent.
+fn report_uncertain(body: &serde_json::Value, json: bool, authored: &AuthoredBody) {
+    if json {
+        emit_json(body.clone(), authored);
+    } else {
+        print_uncertain(body);
     }
 }
 

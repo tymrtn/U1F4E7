@@ -58,6 +58,31 @@ impl std::fmt::Display for SendNotConfirmed {
 
 impl std::error::Error for SendNotConfirmed {}
 
+/// The result carried by `e` when the send's outcome is unknown: the server
+/// may hold the message. Every surface reports it as a result (CLI exit 0,
+/// MCP non-error) whose `status` is `delivery_uncertain`, never as a failure
+/// to retry, since a retry could deliver a second copy.
+pub(crate) fn uncertain_outcome(e: &anyhow::Error) -> Option<&Value> {
+    e.downcast_ref::<SendNotConfirmed>()
+        .map(|n| &n.body)
+        .filter(|body| body["status"] == "delivery_uncertain")
+}
+
+/// The human-readable report of a `delivery_uncertain` result. The command
+/// exits 0, so the first line says the send was not confirmed.
+pub(crate) fn print_uncertain(body: &Value) {
+    println!("Send NOT confirmed (status: delivery_uncertain). Do not treat this message as sent.");
+    if let Some(reason) = body["error"]["reason"].as_str() {
+        println!("{reason}");
+    }
+    if let Some(id) = body["draft_id"].as_str() {
+        println!("Draft ID: {id}");
+    }
+    if let Some(message_id) = body["message_id"].as_str() {
+        println!("Message-ID: {message_id}");
+    }
+}
+
 /// The Governor gate refused the attempt. The row was released; its
 /// `Display` is the gate's canonical `{status, error}` JSON.
 #[derive(Debug)]
@@ -1033,20 +1058,46 @@ mod tests {
     }
 
     /// Without `--json` the error is all a person sees, and its advice
-    /// ("discard this draft") needs the draft's id.
+    /// ("rerun the same command") needs the draft's id.
     #[test]
     fn a_human_readable_outcome_names_its_draft() {
         let outcome = SendNotConfirmed {
             body: json!({
-                "status": "delivery_uncertain",
+                "status": "sending",
                 "draft_id": "d-9",
-                "error": {"reason": "It may have been delivered."},
+                "error": {"reason": "Another process is sending this message now."},
             }),
         };
         assert_eq!(
             outcome.to_string(),
-            "It may have been delivered. (draft d-9)"
+            "Another process is sending this message now. (draft d-9)"
         );
+    }
+
+    /// Only an unknown outcome is reported as a result; every other stop
+    /// stays an error.
+    #[test]
+    fn only_delivery_uncertain_is_reported_as_a_result() {
+        let stopped = |status: &str| -> anyhow::Error {
+            SendNotConfirmed {
+                body: json!({"status": status, "draft_id": "d-9", "retryable": false}),
+            }
+            .into()
+        };
+        let uncertain = stopped("delivery_uncertain");
+        assert_eq!(
+            uncertain_outcome(&uncertain).map(|b| &b["status"]),
+            Some(&json!("delivery_uncertain"))
+        );
+        for status in [
+            "not_sent",
+            "sending",
+            "awaiting_review",
+            "idempotency_key_conflict",
+        ] {
+            assert!(uncertain_outcome(&stopped(status)).is_none(), "{status}");
+        }
+        assert!(uncertain_outcome(&anyhow!("delivery_uncertain")).is_none());
     }
 
     /// Sends the gate lets through. A `governor` build gates every send on the
@@ -1104,8 +1155,12 @@ mod tests {
                 _ = wait_for_body(&server) => {}
             }
 
-            let rerun = send_now(&f.db, &f.creds, &req, &connector).await;
-            let body = status_of(&rerun.unwrap_err());
+            let rerun = send_now(&f.db, &f.creds, &req, &connector)
+                .await
+                .unwrap_err();
+            let body = uncertain_outcome(&rerun)
+                .unwrap_or_else(|| panic!("not reported as a result: {rerun:#}"))
+                .clone();
             assert_eq!(body["status"], "delivery_uncertain", "{body}");
             assert_eq!(body["retryable"], false);
             assert_eq!(server.bodies(), 1, "the rerun must not transmit again");
@@ -1232,13 +1287,20 @@ mod tests {
                     ("sent", "accepted")
                 ]
             );
+            let intent_digest: String =
+                f.db.conn()
+                    .query_row(
+                        "SELECT json_extract(metadata, '$.send_intent.payload_sha256')
+                         FROM drafts WHERE id = ?1",
+                        [&draft_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
             for (_, mid, taken) in &rows {
                 assert_eq!(mid.as_deref(), Some(message_id.as_str()));
                 assert_eq!(taken["recipients"], json!(["alice@example.test"]));
-                assert_eq!(
-                    taken["semantic_sha256"],
-                    "523f0d8bc7e76d999b5ce167fed8429b8e54365cd26984d1b84fc28f5594881e"
-                );
+                assert_eq!(taken["payload_sha256"], intent_digest.as_str());
+                assert!(taken.get("semantic_sha256").is_none(), "{taken}");
             }
             let completed: Option<String> =
                 f.db.conn()

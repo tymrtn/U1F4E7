@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade note: exit code 0 does not mean sent; check `status`
+
+A send whose outcome is unknown (the connection or the process died after the message body
+started, so the server may or may not hold it) now exits 0 and reports `status: "delivery_uncertain"` with
+`retryable: false`, `draft_id`, `message_id` and an `error` object. MCP `send`, `reply` and
+`send_draft` return it as a normal, non-error result. This applies to `send --send-now`
+(including reruns of the same request), a queued `send` rerun that finds an uncertain intent, and
+`draft send --send-now`. Scripts and agents that read exit 0 as "sent" must read `status`: only
+`sent` means the server accepted the message. A `delivery_uncertain` message must never be
+treated as sent or retried, since a retry could deliver a second copy; check the recipient or the
+Sent folder for its Message-ID, then discard the draft to send a new copy. Without `--json`, the
+first line of output says the send was not confirmed.
+
 ### Fixed
 
 - **A rerun after a crash no longer sends the message twice.** `send --send-now` kept no local
@@ -28,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `send_completed` events had no `message_id`. Each send transition (queued, claimed,
   transmitting, sent, released, parked, replayed) now writes an `action_type=send` row in the same
   transaction as the state change, with the draft id, Message-ID, agent id, recipients, payload
-  digests and outcome; `send_completed` fills its `message_id` column and is emitted by the
+  digest and outcome; `send_completed` fills its `message_id` column and is emitted by the
   scheduled sweep and immediate sends too. `actions tail --json` rows carry `agent_id`. Audit
   writes that used to be dropped silently (send-policy and Governor decisions, queue and approval
   events, MCP agent actions) now stop the send before SMTP (`audit_unavailable`) or, after the

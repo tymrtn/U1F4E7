@@ -215,6 +215,43 @@ fn taken(receipt: &Value) -> Value {
 
 // ── Stale `sending` rows ──────────────────────────────────────────────────
 
+fn draft_send_now(home: &Path, draft_id: &str, json: bool) -> Output {
+    let mut args = vec![
+        "draft",
+        "send",
+        draft_id,
+        "--attr",
+        "informational",
+        "--send-now",
+        "--confirm-send-now",
+    ];
+    if json {
+        args.push("--json");
+    }
+    run_cli(home, &args)
+}
+
+/// An unknown outcome exits 0, so `status` is the only thing that tells a
+/// caller the message may not have been sent. Checks every field a caller
+/// needs to act on it.
+fn assert_uncertain(out: &Output, draft_id: &str) -> Value {
+    assert!(
+        out.status.success(),
+        "an unknown outcome exits 0 and reports it in `status`: exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = json_of(out);
+    assert_eq!(body["status"], "delivery_uncertain", "output: {body}");
+    assert_eq!(body["retryable"], false, "output: {body}");
+    assert_eq!(
+        body["error"]["code"], "delivery_uncertain",
+        "output: {body}"
+    );
+    assert_eq!(body["draft_id"], draft_id, "output: {body}");
+    body
+}
+
 /// Pilot failure: `draft_send_now/after_data/kill` left every row `sending`
 /// forever, and the retry refused with "not sendable". A dead owner that had
 /// started the body may have delivered: the row must read
@@ -226,28 +263,42 @@ fn a_dead_owner_mid_body_is_parked_delivery_uncertain_on_retry() {
     let account_id = seed_account(home);
     let draft_id = stranded_draft(home, &account_id, "transmitting");
 
-    let retry = run_cli(
-        home,
-        &[
-            "draft",
-            "send",
-            &draft_id,
-            "--attr",
-            "informational",
-            "--send-now",
-            "--confirm-send-now",
-            "--json",
-        ],
+    let body = assert_uncertain(&draft_send_now(home, &draft_id, true), &draft_id);
+    assert_eq!(body["message_id"], "<stranded@example.test>");
+    assert_eq!(status_of(home, &draft_id), "delivery_uncertain");
+}
+
+/// Without `--json` the exit code is 0 too, so the first line must say the
+/// send was not confirmed.
+#[test]
+fn a_human_readable_uncertain_outcome_says_it_was_not_confirmed() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let account_id = seed_account(home);
+    let draft_id = stranded_draft(home, &account_id, "transmitting");
+
+    let out = draft_send_now(home, &draft_id, false);
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("Send NOT confirmed (status: delivery_uncertain). Do not treat this message as sent."),
+        "stdout: {stdout}"
     );
     assert!(
-        !retry.status.success(),
-        "an uncertain outcome is not a success"
+        stdout.contains(&format!("Draft ID: {draft_id}")),
+        "stdout: {stdout}"
     );
-    let body = json_of(&retry);
-    assert_eq!(body["status"], "delivery_uncertain", "retry output: {body}");
-    assert_eq!(body["draft_id"], draft_id.as_str());
-    assert_eq!(body["retryable"], false);
-    assert_eq!(status_of(home, &draft_id), "delivery_uncertain");
+    assert!(
+        stdout.contains("Message-ID: <stranded@example.test>"),
+        "stdout: {stdout}"
+    );
 }
 
 /// `draft show` alone resolves the stranded row, so a reader never sees a
@@ -368,7 +419,7 @@ fn queue_send(home: &Path, extra: &[&str]) -> Output {
 
 /// Pilot failure: 0 `action_log` rows for 450 operations. A queued send must
 /// leave a receipt carrying the operation id, principal, recipients, payload
-/// digests and outcome, and `draft show` must show the queued body.
+/// digest and outcome, and `draft show` must show the queued body.
 #[test]
 fn a_queued_send_leaves_a_complete_receipt() {
     let temp = tempfile::tempdir().expect("temp HOME");
@@ -402,15 +453,44 @@ fn a_queued_send_leaves_a_complete_receipt() {
         serde_json::json!(["alice@example.test"])
     );
     assert_eq!(body["payload_sha256"].as_str().map(str::len), Some(64));
-    // The Mailroom bench's payload_hash("Crash test", ["alice@example.test"],
-    // "Line one\nLine two"), computed by its Python implementation.
-    assert_eq!(
-        body["semantic_sha256"],
-        "523f0d8bc7e76d999b5ce167fed8429b8e54365cd26984d1b84fc28f5594881e"
-    );
+    assert!(body.get("semantic_sha256").is_none(), "{body}");
 
     let shown = json_of(&run_cli(home, &["draft", "show", &draft_id, "--json"]));
     assert_eq!(shown["content"]["agent_body_text"], "Line one\nLine two");
+}
+
+/// A rerun of a send whose earlier attempt may have been delivered reports
+/// that outcome with exit 0, queued or immediate, and sends nothing.
+#[test]
+fn rerunning_a_send_whose_outcome_is_unknown_reports_it_with_exit_zero() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let queued = json_of(&queue_send(home, &[]));
+    let draft_id = queued["draft_id"].as_str().expect("draft_id").to_string();
+    // What the sweep leaves when the connection drops mid-body.
+    open_db(home)
+        .conn()
+        .execute(
+            "UPDATE drafts SET status = 'delivery_uncertain', send_after = NULL WHERE id = ?1",
+            [&draft_id],
+        )
+        .expect("park draft");
+
+    let queued_rerun = assert_uncertain(&queue_send(home, &[]), &draft_id);
+    assert_eq!(queued_rerun["idempotent_replay"], true);
+    let immediate_rerun = assert_uncertain(
+        &queue_send(home, &["--send-now", "--confirm-send-now"]),
+        &draft_id,
+    );
+    assert_eq!(immediate_rerun["idempotent_replay"], true);
+
+    let rows: i64 = open_db(home)
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts");
+    assert_eq!(rows, 1, "a rerun must not record a second message");
+    assert_eq!(status_of(home, &draft_id), "delivery_uncertain");
 }
 
 /// Rerunning an identical queued send returns the queued draft instead of

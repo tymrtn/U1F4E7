@@ -536,70 +536,6 @@ impl<'a> PayloadFields<'a> {
         };
         Ok(sha256_hex(&serde_json::to_vec(&canon)?))
     }
-
-    fn semantic_sha256(&self) -> String {
-        semantic_sha256(
-            self.subject,
-            &recipient_addresses(self.to, self.cc, self.bcc),
-            self.text.unwrap_or(""),
-        )
-    }
-}
-
-/// `envelope.semantic.v1`: subject, lowercased recipients and text body, with
-/// line endings and trailing whitespace normalized. Message-ID, Date, HTML,
-/// attachments, sender and threading are left out, so it matches the same
-/// content across resends. It is byte-for-byte the Mailroom bench's
-/// `payload_hash` (Python `json.dumps(sort_keys=True)`, ASCII-escaped).
-pub fn semantic_sha256(subject: &str, recipients: &[String], text: &str) -> String {
-    let unix = text.replace("\r\n", "\n");
-    let body = unix
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let body = body.trim_matches('\n');
-    let mut lowered: Vec<String> = recipients.iter().map(|r| r.to_lowercase()).collect();
-    lowered.sort();
-    lowered.dedup();
-    let recipients_json = lowered
-        .iter()
-        .map(|r| python_json_string(r))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let canon = format!(
-        "{{\"recipients\": [{recipients_json}], \"subject\": {}, \"text\": {}}}",
-        python_json_string(subject.trim()),
-        python_json_string(body)
-    );
-    sha256_hex(canon.as_bytes())
-}
-
-/// A JSON string exactly as Python's `json.dumps` writes it with the default
-/// `ensure_ascii=True`.
-fn python_json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units) {
-                    out.push_str(&format!("\\u{unit:04x}"));
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn intent_key_sha256(principal: &str, key: IntentKey<'_>, payload_sha256: &str) -> String {
@@ -833,7 +769,6 @@ impl Database {
         }
         let fields = PayloadFields::of_intent(spec);
         let payload_sha256 = fields.payload_sha256()?;
-        let semantic_sha256 = fields.semantic_sha256();
         let key_sha256 = intent_key_sha256(spec.principal, spec.key, &payload_sha256);
 
         let tx = ImmediateTx::begin(self)?;
@@ -859,7 +794,6 @@ impl Database {
                 "key_kind": spec.key.kind(),
                 "key_sha256": key_sha256,
                 "payload_sha256": payload_sha256,
-                "semantic_sha256": semantic_sha256,
                 "revision": 0,
                 "created_at": now_rfc3339(),
             }),
@@ -1666,7 +1600,6 @@ impl Database {
             draft.bcc_addr.as_deref(),
         );
         let payload_sha256 = fields.payload_sha256()?;
-        let semantic_sha256 = fields.semantic_sha256();
         let attempt = draft
             .metadata
             .as_ref()
@@ -1712,7 +1645,6 @@ impl Database {
             "recipients": recipients,
             "recipient_count": recipients.len(),
             "payload_sha256": payload_sha256,
-            "semantic_sha256": semantic_sha256,
             "key_kind": intent.and_then(|i| i.get("key_kind")).cloned(),
             "evidence": transition.evidence,
         });
@@ -1943,36 +1875,6 @@ mod tests {
     }
 
     // ── Digests ─────────────────────────────────────────────────────────
-
-    /// Vectors from the Mailroom bench's Python `payload_hash`, so a receipt's
-    /// `semantic_sha256` can be compared with what the sink received.
-    #[test]
-    fn semantic_digest_matches_the_bench_vectors() {
-        assert_eq!(
-            semantic_sha256(
-                "Crash test",
-                &["alice@example.test".to_string()],
-                "Line one\nLine two"
-            ),
-            "523f0d8bc7e76d999b5ce167fed8429b8e54365cd26984d1b84fc28f5594881e"
-        );
-        assert_eq!(
-            semantic_sha256(
-                "  Café ☕ 😀 \"q\" \\ ",
-                &[
-                    "Bob@Example.TEST".to_string(),
-                    "alice@example.test".to_string(),
-                    "alice@example.test".to_string()
-                ],
-                "Hé\r\nline two   \r\n\r\n\ttabbed\u{1}\n\n"
-            ),
-            "0d73d64178ac10424d436a455e46ee99c82aa5404d58f9ac0a5c08f0fe61f515"
-        );
-        assert_eq!(
-            semantic_sha256("", &["a@b.c".to_string()], ""),
-            "bb7bfd929993b80ebe337e20a47579c519b1e27589483547ae6e063fc1d2cdce"
-        );
-    }
 
     #[test]
     fn payload_digest_keeps_local_part_case_and_recipient_roles() {

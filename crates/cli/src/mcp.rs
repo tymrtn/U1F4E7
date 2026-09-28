@@ -12,7 +12,7 @@ use crate::commands::authored_body::AuthoredBody;
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
 use crate::commands::governor_gate::{account_domain, governor_request, precheck_attribution};
 use crate::commands::send_attempt::{
-    GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request,
+    GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request, uncertain_outcome,
 };
 use crate::commands::ui;
 use envelope_email_store::{CredentialBackend, Database, Event};
@@ -846,11 +846,10 @@ async fn handle_send(
                 created_by: "mcp",
             };
             let (draft, replay) =
-                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd))
-                    .map_err(|e| send_error_text(&e))?
-                {
-                    Queued::Queued { draft, replay } => (draft, replay),
-                    Queued::Sent(body) => return Ok(body),
+                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd)) {
+                    Ok(Queued::Queued { draft, replay }) => (draft, replay),
+                    Ok(Queued::Sent(body)) => return Ok(body),
+                    Err(e) => return stopped_send(e),
                 };
             return Ok(json!({
                 "sent": false,
@@ -891,14 +890,17 @@ async fn handle_send(
         metadata: json!({}),
         created_by: "mcp",
     };
-    let mut result = crate::commands::send_attempt::send_now(
+    let mut result = match crate::commands::send_attempt::send_now(
         &db,
         &creds,
         &request,
         &AccountConnector::new(&creds),
     )
     .await
-    .map_err(|e| send_error_text(&e))?;
+    {
+        Ok(result) => result,
+        Err(e) => return stopped_send(e),
+    };
     if let Some(map) = result.as_object_mut() {
         map.remove("imap_draft_deleted");
     }
@@ -1292,11 +1294,10 @@ async fn handle_reply(
                 uid,
             );
             let (draft, replay) =
-                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd))
-                    .map_err(|e| send_error_text(&e))?
-                {
-                    Queued::Queued { draft, replay } => (draft, replay),
-                    Queued::Sent(body) => return Ok(body),
+                match queue_request(&db, &creds.account.id, &request, &send_at, Some(cd)) {
+                    Ok(Queued::Queued { draft, replay }) => (draft, replay),
+                    Ok(Queued::Sent(body)) => return Ok(body),
+                    Err(e) => return stopped_send(e),
                 };
             return Ok(json!({
                 "sent": false,
@@ -1329,14 +1330,17 @@ async fn handle_reply(
         folder,
         uid,
     );
-    let mut result = crate::commands::send_attempt::send_now(
+    let mut result = match crate::commands::send_attempt::send_now(
         &db,
         &creds,
         &request,
         &AccountConnector::new(&creds),
     )
     .await
-    .map_err(|e| send_error_text(&e))?;
+    {
+        Ok(result) => result,
+        Err(e) => return stopped_send(e),
+    };
     if let Some(map) = result.as_object_mut() {
         map.remove("imap_draft_deleted");
         map.insert("in_reply_to".into(), json!(headers.in_reply_to));
@@ -1677,7 +1681,7 @@ async fn handle_send_draft(
     // the Governor gate internally before any SMTP, returns structured JSON
     // (safe over the MCP stdio transport), and marks the local draft row sent so
     // a successful send can never leave the local DB at status=draft.
-    let outcome = crate::commands::drafts::send_existing_draft(
+    match crate::commands::drafts::send_existing_draft(
         id,
         account_arg,
         backend,
@@ -1686,8 +1690,10 @@ async fn handle_send_draft(
         agent_context::agent_id_of(ctx),
     )
     .await
-    .map_err(|e| send_error_text(&e))?;
-    Ok(outcome.json)
+    {
+        Ok(outcome) => Ok(outcome.json),
+        Err(e) => stopped_send(e),
+    }
 }
 
 /// Record an agent-attributed audit row for a mutating MCP tool. No-op for
@@ -1750,6 +1756,16 @@ fn attach_audit_warning(result: &mut Value, audit: Result<(), String>) {
         if let Some(items) = warnings.as_array_mut() {
             items.push(json!({"code": "audit_write_failed", "detail": detail}));
         }
+    }
+}
+
+/// The MCP answer for a send that stopped without a confirmed acceptance. A
+/// `delivery_uncertain` outcome is a normal result, as the CLI's exit 0 is:
+/// the agent reads `status` and must not treat the message as sent.
+fn stopped_send(e: anyhow::Error) -> Result<Value, String> {
+    match uncertain_outcome(&e) {
+        Some(body) => Ok(body.clone()),
+        None => Err(send_error_text(&e)),
     }
 }
 

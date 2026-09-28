@@ -2222,6 +2222,16 @@ pub async fn run_send(
         match send_existing_draft(id, account, backend, SendSurface::Cli, &declared, None).await {
             Ok(outcome) => outcome,
             Err(e) => {
+                // An unknown outcome is a result (exit 0): the caller reads
+                // `status` and must not treat the draft as sent.
+                if let Some(body) = super::send_attempt::uncertain_outcome(&e) {
+                    if json {
+                        println!("{body}");
+                    } else {
+                        super::send_attempt::print_uncertain(body);
+                    }
+                    return Ok(());
+                }
                 if json
                     && let Some(not_confirmed) =
                         e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
