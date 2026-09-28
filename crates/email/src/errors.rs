@@ -33,6 +33,19 @@ pub enum SmtpError {
     Send(String),
 }
 
+impl From<crate::smtp_submit::SubmitFailure> for SmtpError {
+    fn from(failure: crate::smtp_submit::SubmitFailure) -> Self {
+        use crate::smtp_submit::SubmitStage;
+        let message = failure.to_string();
+        match failure.stage() {
+            SubmitStage::Connect => Self::Connection(message),
+            SubmitStage::Auth => Self::Auth(message),
+            SubmitStage::Rcpt => Self::RecipientRejected(message),
+            SubmitStage::Mail | SubmitStage::Data | SubmitStage::Body => Self::Send(message),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
     #[error("no candidates found for domain {0}")]

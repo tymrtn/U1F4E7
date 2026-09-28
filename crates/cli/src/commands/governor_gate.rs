@@ -174,18 +174,20 @@ pub(crate) fn precheck_attribution(
     account_id: &str,
     req: &GovernorRequest,
     agent_id: Option<&str>,
-) -> Option<GovernorOutcome> {
+) -> anyhow::Result<Option<GovernorOutcome>> {
     let config = GovernorConfig::smtp();
-    let resolution = req.resolution.as_ref()?;
+    let Some(resolution) = req.resolution.as_ref() else {
+        return Ok(None);
+    };
     if resolution.is_attributed() {
-        return None;
+        return Ok(None);
     }
     // Unattributed / invalid on a bot-originated surface. Produce the canonical
     // refusal via the gate (it does not spawn Governor for a non-attributed
     // request), record it, and block — in required, warn, and off alike.
     let outcome = gate_with_attribution(&config, &req.clone().with_agent_id(agent_id));
-    record_governor_event(db, account_id, req, &outcome, agent_id);
-    Some(outcome)
+    record_governor_event(db, account_id, req, &outcome, agent_id)?;
+    Ok(Some(outcome))
 }
 
 /// Run the Governor gate for an actual-send attempt and persist a sanitized
@@ -195,23 +197,25 @@ pub(crate) fn gate_and_record(
     db: &Database,
     account_id: &str,
     req: &GovernorRequest,
-) -> GovernorOutcome {
+) -> anyhow::Result<GovernorOutcome> {
     gate_and_record_with_agent(db, account_id, req, None)
 }
 
 /// Like [`gate_and_record`], but attributes the gate decision and its audit
 /// event to a specific agent (audit-only; the agent id never widens the gate).
+///
+/// An `Err` means the decision could not be recorded: callers must not send.
 pub(crate) fn gate_and_record_with_agent(
     db: &Database,
     account_id: &str,
     req: &GovernorRequest,
     agent_id: Option<&str>,
-) -> GovernorOutcome {
+) -> anyhow::Result<GovernorOutcome> {
     let config = GovernorConfig::smtp();
     let req = req.clone().with_agent_id(agent_id);
     let outcome = gate_with_attribution(&config, &req);
-    record_governor_event(db, account_id, &req, &outcome, agent_id);
-    outcome
+    record_governor_event(db, account_id, &req, &outcome, agent_id)?;
+    Ok(outcome)
 }
 
 /// Extract a lowercased domain from an account email/username, if present.
@@ -222,13 +226,15 @@ pub(crate) fn account_domain(email: &str) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
+/// Persist the gate decision. Fails loud: a send whose Governor decision left
+/// no audit record must not proceed (`audit_unavailable`).
 fn record_governor_event(
     db: &Database,
     account_id: &str,
     req: &GovernorRequest,
     outcome: &GovernorOutcome,
     agent_id: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     let event_type = if outcome.allowed {
         "send_governor.allowed"
     } else if outcome.is_attribution_failure() {
@@ -256,20 +262,26 @@ fn record_governor_event(
         acked_at: Some(chrono::Utc::now().to_rfc3339()),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let _ = db.insert_event_with_agent(&event, agent_id);
+    db.insert_event_with_agent(&event, agent_id).map_err(|e| {
+        anyhow::anyhow!("audit_unavailable: could not record the Governor decision: {e}")
+    })?;
 
     // Also emit the canonical catalog `governor_blocked` event for a genuine
     // gate block so durable delivery routes can subscribe by its stable wire
     // name. Attribution refusals are protocol errors, not gate blocks, so they
     // are recorded above but do not masquerade as `governor_blocked`.
     if !outcome.allowed && outcome.block_code.as_deref() == Some("governor_blocked") {
-        let _ = db.emit_catalog_event(
+        db.emit_catalog_event(
             account_id,
             envelope_email_store::event_catalog::GOVERNOR_BLOCKED,
             Some(serde_json::json!({ "outcome": outcome.audit_json() })),
             agent_id,
-        );
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("audit_unavailable: could not record the Governor block: {e}")
+        })?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,6 +330,7 @@ mod tests {
     fn precheck_refuses_an_undeclared_send_in_every_build() {
         let db = Database::open_memory().unwrap();
         let refusal = precheck_attribution(&db, "acc1", &cli_request(&db, &[]), None)
+            .unwrap()
             .expect("an undeclared bot send is refused before any side effect");
         assert!(!refusal.allowed);
         assert_eq!(refusal.block_code.as_deref(), Some("attributes_required"));
@@ -330,9 +343,13 @@ mod tests {
     fn gated_send_without_the_governor_feature_records_the_off_verdict() {
         let db = Database::open_memory().unwrap();
         let req = cli_request(&db, &["informational"]);
-        assert!(precheck_attribution(&db, "acc1", &req, None).is_none());
+        assert!(
+            precheck_attribution(&db, "acc1", &req, None)
+                .unwrap()
+                .is_none()
+        );
 
-        let outcome = gate_and_record(&db, "acc1", &req);
+        let outcome = gate_and_record(&db, "acc1", &req).unwrap();
         assert!(outcome.allowed, "attributed send proceeds unscored");
         assert_eq!(outcome.mode, GovernorMode::Off);
         // `disabled`, not `unavailable`: no Governor binary was spawned.

@@ -4,6 +4,9 @@
 use crate::db::Database;
 use crate::errors::{Result, StoreError};
 use crate::models::{Draft, DraftStatus, Event};
+use crate::send_attempts::{
+    AttemptPhase, AttemptStart, ClaimMode, ReleaseBasis, Transition, preserve_server_owned,
+};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -200,6 +203,23 @@ fn safe_token(value: &str) -> bool {
         && value.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
         })
+}
+
+/// Who queued a send, for its receipt and `send_queued` event.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueContext<'a> {
+    pub surface: &'a str,
+    pub agent_id: Option<&'a str>,
+    pub cooldown_seconds: Option<i64>,
+}
+
+impl QueueContext<'_> {
+    /// A queue with no surface of its own to name, for store-level callers.
+    pub const STORE: QueueContext<'static> = QueueContext {
+        surface: "store",
+        agent_id: None,
+        cooldown_seconds: None,
+    };
 }
 
 /// A held provider-sync lease: the opaque owner token plus the status to
@@ -682,50 +702,15 @@ impl Database {
     /// caller did not own. See [`Database::record_sent_draft_recipients`].
     pub fn mark_draft_sent(&self, id: &str, token: &str, message_id: Option<&str>) -> Result<()> {
         // On the terminal `sent` state, `send_after` and the Drafts-folder
-        // `imap_uid` are both cleared:
-        //  - `send_after`: a transmitted draft is no longer scheduled/due, so no
-        //    surface can infer it is still queued (real evidence: a scheduled
-        //    allowed send left `send_after` at the expired timestamp even after
-        //    the row flipped to `sent`). Immediate sends carry no `send_after`,
-        //    so clearing it there is a harmless no-op.
-        //  - `imap_uid` is the IMAP *Drafts*-folder UID; once sent, the provider
-        //    Drafts copy is being cleaned up (the send paths take the cleanup
-        //    identity from the pre-transition in-memory snapshot, not this row),
-        //    so the stored UID is stale. Clearing it keeps `imap_uid`
-        //    Drafts-folder-only and prevents Sent proof from ever being conflated
-        //    with a Drafts UID. Sent-folder proof lives in `metadata.sent_copy`.
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = 'sent', message_id = ?1, operation_token = NULL,
-             send_after = NULL, imap_uid = NULL,
-             sent_at = datetime('now'), updated_at = datetime('now')
-             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
-            params![message_id, id, token],
-        )?;
-        if rows == 0 {
-            return Err(match self.get_draft(id)? {
-                None => StoreError::DraftNotFound(id.to_string()),
-                Some(current) => StoreError::DraftNotEditable(format!(
-                    "{} — only the holder of the `sending` lease can mark this draft sent",
-                    current.status.as_str()
-                )),
-            });
-        }
-
-        // The send is durable from the statement above; everything past it is
-        // cache maintenance. A suggestion cache that could not be written is a
-        // stale dropdown until the next reconcile — reporting it as a send
-        // failure would be far worse, because the callers answer that by
-        // parking the draft as `delivery_uncertain` and telling an operator to
-        // go verify delivery of a message that was, in fact, delivered.
-        if let Err(e) = self.record_sent_draft_recipients(id) {
-            tracing::warn!(
-                draft_id = %id,
-                "draft was sent, but its recipients could not be folded into the \
-                 address history: {e} — they will appear in compose autocomplete \
-                 after the next reconcile"
-            );
-        }
-        Ok(())
+        // `imap_uid` are both cleared: a transmitted draft is no longer due,
+        // and the Drafts-folder UID is stale once the provider copy is being
+        // cleaned up (Sent-folder proof lives in `metadata.sent_copy`).
+        self.finish_attempt_sent(
+            id,
+            token,
+            message_id.unwrap_or(""),
+            serde_json::json!({"kind": "caller_reported"}),
+        )
     }
 
     pub fn discard_draft(&self, id: &str) -> Result<bool> {
@@ -920,16 +905,7 @@ impl Database {
         id: &str,
         expected_revision: i64,
     ) -> Result<Option<String>> {
-        let token = Uuid::new_v4().to_string();
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = 'sending', operation_token = ?3,
-                updated_at = datetime('now')
-             WHERE id = ?1 AND revision = ?2 AND status = 'draft'
-               AND send_after IS NOT NULL
-               AND datetime(send_after) <= datetime('now')",
-            params![id, expected_revision, token],
-        )?;
-        Ok((rows == 1).then_some(token))
+        self.claim_with_anonymous_attempt(id, expected_revision, ClaimMode::Due)
     }
 
     /// Atomically claim a draft for an immediate (CLI/MCP) send.
@@ -947,14 +923,23 @@ impl Database {
         id: &str,
         expected_revision: i64,
     ) -> Result<Option<String>> {
-        let token = Uuid::new_v4().to_string();
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = 'sending', operation_token = ?3,
-                updated_at = datetime('now')
-             WHERE id = ?1 AND revision = ?2 AND status = 'draft'",
-            params![id, expected_revision, token],
-        )?;
-        Ok((rows == 1).then_some(token))
+        self.claim_with_anonymous_attempt(id, expected_revision, ClaimMode::Immediate)
+    }
+
+    /// Claim with an attempt that names no Message-ID of its own and holds no
+    /// owner lock, for callers that manage neither. Transmitting paths use
+    /// [`Self::claim_send_attempt`] instead.
+    fn claim_with_anonymous_attempt(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        mode: ClaimMode,
+    ) -> Result<Option<String>> {
+        let message_id = format!("<{}@envelope.local>", Uuid::new_v4());
+        let start = AttemptStart::new(&message_id, "store", None);
+        Ok(self
+            .claim_send_attempt(id, expected_revision, mode, &start)?
+            .map(|claim| claim.token))
     }
 
     /// Atomically claim a draft for a provider-mailbox sync (`modify_draft`
@@ -1031,6 +1016,8 @@ impl Database {
             obj.remove("human_approval");
             obj.remove("human_send");
         }
+        let stored = self.get_draft(id)?.and_then(|d| d.metadata);
+        preserve_server_owned(stored.as_ref(), &mut sanitized);
         let serialized_meta = serde_json::to_string(&sanitized)?;
         let serialized_attachments = serde_json::to_string(attachments)?;
         let rows = self.conn().execute(
@@ -1177,13 +1164,7 @@ impl Database {
     /// approval or sweep can ever re-send delivered mail. Recovery is an
     /// explicit operator reconciliation (verify delivery, then discard).
     pub fn park_delivery_uncertain(&self, id: &str, token: &str) -> Result<bool> {
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = 'delivery_uncertain', send_after = NULL,
-                operation_token = NULL, updated_at = datetime('now')
-             WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
-            params![id, token],
-        )?;
-        Ok(rows == 1)
+        self.park_attempt_uncertain(id, token, "sent_state_unrecorded", None)
     }
 
     /// Persist a bot's validated attribution declaration onto a queued/scheduled
@@ -1266,8 +1247,13 @@ impl Database {
         expected_revision: i64,
         send_after: &str,
         attribution: &serde_json::Value,
+        context: &QueueContext<'_>,
     ) -> Result<()> {
         let tx = self.conn().unchecked_transaction()?;
+        let from_status = self
+            .get_draft(id)?
+            .map(|d| crate::send_attempts::display_status(&d).to_string())
+            .unwrap_or_default();
         let serialized = serde_json::to_string(attribution)?;
         let rows = self.conn().execute(
             "UPDATE drafts SET
@@ -1293,6 +1279,17 @@ impl Database {
             .get_draft(id)?
             .ok_or_else(|| StoreError::DraftNotFound(id.to_string()))?;
         self.invalidate_current_context_correction(&draft, "non_dashboard_requeue")?;
+        self.write_queued_receipt(id, &from_status, context.surface, context.agent_id)?;
+        self.emit_catalog_event(
+            &draft.account_id,
+            crate::event_catalog::SEND_QUEUED,
+            Some(serde_json::json!({
+                "draft_id": id,
+                "send_after": send_after,
+                "cooldown_seconds": context.cooldown_seconds,
+            })),
+            context.agent_id,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1422,19 +1419,33 @@ impl Database {
         attribution: &serde_json::Value,
     ) -> Result<bool> {
         let serialized = serde_json::to_string(attribution)?;
-        let rows = self.conn().execute(
-            "UPDATE drafts SET
-                status = 'draft', operation_token = NULL,
-                metadata = json_set(
-                    COALESCE(metadata, '{}'),
-                    '$.attribution',
-                    json_set(json(?1), '$.revision', revision)
-                ),
-                updated_at = datetime('now')
-             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
-            params![serialized, id, token],
-        )?;
-        Ok(rows == 1)
+        self.lease_transition(
+            id,
+            token,
+            ReleaseBasis::NotStarted,
+            Transition {
+                to_status: "draft",
+                phase: AttemptPhase::Released,
+                reason: "attribution_retry",
+                retryable: Some(true),
+                evidence: None,
+                agent_id: None,
+            },
+            |metadata| {
+                Ok(self.conn().execute(
+                    "UPDATE drafts SET
+                        status = 'draft', operation_token = NULL,
+                        metadata = json_set(
+                            json(?4),
+                            '$.attribution',
+                            json_set(json(?1), '$.revision', revision)
+                        ),
+                        updated_at = datetime('now')
+                     WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+                    params![serialized, id, token, metadata],
+                )?)
+            },
+        )
     }
 
     /// Park a draft that exhausted its attribution correction attempts.
@@ -1452,19 +1463,33 @@ impl Database {
         attribution: &serde_json::Value,
     ) -> Result<bool> {
         let serialized = serde_json::to_string(attribution)?;
-        let rows = self.conn().execute(
-            "UPDATE drafts SET
-                status = 'pending_review', send_after = NULL, operation_token = NULL,
-                metadata = json_set(
-                    COALESCE(metadata, '{}'),
-                    '$.attribution',
-                    json_set(json(?1), '$.revision', revision)
-                ),
-                updated_at = datetime('now')
-             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
-            params![serialized, id, token],
-        )?;
-        Ok(rows == 1)
+        self.lease_transition(
+            id,
+            token,
+            ReleaseBasis::NotStarted,
+            Transition {
+                to_status: "pending_review",
+                phase: AttemptPhase::Released,
+                reason: "attribution_exhausted",
+                retryable: Some(false),
+                evidence: None,
+                agent_id: None,
+            },
+            |metadata| {
+                Ok(self.conn().execute(
+                    "UPDATE drafts SET
+                        status = 'pending_review', send_after = NULL, operation_token = NULL,
+                        metadata = json_set(
+                            json(?4),
+                            '$.attribution',
+                            json_set(json(?1), '$.revision', revision)
+                        ),
+                        updated_at = datetime('now')
+                     WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+                    params![serialized, id, token, metadata],
+                )?)
+            },
+        )
     }
 
     /// Park a `sending` claim as `pending_review` after a durable Governor
@@ -1497,15 +1522,34 @@ impl Database {
         block: &serde_json::Value,
     ) -> Result<bool> {
         let serialized = serde_json::to_string(block)?;
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = 'pending_review', send_after = NULL,
-                operation_token = NULL,
-                metadata = json_set(COALESCE(metadata, '{}'), '$.send_block', json(?3)),
-                updated_at = datetime('now')
-             WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
-            params![id, token, serialized],
-        )?;
-        Ok(rows == 1)
+        let reason = block
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("send_stopped")
+            .to_string();
+        self.lease_transition(
+            id,
+            token,
+            ReleaseBasis::NotStarted,
+            Transition {
+                to_status: "pending_review",
+                phase: AttemptPhase::Released,
+                reason: &reason,
+                retryable: Some(false),
+                evidence: None,
+                agent_id: None,
+            },
+            |metadata| {
+                Ok(self.conn().execute(
+                    "UPDATE drafts SET status = 'pending_review', send_after = NULL,
+                        operation_token = NULL,
+                        metadata = json_set(json(?4), '$.send_block', json(?3)),
+                        updated_at = datetime('now')
+                     WHERE id = ?1 AND status = 'sending' AND operation_token = ?2",
+                    params![id, token, serialized, metadata],
+                )?)
+            },
+        )
     }
 
     /// Operator-facing stop record when a caller parks without a richer reason.
@@ -1568,13 +1612,28 @@ impl Database {
     /// sends leave the claim through [`Self::mark_draft_sent`] instead — a
     /// transmitted draft must never be released back to due.
     pub fn release_sending_draft(&self, id: &str, token: &str, to: DraftStatus) -> Result<bool> {
-        let rows = self.conn().execute(
-            "UPDATE drafts SET status = ?1, operation_token = NULL,
-                updated_at = datetime('now')
-             WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
-            params![to.as_str(), id, token],
-        )?;
-        Ok(rows == 1)
+        let reason = format!("released_to_{}", to.as_str());
+        self.lease_transition(
+            id,
+            token,
+            ReleaseBasis::NotStarted,
+            Transition {
+                to_status: to.as_str(),
+                phase: AttemptPhase::Released,
+                reason: &reason,
+                retryable: Some(to == DraftStatus::Draft),
+                evidence: None,
+                agent_id: None,
+            },
+            |metadata| {
+                Ok(self.conn().execute(
+                    "UPDATE drafts SET status = ?1, operation_token = NULL, metadata = json(?4),
+                        updated_at = datetime('now')
+                     WHERE id = ?2 AND status = 'sending' AND operation_token = ?3",
+                    params![to.as_str(), id, token, metadata],
+                )?)
+            },
+        )
     }
 
     /// Query drafts that are due for scheduled sending.
@@ -1683,6 +1742,9 @@ impl Database {
             obj.remove("human_approval");
             obj.remove("human_send");
         }
+        let tx = crate::send_attempts::ImmediateTx::begin(self)?;
+        let stored = self.get_draft(id)?.and_then(|d| d.metadata);
+        preserve_server_owned(stored.as_ref(), &mut sanitized);
         let serialized = serde_json::to_string(&sanitized)?;
         // Status guard in the same statement: metadata (threading, contextual
         // state) is part of what gets transmitted, so a claimed
@@ -1700,7 +1762,7 @@ impl Database {
         if rows == 0 {
             return Err(self.classify_guarded_update_miss(id));
         }
-        Ok(())
+        tx.commit()
     }
 
     /// Durably record a sanitized human-approval attestation, compare-and-set
@@ -2213,6 +2275,7 @@ mod tests {
             rev,
             past,
             &bot_attribution(&["financial_content"]),
+            &QueueContext::STORE,
         )
         .unwrap();
 
@@ -2259,6 +2322,7 @@ mod tests {
                 rev + 1,
                 "2000-01-01T00:00:00Z",
                 &bot_attribution(&["financial_content"]),
+                &QueueContext::STORE,
             )
             .unwrap_err();
         assert!(
@@ -2313,6 +2377,7 @@ mod tests {
                 validated_rev,
                 "2000-01-01T00:00:00Z",
                 &bot_attribution(&["financial_content"]),
+                &QueueContext::STORE,
             )
             .unwrap_err();
         assert!(matches!(err, StoreError::DraftModifiedConcurrently(_)));
@@ -2354,6 +2419,7 @@ mod tests {
             rev,
             "2000-01-01T00:00:00Z",
             &bot_attribution(&["informational"]),
+            &QueueContext::STORE,
         )
         .unwrap();
         let reloaded = db.get_draft(&draft.id).unwrap().unwrap();
@@ -2392,6 +2458,7 @@ mod tests {
                 rev,
                 "2000-01-01T00:00:00Z",
                 &bot_attribution(&["informational"]),
+                &QueueContext::STORE,
             )
             .unwrap_err();
         assert!(
@@ -2429,6 +2496,7 @@ mod tests {
                 rev,
                 "2000-01-01T00:00:00Z",
                 &bot_attribution(&["informational"]),
+                &QueueContext::STORE,
             )
             .unwrap_err();
         assert!(
@@ -3191,6 +3259,7 @@ mod tests {
             queued.revision,
             "2030-02-02T00:00:00Z",
             &agent_declaration(queued.revision),
+            &QueueContext::STORE,
         )
         .unwrap();
 
@@ -5571,6 +5640,7 @@ mod tests {
             corrected_again.revision,
             "2030-03-01T00:00:00Z",
             &context_attribution(&["low_stakes"]),
+            &QueueContext::STORE,
         )
         .unwrap();
         assert!(

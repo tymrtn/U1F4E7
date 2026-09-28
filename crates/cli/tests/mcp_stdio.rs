@@ -1123,6 +1123,42 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
     );
 }
 
+/// A send_draft whose earlier attempt may have been delivered returns
+/// `status: "delivery_uncertain"` as a normal result, as the CLI exits 0: the
+/// agent must read `status` and must not treat the draft as sent.
+#[test]
+fn mcp_send_draft_reports_an_unknown_outcome_as_a_result() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let draft_id = create_local_draft(home, "a@b.test");
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .execute(
+            "UPDATE drafts SET status = 'delivery_uncertain' WHERE id = ?1",
+            [&draft_id],
+        )
+        .expect("park draft");
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "send_draft",
+        json!({
+            "draft_id": draft_id,
+            "attributes": ["informational"],
+            "confirm_send": true,
+            "send_now": true,
+            "confirm_send_now": true
+        }),
+    );
+    assert!(!is_error, "expected a non-error result: {payload}");
+    assert_eq!(payload["status"], "delivery_uncertain", "{payload}");
+    assert_eq!(payload["retryable"], false, "{payload}");
+    assert_eq!(payload["error"]["code"], "delivery_uncertain", "{payload}");
+    assert_eq!(payload["draft_id"], draft_id.as_str(), "{payload}");
+}
+
 // ── Wave 3 tools: bulk / thread / rules / watch / snooze ────────────
 
 /// Set a policy with an explicit allow-actions list (comma-separated).

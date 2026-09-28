@@ -35,7 +35,12 @@ impl Database {
     /// Open or create the database at a specific path.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        // synchronous=FULL: a committed send intent, claim or receipt must
+        // survive power loss, not only a process crash. WAL's usual NORMAL
+        // can drop the last commits on an OS crash.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
+        )?;
         crate::migrations::run(&mut conn)?;
         Ok(Self { conn })
     }
