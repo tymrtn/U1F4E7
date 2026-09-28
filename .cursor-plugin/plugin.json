@@ -1,14 +1,14 @@
 {
   "name": "envelope",
-  "version": "1.0.0",
-  "description": "BYO-mailbox email for Cursor agents. Read, search, draft, send, and organize mail against any IMAP/SMTP provider — your mailbox, your domain, not a hosted agent inbox.",
+  "version": "1.0.1",
+  "description": "Add an agent to your email. Don't change your email. Envelope connects to the mailbox you already use — same address, same folders, same habits — so agents can read OTPs, handle replies, run rules, and draft for approval.",
   "author": {
     "name": "Tyler Martin"
   },
-  "homepage": "https://github.com/tymrtn/U1F4E7",
+  "homepage": "https://u1f4e7.com",
   "repository": "https://github.com/tymrtn/U1F4E7",
   "license": "FSL-1.1-ALv2",
-  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "mailbox"],
+  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "mailbox", "otp", "byo", "agent-email"],
   "logo": "assets/logo.svg",
   "skills": "skills/",
   "mcpServers": "mcp.json",

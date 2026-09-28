@@ -41,11 +41,12 @@ envelope inbox --json
 ```bash
 # macOS or Linux: downloads the release binary for your OS and CPU, checks it
 # against the release's SHA-256 file, and installs it to ~/.local/bin (no sudo).
-curl -fsSL https://raw.githubusercontent.com/tymrtn/U1F4E7/main/install.sh | bash
+curl -fsSL https://u1f4e7.com/install.sh | bash
 
 # Homebrew (macOS). The formula builds from source, so Homebrew installs Rust
 # as a build dependency and the first install takes a few minutes.
 brew install tymrtn/u1f4e7/envelope
+# `tymrtn/u1f4e7/u1f4e7` is a live compat alias for the same formula.
 ```
 
 To build it yourself instead:
@@ -321,19 +322,22 @@ For a walkthrough of running multiple agents from one shared inbox with scoped p
 ## Cursor Marketplace plugin
 
 This repo ships a Cursor Plugin that wraps the local stdio MCP server and a
-focused agent skill. The listing pitch is **BYO mailbox / any IMAP** — your
-provider and domain, not a hosted agent inbox. Copy lives in
-[MARKETPLACE.md](MARKETPLACE.md) (category: **Inbox and Collaboration**).
+focused agent skill. The listing pitch is **add an agent to your email —
+don't change your email**: Envelope uses the mailbox you already have, not a
+newly provisioned agent inbox. Copy lives in [MARKETPLACE.md](MARKETPLACE.md)
+(category: **Inbox and Collaboration**). Homepage: [https://u1f4e7.com](https://u1f4e7.com).
 
 **Prerequisite:** the `envelope` binary must be on `PATH` before Cursor starts
-the MCP server. Homebrew installs that binary:
+the MCP server:
 
 ```bash
+curl -fsSL https://u1f4e7.com/install.sh | bash
+# or
 brew install tymrtn/u1f4e7/envelope
 which envelope
 ```
 
-`tymrtn/u1f4e7/u1f4e7` remains a compat alias once the tap PR lands.
+`tymrtn/u1f4e7/u1f4e7` is a live Homebrew compat alias for the same formula.
 
 MCP startup requires an agent token. Create one, then paste it into the plugin
 variable `ENVELOPE_AGENT_TOKEN` (Customize → Plugins → Configure). Never commit
