@@ -486,7 +486,9 @@ describe('SSE wiring — layout refreshes unified on mount', () => {
     await waitFor(() => expect(apiMock.refreshUnifiedInbox).toHaveBeenCalledWith(50));
   });
 
-  it('does not refresh a partial inbox whose reachable caches are fresh', async () => {
+  // #171: an open syncs even when the cache looks fresh; only a sync moments
+  // ago (any tab) is reused. See mailbox-sync-layout.test.ts for the matrix.
+  it('syncs on open even when the reachable caches report fresh', async () => {
     apiMock.unifiedInbox.mockResolvedValue({
       scope: 'unified_inbox', status: 'partial', folder: 'INBOX', limit: 50,
       unread_count: 0, freshness: 'partial',
@@ -494,8 +496,8 @@ describe('SSE wiring — layout refreshes unified on mount', () => {
       errors: [], messages: []
     });
     render(MailLayout, { children: emptyChildren });
-    await waitFor(() => expect(apiMock.unifiedInbox).toHaveBeenCalledWith(50));
-    expect(apiMock.refreshUnifiedInbox).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMock.refreshUnifiedInbox).toHaveBeenCalledWith(50));
+    expect(apiMock.refreshUnifiedInbox).toHaveBeenCalledTimes(1);
   });
 
   it('compose button is present in the list pane header', async () => {

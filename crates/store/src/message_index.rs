@@ -135,8 +135,9 @@ impl Database {
         Ok(())
     }
 
-    /// Record that a mailbox index refresh failed. Cached rows are kept for
-    /// diagnostics but hidden from unified listing while the error is active.
+    /// Record that a mailbox index refresh failed. Cached rows stay listed —
+    /// a failed sync says nothing about them — and the marker is what reports
+    /// them as stale until the next successful refresh clears it.
     ///
     /// The last successful `indexed_at` is preserved: a failed refresh never
     /// overwrites it with the failure time. A mailbox with no prior successful
@@ -171,7 +172,8 @@ impl Database {
     /// One page of cached summaries across accounts, newest first by parsed
     /// date (`date_epoch`), tie-broken by uid then account id so the order is
     /// total and a keyset cursor can continue it exactly. Rows whose account
-    /// has an active index error stay hidden, as before.
+    /// has an active index error are still listed; the per-account freshness
+    /// rows carry the error so callers can label them stale.
     pub fn list_indexed_message_summaries_page(
         &self,
         folder: &str,
@@ -198,10 +200,7 @@ impl Database {
                     ims.date_epoch
              FROM indexed_message_summaries ims
              INNER JOIN accounts a ON a.id = ims.account_id
-             LEFT JOIN message_index_state mis
-               ON mis.account_id = ims.account_id AND mis.folder = ims.folder
              WHERE ims.folder = ?1
-               AND mis.last_error IS NULL
                AND (?5 = 0
                     OR (COALESCE(ims.date_epoch, 0), ims.uid, ims.account_id)
                        < (?6, ?7, ?8))
@@ -261,10 +260,7 @@ impl Database {
                ON df.account_id = ims.account_id
               AND df.folder_type = ?1
               AND df.folder_name = ims.folder
-             LEFT JOIN message_index_state mis
-               ON mis.account_id = ims.account_id AND mis.folder = ims.folder
-             WHERE mis.last_error IS NULL
-               AND (?5 = 0
+             WHERE (?5 = 0
                     OR (COALESCE(ims.date_epoch, 0), ims.uid, ims.account_id)
                        < (?6, ?7, ?8))
              ORDER BY COALESCE(ims.date_epoch, 0) DESC, ims.uid DESC, ims.account_id DESC
@@ -296,7 +292,7 @@ impl Database {
     ) -> Result<Vec<MessageIndexAccountFreshness>> {
         let mut stmt = self.conn().prepare(
             "SELECT a.id, COALESCE(df.folder_name, ?1) AS folder,
-                    CASE WHEN mis.last_error IS NOT NULL THEN 0 ELSE COUNT(ims.uid) END AS message_count,
+                    COUNT(ims.uid) AS message_count,
                     COALESCE(mis.indexed_at, MAX(ims.indexed_at)) AS indexed_at,
                     CASE
                         WHEN mis.last_error IS NOT NULL THEN 'unavailable'
@@ -339,7 +335,7 @@ impl Database {
     ) -> Result<Vec<MessageIndexAccountFreshness>> {
         let mut stmt = self.conn().prepare(
             "SELECT a.id, ?1 AS folder,
-                    CASE WHEN mis.last_error IS NOT NULL THEN 0 ELSE COUNT(ims.uid) END AS message_count,
+                    COUNT(ims.uid) AS message_count,
                     COALESCE(mis.indexed_at, MAX(ims.indexed_at)) AS indexed_at,
                     CASE
                         WHEN mis.last_error IS NOT NULL THEN 'unavailable'
@@ -658,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_marks_cached_mailbox_unavailable_and_hides_rows() {
+    fn failed_refresh_keeps_cached_rows_visible_and_records_the_error() {
         let db = Database::open_memory().unwrap();
         db.test_insert_account_row("acct-failed", "failed@example.test")
             .unwrap();
@@ -693,18 +689,20 @@ mod tests {
         db.record_message_index_error("acct-failed", "INBOX", "IMAP: auth failed")
             .unwrap();
 
-        assert!(
-            db.list_indexed_message_summaries("INBOX", 10)
-                .unwrap()
-                .is_empty()
-        );
+        // A failed sync proves nothing about the cached rows, so they stay
+        // listed (#171): blanking them is how a credential-less sidecar once
+        // turned 703 indexed rows into "Inbox is empty". The error marker is
+        // what tells the caller they are stale.
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.uid, 99);
 
         let freshness = db.list_message_index_account_freshness("INBOX").unwrap();
         let failed = freshness
             .iter()
             .find(|row| row.account_id == "acct-failed")
             .expect("failed account freshness row");
-        assert_eq!(failed.message_count, 0);
+        assert_eq!(failed.message_count, 1);
         assert_eq!(failed.freshness, "unavailable");
         assert_eq!(failed.last_error.as_deref(), Some("IMAP: auth failed"));
         // The last successful index time is preserved, not overwritten with the
@@ -733,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_refresh_clears_prior_error_and_restores_rows() {
+    fn successful_refresh_after_an_error_clears_it_and_replaces_rows() {
         let db = Database::open_memory().unwrap();
         db.test_insert_account_row("acct-recover", "recover@example.test")
             .unwrap();
@@ -755,16 +753,15 @@ mod tests {
         db.upsert_indexed_message_summaries("acct-recover", "INBOX", 123, &[court_row(99)])
             .unwrap();
 
-        // Refresh error hides the row and marks the account unavailable.
+        // A refresh error keeps the cached row listed under the error marker.
         db.record_message_index_error("acct-recover", "INBOX", "fetch INBOX: timeout")
             .unwrap();
-        assert!(
-            db.list_indexed_message_summaries("INBOX", 10)
-                .unwrap()
-                .is_empty()
-        );
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.uid, 99);
 
-        // A later successful refresh clears the error and restores visibility.
+        // A later successful refresh clears the error and replaces the rows
+        // wholesale: the message that left the mailbox (99) is gone.
         db.upsert_indexed_message_summaries("acct-recover", "INBOX", 123, &[court_row(100)])
             .unwrap();
 
@@ -781,5 +778,40 @@ mod tests {
         assert_eq!(recovered.freshness, "fresh");
         assert_eq!(recovered.message_count, 1);
         assert!(recovered.indexed_at.is_some());
+    }
+
+    #[test]
+    fn uidvalidity_reset_replaces_the_mailbox_without_duplicate_rows() {
+        let db = Database::open_memory().unwrap();
+        db.test_insert_account_row("acct-reset", "reset@example.test")
+            .unwrap();
+        let row = |uid: u32, subject: &str| IndexedMessageInput {
+            uid,
+            message_id: Some(format!("<{subject}@example.test>")),
+            from_addr: "sender@example.test".to_string(),
+            to_addr: "reset@example.test".to_string(),
+            subject: subject.to_string(),
+            date: Some("Thu, 09 Jul 2026 08:42:00 +0000".to_string()),
+            flags: vec![],
+            size: 42,
+            snippet: None,
+            thread_id: None,
+        };
+        db.upsert_indexed_message_summaries(
+            "acct-reset",
+            "INBOX",
+            1,
+            &[row(5, "old-five"), row(6, "old-six")],
+        )
+        .unwrap();
+
+        // The server reset UIDVALIDITY and reused UID 5 for a different message.
+        db.upsert_indexed_message_summaries("acct-reset", "INBOX", 2, &[row(5, "new-five")])
+            .unwrap();
+
+        let rows = db.list_indexed_message_summaries("INBOX", 10).unwrap();
+        assert_eq!(rows.len(), 1, "no row from the old UIDVALIDITY survives");
+        assert_eq!(rows[0].uidvalidity, 2);
+        assert_eq!(rows[0].summary.subject, "new-five");
     }
 }

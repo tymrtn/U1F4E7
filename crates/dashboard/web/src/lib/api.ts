@@ -227,19 +227,60 @@ export interface UnifiedNextCursor {
   account_id: string;
 }
 
+/** Per-account cache state in a mailbox view response. `indexed_at` is the
+ *  account's last successful sync; `error` is set while its last sync failed
+ *  (its cached rows are then served as `stale`). */
+export interface UnifiedInboxAccount {
+  account_id: string;
+  account_username: string;
+  account_display_name?: string | null;
+  ok: boolean;
+  message_count?: number;
+  unread_count?: number;
+  freshness: string;
+  indexed_at?: string | null;
+  error?: string | null;
+}
+
+/** What a sync (refresh) request's provider pass did. Only a response that
+ *  carries one may be presented as "synced". */
+export interface SyncReport {
+  target: 'inbox' | 'sent';
+  /** Set when the sync was scoped to one account. */
+  account_id: string | null;
+  status: 'ok' | 'partial' | 'error' | 'empty';
+  started_at: string;
+  finished_at: string;
+  accounts: {
+    account_id: string;
+    account_username: string;
+    ok: boolean;
+    /** True when this request joined a run another caller had started. */
+    joined: boolean;
+    error: string | null;
+  }[];
+}
+
 export interface UnifiedInboxResponse {
-  scope: 'unified_inbox';
+  scope: 'unified_inbox' | 'sent';
   status: string;
   folder: string;
   limit: number;
   messages: UnifiedInboxMessage[];
-  accounts: unknown[];
+  accounts: UnifiedInboxAccount[];
   unread_count: number;
   freshness: string;
   errors?: UnifiedInboxError[];
   /** Present when the page is full: pass back to `unifiedInbox` to continue. */
   next_cursor?: UnifiedNextCursor | null;
+  /** Server time the index was read; a view never regresses to an older one. */
+  generated_at?: string;
+  /** Present only on sync (refresh) responses. */
+  sync?: SyncReport;
 }
+
+/** Options for a sync request: scope it to one account, or sync the view. */
+export type SyncOptions = RequestOptions & { accountId?: string };
 
 export interface FolderMessagesResponse {
   messages: MessageSummary[];
@@ -694,8 +735,15 @@ export const api = {
     });
   },
 
-  refreshUnifiedInbox(limit = 50, o?: RequestOptions): Promise<UnifiedInboxResponse> {
-    return request('/messages/unified/refresh', { ...o, method: 'POST', query: { limit } });
+  /** Read-only provider sync of the Inbox view (every account, or one via
+   *  `accountId`), answered with the refreshed cached view. */
+  refreshUnifiedInbox(limit = 50, o?: SyncOptions): Promise<UnifiedInboxResponse> {
+    const { accountId, ...rest } = o ?? {};
+    return request('/messages/unified/refresh', {
+      ...rest,
+      method: 'POST',
+      query: { limit, account_id: accountId }
+    });
   },
 
   /**
@@ -720,8 +768,14 @@ export const api = {
     });
   },
 
-  refreshSentInbox(limit = 50, o?: RequestOptions): Promise<UnifiedInboxResponse> {
-    return request('/messages/sent/refresh', { ...o, method: 'POST', query: { limit } });
+  /** Read-only provider sync of the Sent view; same contract as the Inbox. */
+  refreshSentInbox(limit = 50, o?: SyncOptions): Promise<UnifiedInboxResponse> {
+    const { accountId, ...rest } = o ?? {};
+    return request('/messages/sent/refresh', {
+      ...rest,
+      method: 'POST',
+      query: { limit, account_id: accountId }
+    });
   },
 
   folderMessages(

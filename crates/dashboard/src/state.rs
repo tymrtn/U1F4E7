@@ -16,6 +16,7 @@ use envelope_email_transport::imap;
 
 use crate::auth::AuthConfig;
 use crate::events::EventBus;
+use crate::mailbox_sync::{AccountSyncer, SyncFlights, SyncLimits};
 
 /// Shared application state injected into every handler.
 #[derive(Clone)]
@@ -30,6 +31,12 @@ pub struct AppState {
     /// Real-time event bus fanned out to `GET /api/events/stream` subscribers.
     /// Cloneable and cheap; publishing when there are no subscribers is a no-op.
     pub events: EventBus,
+    /// In-progress provider syncs, so concurrent requests share one run.
+    pub sync_flights: Arc<SyncFlights>,
+    /// Provider work behind every mailbox sync (read-only IMAP in production).
+    pub syncer: AccountSyncer,
+    /// Fan-out bounds for a sync pass.
+    pub sync_limits: SyncLimits,
 }
 
 impl AppState {
@@ -40,7 +47,23 @@ impl AppState {
             backend,
             auth: AuthConfig::disabled(),
             events: EventBus::new(),
+            sync_flights: Arc::new(SyncFlights::default()),
+            syncer: crate::mailbox_sync::imap_syncer(),
+            sync_limits: SyncLimits::default(),
         }
+    }
+
+    /// Replace the provider syncer (builder style). Tests use this to exercise
+    /// the sync orchestration without a mailbox or credential store.
+    pub fn with_syncer(mut self, syncer: AccountSyncer) -> Self {
+        self.syncer = syncer;
+        self
+    }
+
+    /// Override the sync fan-out bounds (builder style).
+    pub fn with_sync_limits(mut self, limits: SyncLimits) -> Self {
+        self.sync_limits = limits;
+        self
     }
 
     /// Attach a resolved authentication policy (builder style).
