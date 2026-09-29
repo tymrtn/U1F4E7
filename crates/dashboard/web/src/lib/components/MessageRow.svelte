@@ -96,6 +96,9 @@
   // ── Context menu (#172) ──────────────────────────────────────────────
   const contextMenu = getContextMenu();
   const menuOpen = $derived(contextMenu.current?.key === message.key ? contextMenu.current : null);
+  // Null-safe: the menu's props can be read once more after the store closes,
+  // before the {#if} below tears it down.
+  const menuPoint = $derived(menuOpen ? { x: menuOpen.x, y: menuOpen.y } : null);
   const canMenu = $derived(hasHandle || (verbs && !!message.snooze));
   const scopeNote = $derived(
     isSelected && selection.count > 1
@@ -438,10 +441,10 @@
       context={message.snooze
         ? { folder: target.folder, read: null, flagged: null, snoozeId: message.snooze.id }
         : { folder: target.folder, read: isRead, flagged }}
-      at={{ x: menuOpen.x, y: menuOpen.y }}
+      at={menuPoint}
       openHref={message.href}
       {scopeNote}
-      returnFocus={menuOpen.returnFocus}
+      returnFocus={menuOpen?.returnFocus ?? null}
       onclose={closeContextMenu}
     />
   {/if}
