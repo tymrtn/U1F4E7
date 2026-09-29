@@ -1772,7 +1772,27 @@ fn mcp_governor_catalog_is_always_allowed_and_weight_free() {
     let (token, _id) = create_agent(temp.path(), "reader");
     set_policy(temp.path(), "reader", "inbox.read", "draft-only");
 
-    let (resp, is_error) = tool_call(temp.path(), Some(&token), "governor_catalog", json!({}));
+    // Default: the compact declarable projection, equally weight-free.
+    let (compact, is_error) = tool_call(temp.path(), Some(&token), "governor_catalog", json!({}));
+    assert!(
+        !is_error,
+        "governor_catalog must be always allowed: {compact}"
+    );
+    assert_eq!(compact["protocol"], "envelope.attribution.v1");
+    assert_eq!(compact["provenance"], "declarable");
+    assert_eq!(compact["attributes"].as_array().unwrap().len(), 9);
+    let text = serde_json::to_string(&compact).unwrap();
+    assert!(!text.contains("weight"));
+    assert!(!text.contains("\"score\""));
+    assert!(!text.contains("threshold"));
+    assert!(!text.contains("tyler_approved"));
+
+    let (resp, is_error) = tool_call(
+        temp.path(),
+        Some(&token),
+        "governor_catalog",
+        json!({"full": true}),
+    );
     assert!(!is_error, "governor_catalog must be always allowed: {resp}");
     assert_eq!(resp["protocol"], "envelope.attribution.v1");
     assert_eq!(resp["catalog_version"], 1);
@@ -2078,4 +2098,105 @@ fn real_send_responses_conform_to_published_contract_schema() {
         errs.is_empty(),
         "real refusal `send` response drifted from the published schema: {errs:?}\n{refusal}"
     );
+}
+
+/// Put a fake `tailscale` first on PATH whose Serve status publishes the
+/// dashboard on a tailnet host, so the real origin resolver in the MCP process
+/// returns a tailnet origin. Returns the PATH value to hand the MCP server.
+#[cfg(unix)]
+fn fake_tailscale_path(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("tailscale");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+if [ "$1" = serve ]; then
+  printf '%s' '{"TCP":{"443":{"HTTPS":true}},"Web":{"leaky-host.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3141"}}}}}'
+else
+  printf '%s' '{"Self":{"DNSName":"leaky-host.example-tailnet.ts.net."}}'
+fi
+"#,
+    )
+    .expect("write fake tailscale");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailscale");
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// MCP results reach third-party model providers. By default they carry no
+/// dashboard link blocks and no tailnet origin anywhere (including top-level
+/// URL fields such as a draft's `dashboard_url`), even when the host's
+/// Tailscale Serve route is live. `include_ui_links: true` restores the links.
+#[cfg(unix)]
+#[test]
+fn mcp_default_output_never_carries_a_tailnet_dashboard_origin() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let draft_id = create_local_draft(home, "a@b.test");
+    let bin = tempfile::tempdir().expect("fake tailscale dir");
+    let path = fake_tailscale_path(bin.path());
+    let env = [("PATH", path.as_str())];
+
+    for (tool, args) in [
+        ("accounts", json!({})),
+        ("get_draft", json!({"draft_id": draft_id})),
+    ] {
+        let (payload, is_error) = tool_call_env(home, None, tool, args.clone(), &env);
+        assert!(!is_error, "{tool} failed: {payload}");
+        let text = payload.to_string();
+        assert!(
+            !text.contains("ts.net"),
+            "{tool}: default MCP output must not name the host's tailnet: {text}"
+        );
+        assert!(
+            !text.contains("\"ui\""),
+            "{tool}: default MCP output must omit ui blocks: {text}"
+        );
+
+        let mut linked_args = args;
+        linked_args["include_ui_links"] = json!(true);
+        let (linked, is_error) = tool_call_env(home, None, tool, linked_args, &env);
+        assert!(!is_error, "{tool} with links failed: {linked}");
+        let row = if linked.is_array() {
+            &linked[0]
+        } else {
+            &linked
+        };
+        assert_eq!(
+            row["ui"]["dashboard_url"], "https://leaky-host.example-tailnet.ts.net",
+            "{tool}: include_ui_links keeps today's discovered links: {linked}"
+        );
+    }
+}
+
+/// Tool results are compact JSON: indentation is pure token cost for a model.
+#[test]
+fn mcp_tool_result_text_is_compact_json() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    write_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "governor_catalog", "arguments": {}}
+        }),
+    );
+    let resp = read_message(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait mcp");
+
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let parsed: Value = serde_json::from_str(text).expect("result text is JSON");
+    assert_eq!(text, serde_json::to_string(&parsed).unwrap());
 }

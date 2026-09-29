@@ -101,10 +101,7 @@ pub fn description_of(key: &str) -> Option<&'static str> {
 /// The declarable-only key set (author-context facts the host cannot observe),
 /// in catalog order.
 pub fn declarable_keys() -> Vec<String> {
-    catalog_keys()
-        .into_iter()
-        .filter(|k| provenance_of(k) == Some(Provenance::Declarable))
-        .collect()
+    declarable_attributes().map(|a| a.key.clone()).collect()
 }
 
 /// The full set of keys an agent MAY submit in `attributes`, in catalog order:
@@ -175,6 +172,31 @@ pub fn envelope_projection() -> Value {
         },
         "rules": HONESTY_RULES,
     })
+}
+
+/// The compact discovery projection the MCP `governor_catalog` tool returns by
+/// default: only the keys an agent may declare, each with its one-line meaning.
+/// Host-derived and attestation keys are left to [`envelope_projection`].
+pub fn declarable_projection() -> Value {
+    let attributes: Vec<Value> = declarable_attributes()
+        .map(|a| json!({ "key": a.key, "description": a.description }))
+        .collect();
+    json!({
+        "protocol": ATTRIBUTION_PROTOCOL,
+        "catalog": CATALOG_NAME,
+        "catalog_version": catalog_version(),
+        "provenance": "declarable",
+        "attributes": attributes,
+        "host_derived": "Structural keys (reply/attachments/recipients/history/domain) are also accepted, only when Envelope observes them true; governor_catalog with full=true lists every key.",
+        "rules": HONESTY_RULES,
+    })
+}
+
+/// The declarable catalog attributes, in catalog order.
+pub fn declarable_attributes() -> impl Iterator<Item = &'static CatalogAttr> {
+    catalog_attributes()
+        .iter()
+        .filter(|a| provenance_of(&a.key) == Some(Provenance::Declarable))
 }
 
 /// A short declaration note for the discovery projection, for host-derived and

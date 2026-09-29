@@ -3,13 +3,17 @@
 
 //! Ambient dashboard UI metadata for agent-facing JSON outputs.
 //!
-//! Every CLI/MCP JSON response that has account/draft/message/rule context
+//! Every CLI JSON response that has account/draft/message/rule context
 //! should carry a `ui` object so Envelopie/Hermes/Codex can hand Tyler the
-//! relevant dashboard URL without reconstructing it.
+//! relevant dashboard URL without reconstructing it. MCP results drop these
+//! blocks unless the call passes `include_ui_links: true` (see `mcp.rs`).
 //!
 //! Agent-facing origins are discovered from an active local Tailscale Serve
 //! route to Envelope's loopback dashboard. A stale configured hostname does not
 //! prove the service is still reachable, so it is never used for these links.
+//! The MCP server switches discovery off for calls that did not ask for links,
+//! because its output goes to a model provider and a tailnet name identifies
+//! the host.
 //!
 //! Helpers never emit secrets — only account ids, draft ids, message UIDs
 //! and folder/query names go into URLs, and folder/draft values are
@@ -22,6 +26,7 @@ use serde_json::{Value, json};
 use std::io::Read;
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(test))]
 use std::time::Duration;
 use tracing::warn;
@@ -47,6 +52,16 @@ struct ResolvedDashboardOrigin {
     dashboard_origin_warning: Option<String>,
 }
 
+/// Whether origin discovery may consult Tailscale. Always true for the CLI;
+/// the MCP server sets it per tool call from `include_ui_links`.
+static TAILNET_ORIGIN_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+/// Allow or forbid Tailscale discovery for the links built from now on. When
+/// forbidden, every link uses the localhost origin.
+pub(crate) fn allow_tailnet_origin(allowed: bool) {
+    TAILNET_ORIGIN_ALLOWED.store(allowed, Ordering::Relaxed);
+}
+
 /// Resolve the dashboard origin from current local Tailscale state. Only a live
 /// Tailscale Serve route to Envelope's loopback listener can produce a
 /// non-local origin.
@@ -55,6 +70,10 @@ pub fn dashboard_base() -> String {
 }
 
 fn dashboard_origin() -> ResolvedDashboardOrigin {
+    if !TAILNET_ORIGIN_ALLOWED.load(Ordering::Relaxed) {
+        return localhost_origin(None);
+    }
+
     #[cfg(test)]
     {
         // Unit tests exercise the pure parser below; never require a local

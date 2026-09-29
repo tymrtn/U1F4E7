@@ -112,6 +112,11 @@
             "description": "IMAP folder name",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "limit": {
             "default": 25,
             "description": "Maximum messages to return",
@@ -140,6 +145,11 @@
             "description": "IMAP folder",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "uid": {
             "description": "Message UID",
             "type": "integer"
@@ -166,6 +176,11 @@
             "default": "INBOX",
             "description": "IMAP folder",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           },
           "limit": {
             "default": 25,
@@ -195,7 +210,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v3",
-      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -225,7 +240,7 @@
             "type": "array"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -306,6 +321,11 @@
             "minLength": 1,
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "reply_to": {
             "description": "Reply-To address",
             "type": "string"
@@ -346,7 +366,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v3",
-      "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
+      "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -376,7 +396,7 @@
             "type": "array"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -450,6 +470,11 @@
             "minLength": 1,
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "reply_all": {
             "default": false,
             "description": "Reply to all recipients",
@@ -487,7 +512,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v3",
-      "description": "Read-only discovery of the Governor attribution catalog agents declare against: key, description, category, provenance (declarable/host_derived/requires_attestation), and declaration guidance. No weights, thresholds, or scores; no mailbox access; always authorized even under a deny-by-default policy. Use it to learn which `attributes` to declare on send/reply/send_draft.",
+      "description": "Read-only discovery of the Governor attribution catalog agents declare against. By default returns the declarable keys with their meanings (the same list the send/reply/send_draft attributes parameter carries); full=true returns every key with category, provenance (declarable/host_derived/requires_attestation), and declaration guidance. No weights, thresholds, or scores; no mailbox access; always authorized even under a deny-by-default policy.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -495,6 +520,11 @@
             "default": "envelope",
             "description": "Governor catalog to project (only 'envelope' is vendored)",
             "type": "string"
+          },
+          "full": {
+            "default": false,
+            "description": "Return every catalog key with category, provenance, and declaration guidance instead of only the declarable keys",
+            "type": "boolean"
           }
         },
         "required": [],
@@ -543,6 +573,11 @@
           "html": {
             "description": "Initial agent-authored HTML body",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           },
           "reply_all": {
             "default": false,
@@ -606,6 +641,11 @@
           "include_attachments": {
             "default": false,
             "description": "Forward original source-message attachments into the new draft",
+            "type": "boolean"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "to": {
@@ -677,6 +717,11 @@
             "description": "Replacement agent-authored HTML body",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "remove_attach": {
             "items": {
               "description": "Stored attachment filename to remove",
@@ -716,6 +761,11 @@
           "draft_id": {
             "description": "Local draft id",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           }
         },
         "required": [
@@ -727,7 +777,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v3",
-      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+      "description": "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; the attributes parameter lists them). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -736,7 +786,7 @@
             "type": "string"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -795,6 +845,11 @@
             "description": "Local draft id",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "send_now": {
             "default": false,
             "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now",
@@ -823,6 +878,11 @@
             "default": "INBOX",
             "description": "Source folder",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           },
           "to_folder": {
             "description": "Destination folder",
@@ -868,6 +928,11 @@
             "description": "IMAP folder",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "uid": {
             "description": "Message UID",
             "type": "integer"
@@ -891,6 +956,11 @@
           "account": {
             "description": "Account ID or email address",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           }
         },
         "required": [],
@@ -912,6 +982,11 @@
             "default": "INBOX",
             "description": "IMAP folder",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           },
           "scores": {
             "additionalProperties": {
@@ -963,6 +1038,11 @@
             "description": "Contact email address",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "name": {
             "description": "Contact name",
             "type": "string"
@@ -988,7 +1068,13 @@
       "description": "List configured email accounts.",
       "inputSchema": {
         "additionalProperties": false,
-        "properties": {},
+        "properties": {
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          }
+        },
         "required": [],
         "type": "object"
       },
@@ -1107,6 +1193,11 @@
             "description": "IMAP folder to preview",
             "type": "string"
           },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
+          },
           "limit": {
             "default": 25,
             "description": "Maximum messages to evaluate",
@@ -1139,6 +1230,11 @@
             "default": "INBOX",
             "description": "IMAP folder to run rules against",
             "type": "string"
+          },
+          "include_ui_links": {
+            "default": false,
+            "description": "Add dashboard links",
+            "type": "boolean"
           },
           "limit": {
             "default": 25,
@@ -1925,7 +2021,7 @@
             "type": "array"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -2204,7 +2300,7 @@
             "type": "string"
           },
           "ui": {
-            "description": "Dashboard navigation links (draft or account view)",
+            "description": "Dashboard navigation links (draft or account view); MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "warnings": {
@@ -2820,7 +2916,7 @@
             "type": "array"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -2968,7 +3064,7 @@
             "type": "string"
           },
           "draft_ui": {
-            "description": "Dashboard review links for the draft",
+            "description": "Dashboard review links for the draft; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "error": {
@@ -2998,7 +3094,7 @@
             ]
           },
           "parent_ui": {
-            "description": "Dashboard links for the parent message when replying",
+            "description": "Dashboard links for the parent message when replying; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "provider_sent_copy": {
@@ -3085,7 +3181,7 @@
             "type": "string"
           },
           "ui": {
-            "description": "Dashboard navigation links",
+            "description": "Dashboard navigation links; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "warnings": {
@@ -3382,7 +3478,7 @@
             "type": "string"
           },
           "attributes": {
-            "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery.",
+            "description": "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:\n- informational: Message is purely informational (status update, FYI)\n- scheduling: Message concerns ordinary scheduling or a calendar invitation\n- agent_drafted: Content was entirely drafted by an AI agent\n- has_pii: Message contains personally identifiable information\n- uncited_claims: Message contains factual claims without sources\n- financial_content: Message discusses money, invoices, or payments\n- legal_content: Message has legal implications\n- commitment_language: Message makes promises or commitments on the human's behalf\n- low_stakes: A mistaken invitation would be trivial to correct\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help.",
             "items": {
               "enum": [
                 "reply_to_thread",
@@ -3494,7 +3590,7 @@
             "type": "string"
           },
           "draft_ui": {
-            "description": "Dashboard review links for the draft",
+            "description": "Dashboard review links for the draft; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "error": {
@@ -3524,7 +3620,7 @@
             ]
           },
           "parent_ui": {
-            "description": "Dashboard links for the parent message when replying",
+            "description": "Dashboard links for the parent message when replying; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "provider_sent_copy": {
@@ -3611,7 +3707,7 @@
             "type": "string"
           },
           "ui": {
-            "description": "Dashboard navigation links",
+            "description": "Dashboard navigation links; MCP includes them only with include_ui_links=true",
             "type": "object"
           },
           "warnings": {
@@ -3640,6 +3736,11 @@
             "default": "envelope",
             "description": "Governor catalog to project (only 'envelope' is vendored)",
             "type": "string"
+          },
+          "full": {
+            "default": false,
+            "description": "Return every catalog key with category, provenance, and declaration guidance instead of only the declarable keys",
+            "type": "boolean"
           }
         },
         "required": [],
@@ -3651,7 +3752,7 @@
       },
       "name": "governor_catalog",
       "output_schema": {
-        "description": "Vendored weight-free Envelope catalog projection: protocol, catalog_version, attributes[{key, category, provenance, description, note?}], declaration guidance, and honesty rules. Never contains a weight, threshold, or score.",
+        "description": "Vendored weight-free Envelope catalog projection. Default: protocol, catalog, catalog_version, provenance=declarable, attributes[{key, description}] for the declarable keys, a host_derived note, and honesty rules. full=true: protocol, catalog_version, attributes[{key, category, provenance, description, note?}], declaration guidance, and honesty rules. Never contains a weight, threshold, or score.",
         "type": "object"
       },
       "stability": "stable-v1"

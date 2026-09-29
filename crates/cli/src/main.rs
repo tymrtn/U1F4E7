@@ -3107,7 +3107,21 @@ mod tests {
             .find(|tool| tool["name"] == "inbox")
             .expect("inbox MCP tool");
         let contract_inbox = commands::contract::surface("inbox").expect("inbox contract surface");
-        assert_eq!(inbox["inputSchema"], contract_inbox["input_schema"]);
+        // The one MCP-only input: dashboard links are opt-in on the agent surface.
+        let mut mcp_input = inbox["inputSchema"].clone();
+        let links = mcp_input["properties"]
+            .as_object_mut()
+            .expect("inbox properties")
+            .remove("include_ui_links");
+        assert_eq!(
+            links,
+            Some(serde_json::json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Add dashboard links"
+            }))
+        );
+        assert_eq!(mcp_input, contract_inbox["input_schema"]);
     }
 
     #[test]
