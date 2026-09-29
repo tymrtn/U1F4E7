@@ -446,3 +446,20 @@ describe('sync keeps user context and drops stale handles', () => {
     expect(document.querySelectorAll('#unified-msg-list > li')).toHaveLength(1);
   });
 });
+
+describe('right-click menu (#172)', () => {
+  it('closes when the route changes', async () => {
+    const { getContextMenu } = await import('$lib/context-menu.svelte');
+    apiMock.unifiedInbox.mockResolvedValue(viewOf([row('acct-a', 1, 'one')]));
+    apiMock.refreshUnifiedInbox.mockResolvedValue(viewOf([row('acct-a', 1, 'one')]));
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(listText()).toContain('one'));
+    const link = document.querySelector('[data-msg-key="acct-a:1"] a.msg-body')!;
+    link.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 50, clientY: 50 }));
+    await waitFor(() => expect(document.querySelector('.msg-context-menu')).toBeTruthy());
+    pageState.params = { box: 'unified', account: 'acct-a', uid: '1' };
+    pageState.url = new URL('http://localhost/v2/mail/unified/acct-a/1') as typeof pageState.url;
+    await waitFor(() => expect(document.querySelector('.msg-context-menu')).toBeNull());
+    expect(getContextMenu().current).toBeNull();
+  });
+});
