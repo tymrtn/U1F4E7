@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EnvelopeApiError, api, request, resetCsrf } from './api';
+import { EnvelopeApiError, api, bulkClient, request, resetCsrf } from './api';
 
 type FetchCall = [RequestInfo | URL, RequestInit?];
 
@@ -296,6 +296,30 @@ describe('api.snoozeMessage()', () => {
       return_at: '2026-08-09T09:00:00',
       message_id: '<m@x>',
       subject: 'Hi'
+    });
+  });
+});
+
+describe('bulkClient identity guards (#170)', () => {
+  it('forwards each item’s UIDVALIDITY and Message-ID so a stale handle is refused', async () => {
+    resetCsrf();
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url).includes('/api/csrf')) return jsonResponse({ token: 'tok' });
+      return jsonResponse({ ok: true });
+    });
+    await bulkClient(
+      { type: 'flags', add: ['\\Seen'] },
+      [{ accountId: 'a', uid: 3, folder: 'Receipts', uidvalidity: 77, messageId: '<m@x>' }],
+      undefined,
+      fetchImpl as unknown as typeof fetch
+    );
+    const call = fetchCalls(fetchImpl).find(([u]) => String(u).includes('/messages/3/flags'))!;
+    expect(JSON.parse(String(call[1]!.body))).toEqual({
+      folder: 'Receipts',
+      add: ['\\Seen'],
+      remove: [],
+      uidvalidity: 77,
+      message_id: '<m@x>'
     });
   });
 });

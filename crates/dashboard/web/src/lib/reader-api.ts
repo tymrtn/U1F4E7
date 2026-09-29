@@ -10,6 +10,7 @@
 //   GET  /api/accounts/{id}/threads/{message_id}      → ThreadResponse          (threads.rs show_by_message_id)
 //   GET  /api/accounts/{id}/messages/{uid}/attachments/{filename}?folder= → binary (attachments.rs download)
 
+import { hasFlag } from './flags';
 import { request, type MessageDetail, type RequestOptions } from './api';
 
 // ── Additional attachment type ────────────────────────────────────────
@@ -236,7 +237,8 @@ export function normalizeMessageId(messageId: string): string {
   return messageId.trim().replace(/^<+/, '').replace(/>+$/, '').trim();
 }
 
-/** Return true when the flags array contains \\Seen. Case-insensitive. */
+/** Return true when the flags array contains \\Seen, in the wire (`\\Seen`)
+ *  or index (`Seen`) spelling. Case-insensitive. */
 export function isSeen(flags: string[]): boolean {
-  return flags.some((f) => f.toLowerCase() === '\\seen');
+  return hasFlag(flags, 'seen');
 }

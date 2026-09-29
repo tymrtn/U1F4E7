@@ -2572,6 +2572,94 @@ pub async fn delete_message(
     Ok(())
 }
 
+/// What the server holds at one `(folder, UID)` right now, read before a
+/// single-message mutation so the caller can refuse to act on a stale handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UidProbe {
+    /// UIDVALIDITY of `folder` as reported by SELECT.
+    pub uid_validity: Option<u32>,
+    /// Current flags (index spelling, e.g. `"Seen"`); `None` when the UID is
+    /// not in the mailbox (moved, expunged, or never existed).
+    pub flags: Option<Vec<String>>,
+    /// Message-ID of the message at that UID, brackets stripped.
+    pub message_id: Option<String>,
+}
+
+impl UidProbe {
+    pub fn exists(&self) -> bool {
+        self.flags.is_some()
+    }
+}
+
+/// SELECT `folder` and read the FLAGS and Message-ID of exactly `uid`.
+///
+/// `UID STORE`/`UID COPY` against a UID that is no longer in the mailbox are
+/// silent no-ops on most servers, so a mutation that skips this probe reports
+/// success for a change that never happened. The header read is
+/// `BODY.PEEK`, so probing never sets `\Seen`.
+pub async fn probe_uid(
+    client: &mut ImapClient,
+    folder: &str,
+    uid: u32,
+) -> Result<UidProbe, ImapError> {
+    let selected = select_folder_info(client, folder).await?;
+    let fetches: Vec<async_imap::types::Fetch> = client
+        .session
+        .uid_fetch(
+            uid.to_string(),
+            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid} FLAGS: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    let found = fetches.iter().find(|fetch| fetch.uid == Some(uid));
+    Ok(UidProbe {
+        uid_validity: selected.uid_validity,
+        flags: found.map(|fetch| fetch.flags().map(|f| format!("{f:?}")).collect()),
+        message_id: found
+            .and_then(|fetch| fetch.header())
+            .and_then(parse_message_id_from_header_section),
+    })
+}
+
+/// Find the one message in `folder` with UID ≥ `first_uid` whose Message-ID
+/// equals `message_id` exactly, by FETCHing headers rather than SEARCHing.
+///
+/// Some servers (Migadu, measured) answer `SEARCH HEADER` from an index that
+/// lags a just-completed COPY by seconds, so a message moved a moment ago is
+/// "not found". FETCH reads the mailbox itself. `first_uid` bounds the scan:
+/// pass the destination's UIDNEXT captured before a move to read only what
+/// the move added, or 1 to scan a small folder (Snoozed) whole. Zero or several
+/// exact matches return `None`.
+pub async fn find_unique_uid_by_message_id_from(
+    client: &mut ImapClient,
+    folder: &str,
+    message_id: &str,
+    first_uid: u32,
+) -> Result<Option<u32>, ImapError> {
+    let selected = select_folder_info(client, folder).await?;
+    if selected.exists == 0 {
+        return Ok(None);
+    }
+    let range = format!("{}:*", first_uid.max(1));
+    let headers = fetch_message_headers_selected_uid_set(client, folder, &range).await?;
+    Ok(unique_uid_from(&headers, message_id, first_uid))
+}
+
+/// Pure part of [`find_unique_uid_by_message_id_from`]. `n:*` returns the
+/// highest message even when `n` is past it, so UIDs below `first_uid` are
+/// dropped before the exact Message-ID comparison.
+pub fn unique_uid_from(headers: &[MessageHeader], message_id: &str, first_uid: u32) -> Option<u32> {
+    let candidates: Vec<(u32, Option<String>)> = headers
+        .iter()
+        .filter(|h| h.uid >= first_uid)
+        .map(|h| (h.uid, h.message_id.clone()))
+        .collect();
+    select_unique_exact_message_id(&candidates, message_id)
+}
+
 /// Set a flag on a message by UID.
 pub async fn set_flag(
     client: &mut ImapClient,
@@ -4207,5 +4295,21 @@ Subject: hi\r\n\r\nbody\r\n";
             .expect_err("an empty FETCH reply must not read as no header");
         assert!(matches!(err, ImapError::NotFound(7)), "{err:?}");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn unique_uid_from_ignores_uids_below_the_floor_and_requires_one_exact_match() {
+        let h = |uid: u32, mid: Option<&str>| MessageHeader {
+            uid,
+            message_id: mid.map(str::to_string),
+            size: None,
+        };
+        // `n:*` past the end returns the last message: it must not match.
+        let past_end = [h(40, Some("m@x"))];
+        assert_eq!(unique_uid_from(&past_end, "<m@x>", 41), None);
+        let moved = [h(41, Some("other@x")), h(42, Some("m@x"))];
+        assert_eq!(unique_uid_from(&moved, "<m@x>", 41), Some(42));
+        let dup = [h(41, Some("m@x")), h(42, Some("m@x"))];
+        assert_eq!(unique_uid_from(&dup, "m@x", 1), None);
     }
 }

@@ -96,7 +96,7 @@ pub fn detect_provider(folders: &[String]) -> ProviderType {
 
     let has_exchange_markers = folders
         .iter()
-        .any(|f| f == "Deleted Items" || f == "Junk E-mail");
+        .any(|f| f == "Deleted Items" || f == "Junk E-mail" || f == "Junk Email");
     if has_exchange_markers {
         return ProviderType::Exchange;
     }
@@ -266,6 +266,8 @@ pub fn all_candidates_for(canonical_type: &str) -> &'static [&'static str] {
             "Spam",
             "[Gmail]/Spam",
             "Junk E-mail",
+            // Microsoft 365 / Outlook.com spelling (no hyphen).
+            "Junk Email",
             "INBOX.Junk",
             "INBOX.Spam",
         ],

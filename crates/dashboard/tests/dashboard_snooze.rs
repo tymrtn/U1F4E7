@@ -89,3 +89,85 @@ async fn snooze_rejects_empty_return_at_before_touching_imap() {
     );
     assert_eq!(body["code"], "invalid_return_at");
 }
+
+fn state_with_snoozes() -> AppState {
+    let db = Database::open_memory().unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+             imap_host, imap_port, encrypted_password)
+             VALUES ('acc1', 'A', 'a@example.test', 'example.test', 'smtp.example.test', 587,
+                     'imap.example.test', 993, 'encrypted'),
+                    ('acc2', 'B', 'b@example.test', 'example.test', 'smtp.example.test', 587,
+                     'imap.example.test', 993, 'encrypted')",
+            [],
+        )
+        .unwrap();
+    // Owned by acc2, with a Message-ID.
+    db.conn()
+        .execute(
+            "INSERT INTO snoozed (id, account, uid, original_folder, snoozed_folder, return_at,
+             message_id, subject) VALUES ('other', 'acc2', 9, 'INBOX', 'Snoozed',
+             '2026-11-01T13:00:00', 'm@x', 'Theirs')",
+            [],
+        )
+        .unwrap();
+    // Owned by acc1, legacy row without a Message-ID.
+    db.conn()
+        .execute(
+            "INSERT INTO snoozed (id, account, uid, original_folder, snoozed_folder, return_at,
+             message_id, subject) VALUES ('legacy', 'acc1', 7, 'INBOX', 'Snoozed',
+             '2026-11-01T13:00:00', NULL, 'Mine')",
+            [],
+        )
+        .unwrap();
+    AppState::new(db, CredentialBackend::File)
+}
+
+async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn unsnooze_refuses_a_record_owned_by_another_account_before_imap() {
+    let app = dashboard_router(state_with_snoozes());
+    let (status, _) = post_json(&app, "/api/accounts/acc1/snoozed/other/unsnooze", "{}").await;
+    // 404, not 502: the ownership check ran before any socket was opened.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unsnooze_without_message_id_refuses_instead_of_guessing_a_uid() {
+    let app = dashboard_router(state_with_snoozes());
+    let (status, body) = post_json(&app, "/api/accounts/acc1/snoozed/legacy/unsnooze", "{}").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "snooze_target_unknown");
+}
+
+#[tokio::test]
+async fn snoozed_list_serves_utc_return_time_and_state() {
+    let app = dashboard_router(state_with_snoozes());
+    let (status, body) = get_json(&app, "/api/accounts/acc1/snoozed").await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["snoozed"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only this account's snoozes: {body}");
+    assert_eq!(items[0]["id"], "legacy");
+    assert_eq!(items[0]["account_id"], "acc1");
+    assert_eq!(items[0]["return_at"], "2026-11-01T13:00:00Z");
+    assert!(matches!(
+        items[0]["status"].as_str(),
+        Some("snoozed" | "overdue")
+    ));
+}

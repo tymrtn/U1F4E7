@@ -51,3 +51,37 @@ export function snoozeOptions(now: Date): SnoozeOption[] {
 
   return options;
 }
+
+/**
+ * The exact return time a person will see, in their local zone and named, so a
+ * snooze set before a DST change still reads correctly after it (`Sun, Nov 1,
+ * 8:00 AM EST`). `timeZone` is only for tests; the UI uses the viewer's zone.
+ */
+export function formatExactReturn(at: Date, timeZone?: string): string {
+  return at.toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: at.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+    timeZone
+  });
+}
+
+/**
+ * Parse an `<input type="datetime-local">` value (`YYYY-MM-DDTHH:MM`) as local
+ * wall-clock time. Returns null for anything unparseable or not in the future
+ * of `now`, so a custom snooze can never be sent for a past instant.
+ */
+export function parseCustomSnooze(value: string, now: Date): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const [, y, mo, d, h, mi] = m.map(Number);
+  const at = new Date(y, mo - 1, d, h, mi, 0, 0);
+  // Reject values that do not exist locally (e.g. 02:30 on a spring-forward
+  // day), which Date silently shifts to another hour.
+  if (at.getHours() !== h || at.getMinutes() !== mi || at.getDate() !== d) return null;
+  return at.getTime() > now.getTime() ? at : null;
+}

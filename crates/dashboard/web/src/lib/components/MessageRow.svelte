@@ -2,19 +2,26 @@
   // A single row in the message list (design plan rev 3, A2 identity rows +
   // A6 hidden verbs). Lead slot shows the sender avatar, swapping to the
   // selection checkbox on hover/selection. Two text lines — who → when, then
-  // subject — with a muted snippet. Unread = dot + bold. A GTD verb cluster
-  // (reply / snooze / delegate / archive / delete) reveals on hover/focus and
-  // is keyboard-driven; it dispatches the same single-item ops the reader and
-  // BulkToolbar use, then bumps the shared mailbox-ops signal so the list
-  // refreshes. `delegate` is present but disabled until its backend lands
-  // (Phase E). Nothing here opens a new send path.
+  // subject — with a muted snippet. Unread = dot + bold.
+  //
+  // Actions (#170): every single-message action goes through the shared
+  // action model (`message-actions.svelte.ts`) with this row's exact
+  // (account, folder, UID, UIDVALIDITY, Message-ID). A visible "More actions"
+  // button opens the full menu without hover or selection; the hover verb
+  // cluster is a desktop shortcut onto the same dispatch. Progress, errors,
+  // and a short done note render on the row itself. `delegate` stays present
+  // but disabled until its backend lands. Nothing here opens a send path.
   import type { SelectionStore } from '$lib/selection.svelte';
-  import { api, bulkClient, EnvelopeApiError } from '$lib/api';
-  import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
-  import { snoozeOptions, type SnoozeOption } from '$lib/snooze-options';
+  import {
+    getMessageActions,
+    type ActionCommand,
+    type ActionTarget
+  } from '$lib/message-actions.svelte';
+  import { formatExactReturn } from '$lib/snooze-options';
   import { identityColor } from '$lib/hue';
   import Avatar from './Avatar.svelte';
   import Icon from './Icon.svelte';
+  import MessageActionMenu from './MessageActionMenu.svelte';
 
   type Message = {
     key: string; // unique key, e.g. "accountId:uid"
@@ -26,9 +33,14 @@
     snippet: string | null;
     unread: boolean;
     starred: boolean;
-    folder?: string; // source folder — required for the verb cluster ops
+    folder?: string; // source folder — required for any mailbox action
+    uidvalidity?: number | null;
+    messageId?: string | null;
     accountChip?: string | null; // display label for unified rows
-    href: string;
+    /** Absent for rows with no openable mailbox handle (snoozed records). */
+    href?: string;
+    /** Snoozed record: the row shows its exact return and offers Unsnooze. */
+    snooze?: { id: string; returnAt: string; status: string } | null;
   };
 
   let {
@@ -37,29 +49,37 @@
     orderedKeys,
     active = false,
     verbs = false,
-    onstar,
     onfocus
   }: {
     message: Message;
     selection: SelectionStore;
     orderedKeys: string[];
     active?: boolean;
-    /** Enable the GTD hover verb cluster (unified/search inbox surfaces). */
+    /** Enable mailbox actions (row cluster + More actions menu). */
     verbs?: boolean;
-    onstar?: (uid: number, accountId: string, star: boolean) => void;
     onfocus?: (key: string) => void;
   } = $props();
 
-  const mailboxOps = getMailboxOpsStore();
+  const actions = getMessageActions();
 
   const isSelected = $derived(selection.isSelected(message.key));
-  const showVerbs = $derived(verbs && !!message.folder);
+  const hasHandle = $derived(verbs && !!message.folder && !message.snooze);
   const accountTint = $derived(message.accountChip ? identityColor(message.accountId) : null);
 
-  let acting = $state(false);
-  let opError = $state<string | null>(null);
-  let snoozeMenuOpen = $state(false);
-  let snoozeChoices = $state<SnoozeOption[]>([]);
+  const target = $derived<ActionTarget>({
+    accountId: message.accountId,
+    folder: message.folder ?? '',
+    uid: message.uid,
+    uidvalidity: message.uidvalidity ?? null,
+    messageId: message.messageId ?? null,
+    subject: message.subject
+  });
+  const rowState = $derived(message.folder ? actions.rowState(target) : undefined);
+  const busy = $derived(!!message.folder && actions.isBusy(target));
+  const flagged = $derived(
+    message.folder ? actions.isFlagged(target, message.starred) : message.starred
+  );
+  const snoozeReturn = $derived(message.snooze ? new Date(message.snooze.returnAt) : null);
 
   function handleCheckbox(e: MouseEvent) {
     e.stopPropagation();
@@ -79,36 +99,41 @@
     }
   }
 
+  function act(command: ActionCommand) {
+    if (!hasHandle || busy) return;
+    void actions.dispatch(target, command);
+  }
+
   function handleRowKeydown(e: KeyboardEvent) {
     if (e.key === 'x') {
       e.preventDefault();
       selection.keyToggle(message.key);
       return;
     }
-    if (!showVerbs || acting) return;
+    if (!hasHandle || busy) return;
     // Verb keys mirror the cluster. Ignore when typing in a field.
     const target = e.target as HTMLElement | null;
     if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
     switch (e.key) {
       case 'e':
         e.preventDefault();
-        void archive();
+        act({ kind: 'archive' });
         break;
       case '#':
         e.preventDefault();
-        void del();
+        act({ kind: 'trash' });
         break;
-      case 's':
+      case 'U':
         e.preventDefault();
-        toggleSnoozeMenu();
+        act({ kind: message.unread ? 'mark-read' : 'mark-unread' });
         break;
     }
   }
 
-  function handleStar(e: MouseEvent) {
+  function toggleFlag(e: Event) {
     e.preventDefault();
     e.stopPropagation();
-    onstar?.(message.uid, message.accountId, !message.starred);
+    act({ kind: flagged ? 'unflag' : 'flag' });
   }
 
   function handleFocus() {
@@ -125,71 +150,6 @@
       ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
       : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
-
-  // ── Verb cluster ops: single-item, same paths as the reader/BulkToolbar ──
-  async function runMove(toFolder: string, verb: string) {
-    if (acting) return;
-    acting = true;
-    opError = null;
-    try {
-      const folder = message.folder!;
-      const result = await bulkClient({ type: 'move', to_folder: toFolder, folder }, [
-        { accountId: message.accountId, uid: message.uid, folder }
-      ]);
-      if (result.failed.length > 0) {
-        opError = `Couldn't ${verb}: ${result.failed[0].error}`;
-      } else {
-        mailboxOps.operated();
-      }
-    } catch (e) {
-      const err = e as EnvelopeApiError;
-      opError = `Couldn't ${verb}: ${err.message ?? 'operation failed'}`;
-    } finally {
-      acting = false;
-    }
-  }
-
-  const archive = () => runMove('\\Archive', 'archive');
-  const del = () => runMove('\\Trash', 'delete');
-
-  function toggleSnoozeMenu() {
-    if (snoozeMenuOpen) {
-      snoozeMenuOpen = false;
-      return;
-    }
-    snoozeChoices = snoozeOptions(new Date());
-    snoozeMenuOpen = true;
-  }
-
-  async function chooseSnooze(opt: SnoozeOption) {
-    snoozeMenuOpen = false;
-    if (acting) return;
-    acting = true;
-    opError = null;
-    try {
-      await api.snoozeMessage(message.accountId, message.uid, {
-        folder: message.folder!,
-        // A UTC instant, matching BulkToolbar: the unsnooze sweep compares
-        // against UTC now, so a naive local string fires off by the offset.
-        return_at: opt.at.toISOString(),
-        subject: message.subject
-      });
-      mailboxOps.operated();
-    } catch (e) {
-      const err = e as EnvelopeApiError;
-      opError = `Couldn't snooze: ${err.message ?? 'operation failed'}`;
-    } finally {
-      acting = false;
-    }
-  }
-
-  function snoozeHint(at: Date): string {
-    const now = new Date();
-    const sameDay = at.toDateString() === now.toDateString();
-    return sameDay
-      ? at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-      : at.toLocaleDateString([], { weekday: 'short', hour: 'numeric' });
-  }
 </script>
 
 <!-- svelte-ignore a11y_interactive_supports_focus -->
@@ -199,10 +159,12 @@
   class:is-active={active}
   class:is-unread={message.unread}
   class:has-tint={!!accountTint}
+  class:is-busy={busy}
   style={accountTint ? `--account-tint: ${accountTint}` : undefined}
   role="row"
   data-msg-key={message.key}
   aria-selected={isSelected}
+  aria-busy={busy}
   onkeydown={handleRowKeydown}
   onfocus={handleFocus}
 >
@@ -222,12 +184,21 @@
     </span>
   </div>
 
-  <a class="msg-body" class:is-unread={message.unread} href={message.href} tabindex="0">
+  <svelte:element
+    this={message.href ? 'a' : 'div'}
+    class="msg-body"
+    class:is-unread={message.unread}
+    href={message.href}
+    tabindex={message.href ? 0 : undefined}
+  >
     <div class="msg-line1">
       <span class="msg-sender">
         {#if message.unread}
           <span class="msg-sr">Unread.</span>
           <span class="msg-unread-dot" aria-hidden="true"></span>
+        {/if}
+        {#if flagged}
+          <span class="msg-sr">Flagged.</span>
         {/if}
         {message.from || message.accountId}
       </span>
@@ -239,54 +210,27 @@
         <span class="msg-chip" title={message.accountChip}>{message.accountChip}</span>
       {/if}
     </div>
-    {#if message.snippet}
+    {#if message.snooze && snoozeReturn}
+      <p class="msg-snooze" class:is-overdue={message.snooze.status === 'overdue'}>
+        {#if message.snooze.status === 'overdue'}
+          Overdue: was due {formatExactReturn(snoozeReturn)}
+        {:else}
+          Returns {formatExactReturn(snoozeReturn)}
+        {/if}
+      </p>
+    {:else if message.snippet}
       <p class="msg-snippet">{message.snippet}</p>
     {/if}
-  </a>
+  </svelte:element>
 
   <div class="msg-tail">
-    {#if showVerbs}
-      <div class="msg-verbs" role="group" aria-label="Message actions">
-        <a class="verb" href={message.href} aria-label="Reply" title="Reply (r)">
-          <Icon name="reply" size={15} />
-        </a>
-        <div class="verb-snooze">
-          <button
-            class="verb"
-            type="button"
-            disabled={acting}
-            aria-label="Snooze"
-            aria-haspopup="menu"
-            aria-expanded={snoozeMenuOpen}
-            title="Snooze (s)"
-            onclick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              toggleSnoozeMenu();
-            }}
-          >
-            <Icon name="clock" size={15} />
-          </button>
-          {#if snoozeMenuOpen}
-            <div class="snooze-menu" role="menu">
-              {#each snoozeChoices as opt (opt.key)}
-                <button
-                  class="snooze-item"
-                  type="button"
-                  role="menuitem"
-                  onclick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    void chooseSnooze(opt);
-                  }}
-                >
-                  <span>{opt.label}</span>
-                  <span class="snooze-when">{snoozeHint(opt.at)}</span>
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
+    {#if hasHandle}
+      <div class="msg-verbs" role="group" aria-label="Quick actions">
+        {#if message.href}
+          <a class="verb" href={message.href} aria-label="Reply" title="Reply (r)">
+            <Icon name="reply" size={15} />
+          </a>
+        {/if}
         <button
           class="verb verb-delegate"
           type="button"
@@ -299,13 +243,27 @@
         <button
           class="verb"
           type="button"
-          disabled={acting}
+          disabled={busy}
+          aria-label="Move to Junk"
+          title="Move to Junk"
+          onclick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            act({ kind: 'junk' });
+          }}
+        >
+          <Icon name="ban" size={15} />
+        </button>
+        <button
+          class="verb"
+          type="button"
+          disabled={busy}
           aria-label="Archive"
           title="Archive (e)"
           onclick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            void archive();
+            act({ kind: 'archive' });
           }}
         >
           <Icon name="archive" size={15} />
@@ -313,13 +271,13 @@
         <button
           class="verb"
           type="button"
-          disabled={acting}
+          disabled={busy}
           aria-label="Delete"
-          title="Delete (#)"
+          title="Move to Trash (#)"
           onclick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            void del();
+            act({ kind: 'trash' });
           }}
         >
           <Icon name="trash" size={15} />
@@ -327,44 +285,51 @@
       </div>
     {/if}
 
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <span
-      class="msg-star"
-      class:is-starred={message.starred}
-      onclick={handleStar}
-      role="button"
-      aria-label={message.starred ? 'Unstar message' : 'Star message'}
-      tabindex="0"
-      onkeydown={(e) =>
-        e.key === 'Enter' || e.key === ' ' ? handleStar(e as unknown as MouseEvent) : null}
-    >
-      {message.starred ? '★' : '☆'}
-    </span>
+    {#if hasHandle}
+      <button
+        class="msg-flag"
+        class:is-flagged={flagged}
+        type="button"
+        aria-pressed={flagged}
+        aria-label={flagged ? 'Unflag message' : 'Flag message'}
+        title={flagged ? 'Unflag' : 'Flag'}
+        disabled={busy}
+        onclick={toggleFlag}
+      >
+        {flagged ? '★' : '☆'}
+      </button>
+      <MessageActionMenu
+        {target}
+        context={{ folder: target.folder, read: !message.unread, flagged }}
+      />
+    {:else if message.snooze}
+      <MessageActionMenu
+        {target}
+        context={{ folder: target.folder, read: null, flagged: null, snoozeId: message.snooze.id }}
+      />
+    {:else if flagged}
+      <span class="msg-flag is-flagged is-static" aria-hidden="true">★</span>
+    {/if}
   </div>
 
-  {#if opError}
+  {#if rowState?.phase === 'pending'}
+    <p class="msg-op-status" role="status">{rowState.label}</p>
+  {:else if rowState?.phase === 'error'}
     <p class="msg-op-error" role="alert">
-      {opError}
+      Couldn't {rowState.kind.replace('-', ' ')}: {rowState.message}
       <button
         class="msg-op-dismiss"
         type="button"
         aria-label="Dismiss error"
-        onclick={() => (opError = null)}
+        onclick={() => actions.clearRow(target)}
       >
         <Icon name="x" size={12} />
       </button>
     </p>
+  {:else if rowState?.phase === 'done' && !rowState.receipt.removesRow}
+    <p class="msg-op-status is-done" role="status">{rowState.receipt.text}</p>
   {/if}
 </div>
-
-<svelte:window
-  onclick={() => {
-    if (snoozeMenuOpen) snoozeMenuOpen = false;
-  }}
-  onkeydown={(e) => {
-    if (e.key === 'Escape' && snoozeMenuOpen) snoozeMenuOpen = false;
-  }}
-/>
 
 <style>
   .msg-row {
@@ -572,6 +537,13 @@
   .msg-verbs:focus-within {
     opacity: 1;
   }
+  /* Touch and phone: no hover, so the quick cluster would be invisible dead
+     space. The always-visible flag + More actions carry every action. */
+  @media (hover: none), (max-width: 640px) {
+    .msg-verbs {
+      display: none;
+    }
+  }
   .verb {
     display: inline-flex;
     align-items: center;
@@ -598,63 +570,58 @@
        verb reads as a promise, not an omission. */
     color: var(--env-muted);
   }
-  .verb-snooze {
-    position: relative;
-    display: inline-flex;
-  }
-  .snooze-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    z-index: 20;
-    min-width: 160px;
-    background: var(--env-surface);
-    border: 1px solid var(--env-rule);
-    border-radius: var(--radius-md, 5px);
-    box-shadow: 0 6px 20px rgba(10, 10, 10, 0.14);
-    padding: 0.25rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-  }
-  .snooze-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.75rem;
-    padding: 0.4rem 0.5rem;
-    border: none;
-    background: none;
-    border-radius: var(--radius-sm, 3px);
-    font-size: 0.8125rem;
-    color: var(--env-ink);
-    cursor: pointer;
-    text-align: left;
-  }
-  .snooze-item:hover {
-    background: var(--env-accent-soft);
-  }
-  .snooze-when {
-    font-family: var(--font-mono);
-    font-size: 0.6875rem;
-    color: var(--env-muted);
-  }
-  .msg-star {
+  .msg-flag {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 26px;
-    font-size: 0.875rem;
+    width: 28px;
+    height: 28px;
+    border: none;
+    background: none;
+    border-radius: var(--radius-sm, 3px);
+    font-size: 0.9rem;
     color: var(--env-muted);
     cursor: pointer;
     user-select: none;
   }
-  .msg-star.is-starred {
+  .msg-flag.is-flagged {
     color: var(--env-pending);
   }
-  .msg-star:hover {
+  .msg-flag:hover:not(:disabled):not(.is-static) {
     color: var(--env-pending);
+    background: var(--env-surface);
+  }
+  .msg-flag:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--env-accent) 62%, white);
+    outline-offset: 1px;
+  }
+  .msg-flag:disabled {
+    cursor: progress;
+    opacity: 0.5;
+  }
+  .msg-flag.is-static {
+    cursor: default;
+  }
+  .msg-row.is-busy {
+    opacity: 0.75;
+  }
+  .msg-snooze {
+    margin: 0.2rem 0 0;
+    font-size: 0.75rem;
+    color: var(--env-muted);
+    font-family: var(--font-mono);
+  }
+  .msg-snooze.is-overdue {
+    color: var(--env-warn);
+  }
+  .msg-op-status {
+    grid-column: 1 / -1;
+    margin: 0.35rem 0.75rem 0.1rem 3.6rem;
+    font-size: 0.75rem;
+    color: var(--env-muted);
+  }
+  .msg-op-status.is-done {
+    color: var(--env-ok, var(--env-muted));
   }
   .msg-op-error {
     grid-column: 1 / -1;

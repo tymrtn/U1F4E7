@@ -247,6 +247,23 @@ impl Database {
         Ok(changed)
     }
 
+    /// Drop one message from the index after Envelope itself moved it out of
+    /// `folder`, so a cache-first list reload does not keep showing a message
+    /// that is no longer there. Returns rows removed; zero when it was not
+    /// indexed. The next refresh rebuilds the folder either way.
+    pub fn forget_indexed_message(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM indexed_message_summaries
+             WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            params![account_id, folder, uid as i64],
+        )?)
+    }
+
     /// `message_seen` events for one message, oldest first.
     pub fn list_message_seen_events(
         &self,
@@ -517,5 +534,32 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn forget_indexed_message_removes_only_that_message() {
+        let db = Database::open_memory().unwrap();
+        db.upsert_indexed_message_summaries("acc", "INBOX", 7, &[msg(1, &[]), msg(2, &[])])
+            .unwrap();
+        db.upsert_indexed_message_summaries("acc", "Archive", 3, &[msg(1, &[])])
+            .unwrap();
+        assert_eq!(db.forget_indexed_message("acc", "INBOX", 1).unwrap(), 1);
+        assert_eq!(db.forget_indexed_message("acc", "INBOX", 1).unwrap(), 0);
+        let uids = |folder: &str| -> Vec<i64> {
+            let mut stmt = db
+                .conn()
+                .prepare(
+                    "SELECT uid FROM indexed_message_summaries
+                     WHERE account_id = 'acc' AND folder = ?1 ORDER BY uid",
+                )
+                .unwrap();
+            stmt.query_map([folder], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(uids("INBOX"), vec![2]);
+        // Same UID in another folder is another message and stays.
+        assert_eq!(uids("Archive"), vec![1]);
     }
 }
