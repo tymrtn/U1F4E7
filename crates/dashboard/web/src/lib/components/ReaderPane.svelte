@@ -8,11 +8,12 @@
   //   • Headers block with from/to/cc/date/subject; to+cc collapsed behind Details
   //   • Thread strip (ThreadStrip)
   //   • Attachment list (AttachmentList)
-  //   • Read-on-open: a successful open marks the message \Seen through an
-  //     intentional STORE mutation (the content fetch stays BODY.PEEK). A
-  //     failed load never marks read; re-opening a read message is idempotent.
-  //     Evidence/export paths are read-only and never reach this component.
-  //   • Explicit read/unread toggle (restores unread after auto-read)
+  //   • Opening is read-only (#170): the fetch is BODY.PEEK and nothing marks
+  //     the message \Seen. Read state changes only through the explicit
+  //     Mark read / Mark unread action. Evidence/export paths never reach this
+  //     component either.
+  //   • Flag, read state, Junk, Snooze, Archive, Trash all dispatch through
+  //     the shared action model with this message's exact identity
   //   • MonoTag copy affordances for uid + message-id (click-to-copy, toast)
   //   • Drafts intercept: a Drafts-folder deep link never loads the reader. It
   //     resolves the local draft by IMAP UID and hands off to the review
@@ -32,14 +33,22 @@
   import {
     fetchMessageDetail,
     fetchThread,
-    postFlags,
     isSeen,
     type MessageDetailFull,
     type ThreadMessage,
     type ThreatView
   } from '$lib/reader-api';
   import { api, bulkClient, EnvelopeApiError } from '$lib/api';
-  import { looksLikeTrash } from '$lib/folder-kinds';
+  import { hasFlag } from '$lib/flags';
+  import {
+    getMessageActions,
+    type ActionCommand,
+    type ActionOutcome,
+    type ActionTarget,
+    type CommandKind
+  } from '$lib/message-actions.svelte';
+  import MessageActionMenu from '$lib/components/MessageActionMenu.svelte';
+  import { looksLikeJunk, looksLikeTrash } from '$lib/folder-kinds';
   import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
   import { isDraftsFolder } from '$lib/mailboxes';
   import { folderHints } from '$lib/folder-hints.svelte';
@@ -94,15 +103,25 @@
   let threadMessages = $state<ThreadMessage[]>([]);
   let threadLoading = $state(false);
 
-  // ── Read-toggle state ─────────────────────────────────────────────────
+  // ── Action target + read/flag state ───────────────────────────────────
+  // Read and flag state render from the same shared stores the list uses,
+  // seeded by this message's server flags, so the row and the reader can
+  // never disagree about one message.
 
-  let flagging = $state(false);
-  let localSeen = $state<boolean | null>(null); // null = use message.flags
+  const actions = getMessageActions();
+  const target = $derived<ActionTarget>({
+    accountId,
+    folder,
+    uid,
+    messageId: message?.message_id ?? null,
+    subject: message?.subject ?? null
+  });
+  const rowState = $derived(actions.rowState(target));
+  const busy = $derived(actions.isBusy(target));
 
   let isRead = $derived(() => {
-    if (localSeen !== null) return localSeen;
     if (!message) return false;
-    return isSeen(message.flags);
+    return !readState.isUnread(accountId, folder, uid, !isSeen(message.flags));
   });
 
   // ── View format (text / html) — decided per message ──────────────────
@@ -184,8 +203,6 @@
     message = null;
     threat = null;
     threadMessages = [];
-    localSeen = null;
-    localFlagged = null;
     actionError = null;
     remoteImages = false;
     remoteBlockedCount = 0;
@@ -204,14 +221,10 @@
       message = res.message;
       threat = res.threat ?? null;
 
-      // Read-on-open: the successful load is the operator's explicit read
-      // action. Fire an intentional \Seen STORE (not a BODY[] side effect).
-      // Idempotent — skip when the message already carries \Seen.
-      if (!isSeen(message.flags)) {
-        void markReadOnOpen(acct, u, f);
-      } else {
-        readState.markRead(acct, f, u);
-      }
+      // Opening never writes. The server's own \Seen state is fresh, so let
+      // it correct a stale cached row for this exact message.
+      if (isSeen(message.flags)) readState.markRead(acct, f, u);
+      else readState.markUnread(acct, f, u);
 
       // Thread: load if message_id is present (fire-and-forget, no blocking).
       if (message.message_id) {
@@ -270,23 +283,6 @@
     }
   }
 
-  // Mark a freshly-opened unread message \Seen. On success, reflect Read in
-  // this pane and in the shared list store so the row un-bolds without a
-  // refetch. On failure, leave the message unread and say so (never silent).
-  async function markReadOnOpen(acct: string, u: number, f: string) {
-    try {
-      await postFlags(acct, u, f, ['\\Seen'], []);
-    } catch {
-      showToast('Couldn’t mark read', 'warn');
-      return;
-    }
-    readState.markRead(acct, f, u);
-    // Only reflect in this pane if it's still showing the same message.
-    if (accountId === acct && uid === u && folder === f) {
-      localSeen = true;
-    }
-  }
-
   $effect(() => {
     const key = `${accountId}:${uid}:${folder}`;
     if (accountId && uid && key !== loadKey) {
@@ -297,24 +293,9 @@
 
   // ── Mark read/unread ──────────────────────────────────────────────────
 
-  async function toggleRead() {
-    if (!message || flagging) return;
-    flagging = true;
-    const currentlyRead = isRead();
-    const add = currentlyRead ? [] : ['\\Seen'];
-    const remove = currentlyRead ? ['\\Seen'] : [];
-    try {
-      await postFlags(accountId, uid, folder, add, remove);
-      localSeen = !currentlyRead;
-      if (localSeen) readState.markRead(accountId, folder, uid);
-      else readState.markUnread(accountId, folder, uid);
-      showToast(currentlyRead ? 'Marked unread' : 'Marked read');
-    } catch (e) {
-      const err = e as EnvelopeApiError;
-      showToast(err.message ?? 'Could not update flag', 'warn');
-    } finally {
-      flagging = false;
-    }
+  function toggleRead() {
+    if (!message || busy) return;
+    void actions.dispatch(target, { kind: isRead() ? 'mark-unread' : 'mark-read' });
   }
 
   // ── Reply / reply-all / forward ──────────────────────────────────────
@@ -454,77 +435,49 @@
   let acting = $state(false);
   let actionError = $state<string | null>(null);
   let deleteConfirmOpen = $state(false);
-  let localFlagged = $state<boolean | null>(null);
 
   const inTrash = $derived(looksLikeTrash(folder));
+  const inJunk = $derived(looksLikeJunk(folder));
 
   let isStarred = $derived(() => {
-    if (localFlagged !== null) return localFlagged;
     if (!message) return false;
-    return message.flags.some((f) => f.toLowerCase() === '\\flagged');
+    return actions.isFlagged(target, hasFlag(message.flags, 'flagged'));
   });
 
   function leaveToList() {
     void goto(`${base}/mail/${encodeURIComponent(box)}`);
   }
 
-  async function runMailboxOp(
-    op: Parameters<typeof bulkClient>[0],
-    verb: string
-  ): Promise<boolean> {
-    if (!message || acting) return false;
-    acting = true;
-    actionError = null;
-    try {
-      const result = await bulkClient(op, [{ accountId, uid, folder }]);
-      if (result.failed.length > 0) {
-        actionError = `Couldn’t ${verb}: ${result.failed[0].error}`;
-        return false;
-      }
-      mailboxOps.operated();
-      return true;
-    } finally {
-      acting = false;
-    }
+  /** After any action settles: a message that left this folder leaves the
+   *  reader too; everything else stays put with its row-local state. */
+  function afterAction(_kind: CommandKind, outcome: ActionOutcome) {
+    if (outcome.status === 'ok' && outcome.receipt.removesRow) leaveToList();
   }
 
-  async function archiveMessage() {
-    if (await runMailboxOp({ type: 'move', to_folder: '\\Archive', folder }, 'archive')) {
-      leaveToList();
-    }
+  async function act(command: ActionCommand) {
+    if (!message || busy) return;
+    afterAction(command.kind, await actions.dispatch(target, command));
   }
 
-  async function trashMessage() {
-    if (await runMailboxOp({ type: 'move', to_folder: '\\Trash', folder }, 'move to Trash')) {
-      leaveToList();
-    }
-  }
+  const archiveMessage = () => act({ kind: 'archive' });
+  const trashMessage = () => act({ kind: 'trash' });
+  const toggleStar = () => act({ kind: isStarred() ? 'unflag' : 'flag' });
 
+  // Permanent delete (Trash only) is outside the single-message action model:
+  // it is irreversible, so it keeps its own confirmed flow.
   async function deleteForever() {
     deleteConfirmOpen = false;
-    if (await runMailboxOp({ type: 'delete', folder }, 'delete')) {
-      leaveToList();
-    }
-  }
-
-  async function toggleStar() {
     if (!message || acting) return;
     acting = true;
     actionError = null;
-    const starred = isStarred();
     try {
-      await postFlags(
-        accountId,
-        uid,
-        folder,
-        starred ? [] : ['\\Flagged'],
-        starred ? ['\\Flagged'] : []
-      );
-      localFlagged = !starred;
+      const result = await bulkClient({ type: 'delete', folder }, [{ accountId, uid, folder }]);
+      if (result.failed.length > 0) {
+        actionError = `Couldn’t delete: ${result.failed[0].error}`;
+        return;
+      }
       mailboxOps.operated();
-    } catch (e) {
-      const err = e as EnvelopeApiError;
-      actionError = `Couldn’t ${starred ? 'unstar' : 'star'}: ${err.message ?? 'flag update failed'}`;
+      leaveToList();
     } finally {
       acting = false;
     }
@@ -630,7 +583,7 @@
               type="button"
               aria-label="Remove from {folderLabel}"
               title="Archive — remove from {folderLabel}"
-              disabled={acting}
+              disabled={busy}
               onclick={archiveMessage}
             >
               <Icon name="x" size={11} />
@@ -675,9 +628,19 @@
           <button
             class="reader-icon-btn"
             type="button"
+            aria-label={inJunk ? 'Not junk: move to Inbox' : 'Move to Junk'}
+            title={inJunk ? 'Not junk: move to Inbox' : 'Move to Junk'}
+            disabled={busy}
+            onclick={() => act({ kind: inJunk ? 'not-junk' : 'junk' })}
+          >
+            <Icon name="ban" size={16} />
+          </button>
+          <button
+            class="reader-icon-btn"
+            type="button"
             aria-label="Archive"
             title="Archive"
-            disabled={acting}
+            disabled={busy}
             onclick={archiveMessage}
           >
             <Icon name="archive" size={16} />
@@ -688,7 +651,7 @@
               type="button"
               aria-label="Delete forever"
               title="Delete forever"
-              disabled={acting}
+              disabled={acting || busy}
               onclick={() => (deleteConfirmOpen = true)}
             >
               <Icon name="trash" size={16} />
@@ -698,8 +661,8 @@
               class="reader-icon-btn"
               type="button"
               aria-label="Delete"
-              title="Delete"
-              disabled={acting}
+              title="Move to Trash"
+              disabled={busy}
               onclick={trashMessage}
             >
               <Icon name="trash" size={16} />
@@ -709,10 +672,10 @@
             class="reader-icon-btn reader-star-btn"
             class:is-starred={isStarred()}
             type="button"
-            aria-label={isStarred() ? 'Unstar' : 'Star'}
-            title={isStarred() ? 'Unstar' : 'Star'}
+            aria-label={isStarred() ? 'Unflag' : 'Flag'}
+            title={isStarred() ? 'Unflag' : 'Flag'}
             aria-pressed={isStarred()}
-            disabled={acting}
+            disabled={busy}
             onclick={toggleStar}
           >
             {isStarred() ? '★' : '☆'}
@@ -722,13 +685,27 @@
             type="button"
             aria-label={isRead() ? 'Mark unread' : 'Mark read'}
             title={isRead() ? 'Mark unread' : 'Mark read'}
-            disabled={flagging}
+            disabled={busy}
             onclick={toggleRead}
           >
             <Icon name={isRead() ? 'mail' : 'mail-open'} size={16} />
           </button>
+          <MessageActionMenu
+            {target}
+            context={{ folder, read: isRead(), flagged: isStarred() }}
+            onresult={afterAction}
+          />
         </div>
       </header>
+      {#if rowState?.phase === 'pending'}
+        <p class="msg-action-status" role="status">{rowState.label}</p>
+      {:else if rowState?.phase === 'error'}
+        <p class="msg-action-error" role="alert">
+          Couldn’t {rowState.kind.replace('-', ' ')}: {rowState.message}
+        </p>
+      {:else if rowState?.phase === 'done' && !rowState.receipt.removesRow}
+        <p class="msg-action-status" role="status">{rowState.receipt.text}</p>
+      {/if}
       {#if actionError}
         <p class="msg-action-error" role="alert">{actionError}</p>
       {/if}
@@ -925,7 +902,7 @@
     <!-- Empty / no-message-selected state -->
     <div class="reader-empty" id="reader-empty">
       <p class="reader-empty-msg">Select a message to read it.</p>
-      <p class="reader-empty-note">Opening a message marks it read.</p>
+      <p class="reader-empty-note">Opening a message leaves it unread. Use Mark read when you are done.</p>
     </div>
   {/if}
 </div>
@@ -1143,6 +1120,11 @@
     color: var(--env-pending);
   }
 
+  .msg-action-status {
+    margin: 0.25rem 0 0;
+    font-size: 0.75rem;
+    color: var(--env-muted);
+  }
   .msg-action-error {
     margin: -0.25rem 0 0.75rem;
     font-size: 0.8125rem;

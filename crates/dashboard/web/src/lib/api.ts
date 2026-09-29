@@ -876,37 +876,68 @@ export const api = {
 
   /**
    * POST /api/accounts/{id}/messages/{uid}/flags
-   * Adds and/or removes IMAP flags on a single message.
+   * Adds and/or removes IMAP flags on a single message. `uidvalidity` and
+   * `message_id`, when given, make the server refuse (409 `stale_uid` /
+   * `message_not_found`) instead of touching a different or missing message.
+   * The response carries the server's read-back of the flags.
    */
   messageFlags(
     accountId: string,
     uid: number,
-    opts: { folder?: string; add?: string[]; remove?: string[] },
+    opts: {
+      folder: string;
+      add?: string[];
+      remove?: string[];
+      uidvalidity?: number | null;
+      message_id?: string | null;
+    },
     o?: RequestOptions
-  ): Promise<{ ok: boolean; uid: number; added: string[]; removed: string[] }> {
+  ): Promise<FlagsResult> {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/flags`,
       {
         ...o,
         method: 'POST',
-        body: { folder: opts.folder ?? 'INBOX', add: opts.add ?? [], remove: opts.remove ?? [] }
+        body: {
+          folder: opts.folder,
+          add: opts.add ?? [],
+          remove: opts.remove ?? [],
+          uidvalidity: opts.uidvalidity ?? null,
+          message_id: opts.message_id ?? null
+        }
       }
     );
   },
 
   /**
    * POST /api/accounts/{id}/messages/{uid}/move
-   * Moves a message to a target folder.
+   * Moves a message to a target folder. Canonical targets (`\\Junk`,
+   * `\\Archive`, `\\Trash`) resolve to the provider's real folder server-side.
+   * The response names the message's new exact home when it can be found.
    */
   messageMove(
     accountId: string,
     uid: number,
-    opts: { folder?: string; to_folder: string },
+    opts: {
+      folder: string;
+      to_folder: string;
+      uidvalidity?: number | null;
+      message_id?: string | null;
+    },
     o?: RequestOptions
-  ): Promise<{ ok: boolean; uid: number; moved_to: string }> {
+  ): Promise<MoveResult> {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/move`,
-      { ...o, method: 'POST', body: { folder: opts.folder ?? 'INBOX', to_folder: opts.to_folder } }
+      {
+        ...o,
+        method: 'POST',
+        body: {
+          folder: opts.folder,
+          to_folder: opts.to_folder,
+          uidvalidity: opts.uidvalidity ?? null,
+          message_id: opts.message_id ?? null
+        }
+      }
     );
   },
 
@@ -928,28 +959,47 @@ export const api = {
 
   /**
    * POST /api/accounts/{id}/messages/{uid}/snooze
-   * Moves a message to the Snoozed folder until `return_at` and records it so
-   * the background sweep returns it. `return_at` is a wall-clock timestamp
-   * (`YYYY-MM-DDTHH:MM:SS`) — the same shape `envelope snooze set` writes.
+   * Moves a message to the Snoozed folder until `return_at` (a UTC instant) and
+   * records it so the background sweep returns it. The response carries the
+   * snooze id (for Unsnooze) and the stored return time as RFC 3339 UTC.
    */
   snoozeMessage(
     accountId: string,
     uid: number,
-    opts: { folder?: string; return_at: string; message_id?: string | null; subject?: string | null },
+    opts: {
+      folder: string;
+      return_at: string;
+      message_id?: string | null;
+      subject?: string | null;
+      uidvalidity?: number | null;
+    },
     o?: RequestOptions
-  ): Promise<{ ok: boolean; uid: number; return_at: string; snoozed_folder: string }> {
+  ): Promise<SnoozeResult> {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/messages/${uid}/snooze`,
       {
         ...o,
         method: 'POST',
         body: {
-          folder: opts.folder ?? 'INBOX',
+          folder: opts.folder,
           return_at: opts.return_at,
           message_id: opts.message_id ?? null,
-          subject: opts.subject ?? null
+          subject: opts.subject ?? null,
+          uidvalidity: opts.uidvalidity ?? null
         }
       }
+    );
+  },
+
+  /** POST /api/accounts/{id}/snoozed/{snoozeId}/unsnooze — move it back now. */
+  unsnooze(
+    accountId: string,
+    snoozeId: string,
+    o?: RequestOptions
+  ): Promise<{ ok: boolean; id: string; moved_to: string; record_cleared: boolean }> {
+    return request(
+      `/accounts/${encodeURIComponent(accountId)}/snoozed/${encodeURIComponent(snoozeId)}/unsnooze`,
+      { ...o, method: 'POST', body: {} }
     );
   },
 
@@ -1144,17 +1194,54 @@ export interface FoldersResponse {
   error?: string;
 }
 
+/** One snooze record as `GET /accounts/{id}/snoozed` serves it. `uid` names
+ *  the message in its ORIGINAL folder; inside the Snoozed folder it has a new
+ *  UID the list does not know, so a snoozed row is not a mailbox handle. */
 export interface SnoozedItem {
   id: string;
   account_id: string;
   uid: number;
   message_id: string | null;
   subject: string | null;
-  from_addr: string | null;
-  snoozed_folder: string;
   original_folder: string;
-  snooze_until: string;
+  snoozed_folder: string;
+  /** RFC 3339 UTC. */
+  return_at: string;
+  status: 'snoozed' | 'overdue' | 'unknown';
+  reason: string | null;
+  reply_received: boolean;
   created_at: string;
+}
+
+export interface FlagsResult {
+  ok: boolean;
+  uid: number;
+  added: string[];
+  removed: string[];
+  /** False when the STORE succeeded but the read-back failed. */
+  confirmed: boolean;
+  flags: string[] | null;
+  seen: boolean | null;
+  flagged: boolean | null;
+}
+
+export interface MoveResult {
+  ok: boolean;
+  uid: number;
+  from_folder: string;
+  moved_to: string;
+  moved_uid: number | null;
+  moved_uidvalidity: number | null;
+}
+
+export interface SnoozeResult {
+  ok: boolean;
+  id: string;
+  uid: number;
+  original_folder: string;
+  return_at: string;
+  snoozed_folder: string;
+  message_id: string;
 }
 
 export interface SnoozedResponse {
@@ -1186,6 +1273,9 @@ export interface BulkItem {
    * falling back to the op's folder when absent (single-folder surfaces).
    */
   folder?: string;
+  /** Identity guards, forwarded so a stale handle is refused server-side. */
+  uidvalidity?: number | null;
+  messageId?: string | null;
 }
 
 export interface BulkProgress {
@@ -1221,12 +1311,31 @@ export async function bulkClient(
       if (op.type === 'flags') {
         await request(
           `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/flags`,
-          { ...o, method: 'POST', body: { folder, add: op.add ?? [], remove: op.remove ?? [] } }
+          {
+            ...o,
+            method: 'POST',
+            body: {
+              folder,
+              add: op.add ?? [],
+              remove: op.remove ?? [],
+              uidvalidity: item.uidvalidity ?? null,
+              message_id: item.messageId ?? null
+            }
+          }
         );
       } else if (op.type === 'move') {
         await request(
           `/accounts/${encodeURIComponent(item.accountId)}/messages/${item.uid}/move`,
-          { ...o, method: 'POST', body: { folder, to_folder: op.to_folder } }
+          {
+            ...o,
+            method: 'POST',
+            body: {
+              folder,
+              to_folder: op.to_folder,
+              uidvalidity: item.uidvalidity ?? null,
+              message_id: item.messageId ?? null
+            }
+          }
         );
       } else if (op.type === 'delete') {
         await request(

@@ -15,6 +15,7 @@
   import { normalizedAddress, isValidEmail } from '$lib/addresses';
   import { readState } from '$lib/read-state.svelte';
   import { looksLikeTrash } from '$lib/folder-kinds';
+  import { getMessageActions } from '$lib/message-actions.svelte';
   import Modal from './Modal.svelte';
   import Toast from './Toast.svelte';
   import MonoTag from './MonoTag.svelte';
@@ -56,6 +57,7 @@
     folder?: string;
     message_id?: string | null;
     subject?: string | null;
+    uidvalidity?: number | null;
   };
 
   let {
@@ -116,14 +118,26 @@
   // code never derives identity by parsing the key itself — a key with no
   // messageIndex entry has no derivable real identity and is dropped.
 
-  type ResolvedItem = { accountId: string; uid: number; folder: string };
+  type ResolvedItem = {
+    accountId: string;
+    uid: number;
+    folder: string;
+    uidvalidity: number | null;
+    messageId: string | null;
+  };
 
   function resolveItem(key: string): ResolvedItem | null {
     const info = messageIndex[key];
     if (!info || typeof info.accountId !== 'string' || !info.accountId || typeof info.uid !== 'number' || !Number.isFinite(info.uid)) {
       return null;
     }
-    return { accountId: info.accountId, uid: info.uid, folder: info.folder ?? folder };
+    return {
+      accountId: info.accountId,
+      uid: info.uid,
+      folder: info.folder ?? folder,
+      uidvalidity: info.uidvalidity ?? null,
+      messageId: info.message_id ?? null
+    };
   }
 
   function resolvedSelection(): ResolvedItem[] {
@@ -142,7 +156,13 @@
   function selectedItems(): BulkItem[] {
     // Dispatch each item with its own source folder (a unified selection can
     // span mailboxes); fall back to the toolbar's folder when unknown.
-    return resolvedSelection().map(({ accountId, uid, folder }) => ({ accountId, uid, folder }));
+    return resolvedSelection().map(({ accountId, uid, folder, uidvalidity, messageId }) => ({
+      accountId,
+      uid,
+      folder,
+      uidvalidity,
+      messageId
+    }));
   }
 
   function selectedDetailed() {
@@ -313,15 +333,33 @@
     await runReadStateOp(selectedItems(), false, 'marked unread', 'unread');
   }
 
+  /** Rows render flag state from the shared action model; record only the
+   *  items the server confirmed, so a failed item keeps its real state. */
+  function applyConfirmedFlagState(items: BulkItem[], result: BulkProgress, flagged: boolean) {
+    const failed = new Set(result.failed.map(({ item }) => itemIdentity(item)));
+    const actions = getMessageActions();
+    for (const item of items) {
+      if (failed.has(itemIdentity(item))) continue;
+      actions.noteFlagged(
+        { accountId: item.accountId, folder: item.folder ?? folder, uid: item.uid },
+        flagged
+      );
+    }
+  }
+
   async function flag() {
     if (!requireFullyResolved()) return;
-    await runBulkOp({ type: 'flags', folder, add: ['\\Flagged'], remove: [] }, selectedItems(), 'flagged', 'flag');
+    const items = selectedItems();
+    const result = await runBulkOp({ type: 'flags', folder, add: ['\\Flagged'], remove: [] }, items, 'flagged', 'flag');
+    applyConfirmedFlagState(items, result, true);
   }
 
   async function unflag() {
     moreMenuOpen = false;
     if (!requireFullyResolved()) return;
-    await runBulkOp({ type: 'flags', folder, add: [], remove: ['\\Flagged'] }, selectedItems(), 'unflagged', 'unflag');
+    const items = selectedItems();
+    const result = await runBulkOp({ type: 'flags', folder, add: [], remove: ['\\Flagged'] }, items, 'unflagged', 'unflag');
+    applyConfirmedFlagState(items, result, false);
   }
 
   // ── Junk (split: move-only vs move + block sender) ───────────────────

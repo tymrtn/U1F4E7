@@ -14,6 +14,9 @@
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
+  import ActionReceipts from '$lib/components/ActionReceipts.svelte';
+  import { getMessageActions } from '$lib/message-actions.svelte';
+  import { hasFlag } from '$lib/flags';
   import { mailboxBySlug } from '$lib/mailboxes';
   import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
   import { folderHints } from '$lib/folder-hints.svelte';
@@ -51,7 +54,9 @@
   // BulkToolbar triggers via `onoperated`, so the moved row disappears from the
   // mounted list. Version-compare so a route change alone never re-fetches.
   const mailboxOps = getMailboxOpsStore();
-  let seenOpsVersion = 0;
+  // Start from the current version: the signal outlives this layout, so a
+  // remount must not replay an operation that finished before it existed.
+  let seenOpsVersion = mailboxOps.version;
   $effect(() => {
     const v = mailboxOps.version;
     if (v === seenOpsVersion) return;
@@ -109,6 +114,7 @@
     folder: string;
     message_id: string | null;
     subject: string | null;
+    uidvalidity?: number | null;
   };
 
   const searchQuery = $derived(page.url.searchParams.get('q') ?? '');
@@ -123,7 +129,6 @@
   let searchAbort: AbortController | null = null;
   const isSearching = $derived(searchQuery.length > 0);
 
-  let starOverrides = $state<Map<string, boolean>>(new Map());
   let unifiedLoadGen = 0;
   let unifiedRefreshInFlight = false;
 
@@ -347,7 +352,6 @@
     if (box?.wired && loadedBox !== slug) {
       loadedBox = slug;
       selection.clear();
-      starOverrides = new Map();
       if (slug === 'unified') {
         loadUnified();
         loadFolders();
@@ -463,33 +467,24 @@
     }
   }
 
-  async function handleStar(uid: number, accountId: string, star: boolean) {
-    const key = `${accountId}:${uid}`;
-    const prev = starOverrides.has(key)
-      ? starOverrides.get(key)!
-      : (unifiedMessages.find((m) => m.uid === uid && m.account_id === accountId)?.flags ?? [])
-          .some((f) => f.toLowerCase().includes('flagged'));
-    starOverrides = new Map(starOverrides).set(key, star);
-    try {
-      await api.messageFlags(accountId, uid, {
-        folder: 'INBOX',
-        add: star ? ['\\Flagged'] : [],
-        remove: star ? [] : ['\\Flagged'],
-      });
-    } catch {
-      starOverrides = new Map(starOverrides).set(key, prev);
-    }
-  }
+  const messageActions = getMessageActions();
 
-  function isStarred(uid: number, accountId: string, flags: string[]): boolean {
-    const key = `${accountId}:${uid}`;
-    if (starOverrides.has(key)) return starOverrides.get(key)!;
-    return flags.some((f) => f.toLowerCase().includes('flagged'));
+  /** Flag state for a row: a confirmed action result wins over the list's
+   *  (possibly cached) flags. Keyed by account + folder + UID. */
+  function isStarred(uid: number, accountId: string, folder: string, flags: string[]): boolean {
+    return messageActions.isFlagged({ accountId, folder, uid }, hasFlag(flags, 'flagged'));
   }
 
   function senderLabel(m: UnifiedInboxMessage): string {
     return m.from_addr || m.account_username;
   }
+
+  /** Unread count for the loaded Inbox rows, through the same read-state
+   *  overrides the rows render, so a Mark read/unread moves it at once. */
+  const unifiedUnread = $derived(
+    unifiedMessages.filter((m) => readState.isUnread(m.account_id, m.folder, m.uid, m.unread))
+      .length
+  );
 
   const orderedUnifiedKeys = $derived(
     unifiedMessages.map((m) => `${m.account_id}:${m.uid}`)
@@ -517,9 +512,10 @@
         accountId: m.account_id,
         uid: m.uid,
         from: m.from_addr ?? '',
-        folder: m.folder ?? 'INBOX',
+        folder: m.folder,
         message_id: m.message_id ?? null,
         subject: m.subject ?? null,
+        uidvalidity: m.uidvalidity ?? null,
       };
     }
     return idx;
@@ -557,28 +553,18 @@
         folder: m.folder,
         message_id: m.message_id ?? null,
         subject: m.subject ?? null,
+        uidvalidity: m.uidvalidity ?? null,
       };
     }
     return idx;
   });
 
-  /** A snoozed message physically resides in `snoozed_folder` until the sweep
-   *  returns it — bulk actions (archive/flag/move/etc.) must target that real
-   *  current location, not `original_folder` (where it isn't right now). */
-  const snoozedMessageIndex = $derived.by(() => {
-    const idx: Record<string, MsgIndexEntry> = {};
-    for (const s of snoozed) {
-      idx[`snoozed:${s.account_id}:${s.uid}`] = {
-        accountId: s.account_id,
-        uid: s.uid,
-        from: s.from_addr ?? '',
-        folder: s.snoozed_folder,
-        message_id: s.message_id ?? null,
-        subject: s.subject ?? null,
-      };
-    }
-    return idx;
-  });
+  /** A snooze record's stored `uid` names the message in its ORIGINAL folder;
+   *  inside the Snoozed folder it has a UID the list does not know. So a
+   *  snoozed row is not a mailbox handle and gets no bulk actions (they would
+   *  act on whatever message holds that number in Snoozed). Its one action,
+   *  Unsnooze, goes by snooze id through the row menu. */
+  const snoozedMessageIndex: Record<string, MsgIndexEntry> = {};
 
   async function handleOperated() {
     const slug = page.params.box ?? 'unified';
@@ -700,6 +686,11 @@
               <MonoTag>{isSearching ? searchResults.length : (box.slug === 'unified' ? unifiedMessages.length : box.slug === 'drafts' ? drafts.length : box.slug === 'sent' ? sentMessages.length : snoozed.length)}</MonoTag>
             {/if}
           </span>
+          {#if box.slug === 'unified' && !isSearching && unifiedMessages.length > 0}
+            <span class="pane-unread" id="pane-unread-count" aria-live="polite">
+              <MonoTag>{unifiedUnread} unread</MonoTag>
+            </span>
+          {/if}
           <SearchBar
             hint="Search {box.label}… (from: to: subject: is:unread before:)"
             onreset={() => { searchResults = []; searchError = null; searchFailures = []; }}
@@ -821,12 +812,14 @@
                   date: m.date,
                   snippet: null,
                   unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
-                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  starred: isStarred(m.uid, m.account_id, m.folder, m.flags),
                   folder: m.folder,
+                  messageId: m.message_id,
                   href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedSearchKeys}
+                verbs
               />
             </li>
           {/each}
@@ -860,16 +853,17 @@
                   date: m.date,
                   snippet: m.snippet,
                   unread: readState.isUnread(m.account_id, m.folder, m.uid, m.unread),
-                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  starred: isStarred(m.uid, m.account_id, m.folder, m.flags),
                   accountChip: m.account_display_name || m.account_username,
                   folder: m.folder,
+                  uidvalidity: m.uidvalidity,
+                  messageId: m.message_id,
                   href: `${base}/mail/unified/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={orderedUnifiedKeys}
                 {active}
                 verbs
-                onstar={handleStar}
               />
             </li>
           {/each}
@@ -924,7 +918,7 @@
       {:else}
         <ul id="snoozed-msg-list" class="msg-list">
           {#each snoozed as s (s.id)}
-            {@const key = `snoozed:${s.account_id}:${s.uid}`}
+            {@const key = `snoozed:${s.id}`}
             <li>
               <MessageRow
                 message={{
@@ -932,16 +926,18 @@
                   uid: s.uid,
                   accountId: s.account_id,
                   subject: s.subject ?? '(no subject)',
-                  from: s.from_addr ?? s.account_id,
-                  date: s.snooze_until,
+                  from: `Snoozed from ${s.original_folder}`,
+                  date: s.created_at,
                   snippet: null,
-                  unread: readState.isUnread(s.account_id, s.snoozed_folder, s.uid, false),
+                  unread: false,
                   starred: false,
-                  accountChip: s.account_id,
-                  href: `${base}/mail/snoozed/${encodeURIComponent(s.account_id)}/${s.uid}?folder=${encodeURIComponent(s.snoozed_folder)}`,
+                  folder: s.snoozed_folder,
+                  accountChip:
+                    allAccounts.find((a) => a.id === s.account_id)?.username ?? s.account_id,
+                  snooze: { id: s.id, returnAt: s.return_at, status: s.status },
                 }}
                 {selection}
-                orderedKeys={snoozed.map((x) => `snoozed:${x.account_id}:${x.uid}`)}
+                orderedKeys={snoozed.map((x) => `snoozed:${x.id}`)}
               />
             </li>
           {/each}
@@ -966,12 +962,16 @@
                   date: m.date,
                   snippet: m.snippet,
                   unread: false,
-                  starred: isStarred(m.uid, m.account_id, m.flags),
+                  starred: isStarred(m.uid, m.account_id, m.folder, m.flags),
                   accountChip: m.account_display_name || m.account_username,
+                  folder: m.folder,
+                  uidvalidity: m.uidvalidity,
+                  messageId: m.message_id,
                   href: `${base}/mail/sent/${encodeURIComponent(m.account_id)}/${m.uid}?folder=${encodeURIComponent(m.folder)}`,
                 }}
                 {selection}
                 orderedKeys={sentMessages.map((x) => `sent:${x.account_id}:${x.uid}`)}
+                verbs
               />
             </li>
           {/each}
@@ -1006,6 +1006,9 @@
     {@render children()}
   </section>
 </div>
+
+<!-- Durable receipts for single-message actions (Junk, Archive, Snooze…). -->
+<ActionReceipts />
 
 <!-- Composer drawer: mounts globally for keyboard 'c' and rail button. -->
 <ComposerDrawer

@@ -17,6 +17,7 @@ use envelope_email_store::models::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::handlers::message_target::{TargetExpectation, has_flag, verify_target};
 use crate::state::AppState;
 
 const UNIFIED_INBOX_FOLDER: &str = "INBOX";
@@ -1200,6 +1201,12 @@ pub struct FlagsRequest {
     pub add: Vec<String>,
     #[serde(default)]
     pub remove: Vec<String>,
+    /// UIDVALIDITY the client saw when it rendered the row; a reset refuses.
+    #[serde(default)]
+    pub uidvalidity: Option<u32>,
+    /// Message-ID the client saw at this UID; a different message refuses.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 pub async fn flags(
@@ -1214,6 +1221,16 @@ pub async fn flags(
         }
     };
     let mut client = client_arc.lock().await;
+
+    let expect = TargetExpectation {
+        uidvalidity: req.uidvalidity,
+        message_id: req.message_id.clone(),
+    };
+    if let Err(refusal) =
+        verify_target(&state, &mut client, &account_id, &req.folder, uid, &expect).await
+    {
+        return refusal;
+    }
 
     for flag in &req.add {
         if let Err(e) =
@@ -1267,7 +1284,41 @@ pub async fn flags(
                 .into_response();
         }
     }
-    Json(json!({ "ok": true, "uid": uid, "added": req.add, "removed": req.remove })).into_response()
+
+    // Read the flags back so the client renders the server's state, not its
+    // own guess. The STOREs above already succeeded: a failed read-back is
+    // reported as unconfirmed, never as a failed write.
+    let confirmed = envelope_email_transport::imap::probe_uid(&mut client, &req.folder, uid)
+        .await
+        .ok()
+        .and_then(|probe| probe.flags);
+    Json(flags_response(
+        uid,
+        &req.add,
+        &req.remove,
+        confirmed.as_deref(),
+    ))
+    .into_response()
+}
+
+/// Response for a completed flag change. `flags`/`seen`/`flagged` are the
+/// server's read-back; all three are null when the read-back failed.
+fn flags_response(
+    uid: u32,
+    added: &[String],
+    removed: &[String],
+    confirmed: Option<&[String]>,
+) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "uid": uid,
+        "added": added,
+        "removed": removed,
+        "confirmed": confirmed.is_some(),
+        "flags": confirmed,
+        "seen": confirmed.map(|f| has_flag(f, "seen")),
+        "flagged": confirmed.map(|f| has_flag(f, "flagged")),
+    })
 }
 
 #[derive(Deserialize)]
@@ -1279,6 +1330,10 @@ pub struct MoveRequest {
     /// resolved to the account's real provider folder before any move. See
     /// [`envelope_email_transport::folders::canonical_move_key`].
     pub to_folder: String,
+    #[serde(default)]
+    pub uidvalidity: Option<u32>,
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 /// Send-safe canonical folder resolution against the shared (mutex-guarded) DB.
@@ -1334,26 +1389,35 @@ pub(crate) async fn resolve_canonical_folder(
         }
     }
 
-    // 4. Provider-resolved name, verified to actually exist on the server.
+    // 4–5. Provider-resolved name, else any known variant — both verified to
+    // exist on the server.
+    let picked = pick_canonical_folder(provider, canonical_type, &folders);
+    if let Some(name) = &picked {
+        let db = state.db.lock().await;
+        let _ = db.set_detected_folder(account_id, canonical_type, name);
+    }
+    Ok(picked)
+}
+
+/// Pure folder choice for a canonical type against a real folder inventory:
+/// the provider's own name when it exists, else the first known variant that
+/// exists, else `None`. Never returns a folder the server did not list.
+pub(crate) fn pick_canonical_folder(
+    provider: envelope_email_transport::provider::ProviderType,
+    canonical_type: &str,
+    folders: &[String],
+) -> Option<String> {
+    use envelope_email_transport::provider::{self, ProviderType};
     if provider != ProviderType::Unknown {
-        let resolved = provider::resolve_folder(provider, canonical_type).to_string();
-        if folders.iter().any(|f| f == &resolved) {
-            let db = state.db.lock().await;
-            let _ = db.set_detected_folder(account_id, canonical_type, &resolved);
-            return Ok(Some(resolved));
+        let resolved = provider::resolve_folder(provider, canonical_type);
+        if folders.iter().any(|f| f == resolved) {
+            return Some(resolved.to_string());
         }
     }
-
-    // 5. Candidate fallback across every known provider variant for this type.
-    for candidate in provider::all_candidates_for(canonical_type) {
-        if folders.iter().any(|f| f == candidate) {
-            let db = state.db.lock().await;
-            let _ = db.set_detected_folder(account_id, canonical_type, candidate);
-            return Ok(Some(candidate.to_string()));
-        }
-    }
-
-    Ok(None)
+    provider::all_candidates_for(canonical_type)
+        .iter()
+        .find(|candidate| folders.iter().any(|f| f == *candidate))
+        .map(|c| c.to_string())
 }
 
 /// Stable JSON failure for a canonical move target that resolved to no real
@@ -1412,14 +1476,88 @@ pub async fn mv(
         None => req.to_folder.clone(),
     };
 
-    match envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, &to_folder)
+    let expect = TargetExpectation {
+        uidvalidity: req.uidvalidity,
+        message_id: req.message_id.clone(),
+    };
+    let probe =
+        match verify_target(&state, &mut client, &account_id, &req.folder, uid, &expect).await {
+            Ok(p) => p,
+            Err(refusal) => return refusal,
+        };
+
+    // The destination's UIDNEXT before the move bounds where the moved copy
+    // can land, so finding it afterwards reads only what the move added.
+    let dest_before = envelope_email_transport::imap::select_folder_info(&mut client, &to_folder)
         .await
+        .ok();
+
+    if let Err(e) =
+        envelope_email_transport::imap::move_message(&mut client, uid, &req.folder, &to_folder)
+            .await
     {
-        Ok(()) => Json(json!({ "ok": true, "uid": uid, "moved_to": to_folder })).into_response(),
-        Err(e) => {
-            state.evict_imap(&account_id).await;
-            (StatusCode::BAD_GATEWAY, format!("move: {e}")).into_response()
+        state.evict_imap(&account_id).await;
+        return (StatusCode::BAD_GATEWAY, format!("move: {e}")).into_response();
+    }
+
+    // The message has left the source folder: drop it from the local index so
+    // a cache-first reload shows the server's state instead of a ghost row.
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db.forget_indexed_message(&account_id, &req.folder, uid) {
+            tracing::warn!("move: moved on the server, but index cleanup failed: {e}");
         }
+    }
+
+    // Name the message's new home exactly, so the client can offer "Move
+    // back" against a real UID. The move already succeeded; a failed lookup
+    // only means no exact handle, reported as null.
+    let (moved_uid, moved_uidvalidity) = match dest_before {
+        Some(before) => {
+            locate_moved(&mut client, &to_folder, probe.message_id.as_deref(), before).await
+        }
+        None => (None, None),
+    };
+    Json(json!({
+        "ok": true,
+        "uid": uid,
+        "from_folder": req.folder,
+        "moved_to": to_folder,
+        "moved_uid": moved_uid,
+        "moved_uidvalidity": moved_uidvalidity,
+    }))
+    .into_response()
+}
+
+/// Exact `(UID, UIDVALIDITY)` of a just-moved message in `folder`, by unique
+/// Message-ID among UIDs at or above the pre-move UIDNEXT. `(None, None)` when
+/// the message has no Message-ID, the mailbox was reset during the move, the
+/// match is not unique, or the lookup failed.
+async fn locate_moved(
+    client: &mut envelope_email_transport::ImapClient,
+    folder: &str,
+    message_id: Option<&str>,
+    before: envelope_email_transport::imap::SelectedMailbox,
+) -> (Option<u32>, Option<u32>) {
+    let (Some(mid), Some(uid_next)) = (message_id, before.uid_next) else {
+        return (None, None);
+    };
+    let uid = envelope_email_transport::imap::find_unique_uid_by_message_id_from(
+        client, folder, mid, uid_next,
+    )
+    .await
+    .ok()
+    .flatten();
+    let Some(uid) = uid else {
+        return (None, None);
+    };
+    // The lookup just SELECTed `folder`; its UIDVALIDITY must still be the
+    // one the floor was read under, or the UID means nothing.
+    match envelope_email_transport::imap::select_folder_info(client, folder).await {
+        Ok(now) if now.uid_validity.is_some() && now.uid_validity == before.uid_validity => {
+            (Some(uid), now.uid_validity)
+        }
+        _ => (None, None),
     }
 }
 
@@ -1487,6 +1625,8 @@ pub struct SnoozeRequest {
     pub message_id: Option<String>,
     #[serde(default)]
     pub subject: Option<String>,
+    #[serde(default)]
+    pub uidvalidity: Option<u32>,
 }
 
 /// POST /api/accounts/{id}/messages/{uid}/snooze
@@ -1519,6 +1659,29 @@ pub async fn snooze(
     };
     let mut client = client_arc.lock().await;
 
+    let expect = TargetExpectation {
+        uidvalidity: req.uidvalidity,
+        message_id: req.message_id.clone(),
+    };
+    let probe =
+        match verify_target(&state, &mut client, &account_id, &req.folder, uid, &expect).await {
+            Ok(p) => p,
+            Err(refusal) => return refusal,
+        };
+    // The Message-ID is how the sweep and Unsnooze find the message again in
+    // the Snoozed folder, where it has a new UID. Without one there is no
+    // exact way back, so refuse before moving anything.
+    let Some(message_id) = probe.message_id.clone() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "code": "message_id_missing",
+                "reason": "this message has no Message-ID, so a snooze could not find it again; archive or flag it instead",
+            })),
+        )
+            .into_response();
+    };
+
     // Ensure the Snoozed folder exists (idempotent; may already be present).
     if let Err(e) = envelope_email_transport::imap::create_folder(&mut client, SNOOZED_FOLDER).await
     {
@@ -1537,28 +1700,39 @@ pub async fn snooze(
     // Record so the sweep can return it. `account` is the path id — matching how
     // the dashboard snoozed list/unsnooze query rows back.
     let db = state.db.lock().await;
+    if let Err(e) = db.forget_indexed_message(&account_id, &req.folder, uid) {
+        tracing::warn!("snooze: moved on the server, but index cleanup failed: {e}");
+    }
     match db.create_snoozed(
         &account_id,
         uid,
         &req.folder,
         SNOOZED_FOLDER,
         &return_at,
-        req.message_id.as_deref(),
+        Some(&message_id),
         req.subject.as_deref(),
         Some("dashboard"),
         None,
         None,
     ) {
-        Ok(_) => Json(json!({
+        Ok(record) => Json(json!({
             "ok": true,
+            "id": record.id,
             "uid": uid,
-            "return_at": return_at,
-            "snoozed_folder": SNOOZED_FOLDER
+            "original_folder": record.original_folder,
+            "return_at": crate::handlers::snoozed::utc_rfc3339(&record.return_at),
+            "snoozed_folder": SNOOZED_FOLDER,
+            "message_id": message_id,
         }))
         .into_response(),
+        // The message is already in Snoozed. Say exactly that, so the client
+        // never reports the move itself as failed.
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "snooze_record_failed", "error": e.to_string() })),
+            Json(json!({
+                "code": "snooze_record_failed",
+                "error": format!("moved to {SNOOZED_FOLDER}, but recording the return time failed: {e}"),
+            })),
         )
             .into_response(),
     }
@@ -1633,6 +1807,82 @@ mod tests {
 
     fn at(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    fn inventory(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn junk_resolves_to_each_providers_real_spam_folder() {
+        use envelope_email_transport::provider::{ProviderType, detect_provider};
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "gmail",
+                &["INBOX", "[Gmail]/Spam", "[Gmail]/Trash", "[Gmail]/All Mail"],
+                "[Gmail]/Spam",
+            ),
+            (
+                "exchange/workmail",
+                &["INBOX", "Deleted Items", "Junk E-mail", "Sent Items"],
+                "Junk E-mail",
+            ),
+            (
+                "microsoft 365",
+                &["INBOX", "Deleted Items", "Junk Email", "Sent Items"],
+                "Junk Email",
+            ),
+            (
+                "generic (Migadu)",
+                &["INBOX", "Junk", "Trash", "Archive", "Sent"],
+                "Junk",
+            ),
+            (
+                "dovecot",
+                &["INBOX", "INBOX.Junk", "INBOX.Trash"],
+                "INBOX.Junk",
+            ),
+            ("spam-named", &["INBOX", "Spam", "Trash"], "Spam"),
+        ];
+        for (label, names, want) in cases {
+            let folders = inventory(names);
+            let provider = detect_provider(&folders);
+            assert_eq!(
+                pick_canonical_folder(provider, "spam", &folders).as_deref(),
+                Some(*want),
+                "{label}"
+            );
+            // Unknown provider still lands on a real, listed folder.
+            assert_eq!(
+                pick_canonical_folder(ProviderType::Unknown, "spam", &folders).as_deref(),
+                Some(*want),
+                "{label} (unknown provider)"
+            );
+        }
+    }
+
+    #[test]
+    fn junk_with_no_spam_folder_resolves_to_nothing_rather_than_a_literal() {
+        let folders = inventory(&["INBOX", "Trash", "Sent"]);
+        let provider = envelope_email_transport::provider::detect_provider(&folders);
+        assert_eq!(pick_canonical_folder(provider, "spam", &folders), None);
+    }
+
+    #[test]
+    fn flags_response_reports_the_server_read_back() {
+        let flags = vec!["Seen".to_string(), "Flagged".to_string()];
+        let body = flags_response(5, &["\\Flagged".into()], &[], Some(&flags));
+        assert_eq!(body["confirmed"], true);
+        assert_eq!(body["seen"], true);
+        assert_eq!(body["flagged"], true);
+    }
+
+    #[test]
+    fn flags_response_after_failed_read_back_is_unconfirmed_not_failed() {
+        let body = flags_response(5, &[], &["\\Seen".into()], None);
+        assert_eq!(body["ok"], true, "the STORE succeeded");
+        assert_eq!(body["confirmed"], false);
+        assert!(body["seen"].is_null());
     }
 
     #[test]

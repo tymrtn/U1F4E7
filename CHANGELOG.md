@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Webmail message actions (#170).** Every message row and the reader now have a visible
+  **More actions** menu (keyboard and phone reachable) with Mark read/unread, Flag/Unflag, Snooze
+  with exact return times, Move to Junk (or Not junk inside Junk), Archive and Move to Trash. The
+  row keeps an always-visible flag. Remind and Follow up are listed as not available, with the
+  reason, because Envelope has no backend for either yet.
+- **Opening a message no longer marks it read.** The reader is read-only; use Mark read.
+- Actions that move a message leave a receipt naming the real destination folder, with
+  **Move back** when the server found the moved copy exactly, and **Unsnooze** after a snooze.
+
 ### Fixed
+
+- **Webmail:** flag, read-state, move and snooze requests carry the row's folder, UIDVALIDITY and
+  Message-ID, and the server refuses with `409 stale_uid` / `message_not_found` when they no longer
+  name the same message. A click on a moved or replaced message used to report success for a
+  change that never happened. Starring a message outside INBOX no longer targets INBOX.
+- **Webmail:** the reader and rows read the server's `Seen`/`Flagged` flag spelling, so an
+  already-read or flagged message shows as such.
+- **Snooze:** the Snoozed view shows each message's exact return time (served as UTC) and whether
+  it is overdue. Unsnooze and the background sweep find the message by exact Message-ID and skip
+  it rather than moving whatever message holds the original folder's UID in Snoozed. A snooze of
+  a message with no Message-ID is refused up front.
+- **Junk:** Microsoft 365's `Junk Email` folder is recognised alongside `Junk E-mail`,
+  `[Gmail]/Spam` and generic `Junk`/`Spam`.
 
 - **Storage:** opens a database at schema version 24 as it finds it. Envelope 2 adds migration
   24 (the Microsoft sign-in and Graph tables: `oauth_grants`, `msgraph_folders`, `msgraph_ids`),

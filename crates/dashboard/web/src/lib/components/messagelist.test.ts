@@ -2,10 +2,11 @@
 // star optimistic revert, and bulk client partial-failure + concurrency cap.
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
 import { SelectionStore } from '$lib/selection.svelte';
 import { bulkClient, type BulkItem, EnvelopeApiError, resetCsrf } from '$lib/api';
 import { readState, __resetReadState } from '$lib/read-state.svelte';
+import { __resetMessageActions } from '$lib/message-actions.svelte';
 
 // ── Module mocks ──────────────────────────────────────────────────────
 import { page as pageState } from '$app/state';
@@ -71,6 +72,7 @@ function jsonResponse(body: unknown, init: { status?: number } = {}): Response {
 beforeEach(() => {
   resetCsrf();
   __resetReadState();
+  __resetMessageActions();
   pageState.params = { box: 'unified' };
   pageState.url = new URL('http://localhost/v2/mail/unified') as typeof pageState.url;
   apiMock.listAccounts.mockResolvedValue({ accounts: [] });
@@ -100,6 +102,14 @@ function stubOkFetch(): ReturnType<typeof vi.fn> {
   vi.stubGlobal('fetch', f);
   return f;
 }
+
+/** One snooze record in the shape GET /accounts/{id}/snoozed serves. */
+const SNOOZED_ITEM = {
+  id: 'snz-1', account_id: 'acct-ok', uid: 55, message_id: 's@x',
+  subject: 'Snoozed subject', original_folder: 'INBOX', snoozed_folder: 'Snoozed',
+  return_at: '2026-08-01T09:00:00Z', status: 'snoozed', reason: 'dashboard',
+  reply_received: false, created_at: '2026-07-08T10:00:00'
+};
 
 // ── 1. SelectionStore — range selection ───────────────────────────────
 
@@ -785,8 +795,8 @@ describe('bulkClient — partial failure + concurrency', () => {
 
 // ── 4. Star optimistic revert ─────────────────────────────────────────
 
-describe('Star optimistic revert', () => {
-  it('calls messageFlags with \\Flagged add when starring', async () => {
+describe('Row flag through the action model', () => {
+  it('calls messageFlags with \\Flagged add and the row’s exact identity when flagging', async () => {
     apiMock.unifiedInbox.mockResolvedValue({
       scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
       unread_count: 1, freshness: 'fresh', accounts: [], errors: [],
@@ -799,20 +809,70 @@ describe('Star optimistic revert', () => {
         indexed_at: null, index_freshness: 'fresh'
       }]
     });
-    apiMock.messageFlags.mockResolvedValue({ ok: true, uid: 101, added: ['\\Flagged'], removed: [] });
+    apiMock.messageFlags.mockResolvedValue({
+      ok: true, uid: 101, added: ['\\Flagged'], removed: [],
+      confirmed: true, flags: ['Flagged'], seen: false, flagged: true
+    });
 
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Hello')).toBeInTheDocument());
 
-    const starBtn = screen.getByRole('button', { name: /star message/i });
+    const starBtn = screen.getByRole('button', { name: 'Flag message' });
     await fireEvent.click(starBtn);
 
     await waitFor(() =>
       expect(apiMock.messageFlags).toHaveBeenCalledWith(
         'acct-ok', 101,
-        expect.objectContaining({ add: ['\\Flagged'], remove: [] })
+        expect.objectContaining({
+          folder: 'INBOX', add: ['\\Flagged'], remove: [], uidvalidity: 1, message_id: '<a@x>'
+        })
       )
     );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Unflag message' }).textContent?.trim()).toBe('★')
+    );
+  });
+
+  it('a row in another folder flags in that folder, never INBOX', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [],
+      messages: [{
+        uid: 7, message_id: '<c@x>', from_addr: 'c@example.com',
+        to_addr: 'work@example.com', subject: 'Filed', date: '2026-07-08T10:00:00Z',
+        flags: ['Seen'], size: 10, unread: false, account_id: 'acct-ok',
+        account_username: 'work@example.com', account_display_name: null,
+        folder: 'Clients/Acme', uidvalidity: 44, snippet: null, thread_id: null,
+        indexed_at: null, index_freshness: 'fresh'
+      }]
+    });
+    apiMock.messageFlags.mockResolvedValue({
+      ok: true, uid: 7, added: [], removed: [], confirmed: true, flags: ['Seen', 'Flagged'],
+      seen: true, flagged: true
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Filed')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Flag message' }));
+    await waitFor(() => expect(apiMock.messageFlags).toHaveBeenCalledTimes(1));
+    expect(apiMock.messageFlags.mock.calls[0][2]).toMatchObject({ folder: 'Clients/Acme', uidvalidity: 44 });
+  });
+
+  it('renders the index flag spelling ("Flagged") as flagged', async () => {
+    apiMock.unifiedInbox.mockResolvedValue({
+      scope: 'unified_inbox', status: 'ok', folder: 'INBOX', limit: 50,
+      unread_count: 0, freshness: 'fresh', accounts: [], errors: [],
+      messages: [{
+        uid: 8, message_id: '<d@x>', from_addr: 'd@example.com',
+        to_addr: 'work@example.com', subject: 'Starred one', date: '2026-07-08T10:00:00Z',
+        flags: ['Seen', 'Flagged'], size: 10, unread: false, account_id: 'acct-ok',
+        account_username: 'work@example.com', account_display_name: null,
+        folder: 'INBOX', uidvalidity: 1, snippet: null, thread_id: null,
+        indexed_at: null, index_freshness: 'fresh'
+      }]
+    });
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Starred one')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Unflag message' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('reverts star if messageFlags throws', async () => {
@@ -833,7 +893,7 @@ describe('Star optimistic revert', () => {
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Hello')).toBeInTheDocument());
 
-    const starBtn = screen.getByRole('button', { name: /star message/i });
+    const starBtn = screen.getByRole('button', { name: 'Flag message' });
     // Before clicking: unstarred state
     expect(starBtn.textContent?.trim()).toBe('☆');
     await fireEvent.click(starBtn);
@@ -1111,7 +1171,8 @@ describe('Selection identity across surfaces', () => {
     await waitFor(() => expect(screen.getByText('Search hit subject')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('checkbox'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    const toolbar = document.getElementById('bulk-toolbar')!;
+    await fireEvent.click(within(toolbar).getByRole('button', { name: 'Archive' }));
 
     await waitFor(() => {
       const call = fetch.mock.calls.find(([u]) => String(u).includes('/messages/200/move'));
@@ -1122,7 +1183,9 @@ describe('Selection identity across surfaces', () => {
     });
   });
 
-  it('snoozed: bulk Archive dispatches against the snoozed_folder (its real current location)', async () => {
+  it('snoozed: a record is not a mailbox handle — bulk actions stay disabled; Unsnooze goes by id', async () => {
+    // The stored uid names the message in its ORIGINAL folder. Acting on
+    // "uid 55 in Snoozed" would hit whatever message holds that number there.
     pageState.params = { box: 'snoozed' };
     pageState.url = new URL('http://localhost/v2/mail/snoozed') as typeof pageState.url;
     apiMock.listAccounts.mockResolvedValue({
@@ -1132,32 +1195,28 @@ describe('Selection identity across surfaces', () => {
         imap_host: 'imap.example.com', imap_port: 993
       }]
     });
-    apiMock.snoozed.mockResolvedValue({
-      snoozed: [{
-        id: 'snz-1', account_id: 'acct-ok', uid: 55, message_id: '<s@x>',
-        subject: 'Snoozed subject', from_addr: 'dana@example.com',
-        snoozed_folder: 'Snoozed', original_folder: 'INBOX',
-        snooze_until: '2026-08-01T09:00:00Z', created_at: '2026-07-08T10:00:00Z'
-      }]
-    });
+    apiMock.snoozed.mockResolvedValue({ snoozed: [SNOOZED_ITEM] });
+    (apiMock as Record<string, ReturnType<typeof vi.fn>>).unsnooze = vi
+      .fn()
+      .mockResolvedValue({ ok: true, id: 'snz-1', moved_to: 'INBOX', record_cleared: true });
 
     const fetch = stubOkFetch2();
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Snoozed subject')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('checkbox'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    const toolbar = document.getElementById('bulk-toolbar')!;
+    expect(within(toolbar).getByRole('button', { name: 'Archive' })).toBeDisabled();
+    expect(fetch.mock.calls.some(([u]) => String(u).includes('/move'))).toBe(false);
 
-    await waitFor(() => {
-      const call = fetch.mock.calls.find(([u]) => String(u).includes('/messages/55/move'));
-      expect(call).toBeTruthy();
-      const body = JSON.parse(String((call![1] as RequestInit).body));
-      // The message physically sits in the Snoozed folder right now — moving
-      // it must reference that real current folder, not original_folder
-      // (where it isn't) or a default INBOX.
-      expect(body.folder).toBe('Snoozed');
-      expect(String(call![0])).toBe('/api/accounts/acct-ok/messages/55/move');
-    });
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Unsnooze' }));
+    await waitFor(() =>
+      expect((apiMock as Record<string, ReturnType<typeof vi.fn>>).unsnooze).toHaveBeenCalledWith(
+        'acct-ok',
+        'snz-1'
+      )
+    );
   });
 });
 
@@ -1417,7 +1476,7 @@ describe('Search/Snoozed read-state rendering', () => {
     await waitFor(() => expect(row.classList.contains('is-unread')).toBe(false));
   });
 
-  it('snoozed rows render unread state from the readState override instead of hard-coded read', async () => {
+  it('snoozed rows show the server’s exact UTC return time and state', async () => {
     pageState.params = { box: 'snoozed' };
     pageState.url = new URL('http://localhost/v2/mail/snoozed') as typeof pageState.url;
     apiMock.listAccounts.mockResolvedValue({
@@ -1427,23 +1486,16 @@ describe('Search/Snoozed read-state rendering', () => {
         imap_host: 'imap.example.com', imap_port: 993
       }]
     });
-    apiMock.snoozed.mockResolvedValue({
-      snoozed: [{
-        id: 'snz-1', account_id: 'acct-ok', uid: 55, message_id: '<s@x>',
-        subject: 'Snoozed subject', from_addr: 'dana@example.com',
-        snoozed_folder: 'Snoozed', original_folder: 'INBOX',
-        snooze_until: '2026-08-01T09:00:00Z', created_at: '2026-07-08T10:00:00Z'
-      }]
-    });
+    apiMock.snoozed.mockResolvedValue({ snoozed: [{ ...SNOOZED_ITEM, status: 'overdue' }] });
 
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Snoozed subject')).toBeInTheDocument());
-
     const row = screen.getAllByRole('row').find((r) => r.textContent?.includes('Snoozed subject'))!;
-    expect(row.classList.contains('is-unread')).toBe(false); // no override yet — base false
-
-    readState.markUnread('acct-ok', 'Snoozed', 55);
-    await waitFor(() => expect(row.classList.contains('is-unread')).toBe(true));
+    const when = new Date(SNOOZED_ITEM.return_at).toLocaleString(undefined, {
+      hour: 'numeric',
+      minute: '2-digit'
+    });
+    expect(row.querySelector('.msg-snooze.is-overdue')?.textContent).toContain(when);
   });
 });
 
@@ -1516,7 +1568,7 @@ describe('Message row deep links', () => {
     expect(hrefFor('Search hit subject')).toBe('/v2/mail/unified/acct%2Fone/200?folder=INBOX');
   });
 
-  it('snoozed rows link to where the message physically is, not its original folder', async () => {
+  it('snoozed rows are not links: their stored UID is not a handle inside the Snoozed folder', async () => {
     pageState.params = { box: 'snoozed' };
     pageState.url = new URL('http://localhost/v2/mail/snoozed') as typeof pageState.url;
     apiMock.listAccounts.mockResolvedValue({
@@ -1526,20 +1578,11 @@ describe('Message row deep links', () => {
         imap_host: 'imap.example.com', imap_port: 993
       }]
     });
-    apiMock.snoozed.mockResolvedValue({
-      snoozed: [{
-        id: 'snz-1', account_id: 'acct-ok', uid: 55, message_id: '<s@x>',
-        subject: 'Snoozed subject', from_addr: 'dana@example.com',
-        snoozed_folder: 'Envelope/Snoozed Mail', original_folder: 'INBOX',
-        snooze_until: '2026-08-01T09:00:00Z', created_at: '2026-07-08T10:00:00Z'
-      }]
-    });
+    apiMock.snoozed.mockResolvedValue({ snoozed: [SNOOZED_ITEM] });
 
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('Snoozed subject')).toBeInTheDocument());
-
-    expect(hrefFor('Snoozed subject')).toBe(
-      '/v2/mail/snoozed/acct-ok/55?folder=Envelope%2FSnoozed%20Mail'
-    );
+    const row = screen.getAllByRole('row').find((r) => r.textContent?.includes('Snoozed subject'))!;
+    expect(row.querySelector('a.msg-body')).toBeNull();
   });
 });

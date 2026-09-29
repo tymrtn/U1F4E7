@@ -22,12 +22,16 @@ const { readerApiMock } = vi.hoisted(() => ({
 }));
 
 const { apiMock } = vi.hoisted(() => ({
-  apiMock: { bulkClient: vi.fn() }
+  apiMock: { bulkClient: vi.fn(), messageFlags: vi.fn(), messageMove: vi.fn() }
 }));
 
 vi.mock('$lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/api')>();
-  return { ...actual, bulkClient: apiMock.bulkClient };
+  return {
+    ...actual,
+    bulkClient: apiMock.bulkClient,
+    api: { ...actual.api, messageFlags: apiMock.messageFlags, messageMove: apiMock.messageMove }
+  };
 });
 
 vi.mock('$lib/reader-api', async (importOriginal) => {
@@ -50,7 +54,8 @@ import {
   type ThreadMessage
 } from '$lib/reader-api';
 import { EnvelopeApiError } from '$lib/api';
-import { __resetReadState } from '$lib/read-state.svelte';
+import { __resetReadState, readState } from '$lib/read-state.svelte';
+import { __resetMessageActions } from '$lib/message-actions.svelte';
 import { getComposerStore, __resetComposerStore } from '$lib/composer.svelte';
 import { getMailboxOpsStore, __resetMailboxOpsStore } from '$lib/mailbox-ops.svelte';
 import { goto } from '$app/navigation';
@@ -81,7 +86,15 @@ beforeEach(() => {
   readerApiMock.fetchThread.mockResolvedValue(null);
   readerApiMock.postFlags.mockResolvedValue({ ok: true, uid: 42, added: [], removed: [] });
   apiMock.bulkClient.mockResolvedValue({ done: 1, total: 1, failed: [] });
+  apiMock.messageMove.mockResolvedValue({
+    ok: true, uid: 42, from_folder: 'INBOX', moved_to: 'Archive', moved_uid: 900, moved_uidvalidity: 3
+  });
+  apiMock.messageFlags.mockImplementation(async (_a: string, _u: number, o: { add?: string[]; remove?: string[] }) => ({
+    ok: true, uid: 42, added: o.add ?? [], removed: o.remove ?? [], confirmed: true,
+    flags: [], seen: (o.add ?? []).includes('\\Seen'), flagged: (o.add ?? []).includes('\\Flagged')
+  }));
   __resetReadState();
+  __resetMessageActions();
   __resetMailboxOpsStore();
 });
 
@@ -449,8 +462,10 @@ describe('ReaderPane', () => {
     await waitFor(() =>
       expect(screen.getByText('Select a message to read it.')).toBeInTheDocument()
     );
-    // The empty-state hint sets read-on-open expectations in plain language.
-    expect(screen.getByText('Opening a message marks it read.')).toBeInTheDocument();
+    // The empty-state hint says, in plain language, that opening is read-only.
+    expect(
+      screen.getByText('Opening a message leaves it unread. Use Mark read when you are done.')
+    ).toBeInTheDocument();
   });
 
   it('shows text/HTML toggle when both bodies are present', async () => {
@@ -514,23 +529,18 @@ describe('ReaderPane', () => {
     expect(screen.getByRole('button', { name: /^HTML$/i }).className).toContain('is-active');
   });
 
-  it('auto-marks an unread message read on successful open (postFlags add \\Seen, exactly once)', async () => {
+  it('opening an unread message never writes \\Seen: preview is read-only (#170)', async () => {
     readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
       message: { ...BASE_MSG, flags: [] } // unread
     });
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
-
-    await waitFor(() =>
-      expect(readerApiMock.postFlags).toHaveBeenCalledWith(
-        'acct-a',
-        42,
-        'INBOX',
-        ['\\Seen'],
-        []
-      )
-    );
-    expect(readerApiMock.postFlags).toHaveBeenCalledTimes(1);
+    // Give any async write a chance to (wrongly) fire.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(readerApiMock.postFlags).not.toHaveBeenCalled();
+    expect(apiMock.messageFlags).not.toHaveBeenCalled();
+    expect(screen.getByText('Unread')).toBeInTheDocument();
+    expect(readState.isUnread('acct-a', 'INBOX', 42, false)).toBe(true);
   });
 
   it('does NOT auto-mark read when the detail load fails', async () => {
@@ -563,14 +573,28 @@ describe('ReaderPane', () => {
     const btn = screen.getByRole('button', { name: /mark unread/i });
     await fireEvent.click(btn);
     await waitFor(() =>
-      expect(readerApiMock.postFlags).toHaveBeenCalledWith(
+      expect(apiMock.messageFlags).toHaveBeenCalledWith(
         'acct-a',
         42,
-        'INBOX',
-        [],
-        ['\\Seen']
+        expect.objectContaining({
+          folder: 'INBOX',
+          add: [],
+          remove: ['\\Seen'],
+          message_id: '<test@example.com>'
+        })
       )
     );
+    await waitFor(() => expect(screen.getByText('Unread')).toBeInTheDocument());
+    expect(readState.isUnread('acct-a', 'INBOX', 42, false)).toBe(true);
+  });
+
+  it('treats the server’s index spelling ("Seen") as read', async () => {
+    readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
+      message: { ...BASE_MSG, flags: ['Seen'] }
+    });
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Read')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Mark unread' })).toBeInTheDocument();
   });
 
   it('shows "Read" badge when message has \\Seen flag', async () => {
@@ -582,10 +606,23 @@ describe('ReaderPane', () => {
     expect(screen.queryByText('Unread')).not.toBeInTheDocument();
   });
 
-  it('flips the badge to "Read" after auto-marking an unread message on open', async () => {
+  it('Mark read is explicit: the badge flips to Read after the server confirms', async () => {
     render(ReaderPane); // BASE_MSG is unread (flags: [])
+    await waitFor(() => expect(screen.getByText('Unread')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Mark read' }));
     await waitFor(() => expect(screen.getByText('Read')).toBeInTheDocument());
-    expect(screen.queryByText('Unread')).not.toBeInTheDocument();
+    expect(apiMock.messageFlags.mock.calls[0][2]).toMatchObject({ add: ['\\Seen'], remove: [] });
+  });
+
+  it('a failed Mark read keeps the message unread and says why', async () => {
+    apiMock.messageFlags.mockRejectedValueOnce(
+      new EnvelopeApiError(409, 'message_not_found', 'this message is no longer in that folder', null)
+    );
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Unread')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Mark read' }));
+    await waitFor(() => expect(screen.getByText(/no longer in that folder/)).toBeInTheDocument());
+    expect(screen.getByText('Unread')).toBeInTheDocument();
   });
 
   it('reader UI uses plain language — no protocol jargon', async () => {
@@ -711,11 +748,13 @@ describe('ReaderPane mailbox actions', () => {
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
     const ops = getMailboxOpsStore();
     await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
-    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
-    expect(apiMock.bulkClient).toHaveBeenCalledWith(
-      { type: 'move', to_folder: '\\Archive', folder: 'INBOX' },
-      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
-    );
+    await waitFor(() => expect(apiMock.messageMove).toHaveBeenCalled());
+    expect(apiMock.messageMove).toHaveBeenCalledWith('acct-a', 42, {
+      folder: 'INBOX',
+      to_folder: '\\Archive',
+      uidvalidity: null,
+      message_id: '<test@example.com>'
+    });
     await waitFor(() => expect(ops.version).toBe(1));
     expect(goto).toHaveBeenCalledWith('/v2/mail/unified');
   });
@@ -724,12 +763,39 @@ describe('ReaderPane mailbox actions', () => {
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
-    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
-    expect(apiMock.bulkClient).toHaveBeenCalledWith(
-      { type: 'move', to_folder: '\\Trash', folder: 'INBOX' },
-      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
-    );
-    expect(goto).toHaveBeenCalledWith('/v2/mail/unified');
+    await waitFor(() => expect(apiMock.messageMove).toHaveBeenCalled());
+    expect(apiMock.messageMove.mock.calls[0][2]).toMatchObject({ folder: 'INBOX', to_folder: '\\Trash' });
+    await waitFor(() => expect(goto).toHaveBeenCalledWith('/v2/mail/unified'));
+  });
+
+  it('Move to Junk targets the open message’s own folder, then leaves the reader', async () => {
+    pageState.url = new URL('http://localhost/v2/mail/unified/acct-a/42?folder=Newsletters') as typeof pageState.url;
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Move to Junk' }));
+    await waitFor(() => expect(apiMock.messageMove).toHaveBeenCalled());
+    expect(apiMock.messageMove.mock.calls[0][2]).toMatchObject({
+      folder: 'Newsletters',
+      to_folder: '\\Junk'
+    });
+    await waitFor(() => expect(goto).toHaveBeenCalledWith('/v2/mail/unified'));
+  });
+
+  it('inside Junk the reader offers Not junk, which moves to Inbox', async () => {
+    pageState.url = new URL('http://localhost/v2/mail/unified/acct-a/42?folder=Junk') as typeof pageState.url;
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Not junk: move to Inbox' }));
+    await waitFor(() => expect(apiMock.messageMove).toHaveBeenCalled());
+    expect(apiMock.messageMove.mock.calls[0][2]).toMatchObject({ folder: 'Junk', to_folder: 'INBOX' });
+  });
+
+  it('the reader’s More actions lists Remind and Follow up as unavailable', async () => {
+    render(ReaderPane);
+    await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    const remind = screen.getByText('Remind me…').closest('[role="menuitem"]')!;
+    expect(remind).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('Delete inside Trash asks for confirmation, then permanently deletes', async () => {
@@ -749,11 +815,7 @@ describe('ReaderPane mailbox actions', () => {
   });
 
   it('a failed move stays on the message and reports the error', async () => {
-    apiMock.bulkClient.mockResolvedValueOnce({
-      done: 1,
-      total: 1,
-      failed: [{ item: { accountId: 'acct-a', uid: 42, folder: 'INBOX' }, error: 'IMAP down' }]
-    });
+    apiMock.messageMove.mockRejectedValueOnce(new EnvelopeApiError(502, 'http_502', 'IMAP down', null));
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
@@ -762,25 +824,33 @@ describe('ReaderPane mailbox actions', () => {
     expect(getMailboxOpsStore().version).toBe(0);
   });
 
-  it('Star sets \\Flagged on the open message and flips to Unstar', async () => {
+  it('Flag sets \\Flagged on the open message and flips to Unflag', async () => {
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: 'Star' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Flag' }));
     await waitFor(() =>
-      expect(readerApiMock.postFlags).toHaveBeenCalledWith('acct-a', 42, 'INBOX', ['\\Flagged'], [])
+      expect(apiMock.messageFlags).toHaveBeenCalledWith(
+        'acct-a',
+        42,
+        expect.objectContaining({ folder: 'INBOX', add: ['\\Flagged'], remove: [] })
+      )
     );
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Unstar' })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Unflag' })).toBeInTheDocument());
   });
 
-  it('Unstar removes \\Flagged when the message is already starred', async () => {
+  it('Unflag removes \\Flagged when the message is already flagged (index spelling)', async () => {
     readerApiMock.fetchMessageDetail.mockResolvedValueOnce({
-      message: { ...BASE_MSG, flags: ['\\Flagged'] }
+      message: { ...BASE_MSG, flags: ['Flagged'] }
     });
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
-    await fireEvent.click(screen.getByRole('button', { name: 'Unstar' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Unflag' }));
     await waitFor(() =>
-      expect(readerApiMock.postFlags).toHaveBeenCalledWith('acct-a', 42, 'INBOX', [], ['\\Flagged'])
+      expect(apiMock.messageFlags).toHaveBeenCalledWith(
+        'acct-a',
+        42,
+        expect.objectContaining({ add: [], remove: ['\\Flagged'] })
+      )
     );
   });
 });
@@ -805,11 +875,8 @@ describe('ReaderPane — document view (Phase C)', () => {
     render(ReaderPane);
     await waitFor(() => expect(screen.getByText('Test subject')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: 'Remove from Inbox' }));
-    await waitFor(() => expect(apiMock.bulkClient).toHaveBeenCalled());
-    expect(apiMock.bulkClient).toHaveBeenCalledWith(
-      { type: 'move', to_folder: '\\Archive', folder: 'INBOX' },
-      [{ accountId: 'acct-a', uid: 42, folder: 'INBOX' }]
-    );
+    await waitFor(() => expect(apiMock.messageMove).toHaveBeenCalled());
+    expect(apiMock.messageMove.mock.calls[0][2]).toMatchObject({ folder: 'INBOX', to_folder: '\\Archive' });
   });
 
   it('Details reveals the full headers (To, UID)', async () => {

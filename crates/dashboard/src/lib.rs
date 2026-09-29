@@ -648,21 +648,25 @@ async fn run_unsnooze_sweep(state: &AppState) -> anyhow::Result<()> {
         };
         let mut client = client_arc.lock().await;
 
-        // Find the current UID (may have changed after move)
-        let current_uid = if let Some(ref mid) = msg.message_id {
-            let mid_clean = mid.trim_matches(|c| c == '<' || c == '>');
-            match envelope_email_transport::imap::find_uid_by_message_id(
-                &mut client,
-                &msg.snoozed_folder,
-                mid_clean,
-            )
-            .await
-            {
-                Ok(Some(uid)) => uid,
-                _ => msg.uid,
+        // The stored uid names the message in its ORIGINAL folder; inside the
+        // Snoozed folder only an exact, unique Message-ID match is a safe
+        // handle. Anything else is skipped, never guessed.
+        let current_uid = match handlers::snoozed::locate_snoozed(&mut client, msg).await {
+            Ok(Some(uid)) => uid,
+            Ok(None) => {
+                tracing::warn!(
+                    "unsnooze: no exact Message-ID match in {} for snooze {}; skipped",
+                    msg.snoozed_folder,
+                    msg.id
+                );
+                continue;
             }
-        } else {
-            msg.uid
+            Err(e) => {
+                tracing::warn!("unsnooze: lookup failed for {}: {e}", msg.account);
+                drop(client);
+                state.evict_imap(&msg.account).await;
+                continue;
+            }
         };
 
         // Move back to original folder
