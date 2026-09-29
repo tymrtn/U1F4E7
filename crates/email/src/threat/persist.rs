@@ -384,6 +384,42 @@ pub fn attachment_block(
     }))
 }
 
+/// Every attachment of `raw` the download gate would refuse, by filename, in
+/// message order. The reader uses it to show a blocked attachment as blocked
+/// instead of offering a download the server will refuse. Names and content
+/// types are read the way the download path reads them.
+pub fn blocked_attachments(
+    db: &Database,
+    account_id: &str,
+    raw: &[u8],
+) -> Result<Vec<(String, AttachmentBlock)>> {
+    use mail_parser::MimeHeaders;
+    let parsed = mail_parser::MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| anyhow!("message could not be parsed for the attachment gate"))?;
+    let message_id = parsed.message_id().map(canonical_message_id);
+    let mut out = Vec::new();
+    for attachment in parsed.attachments() {
+        let filename = attachment.attachment_name().unwrap_or("unnamed");
+        let content_type = attachment
+            .content_type()
+            .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let content_type = crate::ingress::normalize_content_type(&content_type);
+        if let Some(block) = attachment_block(
+            db,
+            account_id,
+            message_id,
+            filename,
+            &content_type,
+            attachment.contents(),
+        )? {
+            out.push((filename.to_string(), block));
+        }
+    }
+    Ok(out)
+}
+
 /// `threat mark-safe`: tag `threat:false_positive`, clear the level,
 /// malware and quarantine tags, zero the score, and log `label_applied`.
 pub fn mark_safe(
@@ -983,6 +1019,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
+    }
+
+    /// The reader shows a blocked attachment as blocked, so it asks the same
+    /// gate the download chokepoint uses, per attachment of the raw message.
+    #[test]
+    fn blocked_attachments_names_what_the_download_gate_refuses() {
+        let db = Database::open_memory().unwrap();
+        let raw = b"From: a@example.org\r\nTo: me@example.org\r\nMessage-ID: <m1@x>\r\n\
+Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
+--b--\r\n";
+        let blocked = blocked_attachments(&db, ACCT, raw).unwrap();
+        let names: Vec<&str> = blocked.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["invoice.pdf.exe"]);
+        assert_eq!(blocked[0].1.code, ATTACHMENT_BLOCKED);
+
+        // A threat:malware message blocks every attachment, innocent or not.
+        db.add_tag(ACCT, "m1@x", TAG_MALWARE, Some(3), Some("INBOX"))
+            .unwrap();
+        let blocked = blocked_attachments(&db, ACCT, raw).unwrap();
+        let names: Vec<&str> = blocked.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["notes.pdf", "invoice.pdf.exe"]);
+        assert!(blocked[0].1.reason.contains("threat:malware"));
     }
 
     /// A part-by-part read of an over-cap message passes no raw bytes: there

@@ -1088,12 +1088,21 @@ pub async fn read(
                         Err(e) => json!({"level": "unavailable", "error": format!("{e:#}")}),
                     }
                 };
+                let attachment_blocks = {
+                    let db = state.db.lock().await;
+                    attachment_blocks_view(&db, &account_id, &msg, raw.as_deref())
+                };
                 let message = DashboardMessage {
                     unread: message_is_unread(&msg),
                     message: msg,
                     thread_context,
                 };
-                return Json(json!({ "message": message, "threat": threat })).into_response();
+                return Json(json!({
+                    "message": message,
+                    "threat": threat,
+                    "attachment_blocks": attachment_blocks,
+                }))
+                .into_response();
             }
             Ok(None) => return (StatusCode::NOT_FOUND, "message not found").into_response(),
             Err(e) => {
@@ -1113,6 +1122,59 @@ pub async fn read(
         last_err.unwrap_or_else(|| "fetch: IMAP error".to_string()),
     )
         .into_response()
+}
+
+/// Attachments the download route would refuse, so the reader can show them
+/// as blocked with the reason instead of a link that fails. Asks the same gate
+/// as the download chokepoint. Without whole-message bytes (a message read
+/// part by part) it gates on the metadata alone. If the gate itself fails,
+/// every attachment is reported blocked with that error: the download route
+/// would refuse them too.
+fn attachment_blocks_view(
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    msg: &Message,
+    raw: Option<&[u8]>,
+) -> Vec<serde_json::Value> {
+    use envelope_email_transport::threat::persist;
+    let blocked = match raw {
+        Some(raw) => persist::blocked_attachments(db, account_id, raw),
+        None => msg
+            .attachments
+            .iter()
+            .filter_map(|a| {
+                persist::attachment_block(
+                    db,
+                    account_id,
+                    msg.message_id.as_deref(),
+                    &a.filename,
+                    &a.content_type,
+                    &[],
+                )
+                .map(|block| block.map(|b| (a.filename.clone(), b)))
+                .transpose()
+            })
+            .collect(),
+    };
+    match blocked {
+        Ok(blocked) => blocked
+            .into_iter()
+            .map(|(filename, block)| {
+                json!({ "filename": filename, "code": block.code, "reason": block.reason })
+            })
+            .collect(),
+        Err(e) => msg
+            .attachments
+            .iter()
+            .map(|a| {
+                json!({
+                    "filename": a.filename,
+                    "code": persist::ATTACHMENT_BLOCKED,
+                    "reason": format!("threat check failed: {e:#}"),
+                })
+            })
+            .collect(),
+    }
 }
 
 #[derive(Deserialize)]
