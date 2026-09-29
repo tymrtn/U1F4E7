@@ -7,26 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.11] — 2026-09-29
+
+Webmail usability fixes: mailbox sync on open, one set of message actions, and a right-click menu.
+
 ### Added
 
-- **Webmail right-click menu (#172).** Right-click a message row, press Shift+F10 or the Menu key,
-  or long-press on a phone to get that message's actions at the pointer: Open, the read toggle,
-  Flag, Snooze, Junk, Archive and Move to Trash, with Remind and Follow up shown as not available.
-  It runs the same actions as the More menu with the same receipts and errors. Opening the menu
-  never opens the message or marks it read. When the row is part of a multi-selection the menu
-  says it acts on that message only. The browser's own menu still appears on selected text,
-  inputs, images and ordinary links.
+- **Dashboard (mail): Inbox and Sent sync when you open them, plus Sync now (#171).** Opening Inbox
+  or Sent shows the cached messages at once, then runs one read-only sync of that view with the
+  provider. **Sync now** runs the same sync on demand, and an account that failed gets its own
+  **Retry**. The status line says Syncing…, Synced HH:MM, which accounts failed, or that the sync
+  failed. Two tabs, repeated clicks and the hourly Sent sweep share one run per account.
+- **Dashboard (mail): right-click menu (#172).** Right-click a message row, press Shift+F10 or the
+  Menu key, or long-press on a phone to get that message's actions at the pointer: Open, the read
+  toggle, Flag, Snooze, Junk, Archive and Move to Trash. It runs the same actions as the More menu,
+  with the same receipts and errors. Opening the menu never opens the message or marks it read.
+  When the row is part of a multi-selection, the menu says it acts on that message only. The
+  browser's own menu still appears on selected text, inputs, images and ordinary links.
 
 ### Changed
 
-- **Webmail message actions (part of #170).** Every message row and the reader now have a visible
-  **More actions** menu (keyboard and phone reachable) with one read toggle (**Mark unread** on a
-  read message, **Mark read** on an unread one), Flag/Unflag, Snooze
-  with exact return times, Move to Junk (or Not junk inside Junk), Archive and Move to Trash. The
-  row keeps an always-visible flag. Remind and Follow up are listed as not available, with the
-  reason, because Envelope has no backend for either yet.
+- **Dashboard (mail): an account that fails to sync keeps its cached mail on screen, marked stale**,
+  with the error. Before, its messages were hidden, which could show an empty Inbox over hundreds
+  of indexed messages (#171).
+- **Dashboard (mail): one action model for message actions (#170, first part).** Every message row
+  and the reader have a visible **More actions** menu (keyboard and phone reachable) with one read
+  toggle (**Mark unread** on a read message, **Mark read** on an unread one, never both),
+  Flag/Unflag, Snooze with exact return times, Move to Junk (or Not junk inside Junk), Archive and
+  Move to Trash. The row keeps an always-visible flag. Every surface sends the same command for the
+  same exact message, and a message that has moved or changed on the server is refused as stale
+  instead of being reported as done.
+- **Remind and Follow up are shown as not available**, with the reason. Envelope has no reminder
+  that keeps a message in place, and nothing in the web app watches for replies. They stay open in
+  #170.
 - **Opening a message in the reader marks it read**, as before. Hovering or previewing a list row
-  never does, and the toggle's label follows the message's state straight after opening.
+  never does, and the read toggle says **Mark unread** straight after opening.
 - Actions that move a message leave a receipt naming the real destination folder, with
   **Move back** when the server found the moved copy exactly, and **Unsnooze** after a snooze.
 
@@ -44,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a message with no Message-ID is refused up front.
 - **Junk:** Microsoft 365's `Junk Email` folder is recognised alongside `Junk E-mail`,
   `[Gmail]/Spam` and generic `Junk`/`Spam`.
-
 - **Storage:** opens a database at schema version 24 as it finds it. Envelope 2 adds migration
   24 (the Microsoft sign-in and Graph tables: `oauth_grants`, `msgraph_folders`, `msgraph_ids`),
   which is new tables only. This build runs no migrations on such a database, writes nothing to
