@@ -6,7 +6,7 @@
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { Snippet } from 'svelte';
   import { Rail, Spinner, EmptyState, MonoTag } from '$lib/components';
   import MessageRow from '$lib/components/MessageRow.svelte';
@@ -33,6 +33,7 @@
   import { getLiveStore } from '$lib/live.svelte';
   import { getComposerStore } from '$lib/composer.svelte';
   import { getMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+  import { getContextMenu } from '$lib/context-menu.svelte';
   import { parseSearchQuery } from '$lib/search-query';
   import {
     api,
@@ -61,6 +62,14 @@
   // delete / star through this shared store. Re-run the same refresh
   // BulkToolbar triggers via `onoperated`, so the moved row disappears from the
   // mounted list. Version-compare so a route change alone never re-fetches.
+  // A right-click menu belongs to the view it was opened in (#172).
+  const contextMenu = getContextMenu();
+  $effect(() => {
+    void page.url.href;
+    void page.params;
+    untrack(() => contextMenu.close());
+  });
+
   const mailboxOps = getMailboxOpsStore();
   // Start from the current version: the signal outlives this layout, so a
   // remount must not replay an operation that finished before it existed.

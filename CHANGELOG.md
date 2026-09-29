@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Webmail right-click menu (#172).** Right-click a message row, press Shift+F10 or the Menu key,
+  or long-press on a phone to get that message's actions at the pointer: Open, the read toggle,
+  Flag, Snooze, Junk, Archive and Move to Trash, with Remind and Follow up shown as not available.
+  It runs the same actions as the More menu with the same receipts and errors. Opening the menu
+  never opens the message or marks it read. When the row is part of a multi-selection the menu
+  says it acts on that message only. The browser's own menu still appears on selected text,
+  inputs, images and ordinary links.
+
 ### Changed
 
 - **Webmail message actions (part of #170).** Every message row and the reader now have a visible

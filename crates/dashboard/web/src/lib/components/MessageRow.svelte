@@ -11,6 +11,11 @@
   // cluster is a desktop shortcut onto the same dispatch. Progress, errors,
   // and a short done note render on the row itself. `delegate` stays present
   // but disabled until its backend lands. Nothing here opens a send path.
+  //
+  // Right-click (#172) opens the same menu at the pointer, as does Shift+F10 /
+  // the ContextMenu key and a touch long-press. It never opens the message or
+  // marks it read. The browser's own menu stays on text selections, inputs,
+  // images, and links other than the row itself.
   import type { SelectionStore } from '$lib/selection.svelte';
   import {
     getMessageActions,
@@ -18,6 +23,8 @@
     type ActionTarget
   } from '$lib/message-actions.svelte';
   import { formatExactReturn } from '$lib/snooze-options';
+  import { getContextMenu } from '$lib/context-menu.svelte';
+  import { readState } from '$lib/read-state.svelte';
   import { identityColor } from '$lib/hue';
   import Avatar from './Avatar.svelte';
   import Icon from './Icon.svelte';
@@ -80,6 +87,108 @@
     message.folder ? actions.isFlagged(target, message.starred) : message.starred
   );
   const snoozeReturn = $derived(message.snooze ? new Date(message.snooze.returnAt) : null);
+  // Read state from the shared store, so the read toggle's label is right the
+  // moment the message is opened or toggled anywhere else.
+  const isRead = $derived(
+    !readState.isUnread(message.accountId, message.folder ?? '', message.uid, message.unread)
+  );
+
+  // ── Context menu (#172) ──────────────────────────────────────────────
+  const contextMenu = getContextMenu();
+  const menuOpen = $derived(contextMenu.current?.key === message.key ? contextMenu.current : null);
+  // Null-safe: the menu's props can be read once more after the store closes,
+  // before the {#if} below tears it down.
+  const menuPoint = $derived(menuOpen ? { x: menuOpen.x, y: menuOpen.y } : null);
+  const canMenu = $derived(hasHandle || (verbs && !!message.snooze));
+  const scopeNote = $derived(
+    isSelected && selection.count > 1
+      ? `This message only. ${selection.count} selected: use the toolbar to act on all of them.`
+      : null
+  );
+  let rowEl = $state<HTMLDivElement | null>(null);
+
+  const LONG_PRESS_MS = 500;
+  const PRESS_SLOP_PX = 10;
+  let pressTimer: ReturnType<typeof setTimeout> | null = null;
+  let pressAt = { x: 0, y: 0 };
+  let swallowClick = false;
+
+  function wantsNativeMenu(t: HTMLElement | null): boolean {
+    if (!t || !rowEl) return true;
+    if (t.closest('input, textarea, select, img, video, [contenteditable], .msg-actions-menu')) {
+      return true;
+    }
+    const link = t.closest('a[href]');
+    if (link && !link.classList.contains('msg-body')) return true;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+      if (rowEl.contains(sel.getRangeAt(0).commonAncestorContainer)) return true;
+    }
+    return false;
+  }
+
+  function focusTarget(t: HTMLElement | null): HTMLElement | null {
+    return t?.closest<HTMLElement>('.msg-body') ?? rowEl;
+  }
+
+  function openMenuAt(x: number, y: number, returnFocus: HTMLElement | null) {
+    contextMenu.openAt({ key: message.key, x, y, returnFocus });
+  }
+
+  function openMenuFromElement(el: HTMLElement | null) {
+    const r = (el ?? rowEl)?.getBoundingClientRect();
+    openMenuAt(r ? r.left + 16 : 0, r ? r.bottom : 0, el ?? rowEl);
+  }
+
+  function closeContextMenu() {
+    // Another row may already own the menu (retarget); only close our own.
+    if (contextMenu.current?.key === message.key) contextMenu.close();
+  }
+
+  function handleContextMenu(e: MouseEvent) {
+    if (!canMenu) return;
+    const t = e.target as HTMLElement | null;
+    if (wantsNativeMenu(t)) return;
+    e.preventDefault();
+    // Shift+F10 / the ContextMenu key also fire a contextmenu event with no
+    // pointer position after the keydown already opened the menu.
+    if (e.clientX === 0 && e.clientY === 0) {
+      if (!menuOpen) openMenuFromElement(focusTarget(t));
+      return;
+    }
+    openMenuAt(e.clientX, e.clientY, focusTarget(t));
+  }
+
+  function cancelPress() {
+    if (pressTimer) clearTimeout(pressTimer);
+    pressTimer = null;
+  }
+
+  function handlePointerDown(e: PointerEvent) {
+    if (e.pointerType !== 'touch' || !canMenu) return;
+    const t = e.target as HTMLElement | null;
+    if (wantsNativeMenu(t)) return;
+    pressAt = { x: e.clientX, y: e.clientY };
+    cancelPress();
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      swallowClick = true;
+      openMenuAt(pressAt.x, pressAt.y, focusTarget(t));
+    }, LONG_PRESS_MS);
+  }
+
+  function handlePointerMove(e: PointerEvent) {
+    if (!pressTimer) return;
+    if (Math.hypot(e.clientX - pressAt.x, e.clientY - pressAt.y) > PRESS_SLOP_PX) cancelPress();
+  }
+
+  function handleClickCapture(e: MouseEvent) {
+    // The click that ends a long-press must not open the message.
+    if (!swallowClick) return;
+    swallowClick = false;
+    e.preventDefault();
+    e.stopPropagation();
+  }
 
   function handleCheckbox(e: MouseEvent) {
     e.stopPropagation();
@@ -105,6 +214,13 @@
   }
 
   function handleRowKeydown(e: KeyboardEvent) {
+    if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+      const t = e.target as HTMLElement | null;
+      if (!canMenu || (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      e.preventDefault();
+      openMenuFromElement(focusTarget(t));
+      return;
+    }
     if (e.key === 'x') {
       e.preventDefault();
       selection.keyToggle(message.key);
@@ -125,7 +241,7 @@
         break;
       case 'U':
         e.preventDefault();
-        act({ kind: message.unread ? 'mark-read' : 'mark-unread' });
+        act({ kind: isRead ? 'mark-unread' : 'mark-read' });
         break;
     }
   }
@@ -165,8 +281,15 @@
   data-msg-key={message.key}
   aria-selected={isSelected}
   aria-busy={busy}
+  bind:this={rowEl}
   onkeydown={handleRowKeydown}
   onfocus={handleFocus}
+  oncontextmenu={handleContextMenu}
+  onpointerdown={handlePointerDown}
+  onpointermove={handlePointerMove}
+  onpointerup={cancelPress}
+  onpointercancel={cancelPress}
+  onclickcapture={handleClickCapture}
 >
   <div class="msg-lead">
     <span class="msg-avatar"><Avatar name={message.from || message.accountId} size={30} /></span>
@@ -300,7 +423,7 @@
       </button>
       <MessageActionMenu
         {target}
-        context={{ folder: target.folder, read: !message.unread, flagged }}
+        context={{ folder: target.folder, read: isRead, flagged }}
       />
     {:else if message.snooze}
       <MessageActionMenu
@@ -311,6 +434,20 @@
       <span class="msg-flag is-flagged is-static" aria-hidden="true">★</span>
     {/if}
   </div>
+
+  {#if menuOpen && canMenu}
+    <MessageActionMenu
+      {target}
+      context={message.snooze
+        ? { folder: target.folder, read: null, flagged: null, snoozeId: message.snooze.id }
+        : { folder: target.folder, read: isRead, flagged }}
+      at={menuPoint}
+      openHref={message.href}
+      {scopeNote}
+      returnFocus={menuOpen?.returnFocus ?? null}
+      onclose={closeContextMenu}
+    />
+  {/if}
 
   {#if rowState?.phase === 'pending'}
     <p class="msg-op-status" role="status">{rowState.label}</p>
@@ -332,6 +469,15 @@
 </div>
 
 <style>
+  @media (pointer: coarse) {
+    /* Long-press opens the app menu; keep the OS callout and text selection
+       from fighting it. */
+    .msg-row {
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+  }
   .msg-row {
     display: grid;
     grid-template-columns: auto 1fr auto;

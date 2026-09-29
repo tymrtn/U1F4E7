@@ -6,6 +6,12 @@
   //
   // Keyboard: the trigger opens with Enter/Space/ArrowDown; arrows move,
   // Home/End jump, Escape closes and returns focus to the trigger, Tab closes.
+  //
+  // Context mode (#172): with `at` set there is no trigger. The row renders
+  // this component only while its right-click menu is open, positioned at the
+  // pointer and kept inside the viewport. It adds an Open link, can carry a
+  // row-vs-selection note, and closes on Escape, outside click, another
+  // right-click, scroll, or a chosen action; `onclose` tells the row.
   import {
     availableActions,
     getMessageActions,
@@ -23,20 +29,37 @@
     target,
     context,
     label = 'More actions',
-    onresult
+    onresult,
+    at = null,
+    openHref,
+    scopeNote,
+    returnFocus = null,
+    onclose
   }: {
     target: ActionTarget;
     context: ActionContext;
     label?: string;
     /** Called after a dispatch settles (reader uses it to leave after a move). */
     onresult?: (kind: CommandKind, outcome: ActionOutcome) => void;
+    /** Context mode: open at this viewport point, with no trigger button. */
+    at?: { x: number; y: number } | null;
+    /** Context mode: link for the Open item. */
+    openHref?: string;
+    /** Context mode: says whether the menu acts on the row or a selection. */
+    scopeNote?: string | null;
+    /** Context mode: focus goes back here on Escape. */
+    returnFocus?: HTMLElement | null;
+    onclose?: () => void;
   } = $props();
+
+  const contextMode = $derived(at !== null);
 
   const actions = getMessageActions();
   const busy = $derived(actions.isBusy(target));
   const items = $derived(availableActions(context));
 
-  let open = $state(false);
+  // svelte-ignore state_referenced_locally
+  let open = $state(at !== null);
   let view = $state<'main' | 'snooze'>('main');
   let presets = $state<SnoozeOption[]>([]);
   let customValue = $state('');
@@ -54,7 +77,8 @@
   function focusItem(index: number) {
     const list = menuItems();
     if (list.length === 0) return;
-    list[(index + list.length) % list.length].focus();
+    // preventScroll: a focus-driven scroll would close a context menu.
+    list[(index + list.length) % list.length].focus({ preventScroll: true });
   }
 
   async function openMenu() {
@@ -65,12 +89,39 @@
     focusItem(0);
   }
 
-  function closeMenu(returnFocus = true) {
+  function closeMenu(restoreFocus = true) {
     open = false;
     view = 'main';
     customError = null;
-    if (returnFocus) trigger?.focus();
+    if (contextMode) {
+      if (restoreFocus) returnFocus?.focus();
+      onclose?.();
+      return;
+    }
+    if (restoreFocus) trigger?.focus();
   }
+
+  // Context mode: focus the first item on open and keep the menu on screen.
+  let pos = $state({ left: 0, top: 0 });
+  function place() {
+    if (!at) return;
+    const r = menu?.getBoundingClientRect();
+    const w = r?.width ?? 0;
+    const h = r?.height ?? 0;
+    const margin = 8;
+    pos = {
+      left: Math.max(margin, Math.min(at.x, window.innerWidth - w - margin)),
+      top: Math.max(margin, Math.min(at.y, window.innerHeight - h - margin))
+    };
+  }
+  $effect(() => {
+    if (!at || !menu) return;
+    place();
+  });
+  $effect(() => {
+    if (!contextMode) return;
+    void Promise.resolve().then(() => focusItem(0));
+  });
 
   async function showSnooze() {
     presets = snoozeOptions(new Date());
@@ -173,11 +224,28 @@
   function onWindowPointer(e: MouseEvent) {
     if (open && root && !root.contains(e.target as Node)) closeMenu(false);
   }
+
+  // A right-click a row claimed (preventDefault) retargets through the row;
+  // any other right-click closes the menu and leaves the browser's own.
+  function onWindowContextMenu(e: MouseEvent) {
+    if (contextMode && e.defaultPrevented) return;
+    onWindowPointer(e);
+  }
+
+  function onWindowScroll() {
+    if (contextMode && open) closeMenu(false);
+  }
 </script>
 
-<svelte:window onclick={onWindowPointer} />
+<svelte:window
+  onclick={onWindowPointer}
+  oncontextmenu={onWindowContextMenu}
+  onresize={place}
+  onscrollcapture={onWindowScroll}
+/>
 
-<div class="msg-actions" bind:this={root}>
+<div class="msg-actions" class:is-context={contextMode} bind:this={root}>
+  {#if !contextMode}
   <button
     bind:this={trigger}
     class="msg-actions-trigger"
@@ -199,6 +267,7 @@
   >
     <Icon name="ellipsis" size={16} />
   </button>
+  {/if}
 
   {#if open}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -206,6 +275,8 @@
       bind:this={menu}
       id={menuId}
       class="msg-actions-menu"
+      class:msg-context-menu={contextMode}
+      style={contextMode ? `left: ${pos.left}px; top: ${pos.top}px` : undefined}
       role="menu"
       tabindex="-1"
       aria-label={view === 'snooze' ? 'Snooze until' : 'Message actions'}
@@ -213,6 +284,20 @@
       onclick={(e) => e.stopPropagation()}
     >
       {#if view === 'main'}
+        {#if contextMode && scopeNote}
+          <p class="msg-actions-scope">{scopeNote}</p>
+        {/if}
+        {#if contextMode && openHref}
+          <a
+            role="menuitem"
+            class="msg-actions-item"
+            data-action="open"
+            href={openHref}
+            onclick={() => closeMenu(false)}
+          >
+            Open
+          </a>
+        {/if}
         {#each items as item (item.id)}
           {#if item.available}
             <button
@@ -340,6 +425,22 @@
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
+  }
+  .msg-actions-menu.msg-context-menu {
+    position: fixed;
+    right: auto;
+    z-index: 60;
+  }
+  .msg-actions-scope {
+    margin: 0;
+    padding: 0.35rem 0.55rem 0.4rem;
+    font-size: 0.6875rem;
+    line-height: 1.35;
+    color: var(--env-muted);
+    border-bottom: 1px solid var(--env-rule);
+  }
+  a.msg-actions-item {
+    text-decoration: none;
   }
   .msg-actions-item {
     display: flex;

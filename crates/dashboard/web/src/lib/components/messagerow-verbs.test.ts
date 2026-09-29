@@ -31,6 +31,7 @@ import MessageRow from './MessageRow.svelte';
 import { SelectionStore } from '$lib/selection.svelte';
 import { getMailboxOpsStore, __resetMailboxOpsStore } from '$lib/mailbox-ops.svelte';
 import { __resetMessageActions, FOLLOW_UP_SEMANTICS } from '$lib/message-actions.svelte';
+import { __resetReadState } from '$lib/read-state.svelte';
 
 function mkMessage(over: Record<string, unknown> = {}) {
   return {
@@ -71,6 +72,7 @@ const MOVED = {
 beforeEach(() => {
   __resetMailboxOpsStore();
   __resetMessageActions();
+  __resetReadState();
   moveMock.mockResolvedValue(MOVED);
   flagsMock.mockResolvedValue({
     ok: true,
