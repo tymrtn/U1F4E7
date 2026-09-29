@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.12] — 2026-09-29
+
+Fixes for four problems the v1 smoke suite found in 1.3.11.
+
+### Fixed
+
+- **Dashboard (drafts): saved drafts can be discarded.** The Drafts list has a **Discard draft**
+  button on every row, and the draft page has **Discard**. Both ask first. If the draft has a copy
+  in your mailbox's Drafts folder, that copy moves to Trash. If the copy can't be moved (the
+  mailbox is unreachable, or that slot now holds a different message), the draft stays as it was
+  and the page says why.
+- **Dashboard (reader): blocked attachments are shown as blocked.** An attachment that rShield
+  refuses to download (a `threat:malware` message, or a malware-grade file such as
+  `invoice.pdf.exe`) used to show a Download link that failed silently. It now shows **Blocked**
+  with the reason and no link. The CLI `--unsafe` override is unchanged.
+- **Dashboard (mail): a fresh install no longer opens to "Sync failed … timed out after 10s".**
+  The background threat scan held the account's shared mailbox connection for its whole first
+  pass, so the Inbox sync that runs when you open the page had to wait behind it and ran out of
+  time. The scan now uses its own connection.
+- **Installer: downloads retry on network and TLS errors.** `install.sh` now retries each download
+  up to four times with backoff (2, 4, 8 seconds). Before, `curl --retry` gave up at once on TLS
+  handshake failures and connection resets. Checksum verification is unchanged.
+
 ## [1.3.11] — 2026-09-29
 
 Webmail usability fixes: mailbox sync on open, one set of message actions, and a right-click menu.
