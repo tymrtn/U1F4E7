@@ -135,6 +135,8 @@ CLI `--json` output keeps its `ui` objects (`dashboard_url`, `dashboard_path`, `
 
 MCP results leave them out by default. Every `ui`, `parent_ui`, and `draft_ui` object is removed at any depth (including `sent_mail.ui`), and the call builds its links from the localhost origin without consulting Tailscale, so URL fields outside those blocks (a draft's `dashboard_url`/`review_url`, `sent_message_url`, `sent_mail.message_url`) carry `http://localhost:3141`. MCP output goes to the agent's model provider, and a Tailscale Serve hostname identifies the host and its tailnet. The blocks also cost about 400 bytes per message row.
 
+MCP tool results are serialized as compact JSON (no indentation) in the `text` content item; CLI `--json` output is unchanged.
+
 The tools that can return links (`accounts`, `inbox`, `read`, `search`, `send`, `reply`, `create_reply_draft`, `create_forward_draft`, `modify_draft`, `get_draft`, `send_draft`, `move_message`, `flag`, `folders`, `tag`, `contacts`, `rules_preview`, `rules_run`) accept an optional boolean `include_ui_links` (default `false`). With `true`, the result is what it was before this option existed: full `ui` blocks and the discovered dashboard origin. A non-boolean value is rejected. The trust envelope (`_envelope_trust`, `_warning`, `trust`) is the same either way.
 
 ## Send safety

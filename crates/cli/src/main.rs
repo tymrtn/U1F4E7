@@ -3115,7 +3115,11 @@ mod tests {
             .remove("include_ui_links");
         assert_eq!(
             links,
-            Some(serde_json::json!({"type": "boolean", "default": false}))
+            Some(serde_json::json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Add dashboard links"
+            }))
         );
         assert_eq!(mcp_input, contract_inbox["input_schema"]);
     }

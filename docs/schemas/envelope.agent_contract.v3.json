@@ -114,6 +114,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "limit": {
@@ -146,6 +147,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "uid": {
@@ -177,6 +179,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "limit": {
@@ -320,6 +323,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "reply_to": {
@@ -468,6 +472,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "reply_all": {
@@ -571,6 +576,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "reply_all": {
@@ -639,6 +645,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "to": {
@@ -712,6 +719,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "remove_attach": {
@@ -756,6 +764,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           }
         },
@@ -838,6 +847,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "send_now": {
@@ -871,6 +881,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "to_folder": {
@@ -919,6 +930,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "uid": {
@@ -947,6 +959,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           }
         },
@@ -972,6 +985,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "scores": {
@@ -1026,6 +1040,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "name": {
@@ -1056,6 +1071,7 @@
         "properties": {
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           }
         },
@@ -1179,6 +1195,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "limit": {
@@ -1216,6 +1233,7 @@
           },
           "include_ui_links": {
             "default": false,
+            "description": "Add dashboard links",
             "type": "boolean"
           },
           "limit": {

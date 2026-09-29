@@ -2173,3 +2173,30 @@ fn mcp_default_output_never_carries_a_tailnet_dashboard_origin() {
         );
     }
 }
+
+/// Tool results are compact JSON: indentation is pure token cost for a model.
+#[test]
+fn mcp_tool_result_text_is_compact_json() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    write_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "governor_catalog", "arguments": {}}
+        }),
+    );
+    let resp = read_message(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait mcp");
+
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let parsed: Value = serde_json::from_str(text).expect("result text is JSON");
+    assert_eq!(text, serde_json::to_string(&parsed).unwrap());
+}

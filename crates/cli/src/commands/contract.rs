@@ -646,6 +646,12 @@ const UI_LINK_TOOLS: &[&str] = &[
     "rules_run",
 ];
 
+/// The `include_ui_links` input every tool in [`UI_LINK_TOOLS`] shares. Kept to
+/// one short line because tools/list rides along with every model request.
+fn include_ui_links_schema() -> Value {
+    json!({"type": "boolean", "default": false, "description": "Add dashboard links"})
+}
+
 fn mcp_tool_entries() -> Value {
     let descriptions = [
         (
@@ -748,8 +754,7 @@ fn mcp_tool_entries() -> Value {
                     surface(name).unwrap_or_else(|| panic!("missing MCP contract surface: {name}"));
                 let mut input_schema = surface["input_schema"].clone();
                 if UI_LINK_TOOLS.contains(name) {
-                    input_schema["properties"]["include_ui_links"] =
-                        json!({"type": "boolean", "default": false});
+                    input_schema["properties"]["include_ui_links"] = include_ui_links_schema();
                 }
                 if *name == "send" {
                     if let Some(send_mode) = input_schema

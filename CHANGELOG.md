@@ -14,11 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dashboard_url` named the host's tailnet, and that text went to the agent's model provider. MCP
   calls now build links from localhost and drop `ui`, `parent_ui` and `draft_ui` blocks unless the
   call passes `include_ui_links: true`, which returns the previous output. CLI `--json` is unchanged.
-- **MCP: smaller results.** Without the per-row `ui` block, a 10-message `inbox` result drops from
-  8,040 to 4,060 bytes. The `attributes` parameter of `send`, `reply` and `send_draft` now lists the
-  declarable keys with their meanings, and the tool descriptions no longer send models to
-  `governor_catalog`. `governor_catalog` returns only the declarable keys by default (1,789 bytes
-  instead of 9,362); pass `full: true` for the full projection.
+- **MCP: smaller results.** Tool results are compact JSON instead of pretty-printed, and message
+  rows no longer carry a `ui` block, so a 10-message `inbox` result drops from 8,040 to 3,107 bytes.
+  The `attributes` parameter of `send`, `reply` and `send_draft` now lists the declarable keys with
+  their meanings, and the tool descriptions no longer send models to `governor_catalog`.
+  `governor_catalog` returns only the declarable keys by default (1,500 bytes instead of 9,362);
+  pass `full: true` for the full projection.
 
 ## [1.3.11] — 2026-09-29
 
