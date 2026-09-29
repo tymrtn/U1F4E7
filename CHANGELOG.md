@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.12] — 2026-09-29
+
+Smaller MCP results with the host's dashboard origin kept out of model context, plus four fixes
+from the v1 smoke suite.
+
 ### Fixed
 
 - **MCP (privacy): the host's dashboard origin no longer reaches model context by default.** When
@@ -20,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their meanings, and the tool descriptions no longer send models to `governor_catalog`.
   `governor_catalog` returns only the declarable keys by default (1,500 bytes instead of 9,362);
   pass `full: true` for the full projection.
+- **Dashboard (drafts): saved drafts can be discarded (#180).** Drafts rows have a Discard draft
+  button and the draft page has Discard, both behind a confirmation. Discarding moves the draft's
+  Drafts-folder copy to Trash first; it refuses with `409 draft_copy_mismatch` when that UID holds a
+  different message and leaves the draft untouched on any mailbox error. Sent or in-flight drafts
+  are refused before the mailbox is touched.
+- **Dashboard (reader): blocked attachments no longer show a Download link (#180).** The message
+  API returns `attachment_blocks` from the same gate the download route uses, and the reader shows
+  "Blocked · reason" with no link. The CLI `--unsafe` override is unchanged.
+- **Dashboard (mail): a fresh install no longer opens to "Sync failed … timed out after 10s"
+  (#180).** The startup threat sweep held the account's pooled IMAP connection for its whole first
+  scan, so the first inbox sync waited past its budget. The sweep now uses its own connection.
+- **Installer: `install.sh` retries TLS handshake and connection-reset errors (#180),** which
+  `curl --retry` skips. Downloads get 4 attempts with 2/4/8s backoff; the checksum check is
+  unchanged.
 
 ## [1.3.11] — 2026-09-29
 
