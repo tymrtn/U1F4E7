@@ -20,6 +20,7 @@ pub mod events_log;
 pub mod events_stream;
 pub mod folders;
 pub mod health;
+pub mod message_target;
 pub mod messages;
 pub mod review;
 pub mod rules;

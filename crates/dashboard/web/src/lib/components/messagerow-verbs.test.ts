@@ -1,27 +1,36 @@
-// MessageRow GTD verb cluster (design plan rev 3, Phase B). The row dispatches
-// the same single-item ops the reader/BulkToolbar use, bumps the shared
-// mailbox-ops signal on success, surfaces failures loudly, and never opens a
-// new send path. Delegate is present but disabled until its backend lands.
+// MessageRow actions (#170). The row dispatches single-message commands
+// through the shared action model with its exact identity, shows progress,
+// errors, and done notes on the row, exposes every action through a visible
+// More actions menu (no hover or selection needed), and never opens a send
+// path. Delegate is present but disabled until its backend lands.
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { bulkClientMock, snoozeMock } = vi.hoisted(() => ({
-  bulkClientMock: vi.fn(),
-  snoozeMock: vi.fn()
+const { moveMock, flagsMock, snoozeMock, unsnoozeMock } = vi.hoisted(() => ({
+  moveMock: vi.fn(),
+  flagsMock: vi.fn(),
+  snoozeMock: vi.fn(),
+  unsnoozeMock: vi.fn()
 }));
 
 vi.mock('$lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/api')>();
   return {
     ...actual,
-    bulkClient: bulkClientMock,
-    api: { ...actual.api, snoozeMessage: snoozeMock }
+    api: {
+      ...actual.api,
+      messageMove: moveMock,
+      messageFlags: flagsMock,
+      snoozeMessage: snoozeMock,
+      unsnooze: unsnoozeMock
+    }
   };
 });
 
 import MessageRow from './MessageRow.svelte';
 import { SelectionStore } from '$lib/selection.svelte';
 import { getMailboxOpsStore, __resetMailboxOpsStore } from '$lib/mailbox-ops.svelte';
+import { __resetMessageActions, FOLLOW_UP_SEMANTICS } from '$lib/message-actions.svelte';
 
 function mkMessage(over: Record<string, unknown> = {}) {
   return {
@@ -35,6 +44,8 @@ function mkMessage(over: Record<string, unknown> = {}) {
     unread: true,
     starred: false,
     folder: 'INBOX',
+    uidvalidity: 1700,
+    messageId: '<r30@example.test>',
     href: '/mail/unified/acct-1/30?folder=INBOX',
     ...over
   };
@@ -48,10 +59,38 @@ function renderRow(over: Record<string, unknown> = {}, verbs = true) {
   });
 }
 
+const MOVED = {
+  ok: true,
+  uid: 30,
+  from_folder: 'INBOX',
+  moved_to: 'Archive',
+  moved_uid: 501,
+  moved_uidvalidity: 9
+};
+
 beforeEach(() => {
   __resetMailboxOpsStore();
-  bulkClientMock.mockResolvedValue({ done: 1, total: 1, failed: [] });
-  snoozeMock.mockResolvedValue({ ok: true, uid: 30, return_at: 'x', snoozed_folder: 'Snoozed' });
+  __resetMessageActions();
+  moveMock.mockResolvedValue(MOVED);
+  flagsMock.mockResolvedValue({
+    ok: true,
+    uid: 30,
+    added: ['\\Flagged'],
+    removed: [],
+    confirmed: true,
+    flags: ['Flagged'],
+    seen: false,
+    flagged: true
+  });
+  snoozeMock.mockResolvedValue({
+    ok: true,
+    id: 'snz-1',
+    uid: 30,
+    original_folder: 'INBOX',
+    return_at: '2030-01-07T08:00:00Z',
+    snoozed_folder: 'Snoozed',
+    message_id: 'r30@example.test'
+  });
 });
 
 afterEach(() => {
@@ -99,33 +138,39 @@ describe('MessageRow — identity', () => {
   });
 });
 
-describe('MessageRow — verb cluster', () => {
-  it('omits verbs when the row has no folder', () => {
+describe('MessageRow — actions', () => {
+  it('omits mailbox actions when the row has no folder', () => {
     renderRow({ folder: undefined });
     expect(screen.queryByRole('button', { name: 'Archive' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'More actions' })).toBeNull();
   });
 
-  it('archive dispatches a \\Archive move and bumps the ops signal', async () => {
+  it('archive dispatches a \\Archive move with the row’s exact identity and bumps the ops signal', async () => {
     const ops = getMailboxOpsStore();
     const before = ops.version;
     renderRow();
     await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
-    await waitFor(() => expect(bulkClientMock).toHaveBeenCalledTimes(1));
-    const [op, items] = bulkClientMock.mock.calls[0];
-    expect(op).toEqual({ type: 'move', to_folder: '\\Archive', folder: 'INBOX' });
-    expect(items).toEqual([{ accountId: 'acct-1', uid: 30, folder: 'INBOX' }]);
+    await waitFor(() => expect(moveMock).toHaveBeenCalledTimes(1));
+    expect(moveMock.mock.calls[0]).toEqual([
+      'acct-1',
+      30,
+      { folder: 'INBOX', to_folder: '\\Archive', uidvalidity: 1700, message_id: '<r30@example.test>' }
+    ]);
     await waitFor(() => expect(ops.version).toBe(before + 1));
   });
 
   it('delete moves to \\Trash (reversible)', async () => {
     renderRow();
     await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
-    await waitFor(() => expect(bulkClientMock).toHaveBeenCalledTimes(1));
-    expect(bulkClientMock.mock.calls[0][0]).toEqual({
-      type: 'move',
-      to_folder: '\\Trash',
-      folder: 'INBOX'
-    });
+    await waitFor(() => expect(moveMock).toHaveBeenCalledTimes(1));
+    expect(moveMock.mock.calls[0][2]).toMatchObject({ folder: 'INBOX', to_folder: '\\Trash' });
+  });
+
+  it('a row in another folder acts on that folder, never INBOX', async () => {
+    renderRow({ folder: 'Clients/Acme', key: 'acct-1:Clients/Acme:30' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Move to Junk' }));
+    await waitFor(() => expect(moveMock).toHaveBeenCalledTimes(1));
+    expect(moveMock.mock.calls[0][2]).toMatchObject({ folder: 'Clients/Acme', to_folder: '\\Junk' });
   });
 
   it('delegate is present but disabled with a reason', () => {
@@ -141,51 +186,43 @@ describe('MessageRow — verb cluster', () => {
     expect(reply.getAttribute('href')).toBe('/mail/unified/acct-1/30?folder=INBOX');
   });
 
-  it('snooze opens a menu of explicit times and dispatches the chosen one', async () => {
+  it('flag is always visible (not hover-only) and sets \\Flagged on this exact message', async () => {
     renderRow();
-    await fireEvent.click(screen.getByRole('button', { name: 'Snooze' }));
-    const menu = await screen.findByRole('menu');
-    expect(menu).toBeInTheDocument();
-    const items = screen.getAllByRole('menuitem');
-    expect(items.length).toBeGreaterThanOrEqual(2);
-    await fireEvent.click(items[items.length - 1]); // "Next week"
-    await waitFor(() => expect(snoozeMock).toHaveBeenCalledTimes(1));
-    const [accountId, uid, opts] = snoozeMock.mock.calls[0];
-    expect(accountId).toBe('acct-1');
-    expect(uid).toBe(30);
-    expect(opts.folder).toBe('INBOX');
-    // A UTC instant (…Z), not a naive local string — the sweep compares
-    // against UTC now, so a naive string would fire off by the offset.
-    expect(opts.return_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    const flag = screen.getByRole('button', { name: 'Flag message' });
+    expect(flag.closest('.msg-verbs')).toBeNull();
+    expect(flag).toHaveAttribute('aria-pressed', 'false');
+    await fireEvent.click(flag);
+    await waitFor(() => expect(flagsMock).toHaveBeenCalledTimes(1));
+    expect(flagsMock.mock.calls[0][2]).toMatchObject({
+      folder: 'INBOX',
+      add: ['\\Flagged'],
+      uidvalidity: 1700,
+      message_id: '<r30@example.test>'
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Unflag message' })).toHaveAttribute('aria-pressed', 'true')
+    );
+    expect(await screen.findByText('Flagged')).toBeInTheDocument();
   });
 
-  it('snooze success bumps the ops signal; failure surfaces an error without bumping', async () => {
-    const ops = getMailboxOpsStore();
-    // Success path.
-    const before = ops.version;
+  it('a repeated click while the write is in flight sends one request and shows progress', async () => {
+    let release!: (v: unknown) => void;
+    moveMock.mockReturnValueOnce(new Promise((r) => (release = r)));
     renderRow();
-    await fireEvent.click(screen.getByRole('button', { name: 'Snooze' }));
-    await fireEvent.click(screen.getAllByRole('menuitem')[0]);
-    await waitFor(() => expect(snoozeMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(ops.version).toBe(before + 1));
-
-    // Failure path: the endpoint rejects.
-    const { EnvelopeApiError } = await import('$lib/api');
-    snoozeMock.mockRejectedValueOnce(new EnvelopeApiError(502, 'imap_error', 'snooze store failed', null));
-    const afterSuccess = ops.version;
-    renderRow();
-    const snoozeBtns = screen.getAllByRole('button', { name: 'Snooze' });
-    await fireEvent.click(snoozeBtns[snoozeBtns.length - 1]);
-    const items = screen.getAllByRole('menuitem');
-    await fireEvent.click(items[items.length - 1]);
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toMatch(/couldn't snooze/i);
-    expect(ops.version).toBe(afterSuccess);
+    const archive = screen.getByRole('button', { name: 'Archive' });
+    await fireEvent.click(archive);
+    expect(await screen.findByRole('status')).toHaveTextContent('Archiving…');
+    expect(archive).toBeDisabled();
+    await fireEvent.click(archive);
+    await fireEvent.keyDown(screen.getByRole('row'), { key: 'e' });
+    expect(moveMock).toHaveBeenCalledTimes(1);
+    release(MOVED);
+    await waitFor(() => expect(archive).not.toBeDisabled());
   });
 
-  it('surfaces a loud error when a move throws (bulkClient rejects)', async () => {
+  it('surfaces a loud row-local error when a move fails, without bumping the ops signal', async () => {
     const { EnvelopeApiError } = await import('$lib/api');
-    bulkClientMock.mockRejectedValueOnce(new EnvelopeApiError(500, 'net', 'connection reset', null));
+    moveMock.mockRejectedValueOnce(new EnvelopeApiError(502, 'http_502', 'connection reset', null));
     const ops = getMailboxOpsStore();
     const before = ops.version;
     renderRow();
@@ -194,21 +231,158 @@ describe('MessageRow — verb cluster', () => {
     expect(alert.textContent).toMatch(/couldn't archive/i);
     expect(alert.textContent).toMatch(/connection reset/i);
     expect(ops.version).toBe(before);
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }));
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
-  it('surfaces a loud error when an op fails, without bumping the ops signal', async () => {
+  it('a stale handle says so and refreshes the list instead of claiming success', async () => {
+    const { EnvelopeApiError } = await import('$lib/api');
+    flagsMock.mockRejectedValueOnce(
+      new EnvelopeApiError(409, 'message_not_found', 'this message is no longer in that folder', null)
+    );
     const ops = getMailboxOpsStore();
     const before = ops.version;
-    bulkClientMock.mockResolvedValueOnce({
-      done: 0,
-      total: 1,
-      failed: [{ item: { accountId: 'acct-1', uid: 30 }, error: 'imap timeout' }]
-    });
     renderRow();
-    await fireEvent.click(screen.getByRole('button', { name: 'Archive' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Flag message' }));
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toMatch(/couldn't archive/i);
-    expect(alert.textContent).toMatch(/imap timeout/i);
+    expect(alert.textContent).toMatch(/no longer in that folder/);
+    expect(ops.version).toBe(before + 1);
+    expect(screen.getByRole('button', { name: 'Flag message' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('Shift+U toggles read state from the keyboard', async () => {
+    renderRow({ unread: true });
+    await fireEvent.keyDown(screen.getByRole('row'), { key: 'U' });
+    await waitFor(() => expect(flagsMock).toHaveBeenCalledTimes(1));
+    expect(flagsMock.mock.calls[0][2]).toMatchObject({ add: ['\\Seen'], remove: [] });
+  });
+});
+
+describe('MessageRow — More actions menu', () => {
+  it('is reachable without hover or selection and lists the truthful actions', async () => {
+    renderRow({ unread: true, starred: false });
+    const more = screen.getByRole('button', { name: 'More actions' });
+    expect(more.closest('.msg-verbs')).toBeNull();
+    expect(more).toHaveAttribute('aria-haspopup', 'menu');
+    await fireEvent.click(more);
+    const names = screen.getAllByRole('menuitem').map((m) => m.textContent?.trim() ?? '');
+    expect(names[0]).toBe('Mark read');
+    expect(names).toEqual(
+      expect.arrayContaining(['Flag', 'Snooze…', 'Move to Junk', 'Archive', 'Move to Trash'])
+    );
+  });
+
+  it('shows one read toggle whose label follows the state (Tyler 2026-09-29)', async () => {
+    renderRow({ unread: false });
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    const names = screen.getAllByRole('menuitem').map((m) => m.textContent?.trim() ?? '');
+    expect(names).toContain('Mark unread');
+    expect(names).not.toContain('Mark read');
+  });
+
+  it('shows Remind and Follow up as unavailable with the reason, and does nothing when chosen', async () => {
+    renderRow();
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    const remind = screen.getByText('Remind me…').closest('[role="menuitem"]')!;
+    const follow = screen.getByText('Follow up if no reply…').closest('[role="menuitem"]')!;
+    expect(remind).toHaveAttribute('aria-disabled', 'true');
+    expect(follow).toHaveAttribute('aria-disabled', 'true');
+    expect(remind).toHaveAccessibleDescription(FOLLOW_UP_SEMANTICS.remind);
+    expect(follow).toHaveAccessibleDescription(FOLLOW_UP_SEMANTICS['follow-up']);
+    await fireEvent.click(remind);
+    await fireEvent.click(follow);
+    expect(flagsMock).not.toHaveBeenCalled();
+    expect(moveMock).not.toHaveBeenCalled();
+    expect(snoozeMock).not.toHaveBeenCalled();
+  });
+
+  it('keyboard: ArrowDown opens and focuses the first item, arrows move, Escape returns focus', async () => {
+    renderRow();
+    const more = screen.getByRole('button', { name: 'More actions' });
+    more.focus();
+    await fireEvent.keyDown(more, { key: 'ArrowDown' });
+    const items = await screen.findAllByRole('menuitem');
+    await waitFor(() => expect(document.activeElement).toBe(items[0]));
+    await fireEvent.keyDown(items[0], { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(items[1]);
+    await fireEvent.keyDown(items[1], { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(items[0]);
+    await fireEvent.keyDown(items[0], { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
+
+  it('snooze lists explicit exact times and dispatches the chosen one as a UTC instant', async () => {
+    renderRow();
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Snooze…' }));
+    const menu = await screen.findByRole('menu', { name: 'Snooze until' });
+    const next = menu.querySelector('[data-snooze="next-week"]') as HTMLElement;
+    expect(next.textContent).toMatch(/Next week/);
+    await fireEvent.click(next);
+    await waitFor(() => expect(snoozeMock).toHaveBeenCalledTimes(1));
+    const [accountId, uid, opts] = snoozeMock.mock.calls[0];
+    expect(accountId).toBe('acct-1');
+    expect(uid).toBe(30);
+    expect(opts.folder).toBe('INBOX');
+    expect(opts.return_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+
+  it('a custom snooze time in the past is refused before any request', async () => {
+    renderRow();
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Snooze…' }));
+    const input = screen.getByLabelText('Pick a date and time') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: '2001-01-01T09:00' } });
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Snooze until then' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Pick a time in the future.');
+    expect(snoozeMock).not.toHaveBeenCalled();
+  });
+
+  it('snooze failure shows a row-local error without bumping the ops signal', async () => {
+    const { EnvelopeApiError } = await import('$lib/api');
+    snoozeMock.mockRejectedValueOnce(new EnvelopeApiError(502, 'imap_error', 'snooze store failed', null));
+    const ops = getMailboxOpsStore();
+    const before = ops.version;
+    renderRow();
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Snooze…' }));
+    await fireEvent.click(screen.getAllByRole('menuitem')[0]);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/couldn't snooze/i);
     expect(ops.version).toBe(before);
+  });
+});
+
+describe('MessageRow — snoozed record', () => {
+  const snoozedRow = {
+    key: 'snoozed:snz-9',
+    folder: 'Snoozed',
+    href: undefined,
+    snooze: { id: 'snz-9', returnAt: '2030-01-07T13:00:00Z', status: 'snoozed' }
+  };
+
+  it('shows the exact return time and offers only Unsnooze', async () => {
+    unsnoozeMock.mockResolvedValue({ ok: true, id: 'snz-9', moved_to: 'INBOX', record_cleared: true });
+    const { container } = renderRow(snoozedRow, false);
+    expect(container.querySelector('.msg-snooze')?.textContent).toMatch(/^\s*Returns /);
+    // Not a link: the stored UID is not a handle inside the Snoozed folder.
+    expect(container.querySelector('a.msg-body')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    const enabled = screen
+      .getAllByRole('menuitem')
+      .filter((m) => m.getAttribute('aria-disabled') !== 'true')
+      .map((m) => m.textContent?.trim());
+    expect(enabled).toEqual(['Unsnooze']);
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Unsnooze' }));
+    await waitFor(() => expect(unsnoozeMock).toHaveBeenCalledWith('acct-1', 'snz-9'));
+  });
+
+  it('marks an overdue snooze as overdue', () => {
+    const { container } = renderRow(
+      { ...snoozedRow, snooze: { ...snoozedRow.snooze, status: 'overdue' } },
+      false
+    );
+    expect(container.querySelector('.msg-snooze.is-overdue')?.textContent).toMatch(/Overdue/);
   });
 });
