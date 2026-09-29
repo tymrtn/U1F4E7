@@ -20,6 +20,8 @@
   //   • CSRF is handled by the shared request() helper in $lib/api. Nothing
   //     here bypasses it, and there is no direct-send path.
 
+  import { base } from '$app/paths';
+  import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import {
     addrKey,
@@ -166,6 +168,8 @@
   let queueing = $state(false);
   let holding = $state(false);
   let approving = $state(false);
+  let discarding = $state(false);
+  let discardOpen = $state(false);
   let confirmOpen = $state(false);
   let refinementOpen = $state(false);
   let refinementResult = $state<ContextRefinementRetryResponse | null>(null);
@@ -945,6 +949,44 @@
     }
   }
 
+  // ── Discard (destructive; confirmed first) ────────────────────────────
+
+  /** The store's discardable set: never a sent, sending, or syncing draft. */
+  const discardable = $derived(
+    !!draft &&
+      (['draft', 'pending_review', 'blocked', 'delivery_uncertain'] as DraftStatus[]).includes(
+        draft.status
+      )
+  );
+  const canDiscard = $derived(discardable && identityMatches && !discarding && !saving);
+
+  /**
+   * The server moves any Drafts-folder copy to Trash before discarding the
+   * row. A refusal (for example the copy's UID now holds a different message)
+   * leaves the draft exactly as it was, so this page stays and says why.
+   */
+  async function discard() {
+    if (!draft || !canDiscard) return;
+    const targetAccount = accountId;
+    const targetDraft = draftId;
+    discarding = true;
+    actionError = null;
+    try {
+      await api.discardDraft(targetAccount, targetDraft);
+      discardOpen = false;
+      await goto(`${base}/mail/drafts`);
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      discardOpen = false;
+      actionError = {
+        code: err.code ?? 'discard_failed',
+        message: err.message ?? 'Could not discard this draft.'
+      };
+    } finally {
+      discarding = false;
+    }
+  }
+
   /**
    * 409 is the revision guard, not a generic failure: the draft changed since
    * it was loaded and the server refused rather than clobbering it. Surface it
@@ -1319,6 +1361,11 @@
         {/if}
       </div>
       <div class="draft-actions-buttons">
+        {#if discardable}
+          <Button variant="ghost" disabled={!canDiscard} onclick={() => (discardOpen = true)}>
+            Discard
+          </Button>
+        {/if}
         {#if editable}
           <Button variant="ghost" disabled={!canSave} onclick={save}>
             {#if saving}<Spinner label="Saving" />{/if}
@@ -1385,6 +1432,19 @@
     <Button variant="primary" disabled={queueing} onclick={() => confirmSend(false)}>
       {#if queueing && !sendNowPending}<Spinner label="Queueing" />{/if}
       Send in {cooldownLabel}
+    </Button>
+  {/snippet}
+</Modal>
+
+<Modal open={discardOpen} title="Discard this draft?" onclose={() => (discardOpen = false)}>
+  <p class="draft-confirm-note">
+    It leaves Drafts. A copy saved in your mailbox's Drafts folder moves to Trash.
+  </p>
+  {#snippet footer()}
+    <Button variant="ghost" disabled={discarding} onclick={() => (discardOpen = false)}>Keep draft</Button>
+    <Button variant="danger" disabled={discarding} onclick={discard}>
+      {#if discarding}<Spinner label="Discarding" />{/if}
+      Discard draft
     </Button>
   {/snippet}
 </Modal>

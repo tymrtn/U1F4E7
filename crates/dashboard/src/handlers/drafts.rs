@@ -692,31 +692,162 @@ pub async fn edit(
     }
 }
 
+/// Discard a draft. When the draft has a copy in the provider's Drafts
+/// folder, that copy moves to Trash first (recoverable, like every other
+/// dashboard delete), and only then is the local row discarded. A copy that
+/// cannot be moved leaves the draft untouched and says why.
 pub async fn discard(
     State(state): State<AppState>,
     Path((account_id, draft_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    // Resolve the canonical account id up front so the emitted event carries the
-    // account id, not a caller-supplied email alias.
-    let resolved_account = ensure_draft_account(&db, &account_id, &draft_id)
-        .map(|draft| draft.account_id)
-        .unwrap_or_else(|_| account_id.clone());
-    match ensure_draft_account(&db, &account_id, &draft_id)
-        .and_then(|_| db.discard_draft(&draft_id))
-    {
+) -> axum::response::Response {
+    let draft = {
+        let db = state.db.lock().await;
+        match ensure_draft_account(&db, &account_id, &draft_id) {
+            Ok(draft) => draft,
+            Err(e) => return draft_error(e),
+        }
+    };
+    // Mirrors the store's discardable set, checked before the mailbox is
+    // touched: a sent or in-flight draft's server copy is left alone.
+    if !matches!(
+        draft.status,
+        DraftStatus::Draft
+            | DraftStatus::PendingReview
+            | DraftStatus::Blocked
+            | DraftStatus::DeliveryUncertain
+    ) {
+        return (StatusCode::CONFLICT, "draft is not discardable").into_response();
+    }
+    let server_copy = match draft.imap_uid {
+        None => "none",
+        Some(uid) => {
+            match trash_server_copy(&state, &draft.account_id, uid, draft.message_id.as_deref())
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(refusal) => return refusal,
+            }
+        }
+    };
+    let discarded = {
+        let db = state.db.lock().await;
+        db.discard_draft(&draft_id)
+    };
+    match discarded {
         Ok(true) => {
             state
                 .events
                 .publish(crate::events::DashboardEvent::DraftStatusChanged {
-                    account_id: resolved_account,
+                    account_id: draft.account_id.clone(),
                     draft_id: draft_id.clone(),
                     status: DraftStatus::Discarded.as_str().to_string(),
                 });
-            Json(json!({ "draft_id": draft_id, "status": "discarded" })).into_response()
+            Json(json!({
+                "draft_id": draft_id,
+                "status": "discarded",
+                "server_copy": server_copy,
+            }))
+            .into_response()
         }
         Ok(false) => (StatusCode::CONFLICT, "draft is not discardable").into_response(),
         Err(e) => draft_error(e),
+    }
+}
+
+/// Move a draft's server copy from Drafts to Trash. `Ok("trashed")`, or
+/// `Ok("already_gone")` when the UID is no longer in Drafts (another client
+/// removed it). Refuses when the UID now holds a different message, or when
+/// the account has no Trash folder; nothing is moved in either case.
+async fn trash_server_copy(
+    state: &AppState,
+    account_id: &str,
+    uid: u32,
+    message_id: Option<&str>,
+) -> Result<&'static str, axum::response::Response> {
+    use crate::handlers::message_target::{TargetExpectation, TargetMismatch, check_target};
+    use envelope_email_transport::provider::canonical;
+
+    let (client_arc, _creds) = state
+        .get_or_create_imap(account_id)
+        .await
+        .map_err(|e| draft_copy_unreachable("connect", &e))?;
+    let mut client = client_arc.lock().await;
+
+    let drafts = special_folder(state, &mut client, account_id, canonical::DRAFTS).await?;
+    let trash = special_folder(state, &mut client, account_id, canonical::TRASH).await?;
+
+    let probe = match envelope_email_transport::imap::probe_uid(&mut client, &drafts, uid).await {
+        Ok(probe) => probe,
+        Err(e) => {
+            state.evict_imap(account_id).await;
+            return Err(draft_copy_unreachable("probe", &e));
+        }
+    };
+    let expect = TargetExpectation {
+        uidvalidity: None,
+        message_id: message_id.map(str::to_string),
+    };
+    match check_target(&expect, &probe) {
+        Ok(()) => {}
+        Err(TargetMismatch::Gone) => return Ok("already_gone"),
+        Err(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": "draft_copy_mismatch",
+                    "error": format!(
+                        "{drafts} UID {uid} holds a different message now, so Envelope left the mailbox alone and did not discard the draft"
+                    ),
+                })),
+            )
+                .into_response());
+        }
+    }
+    if let Err(e) =
+        envelope_email_transport::imap::move_message(&mut client, uid, &drafts, &trash).await
+    {
+        state.evict_imap(account_id).await;
+        return Err(draft_copy_unreachable("move to Trash", &e));
+    }
+    Ok("trashed")
+}
+
+fn draft_copy_unreachable(what: &str, e: &dyn std::fmt::Display) -> axum::response::Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "code": "draft_copy_unreachable",
+            "error": format!("could not remove the draft from the mailbox ({what}): {e}"),
+        })),
+    )
+        .into_response()
+}
+
+/// The account's real folder for a special-use kind, or a response saying why
+/// there is none. Never guesses a literal folder name.
+async fn special_folder(
+    state: &AppState,
+    client: &mut envelope_email_transport::ImapClient,
+    account_id: &str,
+    kind: &'static str,
+) -> Result<String, axum::response::Response> {
+    match crate::handlers::messages::resolve_canonical_folder(state, client, account_id, kind).await
+    {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "code": "folder_not_resolved",
+                "error": format!(
+                    "this account has no {kind} folder, so the draft was left where it is"
+                ),
+            })),
+        )
+            .into_response()),
+        Err(e) => {
+            state.evict_imap(account_id).await;
+            Err(draft_copy_unreachable("folder lookup", &e))
+        }
     }
 }
 
