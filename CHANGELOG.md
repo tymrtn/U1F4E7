@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP (privacy): the host's dashboard origin no longer reaches model context by default.** When
+  Tailscale Serve published the dashboard, MCP results that carried a `ui` block or a draft's
+  `dashboard_url` named the host's tailnet, and that text went to the agent's model provider. MCP
+  calls now build links from localhost and drop `ui`, `parent_ui` and `draft_ui` blocks unless the
+  call passes `include_ui_links: true`, which returns the previous output. CLI `--json` is unchanged.
+- **MCP: smaller results.** Without the per-row `ui` block, a 10-message `inbox` result drops from
+  8,040 to 4,060 bytes. The `attributes` parameter of `send`, `reply` and `send_draft` now lists the
+  declarable keys with their meanings, and the tool descriptions no longer send models to
+  `governor_catalog`. `governor_catalog` returns only the declarable keys by default (1,789 bytes
+  instead of 9,362); pass `full: true` for the full projection.
+
 ## [1.3.11] — 2026-09-29
 
 Webmail usability fixes: mailbox sync on open, one set of message actions, and a right-click menu.

@@ -148,6 +148,34 @@ fn wrap_untrusted(value: Value) -> Value {
     })
 }
 
+// ── Dashboard links in agent results ────────────────────────────────
+
+/// Result keys that hold a dashboard link block.
+const UI_LINK_KEYS: &[&str] = &["ui", "parent_ui", "draft_ui"];
+
+/// Whether the call asked for dashboard links (`include_ui_links`, default
+/// false). Links cost ~400 bytes a message row and, with Tailscale Serve
+/// active, name the host's tailnet to the model provider.
+fn ui_links_requested(params: &Value) -> Result<bool, String> {
+    match params.get("include_ui_links") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(requested)) => Ok(*requested),
+        Some(_) => Err("include_ui_links must be a boolean".to_string()),
+    }
+}
+
+/// Remove every dashboard link block, at any depth, from a tool result.
+fn strip_ui_links(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, v| !(UI_LINK_KEYS.contains(&key.as_str()) && v.is_object()));
+            map.values_mut().for_each(strip_ui_links);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_ui_links),
+        _ => {}
+    }
+}
+
 // ── Tool dispatch ───────────────────────────────────────────────────
 
 /// The destination or single folder selecting parameter for a tool call, used
@@ -403,6 +431,11 @@ async fn handle_tool_call(
     backend: CredentialBackend,
     ctx: Option<&AgentContext>,
 ) -> Result<Value, String> {
+    let ui_links = ui_links_requested(params)?;
+    // Set before anything can build a link, so it also covers URL fields
+    // outside `ui` blocks (a draft's dashboard_url, sent_message_url, error
+    // text): without links they use the localhost origin.
+    ui::allow_tailnet_origin(ui_links);
     if let Err(denial) = authorize_tool_call(ctx, tool_name, params) {
         if agent_context::agent_id_of(ctx).is_some() {
             if let Ok(db) = Database::open_default() {
@@ -424,6 +457,9 @@ async fn handle_tool_call(
                 None => Err("no account to file the audit row under".to_string()),
             });
         attach_audit_warning(&mut result, audit);
+    }
+    if !ui_links {
+        strip_ui_links(&mut result);
     }
     Ok(result)
 }
@@ -463,11 +499,17 @@ async fn dispatch_tool_call(
     }
 }
 
-/// Read-only Governor catalog discovery: the vendored, weight-free Envelope
-/// projection (key/description/category/provenance + declaration guidance). No
-/// mailbox access, no Governor spawn, no weights or scores — works even when the
-/// Governor binary is absent.
+/// Read-only Governor catalog discovery from the vendored, weight-free Envelope
+/// projection: the declarable keys by default, or with `full: true` every key
+/// with category/provenance + declaration guidance. No mailbox access, no
+/// Governor spawn, no weights or scores — works even when the Governor binary is
+/// absent.
 async fn handle_governor_catalog(params: &Value) -> Result<Value, String> {
+    let full = match params.get("full") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(full)) => *full,
+        Some(_) => return Err("full must be a boolean".to_string()),
+    };
     if let Some(cat) = params.get("catalog").and_then(|v| v.as_str())
         && cat != envelope_email_transport::governor_catalog::CATALOG_NAME
     {
@@ -483,7 +525,26 @@ async fn handle_governor_catalog(params: &Value) -> Result<Value, String> {
         })
         .to_string());
     }
-    Ok(envelope_email_transport::governor_catalog::envelope_projection())
+    Ok(if full {
+        envelope_email_transport::governor_catalog::envelope_projection()
+    } else {
+        envelope_email_transport::governor_catalog::declarable_projection()
+    })
+}
+
+/// One message as the inbox/read/search tools return it, with its dashboard
+/// links (removed later unless the call asked for them).
+fn message_row<T: Serialize>(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message: &T,
+) -> Value {
+    ui::with_ui(
+        message,
+        ui::message_or_draft_ui(db, account_id, uid, folder),
+    )
 }
 
 async fn handle_accounts(_backend: CredentialBackend) -> Result<Value, String> {
@@ -519,12 +580,7 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
     Ok(wrap_untrusted(Value::Array(
         messages
             .iter()
-            .map(|message| {
-                ui::with_ui(
-                    message,
-                    ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
-                )
-            })
+            .map(|message| message_row(&db, &creds.account.id, folder, message.uid, message))
             .collect(),
     )))
 }
@@ -556,10 +612,7 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
         crate::commands::threat::verdict_for_read(&db, &creds, folder, uid, raw.as_deref())
             .map_err(|e| format!("{e:#}"))?;
 
-    let mut value = ui::with_ui(
-        &message,
-        ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
-    );
+    let mut value = message_row(&db, &creds.account.id, folder, message.uid, &message);
     crate::commands::threat::apply_read_policy(&mut value, verdict.as_ref());
     Ok(wrap_untrusted(value))
 }
@@ -623,12 +676,7 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
     Ok(wrap_untrusted(Value::Array(
         messages
             .iter()
-            .map(|message| {
-                ui::with_ui(
-                    message,
-                    ui::message_or_draft_ui(&db, &creds.account.id, message.uid, folder),
-                )
-            })
+            .map(|message| message_row(&db, &creds.account.id, folder, message.uid, message))
             .collect(),
     )))
 }
@@ -3318,6 +3366,113 @@ mod tests {
             provider_spam: None,
             partial_fetch: None,
         }
+    }
+
+    /// Dashboard link blocks cost ~400 bytes a row and named the host's
+    /// tailnet, so agent results omit them unless the call opts in.
+    #[test]
+    fn mcp_inbox_and_read_results_omit_ui_unless_links_are_requested() {
+        let db = contacts_test_db();
+        let message = reply_parent("<m1@example.test>", "sender@example.test");
+        let inbox = wrap_untrusted(Value::Array(vec![message_row(
+            &db, "acc1", "INBOX", 7, &message,
+        )]));
+        let read = wrap_untrusted(message_row(&db, "acc1", "INBOX", 7, &message));
+        assert!(inbox["content"][0]["ui"]["message_url"].is_string());
+        assert!(read["content"]["ui"]["message_url"].is_string());
+
+        for (tool, result) in [("inbox", inbox), ("read", read)] {
+            let mut shaped = result.clone();
+            if !ui_links_requested(&json!({})).unwrap() {
+                strip_ui_links(&mut shaped);
+            }
+            let text = shaped.to_string();
+            assert!(
+                !text.contains("\"ui\""),
+                "{tool}: default result has ui: {text}"
+            );
+            assert!(!text.contains("dashboard_"), "{tool}: {text}");
+            // The trust envelope is untouched.
+            for key in ["_envelope_trust", "_warning", "trust"] {
+                assert_eq!(shaped[key], result[key], "{tool}: {key} changed");
+            }
+            let row = if shaped["content"].is_array() {
+                &shaped["content"][0]
+            } else {
+                &shaped["content"]
+            };
+            assert_eq!(row["uid"], 7, "{tool}: message fields survive");
+        }
+
+        assert!(ui_links_requested(&json!({"include_ui_links": true})).unwrap());
+        assert!(!ui_links_requested(&json!({"include_ui_links": false})).unwrap());
+        assert!(ui_links_requested(&json!({"include_ui_links": "yes"})).is_err());
+    }
+
+    /// Only dashboard link blocks go: a same-named non-object value (an agent's
+    /// own tag score, say) is data and stays.
+    #[test]
+    fn strip_ui_links_removes_nested_link_blocks_only() {
+        let mut value = json!({
+            "status": "sent",
+            "ui": {"dashboard_url": "http://localhost:3141"},
+            "parent_ui": {"dashboard_url": "http://localhost:3141"},
+            "draft_ui": {"dashboard_url": "http://localhost:3141"},
+            "sent_mail": {"uid": 4, "ui": {"dashboard_url": "http://localhost:3141"}},
+            "rows": [{"uid": 1, "ui": {"dashboard_url": "http://localhost:3141"}}],
+            "scores": {"ui": 0.5}
+        });
+        strip_ui_links(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "status": "sent",
+                "sent_mail": {"uid": 4},
+                "rows": [{"uid": 1}],
+                "scores": {"ui": 0.5}
+            })
+        );
+    }
+
+    /// governor_catalog answers with the declarable keys by default (the full
+    /// projection cost ~6k chars a call); `full: true` is today's projection.
+    #[tokio::test]
+    async fn governor_catalog_defaults_to_compact_declarable_projection() {
+        use envelope_email_transport::governor_catalog as catalog;
+        let compact = handle_governor_catalog(&json!({})).await.unwrap();
+        let keys: Vec<String> = compact["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|a| a["key"].as_str().expect("key").to_string())
+            .collect();
+        assert_eq!(keys, catalog::declarable_keys());
+        for entry in compact["attributes"].as_array().unwrap() {
+            let key = entry["key"].as_str().unwrap();
+            assert_eq!(
+                entry["description"].as_str(),
+                catalog::description_of(key),
+                "{key}"
+            );
+        }
+        assert_eq!(compact["catalog_version"], catalog::catalog_version());
+        assert_eq!(compact["rules"], json!(catalog::HONESTY_RULES));
+
+        let full = handle_governor_catalog(&json!({"full": true}))
+            .await
+            .unwrap();
+        assert_eq!(full, catalog::envelope_projection());
+        assert!(
+            compact.to_string().len() * 3 < full.to_string().len(),
+            "compact {} vs full {}",
+            compact.to_string().len(),
+            full.to_string().len()
+        );
+        assert!(
+            handle_governor_catalog(&json!({"full": "yes"}))
+                .await
+                .is_err()
+        );
     }
 
     /// The MCP `reply` tool gates on the parent's own Message-ID. That earns

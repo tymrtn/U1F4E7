@@ -408,7 +408,7 @@ fn surfaces() -> Value {
                 "draft_id": string("Local draft id: the durable record (operation id) of the send, present on every outcome"),
                 "to": string("Recipient address"),
                 "subject": string("Subject"),
-                "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view)"}),
+                "ui": json!({"type": "object", "description": "Dashboard navigation links (draft or account view); MCP includes them only with include_ui_links=true"}),
                 "input_normalization": json!({"type": ["object", "null"], "description": "Present ONLY when the authored body arrived carrying literal escape sequences: {applied, fields[{field, action, newlines_converted, backslashes_unescaped, newlines_left_as_written}], explanation, verify}. applied=true means the body had no real line breaks at all, so Envelope decoded the literal \\n text into real line breaks before building the message; applied=false means the sequences sit alongside real line breaks, are ambiguous, and were left exactly as written for the caller to resolve. Either way, re-read the stored body before reporting the task complete."}),
             }),
             json!([]),
@@ -623,6 +623,29 @@ fn surfaces() -> Value {
     Value::Array(items)
 }
 
+/// MCP tools whose results can carry dashboard links. Each advertises the
+/// opt-in `include_ui_links` flag; without it `mcp.rs` strips the links.
+const UI_LINK_TOOLS: &[&str] = &[
+    "accounts",
+    "inbox",
+    "read",
+    "search",
+    "send",
+    "reply",
+    "create_reply_draft",
+    "create_forward_draft",
+    "modify_draft",
+    "get_draft",
+    "send_draft",
+    "move_message",
+    "flag",
+    "folders",
+    "tag",
+    "contacts",
+    "rules_preview",
+    "rules_run",
+];
+
 fn mcp_tool_entries() -> Value {
     let descriptions = [
         (
@@ -639,15 +662,15 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send",
-            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+            "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
         ),
         (
             "reply",
-            "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; discover them with governor_catalog. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
+            "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
         ),
         (
             "governor_catalog",
-            "Read-only discovery of the Governor attribution catalog agents declare against: key, description, category, provenance (declarable/host_derived/requires_attestation), and declaration guidance. No weights, thresholds, or scores; no mailbox access; always authorized even under a deny-by-default policy. Use it to learn which `attributes` to declare on send/reply/send_draft.",
+            "Read-only discovery of the Governor attribution catalog agents declare against. By default returns the declarable keys with their meanings (the same list the send/reply/send_draft attributes parameter carries); full=true returns every key with category, provenance (declarable/host_derived/requires_attestation), and declaration guidance. No weights, thresholds, or scores; no mailbox access; always authorized even under a deny-by-default policy.",
         ),
         (
             "create_reply_draft",
@@ -667,7 +690,7 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send_draft",
-            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; discover them with governor_catalog). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; the attributes parameter lists them). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
         ),
         ("move_message", "Move a message to another IMAP folder."),
         (
@@ -724,6 +747,10 @@ fn mcp_tool_entries() -> Value {
                 let surface =
                     surface(name).unwrap_or_else(|| panic!("missing MCP contract surface: {name}"));
                 let mut input_schema = surface["input_schema"].clone();
+                if UI_LINK_TOOLS.contains(name) {
+                    input_schema["properties"]["include_ui_links"] =
+                        json!({"type": "boolean", "default": false});
+                }
                 if *name == "send" {
                     if let Some(send_mode) = input_schema
                         .get_mut("properties")
@@ -777,9 +804,9 @@ fn sent_copy_output_schema() -> Value {
             "attribution": json!({"type": ["object", "null"], "description": "Additive sanitized attribution block on a SUCCESSFUL result (immediate send, or queued/scheduled acceptance). Contains protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object ({decision, route, mode}) — null on queued/scheduled acceptance, where the real Governor decision runs later at the scheduled-send sweep (governor_decision_pending is then present), or {decision: disabled, route: null, mode: off} in a build without the `governor` feature. Never a score, weight, threshold, body, raw recipient, secret, or attachment byte."}),
             "in_reply_to": json!({"type": ["string", "null"], "description": "In-Reply-To header of the sent/queued reply; null when the parent had no Message-ID"}),
             "attachments": json!({"type": "array", "items": {"type": "object"}, "description": "Non-secret attachment summaries: filename, content_type, and size only"}),
-            "ui": json!({"type": "object", "description": "Dashboard navigation links"}),
-            "parent_ui": json!({"type": "object", "description": "Dashboard links for the parent message when replying"}),
-            "draft_ui": json!({"type": "object", "description": "Dashboard review links for the draft"})
+            "ui": json!({"type": "object", "description": "Dashboard navigation links; MCP includes them only with include_ui_links=true"}),
+            "parent_ui": json!({"type": "object", "description": "Dashboard links for the parent message when replying; MCP includes them only with include_ui_links=true"}),
+            "draft_ui": json!({"type": "object", "description": "Dashboard review links for the draft; MCP includes them only with include_ui_links=true"})
         }),
         json!([]),
     )
@@ -902,13 +929,14 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
             "governor_catalog",
             object(
                 json!({
-                    "catalog": string_default("Governor catalog to project (only 'envelope' is vendored)", "envelope")
+                    "catalog": string_default("Governor catalog to project (only 'envelope' is vendored)", "envelope"),
+                    "full": json!({"type": "boolean", "default": false, "description": "Return every catalog key with category, provenance, and declaration guidance instead of only the declarable keys"})
                 }),
                 json!([]),
             ),
             json!({
                 "type": "object",
-                "description": "Vendored weight-free Envelope catalog projection: protocol, catalog_version, attributes[{key, category, provenance, description, note?}], declaration guidance, and honesty rules. Never contains a weight, threshold, or score."
+                "description": "Vendored weight-free Envelope catalog projection. Default: protocol, catalog, catalog_version, provenance=declarable, attributes[{key, description}] for the declarable keys, a host_derived note, and honesty rules. full=true: protocol, catalog_version, attributes[{key, category, provenance, description, note?}], declaration guidance, and honesty rules. Never contains a weight, threshold, or score."
             }),
         ),
         (
@@ -1155,8 +1183,21 @@ fn attributes_schema() -> Value {
         "type": "array",
         "minItems": 1,
         "items": { "type": "string", "enum": enum_vals },
-        "description": "Required factual attribute labels for this message (catalog: envelope). Declare every listed key that is factually TRUE of this message; omit unknowns. At least one factual attribute is required (a bot-originated send with none is rejected with attributes_required before Governor scoring). Declarable author-context keys are accepted verbatim; host-derived structural keys (reply/attachments/recipients/history/domain) may also be declared but are accepted ONLY when Envelope independently observes them true — a contradiction is conflicts_with_host_observation and an unobservable claim is host_verification_unavailable. Approval-type facts cannot be declared; the host records human approval. Discover the full catalog with the governor_catalog tool; on attributes_required/attributes_invalid read error.help and error.recovery."
+        "description": attributes_description(),
     })
+}
+
+/// The `attributes` description: the rules plus every declarable key with its
+/// one-line meaning, generated from the vendored catalog so it cannot drift.
+/// Host-derived keys stay in the enum but are not described here; the agent
+/// may declare them only when true, and Envelope checks them itself.
+fn attributes_description() -> String {
+    let keys: String = envelope_email_transport::governor_catalog::declarable_attributes()
+        .map(|a| format!("\n- {}: {}", a.key, a.description))
+        .collect();
+    format!(
+        "Required. Declare every key factually TRUE of this message; omit unknowns (none: attributes_required). Declarable keys:{keys}\nThe other enum keys are host-derived facts, accepted only when Envelope observes them true (else conflicts_with_host_observation or host_verification_unavailable). Approval cannot be declared. On attributes_required/attributes_invalid read error.help."
+    )
 }
 
 /// Outbound-send response BODY builders — the single source of truth for the
@@ -1773,6 +1814,45 @@ mod tests {
             per_key.iter().any(|c| c == "host_verification_unavailable"),
             "expected host_verification_unavailable, got {per_key:?}"
         );
+    }
+
+    /// The keys an agent may declare, and what each means, ride in the
+    /// `attributes` description of every tool that requires them, so a model
+    /// never needs a governor_catalog round-trip to comply. Host-derived and
+    /// attestation keys are not named there.
+    #[test]
+    fn send_tool_attributes_description_lists_exactly_the_declarable_keys() {
+        use envelope_email_transport::governor_catalog as catalog;
+        let declarable = catalog::declarable_keys();
+        let tools = mcp_tool_list();
+        let tools = tools["tools"].as_array().expect("tools");
+        for name in ["send", "reply", "send_draft"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let desc = tool["inputSchema"]["properties"]["attributes"]["description"]
+                .as_str()
+                .expect("attributes description");
+            let words: std::collections::HashSet<&str> = desc
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .collect();
+            for key in &declarable {
+                assert!(words.contains(key.as_str()), "{name}: missing `{key}`");
+                let meaning = catalog::description_of(key).expect("described key");
+                assert!(desc.contains(meaning), "{name}: missing meaning of `{key}`");
+            }
+            for key in catalog::catalog_keys() {
+                if !declarable.contains(&key) {
+                    assert!(!words.contains(key.as_str()), "{name}: names `{key}`");
+                }
+            }
+            let tool_desc = tool["description"].as_str().expect("tool description");
+            assert!(
+                !tool_desc.contains("discover them with governor_catalog"),
+                "{name}: points models at a governor_catalog round-trip"
+            );
+        }
     }
 
     /// The `attributes` input schema advertises exactly the runtime-submittable

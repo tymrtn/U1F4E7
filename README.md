@@ -191,6 +191,9 @@ root proxy targets `http://127.0.0.1:3141`. It otherwise falls back to
 Every agent-facing `ui` object reports that decision as
 `dashboard_origin_source` (`tailscale_serve` or `localhost_fallback`) and adds
 a non-secret `dashboard_origin_warning` only when discovery needs attention.
+MCP results omit these `ui` objects and skip Tailscale discovery unless the
+call passes `include_ui_links: true`, so the host's tailnet name stays out of
+model context by default.
 `dashboard_path` is always portable and remains the canonical handle for agents;
 `dashboard.base_url` and the legacy dashboard-base environment variables are
 retained only for compatibility and do not affect emitted agent UI links.
