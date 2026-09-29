@@ -135,3 +135,120 @@ async fn save_draft_refuses_inline_attachments() {
     .await;
     assert!(status.is_client_error(), "got {status}");
 }
+
+async fn get_json(app: &Router, uri: &str) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+// The Drafts box offers Discard on a saved draft. A dashboard-saved draft has
+// no server copy, so discarding it touches no mailbox and drops it from the
+// Drafts list.
+#[tokio::test]
+async fn discarding_a_saved_draft_removes_it_from_the_drafts_list() {
+    let state = state();
+    let db = state.db.clone();
+    let app = dashboard_router(state);
+    let token = mint_csrf(&app).await;
+
+    let (_, body) = post(
+        &app,
+        "/api/accounts/acc1/drafts",
+        &token,
+        serde_json::json!({ "to": "reader@example.test", "subject": "Throwaway" }),
+    )
+    .await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let draft_id = json["draft"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/accounts/acc1/drafts/{draft_id}/discard"),
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "discarded");
+    assert_eq!(json["server_copy"], "none");
+
+    let listed = get_json(&app, "/api/accounts/acc1/drafts").await;
+    assert!(
+        listed["drafts"].as_array().unwrap().is_empty(),
+        "discarded draft still listed: {listed}"
+    );
+    assert_eq!(
+        db.lock()
+            .await
+            .get_draft(&draft_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DraftStatus::Discarded
+    );
+}
+
+// A sent draft's server copy is the record of what went out: discard refuses
+// before it goes anywhere near the mailbox.
+#[tokio::test]
+async fn discarding_a_sent_draft_is_refused_before_touching_the_mailbox() {
+    let state = state();
+    let db = state.db.clone();
+    let app = dashboard_router(state);
+    let token = mint_csrf(&app).await;
+    let draft_id = {
+        let db = db.lock().await;
+        let draft = db
+            .create_draft(
+                "acc1",
+                "reader@example.test",
+                Some("Already out"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE drafts SET status = 'sent', imap_uid = 41 WHERE id = ?1",
+                [&draft.id],
+            )
+            .unwrap();
+        draft.id
+    };
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/accounts/acc1/drafts/{draft_id}/discard"),
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        db.lock()
+            .await
+            .get_draft(&draft_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DraftStatus::Sent
+    );
+}

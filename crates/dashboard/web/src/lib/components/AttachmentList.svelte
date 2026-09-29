@@ -1,7 +1,9 @@
 <script lang="ts">
   // AttachmentList — renders message attachments with filename, size, and download.
+  // An attachment the rShield download gate refuses renders as blocked, with the
+  // reason and no link: the server would refuse the download anyway.
 
-  import type { AttachmentMeta } from '$lib/reader-api';
+  import type { AttachmentBlock, AttachmentMeta } from '$lib/reader-api';
   import { attachmentDownloadUrl, formatBytes } from '$lib/reader-api';
   import Icon from '$lib/components/Icon.svelte';
 
@@ -10,9 +12,14 @@
     accountId: string;
     uid: number;
     folder?: string;
+    blocks?: AttachmentBlock[];
   }
 
-  let { attachments, accountId, uid, folder = 'INBOX' }: Props = $props();
+  let { attachments, accountId, uid, folder = 'INBOX', blocks = [] }: Props = $props();
+
+  function blockFor(a: AttachmentMeta): AttachmentBlock | undefined {
+    return blocks.find((b) => b.filename === a.filename);
+  }
 
   function downloadUrl(a: AttachmentMeta): string {
     return attachmentDownloadUrl(accountId, uid, a.filename, folder);
@@ -30,19 +37,30 @@
     </h3>
     <ul class="attachment-items">
       {#each attachments as a (a.filename + a.size)}
+        {@const block = blockFor(a)}
         <li class="attachment-item">
-          <a
-            class="attachment-card"
-            href={downloadUrl(a)}
-            download={a.filename}
-            aria-label="Download {a.filename}"
-          >
-            <span class="attachment-icon" aria-hidden="true"><Icon name="paperclip" size={16} /></span>
-            <span class="attachment-body">
-              <span class="attachment-name">{a.filename}</span>
-              <span class="attachment-meta">{mimeBase(a.content_type)} · {formatBytes(a.size)}</span>
-            </span>
-          </a>
+          {#if block}
+            <div class="attachment-card is-blocked">
+              <span class="attachment-icon" aria-hidden="true"><Icon name="ban" size={16} /></span>
+              <span class="attachment-body">
+                <span class="attachment-name">{a.filename}</span>
+                <span class="attachment-meta">Blocked · {block.reason}</span>
+              </span>
+            </div>
+          {:else}
+            <a
+              class="attachment-card"
+              href={downloadUrl(a)}
+              download={a.filename}
+              aria-label="Download {a.filename}"
+            >
+              <span class="attachment-icon" aria-hidden="true"><Icon name="paperclip" size={16} /></span>
+              <span class="attachment-body">
+                <span class="attachment-name">{a.filename}</span>
+                <span class="attachment-meta">{mimeBase(a.content_type)} · {formatBytes(a.size)}</span>
+              </span>
+            </a>
+          {/if}
         </li>
       {/each}
     </ul>
@@ -87,7 +105,18 @@
     color: var(--env-ink);
     transition: border-color 0.1s ease, background 0.1s ease;
   }
-  .attachment-card:hover {
+  .attachment-card.is-blocked {
+    border-color: var(--env-warn);
+    cursor: default;
+  }
+  .attachment-card.is-blocked .attachment-icon,
+  .attachment-card.is-blocked .attachment-meta {
+    color: var(--env-warn);
+  }
+  .attachment-card.is-blocked .attachment-meta {
+    white-space: normal;
+  }
+  a.attachment-card:hover {
     border-color: var(--env-accent);
     background: var(--env-accent-soft);
   }
@@ -96,7 +125,7 @@
     color: var(--env-muted);
     flex-shrink: 0;
   }
-  .attachment-card:hover .attachment-icon {
+  a.attachment-card:hover .attachment-icon {
     color: var(--env-accent);
   }
   .attachment-body {

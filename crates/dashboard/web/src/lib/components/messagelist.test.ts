@@ -25,6 +25,7 @@ const { apiMock } = vi.hoisted(() => ({
     deleteAccount: vi.fn(),
     snoozed: vi.fn(),
     drafts: vi.fn(),
+    discardDraft: vi.fn(),
     folders: vi.fn(),
     folderMessages: vi.fn(),
     messageFlags: vi.fn(),
@@ -1142,6 +1143,74 @@ describe('Selection identity across surfaces', () => {
     // Selection can still register, but no mailbox-action toolbar renders —
     // drafts have no account/folder/UID to dispatch a move/flag/junk against.
     expect(screen.queryByRole('toolbar')).not.toBeInTheDocument();
+  });
+
+  it('drafts: a row offers Discard draft, confirms, discards, and drops the row', async () => {
+    pageState.params = { box: 'drafts' };
+    pageState.url = new URL('http://localhost/v2/mail/drafts') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct-ok', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    const draft = {
+      id: 'draft-1', account_id: 'acct-ok', status: 'draft', to_addr: 'x@y.com',
+      cc_addr: null, bcc_addr: null, reply_to: null, subject: 'Draft subject',
+      text_content: null, html_content: null, in_reply_to: null, metadata: null,
+      attachments: [], message_id: null, send_after: null, snoozed_until: null,
+      created_at: '2026-07-08T10:00:00Z', updated_at: '2026-07-08T10:00:00Z',
+      sent_at: null, created_by: null, revision: 1
+    };
+    apiMock.drafts.mockResolvedValueOnce({ drafts: [draft] }).mockResolvedValue({ drafts: [] });
+    apiMock.discardDraft.mockResolvedValue({ draft_id: 'draft-1', status: 'discarded', server_copy: 'none' });
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Draft subject')).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard draft' }));
+    // Destructive: nothing happens until the dialog is confirmed.
+    expect(apiMock.discardDraft).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    await fireEvent.click(within(dialog).getByRole('button', { name: 'Discard draft' }));
+
+    await waitFor(() => expect(apiMock.discardDraft).toHaveBeenCalledWith('acct-ok', 'draft-1'));
+    await waitFor(() => expect(screen.queryByText('Draft subject')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('No drafts')).toBeInTheDocument());
+  });
+
+  it('drafts: a failed discard keeps the row and says why', async () => {
+    pageState.params = { box: 'drafts' };
+    pageState.url = new URL('http://localhost/v2/mail/drafts') as typeof pageState.url;
+    apiMock.listAccounts.mockResolvedValue({
+      accounts: [{
+        id: 'acct-ok', name: 'Work', username: 'work@example.com',
+        domain: 'example.com', smtp_host: 'smtp.example.com', smtp_port: 465,
+        imap_host: 'imap.example.com', imap_port: 993
+      }]
+    });
+    apiMock.drafts.mockResolvedValue({
+      drafts: [{
+        id: 'draft-1', account_id: 'acct-ok', status: 'draft', to_addr: 'x@y.com',
+        cc_addr: null, bcc_addr: null, reply_to: null, subject: 'Draft subject',
+        text_content: null, html_content: null, in_reply_to: null, metadata: null,
+        attachments: [], message_id: null, send_after: null, snoozed_until: null,
+        created_at: '2026-07-08T10:00:00Z', updated_at: '2026-07-08T10:00:00Z',
+        sent_at: null, created_by: null, revision: 1
+      }]
+    });
+    apiMock.discardDraft.mockRejectedValue(
+      new EnvelopeApiError(502, 'draft_copy_unreachable', 'could not remove the draft from the mailbox (connect): timeout', null)
+    );
+
+    render(MailLayout, { children: emptyChildren });
+    await waitFor(() => expect(screen.getByText('Draft subject')).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard draft' }));
+    await fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Discard draft' }));
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/could not remove the draft/));
+    expect(screen.getByText('Draft subject')).toBeInTheDocument();
   });
 
   it('search: bulk Archive dispatches against the hit\'s REAL account, not a parsed "search" prefix', async () => {

@@ -56,7 +56,8 @@
     orderedKeys,
     active = false,
     verbs = false,
-    onfocus
+    onfocus,
+    ondiscard
   }: {
     message: Message;
     selection: SelectionStore;
@@ -65,6 +66,8 @@
     /** Enable mailbox actions (row cluster + More actions menu). */
     verbs?: boolean;
     onfocus?: (key: string) => void;
+    /** Draft rows: the list owns the confirmation and the discard call. */
+    ondiscard?: () => void;
   } = $props();
 
   const actions = getMessageActions();
@@ -425,6 +428,21 @@
         {target}
         context={{ folder: target.folder, read: isRead, flagged }}
       />
+    {:else if ondiscard}
+      <!-- Always visible: drafts have no hover cluster, and phones have no hover. -->
+      <button
+        class="verb verb-discard"
+        type="button"
+        aria-label="Discard draft"
+        title="Discard draft"
+        onclick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          ondiscard();
+        }}
+      >
+        <Icon name="trash" size={15} />
+      </button>
     {:else if message.snooze}
       <MessageActionMenu
         {target}

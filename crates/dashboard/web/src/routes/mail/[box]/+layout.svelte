@@ -8,7 +8,7 @@
   import { goto } from '$app/navigation';
   import { onMount, untrack } from 'svelte';
   import type { Snippet } from 'svelte';
-  import { Rail, Spinner, EmptyState, MonoTag } from '$lib/components';
+  import { Rail, Spinner, EmptyState, MonoTag, Modal, Button } from '$lib/components';
   import MessageRow from '$lib/components/MessageRow.svelte';
   import BulkToolbar from '$lib/components/BulkToolbar.svelte';
   import SearchBar from '$lib/components/SearchBar.svelte';
@@ -312,6 +312,32 @@
       error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load drafts.' };
     } finally {
       loading = false;
+    }
+  }
+
+  // ── Draft discard (Drafts box) ────────────────────────────────────
+  // Destructive, so it asks first, like closing a dirty composer does. A
+  // refusal keeps the row and shows the server's reason.
+  let discardTarget = $state<Draft | null>(null);
+  let discarding = $state(false);
+  let discardError = $state<string | null>(null);
+
+  async function confirmDiscard() {
+    const target = discardTarget;
+    if (!target || discarding) return;
+    discarding = true;
+    discardError = null;
+    try {
+      await api.discardDraft(target.account_id, target.id);
+      drafts = drafts.filter((d) => d.id !== target.id);
+      discardTarget = null;
+      void loadDrafts();
+    } catch (e) {
+      const err = e as EnvelopeApiError;
+      discardTarget = null;
+      discardError = err.message ?? 'Could not discard the draft.';
+    } finally {
+      discarding = false;
     }
   }
 
@@ -947,6 +973,12 @@
       {#if drafts.length === 0}
         <EmptyState title="No drafts" hint="Drafts waiting to be sent appear here." />
       {:else}
+        {#if discardError}
+          <div class="list-error" role="alert">
+            <p class="list-error-msg">Couldn't discard the draft.</p>
+            <p class="list-error-detail">{discardError}</p>
+          </div>
+        {/if}
         <ul id="drafts-msg-list" class="msg-list">
           {#each drafts as d (d.id)}
             {@const key = `draft:${d.account_id}:${d.id}`}
@@ -967,6 +999,10 @@
                 }}
                 {selection}
                 orderedKeys={drafts.map((x) => `draft:${x.account_id}:${x.id}`)}
+                ondiscard={() => {
+                  discardError = null;
+                  discardTarget = d;
+                }}
               />
             </li>
           {/each}
@@ -1081,6 +1117,26 @@
     goto(`${base}/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}`)}
 />
 
+<Modal
+  open={discardTarget !== null}
+  title="Discard this draft?"
+  onclose={() => {
+    if (!discarding) discardTarget = null;
+  }}
+>
+  <p class="discard-warn">
+    “{discardTarget?.subject || '(no subject)'}” leaves Drafts. A copy saved in your mailbox's
+    Drafts folder moves to Trash.
+  </p>
+  {#snippet footer()}
+    <Button variant="ghost" disabled={discarding} onclick={() => (discardTarget = null)}>Keep draft</Button>
+    <Button variant="danger" disabled={discarding} onclick={confirmDiscard}>
+      {#if discarding}<Spinner label="Discarding" />{/if}
+      Discard draft
+    </Button>
+  {/snippet}
+</Modal>
+
 <!-- Undo toast: shown only when a compose queued with cooldown. -->
 {#if undoToast && undoToast.res.cooldown_seconds > 0}
   <UndoToast
@@ -1154,6 +1210,10 @@
     padding: 1rem;
     font-size: 0.8125rem;
     color: var(--env-muted);
+  }
+  .discard-warn {
+    margin: 0;
+    font-size: 0.875rem;
   }
   .list-error {
     padding: 1rem;

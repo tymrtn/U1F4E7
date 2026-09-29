@@ -100,6 +100,22 @@ impl AppState {
         Ok((arc, creds))
     }
 
+    /// Open a fresh IMAP connection that is NOT pooled, for long background
+    /// work. The pooled connection is one mutex per account: a sweep holding it
+    /// for a whole scan makes every interactive request for that account wait,
+    /// and the web UI's inbox sync then fails its time budget. The connection
+    /// closes when the returned client is dropped.
+    pub async fn connect_imap_unpooled(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<(ImapClient, AccountWithCredentials)> {
+        let creds = self.resolve_credentials(account_id).await?;
+        let client = imap::connect(&creds)
+            .await
+            .map_err(|e| anyhow::anyhow!("IMAP connect failed for {account_id}: {e}"))?;
+        Ok((client, creds))
+    }
+
     /// Evict a cached IMAP connection (call when you detect a stale one).
     pub async fn evict_imap(&self, account_id: &str) {
         let mut pool = self.imap_pool.lock().await;

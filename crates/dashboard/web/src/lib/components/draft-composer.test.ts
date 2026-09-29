@@ -45,6 +45,7 @@ vi.mock('$lib/api', async (importOriginal) => {
 
 import DraftComposer from './DraftComposer.svelte';
 import { EnvelopeApiError, type Draft } from '$lib/api';
+import { goto } from '$app/navigation';
 
 const ACCOUNT = '31f5fddf-04f9-4978-aea5-29aa9af12bb0';
 const DRAFT = '365d958c-6666-4872-898e-cb8a60f21aca';
@@ -2022,5 +2023,42 @@ describe('DraftComposer approve', () => {
     await waitFor(() => expect(document.getElementById('draft-conflict')).toBeTruthy());
     expect(screen.queryByText('Approved')).toBeNull();
     expect(screen.getByText('Pending review')).toBeInTheDocument();
+  });
+});
+
+// ── Discard ───────────────────────────────────────────────────────────
+
+describe('DraftComposer discard', () => {
+  it('discards a saved draft after confirmation and returns to Drafts', async () => {
+    apiMock.discardDraft.mockResolvedValue({ draft_id: DRAFT, status: 'discarded', server_copy: 'trashed' });
+    await renderLoaded();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    expect(apiMock.discardDraft).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(/Discard this draft\?/);
+    await fireEvent.click(within(dialog).getByRole('button', { name: 'Discard draft' }));
+
+    await waitFor(() => expect(apiMock.discardDraft).toHaveBeenCalledWith(ACCOUNT, DRAFT));
+    await waitFor(() => expect(goto).toHaveBeenCalledWith('/v2/mail/drafts'));
+  });
+
+  it('keeps the draft and shows the error when the discard is refused', async () => {
+    apiMock.discardDraft.mockRejectedValue(
+      new EnvelopeApiError(409, 'draft_copy_mismatch', 'Drafts UID 41 holds a different message now', null)
+    );
+    await renderLoaded();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    await fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Discard draft' }));
+
+    await waitFor(() => expect(screen.getByText(/holds a different message now/)).toBeInTheDocument());
+    expect(goto).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('To')).toBeInTheDocument();
+  });
+
+  it('offers no Discard on a sent draft', async () => {
+    await renderLoaded({ status: 'sent', sent_at: '2026-07-30T10:05:00Z' });
+    expect(screen.queryByRole('button', { name: 'Discard' })).not.toBeInTheDocument();
   });
 });

@@ -134,6 +134,30 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
+# Download with retry
+# ---------------------------------------------------------------------------
+# curl's own --retry skips TLS handshake failures and connection resets
+# (exit 35/56), the usual transient errors from the release-asset CDN, and
+# --retry-all-errors needs curl 7.71+. So retry every failure here, with
+# backoff. The checksum check below still verifies whatever arrives.
+DOWNLOAD_ATTEMPTS=4
+fetch() {
+    local url="$1" out="$2" attempt=1 delay=2
+    while true; do
+        if curl -fsSL --connect-timeout 20 -o "$out" "$url"; then
+            return 0
+        fi
+        if (( attempt >= DOWNLOAD_ATTEMPTS )); then
+            return 1
+        fi
+        echo "  Download failed (attempt ${attempt}/${DOWNLOAD_ATTEMPTS}); retrying in ${delay}s..." >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Resolve version
 # ---------------------------------------------------------------------------
 if [[ -n "$REQUESTED_VERSION" ]]; then
@@ -141,7 +165,10 @@ if [[ -n "$REQUESTED_VERSION" ]]; then
     echo "Installing Envelope ${VERSION} (requested)..."
 else
     echo "Resolving latest Envelope release..."
-    RELEASES_RESPONSE="$(curl -fsSL "$GITHUB_API" 2>/dev/null || true)"
+    RELEASES_RESPONSE=""
+    if fetch "$GITHUB_API" "${TMPDIR_WORK}/release.json"; then
+        RELEASES_RESPONSE="$(cat "${TMPDIR_WORK}/release.json")"
+    fi
 
     # Detect "Not Found" (404) or missing tag_name — no releases published yet
     if [[ -z "$RELEASES_RESPONSE" ]] || echo "$RELEASES_RESPONSE" | grep -q '"message".*"Not Found"'; then
@@ -203,7 +230,7 @@ SHA256_URL="${GITHUB_RELEASES}/${VERSION}/${SHA256_FILE}"
 # Download tarball and checksum
 # ---------------------------------------------------------------------------
 echo "Downloading ${TARBALL_FILE}..."
-if ! curl -fsSL --retry 3 --retry-delay 2 -o "${TMPDIR_WORK}/${TARBALL_FILE}" "${TARBALL_URL}"; then
+if ! fetch "${TARBALL_URL}" "${TMPDIR_WORK}/${TARBALL_FILE}"; then
     echo "ERROR: Download failed: ${TARBALL_URL}" >&2
     echo "       Check that release ${VERSION} has a ${TARGET} binary:" >&2
     echo "       https://github.com/${REPO}/releases/tag/${VERSION}" >&2
@@ -211,7 +238,7 @@ if ! curl -fsSL --retry 3 --retry-delay 2 -o "${TMPDIR_WORK}/${TARBALL_FILE}" "$
 fi
 
 echo "Downloading checksum..."
-if ! curl -fsSL --retry 3 --retry-delay 2 -o "${TMPDIR_WORK}/${SHA256_FILE}" "${SHA256_URL}"; then
+if ! fetch "${SHA256_URL}" "${TMPDIR_WORK}/${SHA256_FILE}"; then
     echo "ERROR: Checksum download failed: ${SHA256_URL}" >&2
     exit 1
 fi

@@ -1218,19 +1218,28 @@ export const api = {
 
   /**
    * POST /api/accounts/{id}/drafts/{draftId}/discard
-   * Discard a queued draft (destructive — `holdDraft` unqueues and keeps it).
+   * Discard a draft (destructive — `holdDraft` unqueues and keeps it). A copy in
+   * the provider's Drafts folder moves to Trash first; if it cannot, the draft
+   * is left as it was and the error says why.
    */
   discardDraft(
     accountId: string,
     draftId: string,
     o?: RequestOptions
-  ): Promise<{ draft_id: string; status: string }> {
+  ): Promise<DraftDiscardedResponse> {
     return request(
       `/accounts/${encodeURIComponent(accountId)}/drafts/${encodeURIComponent(draftId)}/discard`,
       { ...o, method: 'POST', body: {} }
     );
   }
 };
+
+/** POST .../drafts/{draftId}/discard. `server_copy` says what happened to the Drafts-folder copy. */
+export interface DraftDiscardedResponse {
+  draft_id: string;
+  status: 'discarded';
+  server_copy: 'none' | 'trashed' | 'already_gone';
+}
 
 // ── Additional domain types ───────────────────────────────────────────
 

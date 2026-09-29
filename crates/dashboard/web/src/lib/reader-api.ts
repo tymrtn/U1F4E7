@@ -60,11 +60,20 @@ export interface ThreatView {
   error?: string;
 }
 
+/** An attachment the download gate refuses (crates/dashboard/src/handlers/messages.rs `attachment_blocks_view`). */
+export interface AttachmentBlock {
+  filename: string;
+  code: string;
+  reason: string;
+}
+
 /** Wrapper matching GET /api/accounts/{id}/messages/{uid} response shape. */
 export interface MessageDetailFullResponse {
   message: MessageDetailFull;
   /** Null when the threat engine is off or has no verdict. */
   threat?: ThreatView | null;
+  /** Attachments the download route would refuse, with the reason. */
+  attachment_blocks?: AttachmentBlock[];
 }
 
 export interface ThreatReportResponse {

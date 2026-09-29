@@ -35,6 +35,7 @@
     fetchMessageDetail,
     fetchThread,
     isSeen,
+    type AttachmentBlock,
     type MessageDetailFull,
     type ThreadMessage,
     type ThreatView
@@ -90,6 +91,7 @@
   let message = $state<MessageDetailFull | null>(null);
   // Threat verdict from the read (scanned on open when none is stored).
   let threat = $state<ThreatView | null>(null);
+  let attachmentBlocks = $state<AttachmentBlock[]>([]);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadKey = $state('');
@@ -203,6 +205,7 @@
     error = null;
     message = null;
     threat = null;
+    attachmentBlocks = [];
     threadMessages = [];
     actionError = null;
     remoteImages = false;
@@ -221,6 +224,7 @@
       const res = await fetchMessageDetail(acct, u, f);
       message = res.message;
       threat = res.threat ?? null;
+      attachmentBlocks = res.attachment_blocks ?? [];
 
       // The server's own \Seen state is fresh, so let it correct a stale
       // cached row for this exact message, then mark an unread one read.
@@ -882,6 +886,7 @@
           {accountId}
           uid={message.uid}
           {folder}
+          blocks={attachmentBlocks}
         />
       {/if}
 

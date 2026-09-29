@@ -375,23 +375,16 @@ async fn sweep_account(
     config: &ThreatConfig,
 ) -> anyhow::Result<()> {
     const FOLDER: &str = "INBOX";
-    let (client_arc, _creds) = state.get_or_create_imap(&account.id).await?;
-    let summaries = {
-        let mut client = client_arc.lock().await;
-        envelope_email_transport::imap::fetch_folder_summaries_read_only(
-            &mut client,
-            FOLDER,
-            SWEEP_WINDOW,
-        )
-        .await
-    };
-    let summaries = match summaries {
-        Ok(s) => s,
-        Err(e) => {
-            state.evict_imap(&account.id).await;
-            return Err(e.into());
-        }
-    };
+    // Its own connection, never the pooled one: a first scan fetches and
+    // analyzes up to SWEEP_MAX_SCANS messages, and holding the pooled
+    // connection that long starves the web UI's inbox sync on the same account.
+    let (mut client, _creds) = state.connect_imap_unpooled(&account.id).await?;
+    let summaries = envelope_email_transport::imap::fetch_folder_summaries_read_only(
+        &mut client,
+        FOLDER,
+        SWEEP_WINDOW,
+    )
+    .await?;
     let uids = {
         let db = state.db.lock().await;
         unscanned_uids(&db, &account.id, FOLDER, &summaries)
@@ -399,7 +392,6 @@ async fn sweep_account(
     if uids.is_empty() {
         return Ok(());
     }
-    let mut client = client_arc.lock().await;
     let mut mbox = DashboardMailbox {
         state,
         client: &mut client,
