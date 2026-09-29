@@ -17,9 +17,10 @@ use envelope_email_store::models::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::mailbox_sync::{AccountSyncOutcome, SyncReport, SyncTarget, sync_accounts};
 use crate::state::AppState;
 
-const UNIFIED_INBOX_FOLDER: &str = "INBOX";
+pub(crate) const UNIFIED_INBOX_FOLDER: &str = "INBOX";
 /// `detected_folders.folder_type` key for the Sent smart mailbox: each
 /// account's real Sent folder name is resolved (and cached) per provider, so
 /// no single literal folder name exists — index reads join through the
@@ -53,6 +54,15 @@ pub struct UnifiedInboxQuery {
     pub before_epoch: Option<i64>,
     pub before_uid: Option<u32>,
     pub before_account: Option<String>,
+}
+
+/// Query for the sync (refresh) endpoints. `account_id` scopes the provider
+/// pass to one account (id or address); the response is still the whole view.
+#[derive(Deserialize)]
+pub struct SyncQuery {
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +150,8 @@ impl UnifiedInboxAccountResult {
         last_error: Option<String>,
     ) -> Self {
         let (ok, freshness, error) = if let Some(error) = last_error {
-            (false, UnifiedAccountFreshness::Unavailable, Some(error))
+            // The last sync failed: cached rows are still shown, as stale.
+            (false, failed_freshness(message_count), Some(error))
         } else {
             match freshness {
                 "fresh" if message_count == 0 => (true, UnifiedAccountFreshness::Empty, None),
@@ -178,21 +189,15 @@ impl UnifiedInboxAccountResult {
             error,
         }
     }
+}
 
-    fn err(account: &Account, folder: &str, error: String) -> Self {
-        Self {
-            account_id: account.id.clone(),
-            account_username: account.username.clone(),
-            account_display_name: account.display_name.clone(),
-            folder: folder.to_string(),
-            ok: false,
-            message_count: 0,
-            unread_count: 0,
-            latest_message_date: None,
-            freshness: UnifiedAccountFreshness::Unavailable,
-            indexed_at: None,
-            error: Some(error),
-        }
+/// Freshness of an account whose last sync failed: its cached rows are stale
+/// when it has any, and there is nothing to show when it has none.
+fn failed_freshness(message_count: usize) -> UnifiedAccountFreshness {
+    if message_count > 0 {
+        UnifiedAccountFreshness::Stale
+    } else {
+        UnifiedAccountFreshness::Unavailable
     }
 }
 
@@ -228,6 +233,12 @@ pub struct UnifiedInboxResponse {
     /// Present when the page is full: pass these back as `before_*` query
     /// params to continue exactly where this page ended.
     pub next_cursor: Option<UnifiedNextCursor>,
+    /// When the index was read (server clock). Clients drop any response
+    /// older than the view they already show.
+    pub generated_at: String,
+    /// Present only on sync (refresh) responses: what the provider pass did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,57 +312,11 @@ pub async fn unified_inbox(
     ))
     .into_response()
 }
-/// Run `f` for every account with bounded concurrency and a per-account
-/// timeout. The sweep found the refresh crawling 25 accounts serially — one
-/// slow provider pinned the whole pass past 240s. Order of results follows
-/// completion; every account appears exactly once.
-async fn refresh_accounts_bounded<F, Fut>(
-    accounts: Vec<Account>,
-    concurrency: usize,
-    per_account_timeout: std::time::Duration,
-    f: F,
-) -> Vec<(Account, Result<(), String>)>
-where
-    F: Fn(Account) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), String>> + Send,
-{
-    use std::sync::Arc;
-    let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
-        accounts,
-    )));
-    let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let workers = concurrency.max(1);
-    let mut set = tokio::task::JoinSet::new();
-    for _ in 0..workers {
-        let queue = Arc::clone(&queue);
-        let results = Arc::clone(&results);
-        let f = f.clone();
-        set.spawn(async move {
-            loop {
-                let account = { queue.lock().await.pop_front() };
-                let Some(account) = account else { break };
-                let outcome =
-                    match tokio::time::timeout(per_account_timeout, f(account.clone())).await {
-                        Ok(res) => res,
-                        Err(_) => Err(format!(
-                            "timed out after {}s",
-                            per_account_timeout.as_secs()
-                        )),
-                    };
-                results.lock().await.push((account, outcome));
-            }
-        });
-    }
-    while set.join_next().await.is_some() {}
-    Arc::try_unwrap(results)
-        .map(|m| m.into_inner())
-        .unwrap_or_default()
-}
 
 /// One account's index refresh: connect, EXAMINE, fetch summaries read-only,
 /// upsert into the local index. Returns the failure string on any step; the
-/// caller persists errors and builds the response uniformly.
-async fn refresh_one_account(
+/// sync flight persists errors and callers build the response uniformly.
+pub(crate) async fn refresh_one_account(
     state: AppState,
     account: Account,
     folder: String,
@@ -416,7 +381,7 @@ async fn refresh_one_account(
 /// (cached in `detected_folders`), then reuse the standard mailbox index
 /// refresh against it. Resolution failure is an account-level error — never
 /// fall back to a literal "Sent" guess (the account may genuinely have none).
-async fn refresh_one_account_sent(
+pub(crate) async fn refresh_one_account_sent(
     state: AppState,
     account: Account,
     limit: u32,
@@ -438,14 +403,7 @@ async fn refresh_one_account_sent(
     let Some(folder) = folder else {
         return Err("no Sent folder detected on this account".to_string());
     };
-    let outcome = refresh_one_account(state.clone(), account.clone(), folder.clone(), limit).await;
-    // Unlike the unified path, the caller doesn't know the resolved folder, so
-    // the error marker (which hides stale rows from the listing) is persisted
-    // here where the folder name is in hand.
-    if let Err(error) = &outcome {
-        persist_refresh_error(&state, &account.id, &folder, error).await;
-    }
-    outcome
+    refresh_one_account(state, account, folder, limit).await
 }
 
 /// GET /api/messages/sent — the cross-account Sent list served from the local
@@ -492,77 +450,88 @@ pub async fn sent_inbox(
     .into_response()
 }
 
-/// POST /api/messages/sent/refresh — fan out a Sent index refresh across every
-/// account now (bounded, per-account budget), then serve the refreshed index.
-pub async fn refresh_sent_inbox(
-    State(state): State<AppState>,
-    Query(q): Query<UnifiedInboxQuery>,
-) -> impl IntoResponse {
+/// Run one read-only provider sync for a view: every account, or only the one
+/// named by `account_id`. Returns all accounts (the view is always whole) and
+/// the per-account outcomes of the accounts actually synced.
+async fn run_view_sync(
+    state: &AppState,
+    target: SyncTarget,
+    q: &SyncQuery,
+) -> Result<(Vec<Account>, SyncReport, Vec<AccountSyncOutcome>), axum::response::Response> {
     let accounts = {
         let db = state.db.lock().await;
         match db.list_accounts() {
             Ok(accounts) => accounts,
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
-                    .into_response();
+                return Err(
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response(),
+                );
             }
         }
     };
-
-    const REFRESH_CONCURRENCY: usize = 6;
-    const REFRESH_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-    let outcomes = {
-        let state = state.clone();
-        let limit = q.limit;
-        refresh_accounts_bounded(
-            accounts.clone(),
-            REFRESH_CONCURRENCY,
-            REFRESH_ACCOUNT_TIMEOUT,
-            move |account: Account| {
-                let state = state.clone();
-                refresh_one_account_sent(state, account, limit)
-            },
-        )
-        .await
-    };
-
-    let mut refresh_failures = Vec::new();
-    for (account, outcome) in outcomes {
-        if let Err(error) = outcome {
-            if error.starts_with("timed out") {
-                state.evict_imap(&account.id).await;
+    let targets: Vec<Account> = match q.account_id.as_deref() {
+        None => accounts.clone(),
+        Some(wanted) => {
+            let found: Vec<Account> = accounts
+                .iter()
+                .filter(|a| a.id == wanted || a.username.eq_ignore_ascii_case(wanted))
+                .cloned()
+                .collect();
+            if found.is_empty() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "code": "account_not_found",
+                        "error": "account_not_found",
+                        "message": "No such account to sync.",
+                    })),
+                )
+                    .into_response());
             }
-            refresh_failures.push(UnifiedInboxAccountResult::err(
-                &account,
-                SENT_SCOPE_LABEL,
-                error,
-            ));
+            found
         }
-    }
+    };
+    let scoped_id = q.account_id.as_ref().map(|_| targets[0].id.clone());
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let outcomes = sync_accounts(state, targets, target, q.limit, state.sync_limits).await;
+    let report = SyncReport::new(target, scoped_id, started_at, &outcomes);
+    Ok((accounts, report, outcomes))
+}
+
+/// POST /api/messages/sent/refresh — read-only Sent sync (all accounts, or one
+/// via `account_id`), then serve the refreshed index.
+pub async fn refresh_sent_inbox(
+    State(state): State<AppState>,
+    Query(q): Query<SyncQuery>,
+) -> impl IntoResponse {
+    let (accounts, report, _outcomes) = match run_view_sync(&state, SyncTarget::Sent, &q).await {
+        Ok(synced) => synced,
+        Err(response) => return response,
+    };
 
     let (mut messages, mut account_results) =
         match load_indexed_sent(&state, &accounts, q.limit, None).await {
             Ok(indexed) => indexed,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
+    apply_sync_failures(&mut messages, &mut account_results, &report);
 
-    apply_refresh_failures(&mut messages, &mut account_results, refresh_failures);
-
-    Json(build_inbox_response(
+    let mut response = build_inbox_response(
         "sent",
         SENT_SCOPE_LABEL.to_string(),
         q.limit,
         messages,
         account_results,
-    ))
-    .into_response()
+    );
+    response.sync = Some(report);
+    Json(response).into_response()
 }
 
 /// Hourly background pass that keeps the Sent index warm, so opening the Sent
 /// box reads the local cache instead of fanning 25 IMAP round-trips from the
 /// browser. Lower concurrency and a generous per-account budget: this runs on
-/// a timer, never against a spinner.
+/// a timer, never against a spinner. It shares sync flights with the manual
+/// path, so a sweep and a Sync now click never double-fetch an account.
 pub async fn run_sent_index_sweep(state: &AppState) -> anyhow::Result<()> {
     let accounts = {
         let db = state.db.lock().await;
@@ -572,30 +541,16 @@ pub async fn run_sent_index_sweep(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    const SWEEP_CONCURRENCY: usize = 4;
-    const SWEEP_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const SWEEP_LIMITS: crate::mailbox_sync::SyncLimits = crate::mailbox_sync::SyncLimits {
+        concurrency: 4,
+        account_timeout: std::time::Duration::from_secs(30),
+    };
     const SWEEP_LIMIT: u32 = 50;
 
-    let outcomes = {
-        let state = state.clone();
-        refresh_accounts_bounded(
-            accounts,
-            SWEEP_CONCURRENCY,
-            SWEEP_ACCOUNT_TIMEOUT,
-            move |account: Account| {
-                let state = state.clone();
-                refresh_one_account_sent(state, account, SWEEP_LIMIT)
-            },
-        )
-        .await
-    };
-
-    for (account, outcome) in outcomes {
-        if let Err(error) = outcome {
-            if error.starts_with("timed out") {
-                state.evict_imap(&account.id).await;
-            }
-            tracing::warn!("sent index sweep [{}]: {error}", account.username);
+    for outcome in sync_accounts(state, accounts, SyncTarget::Sent, SWEEP_LIMIT, SWEEP_LIMITS).await
+    {
+        if let Err(error) = outcome.result {
+            tracing::warn!("sent index sweep [{}]: {error}", outcome.account.username);
         }
     }
     Ok(())
@@ -615,7 +570,7 @@ async fn load_indexed_sent(
         .list_message_index_detected_folder_freshness(SENT_FOLDER_TYPE)
         .map_err(|e| format!("db error: {e}"))?;
 
-    let messages: Vec<UnifiedInboxMessage> = indexed
+    let mut messages: Vec<UnifiedInboxMessage> = indexed
         .into_iter()
         .enumerate()
         .map(|(idx, row)| {
@@ -662,79 +617,44 @@ async fn load_indexed_sent(
                 account_freshness.and_then(|row| row.last_error.clone()),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    mark_failed_account_rows_stale(&mut messages, &account_results);
 
     Ok((messages, account_results))
 }
 
+/// POST /api/messages/unified/refresh — read-only Inbox sync (all accounts, or
+/// one via `account_id`), then serve the refreshed unified index.
 pub async fn refresh_unified_inbox(
     State(state): State<AppState>,
-    Query(q): Query<UnifiedInboxQuery>,
+    Query(q): Query<SyncQuery>,
 ) -> impl IntoResponse {
-    let accounts = {
-        let db = state.db.lock().await;
-        match db.list_accounts() {
-            Ok(accounts) => accounts,
-            Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))
-                    .into_response();
-            }
-        }
+    let (accounts, report, outcomes) = match run_view_sync(&state, SyncTarget::Inbox, &q).await {
+        Ok(synced) => synced,
+        Err(response) => return response,
     };
 
     let folder = UNIFIED_INBOX_FOLDER.to_string();
-
-    // Bounded fan-out with a per-account budget: the old serial crawl let one
-    // slow provider pin the whole pass past 240s while the UI spun.
-    const REFRESH_CONCURRENCY: usize = 6;
-    const REFRESH_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-    let outcomes = {
-        let state = state.clone();
-        let folder = folder.clone();
-        let limit = q.limit;
-        refresh_accounts_bounded(
-            accounts.clone(),
-            REFRESH_CONCURRENCY,
-            REFRESH_ACCOUNT_TIMEOUT,
-            move |account: Account| {
-                let state = state.clone();
-                let folder = folder.clone();
-                refresh_one_account(state, account, folder, limit)
-            },
-        )
-        .await
-    };
-
-    let mut refresh_failures = Vec::new();
-    for (account, outcome) in outcomes {
-        if let Err(error) = outcome {
-            // A timed-out future was dropped mid-IMAP; force a reconnect so the
-            // shared client cannot be left in a half-run command state.
-            if error.starts_with("timed out") {
-                state.evict_imap(&account.id).await;
-            }
-            persist_refresh_error(&state, &account.id, &folder, &error).await;
-            refresh_failures.push(UnifiedInboxAccountResult::err(&account, &folder, error));
-        }
-    }
-
     let (mut messages, mut account_results) =
         match load_indexed_unified_inbox(&state, &accounts, &folder, q.limit, None).await {
             Ok(indexed) => indexed,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
+    apply_sync_failures(&mut messages, &mut account_results, &report);
 
-    apply_refresh_failures(&mut messages, &mut account_results, refresh_failures);
-
-    // Publish a metadata-level `new_mail` event per successfully-refreshed
-    // account. The unified refresh path has no server-side "new since last"
-    // delta, so this fires on every refresh that reached IMAP, carrying only
-    // post-refresh counts (no bodies/subjects/recipients). Clients treat it as
-    // "the inbox index for this account may have changed — reconcile counts".
-    // A dedicated IMAP IDLE push worker is intentionally out of scope this round.
-    for result in &account_results {
-        if result.ok {
+    // Publish a metadata-level `new_mail` event for each account THIS request
+    // synced (a joined run was announced by the request that started it; an
+    // account outside the scope was not synced at all). It carries only
+    // post-sync counts — no bodies, subjects or recipients. Clients treat it
+    // as "this account's index may have changed — reload the cached view".
+    for outcome in outcomes
+        .iter()
+        .filter(|outcome| outcome.result.is_ok() && !outcome.joined)
+    {
+        if let Some(result) = account_results
+            .iter()
+            .find(|result| result.account_id == outcome.account.id)
+        {
             state
                 .events
                 .publish(crate::events::DashboardEvent::NewMail {
@@ -745,56 +665,45 @@ pub async fn refresh_unified_inbox(
         }
     }
 
-    Json(build_inbox_response(
-        "unified_inbox",
-        folder,
-        q.limit,
-        messages,
-        account_results,
-    ))
-    .into_response()
+    let mut response =
+        build_inbox_response("unified_inbox", folder, q.limit, messages, account_results);
+    response.sync = Some(report);
+    Json(response).into_response()
 }
 
-/// Persist a per-account/folder refresh-error marker. Persistence failure must
-/// not be silent (it would let a stale phantom row survive), but it also must
-/// not abort the response: the caller has already recorded the failure
-/// in-memory and [`apply_refresh_failures`] fails closed regardless of whether
-/// this write lands. We surface the persistence error to the log; the SQLite
-/// error string carries no mailbox secrets.
-async fn persist_refresh_error(state: &AppState, account_id: &str, folder: &str, error: &str) {
-    let result = {
-        let db = state.db.lock().await;
-        db.record_message_index_error(account_id, folder, error)
-    };
-    if let Err(persist_err) = result {
-        tracing::warn!(
-            "unified refresh: failed to persist index error for account {account_id} folder {folder}: {persist_err}"
-        );
-    }
-}
-
-/// Fail closed for the current refresh response: drop every cached message
-/// belonging to an account whose in-memory refresh failed, and overwrite its
-/// account result with the failure result. This is independent of whether the
-/// SQLite error marker persisted — if the marker write was rejected while reads
-/// still work, the DB query would otherwise leak the account's stale rows.
-fn apply_refresh_failures(
-    messages: &mut Vec<UnifiedInboxMessage>,
+/// Apply this sync's failures to the response in memory, independent of
+/// whether the flight's error marker persisted. A failed account keeps its
+/// cached rows, now labeled stale, and reports the error; nothing is dropped
+/// and nothing is reported as an empty success.
+fn apply_sync_failures(
+    messages: &mut [UnifiedInboxMessage],
     account_results: &mut [UnifiedInboxAccountResult],
-    failures: Vec<UnifiedInboxAccountResult>,
+    report: &SyncReport,
 ) {
-    let failed_account_ids: std::collections::HashSet<String> = failures
-        .iter()
-        .map(|failure| failure.account_id.clone())
-        .collect();
-    messages.retain(|message| !failed_account_ids.contains(&message.account_id));
-
-    for failure in failures {
+    for failure in report.accounts.iter().filter(|a| !a.ok) {
         if let Some(slot) = account_results
             .iter_mut()
             .find(|result| result.account_id == failure.account_id)
         {
-            *slot = failure;
+            slot.ok = false;
+            slot.freshness = failed_freshness(slot.message_count);
+            slot.error = failure.error.clone();
+        }
+    }
+    mark_failed_account_rows_stale(messages, account_results);
+}
+
+/// Rows of an account whose last sync failed are served, but as stale.
+fn mark_failed_account_rows_stale(
+    messages: &mut [UnifiedInboxMessage],
+    account_results: &[UnifiedInboxAccountResult],
+) {
+    for message in messages.iter_mut() {
+        if account_results
+            .iter()
+            .any(|result| result.account_id == message.account_id && result.error.is_some())
+        {
+            message.index_freshness = "stale".to_string();
         }
     }
 }
@@ -814,7 +723,7 @@ async fn load_indexed_unified_inbox(
         .list_message_index_account_freshness(folder)
         .map_err(|e| format!("db error: {e}"))?;
 
-    let messages: Vec<UnifiedInboxMessage> = indexed
+    let mut messages: Vec<UnifiedInboxMessage> = indexed
         .into_iter()
         .enumerate()
         .map(|(idx, row)| {
@@ -859,7 +768,8 @@ async fn load_indexed_unified_inbox(
                 account_freshness.and_then(|row| row.last_error.clone()),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    mark_failed_account_rows_stale(&mut messages, &account_results);
 
     Ok((messages, account_results))
 }
@@ -908,6 +818,8 @@ fn build_inbox_response(
         freshness,
         errors,
         next_cursor,
+        generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        sync: None,
     }
 }
 
@@ -918,7 +830,17 @@ fn unified_inbox_freshness(
     match status {
         UnifiedInboxStatus::Empty => UnifiedAccountFreshness::Empty,
         UnifiedInboxStatus::Partial => UnifiedAccountFreshness::Partial,
-        UnifiedInboxStatus::Error => UnifiedAccountFreshness::Unavailable,
+        // Every account failed; whatever cached rows exist are stale.
+        UnifiedInboxStatus::Error => {
+            if accounts
+                .iter()
+                .any(|account| account.freshness == UnifiedAccountFreshness::Stale)
+            {
+                UnifiedAccountFreshness::Stale
+            } else {
+                UnifiedAccountFreshness::Unavailable
+            }
+        }
         UnifiedInboxStatus::Ok => {
             if accounts
                 .iter()
@@ -1812,62 +1734,7 @@ mod tests {
         assert!(res.next_cursor.is_none());
     }
 
-    // ── bounded refresh fan-out (sweep blocker #4: 240s serial hang) ────
-
-    #[tokio::test]
-    async fn bounded_refresh_times_out_slow_accounts_instead_of_hanging() {
-        let accounts: Vec<Account> = ["a", "b", "c"]
-            .iter()
-            .map(|id| Account {
-                id: (*id).to_string(),
-                name: String::new(),
-                username: format!("{id}@example.test"),
-                domain: String::new(),
-                smtp_host: String::new(),
-                smtp_port: 0,
-                imap_host: String::new(),
-                imap_port: 0,
-                smtp_username: None,
-                imap_username: None,
-                display_name: None,
-                signature_text: None,
-                signature_html: None,
-                created_at: String::new(),
-            })
-            .collect();
-
-        let started = std::time::Instant::now();
-        let results = refresh_accounts_bounded(
-            accounts,
-            2,
-            std::time::Duration::from_millis(300),
-            |account: Account| async move {
-                if account.id == "b" {
-                    // Slower than the per-account budget: must be cut off.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                Ok::<(), String>(())
-            },
-        )
-        .await;
-
-        assert_eq!(results.len(), 3);
-        let by_id = |id: &str| results.iter().find(|(a, _)| a.id == id).unwrap();
-        assert!(by_id("a").1.is_ok());
-        assert!(by_id("c").1.is_ok());
-        let err = by_id("b").1.as_ref().unwrap_err();
-        assert!(
-            err.contains("timed out"),
-            "slow account reported as timed out, got: {err}"
-        );
-        // Even with one pathological account, the whole pass is bounded by the
-        // per-account budget, never a serial 25×-connect crawl.
-        assert!(
-            started.elapsed() <= std::time::Duration::from_secs(2),
-            "elapsed {:?}",
-            started.elapsed()
-        );
-    }
+    // Bounded fan-out + timeouts are tested in `mailbox_sync`.
 
     #[test]
     fn unified_merge_sorts_newest_first_by_parsed_date_then_stable_fallback() {
@@ -1900,11 +1767,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_refresh_failures_fails_closed_even_without_persisted_marker() {
-        // Simulate a refresh whose DB error-marker write was rejected: the DB
-        // query still returns the failed account's stale phantom row and still
-        // reports it as ok/fresh. The in-memory failure must nonetheless drop
-        // the row from the response and mark the account unavailable.
+    fn apply_sync_failures_keeps_rows_as_stale_even_without_persisted_marker() {
+        // Simulate a sync whose DB error-marker write was rejected: the DB
+        // query still reports the failed account as ok/fresh. The in-memory
+        // failure must still mark it failed and its rows stale — and keep the
+        // rows, never swapping them for an empty success (#171).
         let mut messages = vec![
             unified("acct-ok", 10, Some("Tue, 12 May 2026 10:00:00 +0000"), 0),
             unified(
@@ -1914,30 +1781,51 @@ mod tests {
                 1,
             ),
         ];
-        let mut account_results = vec![
-            account_result("acct-ok", true, None),
-            // Stale success: as if last_error never persisted.
-            account_result("acct-failed", true, None),
-        ];
-        let failures = vec![account_result(
-            "acct-failed",
-            false,
-            Some("IMAP: auth failed"),
-        )];
+        let mut failed_cached = account_result("acct-failed", true, None);
+        failed_cached.message_count = 1;
+        let mut account_results = vec![account_result("acct-ok", true, None), failed_cached];
+        let report = SyncReport {
+            target: SyncTarget::Inbox,
+            account_id: None,
+            status: crate::mailbox_sync::SyncStatus::Partial,
+            started_at: String::new(),
+            finished_at: String::new(),
+            accounts: vec![
+                crate::mailbox_sync::AccountSyncResult {
+                    account_id: "acct-ok".into(),
+                    account_username: "acct-ok@example.test".into(),
+                    ok: true,
+                    joined: false,
+                    error: None,
+                },
+                crate::mailbox_sync::AccountSyncResult {
+                    account_id: "acct-failed".into(),
+                    account_username: "acct-failed@example.test".into(),
+                    ok: false,
+                    joined: false,
+                    error: Some("IMAP: auth failed".into()),
+                },
+            ],
+        };
 
-        apply_refresh_failures(&mut messages, &mut account_results, failures);
+        apply_sync_failures(&mut messages, &mut account_results, &report);
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].account_id, "acct-ok");
-        assert!(messages.iter().all(|m| m.account_id != "acct-failed"));
+        assert_eq!(messages.len(), 2, "no cached row is dropped");
+        let failed_row = messages
+            .iter()
+            .find(|m| m.account_id == "acct-failed")
+            .unwrap();
+        assert_eq!(failed_row.index_freshness, "stale");
+        let ok_row = messages.iter().find(|m| m.account_id == "acct-ok").unwrap();
+        assert_ne!(ok_row.index_freshness, "stale");
 
         let failed = account_results
             .iter()
             .find(|result| result.account_id == "acct-failed")
             .expect("failed account result");
         assert!(!failed.ok);
-        assert_eq!(failed.freshness, UnifiedAccountFreshness::Unavailable);
-        assert_eq!(failed.message_count, 0);
+        assert_eq!(failed.freshness, UnifiedAccountFreshness::Stale);
+        assert_eq!(failed.message_count, 1);
         assert_eq!(failed.error.as_deref(), Some("IMAP: auth failed"));
 
         let healthy = account_results
@@ -1945,6 +1833,17 @@ mod tests {
             .find(|result| result.account_id == "acct-ok")
             .expect("healthy account result");
         assert!(healthy.ok);
+
+        let response = build_inbox_response(
+            "unified_inbox",
+            "INBOX".into(),
+            50,
+            messages,
+            account_results,
+        );
+        assert_eq!(response.status, UnifiedInboxStatus::Partial);
+        assert_eq!(response.freshness, UnifiedAccountFreshness::Partial);
+        assert_eq!(response.errors.len(), 1);
     }
 
     #[tokio::test]

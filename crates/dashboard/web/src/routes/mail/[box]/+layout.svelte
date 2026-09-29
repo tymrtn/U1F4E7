@@ -14,8 +14,16 @@
   import SearchBar from '$lib/components/SearchBar.svelte';
   import ComposerDrawer from '$lib/components/ComposerDrawer.svelte';
   import UndoToast from '$lib/components/UndoToast.svelte';
+  import SyncControl from '$lib/components/SyncControl.svelte';
   import { mailboxBySlug } from '$lib/mailboxes';
-  import { unifiedNeedsRefresh, positionOf } from '$lib/mailbox-position';
+  import { positionOf } from '$lib/mailbox-position';
+  import {
+    MailboxSync,
+    autoSyncDue,
+    isNewerView,
+    staleSelectionKeys,
+    type SyncScope
+  } from '$lib/mailbox-sync.svelte';
   import { folderHints } from '$lib/folder-hints.svelte';
   import { SelectionStore } from '$lib/selection.svelte';
   import { readState } from '$lib/read-state.svelte';
@@ -28,13 +36,13 @@
     EnvelopeApiError,
     type UnifiedInboxMessage,
     type UnifiedNextCursor,
-    type UnifiedInboxError,
     type Draft,
     type SnoozedItem,
     type SearchMessageSummary,
     type FolderStats,
     type ComposeResponse,
     type Account,
+    type UnifiedInboxResponse,
   } from '$lib/api';
 
   let { children }: { children: Snippet } = $props();
@@ -83,7 +91,6 @@
   let sentMessages = $state<UnifiedInboxMessage[]>([]);
   let sentNextCursor = $state<UnifiedNextCursor | null>(null);
   let sentLoadingMore = $state(false);
-  let listErrors = $state<UnifiedInboxError[]>([]);
   let loading = $state(false);
   let error = $state<{ code: string; message: string } | null>(null);
   let loadedBox = $state<string | null>(null);
@@ -125,7 +132,25 @@
 
   let starOverrides = $state<Map<string, boolean>>(new Map());
   let unifiedLoadGen = 0;
-  let unifiedRefreshInFlight = false;
+
+  // ── Mailbox sync (#171) ───────────────────────────────────────────
+  // Opening Inbox or Sent paints the server's cached index, then asks for one
+  // read-only provider sync of that view; Sync now / Retry drive the same
+  // path. `*AsOf` is the server time of the view on screen, so a response
+  // read earlier (a slow cached reload, a superseded sync) can never paint
+  // over a newer one.
+  const mailboxSync = new MailboxSync((scope, accountId) => {
+    const opts = accountId ? { accountId } : undefined;
+    if (scope === 'sent') {
+      return opts ? api.refreshSentInbox(50, opts) : api.refreshSentInbox(50);
+    }
+    return opts ? api.refreshUnifiedInbox(50, opts) : api.refreshUnifiedInbox(50);
+  });
+  let unifiedAsOf: string | null = null;
+  let sentAsOf: string | null = null;
+  const syncScope = $derived<SyncScope | null>(
+    box?.slug === 'unified' || box?.slug === 'sent' ? box.slug : null
+  );
 
   // ── Where the open message sits in the list ───────────────────────
   // The unified list is a flat merge of every account, so "which one am I
@@ -160,17 +185,51 @@
     row.scrollIntoView({ block: 'nearest' });
   });
 
-  function applyUnified(res: {
-    messages: UnifiedInboxMessage[];
-    errors?: UnifiedInboxError[];
-    next_cursor?: UnifiedNextCursor | null;
-  }) {
+  /** Deselect rows a newer view no longer contains (deleted, moved, or
+   *  renumbered by a UIDVALIDITY reset), so no action runs on a stale handle.
+   *  Everything still present stays selected. */
+  function dropStaleSelection(
+    prev: UnifiedInboxMessage[],
+    next: UnifiedInboxMessage[],
+    keyOf: (m: { account_id: string; uid: number }) => string
+  ) {
+    const stale = staleSelectionKeys(prev, next, selection.selected, keyOf);
+    if (stale.length > 0) selection.deselect(stale);
+  }
+
+  /** After a provider sync the server's flags are current; optimistic star
+   *  overrides for rows it returned have done their job. */
+  function settleStarOverrides(res: UnifiedInboxResponse, keyOf: (m: UnifiedInboxMessage) => string) {
+    if (!res.sync || starOverrides.size === 0) return;
+    const next = new Map(starOverrides);
+    for (const m of res.messages) next.delete(keyOf(m));
+    starOverrides = next;
+  }
+
+  const unifiedKey = (m: { account_id: string; uid: number }) => `${m.account_id}:${m.uid}`;
+  const sentKey = (m: { account_id: string; uid: number }) => `sent:${m.account_id}:${m.uid}`;
+
+  function applyUnified(res: UnifiedInboxResponse): boolean {
+    if (!isNewerView(unifiedAsOf, res.generated_at)) return false;
+    unifiedAsOf = res.generated_at ?? unifiedAsOf;
+    dropStaleSelection(unifiedMessages, res.messages, unifiedKey);
+    settleStarOverrides(res, unifiedKey);
     unifiedMessages = res.messages;
     unifiedNextCursor = res.next_cursor ?? null;
-    listErrors = res.errors ?? [];
     // Record the mailbox each row came from, so a reader link that lost its
     // `?folder=` can still resolve one instead of guessing INBOX.
     folderHints.remember(res.messages);
+    return true;
+  }
+
+  /** Start (or join) the read-only provider sync for a view and paint its
+   *  result, unless the operator has since left that view — the index is
+   *  updated server-side either way, so the next open reads it. */
+  async function syncView(scope: SyncScope, accountId?: string) {
+    const res = await mailboxSync.sync(scope, accountId);
+    if (!res || (page.params.box ?? 'unified') !== scope) return;
+    if (scope === 'unified') applyUnified(res);
+    else applySent(res);
   }
 
   /** Fetch the next unified page with the keyset cursor and append it.
@@ -195,32 +254,19 @@
     }
   }
 
-  async function refreshStaleUnified(gen: number) {
-    if (unifiedRefreshInFlight) return;
-    unifiedRefreshInFlight = true;
-    try {
-      const refreshed = await api.refreshUnifiedInbox(50);
-      if (gen !== unifiedLoadGen) return;
-      applyUnified(refreshed);
-    } catch {
-      // Keep the painted cache. A failed refresh must not blank the list.
-    } finally {
-      unifiedRefreshInFlight = false;
-    }
-  }
-
-  async function loadUnified() {
+  /** Paint the cached Inbox. `open` marks a navigation to the view: it then
+   *  schedules the view's sync unless every account synced moments ago.
+   *  Reloads (SSE events, bulk operations) stay cache-only. */
+  async function loadUnified(open = false) {
     const gen = ++unifiedLoadGen;
     loading = unifiedMessages.length === 0;
     error = null;
     try {
       const res = await api.unifiedInbox(50);
       if (gen !== unifiedLoadGen) return;
-      applyUnified(res);
+      if (applyUnified(res)) mailboxSync.observe('unified', res);
       loading = false;
-      if (unifiedNeedsRefresh(res)) {
-        await refreshStaleUnified(gen);
-      }
+      if (open && autoSyncDue(res)) void syncView('unified');
     } catch (e) {
       if (gen !== unifiedLoadGen) return;
       const err = e as EnvelopeApiError;
@@ -280,29 +326,28 @@
     }
   }
 
-  function applySent(res: {
-    messages: UnifiedInboxMessage[];
-    next_cursor?: UnifiedNextCursor | null;
-  }) {
+  function applySent(res: UnifiedInboxResponse): boolean {
+    if (!isNewerView(sentAsOf, res.generated_at)) return false;
+    sentAsOf = res.generated_at ?? sentAsOf;
+    dropStaleSelection(sentMessages, res.messages, sentKey);
+    settleStarOverrides(res, sentKey);
     sentMessages = res.messages;
     sentNextCursor = res.next_cursor ?? null;
     folderHints.remember(res.messages);
+    return true;
   }
 
   /** Sent reads the server's local index (kept warm by an hourly sweep), so
-   *  opening the box never fans IMAP from the browser. A missing/stale index
-   *  triggers one server-side refresh, same contract as the unified inbox. */
-  async function loadSent() {
+   *  first paint never fans IMAP from the browser; an open then syncs the
+   *  Sent view server-side, same contract as the Inbox. */
+  async function loadSent(open = false) {
     loading = sentMessages.length === 0;
     error = null;
     try {
       const res = await api.sentInbox(50);
-      applySent(res);
+      if (applySent(res)) mailboxSync.observe('sent', res);
       loading = false;
-      if (unifiedNeedsRefresh(res)) {
-        const refreshed = await api.refreshSentInbox(50);
-        applySent(refreshed);
-      }
+      if (open && autoSyncDue(res)) void syncView('sent');
     } catch (e) {
       const err = e as EnvelopeApiError;
       error = { code: err.code ?? 'unknown', message: err.message ?? 'Failed to load sent messages.' };
@@ -349,14 +394,14 @@
       selection.clear();
       starOverrides = new Map();
       if (slug === 'unified') {
-        loadUnified();
+        loadUnified(true);
         loadFolders();
       } else if (slug === 'drafts') {
         loadDrafts();
       } else if (slug === 'snoozed') {
         loadSnoozed();
       } else if (slug === 'sent') {
-        loadSent();
+        loadSent(true);
       }
     }
   });
@@ -726,17 +771,27 @@
       </div>
     </header>
 
-    <!-- Connection indicator (rail footer) -->
-    <div id="live-indicator" class="live-indicator" aria-label="Connection status">
-      {#if connectionState === 'open' && !isDegraded}
-        <span class="live-dot live-dot-ok" aria-hidden="true"></span>
-        <span class="live-label">Live</span>
-      {:else if isDegraded}
-        <span class="live-dot live-dot-degraded" aria-hidden="true"></span>
-        <span class="live-label">Polling</span>
-      {:else if connectionState === 'connecting' || connectionState === 'reconnecting'}
-        <span class="live-dot live-dot-pending" aria-hidden="true"></span>
-        <span class="live-label">Connecting</span>
+    <div id="list-status-bar" class="list-status-bar">
+      <!-- Event-stream connection state. It is not a sync state: "Live" means
+           the dashboard hears server events, never that mail was synced. -->
+      <div id="live-indicator" class="live-indicator" aria-label="Connection status">
+        {#if connectionState === 'open' && !isDegraded}
+          <span class="live-dot live-dot-ok" aria-hidden="true"></span>
+          <span class="live-label">Live</span>
+        {:else if isDegraded}
+          <span class="live-dot live-dot-degraded" aria-hidden="true"></span>
+          <span class="live-label">Polling</span>
+        {:else if connectionState === 'connecting' || connectionState === 'reconnecting'}
+          <span class="live-dot live-dot-pending" aria-hidden="true"></span>
+          <span class="live-label">Connecting</span>
+        {/if}
+      </div>
+      {#if syncScope && !isSearching}
+        <SyncControl
+          sync={mailboxSync.state(syncScope)}
+          onsync={() => syncScope && void syncView(syncScope)}
+          onretry={(accountId) => syncScope && void syncView(syncScope, accountId)}
+        />
       {/if}
     </div>
 
@@ -784,10 +839,10 @@
         <p><MonoTag>{error.code}</MonoTag></p>
         <button class="list-retry" type="button" onclick={() => {
           const slug = page.params.box ?? 'unified';
-          if (slug === 'unified') loadUnified();
+          if (slug === 'unified') loadUnified(true);
           else if (slug === 'drafts') loadDrafts();
           else if (slug === 'snoozed') loadSnoozed();
-          else if (slug === 'sent') loadSent();
+          else if (slug === 'sent') loadSent(true);
         }}>Retry</button>
       </div>
 
@@ -834,12 +889,9 @@
       {/if}
 
     {:else if box.slug === 'unified'}
-      {#if listErrors.length > 0}
-        <p class="list-partial" role="status">
-          {listErrors.length} account{listErrors.length === 1 ? '' : 's'} couldn't be reached: {listErrors.map((e) => e.account_username).join(', ')} — showing what loaded.
-        </p>
-      {/if}
-      {#if unifiedMessages.length === 0}
+      {#if unifiedMessages.length === 0 && mailboxSync.isSyncing('unified')}
+        <div class="list-loading"><Spinner label="Syncing Inbox" /> <span>Syncing Inbox…</span></div>
+      {:else if unifiedMessages.length === 0}
         <EmptyState
           title="Inbox is empty"
           hint="No messages across your connected accounts. New mail appears here."
@@ -949,7 +1001,9 @@
       {/if}
 
     {:else if box.slug === 'sent'}
-      {#if sentMessages.length === 0}
+      {#if sentMessages.length === 0 && mailboxSync.isSyncing('sent')}
+        <div class="list-loading"><Spinner label="Syncing Sent" /> <span>Syncing Sent…</span></div>
+      {:else if sentMessages.length === 0}
         <EmptyState title="No sent messages" hint="Messages you send appear here, across all connected accounts." />
       {:else}
         <ul id="sent-msg-list" class="msg-list">
@@ -1115,13 +1169,6 @@
     cursor: pointer;
     text-decoration: underline;
   }
-  .list-partial {
-    margin: 0;
-    padding: 0.4rem 1rem;
-    font-size: 0.75rem;
-    color: var(--env-pending);
-    background: var(--env-pending-soft);
-  }
   .empty-link {
     font-size: 0.8125rem;
     color: var(--env-accent);
@@ -1151,13 +1198,21 @@
   .compose-btn:hover {
     background: #262626;
   }
+  .list-status-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 2.25rem;
+    padding: 0.25rem 0.75rem;
+    border-bottom: 1px solid var(--env-rule);
+    background: var(--env-paper);
+  }
   .live-indicator {
     display: flex;
     align-items: center;
     gap: 0.3rem;
-    padding: 0.25rem 0.75rem;
-    border-bottom: 1px solid var(--env-rule);
-    background: var(--env-paper);
+    flex-shrink: 0;
   }
   .live-dot {
     width: 6px;

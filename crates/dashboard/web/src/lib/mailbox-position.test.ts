@@ -1,73 +1,12 @@
-// Locating a message inside the unified inbox, and deciding when the cached
-// list is lying about being empty.
-//
-// Both behaviours come from the same incident: a sidecar without credentials
-// wrote a per-account `last_error` into the SHARED message index, which the
-// index query turns into `message_count = 0` for that account. Every account
-// carried one, so the dashboard showed "Inbox is empty" over 703 perfectly
-// good indexed rows — and sat that way for a day, because the existing
-// stale-refresh predicate only fired on `stale`/`expired`, never `unavailable`.
+// Locating a message inside the unified inbox. (When to sync the list is
+// mailbox-sync.svelte.ts; a failed sync no longer hides indexed rows, #171.)
 
 import { describe, expect, it } from 'vitest';
 import {
   folderHints,
   __resetFolderHints
 } from './folder-hints.svelte';
-import { unifiedNeedsRefresh, positionOf } from './mailbox-position';
-
-function acct(freshness: string, ok = true) {
-  return { account_id: 'a1', freshness, ok };
-}
-
-describe('unifiedNeedsRefresh', () => {
-  it('refreshes when an account cache is stale or expired', () => {
-    expect(unifiedNeedsRefresh({ freshness: 'stale', accounts: [], messages: [] })).toBe(true);
-    expect(unifiedNeedsRefresh({ freshness: 'expired', accounts: [], messages: [] })).toBe(true);
-    expect(
-      unifiedNeedsRefresh({ freshness: 'fresh', accounts: [acct('stale')], messages: [{}] })
-    ).toBe(true);
-  });
-
-  /// THE regression: every account unavailable and not one message rendered.
-  /// `unavailable` was deliberately excluded from the stale check so two
-  /// permanently-broken accounts could not re-IMAP the fleet on every open —
-  /// but that also meant a fully-blanked inbox could never heal itself.
-  it('refreshes when the list is empty but accounts exist', () => {
-    const blanked = {
-      freshness: 'partial',
-      accounts: [acct('unavailable', false), acct('unavailable', false)],
-      messages: []
-    };
-    expect(unifiedNeedsRefresh(blanked)).toBe(true);
-  });
-
-  /// The steady state that must NOT re-IMAP: a couple of accounts are
-  /// permanently unreachable, but mail is rendering fine.
-  it('does not refresh when messages rendered, even with unreachable accounts', () => {
-    const steady = {
-      freshness: 'partial',
-      accounts: [acct('fresh'), acct('unavailable', false), acct('unavailable', false)],
-      messages: [{}, {}, {}]
-    };
-    expect(unifiedNeedsRefresh(steady)).toBe(false);
-  });
-
-  /// A genuinely empty mailbox must not spin: no accounts, nothing to refresh.
-  it('does not refresh an empty list with no accounts', () => {
-    expect(unifiedNeedsRefresh({ freshness: 'fresh', accounts: [], messages: [] })).toBe(false);
-  });
-
-  /// Every account reporting a healthy empty mailbox is genuinely empty.
-  it('does not refresh when accounts are fresh and simply have no mail', () => {
-    expect(
-      unifiedNeedsRefresh({
-        freshness: 'fresh',
-        accounts: [acct('empty'), acct('empty')],
-        messages: []
-      })
-    ).toBe(false);
-  });
-});
+import { positionOf } from './mailbox-position';
 
 describe('positionOf', () => {
   const list = [

@@ -97,7 +97,7 @@ describe('unified banner names unreachable accounts', () => {
     );
     render(MailLayout, { children: emptyChildren });
     await waitFor(() => expect(screen.getByText('only')).toBeInTheDocument());
-    const note = screen.getByRole('status');
+    const note = screen.getByRole('list', { name: 'Accounts that did not sync' });
     expect(note.textContent).toContain('x@example.com');
     expect(note.textContent).toContain('y@example.com');
   });
