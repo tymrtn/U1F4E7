@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `envelope --help` and the package descriptions now say what Envelope is for both audiences: all your email accounts in one inbox, shared with your agents.
+
 ## [1.3.12] — 2026-09-29
 
 Smaller MCP results with the host's dashboard origin kept out of model context, plus four fixes

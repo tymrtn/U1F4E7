@@ -6,7 +6,7 @@ name = "envelope-email"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "BYO mailbox email client with agent-native primitives"
+description = "BYO-mailbox email client: all your accounts in one inbox, shared with your agents"
 
 [features]
 # Build the Governor send gate into the `envelope` binary:

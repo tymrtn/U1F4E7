@@ -55,6 +55,7 @@ h2 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
 .five-up { grid-template-columns: repeat(5, 1fr); }
 .six-up { grid-template-columns: repeat(3, 1fr); }
 .three-up { grid-template-columns: repeat(3, 1fr); }
+.four-up { grid-template-columns: repeat(4, 1fr); }
 .pricing-grid { grid-template-columns: repeat(4, 1fr); margin-top: 1.5rem; }
 .pricing-card { display: flex; flex-direction: column; }
 .pricing-card .button { margin-top: auto; }
@@ -87,7 +88,7 @@ h2 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
 .footer-links { display: flex; gap: 1rem; }
 .site-footer { padding: 2rem 0 3rem; color: var(--muted); }
 @media (max-width: 1080px) {
-  .five-up, .six-up, .pricing-grid { grid-template-columns: repeat(2, 1fr); }
+  .four-up, .five-up, .six-up, .pricing-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 900px) {
   .hero-grid, .two-col, .section-head, .footer-row, .three-up { grid-template-columns: 1fr; display: grid; }
@@ -96,7 +97,7 @@ h2 { font-size: clamp(1.7rem, 3vw, 2.5rem); }
   .nav { align-items: flex-start; flex-direction: column; }
 }
 @media (max-width: 640px) {
-  .five-up, .six-up, .pricing-grid { grid-template-columns: 1fr; }
+  .four-up, .five-up, .six-up, .pricing-grid { grid-template-columns: 1fr; }
 }
 /* Grid items default to min-width:auto, which lets the nowrap install commands
    widen the hero column past a phone screen. */
