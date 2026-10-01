@@ -19,7 +19,7 @@ use envelope_email_transport::detect_drafts_folder;
 use envelope_email_transport::imap;
 use envelope_email_transport::outbound::SendSurface;
 use envelope_email_transport::reply;
-use envelope_email_transport::smtp::Attachment;
+use envelope_email_transport::smtp::{Attachment, message_id_for_address};
 use lettre::message::{Mailbox, Mailboxes};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
@@ -154,7 +154,8 @@ pub(crate) fn sent_copy_convenience_objects(
 /// explicit (preserved) Message-ID.
 ///
 /// Passing `message_id = Some(bare_id)` preserves a stable Message-ID across
-/// draft modify/send cycles; passing `None` lets mail-builder generate one.
+/// draft modify/send cycles; passing `None` generates one on the sender's
+/// domain.
 /// Returns `(rfc822_bytes, message_id_header_value)` where the returned value
 /// includes angle brackets as written to the message.
 #[allow(clippy::too_many_arguments)]
@@ -171,9 +172,8 @@ pub(crate) fn build_rfc822_full(
     message_id: Option<&str>,
     attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
-    let mut builder = MessageBuilder::new()
-        .from(builder_from_address(from)?)
-        .subject(subject);
+    let (from_address, from_email) = builder_from_address(from)?;
+    let mut builder = MessageBuilder::new().from(from_address).subject(subject);
     if !to.trim().is_empty() {
         builder = builder.to(builder_address_list(to, "to")?);
     }
@@ -197,11 +197,11 @@ pub(crate) fn build_rfc822_full(
         let bare: Vec<String> = references.iter().map(|r| strip_brackets(r)).collect();
         builder = builder.references(bare);
     }
-    if let Some(mid) = message_id {
-        if !mid.trim().is_empty() {
-            builder = builder.message_id(strip_brackets(mid));
-        }
-    }
+    let message_id = match message_id.map(strip_brackets) {
+        Some(mid) if !mid.trim().is_empty() => mid,
+        _ => message_id_for_address(&from_email),
+    };
+    builder = builder.message_id(message_id);
 
     builder = match (text, html) {
         (Some(t), Some(h)) => builder.text_body(t).html_body(h),
@@ -248,9 +248,11 @@ fn build_rfc822_draft(
     in_reply_to: Option<&str>,
     attachments: &[Attachment],
 ) -> Result<(Vec<u8>, String)> {
+    let (from_address, from_email) = builder_from_address(from)?;
     let mut builder = MessageBuilder::new()
-        .from(builder_from_address(from)?)
-        .subject(subject.unwrap_or(""));
+        .from(from_address)
+        .subject(subject.unwrap_or(""))
+        .message_id(message_id_for_address(&from_email));
 
     if !to.trim().is_empty() {
         builder = builder.to(builder_address_list(to, "to")?);
@@ -316,7 +318,9 @@ fn build_rfc822_draft(
 /// it safely; passing the preformatted string to `MessageBuilder::from` treats the
 /// whole thing as a bare address and double-wraps it into `<Display Name <addr>>`
 /// (issue #81).
-fn builder_from_address(from: &str) -> Result<BuilderAddress<'static>> {
+/// The sender as a mail-builder address, plus its bare email for the
+/// Message-ID domain.
+fn builder_from_address(from: &str) -> Result<(BuilderAddress<'static>, String)> {
     let mailboxes = from
         .parse::<Mailboxes>()
         .with_context(|| "invalid from address")?;
@@ -324,9 +328,10 @@ fn builder_from_address(from: &str) -> Result<BuilderAddress<'static>> {
         .iter()
         .next()
         .with_context(|| "from address is empty")?;
-    Ok(BuilderAddress::new_address(
-        mailbox.name.clone(),
-        mailbox.email.to_string(),
+    let email = mailbox.email.to_string();
+    Ok((
+        BuilderAddress::new_address(mailbox.name.clone(), email.clone()),
+        email,
     ))
 }
 
@@ -2985,6 +2990,42 @@ mod tests {
         assert_eq!(value["lookup_status"], "not_found");
         assert_eq!(value["lookup_error"], "not indexed yet");
         assert!(value["ui"]["cockpit_url"].as_str().is_some());
+    }
+
+    #[test]
+    fn generated_draft_message_ids_use_the_sender_domain_not_the_hostname() {
+        let (_, simple) = build_rfc822_draft(
+            "Sam <sam@riverastudio.test>",
+            "marta@crumbandco.test",
+            Some("Logo refresh"),
+            Some("hello"),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (_, full) = build_rfc822_full(
+            "Sam <sam@riverastudio.test>",
+            "marta@crumbandco.test",
+            "Logo refresh",
+            Some("hello"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
+
+        for id in [simple, full] {
+            assert!(
+                id.starts_with('<') && id.ends_with("@riverastudio.test>"),
+                "{id}"
+            );
+        }
     }
 
     #[test]

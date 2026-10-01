@@ -144,9 +144,14 @@ impl SmtpSender {
 /// sentinel domain. Callers pass the bare id to [`build_message`], which wraps
 /// it in angle brackets when serializing the header.
 pub fn generate_message_id(account: &AccountWithCredentials) -> String {
-    let domain = account
-        .account
-        .username
+    message_id_for_address(&account.account.username)
+}
+
+/// [`generate_message_id`] for a bare address, for builders that know the
+/// sender but not the account. mail-builder and lettre otherwise fall back to
+/// this machine's hostname, which would publish it in every Message-ID.
+pub fn message_id_for_address(address: &str) -> String {
+    let domain = address
         .rsplit('@')
         .next()
         .map(str::trim)
