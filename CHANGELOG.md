@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.13] — 2026-10-01
+
+A privacy fix for drafts, and new wording for what Envelope is: all your email accounts in one inbox, shared with your agents.
+
 ### Changed
 
 - `envelope --help` and the package descriptions now say what Envelope is for both audiences: all your email accounts in one inbox, shared with your agents.
