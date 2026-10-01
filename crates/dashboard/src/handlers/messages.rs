@@ -1076,13 +1076,18 @@ pub async fn read(
                 // is reported to the reader, never shown as a clean message.
                 let threat = {
                     let db = state.db.lock().await;
-                    match crate::handlers::threat::verdict_for_open(
-                        &db,
-                        &account_id,
-                        &creds.account.username,
-                        &q.folder,
-                        uid,
-                        raw.as_deref(),
+                    match envelope_email_transport::threat::ThreatConfig::load().and_then(
+                        |config| {
+                            crate::handlers::threat::verdict_for_open(
+                                &db,
+                                &account_id,
+                                &creds.account.username,
+                                &q.folder,
+                                uid,
+                                raw.as_deref(),
+                                &config,
+                            )
+                        },
                     ) {
                         Ok(view) => json!(view),
                         Err(e) => json!({"level": "unavailable", "error": format!("{e:#}")}),

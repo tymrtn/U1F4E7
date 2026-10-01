@@ -703,6 +703,19 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     })
 }
 
+/// The canonical Message-ID of a raw message; `None` when it has none.
+pub fn raw_message_id(raw: &[u8], account_address: &str) -> Option<String> {
+    ThreatInput::from_raw(raw, account_address)
+        .ok()
+        .and_then(|i| {
+            i.headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
+                .map(|(_, v)| canonical_message_id(v).to_string())
+        })
+        .filter(|m| !m.is_empty())
+}
+
 /// Scan one message on open when it has no current verdict (and
 /// `threat.on_read` is on). Returns the verdict to show.
 ///
@@ -721,15 +734,7 @@ pub fn verdict_on_open(
     let Some(raw) = raw else {
         return latest_verdict(db, account_id, None, folder, uid);
     };
-    let message_id = ThreatInput::from_raw(raw, account_address)
-        .ok()
-        .and_then(|i| {
-            i.headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
-                .map(|(_, v)| canonical_message_id(v).to_string())
-        })
-        .filter(|m| !m.is_empty());
+    let message_id = raw_message_id(raw, account_address);
     let existing = latest_verdict(db, account_id, message_id.as_deref(), folder, uid)?;
     if !config.enabled || !config.on_read || !needs_scan(existing.as_ref()) {
         return Ok(existing);
