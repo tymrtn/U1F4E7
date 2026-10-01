@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.13] — 2026-10-01
+
+Two fixes, one for draft privacy and one for the threat banner, plus new wording for what Envelope is: all your email accounts in one inbox, shared with your agents.
+
 ### Changed
 
 - `envelope --help` and the package descriptions now say what Envelope is for both audiences: all your email accounts in one inbox, shared with your agents.
@@ -14,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Drafts no longer carry this machine's hostname in their Message-ID. `draft create` and the other draft builders let the mail library fall back to the hostname (on a tailnet, the full `*.ts.net` name), so every saved draft published it in its headers on the provider. Draft Message-IDs now use the sender's domain, as sends already did. Sent mail was not affected.
+- **Dashboard (reader):** the threat banner now says a message's attachments are blocked whenever they are. The reader looked up the message's threat tags by the UID it was scanned under, so a message that came back with a new UID (moved back to the inbox, or delivered again) showed its danger score without the malware warning, while the attachment itself was still blocked. The tags are now looked up by the message's own Message-ID.
 
 ## [1.3.12] — 2026-09-29
 

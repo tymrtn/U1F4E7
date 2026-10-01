@@ -90,12 +90,19 @@ pub fn verdict_for_open(
     folder: &str,
     uid: u32,
     raw: Option<&[u8]>,
+    config: &ThreatConfig,
 ) -> anyhow::Result<Option<Value>> {
-    let config = ThreatConfig::load()?;
     let verdict =
-        persist::verdict_on_open(db, account_id, account_address, folder, uid, raw, &config)?;
-    let message_id =
-        persist::stored_verdict_for_uid(db, account_id, folder, uid)?.and_then(|s| s.message_id);
+        persist::verdict_on_open(db, account_id, account_address, folder, uid, raw, config)?;
+    // Tags are keyed by Message-ID, so take it from the message itself: a
+    // message moved back or delivered again has a new UID, and the stored
+    // verdict's UID no longer matches.
+    let message_id = match raw.and_then(|r| persist::raw_message_id(r, account_address)) {
+        Some(mid) => Some(mid),
+        None => {
+            persist::stored_verdict_for_uid(db, account_id, folder, uid)?.and_then(|s| s.message_id)
+        }
+    };
     Ok(verdict.map(|v| verdict_view(db, account_id, message_id.as_deref(), &v)))
 }
 
@@ -441,6 +448,44 @@ mod tests {
             size: 0,
             provider_spam: None,
         }
+    }
+
+    #[test]
+    fn open_shows_the_malware_tag_when_the_message_has_a_new_uid() {
+        // Scanned at UID 571; moved back, or delivered again, as UID 580.
+        let db = Database::open_memory().unwrap();
+        let verdict = combine(
+            vec![Signal::new("double_extension", 70, "ext=.pdf.exe").malware()],
+            vec!["attachments".into()],
+            vec![],
+            false,
+        );
+        persist::record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: "a",
+                folder: "INBOX",
+                uid: 571,
+                message_id: Some("phish@x"),
+            },
+            &verdict,
+        )
+        .unwrap();
+        let raw = b"Message-ID: <phish@x>\r\nFrom: bob@example.test\r\nTo: me@example.org\r\nSubject: s\r\n\r\nbody\r\n";
+
+        let view = verdict_for_open(
+            &db,
+            "a",
+            "me@example.org",
+            "INBOX",
+            580,
+            Some(raw),
+            &ThreatConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(view["malware"], true, "{view}");
     }
 
     #[test]
