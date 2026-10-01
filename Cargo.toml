@@ -16,7 +16,7 @@ edition = "2024"
 license = "FSL-1.1-ALv2"
 authors = ["Tyler Martin"]
 repository = "https://github.com/tymrtn/envelope-email"
-description = "BYO mailbox email client with agent-native primitives"
+description = "BYO-mailbox email client: all your accounts in one inbox, shared with your agents"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Envelope — BYO email for agents</title>
-  <meta name="description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
+  <title>Envelope — one inbox for you and your agents</title>
+  <meta name="description" content="All your email accounts in one inbox on your own machine, shared with your agents over CLI, JSON and MCP. Works with the IMAP accounts you already have.">
   <link rel="canonical" href="https://u1f4e7.com/">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
   <meta name="theme-color" content="#0b1020">
@@ -12,13 +12,13 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Envelope">
   <meta property="og:url" content="https://u1f4e7.com/">
-  <meta property="og:title" content="Envelope — BYO email for agents">
-  <meta property="og:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
+  <meta property="og:title" content="Envelope — one inbox for you and your agents">
+  <meta property="og:description" content="All your email accounts in one inbox on your own machine, shared with your agents over CLI, JSON and MCP. Works with the IMAP accounts you already have.">
   <meta property="og:image" content="https://u1f4e7.com/og-card.png">
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Envelope — BYO email for agents">
-  <meta name="twitter:description" content="Add an agent to the email you already have. Envelope connects to your existing IMAP mailbox — same address, same folders, no DNS changes. OTP relay, reviewable rules, a local dashboard, CLI + JSON + MCP.">
+  <meta name="twitter:title" content="Envelope — one inbox for you and your agents">
+  <meta name="twitter:description" content="All your email accounts in one inbox on your own machine, shared with your agents over CLI, JSON and MCP. Works with the IMAP accounts you already have.">
   <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
   <link rel="stylesheet" href="styles.css">
   <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
@@ -43,10 +43,10 @@
     <section class="hero">
       <div class="wrap hero-grid">
         <div>
-          <p class="eyebrow">BYO email for agents</p>
-          <h1>Add an agent to your email. Don't change your email.</h1>
+          <p class="eyebrow">BYO email for people and agents</p>
+          <h1>One inbox for all your accounts, shared with your agents.</h1>
           <p class="lede">
-            Envelope connects to the mailbox you already use — same address, same folders, same habits. Your agent reads OTPs, handles replies, runs rules, and drafts for your approval. Nothing moves until you say so.
+            Connect the mailboxes you already have, as many as you like, and read them together in one app that runs on your own machine. Your agents use the same accounts through the CLI or MCP, and whatever they draft waits for you.
           </p>
           <div class="cta-row">
             <a class="button" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-cta" data-umami-event="github-cta">Get the repo</a>
@@ -58,23 +58,25 @@
             <div class="install-line"><code id="install-brew">brew install tymrtn/u1f4e7/envelope</code><button type="button" class="copy-button" data-copy-target="install-brew" data-umami-event="install-copy-brew">Copy</button></div>
             <p class="muted install-note">The script checks the release's SHA-256 and installs to ~/.local/bin without sudo. Homebrew builds from source, so it installs Rust first.</p>
           </div>
-          <p class="muted" style="margin-top:1rem"><a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.4?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner" data-umami-event="release-banner">Current release: Envelope 1.3.4</a>. Since <a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.0?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner-rshield" data-umami-event="release-banner-rshield">1.3.0</a>, rShield gives every incoming message a local phishing and malware score from six analyzers.</p>
+          <p class="muted" style="margin-top:1rem"><a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.12?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner" data-umami-event="release-banner">Current release: Envelope 1.3.12</a>. Since <a href="https://github.com/tymrtn/U1F4E7/releases/tag/v1.3.0?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-release-banner-rshield" data-umami-event="release-banner-rshield">1.3.0</a>, rShield gives every incoming message a local phishing and malware score from six analyzers.</p>
           <ul class="hero-points">
+            <li>Every account in one Unified Inbox</li>
+            <li>Search all your accounts at once</li>
             <li>Bring your own mailbox</li>
-            <li>Claude Code, Codex, OpenHands, Hermes</li>
-            <li>CLI + JSON + MCP</li>
-            <li>Human in the loop by default</li>
+            <li>CLI + JSON + MCP for Claude Code, Codex, OpenHands, Hermes</li>
+            <li>Agent drafts wait for your approval</li>
           </ul>
         </div>
         <aside class="callout code-panel">
-<pre><code># Add your existing mailbox — app password is typed into a hidden prompt
+<pre><code># Repeat for each account you use;
+# the app password prompt is hidden
 envelope accounts add --email you@example.com
+
+# Unified Inbox at localhost:3141
+envelope serve
 
 # Wait for an OTP, hand it to your agent
 CODE=$(envelope code --wait 60)
-
-# Watch for new mail via IMAP IDLE
-envelope watch --json
 
 # MCP server for Claude Code, Cursor, Zed
 envelope mcp --config</code></pre>
@@ -87,7 +89,12 @@ envelope mcp --config</code></pre>
       <div class="wrap">
         <p class="eyebrow">Use cases</p>
         <h2>One runtime. Several buying moments.</h2>
-        <div class="cards three-up" style="margin-top:1.5rem">
+        <div class="cards four-up" style="margin-top:1.5rem">
+          <article class="card">
+            <h3>Many accounts, one inbox</h3>
+            <p>Gmail, Fastmail, iCloud and your own domain land in one Unified Inbox, newest first. Search every account at once with Gmail-style operators, and archive or snooze across accounts in one pass. Each account keeps its own server, folders and address.</p>
+            <a href="#product">See the unified inbox →</a>
+          </article>
           <article class="card">
             <h3>Shared inbox agents</h3>
             <p>Add an agent to support@, ops@, editor@, or your personal inbox. Same mailbox, same workflows, better coverage.</p>
@@ -138,28 +145,28 @@ envelope mcp --config</code></pre>
         <div id="product" class="product-gallery">
           <p class="eyebrow">See it in action</p>
           <h2>One inbox. Every agent. Full human control.</h2>
-          <p class="lede">Read and triage mail, review agent work, inspect send decisions, act on several messages at once, and compose without leaving the local control plane.</p>
+          <p class="lede">Read and triage mail from every account, review agent work, act on several messages at once, and write from whichever address fits, all in one app on your own machine.</p>
 
           <div class="screenshot-grid">
             <figure class="product-shot product-shot-wide">
               <a href="assets/screenshots/inbox-reader.webp">
-                <img src="assets/screenshots/inbox-reader.webp" width="1440" height="900" alt="Envelope unified inbox with message list, thread reader, and attachment details">
+                <img src="assets/screenshots/inbox-reader.webp" width="1440" height="900" alt="Envelope unified inbox with four accounts, a color-coded message list, and an invoice open in the reader">
               </a>
-              <figcaption><strong>Unified inbox + reader.</strong> Multiple mailboxes, one view, with thread context and attachments.</figcaption>
+              <figcaption><strong>Unified inbox + reader.</strong> Every account in one list, each row tagged with the address it came to, and the message open beside it.</figcaption>
             </figure>
 
             <figure class="product-shot">
               <a href="assets/screenshots/compose-drawer.webp">
-                <img src="assets/screenshots/compose-drawer.webp" width="1440" height="900" alt="Envelope compose drawer over the unified inbox">
+                <img src="assets/screenshots/compose-drawer.webp" width="1440" height="900" alt="Envelope compose drawer sending from the Studio inbox address, over the unified inbox">
               </a>
-              <figcaption><strong>Compose in context.</strong> A focused draft window without surrendering the inbox.</figcaption>
+              <figcaption><strong>Write from any account.</strong> Pick the From address for each message while the inbox stays in view.</figcaption>
             </figure>
 
             <figure class="product-shot product-shot-wide">
               <a href="assets/screenshots/bulk-actions.webp">
-                <img src="assets/screenshots/bulk-actions.webp" width="1440" height="900" alt="Envelope unified inbox with several messages selected and the bulk actions toolbar visible">
+                <img src="assets/screenshots/bulk-actions.webp" width="1440" height="900" alt="Envelope unified inbox with messages from four different accounts selected and the bulk actions toolbar visible">
               </a>
-              <figcaption><strong>Fast bulk triage.</strong> Archive, move, mark, star, or delete several messages at once.</figcaption>
+              <figcaption><strong>Bulk triage across accounts.</strong> Select messages from different accounts, then archive, snooze, flag, or move them in one pass.</figcaption>
             </figure>
           </div>
         </div>
@@ -302,7 +309,7 @@ envelope mcp --config</code></pre>
 
   <footer class="site-footer">
     <div class="wrap footer-row">
-      <p>Envelope — BYO email for agents.</p>
+      <p>Envelope — one inbox for you and your agents.</p>
       <div class="footer-links">
         <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=launch&amp;utm_content=home-footer" data-umami-event="github-footer">GitHub</a>
         <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing" data-umami-event="license-licensing-footer">Licensing</a>

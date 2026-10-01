@@ -10,7 +10,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 #[command(
     name = "envelope",
     version,
-    about = "Email mastery for agents. BYO mailbox — give it an email and password, it does the rest.",
+    about = "All your email accounts in one inbox, shared with your agents. BYO mailbox: give it an address and an app password, and it does the rest.",
     after_help = r#"GETTING STARTED
   Add an account (auto-discovers IMAP/SMTP from the domain):
     envelope accounts add --email you@gmail.com

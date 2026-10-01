@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">📧 Envelope</h1>
   <p align="center"><code>U+1F4E7</code> — if you know, you know.</p>
-  <p align="center"><strong>Email mastery for agents. Add your credentials, and go.</strong></p>
+  <p align="center"><strong>One inbox for all your email accounts, shared with your agents.</strong></p>
 </p>
 
 > **Why U1F4E7?** It's the Unicode codepoint for 📧. Humans see a repo name. Agents see an envelope.
@@ -21,19 +21,21 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-1.3.2-green.svg" alt="v1.3.2">
+  <img src="https://img.shields.io/badge/version-1.3.12-green.svg" alt="v1.3.12">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
 ---
 
-Your agent needs to manage email. You shouldn't need to configure DNS records, set up a new domain, or pay per-message fees to make that happen.
+Envelope connects to the email accounts you already have (Gmail, Fastmail, iCloud, your own domain, any IMAP server) and puts them in one place. Open the Unified Inbox in your browser to read every account together, search them all at once, and archive or snooze across accounts in one pass. Your agents work the same mailboxes from the CLI, with JSON output, or over MCP, and anything they draft waits for your approval.
 
-**Envelope: add your email address and password. That's it. Your agent reads, sends, replies, snoozes, tags, and filters email — from your existing mailbox.**
+You don't change DNS, set up a new domain, or pay per-message fees. Add each address with its app password and go.
 
 ```bash
 envelope accounts add --email you@gmail.com
-envelope inbox --json
+envelope accounts add --email you@work.example
+envelope serve                                     # every account in one inbox at http://localhost:3141
+envelope inbox --account you@work.example --json   # the same mail, for your agent
 ```
 
 ## Install
@@ -416,11 +418,13 @@ Two optional analyzers are off until you enable them:
 - Left mailbox sidebar with Unified Inbox, Today/Needs Attention, Snoozed,
   Sent, Drafts, All Mail, and account mailboxes
 - Middle message list with a permanent right-side reader
-- Agent Cockpit attention strip with expandable operator details
+- Review page for agent drafts waiting on your approval, and a Logs page with
+  each agent's history
 - Reply / Reply-all with automatic header threading
 - Compose with text/html toggle and file attachments
 - ★ Snoozed virtual folder with overdue highlighting
-- IMAP search
+- Search across every account with Gmail-style operators (`from:`, `subject:`,
+  `is:unread`, `before:`)
 
 ## Travel
 
