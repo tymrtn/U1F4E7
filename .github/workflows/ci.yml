@@ -33,8 +33,8 @@ jobs:
       - name: Check orphaned modules
         run: ./ci/check-orphans.sh
 
-      - name: Check Cursor plugin packaging
-        run: ./ci/check-cursor-plugin.sh
+      - name: Agent plugin packaging checklist
+        run: ./ci/check-agent-plugins.sh
 
       - name: Clippy (errors only)
         # Warnings are still reported but do not fail the build for v0.3.0.

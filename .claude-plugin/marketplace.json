@@ -1,0 +1,12 @@
+{
+  "name": "envelope",
+  "description": "Envelope: all your email accounts in one inbox, shared with your agents.",
+  "owner": { "name": "Tyler Martin", "url": "https://u1f4e7.com" },
+  "plugins": [
+    {
+      "name": "envelope",
+      "source": "./",
+      "description": "All your email accounts in one inbox, shared with your agents."
+    }
+  ]
+}

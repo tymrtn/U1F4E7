@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "envelope": {
+      "command": "envelope",
+      "args": ["mcp"],
+      "env_vars": ["ENVELOPE_AGENT_TOKEN"]
+    }
+  }
+}

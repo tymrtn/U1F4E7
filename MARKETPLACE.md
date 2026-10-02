@@ -12,11 +12,11 @@ Product site (homepage): [https://u1f4e7.com](https://u1f4e7.com).
 
 **Category:** Inbox and Collaboration
 
-**One-liner:** Add an agent to your email. Don't change your email.
+**One-liner:** All your email accounts in one inbox, shared with your agents.
 
 **Bullets:**
 
-- Bring your own mailbox: same address, same folders, same habits — Gmail, Fastmail, iCloud, Migadu, or any IMAP you already use. Not a newly provisioned agent inbox.
+- Bring your own mailboxes: Gmail, Fastmail, iCloud, your own domain, or any IMAP, all in one inbox on your machine. Nothing migrates and no new inbox is created.
 - Agent reads OTPs, handles replies, runs rules, and drafts for approval. Works with Claude Code, Codex, OpenHands, and Hermes.
 - CLI + JSON + local stdio MCP (`envelope mcp`). Human in the loop by default; send modes are contextual policy, not a send block.
 - Requires the `envelope` CLI on `PATH` and an `ENVELOPE_AGENT_TOKEN` from `envelope agent create`.

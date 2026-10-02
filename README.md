@@ -12,7 +12,7 @@
   <a href="#cli-reference">CLI</a> •
   <a href="#rules-engine">Rules</a> •
   <a href="#mcp-server">MCP</a> •
-  <a href="#cursor-marketplace-plugin">Cursor plugin</a> •
+  <a href="#use-envelope-from-your-agent">Agent plugins</a> •
   <a href="#why-not-himalaya--cloudflare--resend">vs. Alternatives</a> •
   <a href="#dashboard">Dashboard</a> •
   <a href="#commercial-licensing">Commercial licensing</a> •
@@ -324,47 +324,75 @@ For a single, distribution-ready operating guide to hand a fresh agent, see [the
 
 For a walkthrough of running multiple agents from one shared inbox with scoped policies, see [Agents at a glance](docs/agent-fleet-shared-inbox.md).
 
-## Cursor Marketplace plugin
+## Use Envelope from your agent
 
-This repo ships a Cursor Plugin that wraps the local stdio MCP server and a
-focused agent skill. The listing pitch is **add an agent to your email —
-don't change your email**: Envelope uses the mailbox you already have, not a
-newly provisioned agent inbox. Copy lives in [MARKETPLACE.md](MARKETPLACE.md)
-(category: **Inbox and Collaboration**). Homepage: [https://u1f4e7.com](https://u1f4e7.com).
+Envelope ships as a plugin for Claude Code, Codex and Cursor, and as skills on
+skills.sh. Each install adds two skills: `envelope` for working mail, and
+`envelope-setup` for first-run setup. It also adds the local MCP server
+(`envelope mcp`).
 
-**Prerequisite:** the `envelope` binary must be on `PATH` before Cursor starts
-the MCP server:
+**Prerequisite:** the `envelope` binary on `PATH`. The `envelope-setup` skill
+walks through this if it's missing.
 
 ```bash
 curl -fsSL https://u1f4e7.com/install.sh | bash
 # or
 brew install tymrtn/u1f4e7/envelope
-which envelope
 ```
 
 `tymrtn/u1f4e7/u1f4e7` is a live Homebrew compat alias for the same formula.
 
-MCP startup requires an agent token. Create one, then paste it into the plugin
-variable `ENVELOPE_AGENT_TOKEN` (Customize → Plugins → Configure). Never commit
-the token.
+Then add your accounts and create a token for the agent. Run both in your own
+terminal, so your password and token never pass through the agent:
 
 ```bash
 envelope accounts add --email you@example.com
-envelope agent create cursor
+envelope agent create claude-code
 ```
 
-The plugin layout:
+Agent names are unique, and the free tier allows two active agents
+(`envelope agent list` shows them). Use one name per tool, or reuse one
+agent's token in several tools.
+
+**Claude Code** (it asks for the token while installing):
+
+```
+/plugin marketplace add tymrtn/U1F4E7
+/plugin install envelope@envelope
+```
+
+**Codex** (it forwards `ENVELOPE_AGENT_TOKEN` from your shell environment):
+
+```bash
+codex plugin marketplace add tymrtn/U1F4E7
+codex plugin add envelope@envelope
+```
+
+Then, in an editor, add the token to the shell profile that starts Codex (for
+example `~/.zshrc`). Typing it at the prompt would leave it in shell history.
+
+```sh
+export ENVELOPE_AGENT_TOKEN=<token>
+```
+
+**Cursor Marketplace plugin:** install Envelope from the marketplace, then set
+`ENVELOPE_AGENT_TOKEN` under Plugins → Configure. Listing copy is
+in [MARKETPLACE.md](MARKETPLACE.md).
+
+**Skills only** (any agent that skills.sh supports):
+
+```bash
+npx skills add https://github.com/tymrtn/U1F4E7/tree/main/skills
+```
 
 | Path | Role |
 |---|---|
-| `.cursor-plugin/plugin.json` | Manifest (`name`: `envelope`) |
-| `mcp.json` | stdio server: `envelope` `["mcp"]` |
-| `skills/envelope/SKILL.md` | When to use, MCP tools, quickstart |
-| `assets/logo.svg` | Marketplace logo |
+| `skills/envelope/`, `skills/envelope-setup/` | Skills shared by every tool |
+| `.claude-plugin/` | Claude Code manifest and marketplace |
+| `.codex-plugin/`, `.agents/plugins/marketplace.json` | Codex manifest, MCP config and marketplace |
+| `.cursor-plugin/plugin.json`, `mcp.json` | Cursor manifest and MCP config |
 
-After the plugin is on `main`, a human submits the public repo URL at
-[cursor.com/marketplace/publish](https://cursor.com/marketplace/publish).
-Publishing is not automatic.
+Plugin versions follow Envelope releases; `ci/check-agent-plugins.sh` enforces it.
 
 ## Rules engine
 

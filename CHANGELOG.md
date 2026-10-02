@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Plugins for Claude Code and Codex, and refreshed packaging for Cursor, all from this repo. Each installs the Envelope skill, a new `envelope-setup` skill that walks an agent through first-run setup, and the local MCP server. Claude Code asks for the agent token at install and stores it securely. Codex forwards `ENVELOPE_AGENT_TOKEN` from your environment. The skills are also on skills.sh (`npx skills add https://github.com/tymrtn/U1F4E7/tree/main/skills`). Plugin versions follow Envelope releases.
+
 ## [1.3.13] — 2026-10-01
 
 Two fixes, one for draft privacy and one for the threat banner, plus new wording for what Envelope is: all your email accounts in one inbox, shared with your agents.
