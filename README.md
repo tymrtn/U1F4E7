@@ -372,7 +372,7 @@ in [MARKETPLACE.md](MARKETPLACE.md).
 **Skills only** (any agent that skills.sh supports):
 
 ```bash
-npx skills add tymrtn/U1F4E7
+npx skills add https://github.com/tymrtn/U1F4E7/tree/main/skills
 ```
 
 | Path | Role |
