@@ -187,7 +187,8 @@ if isinstance(claude, dict):
 
 claude_mkt = load_json(".claude-plugin/marketplace.json")
 if isinstance(claude_mkt, dict):
-    entries = claude_mkt.get("plugins") or []
+    listed = claude_mkt.get("plugins")
+    entries = [p for p in listed if isinstance(p, dict)] if isinstance(listed, list) else []
     if claude_mkt.get("name") != "envelope" or not claude_mkt.get("description"):
         err('.claude-plugin/marketplace.json needs name "envelope" and a description')
     if not any(p.get("name") == "envelope" and p.get("source") == "./" for p in entries):
@@ -218,11 +219,14 @@ if isinstance(codex_mcp, dict):
 
 codex_mkt = load_json(".agents/plugins/marketplace.json")
 if isinstance(codex_mkt, dict):
-    entries = codex_mkt.get("plugins") or []
+    listed = codex_mkt.get("plugins")
+    entries = [p for p in listed if isinstance(p, dict)] if isinstance(listed, list) else []
     if codex_mkt.get("name") != "envelope":
         err('.agents/plugins/marketplace.json name must be "envelope"')
     if not any(
-        p.get("name") == "envelope" and (p.get("source") or {}).get("path") == "./"
+        p.get("name") == "envelope"
+        and isinstance(p.get("source"), dict)
+        and p["source"].get("path") == "./"
         for p in entries
     ):
         err('.agents/plugins/marketplace.json must list envelope with source path "./"')
