@@ -1,0 +1,27 @@
+{
+  "name": "envelope",
+  "version": "1.3.13",
+  "description": "All your email accounts in one inbox, shared with your agents. Envelope runs locally on the mailboxes you already have; agent drafts wait for your approval.",
+  "author": { "name": "Tyler Martin" },
+  "homepage": "https://u1f4e7.com",
+  "repository": "https://github.com/tymrtn/U1F4E7",
+  "license": "FSL-1.1-ALv2",
+  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "otp", "byo", "multi-account"],
+  "skills": ["./skills/"],
+  "mcpServers": {
+    "envelope": {
+      "command": "envelope",
+      "args": ["mcp"],
+      "env": { "ENVELOPE_AGENT_TOKEN": "${user_config.agent_token}" }
+    }
+  },
+  "userConfig": {
+    "agent_token": {
+      "type": "string",
+      "title": "Envelope agent token",
+      "description": "Run `envelope agent create claude-code` in your own terminal and paste the token it prints. Stored securely; never committed.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}
