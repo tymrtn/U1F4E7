@@ -106,6 +106,25 @@ pub fn verdict_for_open(
     Ok(verdict.map(|v| verdict_view(db, account_id, message_id.as_deref(), &v)))
 }
 
+/// The stored verdict for the message at a folder/UID. Verdicts are recorded
+/// under the UID that was scanned, so a message moved back or delivered again
+/// has none under its new UID; the Message-ID the index holds for that UID
+/// still finds it.
+fn stored_verdict_at(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> anyhow::Result<Option<StoredVerdict>> {
+    if let Some(stored) = persist::stored_verdict_for_uid(db, account_id, folder, uid)? {
+        return Ok(Some(stored));
+    }
+    match db.indexed_message_id(account_id, folder, uid)? {
+        Some(message_id) => persist::stored_verdict_for_message(db, account_id, &message_id),
+        None => Ok(None),
+    }
+}
+
 /// `GET /api/accounts/{id}/messages/{uid}/threat` — the stored verdict only.
 pub async fn show(
     State(state): State<AppState>,
@@ -113,7 +132,7 @@ pub async fn show(
     Query(q): Query<FolderQuery>,
 ) -> Response {
     let db = state.db.lock().await;
-    match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
+    match stored_verdict_at(&db, &account_id, &q.folder, uid) {
         Ok(Some(stored)) => {
             Json(json!({"threat": stored_view(&db, &account_id, &stored)})).into_response()
         }
@@ -133,7 +152,7 @@ pub async fn mark_safe(
     Query(q): Query<FolderQuery>,
 ) -> Response {
     let db = state.db.lock().await;
-    let stored = match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
+    let stored = match stored_verdict_at(&db, &account_id, &q.folder, uid) {
         Ok(Some(stored)) => stored,
         Ok(None) => {
             return error(
