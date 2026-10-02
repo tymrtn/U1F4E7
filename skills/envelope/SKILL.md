@@ -1,20 +1,21 @@
 ---
 name: envelope
 description: >-
-  Add an agent to the user's existing email. Don't change their email.
-  Envelope connects to the mailbox they already use — same address, same
-  folders, same habits. Use when reading OTPs, handling replies, running
-  rules, drafting for approval, or otherwise working mail in a BYO IMAP
-  inbox. Not a newly provisioned agent mailbox.
+  Work the user's own email through Envelope: all their accounts (Gmail,
+  Fastmail, iCloud, their own domain, any IMAP) in one inbox, shared with
+  agents. Use for reading OTPs, searching and reading mail across accounts,
+  replying, drafting for the user's approval, rules, tags, snoozes, and
+  watching for new mail. Envelope uses the mailboxes the user already has; it
+  does not create new inboxes. If the envelope MCP server is missing or fails
+  to start, use the envelope-setup skill first.
 ---
 
 # Envelope
 
-Add an agent to the user's email. Don't change their email.
-
-Envelope connects to the mailbox they already use — same address, same
-folders, same habits. The public command is `envelope`. The plugin MCP
-server is local stdio: `envelope mcp`.
+Envelope puts all of the user's email accounts in one inbox and shares them
+with agents. The command is `envelope`; the MCP server is local stdio:
+`envelope mcp`. Drafts you create wait for the user's approval unless the
+user has chosen a send mode that allows more.
 
 This is **bring-your-own mailbox**. The user keeps Gmail, Fastmail, iCloud,
 Migadu, or any standard IMAP/SMTP account they already have. Envelope does
