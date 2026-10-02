@@ -62,13 +62,21 @@ It prints a token once. The user pastes it into their tool's secret setting:
 - **Claude Code:** installing the plugin (`/plugin install envelope@envelope`)
   asks for it. To change it later, open `/plugin`, select envelope, and update
   its settings, or uninstall and reinstall the plugin.
-- **Codex:** add `export ENVELOPE_AGENT_TOKEN=<token>` to the shell profile
-  that starts Codex (for example `~/.zshrc`), then restart Codex. The plugin
+- **Codex:** in an editor, add `export ENVELOPE_AGENT_TOKEN=<token>` to the
+  shell profile that starts Codex (for example `~/.zshrc`), then restart Codex.
+  Typing it at the prompt would leave the token in shell history. The plugin
   forwards that variable to `envelope mcp`.
-- **Cursor:** Customize → Plugins → Envelope → Configure → `ENVELOPE_AGENT_TOKEN`.
+- **Cursor:** set `ENVELOPE_AGENT_TOKEN` in the Envelope plugin's settings
+  (Plugins → Configure).
 
-Never ask the user to paste the token into the chat. If they do, tell them to
-revoke it (`envelope agent revoke <name>`) and create a new one.
+Agent names are unique and stay taken after a revoke, and the free tier allows
+two active agents. `envelope agent list` shows them. If a name is taken, use a
+new one (for example `claude-code-2`); if the user is at the limit, they can
+revoke an agent they no longer use or reuse one agent's token in several tools.
+
+Never ask the user to paste the token into the chat. If they do, or if the
+token is lost, tell them to revoke it (`envelope agent revoke <name>`) and
+create a new agent under a new name.
 
 ## 4. Check the connection
 
@@ -79,7 +87,7 @@ tool. Read the error if it fails:
 |---|---|
 | `envelope: command not found`, or the server never starts | Step 1 |
 | `ENVELOPE_AGENT_TOKEN is required for MCP startup` | The token is not configured: step 3 |
-| `does not match any active agent identity` | The token is wrong or revoked: create a new one in step 3 |
+| `does not match any active agent identity` | The token is wrong or revoked: create a new agent under a new name in step 3 |
 | `accounts` returns an empty list | Step 2 |
 
 When `accounts` lists the user's addresses, setup is done. Continue with the

@@ -350,6 +350,10 @@ envelope accounts add --email you@example.com
 envelope agent create claude-code
 ```
 
+Agent names are unique, and the free tier allows two active agents
+(`envelope agent list` shows them). Use one name per tool, or reuse one
+agent's token in several tools.
+
 **Claude Code** (it asks for the token while installing):
 
 ```
@@ -362,11 +366,17 @@ envelope agent create claude-code
 ```bash
 codex plugin marketplace add tymrtn/U1F4E7
 codex plugin add envelope@envelope
-export ENVELOPE_AGENT_TOKEN=...   # in the profile that starts Codex
+```
+
+Then, in an editor, add the token to the shell profile that starts Codex (for
+example `~/.zshrc`). Typing it at the prompt would leave it in shell history.
+
+```sh
+export ENVELOPE_AGENT_TOKEN=<token>
 ```
 
 **Cursor Marketplace plugin:** install Envelope from the marketplace, then set
-`ENVELOPE_AGENT_TOKEN` under Customize → Plugins → Configure. Listing copy is
+`ENVELOPE_AGENT_TOKEN` under Plugins → Configure. Listing copy is
 in [MARKETPLACE.md](MARKETPLACE.md).
 
 **Skills only** (any agent that skills.sh supports):

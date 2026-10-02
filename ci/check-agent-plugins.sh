@@ -10,11 +10,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-fail() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
 python3 - "$repo_root" <<'PY'
 import json
 import re
@@ -231,7 +226,17 @@ if isinstance(codex_mkt, dict):
     ):
         err('.agents/plugins/marketplace.json must list envelope with source path "./"')
 
-for rel in (".claude-plugin/plugin.json", ".codex-plugin/mcp.json", "mcp.json"):
+token_scan = [
+    ".claude-plugin/plugin.json",
+    ".claude-plugin/marketplace.json",
+    ".codex-plugin/plugin.json",
+    ".codex-plugin/mcp.json",
+    ".agents/plugins/marketplace.json",
+    ".cursor-plugin/plugin.json",
+    "mcp.json",
+    "MARKETPLACE.md",
+] + [str(p.relative_to(root)) for p in sorted((root / "skills").glob("*/SKILL.md"))]
+for rel in token_scan:
     path = root / rel
     if path.is_file() and re.search(r"envtok_[A-Za-z0-9]", path.read_text()):
         err(f"{rel} must not contain an agent token")

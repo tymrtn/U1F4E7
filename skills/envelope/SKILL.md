@@ -37,30 +37,10 @@ not provision a new mailbox (Robotomail / Cloudflare Agentic Inbox style).
 
 ## Prerequisites
 
-The MCP server runs the `envelope` binary from `PATH`. Install it first
-(site order):
-
-```bash
-curl -fsSL https://u1f4e7.com/install.sh | bash
-```
-
-```bash
-brew install tymrtn/u1f4e7/envelope
-```
-
-The curl script checks the release's SHA-256 and installs to `~/.local/bin`
-without sudo. Homebrew builds from source. From source: build
-`target/release/envelope` and put it on `PATH`. Then add a mailbox and
-create an agent token (printed once):
-
-```bash
-envelope accounts add --email you@example.com
-envelope agent create cursor
-```
-
-Paste the token into the plugin variable `ENVELOPE_AGENT_TOKEN` in Cursor
-(Customize → Plugins → Configure). Do not put tokens, passwords, or app
-passwords in this skill, the plugin files, or chat logs.
+The MCP server runs the `envelope` binary from `PATH` and needs an agent
+token. If either is missing, or the server fails to start, follow the
+envelope-setup skill. Never put tokens, passwords, or app passwords in this
+skill, the plugin files, or chat logs.
 
 `envelope paths --json` shows which HOME/database the binary will use. Agent
 harness HOME drift is the usual "no accounts" failure.
