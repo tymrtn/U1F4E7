@@ -2996,6 +2996,60 @@ mod tests {
     }
 
     #[test]
+    fn tag_tool_gives_a_reused_uid_none_of_the_old_message_s_threat_tags() {
+        use crate::commands::tag::tests::{ACCT, OTHER, marked_original_and_twin};
+        let db = Database::open_memory().unwrap();
+        let twin = marked_original_and_twin(&db);
+        // UID 1 now holds another message; the verdict there is the marked
+        // original's.
+        let threat_tags = |message_id: &str, raw: Option<&[u8]>| -> Vec<String> {
+            let result = tag_message(
+                &db,
+                None,
+                ACCT,
+                "INBOX",
+                1,
+                Some(message_id),
+                raw,
+                &json!({}),
+            )
+            .unwrap();
+            let tags = result["tags"].as_array().unwrap().iter();
+            let names = tags.map(|t| t["tag"].as_str().unwrap().to_string());
+            names.filter(|t| t.starts_with("threat:")).collect()
+        };
+        assert_eq!(threat_tags("twin@x", Some(&twin)), Vec::<String>::new());
+        assert_eq!(threat_tags("other@x", Some(OTHER)), Vec::<String>::new());
+        assert_eq!(threat_tags("other@x", None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tag_tool_never_writes_or_reads_under_a_message_id_shaped_like_a_fingerprint_key() {
+        use crate::commands::tag::tests::{ACCT, fingerprint_key_with_a_tag};
+        let db = Database::open_memory().unwrap();
+        let key = fingerprint_key_with_a_tag(&db);
+        let result = tag_message(
+            &db,
+            None,
+            ACCT,
+            "INBOX",
+            5,
+            Some(&key),
+            None,
+            &json!({"tags": ["urgent"], "scores": {"priority": 1.0}}),
+        );
+        assert!(result.is_err(), "{result:?}");
+        let tags: Vec<String> = db
+            .get_tags(ACCT, &key)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.tag)
+            .collect();
+        assert_eq!(tags, ["vip"]);
+        assert!(db.get_scores(ACCT, &key).unwrap().is_empty());
+    }
+
+    #[test]
     fn identity_policy_uses_draft_owner_not_caller_account_or_default() {
         use envelope_email_transport::{AgentPolicy as TransportPolicy, SendMode};
 

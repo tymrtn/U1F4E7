@@ -55,26 +55,15 @@ pub async fn run_set(
         .context("failed to fetch message")?
         .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
 
-    let message_id = tag_key(msg.message_id.as_deref(), folder, uid)?;
-
-    // Apply tags
-    for tag in tags {
-        db.add_tag(account_id, message_id, tag, Some(uid as i64), Some(folder))
-            .with_context(|| format!("failed to add tag '{tag}'"))?;
-    }
-
-    // Apply scores
-    for (dim, val) in &parsed_scores {
-        db.set_score(
-            account_id,
-            message_id,
-            dim,
-            *val,
-            Some(uid as i64),
-            Some(folder),
-        )
-        .with_context(|| format!("failed to set score '{dim}'"))?;
-    }
+    let message_id = set_tags(
+        &db,
+        account_id,
+        folder,
+        uid,
+        msg.message_id.as_deref(),
+        tags,
+        &parsed_scores,
+    )?;
 
     if json {
         println!(
@@ -173,6 +162,36 @@ pub async fn run_show(
     }
 
     Ok(())
+}
+
+/// Apply `tags` and `scores` to the message at folder/UID under its tag key,
+/// and return the key.
+fn set_tags<'a>(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: Option<&'a str>,
+    tags: &[String],
+    scores: &[(String, f64)],
+) -> Result<&'a str> {
+    let message_id = tag_key(message_id, folder, uid)?;
+    for tag in tags {
+        db.add_tag(account_id, message_id, tag, Some(uid as i64), Some(folder))
+            .with_context(|| format!("failed to add tag '{tag}'"))?;
+    }
+    for (dim, val) in scores {
+        db.set_score(
+            account_id,
+            message_id,
+            dim,
+            *val,
+            Some(uid as i64),
+            Some(folder),
+        )
+        .with_context(|| format!("failed to set score '{dim}'"))?;
+    }
+    Ok(message_id)
 }
 
 /// The key `tag set` and `tag show` use: the message's Message-ID, when tags
@@ -359,6 +378,69 @@ pub(crate) mod tests {
         assert!(!names(2, Some(&twin)).contains(&false_positive));
         assert!(!names(2, None).contains(&false_positive));
         assert!(names(1, None).contains(&false_positive));
+    }
+
+    /// Another message, which a reused UID 1 may now hold.
+    pub(crate) const OTHER: &[u8] = b"From: Bob <bob@example.test>\r\nTo: me@example.org\r\n\
+Subject: Hi\r\nMessage-ID: <other@x>\r\n\r\nYo\r\n";
+
+    #[test]
+    fn tag_show_gives_a_reused_uid_none_of_the_old_message_s_threat_tags() {
+        let db = Database::open_memory().unwrap();
+        let twin = marked_original_and_twin(&db);
+        // UID 1 now holds another message; the verdict there is the marked
+        // original's.
+        let threat_tags = |message_id: &str, raw: Option<&[u8]>| -> Vec<String> {
+            let (_, tags, _) = shown(&db, ACCT, "INBOX", 1, Some(message_id), raw).unwrap();
+            let names = tags.into_iter().map(|t| t.tag);
+            names.filter(|t| t.starts_with("threat:")).collect()
+        };
+        assert_eq!(threat_tags("twin@x", Some(&twin)), Vec::<String>::new());
+        assert_eq!(threat_tags("other@x", Some(OTHER)), Vec::<String>::new());
+        assert_eq!(threat_tags("other@x", None), Vec::<String>::new());
+    }
+
+    /// The `fp:` key some content's verdict would be stored under, with a
+    /// tag on it. Returns the key.
+    pub(crate) fn fingerprint_key_with_a_tag(db: &Database) -> String {
+        let raw = b"From: a@example.test\r\nTo: me@example.org\r\nSubject: s\r\n\
+                    Message-ID: <a@x>\r\n\r\nhi\r\n";
+        let fingerprint = envelope_email_transport::threat::content_fingerprint(raw).unwrap();
+        let key = format!("fp:{fingerprint}");
+        db.add_tag(ACCT, &key, "vip", Some(1), Some("INBOX"))
+            .unwrap();
+        key
+    }
+
+    fn tag_names(db: &Database, key: &str) -> Vec<String> {
+        let tags = db.get_tags(ACCT, key).unwrap();
+        tags.into_iter().map(|t| t.tag).collect()
+    }
+
+    #[test]
+    fn tag_set_never_writes_under_a_message_id_shaped_like_a_fingerprint_key() {
+        let db = Database::open_memory().unwrap();
+        let key = fingerprint_key_with_a_tag(&db);
+        let set = set_tags(
+            &db,
+            ACCT,
+            "INBOX",
+            5,
+            Some(&key),
+            &["urgent".to_string()],
+            &[("priority".to_string(), 1.0)],
+        );
+        assert!(set.is_err(), "{set:?}");
+        assert_eq!(tag_names(&db, &key), ["vip"]);
+        assert!(db.get_scores(ACCT, &key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tag_show_never_reads_under_a_message_id_shaped_like_a_fingerprint_key() {
+        let db = Database::open_memory().unwrap();
+        let key = fingerprint_key_with_a_tag(&db);
+        let shown = shown(&db, ACCT, "INBOX", 5, Some(&key), None);
+        assert!(shown.is_err(), "{:?}", shown.map(|(_, tags, _)| tags));
     }
 
     #[test]
