@@ -1080,7 +1080,8 @@ enum AgentPolicyCmd {
         /// Allowed folders: '*' or comma-separated names
         #[arg(long)]
         allow_folders: Option<String>,
-        /// Allowed actions: '*' or comma-separated action names
+        /// Allowed actions: '*', comma-separated action names, or '*' plus
+        /// actions '*' does not include (e.g. '*,watch.webhook')
         #[arg(long)]
         allow_actions: Option<String>,
         /// Send-mode ceiling: draft-only|confirm-send|allowlisted-send|autonomous-send

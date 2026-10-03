@@ -115,12 +115,11 @@ fn build_agents_json(db: &Database) -> StoreResult<Value> {
 /// unrestricted (`"*"`) or a specific allowlist. Never emits the raw JSON
 /// allowlist arrays to keep the card compact and non-leaky.
 fn policy_summary(policy: &AgentPolicy) -> Value {
+    // An action list may be `["*", ...]`: `*` plus actions it does not include.
     let scope = |value: &str| -> &'static str {
-        if value.trim() == "*" {
-            "all"
-        } else {
-            "restricted"
-        }
+        let starred = value.trim() == "*"
+            || serde_json::from_str::<Vec<String>>(value).is_ok_and(|v| v.iter().any(|e| e == "*"));
+        if starred { "all" } else { "restricted" }
     };
     json!({
         "send_mode_ceiling": policy.send_mode_ceiling.as_str(),
@@ -161,6 +160,16 @@ mod tests {
 
     fn seed_account(db: &Database) {
         db.conn().execute("INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port, imap_host, imap_port, encrypted_password) VALUES ('acc1', 'Test', 'op@example.com', 'example.com', 'smtp.example.com', 587, 'imap.example.com', 993, 'x')", []).unwrap();
+    }
+
+    #[test]
+    fn a_star_list_with_named_grants_is_all() {
+        let mut policy = AgentPolicy::default_for("a1");
+        policy.allowed_actions = r#"["*","watch.webhook"]"#.to_string();
+        policy.allowed_folders = r#"["INBOX"]"#.to_string();
+        let summary = policy_summary(&policy);
+        assert_eq!(summary["actions"], "all");
+        assert_eq!(summary["folders"], "restricted");
     }
 
     #[test]

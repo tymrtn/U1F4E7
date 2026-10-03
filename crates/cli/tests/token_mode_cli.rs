@@ -677,6 +677,97 @@ fn watch_webhook_and_unsubscribe_run_with_their_grants() {
 }
 
 #[test]
+fn star_can_add_the_named_grants() {
+    let (f, token) = fixture();
+    let home = f.home();
+
+    let mixed = run(
+        home,
+        &[
+            "agent",
+            "policy",
+            "set",
+            "skippy",
+            "--allow-actions",
+            "*,inbox.read",
+        ],
+    );
+    assert!(
+        !mixed.status.success(),
+        "`*` with an ordinary action is refused"
+    );
+    let reason = String::from_utf8_lossy(&mixed.stderr);
+    for action in [
+        "rules.write",
+        "rules.webhook",
+        "rules.batch_ack",
+        "sieve.publish",
+        "watch.webhook",
+        "unsubscribe",
+    ] {
+        assert!(
+            reason.contains(action),
+            "the refusal names {action}: {reason}"
+        );
+    }
+
+    set_actions(home, "skippy", "*,watch.webhook");
+    let shown = stdout_json(&run(home, &["--json", "agent", "policy", "show", "skippy"]));
+    assert_eq!(
+        shown["allowed_actions"],
+        serde_json::json!(["*", "watch.webhook"]),
+        "{shown}"
+    );
+
+    // `*` still grants the ordinary actions, and the named one is granted too.
+    for args in [
+        vec![
+            "--json",
+            "draft",
+            "create",
+            "--to",
+            "a@b.test",
+            "--account",
+            f.account,
+        ],
+        vec![
+            "--json",
+            "watch",
+            "--account",
+            f.account,
+            "--webhook",
+            "https://example.invalid/hook",
+        ],
+    ] {
+        let (out, _) = run_as(home, &token, &args);
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !output.contains("agent_policy_denied_action"),
+            "{args:?}: {output}"
+        );
+    }
+
+    // Named actions left off the list stay off.
+    let rule = [
+        "--json",
+        "rule",
+        "create",
+        "--name",
+        "everything",
+        "--match-from",
+        "*",
+        "--action",
+        "delete",
+    ];
+    let (out, timed_out) = run_as(home, &token, &rule);
+    assert_refused(&out, timed_out, "agent_policy_denied_action", &rule);
+}
+
+#[test]
 fn read_only_commands_run_with_a_token() {
     let (f, token) = fixture();
     let home = f.home();

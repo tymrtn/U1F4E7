@@ -39,7 +39,7 @@
       ],
       "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. `send` and `draft send` can also return the send-policy codes (outbound_safety.send_authority.denial_codes).",
       "env": "ENVELOPE_AGENT_TOKEN",
-      "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them.",
+      "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them. \"*\" can be listed with them, stored as [\"*\", \"watch.webhook\"]: `envelope agent policy set <name> --allow-actions '*,watch.webhook'`. \"*\" listed with any other action is refused.",
       "explicit_grant_actions": [
         "rules.write",
         "rules.webhook",
@@ -229,7 +229,7 @@
     },
     "policy_enforcement": {
       "attribution": "Mutating tool calls (send/reply/send_draft, move_message, flag, tag) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision).",
-      "authorize": "Every identity-bound MCP tool call is authorized before dispatch against an authoritative resolved account, never a caller-provided account spelling. Draft resources resolve account ownership from the persisted draft id and reject a mismatched optional account. Aggregate diagnostics (accounts, watch_status, and account-omitted snooze listing) fail closed for identity-bound sessions rather than authorizing a default account then reading other accounts. The folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, a single \"*\" allows all.",
+      "authorize": "Every identity-bound MCP tool call is authorized before dispatch against an authoritative resolved account, never a caller-provided account spelling. Draft resources resolve account ownership from the persisted draft id and reject a mismatched optional account. Aggregate diagnostics (accounts, watch_status, and account-omitted snooze listing) fail closed for identity-bound sessions rather than authorizing a default account then reading other accounts. The folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, and a \"*\" entry allows all (in the action list, all but the explicit_grant_actions it does not name).",
       "denial_codes": [
         "agent_policy_denied_action",
         "agent_policy_denied_account",

@@ -205,16 +205,17 @@ pub fn run_policy_set(
         .unwrap_or_else(|| StoreAgentPolicy::default_for(&agent.id));
 
     if let Some(v) = allow_accounts {
-        policy.allowed_accounts = encode_allow_list(v)?;
+        policy.allowed_accounts = encode_allow_list(v, &[])?;
     }
     if let Some(v) = allow_folders {
-        policy.allowed_folders = encode_allow_list(v)?;
+        policy.allowed_folders = encode_allow_list(v, &[])?;
     }
     if let Some(v) = allow_actions {
-        policy.allowed_actions = encode_allow_list(v)?;
+        policy.allowed_actions =
+            encode_allow_list(v, crate::commands::agent_context::EXPLICIT_GRANT_ACTIONS)?;
     }
     if let Some(v) = allow_recipients {
-        policy.allow_recipients = Some(encode_allow_list(v)?);
+        policy.allow_recipients = Some(encode_allow_list(v, &[])?);
     }
     if let Some(v) = send_mode_ceiling {
         // Validate against the four stable names.
@@ -293,7 +294,11 @@ fn print_policy(p: &StoreAgentPolicy) {
 /// Turn a CLI `--allow-*` value into the stored allow-list encoding: the literal
 /// `"*"` stays a wildcard; a comma-separated list becomes a JSON string array.
 /// Empty entries are dropped; an all-empty input is deny-all (`[]`).
-fn encode_allow_list(raw: &str) -> Result<String> {
+///
+/// `"*"` may be listed with entries from `beyond_star`, the ones it does not
+/// cover (`"*,watch.webhook"` is stored as `["*","watch.webhook"]`). Any other
+/// entry next to `"*"` is refused.
+fn encode_allow_list(raw: &str, beyond_star: &[&str]) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed == "*" {
         return Ok("*".to_string());
@@ -304,8 +309,24 @@ fn encode_allow_list(raw: &str) -> Result<String> {
         .filter(|s| !s.is_empty())
         .collect();
     if entries.iter().any(|e| e == "*") {
-        // Mixing "*" with explicit entries is ambiguous; refuse it.
-        bail!("allow-list may be \"*\" (allow all) or a comma-separated list, not both");
+        let covered: Vec<&str> = entries
+            .iter()
+            .map(String::as_str)
+            .filter(|e| *e != "*" && !beyond_star.contains(e))
+            .collect();
+        if beyond_star.is_empty() {
+            bail!("allow-list may be \"*\" (allow all) or a comma-separated list, not both");
+        }
+        if !covered.is_empty() {
+            bail!(
+                "\"*\" already allows {}. Next to \"*\", list only actions it does not include: {}",
+                covered.join(", "),
+                beyond_star.join(", ")
+            );
+        }
+        if entries.iter().all(|e| e == "*") {
+            return Ok("*".to_string());
+        }
     }
     Ok(serde_json::to_string(&entries)?)
 }
@@ -317,4 +338,55 @@ fn decode_for_display(raw: &str) -> serde_json::Value {
         return json!("*");
     }
     serde_json::from_str::<serde_json::Value>(raw).unwrap_or_else(|_| json!(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::agent_context::{
+        AgentContext, EXPLICIT_GRANT_ACTIONS, WATCH_WEBHOOK, map_store_policy,
+    };
+
+    fn agent_with_actions(raw: &str) -> AgentContext {
+        let mut stored = StoreAgentPolicy::default_for("a1");
+        stored.allowed_actions = encode_allow_list(raw, EXPLICIT_GRANT_ACTIONS).unwrap();
+        AgentContext {
+            agent_id: "a1".into(),
+            agent_name: "skippy".into(),
+            policy: map_store_policy(&stored).unwrap(),
+        }
+    }
+
+    #[test]
+    fn star_can_carry_the_actions_it_does_not_include() {
+        assert_eq!(
+            encode_allow_list(" *, watch.webhook ", EXPLICIT_GRANT_ACTIONS).unwrap(),
+            r#"["*","watch.webhook"]"#
+        );
+        let agent = agent_with_actions("*,watch.webhook");
+        assert!(agent.allows_action("move").is_ok());
+        assert!(agent.allows_action(WATCH_WEBHOOK).is_ok());
+        assert!(agent.allows_action("rules.write").is_err());
+        assert!(
+            agent
+                .authorize_action("move", "acct", Some("INBOX"))
+                .is_ok()
+        );
+
+        let refused = encode_allow_list("*,inbox.read", EXPLICIT_GRANT_ACTIONS)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("inbox.read"), "{refused}");
+        for action in EXPLICIT_GRANT_ACTIONS {
+            assert!(refused.contains(action), "{refused}");
+        }
+
+        // Accounts, folders and recipients have no such entries.
+        assert!(encode_allow_list("*,acct-1", &[]).is_err());
+        assert!(encode_allow_list("*,watch.webhook", &[]).is_err());
+        assert_eq!(
+            encode_allow_list("*,*", EXPLICIT_GRANT_ACTIONS).unwrap(),
+            "*"
+        );
+    }
 }

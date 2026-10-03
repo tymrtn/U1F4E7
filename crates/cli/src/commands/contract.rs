@@ -279,7 +279,7 @@ pub fn agent_contract() -> Value {
                     "unsubscribe": "`envelope unsubscribe --confirm`"
                 },
                 "explicit_grant_actions": crate::commands::agent_context::EXPLICIT_GRANT_ACTIONS,
-                "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them.",
+                "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them. \"*\" can be listed with them, stored as [\"*\", \"watch.webhook\"]: `envelope agent policy set <name> --allow-actions '*,watch.webhook'`. \"*\" listed with any other action is refused.",
                 "scope": "Before dispatch only actions are checked. `send`, `draft send`, and the rule commands that need rules.webhook, rules.batch_ack or sieve.publish also check the account. Other commands do not apply the policy's account or folder lists.",
                 "denial_codes": [
                     "agent_token_invalid",
@@ -291,7 +291,7 @@ pub fn agent_contract() -> Value {
                 "isolation": "These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator."
             },
             "policy_enforcement": {
-                "authorize": "Every identity-bound MCP tool call is authorized before dispatch against an authoritative resolved account, never a caller-provided account spelling. Draft resources resolve account ownership from the persisted draft id and reject a mismatched optional account. Aggregate diagnostics (accounts, watch_status, and account-omitted snooze listing) fail closed for identity-bound sessions rather than authorizing a default account then reading other accounts. The folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, a single \"*\" allows all.",
+                "authorize": "Every identity-bound MCP tool call is authorized before dispatch against an authoritative resolved account, never a caller-provided account spelling. Draft resources resolve account ownership from the persisted draft id and reject a mismatched optional account. Aggregate diagnostics (accounts, watch_status, and account-omitted snooze listing) fail closed for identity-bound sessions rather than authorizing a default account then reading other accounts. The folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, and a \"*\" entry allows all (in the action list, all but the explicit_grant_actions it does not name).",
                 "send_mode_clamp": "send/reply/send_draft requests are clamped down to the agent's send_mode_ceiling and never widened. Under a draft-only ceiling an autonomous request still produces only a draft. The allowlist and the confirmation come from the policy and a human approval, never from the call (see outbound_safety.send_authority).",
                 "attribution": "Mutating tool calls (send/reply/send_draft, move_message, flag, tag) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision).",
                 "denial_codes": [
