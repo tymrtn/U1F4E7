@@ -35,6 +35,7 @@ pub mod sender;
 
 use mail_parser::MimeHeaders;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub use config::{Quarantine, ReputationProvider, ThreatConfig};
 pub use envelope_email_store::correspondents::CorrespondentFacts;
@@ -296,6 +297,94 @@ pub fn parse_header_block(raw: &[u8]) -> Vec<(String, String)> {
         }
     }
     headers
+}
+
+/// Header fields a content fingerprint covers besides every `Content-*` field:
+/// the ones the sender writes. Fields a receiving server adds (`Received`,
+/// `Authentication-Results`, `Delivered-To`, spam scores) are left out, so a
+/// message keeps its fingerprint in every folder it is delivered or moved to.
+const FINGERPRINT_HEADERS: &[&str] = &[
+    "from",
+    "sender",
+    "reply-to",
+    "to",
+    "cc",
+    "subject",
+    "date",
+    "message-id",
+    "mime-version",
+    "list-unsubscribe",
+    "list-unsubscribe-post",
+];
+
+/// The identity of a message's content: `v1:` and the SHA-256 of its
+/// fingerprinted header fields (every occurrence, in wire order, as sent) and
+/// its raw body after the first blank line. Stored verdicts and Mark safe
+/// apply only to a message with the same fingerprint.
+pub fn content_fingerprint(raw: &[u8]) -> String {
+    let (fields, body) = raw_header_fields(raw);
+    let mut hasher = Sha256::new();
+    // Length-prefixed, so two different messages never hash the same bytes.
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    for field in fields.into_iter().filter(|f| fingerprinted(f)) {
+        part(field);
+    }
+    part(body);
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("v1:{hex}")
+}
+
+/// `Content-*` fields change how the body is read, a top-level
+/// `Content-Disposition` included, so all of them are fingerprinted.
+fn fingerprinted(field: &[u8]) -> bool {
+    let Some(colon) = field.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let name = field[..colon].trim_ascii().to_ascii_lowercase();
+    name.starts_with(b"content-") || FINGERPRINT_HEADERS.iter().any(|h| h.as_bytes() == name)
+}
+
+/// Each header field's bytes as sent (first line plus folded continuations,
+/// without the final line break), and the body after the first blank line.
+/// Lines split as in [`parse_header_block`].
+fn raw_header_fields(raw: &[u8]) -> (Vec<&[u8]>, &[u8]) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+    while pos < raw.len() {
+        let end = raw[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(raw.len(), |i| pos + i);
+        let line_end = if end > pos && raw[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        let next = (end + 1).min(raw.len());
+        if line_end == pos {
+            return (spans_of(raw, &spans), &raw[next..]);
+        }
+        if matches!(raw[pos], b' ' | b'\t') {
+            if let Some(last) = spans.last_mut() {
+                last.1 = line_end;
+            }
+        } else {
+            spans.push((pos, line_end));
+        }
+        pos = next;
+    }
+    (spans_of(raw, &spans), &[])
+}
+
+fn spans_of<'a>(raw: &'a [u8], spans: &[(usize, usize)]) -> Vec<&'a [u8]> {
+    spans.iter().map(|&(start, end)| &raw[start..end]).collect()
 }
 
 /// The `by` host of a `Received` header, if it names one.
@@ -692,6 +781,57 @@ mod tests {
             received_by_host(&headers[0].1).as_deref(),
             Some("mx.example.org")
         );
+    }
+
+    const LUNCH: &str = "From: Alice <alice@partner.example>\r\n\
+                         To: me@example.org\r\n\
+                         Subject: Lunch\r\n\
+                         Date: Mon, 21 Sep 2026 10:00:00 +0000\r\n\
+                         Message-ID: <m1@partner.example>\r\n\
+                         MIME-Version: 1.0\r\n\
+                         Content-Type: multipart/mixed; boundary=b\r\n\
+                         \r\n\
+                         --b\r\nContent-Type: text/plain\r\n\r\nThursday?\r\n--b--\r\n";
+
+    #[test]
+    fn fingerprint_ignores_receiver_headers() {
+        let fp = content_fingerprint(LUNCH.as_bytes());
+        assert!(fp.starts_with("v1:"), "{fp}");
+        assert_eq!(fp.len(), 3 + 64, "{fp}");
+
+        let delivered = format!(
+            "Return-Path: <alice@partner.example>\r\n\
+             Delivered-To: me@example.org\r\n\
+             Received: from mail.partner.example by mx1.example.org with ESMTPS; \
+             Mon, 21 Sep 2026 10:00:01 +0000\r\n\
+             Authentication-Results: mx1.example.org; spf=pass; dkim=pass; dmarc=pass\r\n\
+             X-Spam-Status: No, score=-0.1\r\n{LUNCH}"
+        );
+        assert_eq!(content_fingerprint(delivered.as_bytes()), fp);
+        let interleaved =
+            LUNCH.replacen("Subject:", "X-Original-To: me@example.org\r\nSubject:", 1);
+        assert_eq!(content_fingerprint(interleaved.as_bytes()), fp);
+    }
+
+    #[test]
+    fn fingerprint_changes_with_body_attachment_or_second_from() {
+        let fp = content_fingerprint(LUNCH.as_bytes());
+        let body = LUNCH.replace("Thursday?", "Friday?");
+        let attachment = LUNCH.replace(
+            "--b--\r\n",
+            "--b\r\nContent-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n",
+        );
+        let second_from = LUNCH.replacen("To:", "From: IT Desk <it@examp1e.org>\r\nTo:", 1);
+        let subject = LUNCH.replace("Subject: Lunch", "Subject: Lunch!");
+        let disposition = LUNCH.replacen(
+            "MIME-Version: 1.0\r\n",
+            "MIME-Version: 1.0\r\nContent-Disposition: attachment; filename=\"a.exe\"\r\n",
+            1,
+        );
+        for changed in [body, attachment, second_from, subject, disposition] {
+            assert_ne!(content_fingerprint(changed.as_bytes()), fp, "{changed}");
+        }
     }
 
     #[test]
