@@ -252,9 +252,12 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                     ReadOnly
                 }
             }
-            // Without --confirm, publish-sieve is a dry run.
-            RuleCmd::PublishSieve { confirm, .. } => {
-                if *confirm {
+            // --host sends the mailbox password to the named server. Without
+            // --confirm, publish-sieve is a dry run.
+            RuleCmd::PublishSieve { host, confirm, .. } => {
+                if host.is_some() {
+                    OperatorOnly
+                } else if *confirm {
                     Gated(SIEVE)
                 } else {
                     ReadOnly
@@ -487,6 +490,11 @@ mod tests {
         ("rule export", ReadOnly),
         ("rule publish-sieve", ReadOnly),
         ("rule publish-sieve --confirm", Gated(SIEVE)),
+        ("rule publish-sieve --host h.example", OperatorOnly),
+        (
+            "rule publish-sieve --confirm --host h.example",
+            OperatorOnly,
+        ),
         ("contacts add --email a@b.test", OperatorOnly),
         ("contacts list", ReadOnly),
         ("contacts show a@b.test", ReadOnly),
@@ -626,6 +634,7 @@ mod tests {
             "--copy-password",
             "--unsafe",
             "--confirm",
+            "--host",
             "--webhook",
             "--run-rules",
         ];

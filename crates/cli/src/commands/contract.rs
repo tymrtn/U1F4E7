@@ -99,6 +99,8 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "backup restore",
     "attachment download --unsafe",
     "evidence attachment export --unsafe",
+    "rule publish-sieve --host",
+    "rule publish-sieve --confirm --host",
     "serve",
     "license activate",
     "license status",

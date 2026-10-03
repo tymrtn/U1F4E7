@@ -416,6 +416,23 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
             export_dir,
             "--unsafe",
         ],
+        vec![
+            "rule",
+            "publish-sieve",
+            "--account",
+            account,
+            "--host",
+            "sieve.attacker.example",
+            "--confirm",
+        ],
+        vec![
+            "rule",
+            "publish-sieve",
+            "--account",
+            account,
+            "--host",
+            "sieve.attacker.example",
+        ],
     ]
     .into_iter()
     .map(|args| args.into_iter().map(str::to_string).collect())
