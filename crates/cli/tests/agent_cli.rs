@@ -494,6 +494,89 @@ fn cli_webhook_rule_without_grant_is_denied_and_writes_nothing() {
 }
 
 #[test]
+fn cli_rule_that_sets_a_threat_tag_is_operator_only() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    // An operator's rule that a confirm offer can pull in by name.
+    for args in [
+        &[
+            "rule",
+            "create",
+            "--name",
+            "lift",
+            "--match-from",
+            "*@sender.example",
+            "--action",
+            "add_tag=threat:false_positive",
+        ][..],
+        &["rule", "disable", "lift"][..],
+    ] {
+        assert!(run(home, args).status.success(), "{args:?}");
+    }
+    let token = create_agent_token(home, "skippy");
+    allow_actions(home, "skippy", "rules.write");
+
+    for action in [
+        r#"{"add_tag":"threat\u003afalse_positive"}"#,
+        r#"{"add_tag":"THREAT\u003aFALSE_POSITIVE"}"#,
+        r#"{"add_tag":" \u0074hreat:malware"}"#,
+        r#"{"confirm":{"prompt":"ok?","then":[{"add_tag":"threat\u003amalware"}]}}"#,
+        r#"{"confirm":{"prompt":"ok?","then":[{"rule":"lift"}]}}"#,
+    ] {
+        let out = run_as(
+            home,
+            &token,
+            &[
+                "--json",
+                "rule",
+                "create",
+                "--name",
+                "agent-rule",
+                "--match-from",
+                "*@sender.example",
+                "--action",
+                action,
+            ],
+        );
+        assert_denied(&out, "operator_only_command");
+    }
+    assert_eq!(rule_count(home), 1, "only the operator's rule may exist");
+
+    let out = run_as(home, &token, &["--json", "rule", "enable", "lift"]);
+    assert_denied(&out, "operator_only_command");
+    let enabled: i64 = open_db(home)
+        .conn()
+        .query_row("SELECT enabled FROM rules WHERE name = 'lift'", [], |r| {
+            r.get(0)
+        })
+        .expect("lift");
+    assert_eq!(enabled, 0, "a refused enable leaves the rule disabled");
+
+    // Other tags are still the agent's to set.
+    let out = run_as(
+        home,
+        &token,
+        &[
+            "--json",
+            "rule",
+            "create",
+            "--name",
+            "plain",
+            "--match-from",
+            "*@sender.example",
+            "--action",
+            r#"{"add_tag":"newsletter"}"#,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn cli_webhook_rule_with_grant_is_allowed() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();

@@ -128,7 +128,6 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "config unset",
     "tag set with a threat:* tag",
     "bulk tag with a threat:* tag",
-    "rule create with a threat:* tag",
 ];
 
 fn cli_gated_commands() -> Value {
@@ -261,6 +260,7 @@ pub fn agent_contract() -> Value {
                 },
                 "gated_commands": cli_gated_commands(),
                 "operator_only_commands": CLI_OPERATOR_ONLY_COMMANDS,
+                "threat_tags": "Under a token, setting a threat:* tag is operator-only: `tag set` and `bulk tag` with one, and `rule create` with an action that sets one (read after JSON decoding, trimmed and case-insensitive, including actions a confirm offer takes from another rule) or `rule enable` of such a rule, are refused with operator_only_command.",
                 "actor": "Under a token, `envelope actions exec --actor` must name the agent itself (its name or id); any other actor is refused with operator_only_command.",
                 "send": "`envelope send` and `envelope draft send` also check the `send` action for the resolved account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
                 "actions": {

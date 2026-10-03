@@ -240,17 +240,12 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
             | RuleCmd::Test { .. }
             | RuleCmd::Preview { .. }
             | RuleCmd::Export { .. } => ReadOnly,
-            // An action naming a threat tag would set a verdict when it runs.
-            RuleCmd::Create { action, .. } => {
-                if action.to_lowercase().contains("threat:") {
-                    OperatorOnly
-                } else {
-                    Gated(RULES_EDIT)
-                }
-            }
-            RuleCmd::Enable { .. } | RuleCmd::Disable { .. } | RuleCmd::Delete { .. } => {
-                Gated(RULES_EDIT)
-            }
+            // `rule create` and `rule enable` refuse an agent a rule that sets
+            // a threat:* tag once the action is parsed.
+            RuleCmd::Create { .. }
+            | RuleCmd::Enable { .. }
+            | RuleCmd::Disable { .. }
+            | RuleCmd::Delete { .. } => Gated(RULES_EDIT),
             // Without --confirm, `rule run` only explains itself.
             RuleCmd::Run { confirm, .. } => {
                 if *confirm {
@@ -505,10 +500,6 @@ mod tests {
         (
             "rule create --name n --match-from * --action delete",
             Gated(RULES_EDIT),
-        ),
-        (
-            "rule create --name n --match-from * --action add_tag=threat:false_positive",
-            OperatorOnly,
         ),
         ("rule list", ReadOnly),
         ("rule test 1", ReadOnly),

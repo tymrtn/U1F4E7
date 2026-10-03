@@ -325,18 +325,6 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
             "--account",
             account,
         ],
-        vec![
-            "rule",
-            "create",
-            "--name",
-            "lift",
-            "--match-from",
-            "*",
-            "--action",
-            "add_tag=threat:false_positive",
-            "--account",
-            account,
-        ],
         vec!["config", "set", "otp.allow_unverified_senders", account],
         vec!["config", "unset", "threat.enabled"],
         vec![

@@ -202,6 +202,16 @@ pub fn run_create(
 
     // Parse and serialize the action (confirm rule references are flattened now)
     let action = parse_authored_action_str(action_str, &db, account_id)?;
+    // A threat:* tag is a verdict, so only the operator writes a rule that sets one.
+    if action.sets_threat_tag() {
+        agent_context::require_cli_operator(
+            &db,
+            agent.as_ref(),
+            agent_context::RULES_WRITE,
+            account_id,
+            json,
+        )?;
+    }
     if matches!(action, Action::Webhook(_)) {
         agent_context::authorize_cli_action(
             &db,
@@ -721,6 +731,15 @@ pub fn run_enable(
     if agent.is_some() {
         let current = rules::StoredRuleAction::parse(&rule.action)
             .with_context(|| format!("rule '{name}' has an invalid action"))?;
+        if current.action.sets_threat_tag() {
+            agent_context::require_cli_operator(
+                &db,
+                agent.as_ref(),
+                agent_context::RULES_WRITE,
+                &acct.id,
+                json,
+            )?;
+        }
         if matches!(current.action, Action::Webhook(_)) {
             agent_context::authorize_cli_action(
                 &db,

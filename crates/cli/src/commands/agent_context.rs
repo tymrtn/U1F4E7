@@ -356,17 +356,46 @@ pub fn authorize_cli_action(
         return Ok(());
     };
     ctx.authorize_action(action, account_id, None)
-        .map_err(|denial| {
-            if let Err(e) = db.log_denied_action_with_agent(
-                account_id,
-                action,
-                denial.code,
-                Some(&ctx.agent_id),
-            ) {
-                tracing::warn!("could not record the refused {action} in the action log: {e}");
-            }
-            print_cli_denial(CliDenial(denial).into(), json)
-        })
+        .map_err(|denial| refuse_cli(db, ctx, action, account_id, denial, json))
+}
+
+/// Refuse an operator-only change for the CLI's acting agent, whatever its
+/// policy grants. The operator (`None`) is always allowed. Recorded and
+/// printed as [`authorize_cli_action`] does.
+pub fn require_cli_operator(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    match ctx {
+        None => Ok(()),
+        Some(ctx) => Err(refuse_cli(
+            db,
+            ctx,
+            action,
+            account_id,
+            operator_only_denial(),
+            json,
+        )),
+    }
+}
+
+fn refuse_cli(
+    db: &Database,
+    ctx: &AgentContext,
+    action: &str,
+    account_id: &str,
+    denial: PolicyDenial,
+    json: bool,
+) -> anyhow::Error {
+    if let Err(e) =
+        db.log_denied_action_with_agent(account_id, action, denial.code, Some(&ctx.agent_id))
+    {
+        tracing::warn!("could not record the refused {action} in the action log: {e}");
+    }
+    print_cli_denial(CliDenial(denial).into(), json)
 }
 
 pub(crate) fn print_cli_denial(error: anyhow::Error, json: bool) -> anyhow::Error {
