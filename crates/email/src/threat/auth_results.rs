@@ -3,18 +3,27 @@
 
 //! Authentication-Results (RFC 8601) analyzer.
 //!
-//! Only an A-R header written by the receiving host counts. RFC 8601 §5 says
-//! the receiving MTA should strip pre-existing headers carrying its own
-//! authserv-id, but many do not, so header *order* is the defence. Everything
-//! above the first `Received` line written by another domain was prepended
-//! by the receiving domain. Where the provider puts its A-R relative to its
-//! own `Received` lines varies: Gmail and Migadu write it *below* their edge
-//! `Received`. So the boundary is the first foreign `Received` (or the end of
-//! the block when there is none), and we trust only the topmost A-R whose
-//! authserv-id belongs to the receiving domain and that appears above it.
-//! Any other A-R claiming the receiving domain (below a foreign hop, or a
-//! second one) was supplied by someone else: `ar_forged`. A-R headers from
-//! other authserv-ids are ignored entirely.
+//! Only results written by the receiving host count. RFC 8601 §5 says the
+//! receiving MTA should strip pre-existing headers carrying its own
+//! authserv-id, but many do not, so header *order* is the defence.
+//!
+//! The receiving host is named by the topmost `Received` with a DNS `by`
+//! host; the receiver writes that line, and nothing a sender supplies can sit
+//! above it. Results with the receiving domain's authserv-id above that line
+//! are the receiver's own: an `Authentication-Results`, or Gmail's
+//! `ARC-Authentication-Results`, since Gmail writes its plain A-R below its
+//! edge `Received`.
+//!
+//! Below that line it is ambiguous. Gmail and Migadu write their A-R there,
+//! but when a receiver writes none, a copy the sender put in the message also
+//! sits there, with no `Received` of the sender's own when it connected
+//! straight to the MX. So the topmost receiving-domain A-R between that line
+//! and the first `Received` written by another domain counts for failures
+//! only: a failure there is the receiver's or harms only the sender, and a
+//! pass there proves nothing. Any other A-R claiming the receiving domain
+//! (below a foreign hop, below the receiver's own results, or a second one)
+//! was supplied by someone else: `ar_forged`. A-R headers from other
+//! authserv-ids are ignored entirely.
 
 use super::domains::registrable;
 use super::{Signal, ThreatInput, is_dns_name, received_by_host};
@@ -30,46 +39,96 @@ pub const AUTH_UNVERIFIABLE: u32 = 5;
 /// claim its authserv-id from anywhere else.
 struct ReceivingAr {
     receiving_domain: String,
-    /// `(authserv-id, header value)` of the one header that is trusted.
-    trusted: Option<(String, String)>,
+    /// The one set of results that is used, if any.
+    trusted: Option<TrustedAr>,
     /// Other headers claiming the receiving domain.
     forged: usize,
+}
+
+struct TrustedAr {
+    authserv_id: String,
+    /// The header value, starting at the authserv-id.
+    value: String,
+    /// Above the receiving host's first `Received`, so the receiver wrote it.
+    /// Otherwise it may be the sender's: its failures count, its passes do not.
+    above_receiver: bool,
 }
 
 /// `None` when no Received header names a receiving host.
 fn trusted_ar(input: &ThreatInput) -> Option<ReceivingAr> {
     let receiving_domain = registrable(input.receiving_host.as_deref()?);
+    let is_received = |name: &str| name.eq_ignore_ascii_case("received");
+    let dns_by_host = |value: &str| received_by_host(value).filter(|host| is_dns_name(host));
 
-    // Boundary: the first Received header written by another domain. Opaque
-    // internal hops like `by 2002:a05:...` do not end the receiving run.
+    // The receiver's first Received: the one `receiving_host` comes from.
+    let anchor = input
+        .headers
+        .iter()
+        .position(|(name, value)| is_received(name) && dns_by_host(value).is_some())?;
+    // The first Received written by another domain. Opaque internal hops like
+    // `by 2002:a05:...` do not end the receiving run.
     let boundary = input
         .headers
         .iter()
         .position(|(name, value)| {
-            name.eq_ignore_ascii_case("received")
-                && matches!(received_by_host(value),
-                    Some(host) if is_dns_name(&host) && registrable(&host) != receiving_domain)
+            is_received(name)
+                && matches!(dns_by_host(value), Some(host) if registrable(&host) != receiving_domain)
         })
         .unwrap_or(input.headers.len());
 
-    let mut trusted: Option<(String, String)> = None;
+    let mut above: Option<(String, String, bool)> = None;
+    let mut below: Option<(String, String)> = None;
     let mut forged = 0;
     for (idx, (name, value)) in input.headers.iter().enumerate() {
-        if !name.eq_ignore_ascii_case("authentication-results") {
+        let arc = name.eq_ignore_ascii_case("arc-authentication-results");
+        if !arc && !name.eq_ignore_ascii_case("authentication-results") {
             continue;
         }
+        // An ARC header starts with its instance, `i=N;`, before the authserv-id.
+        let value = if arc {
+            value.split_once(';').map_or("", |(_, rest)| rest.trim())
+        } else {
+            value.as_str()
+        };
         let Some(authserv) = authserv_id(value) else {
             continue;
         };
         if registrable(&authserv) != receiving_domain {
             continue;
         }
-        if idx < boundary && trusted.is_none() {
-            trusted = Some((authserv, value.clone()));
+        if idx < anchor {
+            if above.is_none() {
+                above = Some((authserv, value.to_string(), arc));
+            }
+            continue;
+        }
+        // ARC sets below the receiver's lines arrived with the message.
+        if arc {
+            continue;
+        }
+        // Gmail's own A-R sits below its edge line under its ARC results; a
+        // receiver whose plain A-R is above the line wrote nothing below it.
+        let receiver_ar_above = above.as_ref().is_some_and(|(_, _, arc)| !arc);
+        if idx < boundary && below.is_none() && !receiver_ar_above {
+            below = Some((authserv, value.to_string()));
         } else {
             forged += 1;
         }
     }
+
+    let trusted = match (above, below) {
+        (Some((authserv_id, value, _)), _) => Some(TrustedAr {
+            authserv_id,
+            value,
+            above_receiver: true,
+        }),
+        (None, Some((authserv_id, value))) => Some(TrustedAr {
+            authserv_id,
+            value,
+            above_receiver: false,
+        }),
+        (None, None) => None,
+    };
     Some(ReceivingAr {
         receiving_domain,
         trusted,
@@ -102,7 +161,12 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         ));
     }
 
-    let Some((authserv, value)) = trusted else {
+    let Some(TrustedAr {
+        authserv_id: authserv,
+        value,
+        above_receiver,
+    }) = trusted
+    else {
         signals.push(Signal::new(
             "auth_unverifiable",
             AUTH_UNVERIFIABLE,
@@ -110,6 +174,7 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         ));
         return signals;
     };
+    let before = signals.len();
 
     let results = method_results(&value);
     let has = |method: &str, result: &str| results.iter().any(|(m, r)| m == method && r == result);
@@ -138,6 +203,15 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
             "dkim_fail",
             DKIM_FAIL,
             format!("authserv-id {authserv}: dkim=fail"),
+        ));
+    }
+    if !above_receiver && signals.len() == before {
+        signals.push(Signal::new(
+            "auth_unverifiable",
+            AUTH_UNVERIFIABLE,
+            format!(
+                "the Authentication-Results from {authserv} sit below the receiving host's first Received, where the sender could have written them"
+            ),
         ));
     }
     signals
@@ -199,7 +273,12 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     let Some(receiving) = trusted_ar(input) else {
         return SenderAuth::Unverifiable("no Received header names a receiving host".to_string());
     };
-    let Some((authserv_id, value)) = receiving.trusted else {
+    let Some(TrustedAr {
+        authserv_id,
+        value,
+        above_receiver,
+    }) = receiving.trusted
+    else {
         return SenderAuth::Unverifiable(format!(
             "no trusted Authentication-Results from {}",
             receiving.receiving_domain
@@ -224,6 +303,11 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     } else {
         return SenderAuth::Fail;
     };
+    if !above_receiver {
+        return SenderAuth::Unverifiable(format!(
+            "the passing Authentication-Results from {authserv_id} sit below the receiving host's first Received, where the sender could have written them"
+        ));
+    }
     SenderAuth::Pass {
         via: via.to_string(),
         domain: from_domain,
@@ -473,7 +557,10 @@ mod tests {
     const GMAIL_SUBMISSION: &str = "Received: by mail-ed1-x548.google.com with SMTP id 4fb4d7f45d1cf-6a0a4a22bf0so3254826a12.0 for <alice@example.net>; Sun, 27 Sep 2026 21:43:14 -0700 (PDT)";
 
     #[test]
-    fn migadu_layout_with_ar_below_its_own_received_is_trusted() {
+    fn migadu_pass_below_its_own_received_is_unverifiable() {
+        // Migadu writes its A-R below its own Received lines, where a sender's
+        // copy would also sit when Migadu writes none. A pass there proves
+        // nothing; it is not treated as forged either.
         let input = input_from(
             &[
                 "Delivered-To: alice@example.net",
@@ -485,11 +572,12 @@ mod tests {
             ],
             "hi",
         );
-        assert!(analyze(&input).is_empty(), "{:?}", analyze(&input));
+        assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+        assert!(matches!(sender_auth(&input), SenderAuth::Unverifiable(_)));
     }
 
     #[test]
-    fn migadu_layout_without_any_upstream_received_is_trusted() {
+    fn migadu_pass_without_any_upstream_received_is_unverifiable() {
         // SES and many ESPs add no Received of their own.
         let input = input_from(
             &[
@@ -501,7 +589,8 @@ mod tests {
             ],
             "hi",
         );
-        assert!(analyze(&input).is_empty(), "{:?}", analyze(&input));
+        assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+        assert!(matches!(sender_auth(&input), SenderAuth::Unverifiable(_)));
     }
 
     #[test]
@@ -723,6 +812,155 @@ mod tests {
 
         let auth = auth_of(&[pass, RECEIVED_EDGE, "Subject: no sender"]);
         assert_eq!(auth, SenderAuth::Fail);
+    }
+
+    // ── Trust boundary: only results above the receiver's first Received ──
+
+    /// A real Gmail delivery, anonymized: Gmail's A-R sits below its own edge
+    /// Received, and its ARC-Authentication-Results sits above it.
+    fn gmail_delivery(arc_results: &str, ar_results: &str, extra_below: &[&str]) -> Vec<String> {
+        let mut headers = vec![
+            "Delivered-To: me@gmail.example".to_string(),
+            "Received: by 2002:a05:6022:5c4:b0:9a1:1234 with SMTP id x1; Mon, 7 Oct 2026 08:12:34 -0700 (PDT)".to_string(),
+            "X-Google-Smtp-Source: AGHT+IEexample".to_string(),
+            "X-Received: by 2002:a05:6214:2a1:b0:6b2:9876 with SMTP id x2; Mon, 07 Oct 2026 08:12:34 -0700 (PDT)".to_string(),
+            "ARC-Seal: i=1; a=rsa-sha256; t=1791378754; cv=none; d=google.com; s=arc-20240605; b=abc".to_string(),
+            "ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605; bh=x; b=y".to_string(),
+            format!("ARC-Authentication-Results: i=1; mx.google.com; {arc_results}"),
+            "Return-Path: <noreply@bank.example>".to_string(),
+            "Received: from out-18.smtp.bank.example (out-18.smtp.bank.example. [192.0.2.201]) by mx.google.com with ESMTPS id x3 for <me@gmail.example> (version=TLS1_3); Mon, 07 Oct 2026 08:12:34 -0700 (PDT)".to_string(),
+            "Received-SPF: pass (google.com: domain of noreply@bank.example designates 192.0.2.201 as permitted sender) client-ip=192.0.2.201;".to_string(),
+            format!("Authentication-Results: mx.google.com; {ar_results}"),
+        ];
+        headers.extend(extra_below.iter().map(|h| h.to_string()));
+        headers.push("From: Bank <noreply@bank.example>".to_string());
+        headers
+    }
+
+    fn auth_of_owned(headers: &[String]) -> SenderAuth {
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        auth_of(&refs)
+    }
+
+    const BANK_PASS: &str = "dkim=pass header.i=@bank.example header.s=s1 header.b=abc; spf=pass smtp.mailfrom=noreply@bank.example; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=bank.example";
+    const BANK_FAIL: &str = "dkim=none; spf=fail smtp.mailfrom=noreply@bank.example; dmarc=fail (p=REJECT) header.from=bank.example";
+
+    #[test]
+    fn direct_to_mx_injection_without_receiver_ar_is_unverifiable() {
+        // The sender connected straight to the MX, so no Received of its own
+        // sits between the receiver's lines and the A-R it supplied.
+        let headers = [
+            "Received: from mx1.example.org by store.example.org with LMTP id q; Mon, 21 Sep 2026 10:00:01 +0000",
+            "Received: from swaks.attacker.example (198.51.100.7) by mx1.example.org with ESMTP id q2; Mon, 21 Sep 2026 10:00:00 +0000",
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
+            "From: Bank <alerts@bank.example>",
+        ];
+        assert!(
+            matches!(auth_of(&headers), SenderAuth::Unverifiable(_)),
+            "{:?}",
+            auth_of(&headers)
+        );
+        let input = input_from(&headers, "hi");
+        assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+    }
+
+    #[test]
+    fn forged_ar_below_the_receivers_received_loses_to_the_real_one_above() {
+        let headers = [
+            "Authentication-Results: mx1.example.org; dkim=none; spf=fail smtp.mailfrom=bank.example; dmarc=fail (p=reject) header.from=bank.example",
+            "Received: from mx1.example.org by store.example.org with LMTP id q; Mon, 21 Sep 2026 10:00:01 +0000",
+            "Received: from swaks.attacker.example (198.51.100.7) by mx1.example.org with ESMTP id q2; Mon, 21 Sep 2026 10:00:00 +0000",
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
+            "From: Bank <alerts@bank.example>",
+        ];
+        assert_eq!(auth_of(&headers), SenderAuth::Fail);
+        let input = input_from(&headers, "hi");
+        assert_eq!(
+            codes(&analyze(&input)),
+            vec!["ar_forged", "dmarc_fail", "spf_fail"]
+        );
+
+        // The same pair with a passing real result: the forged copy changes nothing.
+        let headers = [
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
+            headers[1],
+            headers[2],
+            "Authentication-Results: mx1.example.org; dmarc=pass header.from=attacker.example",
+            headers[4],
+        ];
+        assert_eq!(
+            auth_of(&headers),
+            passed("dmarc", "bank.example", "mx1.example.org")
+        );
+    }
+
+    #[test]
+    fn gmail_ordering_passes_on_its_own_results() {
+        let headers = gmail_delivery(
+            BANK_PASS,
+            BANK_PASS,
+            &[
+                "Received: from laptop (unknown [192.0.2.10]) by mail.bank.example with ESMTPSA id z; Mon, 07 Oct 2026 08:12:33 -0700",
+            ],
+        );
+        assert_eq!(
+            auth_of_owned(&headers),
+            passed("dmarc", "bank.example", "mx.google.com")
+        );
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        assert!(analyze(&input_from(&refs, "hi")).is_empty());
+
+        // Gmail's own failing result wins over a passing copy the sender
+        // placed under it.
+        let headers = gmail_delivery(
+            BANK_FAIL,
+            BANK_FAIL,
+            &[
+                "Authentication-Results: mx.google.com; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
+            ],
+        );
+        assert_eq!(auth_of_owned(&headers), SenderAuth::Fail);
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        assert_eq!(
+            codes(&analyze(&input_from(&refs, "hi"))),
+            vec!["ar_forged", "dmarc_fail", "spf_fail"]
+        );
+    }
+
+    #[test]
+    fn migadu_style_without_ar_is_unverifiable() {
+        let headers = [
+            "Delivered-To: alice@example.net",
+            MIGADU_LMTP,
+            "Received: from mail.bank.example (203.0.113.5) by mizu0.migadu.com with ESMTPS id q8; Mon, 28 Sep 2026 04:43:18 +0000",
+            "From: Bank <alerts@bank.example>",
+        ];
+        assert!(matches!(auth_of(&headers), SenderAuth::Unverifiable(_)));
+    }
+
+    #[test]
+    fn a_failure_below_the_receivers_received_still_fails() {
+        // A failing result there is either the receiver's own or a sender
+        // harming itself; both mean the code is refused.
+        let headers = [
+            MIGADU_LMTP,
+            "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q3; Mon, 28 Sep 2026 04:43:18 +0000",
+            "Authentication-Results: mx13.migadu.com; dkim=none; spf=fail smtp.mailfrom=bank.example; dmarc=fail (policy=reject) header.from=bank.example",
+            "From: Bank <alerts@bank.example>",
+        ];
+        assert_eq!(auth_of(&headers), SenderAuth::Fail);
+    }
+
+    #[test]
+    fn microsoft_ar_without_authserv_id_plus_injection_is_unverifiable() {
+        let headers = [
+            "Received: from DM6PR.namprd.prod.outlook.com (2603:10b6::1) by BN8PR.namprd.prod.outlook.com with HTTPS; Mon, 21 Sep 2026 10:00:02 +0000",
+            "Authentication-Results: spf=fail (sender IP is 198.51.100.7) smtp.mailfrom=bank.example; dkim=none (message not signed) header.d=none;dmarc=fail action=quarantine header.from=bank.example;compauth=fail reason=000",
+            "Received: from swaks.attacker.example (198.51.100.7) by BN1NAM02FT.mail.protection.outlook.com (10.0.0.1) with Microsoft SMTP Server; Mon, 21 Sep 2026 10:00:01 +0000",
+            "Authentication-Results: mx.outlook.com; dmarc=pass header.from=bank.example",
+            "From: Bank <alerts@bank.example>",
+        ];
+        assert!(matches!(auth_of(&headers), SenderAuth::Unverifiable(_)));
     }
 
     #[test]
