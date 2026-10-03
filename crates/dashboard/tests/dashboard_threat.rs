@@ -16,8 +16,16 @@ use envelope_email_dashboard::state::AppState;
 use envelope_email_store::models::IndexedMessageInput;
 use envelope_email_store::{CredentialBackend, Database, Draft};
 use envelope_email_transport::threat::persist::{self, VerdictTarget};
-use envelope_email_transport::threat::{self, Signal, combine};
+use envelope_email_transport::threat::{self, Signal, ThreatConfig, combine, content_fingerprint};
 use tower::ServiceExt;
+
+/// The message the fixture's dangerous verdict at INBOX UID 7 judged.
+const PHISH: &[u8] = b"Message-ID: <phish@x>\r\nFrom: Billing <billing@examp1e.org>\r\n\
+To: me@example.org\r\nSubject: invoice\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+--b\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n";
 
 fn state() -> (AppState, Draft) {
     let db = Database::open_memory().unwrap();
@@ -63,7 +71,7 @@ fn state() -> (AppState, Draft) {
             folder: "INBOX",
             uid: 7,
             message_id: Some("phish@x"),
-            content_fingerprint: None,
+            content_fingerprint: Some(&content_fingerprint(PHISH)),
         },
         &dangerous,
     )
@@ -264,6 +272,32 @@ async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
         .unwrap();
     let app = dashboard_router(state);
     let token = mint_csrf(&app).await;
+
+    // The Message-ID alone no longer finds a verdict for UID 9.
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/accounts/acc1/messages/9/threat?folder=INBOX",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["threat"].is_null(), "{body}");
+
+    // Opening UID 9 matches its bytes to the verdict scanned at UID 7.
+    let opened = envelope_email_dashboard::handlers::threat::verdict_for_open(
+        &*db.lock().await,
+        "acc1",
+        "me@example.org",
+        "INBOX",
+        9,
+        Some(PHISH),
+        &ThreatConfig::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(opened["level"], "dangerous", "{opened}");
 
     let (status, body) = send(
         &app,

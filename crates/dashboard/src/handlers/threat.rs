@@ -106,33 +106,16 @@ pub fn verdict_for_open(
     Ok(verdict.map(|v| verdict_view(db, account_id, message_id.as_deref(), &v)))
 }
 
-/// The stored verdict for the message at a folder/UID. Verdicts are recorded
-/// under the UID that was scanned, so a message moved back or delivered again
-/// has none under its new UID; the Message-ID the index holds for that UID
-/// still finds it.
-fn stored_verdict_at(
-    db: &Database,
-    account_id: &str,
-    folder: &str,
-    uid: u32,
-) -> anyhow::Result<Option<StoredVerdict>> {
-    if let Some(stored) = persist::stored_verdict_for_uid(db, account_id, folder, uid)? {
-        return Ok(Some(stored));
-    }
-    match db.indexed_message_id(account_id, folder, uid)? {
-        Some(message_id) => persist::stored_verdict_for_message(db, account_id, &message_id),
-        None => Ok(None),
-    }
-}
-
-/// `GET /api/accounts/{id}/messages/{uid}/threat` — the stored verdict only.
+/// `GET /api/accounts/{id}/messages/{uid}/threat` — the stored verdict only,
+/// by folder/UID. A message moved back or delivered again has one under its
+/// new UID once opening it has matched its bytes to a verdict.
 pub async fn show(
     State(state): State<AppState>,
     Path((account_id, uid)): Path<(String, u32)>,
     Query(q): Query<FolderQuery>,
 ) -> Response {
     let db = state.db.lock().await;
-    match stored_verdict_at(&db, &account_id, &q.folder, uid) {
+    match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
         Ok(Some(stored)) => {
             Json(json!({"threat": stored_view(&db, &account_id, &stored)})).into_response()
         }
@@ -152,7 +135,7 @@ pub async fn mark_safe(
     Query(q): Query<FolderQuery>,
 ) -> Response {
     let db = state.db.lock().await;
-    let stored = match stored_verdict_at(&db, &account_id, &q.folder, uid) {
+    let stored = match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
         Ok(Some(stored)) => stored,
         Ok(None) => {
             return error(
@@ -475,39 +458,34 @@ mod tests {
     fn open_shows_the_malware_tag_when_the_message_has_a_new_uid() {
         // Scanned at UID 571; moved back, or delivered again, as UID 580.
         let db = Database::open_memory().unwrap();
-        let verdict = combine(
-            vec![Signal::new("double_extension", 70, "ext=.pdf.exe").malware()],
-            vec!["attachments".into()],
-            vec![],
-            false,
-        );
-        persist::record_verdict(
-            &db,
-            &VerdictTarget {
-                account_id: "a",
-                folder: "INBOX",
-                uid: 571,
-                message_id: Some("phish@x"),
-                content_fingerprint: None,
-            },
-            &verdict,
-        )
-        .unwrap();
-        let raw = b"Message-ID: <phish@x>\r\nFrom: bob@example.test\r\nTo: me@example.org\r\nSubject: s\r\n\r\nbody\r\n";
+        let raw = b"Message-ID: <phish@x>\r\nFrom: bob@example.test\r\nTo: me@example.org\r\n\
+Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--b\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n";
+        let open = |uid| {
+            verdict_for_open(
+                &db,
+                "a",
+                "me@example.org",
+                "INBOX",
+                uid,
+                Some(raw),
+                &ThreatConfig::default(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let scanned = open(571);
+        assert_eq!(scanned["malware"], true, "{scanned}");
 
-        let view = verdict_for_open(
-            &db,
-            "a",
-            "me@example.org",
-            "INBOX",
-            580,
-            Some(raw),
-            &ThreatConfig::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let view = open(580);
 
         assert_eq!(view["malware"], true, "{view}");
+        assert_eq!(
+            view["computed_at"], scanned["computed_at"],
+            "the same bytes reuse the verdict"
+        );
     }
 
     #[test]
