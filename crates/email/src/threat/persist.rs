@@ -1318,6 +1318,48 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
     }
 
     #[test]
+    fn prepare_input_takes_the_receiving_domain_from_the_account() {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "me",
+                EMAIL,
+                "pw",
+                "smtp.example.org",
+                587,
+                "imap.example.org",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let raw = "Authentication-Results: mx.example.org; dmarc=pass header.from=bank.example\r\n\
+                   Received: from out.bank.example (out.bank.example [192.0.2.1]) by mx.example.org with ESMTPS id q; Mon, 21 Sep 2026 10:00:00 +0000\r\n\
+                   Message-ID: <r1@x>\r\nFrom: Bank <alerts@bank.example>\r\nTo: me@example.org\r\n\
+                   Subject: s\r\n\r\nhi\r\n";
+        let prepared = |account_id: &str, config: &ThreatConfig| {
+            prepare_input(&db, account_id, EMAIL, raw.as_bytes(), config).unwrap()
+        };
+
+        let input = prepared(&account.id, &ThreatConfig::default());
+        assert_eq!(input.receiver_domain.as_deref(), Some("example.org"));
+        assert!(matches!(
+            super::super::auth_results::sender_auth(&input),
+            super::super::auth_results::SenderAuth::Pass { .. }
+        ));
+
+        let mut config = ThreatConfig::default();
+        config
+            .receiver_domains
+            .insert(EMAIL.to_string(), "relay.example".to_string());
+        let input = prepared(&account.id, &config);
+        assert_eq!(input.receiver_domain.as_deref(), Some("relay.example"));
+
+        // No account row: nothing to trust.
+        let input = prepared("missing", &ThreatConfig::default());
+        assert_eq!(input.receiver_domain, None);
+    }
+
+    #[test]
     fn reputation_lookups_become_domain_only_lookup_performed_events() {
         use super::super::reputation::{CACHE_FILE_NAME, ReputationAnalyzer, ReputationCache};
         let db = Database::open_memory().unwrap();

@@ -4,6 +4,7 @@
 //! `envelope code` — poll IMAP for a verification code and extract it.
 
 use anyhow::{Context, Result, bail};
+use envelope_email_store::Account;
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::code_extractor::extract_code;
 use envelope_email_transport::imap;
@@ -43,19 +44,19 @@ enum Classified {
 
 /// Judge one raw message. The From filter, subject, code and sender
 /// authentication all come from the same bytes. A candidate needs a pass
-/// for the very domain in its From header, from results written in
-/// `receiver_domain`, the account's receiving mail domain.
+/// for the very domain in its From header, from results written in the
+/// account's receiving mail domain (see [`ThreatConfig::receiver_domain`]).
 fn classify(
     raw: &[u8],
-    account: &str,
-    receiver_domain: Option<&str>,
+    account: &Account,
+    config: &ThreatConfig,
     from_filter: Option<&str>,
     subject_filter: Option<&str>,
 ) -> Classified {
-    let Ok(mut input) = ThreatInput::from_raw(raw, account) else {
+    let Ok(mut input) = ThreatInput::from_raw(raw, &account.username) else {
         return Classified::NoMatch;
     };
-    input.receiver_domain = receiver_domain.map(str::to_string);
+    input.receiver_domain = config.receiver_domain(&account.username, Some(&account.imap_host));
     if from_filter.is_some_and(|filter| !sender_matches(&input.from_addr, filter)) {
         return Classified::NoMatch;
     }
@@ -241,9 +242,8 @@ pub async fn run(
 
     let (_db, creds) = setup_credentials(account, backend)?;
     let allow_unverified = super::config::otp_unverified_senders_allowed(&creds.account)?;
-    let receiver_domain = ThreatConfig::load()
-        .context("threat configuration is invalid; fix it with `envelope config`")?
-        .receiver_domain(&creds.account.username, Some(&creds.account.imap_host));
+    let threat_config = ThreatConfig::load()
+        .context("threat configuration is invalid; fix it with `envelope config`")?;
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
@@ -299,8 +299,8 @@ pub async fn run(
             };
             classified.push(classify(
                 &raw,
-                &creds.account.username,
-                receiver_domain.as_deref(),
+                &creds.account,
+                &threat_config,
                 from_filter,
                 subject_filter,
             ));
@@ -510,11 +510,31 @@ mod tests {
     const ISSUER_PASS: &str =
         "mx1.example.org; dkim=pass header.d=issuer.example; dmarc=pass header.from=issuer.example";
 
+    /// The account `me@example.org`, whose mail `imap_host` serves.
+    fn mailbox(imap_host: &str) -> Account {
+        Account {
+            id: "acct-test".to_string(),
+            name: "Me".to_string(),
+            username: "me@example.org".to_string(),
+            domain: "example.org".to_string(),
+            smtp_host: "smtp.example.org".to_string(),
+            smtp_port: 587,
+            imap_host: imap_host.to_string(),
+            imap_port: 993,
+            smtp_username: None,
+            imap_username: None,
+            display_name: None,
+            signature_text: None,
+            signature_html: None,
+            created_at: "2026-10-03T00:00:00Z".to_string(),
+        }
+    }
+
     fn classify_issuer(raw: &[u8]) -> Classified {
         classify(
             raw,
-            "me@example.org",
-            Some("example.org"),
+            &mailbox("imap.example.org"),
+            &ThreatConfig::default(),
             Some("issuer.example"),
             None,
         )
@@ -580,21 +600,47 @@ mod tests {
     #[test]
     fn classify_trusts_only_the_accounts_receiver() {
         let raw = otp_message(Some(ISSUER_PASS), "Issuer <otp@issuer.example>", "555555");
-        for receiver in [None, Some("attacker.example")] {
+        let default = ThreatConfig::default();
+        let mut moved = ThreatConfig::default();
+        moved
+            .receiver_domains
+            .insert("me@example.org".to_string(), "attacker.example".to_string());
+        let mut pinned = ThreatConfig::default();
+        pinned
+            .receiver_domains
+            .insert("me@example.org".to_string(), "example.org".to_string());
+
+        // The IMAP host names the receiving domain, or the operator does.
+        for (imap_host, config) in [("imap.example.org", &default), ("127.0.0.1", &pinned)] {
+            let classified = classify(
+                &raw,
+                &mailbox(imap_host),
+                config,
+                Some("issuer.example"),
+                None,
+            );
+            assert!(
+                matches!(classified, Classified::Candidate(_)),
+                "{imap_host}: {classified:?}"
+            );
+        }
+        // Results from anywhere else prove nothing.
+        for (imap_host, config) in [
+            ("imap.attacker.example", &default),
+            ("127.0.0.1", &default),
+            ("imap.example.org", &moved),
+        ] {
             match classify(
                 &raw,
-                "me@example.org",
-                receiver,
+                &mailbox(imap_host),
+                config,
                 Some("issuer.example"),
                 None,
             ) {
                 Classified::Rejected(c) => {
-                    assert!(
-                        matches!(c.auth, SenderAuth::Unverifiable(_)),
-                        "{receiver:?}"
-                    )
+                    assert!(matches!(c.auth, SenderAuth::Unverifiable(_)), "{imap_host}")
                 }
-                other => panic!("{receiver:?}: {other:?}"),
+                other => panic!("{imap_host}: {other:?}"),
             }
         }
     }
@@ -613,8 +659,8 @@ mod tests {
         ] {
             match classify(
                 &raw,
-                "me@example.org",
-                Some("example.org"),
+                &mailbox("imap.example.org"),
+                &ThreatConfig::default(),
                 Some(filter),
                 None,
             ) {

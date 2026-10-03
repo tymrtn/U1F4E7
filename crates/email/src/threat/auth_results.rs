@@ -1174,6 +1174,20 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_arc_set_below_the_edge_is_neither_trusted_nor_flagged() {
+        // Mail forwarded on from another Gmail mailbox carries that earlier
+        // hop's ARC set, from mx.google.com, below this delivery's edge.
+        let upstream = format!("ARC-Authentication-Results: i=1; mx.google.com; {BANK_FAIL}");
+        let headers = gmail_delivery(BANK_PASS, BANK_PASS, &[upstream.as_str()]);
+        let input = at(Some("google.com"), &headers);
+        assert_eq!(
+            sender_auth(&input),
+            passed("dmarc", "bank.example", "mx.google.com")
+        );
+        assert!(analyze(&input).is_empty(), "{:?}", analyze(&input));
+    }
+
+    #[test]
     fn results_are_read_only_for_the_accounts_receiver() {
         let gmail = gmail_delivery(BANK_PASS, BANK_PASS, &[]);
         assert_eq!(
