@@ -484,14 +484,17 @@ enum Commands {
         attr: Vec<String>,
     },
 
-    /// Poll for a verification/OTP code from a recent email
+    /// Poll for a verification/OTP code from a recent email. A code counts only
+    /// when the mail provider authenticated the sender's From domain (DMARC or
+    /// aligned DKIM), unless an operator set otp.allow_unverified_senders for
+    /// the account.
     Code {
         /// Account ID or email. Required with --json so unattended retrieval is
         /// bound to the expected mailbox.
         #[arg(long)]
         account: Option<String>,
-        /// Exact sender address or full domain. With --json this is required;
-        /// fragments, display names, and wildcards are rejected.
+        /// Exact sender address or full domain (required). Fragments, display
+        /// names, and wildcards never match.
         #[arg(long)]
         from: Option<String>,
         /// Optional subject correlation filter (substring match)

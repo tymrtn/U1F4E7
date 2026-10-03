@@ -983,6 +983,7 @@ dependencies = [
  "hickory-resolver",
  "lettre",
  "mail-builder",
+ "mail-parser",
  "mime_guess",
  "reqwest",
  "rpassword",

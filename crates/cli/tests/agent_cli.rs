@@ -849,3 +849,37 @@ fn cli_draft_send_with_confirm_token_requires_human_approval() {
     assert_eq!(payload["status"], "scheduled", "{payload}");
     assert!(send_after(home, &draft_id).is_some());
 }
+
+// ── One-time-code operator opt-in ───────────────────────────────────
+
+#[test]
+fn otp_unverified_opt_in_is_operator_only() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    let key = "otp.allow_unverified_senders";
+
+    let out = run_as(
+        home,
+        &token,
+        &["--json", "config", "set", key, "test@example.test"],
+    );
+    assert_denied(&out, "agent_policy_denied_action");
+    let shown = json_stdout(&run(home, &["--json", "config", "get", key]));
+    assert_eq!(shown["value"], json!([]), "{shown}");
+
+    let out = run(home, &["--json", "config", "set", key, "test@example.test"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = json_stdout(&run(home, &["--json", "config", "get", key]));
+    assert_eq!(shown["value"], json!(["test@example.test"]), "{shown}");
+
+    let out = run_as(home, &token, &["--json", "config", "unset", key]);
+    assert_denied(&out, "agent_policy_denied_action");
+    let out = run(home, &["config", "set", key, "nobody@example.test"]);
+    assert!(!out.status.success(), "an unknown account must be refused");
+}
