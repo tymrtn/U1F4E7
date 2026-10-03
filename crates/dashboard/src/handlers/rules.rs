@@ -100,7 +100,7 @@ pub async fn test_message(
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("rules: {e}")).into_response();
             }
         };
-        let ctx = match build_message_context(&msg, &db, &account_id) {
+        let ctx = match build_message_context(&msg, &q.folder, &db, &account_id) {
             Ok(ctx) => ctx,
             Err(e) => {
                 return (
@@ -226,7 +226,7 @@ pub async fn preview(
     {
         let db = state.db.lock().await;
         for summary in &summaries {
-            let ctx = match rule_exec::build_summary_context(summary, &db, &account_id) {
+            let ctx = match rule_exec::build_summary_context(summary, &folder, &db, &account_id) {
                 Ok(ctx) => ctx,
                 Err(_) => continue,
             };
@@ -784,8 +784,10 @@ pub async fn disable(
     }
 }
 
+/// Threat data comes from the message's own verdict.
 fn build_message_context(
     msg: &Message,
+    folder: &str,
     db: &Database,
     account_id: &str,
 ) -> anyhow::Result<MessageContext> {
@@ -816,14 +818,18 @@ fn build_message_context(
 
     let contact_tags = db.get_contact_tags(account_id, &msg.from_addr)?;
 
-    Ok(MessageContext {
+    let mut ctx = MessageContext {
         from_addr: msg.from_addr.clone(),
         to_addr: msg.to_addr.clone(),
         subject: msg.subject.clone(),
         tags,
         scores,
         contact_tags,
-    })
+    };
+    envelope_email_transport::threat::persist::bind_threat_context(
+        db, account_id, folder, msg.uid, &mut ctx,
+    )?;
+    Ok(ctx)
 }
 
 #[cfg(test)]
@@ -880,7 +886,7 @@ mod tests {
         // summary — the derived provider_spam seeds the dimension with no
         // full-message parse.
         let derived = summary(1, "<derived@example.com>", Some(6.5));
-        let ctx = build_summary_context(&derived, &db, "acct").unwrap();
+        let ctx = build_summary_context(&derived, "INBOX", &db, "acct").unwrap();
         assert_eq!(ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION), Some(&6.5));
 
         // A persisted score keyed on the bare id is found for a bracketed
@@ -895,7 +901,7 @@ mod tests {
         )
         .unwrap();
         let pinned = summary(2, "<pinned@example.com>", Some(9.9));
-        let ctx = build_summary_context(&pinned, &db, "acct").unwrap();
+        let ctx = build_summary_context(&pinned, "INBOX", &db, "acct").unwrap();
         assert_eq!(
             ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
             Some(&2.0),

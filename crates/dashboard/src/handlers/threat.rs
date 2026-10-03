@@ -108,8 +108,12 @@ pub fn verdict_for_open(
     let (key, fingerprint) = match raw {
         Some(raw) => {
             let fingerprint = threat::content_fingerprint(raw);
-            let key =
-                persist::threat_key(threat::sole_message_id(raw).as_deref(), Some(&fingerprint));
+            let key = persist::threat_key(
+                db,
+                account_id,
+                threat::sole_message_id(raw).as_deref(),
+                Some(&fingerprint),
+            )?;
             (key, Some(fingerprint))
         }
         None => persist::stored_verdict_for_uid(db, account_id, folder, uid)?
@@ -247,14 +251,17 @@ pub fn mark_safe_message(
             format!("{e:#}"),
         );
     }
-    let key = persist::threat_key(message_id.as_deref(), Some(&fingerprint));
-    match verdict_view(
-        db,
-        account_id,
-        key.as_deref(),
-        Some(&fingerprint),
-        &stored.verdict,
-    ) {
+    let view = persist::threat_key(db, account_id, message_id.as_deref(), Some(&fingerprint))
+        .and_then(|key| {
+            verdict_view(
+                db,
+                account_id,
+                key.as_deref(),
+                Some(&fingerprint),
+                &stored.verdict,
+            )
+        });
+    match view {
         Ok(view) => Json(json!({"status": "marked_safe", "threat": view})).into_response(),
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -356,9 +356,11 @@ pub async fn run_release(
     let raw = fetch_raw(&mut client, folder, uid).await?;
     let message_id = threat::sole_message_id(&raw);
     let key = persist::threat_key(
+        &db,
+        &account_id,
         message_id.as_deref(),
         Some(&threat::content_fingerprint(&raw)),
-    );
+    )?;
 
     let ctx = MessageContext {
         from_addr: String::new(),
@@ -560,6 +562,50 @@ mod tests {
         apply_read_policy(&mut msg, None);
         assert_eq!(msg["sanitized"], false);
         assert!(msg["threat"].is_null());
+    }
+
+    /// `threat show` lists the tags of the message's own content: Mark safe
+    /// on another message with its Message-ID leaves them alone.
+    #[test]
+    fn threat_show_keeps_a_twin_s_tags_after_mark_safe_on_the_other() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let clean = b"Message-ID: <twin@x>\r\nFrom: Alice <alice@partner.example>\r\n\
+To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
+        let phish = b"Message-ID: <twin@x>\r\nFrom: IT Desk <it@examp1e.org>\r\n\
+To: me@example.org\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n";
+        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(clean), &config)
+            .unwrap();
+        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 2, Some(phish), &config)
+            .unwrap();
+        persist::mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: "a",
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("twin@x"),
+                content_fingerprint: Some(&threat::content_fingerprint(clean)),
+            },
+            "cli",
+            None,
+        )
+        .unwrap();
+
+        let stored = persist::stored_verdict_for_uid(&db, "a", "INBOX", 2)
+            .unwrap()
+            .unwrap();
+        let value = verdict_json(&db, "a", &stored).unwrap();
+        assert_eq!(value["message_id"], "twin@x");
+        assert_eq!(
+            value["tags"],
+            json!([threat::TAG_DANGEROUS, threat::TAG_MALWARE]),
+            "{value}"
+        );
     }
 
     /// `threat show --json` and MCP `threat_show` serve `verdict_json`; the

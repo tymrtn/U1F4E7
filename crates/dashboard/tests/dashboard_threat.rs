@@ -396,3 +396,55 @@ async fn mark_safe_binds_to_the_bytes_at_that_uid() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "rescan_required");
 }
+
+#[tokio::test]
+async fn mark_safe_on_one_twin_leaves_the_other_flagged_in_the_banner() {
+    let (state, _) = state();
+    let db = state.db.clone();
+    let app = dashboard_router(state);
+    let clean: &[u8] = b"Message-ID: <twin@x>\r\nFrom: Alice <alice@partner.example>\r\n\
+To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
+    let open = |uid: u32, raw: &'static [u8]| {
+        let db = db.clone();
+        async move {
+            envelope_email_dashboard::handlers::threat::verdict_for_open(
+                &*db.lock().await,
+                "acc1",
+                "me@example.org",
+                "INBOX",
+                uid,
+                Some(raw),
+                &ThreatConfig::default(),
+            )
+            .unwrap()
+            .unwrap()
+        }
+    };
+    let twin = String::from_utf8_lossy(PHISH).replace("phish@x", "twin@x");
+    let twin: &'static [u8] = Box::leak(twin.into_bytes().into_boxed_slice());
+    open(11, clean).await;
+    open(12, twin).await;
+
+    let (status, body) = mark_bytes_safe(&db, 11, clean).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for view in [
+        open(12, twin).await,
+        send(
+            &app,
+            "GET",
+            "/api/accounts/acc1/messages/12/threat?folder=INBOX",
+            None,
+            None,
+        )
+        .await
+        .1["threat"]
+            .clone(),
+    ] {
+        assert_eq!(view["malware"], true, "{view}");
+        assert_eq!(view["marked_safe"], false, "{view}");
+        let tags = view["tags"].as_array().unwrap();
+        assert!(tags.contains(&"threat:malware".into()), "{view}");
+        assert!(!tags.contains(&"threat:false_positive".into()), "{view}");
+    }
+}

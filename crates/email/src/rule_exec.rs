@@ -372,10 +372,12 @@ pub fn flatten_authored_action(
     })
 }
 
-/// Build a rule-evaluation context from a header-only summary plus the local
-/// tag/score/contact stores. No body fetch.
+/// Build a rule-evaluation context from a header-only summary in `folder`
+/// plus the local tag/score/contact stores. No body fetch. Threat data comes
+/// from the message's own verdict ([`crate::threat::persist::bind_threat_context`]).
 pub fn build_summary_context(
     summary: &MessageSummary,
+    folder: &str,
     db: &Database,
     account_id: &str,
 ) -> Result<MessageContext> {
@@ -410,14 +412,17 @@ pub fn build_summary_context(
         .get_contact_tags(account_id, &summary.from_addr)
         .context("failed to get contact tags")?;
 
-    Ok(MessageContext {
+    let mut ctx = MessageContext {
         from_addr: summary.from_addr.clone(),
         to_addr: summary.to_addr.clone(),
         subject: summary.subject.clone(),
         tags,
         scores,
         contact_tags,
-    })
+    };
+    crate::threat::persist::bind_threat_context(db, account_id, folder, summary.uid, &mut ctx)
+        .context("failed to read the message's threat verdict")?;
+    Ok(ctx)
 }
 
 /// Display-safe action JSON: webhook URLs are redacted.
@@ -1139,7 +1144,7 @@ pub async fn apply_rules_to_summaries<M: RuleMailbox, D: ExecDb>(
     }
     for summary in summaries {
         let ctx = db
-            .with_db(|d| build_summary_context(summary, d, account.id))
+            .with_db(|d| build_summary_context(summary, folder, d, account.id))
             .await?;
         let message_id = summary
             .message_id
@@ -1576,7 +1581,7 @@ mod tests {
     async fn offer_with_move_to_trash_is_refused_at_execution() {
         // Built in code, bypassing serde, to prove the executor re-validates.
         let db = Database::open_memory().unwrap();
-        let ctx = build_summary_context(&summary(1, "m@x", "a@b"), &db, ACCT).unwrap();
+        let ctx = build_summary_context(&summary(1, "m@x", "a@b"), "INBOX", &db, ACCT).unwrap();
         let target = MessageTarget {
             account_id: ACCT,
             account_email: EMAIL,
