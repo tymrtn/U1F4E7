@@ -289,6 +289,9 @@ fn authorize_tool_call_with_db(
     let Some(ctx) = ctx else {
         return Ok(());
     };
+    if writes_threat_tag(tool_name, params) {
+        return Err(agent_context::operator_only_denial().to_json().to_string());
+    }
     let account = authoritative_policy_account(db, tool_name, params)?;
     let folder = tool_folder(tool_name, params);
 
@@ -317,6 +320,26 @@ fn authorize_tool_call_with_db(
 
     ctx.authorize_tool(tool_name, &account, folder)
         .map_err(|denial| denial.to_json().to_string())
+}
+
+/// A `tag` call or `bulk` tag op naming a threat tag, which only the
+/// operator may set.
+fn writes_threat_tag(tool_name: &str, params: &Value) -> bool {
+    use envelope_email_transport::threat::is_threat_tag;
+    match tool_name {
+        "tag" => params
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().filter_map(Value::as_str).any(is_threat_tag)),
+        "bulk" => {
+            params.get("op").and_then(Value::as_str) == Some("tag")
+                && params
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_threat_tag)
+        }
+        _ => false,
+    }
 }
 
 fn authorize_tool_call(
@@ -3051,6 +3074,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(denial.contains("agent_policy_denied_account"), "{denial}");
+    }
+
+    #[test]
+    fn threat_tags_are_operator_only_for_an_agent() {
+        use envelope_email_transport::{AgentPolicy as TransportPolicy, SendMode};
+
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Me",
+                "me@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let ctx = AgentContext {
+            agent_id: "agent-1".into(),
+            agent_name: "skippy".into(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".into()],
+                allowed_folders: vec!["*".into()],
+                allowed_actions: vec!["*".into()],
+                send_mode_ceiling: SendMode::DraftOnly,
+                allow_recipients: Vec::new(),
+            },
+        };
+        let acct = account.username.as_str();
+        for (tool, params) in [
+            (
+                "tag",
+                json!({"account": acct, "uid": 1, "tags": ["threat:false_positive"]}),
+            ),
+            (
+                "tag",
+                json!({"account": acct, "uid": 1, "tags": ["ok", "Threat:Malware"]}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "tag", "tag": "threat:quarantined", "uids": [1]}),
+            ),
+        ] {
+            let denial = authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).unwrap_err();
+            assert!(denial.contains("operator_only_command"), "{tool}: {denial}");
+            // The anonymous override has no agent policy to apply.
+            assert!(authorize_tool_call_with_db(&db, None, tool, &params).is_ok());
+        }
+        assert!(
+            authorize_tool_call_with_db(
+                &db,
+                Some(&ctx),
+                "tag",
+                &json!({"account": acct, "uid": 1, "tags": ["newsletter"]}),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

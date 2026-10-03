@@ -69,6 +69,17 @@ pub const AGENT_TOKEN_INVALID_CODE: &str = "agent_token_invalid";
 /// Stable code for a command that never runs with an agent token.
 pub const OPERATOR_ONLY_CODE: &str = "operator_only_command";
 
+/// The refusal for something only the operator may do.
+pub fn operator_only_denial() -> PolicyDenial {
+    PolicyDenial {
+        code: OPERATOR_ONLY_CODE,
+        reason: "this changes credentials, agents, policy, configuration, authentication, \
+                 delivery routes or a threat verdict, so it runs only for the operator, \
+                 without an agent token"
+            .to_string(),
+    }
+}
+
 /// A CLI command refused for the acting agent, as a stable `{code, reason}`.
 #[derive(Debug)]
 pub struct CliDenial(pub PolicyDenial);

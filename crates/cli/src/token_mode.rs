@@ -10,8 +10,7 @@
 //! before dispatch.
 
 use crate::commands::agent_context::{
-    self, AgentContext, CliDenial, OPERATOR_ONLY_CODE, RULES_WRITE, SIEVE_PUBLISH, UNSUBSCRIBE,
-    WATCH_WEBHOOK,
+    self, AgentContext, CliDenial, RULES_WRITE, SIEVE_PUBLISH, UNSUBSCRIBE, WATCH_WEBHOOK,
 };
 use crate::{
     AccountsCmd, ActionsCmd, ActionsExecCmd, AgentCmd, AgentPolicyCmd, AnalyticsCmd, AttachmentCmd,
@@ -21,6 +20,7 @@ use crate::{
     ThreadCmd, ThreatCmd,
 };
 use envelope_email_transport::PolicyDenial;
+use envelope_email_transport::threat::is_threat_tag;
 
 /// How a command runs under an agent token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,9 @@ pub(crate) enum Permission {
     /// command may then apply more of the policy itself (account, ceiling,
     /// allowlist, human approval).
     Gated(&'static [&'static str]),
-    /// Changes credentials, identities, policy, authentication, delivery
-    /// routes, or another person's decision. Never runs with an agent token.
+    /// Changes credentials, identities, policy, configuration,
+    /// authentication, delivery routes, a threat verdict, or another
+    /// person's decision. Never runs with an agent token.
     OperatorOnly,
 }
 
@@ -103,7 +104,13 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
             BulkCmd::Move { .. } | BulkCmd::Copy { .. } => Gated(BULK_MOVE),
             BulkCmd::Flag { .. } => Gated(BULK_FLAG),
             BulkCmd::Delete { .. } => Gated(BULK_DELETE),
-            BulkCmd::Tag { .. } => Gated(BULK_TAG),
+            BulkCmd::Tag { tag, .. } => {
+                if is_threat_tag(tag) {
+                    OperatorOnly
+                } else {
+                    Gated(BULK_TAG)
+                }
+            }
         },
         Commands::Migrate { subcommand } => match subcommand {
             MigrateCmd::Folders { .. } | MigrateCmd::Run { .. } => OperatorOnly,
@@ -206,17 +213,30 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
         },
         Commands::Tag { subcommand } => match subcommand {
             TagCmd::Show { .. } | TagCmd::List { .. } => ReadOnly,
-            TagCmd::Set { .. } => Gated(TAG),
+            TagCmd::Set { tag, .. } => {
+                if tag.iter().any(|t| is_threat_tag(t)) {
+                    OperatorOnly
+                } else {
+                    Gated(TAG)
+                }
+            }
         },
         Commands::Rule { subcommand } => match subcommand {
             RuleCmd::List { .. }
             | RuleCmd::Test { .. }
             | RuleCmd::Preview { .. }
             | RuleCmd::Export { .. } => ReadOnly,
-            RuleCmd::Create { .. }
-            | RuleCmd::Enable { .. }
-            | RuleCmd::Disable { .. }
-            | RuleCmd::Delete { .. } => Gated(RULES_EDIT),
+            // An action naming a threat tag would set a verdict when it runs.
+            RuleCmd::Create { action, .. } => {
+                if action.to_lowercase().contains("threat:") {
+                    OperatorOnly
+                } else {
+                    Gated(RULES_EDIT)
+                }
+            }
+            RuleCmd::Enable { .. } | RuleCmd::Disable { .. } | RuleCmd::Delete { .. } => {
+                Gated(RULES_EDIT)
+            }
             // Without --confirm, `rule run` only explains itself.
             RuleCmd::Run { confirm, .. } => {
                 if *confirm {
@@ -296,12 +316,7 @@ fn decide(permission: Permission, agent: &AgentContext) -> Result<(), PolicyDeni
         Gated(actions) => actions
             .iter()
             .try_for_each(|action| agent.allows_action(action)),
-        OperatorOnly => Err(PolicyDenial {
-            code: OPERATOR_ONLY_CODE,
-            reason: "this command changes credentials, agents, policy, authentication or \
-                     delivery routes, so it runs only for the operator, without an agent token"
-                .to_string(),
-        }),
+        OperatorOnly => Err(agent_context::operator_only_denial()),
     }
 }
 
@@ -363,6 +378,7 @@ mod tests {
         ),
         ("bulk delete --uids 1", Gated(BULK_DELETE)),
         ("bulk tag --tag t --uids 1", Gated(BULK_TAG)),
+        ("bulk tag --tag threat:malware --uids 1", OperatorOnly),
         ("folders", ReadOnly),
         ("migrate folders --from a --to b", OperatorOnly),
         ("migrate run --from a --to b", OperatorOnly),
@@ -435,11 +451,19 @@ mod tests {
         ("thread list", ReadOnly),
         ("thread build", ReadOnly),
         ("tag set 1 --tag t", Gated(TAG)),
+        (
+            "tag set 1 --tag ok --tag Threat:False_Positive",
+            OperatorOnly,
+        ),
         ("tag show 1", ReadOnly),
         ("tag list", ReadOnly),
         (
             "rule create --name n --match-from * --action delete",
             Gated(RULES_EDIT),
+        ),
+        (
+            "rule create --name n --match-from * --action add_tag=threat:false_positive",
+            OperatorOnly,
         ),
         ("rule list", ReadOnly),
         ("rule test 1", ReadOnly),
@@ -554,7 +578,11 @@ mod tests {
             match permission {
                 ReadOnly => assert!(outcome.is_ok(), "`{argv}`"),
                 OperatorOnly => {
-                    assert_eq!(outcome.unwrap_err().code, OPERATOR_ONLY_CODE, "`{argv}`")
+                    assert_eq!(
+                        outcome.unwrap_err().code,
+                        agent_context::OPERATOR_ONLY_CODE,
+                        "`{argv}`"
+                    )
                 }
                 Gated(actions) => {
                     let named = actions
@@ -594,6 +622,9 @@ mod tests {
         for word in argv.split_whitespace().filter(|w| CLASS_FLAGS.contains(w)) {
             key.push(' ');
             key.push_str(word);
+        }
+        if argv.to_lowercase().contains("threat:") {
+            key.push_str(" with a threat:* tag");
         }
         key
     }

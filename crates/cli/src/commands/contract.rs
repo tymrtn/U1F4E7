@@ -117,6 +117,9 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "contacts untag",
     "config set",
     "config unset",
+    "tag set with a threat:* tag",
+    "bulk tag with a threat:* tag",
+    "rule create with a threat:* tag",
 ];
 
 fn cli_gated_commands() -> Value {

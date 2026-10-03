@@ -53,6 +53,15 @@ pub const TAG_MALWARE: &str = "threat:malware";
 pub const TAG_QUARANTINED: &str = "threat:quarantined";
 pub const TAG_FALSE_POSITIVE: &str = "threat:false_positive";
 
+/// A tag in the threat engine's namespace. These record verdicts
+/// (`threat:false_positive` lifts the attachment block), so only the
+/// operator may set or clear them by hand.
+pub fn is_threat_tag(tag: &str) -> bool {
+    tag.trim()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("threat:"))
+}
+
 pub const SUSPICIOUS_THRESHOLD: u32 = 30;
 pub const DANGEROUS_THRESHOLD: u32 = 70;
 pub const MAX_SCORE: u32 = 100;
