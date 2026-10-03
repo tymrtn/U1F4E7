@@ -506,6 +506,35 @@ pub struct StoredVerdict {
     pub content_fingerprint: Option<String>,
 }
 
+impl StoredVerdict {
+    /// Whether this verdict is for the message a server reports with
+    /// `message_id`: its own Message-ID, or, for a message without one
+    /// usable Message-ID, one of the values its scan read (an absent or
+    /// empty one matching a scan that read none or an empty one).
+    pub fn is_for_message_id(&self, message_id: Option<&str>) -> bool {
+        let reported = message_id
+            .map(envelope_email_store::canonical_message_id)
+            .filter(|m| !m.is_empty());
+        let observed = &self.observed_message_ids;
+        match (self.message_id.as_deref(), reported) {
+            (Some(own), reported) => reported == Some(own),
+            (None, Some(reported)) => observed.iter().any(|m| m == reported),
+            (None, None) => observed.is_empty() || observed.iter().any(String::is_empty),
+        }
+    }
+
+    /// Whether this verdict is for the message `seen` describes: the same
+    /// fingerprint when the bytes are known, else the same Message-ID.
+    pub fn is_for(&self, seen: Seen<'_>) -> bool {
+        match seen {
+            Seen::Bytes(fingerprint) => {
+                fingerprint.is_some() && self.content_fingerprint.as_deref() == fingerprint
+            }
+            Seen::MessageId(message_id) => self.is_for_message_id(message_id),
+        }
+    }
+}
+
 /// The newest verdict recorded for a folder/UID, with its Message-ID.
 pub fn stored_verdict_for_uid(
     db: &Database,
@@ -519,10 +548,10 @@ pub fn stored_verdict_for_uid(
 }
 
 /// The stored verdict that judged these bytes at folder/UID: the UID's own
-/// verdict when its Message-ID matches and its fingerprint is equal or
-/// missing (stored before fingerprints), else the newest verdict for the
-/// Message-ID with the same fingerprint. A verdict on other bytes that share
-/// the Message-ID never applies.
+/// verdict when its Message-ID matches and its fingerprint is equal, else
+/// the newest verdict for the Message-ID with the same fingerprint. A
+/// verdict stored without a fingerprint, or on other bytes that share the
+/// Message-ID, never applies.
 pub fn matching_verdict(
     db: &Database,
     account_id: &str,
@@ -533,10 +562,7 @@ pub fn matching_verdict(
 ) -> Result<Option<StoredVerdict>> {
     if let Some(own) = stored_verdict_for_uid(db, account_id, folder, uid)?
         && own.message_id.as_deref() == message_id
-        && own
-            .content_fingerprint
-            .as_deref()
-            .is_none_or(|fp| fp == fingerprint)
+        && own.content_fingerprint.as_deref() == Some(fingerprint)
     {
         return Ok(Some(own));
     }
@@ -867,7 +893,14 @@ fn rule_context(
         scores,
         contact_tags: db.get_contact_tags(account_id, &scanned.from_addr)?,
     };
-    bind_threat_context(db, account_id, folder, uid, &mut ctx)?;
+    bind_threat_context(
+        db,
+        account_id,
+        folder,
+        uid,
+        Seen::Bytes(scanned.content_fingerprint.as_deref()),
+        &mut ctx,
+    )?;
     Ok(ctx)
 }
 
@@ -878,16 +911,27 @@ pub fn bind_threat_context(
     account_id: &str,
     folder: &str,
     uid: u32,
+    seen: Seen<'_>,
     ctx: &mut MessageContext,
 ) -> Result<()> {
     ctx.tags.retain(|t| !t.starts_with("threat:"));
     ctx.scores.remove(THREAT_DIMENSION);
-    let bound = bound_threat(db, account_id, folder, uid)?;
+    let bound = bound_threat(db, account_id, folder, uid, seen)?;
     if let Some(score) = bound.score {
         ctx.scores.insert(THREAT_DIMENSION.to_string(), score.value);
     }
     ctx.tags.extend(bound.tags.into_iter().map(|t| t.tag));
     Ok(())
+}
+
+/// What a caller knows of the message at a folder/UID now, to tell whether
+/// the verdict stored there is for it.
+#[derive(Debug, Clone, Copy)]
+pub enum Seen<'a> {
+    /// Its bytes: their content fingerprint, `None` when they have none.
+    Bytes(Option<&'a str>),
+    /// Only its Message-ID, as the server reports it.
+    MessageId(Option<&'a str>),
 }
 
 /// One message's own threat data.
@@ -901,16 +945,21 @@ pub struct BoundThreat {
 /// folder/UID gives its message, read under that message's own threat key.
 /// Stores keyed by Message-ID are shared by every message with that
 /// Message-ID, so they never decide one message's threat data. A UID
-/// without a verdict has none. A tag or score stored under the key keeps
-/// its record; one the verdict implies without a record is dated by it.
+/// without a verdict has none, and so does one whose verdict is for another
+/// message by `seen` (the UID was reused). A tag or score stored under the
+/// key keeps its record; one the verdict implies without a record is dated
+/// by it.
 pub fn bound_threat(
     db: &Database,
     account_id: &str,
     folder: &str,
     uid: u32,
+    seen: Seen<'_>,
 ) -> Result<BoundThreat> {
     let mut bound = BoundThreat::default();
-    let Some(stored) = stored_verdict_for_uid(db, account_id, folder, uid)? else {
+    let Some(stored) =
+        stored_verdict_for_uid(db, account_id, folder, uid)?.filter(|stored| stored.is_for(seen))
+    else {
         return Ok(bound);
     };
     let verdict = &stored.verdict;
@@ -982,17 +1031,24 @@ pub fn bound_threat(
     Ok(bound)
 }
 
-/// The tags and scores a tag view shows for the message at this folder/UID:
-/// those stored under its Message-ID, with the threat data replaced by
-/// [`bound_threat`], as rule contexts read it.
+/// The tags and scores a tag view shows for the message at this folder/UID,
+/// fetched as `raw` (`None` when read part by part): those stored under its
+/// Message-ID, with the threat data replaced by [`bound_threat`], as rule
+/// contexts read it.
 pub fn shown_tags_and_scores(
     db: &Database,
     account_id: &str,
     folder: &str,
     uid: u32,
     message_id: &str,
+    raw: Option<&[u8]>,
 ) -> Result<(Vec<MessageTag>, Vec<MessageScore>)> {
-    let bound = bound_threat(db, account_id, folder, uid)?;
+    let fingerprint = raw.map(super::content_fingerprint);
+    let seen = match &fingerprint {
+        Some(fingerprint) => Seen::Bytes(fingerprint.as_deref()),
+        None => Seen::MessageId(Some(message_id)),
+    };
+    let bound = bound_threat(db, account_id, folder, uid, seen)?;
     let mut tags = db.get_tags(account_id, message_id)?;
     tags.retain(|t| !t.tag.starts_with("threat:"));
     tags.extend(bound.tags);
@@ -1239,10 +1295,17 @@ pub fn verdict_on_open(
         None => None,
     };
     if !config.enabled || !config.on_read {
-        return Ok(matched.map(|m| m.verdict));
+        // Nothing scans. A verdict stored here without a fingerprint may be
+        // shown; it is never reused or marked safe.
+        let shown = match matched {
+            Some(m) => Some(m.verdict),
+            None => stored_verdict_for_uid(db, account_id, folder, uid)?
+                .filter(|own| own.content_fingerprint.is_none() && own.message_id == message_id)
+                .map(|own| own.verdict),
+        };
+        return Ok(shown);
     }
     if let Some(m) = matched
-        && m.content_fingerprint.is_some()
         && !needs_scan(Some(&m.verdict))
     {
         if (m.folder.as_str(), m.uid) != (folder, Some(i64::from(uid))) {
@@ -2476,6 +2539,52 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         }
     }
 
+    /// A verdict stored without a content fingerprint judged no known bytes:
+    /// it is shown when nothing scans, but never reused or marked safe.
+    #[test]
+    fn a_verdict_without_a_fingerprint_is_shown_but_never_reused_or_marked() {
+        let db = Database::open_memory().unwrap();
+        let raw = ordinary("u@x");
+        let fp = content_fingerprint(&raw);
+        let unbound = VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid: 1,
+            message_id: Some("u@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
+        };
+        let clean = crate::threat::combine(vec![], vec![], vec![], false);
+        record_verdict(&db, &unbound, &clean).unwrap();
+        assert!(
+            matching_verdict(&db, ACCT, "INBOX", 1, Some("u@x"), &fp)
+                .unwrap()
+                .is_none()
+        );
+
+        let off = ThreatConfig {
+            enabled: false,
+            ..ThreatConfig::default()
+        };
+        let shown = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&raw), &off).unwrap();
+        assert_eq!(shown, Some(clean));
+
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Some(&raw),
+            &ThreatConfig::default(),
+        )
+        .unwrap();
+        let own = stored_verdict_for_uid(&db, ACCT, "INBOX", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.content_fingerprint.as_deref(), Some(fp.as_str()));
+    }
+
     /// A Message-ID spelling another message's fingerprint key is unusable,
     /// so that message's threat data never lands under the other's key.
     #[tokio::test]
@@ -2516,6 +2625,49 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         assert!(gate.is_none(), "{gate:?}");
     }
 
+    /// The verdict stored at a folder/UID gives threat data only to the
+    /// message it judged: after a UIDVALIDITY reset, another message at that
+    /// UID shows none.
+    #[tokio::test]
+    async fn bound_threat_ignores_a_verdict_for_another_message_at_the_uid() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let before = phish("before@x");
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(5, before.clone());
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[5], &config).await;
+        let tag_names = |seen: Seen<'_>| -> Vec<String> {
+            let mut names: Vec<String> = bound_threat(&db, ACCT, "INBOX", 5, seen)
+                .unwrap()
+                .tags
+                .into_iter()
+                .map(|t| t.tag)
+                .collect();
+            names.sort();
+            names
+        };
+        let before_fp = content_fingerprint(&before);
+        let flagged = vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED];
+        assert_eq!(tag_names(Seen::Bytes(Some(&before_fp))), flagged);
+        assert_eq!(tag_names(Seen::MessageId(Some("before@x"))), flagged);
+
+        let after = ordinary("after@x");
+        let after_fp = content_fingerprint(&after);
+        for seen in [
+            Seen::Bytes(Some(&after_fp)),
+            Seen::Bytes(None),
+            Seen::MessageId(Some("after@x")),
+            Seen::MessageId(None),
+        ] {
+            let bound = bound_threat(&db, ACCT, "INBOX", 5, seen).unwrap();
+            assert!(bound.tags.is_empty(), "{seen:?}: {:?}", bound.tags);
+            assert!(bound.score.is_none(), "{seen:?}");
+        }
+        let (tags, _) =
+            shown_tags_and_scores(&db, ACCT, "INBOX", 5, "after@x", Some(&after)).unwrap();
+        assert!(tags.is_empty(), "{tags:?}");
+    }
+
     /// A tag view shows the message's own threat data: a twin of a marked
     /// message never shows the mark, and a UID without a verdict shows none.
     #[tokio::test]
@@ -2546,7 +2698,8 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
 
         let shown = |uid: u32| {
-            let (tags, scores) = shown_tags_and_scores(&db, ACCT, "INBOX", uid, "twin@x").unwrap();
+            let (tags, scores) =
+                shown_tags_and_scores(&db, ACCT, "INBOX", uid, "twin@x", None).unwrap();
             let mut tags: Vec<String> = tags.into_iter().map(|t| t.tag).collect();
             tags.sort();
             let threat: Vec<f64> = scores

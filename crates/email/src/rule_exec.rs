@@ -420,8 +420,15 @@ pub fn build_summary_context(
         scores,
         contact_tags,
     };
-    crate::threat::persist::bind_threat_context(db, account_id, folder, summary.uid, &mut ctx)
-        .context("failed to read the message's threat verdict")?;
+    crate::threat::persist::bind_threat_context(
+        db,
+        account_id,
+        folder,
+        summary.uid,
+        crate::threat::persist::Seen::MessageId(summary.message_id.as_deref()),
+        &mut ctx,
+    )
+    .context("failed to read the message's threat verdict")?;
     Ok(ctx)
 }
 
@@ -536,8 +543,9 @@ async fn perform<M: RuleMailbox, D: ExecDb>(
             Ok("deleted".to_string())
         }
         Action::AddTag(tag) => {
-            let Some(message_id) = target.message_id.filter(|m| !m.is_empty()) else {
-                bail!("add_tag:{tag} needs a Message-ID; UID {uid} in {folder} has none");
+            let Some(message_id) = target.message_id.and_then(crate::threat::usable_message_id)
+            else {
+                bail!("add_tag:{tag} needs a usable Message-ID; UID {uid} in {folder} has none");
             };
             db.with_db(|d| {
                 d.add_tag(
@@ -1294,6 +1302,29 @@ mod tests {
         assert_eq!(taken["source"], "rule");
         assert_eq!(taken["rule_name"], "travel");
         assert!(mbox.calls.is_empty(), "add_tag must not touch IMAP");
+    }
+
+    /// Fingerprint keys own the `fp:` prefix: a Message-ID shaped like one
+    /// never keys a tag write.
+    #[tokio::test]
+    async fn add_tag_refuses_a_message_id_shaped_like_a_fingerprint_key() {
+        let db = Database::open_memory().unwrap();
+        rule(&db, "travel", r#"{"add_tag":"travel"}"#);
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[
+                summary(7, "fp:v2:abc", "x@airline.example"),
+                summary(8, "FP:v2:def", "x@airline.example"),
+            ],
+        )
+        .await;
+
+        assert!(db.get_tags(ACCT, "fp:v2:abc").unwrap().is_empty());
+        assert!(db.get_tags(ACCT, "FP:v2:def").unwrap().is_empty());
+        assert_eq!(report.actions, 0, "{report:?}");
     }
 
     #[tokio::test]

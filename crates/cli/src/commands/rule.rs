@@ -148,7 +148,12 @@ fn build_message_context(
         contact_tags,
     };
     envelope_email_transport::threat::persist::bind_threat_context(
-        db, account_id, folder, msg.uid, &mut ctx,
+        db,
+        account_id,
+        folder,
+        msg.uid,
+        envelope_email_transport::threat::persist::Seen::MessageId(msg.message_id.as_deref()),
+        &mut ctx,
     )
     .context("failed to read the message's threat verdict")?;
     Ok(ctx)

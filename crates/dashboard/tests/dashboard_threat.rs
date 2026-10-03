@@ -449,3 +449,31 @@ To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
         assert!(!tags.contains(&"threat:false_positive".into()), "{view}");
     }
 }
+
+/// A verdict stored without a content fingerprint judged no known bytes, so
+/// Mark safe on the bytes now at that UID needs a rescan first.
+#[tokio::test]
+async fn mark_safe_refuses_a_verdict_without_a_fingerprint() {
+    let (state, _) = state();
+    let db = state.db.clone();
+    let raw = String::from_utf8_lossy(PHISH)
+        .replace("<phish@x>", "<legacy@x>")
+        .into_bytes();
+    persist::record_verdict(
+        &*db.lock().await,
+        &VerdictTarget {
+            account_id: "acc1",
+            folder: "INBOX",
+            uid: 9,
+            message_id: Some("legacy@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
+        },
+        &combine(vec![], vec![], vec![], false),
+    )
+    .unwrap();
+
+    let (status, body) = mark_bytes_safe(&db, 9, &raw).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "rescan_required");
+}

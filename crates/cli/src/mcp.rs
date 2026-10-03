@@ -2071,28 +2071,49 @@ async fn handle_tag(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .map_err(|e| e.to_string())?;
-    let message = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
+    let (message, raw) =
+        envelope_email_transport::imap::fetch_message_with_raw(&mut client, folder, uid)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
+    tag_message(
+        &db,
+        ctx,
+        &creds.account.id,
+        folder,
+        uid,
+        message.message_id.as_deref(),
+        raw.as_deref(),
+        params,
+    )
+}
 
-    let message_id = message
-        .message_id
-        .as_deref()
-        .ok_or("message has no Message-ID")?;
+/// The `tag` tool on the fetched message at folder/UID (`raw` is `None` when
+/// it was read part by part): apply the requested tags and scores under its
+/// Message-ID, then report what it shows.
+#[allow(clippy::too_many_arguments)]
+fn tag_message(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: Option<&str>,
+    raw: Option<&[u8]>,
+    params: &Value,
+) -> Result<Value, String> {
+    let message_id = message_id.ok_or("message has no Message-ID")?;
+    let message_id =
+        envelope_email_transport::threat::usable_message_id(message_id).ok_or_else(|| {
+            format!("message {uid} in {folder} has no usable Message-ID ({message_id})")
+        })?;
 
     // Set tags
     if let Some(tags) = params.get("tags").and_then(|v| v.as_array()) {
         for tag_val in tags {
             if let Some(tag) = tag_val.as_str() {
-                db.add_tag(
-                    &creds.account.id,
-                    message_id,
-                    tag,
-                    Some(uid as i64),
-                    Some(folder),
-                )
-                .map_err(|e| e.to_string())?;
+                db.add_tag(account_id, message_id, tag, Some(uid as i64), Some(folder))
+                    .map_err(|e| e.to_string())?;
             }
         }
     }
@@ -2102,7 +2123,7 @@ async fn handle_tag(
         for (dimension, value) in scores {
             if let Some(val) = value.as_f64() {
                 db.set_score(
-                    &creds.account.id,
+                    account_id,
                     message_id,
                     dimension,
                     val,
@@ -2116,18 +2137,14 @@ async fn handle_tag(
 
     let (current_tags, current_scores) =
         envelope_email_transport::threat::persist::shown_tags_and_scores(
-            &db,
-            &creds.account.id,
-            folder,
-            uid,
-            message_id,
+            db, account_id, folder, uid, message_id, raw,
         )
         .map_err(|e| e.to_string())?;
 
     let audit = log_agent_mutation(
-        &db,
+        db,
         ctx,
-        &creds.account.id,
+        account_id,
         "tag",
         &json!({"uid": uid, "tags": current_tags}).to_string(),
         Some(message_id),
@@ -2139,7 +2156,7 @@ async fn handle_tag(
         "message_id": message_id,
         "tags": current_tags,
         "scores": current_scores.iter().map(|s| json!({"dimension": s.dimension, "value": s.value})).collect::<Vec<_>>(),
-        "ui": ui::message_ui(&creds.account.id, uid, folder),
+        "ui": ui::message_ui(account_id, uid, folder),
     });
     attach_audit_warning(&mut result, audit);
     Ok(result)
@@ -2947,6 +2964,36 @@ fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyho
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn tag_tool_does_not_give_a_twin_the_marked_original_s_threat_tags() {
+        use crate::commands::tag::tests::{ACCT, marked_original_and_twin};
+        let db = Database::open_memory().unwrap();
+        let twin = marked_original_and_twin(&db);
+        let names = |uid: u32, raw: Option<&[u8]>| -> Vec<String> {
+            let result = tag_message(
+                &db,
+                None,
+                ACCT,
+                "INBOX",
+                uid,
+                Some("twin@x"),
+                raw,
+                &json!({}),
+            )
+            .unwrap();
+            result["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["tag"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let false_positive = "threat:false_positive".to_string();
+        assert!(!names(2, Some(&twin)).contains(&false_positive));
+        assert!(!names(2, None).contains(&false_positive));
+        assert!(names(1, None).contains(&false_positive));
+    }
 
     #[test]
     fn identity_policy_uses_draft_owner_not_caller_account_or_default() {

@@ -415,11 +415,9 @@ pub async fn report_draft(
 }
 
 /// UIDs among `summaries` with no current verdict, newest first, capped. A
-/// verdict counts only when it was stored for the same folder/UID and the
-/// same Message-ID; a message reusing a scanned Message-ID is scanned. For a
-/// message without one usable Message-ID, the summary's Message-ID (as the
-/// server reports it) must be one the scan read in its header block; an
-/// absent or empty one matches a header block with none or an empty one.
+/// verdict counts only when it was stored for the same folder/UID and is for
+/// the summary's Message-ID ([`persist::StoredVerdict::is_for_message_id`]);
+/// a message reusing a scanned Message-ID is scanned.
 pub fn unscanned_uids(
     db: &Database,
     account_id: &str,
@@ -429,25 +427,11 @@ pub fn unscanned_uids(
     let mut out: Vec<u32> = summaries
         .iter()
         .filter(|s| {
-            let mid = s
-                .message_id
-                .as_deref()
-                .map(envelope_email_store::canonical_message_id)
-                .filter(|m| !m.is_empty());
             // A store error reads as "no verdict": the message is scanned.
             let existing = persist::stored_verdict_for_uid(db, account_id, folder, s.uid)
                 .ok()
                 .flatten()
-                .filter(|stored| match stored.message_id.as_deref() {
-                    Some(stored_mid) => mid == Some(stored_mid),
-                    None => match mid {
-                        Some(mid) => stored.observed_message_ids.iter().any(|m| m == mid),
-                        None => {
-                            stored.observed_message_ids.is_empty()
-                                || stored.observed_message_ids.iter().any(String::is_empty)
-                        }
-                    },
-                })
+                .filter(|stored| stored.is_for_message_id(s.message_id.as_deref()))
                 .map(|stored| stored.verdict);
             persist::needs_scan(existing.as_ref())
         })

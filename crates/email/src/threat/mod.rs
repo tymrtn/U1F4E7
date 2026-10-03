@@ -399,13 +399,27 @@ pub fn sole_message_id(raw: &[u8]) -> Option<String> {
 /// [`sole_message_id`] over already parsed header fields.
 pub(crate) fn sole_message_id_in(headers: &[(String, String)]) -> Option<String> {
     let [id] = message_id_values_in(headers).try_into().ok()?;
+    usable(&id).then_some(id)
+}
+
+/// A Message-ID value as threat data and tags may be keyed by it: its
+/// canonical id, unless that is empty, malformed or `fp:`-prefixed. Every
+/// tag write keyed by a Message-ID goes through this, so the `fp:` key space
+/// stays the content fingerprint's.
+pub fn usable_message_id(value: &str) -> Option<&str> {
+    let id = envelope_email_store::canonical_message_id(value);
+    usable(id).then_some(id)
+}
+
+/// Whether a canonical Message-ID is one non-empty, well-formed id outside
+/// the `fp:` key space.
+fn usable(id: &str) -> bool {
     let one_id =
         !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>');
-    // Fingerprint keys own the `fp:` prefix.
     let fingerprint_shaped = id
         .get(..FINGERPRINT_KEY_PREFIX.len())
         .is_some_and(|p| p.eq_ignore_ascii_case(FINGERPRINT_KEY_PREFIX));
-    (one_id && !fingerprint_shaped).then_some(id)
+    one_id && !fingerprint_shaped
 }
 
 /// The canonical value of every Message-ID field, in wire order, empty ones

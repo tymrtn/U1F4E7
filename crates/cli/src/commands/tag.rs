@@ -2,9 +2,11 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use anyhow::{Context, Result, bail};
+use envelope_email_store::Database;
 use envelope_email_store::credential_store::CredentialBackend;
+use envelope_email_store::models::{MessageScore, MessageTag};
 use envelope_email_transport::imap;
-use envelope_email_transport::threat::persist;
+use envelope_email_transport::threat::{self, persist};
 
 use super::common::setup_credentials;
 
@@ -53,10 +55,7 @@ pub async fn run_set(
         .context("failed to fetch message")?
         .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
 
-    let message_id = msg
-        .message_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("message UID {uid} has no Message-ID header"))?;
+    let message_id = tag_key(msg.message_id.as_deref(), folder, uid)?;
 
     // Apply tags
     for tag in tags {
@@ -122,18 +121,19 @@ pub async fn run_show(
         .await
         .context("IMAP connection failed")?;
 
-    let msg = imap::fetch_message(&mut client, folder, uid)
+    let (msg, raw) = imap::fetch_message_with_raw(&mut client, folder, uid)
         .await
         .context("failed to fetch message")?
         .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
 
-    let message_id = msg
-        .message_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("message UID {uid} has no Message-ID header"))?;
-
-    let (tags, scores) = persist::shown_tags_and_scores(&db, account_id, folder, uid, message_id)
-        .context("failed to get tags and scores")?;
+    let (message_id, tags, scores) = shown(
+        &db,
+        account_id,
+        folder,
+        uid,
+        msg.message_id.as_deref(),
+        raw.as_deref(),
+    )?;
 
     if json {
         println!(
@@ -173,6 +173,33 @@ pub async fn run_show(
     }
 
     Ok(())
+}
+
+/// The key `tag set` and `tag show` use: the message's Message-ID, when tags
+/// may be keyed by it ([`threat::usable_message_id`]).
+fn tag_key<'a>(message_id: Option<&'a str>, folder: &str, uid: u32) -> Result<&'a str> {
+    let message_id =
+        message_id.ok_or_else(|| anyhow::anyhow!("message UID {uid} has no Message-ID header"))?;
+    threat::usable_message_id(message_id).ok_or_else(|| {
+        anyhow::anyhow!("message UID {uid} in {folder} has no usable Message-ID ({message_id})")
+    })
+}
+
+/// The Message-ID `tag show` reads under, and the tags and scores it lists
+/// for the message at folder/UID fetched as `raw`.
+fn shown<'a>(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: Option<&'a str>,
+    raw: Option<&[u8]>,
+) -> Result<(&'a str, Vec<MessageTag>, Vec<MessageScore>)> {
+    let message_id = tag_key(message_id, folder, uid)?;
+    let (tags, scores) =
+        persist::shown_tags_and_scores(db, account_id, folder, uid, message_id, raw)
+            .context("failed to get tags and scores")?;
+    Ok((message_id, tags, scores))
 }
 
 /// `envelope tag list` — list messages matching a tag or minimum score filter.
@@ -276,8 +303,63 @@ pub fn run_list(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use envelope_email_transport::threat::ThreatConfig;
+    use envelope_email_transport::threat::persist::VerdictTarget;
+
+    pub(crate) const ACCT: &str = "acct-1";
+
+    /// Scans a message at INBOX UID 1 and marks it safe, then opens another
+    /// message with its Message-ID (`twin@x`) at UID 2. Returns the second
+    /// message's bytes.
+    pub(crate) fn marked_original_and_twin(db: &Database) -> Vec<u8> {
+        let message = |body: &str| {
+            format!(
+                "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                 Subject: Lunch\r\nMessage-ID: <twin@x>\r\n\r\n{body}\r\n"
+            )
+            .into_bytes()
+        };
+        let (original, twin) = (message("Thursday?"), message("Friday?"));
+        let config = ThreatConfig::default();
+        for (uid, raw) in [(1, &original), (2, &twin)] {
+            persist::verdict_on_open(db, ACCT, "me@example.org", "INBOX", uid, Some(raw), &config)
+                .unwrap();
+            if uid == 1 {
+                let fingerprint = envelope_email_transport::threat::content_fingerprint(raw);
+                persist::mark_safe(
+                    db,
+                    &VerdictTarget {
+                        account_id: ACCT,
+                        folder: "INBOX",
+                        uid,
+                        message_id: Some("twin@x"),
+                        content_fingerprint: fingerprint.as_deref(),
+                        observed_message_ids: &[],
+                    },
+                    "cli",
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        twin
+    }
+
+    #[test]
+    fn tag_show_does_not_give_a_twin_the_marked_original_s_threat_tags() {
+        let db = Database::open_memory().unwrap();
+        let twin = marked_original_and_twin(&db);
+        let names = |uid: u32, raw: Option<&[u8]>| -> Vec<String> {
+            let (_, tags, _) = shown(&db, ACCT, "INBOX", uid, Some("twin@x"), raw).unwrap();
+            tags.into_iter().map(|t| t.tag).collect()
+        };
+        let false_positive = "threat:false_positive".to_string();
+        assert!(!names(2, Some(&twin)).contains(&false_positive));
+        assert!(!names(2, None).contains(&false_positive));
+        assert!(names(1, None).contains(&false_positive));
+    }
 
     #[test]
     fn parse_score_valid() {
