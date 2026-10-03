@@ -13,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use envelope_email_dashboard::dashboard_router;
 use envelope_email_dashboard::state::AppState;
+use envelope_email_store::models::IndexedMessageInput;
 use envelope_email_store::{CredentialBackend, Database, Draft};
 use envelope_email_transport::threat::persist::{self, VerdictTarget};
 use envelope_email_transport::threat::{self, Signal, combine};
@@ -233,4 +234,57 @@ async fn banner_verdict_and_mark_safe_use_only_the_local_store() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "not_scanned");
+}
+
+#[tokio::test]
+async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
+    // Scanned at INBOX UID 7; moved back, or delivered again, as UID 9 (#188).
+    let (state, _) = state();
+    let db = state.db.clone();
+    db.lock()
+        .await
+        .upsert_indexed_message_summaries(
+            "acc1",
+            "INBOX",
+            1,
+            &[IndexedMessageInput {
+                uid: 9,
+                message_id: Some("<phish@x>".into()),
+                from_addr: "billing@examp1e.org".into(),
+                to_addr: "me@example.org".into(),
+                subject: "invoice".into(),
+                date: None,
+                flags: vec![],
+                size: 1,
+                snippet: None,
+                thread_id: None,
+            }],
+        )
+        .unwrap();
+    let app = dashboard_router(state);
+    let token = mint_csrf(&app).await;
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/accounts/acc1/messages/9/threat/mark-safe?folder=INBOX",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "marked_safe");
+    assert_eq!(body["threat"]["marked_safe"], true);
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/accounts/acc1/messages/9/threat?folder=INBOX",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["threat"]["level"], "dangerous", "{body}");
+    assert_eq!(body["threat"]["marked_safe"], true);
 }

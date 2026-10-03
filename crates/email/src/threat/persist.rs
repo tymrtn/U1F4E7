@@ -313,7 +313,21 @@ pub fn stored_verdict_for_uid(
     folder: &str,
     uid: u32,
 ) -> Result<Option<StoredVerdict>> {
-    let Some(event) = db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)? else {
+    stored_verdict(db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)?)
+}
+
+/// The newest verdict recorded for a Message-ID, under whatever folder/UID
+/// it was scanned.
+pub fn stored_verdict_for_message(
+    db: &Database,
+    account_id: &str,
+    message_id: &str,
+) -> Result<Option<StoredVerdict>> {
+    stored_verdict(db.latest_event_for_message(account_id, THREAT_VERDICT, message_id)?)
+}
+
+fn stored_verdict(event: Option<Event>) -> Result<Option<StoredVerdict>> {
+    let Some(event) = event else {
         return Ok(None);
     };
     let payload = event
@@ -971,6 +985,40 @@ mod tests {
                 .unwrap()
                 .level,
             Level::Unavailable
+        );
+    }
+
+    #[test]
+    fn stored_verdict_for_message_finds_it_under_the_scanned_uid() {
+        let db = Database::open_memory().unwrap();
+        let (verdict, _) = scan_raw(&db, ACCT, EMAIL, &phish("m@x"), &ThreatConfig::default());
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 7,
+                message_id: Some("m@x"),
+            },
+            &verdict,
+        )
+        .unwrap();
+
+        let stored = stored_verdict_for_message(&db, ACCT, "m@x")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.verdict, verdict);
+        assert_eq!((stored.folder.as_str(), stored.uid), ("INBOX", Some(7)));
+        assert_eq!(stored.message_id.as_deref(), Some("m@x"));
+        assert!(
+            stored_verdict_for_uid(&db, ACCT, "INBOX", 9)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stored_verdict_for_message(&db, ACCT, "other@x")
+                .unwrap()
+                .is_none()
         );
     }
 
