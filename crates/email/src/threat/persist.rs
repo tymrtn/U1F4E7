@@ -847,25 +847,23 @@ pub async fn held_at(
     folder: &str,
     uid: u32,
 ) -> Result<Option<String>> {
-    let fetched = imap::fetch_message_with_raw(client, folder, uid).await;
+    let fetched = imap::fetch_message_with_raw(client, folder, uid)
+        .await
+        .with_context(|| format!("failed to read UID {uid} in {folder} for the threat check"))?;
     held_of_fetch(db, account_id, folder, uid, fetched)
 }
 
-/// [`held_at`] for the result of reading `folder`/`uid` with
-/// [`imap::fetch_message_with_raw`].
+/// [`held_at`] for what [`imap::fetch_message_with_raw`] read at
+/// `folder`/`uid`.
 pub(crate) fn held_of_fetch(
     db: &Database,
     account_id: &str,
     folder: &str,
     uid: u32,
-    fetched: Result<
-        Option<(envelope_email_store::models::Message, Option<Vec<u8>>)>,
-        crate::errors::ImapError,
-    >,
+    fetched: Option<(envelope_email_store::models::Message, Option<Vec<u8>>)>,
 ) -> Result<Option<String>> {
-    let (message, raw) = fetched
-        .with_context(|| format!("failed to read UID {uid} in {folder} for the threat check"))?
-        .ok_or_else(|| anyhow!("message UID {uid} not found in {folder}"))?;
+    let (message, raw) =
+        fetched.ok_or_else(|| anyhow!("message UID {uid} not found in {folder}"))?;
     held_reason(
         db,
         account_id,

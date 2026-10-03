@@ -3861,7 +3861,7 @@ Subject: hi\r\n\r\nbody\r\n";
         const RFC822: &str =
             "Message-ID: <q@x>\r\nFrom: a@partner.example\r\nSubject: s\r\n\r\nbody\r\n";
         const ALL_MAIL: &str = "[Gmail]/All Mail";
-        async fn read_all_mail() -> Result<Option<(Message, Option<Vec<u8>>)>, ImapError> {
+        async fn read_all_mail() -> Option<(Message, Option<Vec<u8>>)> {
             let (mut session, server) = scripted_session(vec![
                 select_turn(),
                 size_turn(RFC822.len()),
@@ -3871,7 +3871,9 @@ Subject: hi\r\n\r\nbody\r\n";
                 )),
             ])
             .await;
-            let fetched = fetch_message_with_raw_in(&mut session, ALL_MAIL, BIG_UID).await;
+            let fetched = fetch_message_with_raw_in(&mut session, ALL_MAIL, BIG_UID)
+                .await
+                .expect("under-cap read");
             server.await.unwrap();
             fetched
         }
@@ -3896,7 +3898,7 @@ Subject: hi\r\n\r\nbody\r\n";
             "{held:?}"
         );
 
-        let missing = held_of_fetch(&db, "acct-1", ALL_MAIL, BIG_UID, Ok(None));
+        let missing = held_of_fetch(&db, "acct-1", ALL_MAIL, BIG_UID, None);
         assert!(
             missing.unwrap_err().to_string().contains("not found"),
             "a UID the folder lacks is an error"
