@@ -29,10 +29,40 @@ use crate::rule_exec::{
     self, ActionAttribution, ActionSource, ExecDb, ImapRuleMailbox, MessageTarget, RuleMailbox,
     RuleRunReport, RunAccount,
 };
-use crate::rules::{Action, MatchExpr, MessageContext, StoredRuleAction};
+use crate::rules::{Action, ConfirmableAction, MatchExpr, MessageContext, StoredRuleAction};
 
 pub const QUARANTINE_FOLDER: &str = "Envelope/Quarantine";
 pub const QUARANTINE_RULE_NAME: &str = "Envelope threat quarantine";
+
+/// Whether `folder` is the quarantine folder: compared trimmed and
+/// case-insensitive, with `.` or `/` as the separator, with or without an
+/// `INBOX` prefix.
+pub fn is_quarantine_folder(folder: &str) -> bool {
+    let normalized = folder.trim().to_ascii_lowercase().replace('.', "/");
+    let normalized = normalized.trim_matches('/');
+    let normalized = normalized.strip_prefix("inbox/").unwrap_or(normalized);
+    normalized.eq_ignore_ascii_case(QUARANTINE_FOLDER)
+}
+
+/// Whether `name` is the shipped quarantine rule's, compared trimmed and
+/// case-insensitive.
+pub fn is_quarantine_rule_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(QUARANTINE_RULE_NAME)
+}
+
+/// Whether a rule with this definition sets a threat verdict, selects mail
+/// by one, or moves mail into quarantine. Under an agent token only the
+/// operator writes or enables such a rule.
+pub fn rule_touches_threat_state(match_expr: &MatchExpr, action: &Action) -> bool {
+    let moves_to_quarantine = match action {
+        Action::Move(dest) => is_quarantine_folder(dest),
+        Action::Confirm { then, .. } => then.iter().any(
+            |step| matches!(step, ConfirmableAction::Move(dest) if is_quarantine_folder(dest)),
+        ),
+        _ => false,
+    };
+    moves_to_quarantine || action.sets_threat_tag() || match_expr.references_threat_tag()
+}
 /// Agent id every engine-driven action and event is attributed to.
 pub const THREAT_AGENT_ID: &str = "envelope:threat";
 /// `score_above` is strict and scores are whole numbers, so `> 69.5` is
@@ -1040,6 +1070,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn rules_touching_quarantine_or_verdicts_are_recognized() {
+        for folder in [
+            "Envelope/Quarantine",
+            " envelope.quarantine ",
+            "INBOX/Envelope/Quarantine",
+            "INBOX.Envelope.Quarantine/",
+        ] {
+            assert!(is_quarantine_folder(folder), "{folder}");
+        }
+        for folder in ["INBOX", "Envelope", "Quarantine", "Envelope/Quarantine/Old"] {
+            assert!(!is_quarantine_folder(folder), "{folder}");
+        }
+        assert!(is_quarantine_rule_name("  envelope THREAT quarantine "));
+        assert!(!is_quarantine_rule_name("Envelope threat quarantine 2"));
+
+        let any = MatchExpr::From("*".to_string());
+        let tagged = MatchExpr::And(vec![
+            any.clone(),
+            MatchExpr::Not(Box::new(MatchExpr::HasTag(
+                " Threat:Quarantined".to_string(),
+            ))),
+        ]);
+        let inbox = Action::Move("INBOX".to_string());
+        assert!(rule_touches_threat_state(&tagged, &inbox));
+        assert!(rule_touches_threat_state(
+            &any,
+            &Action::Move("envelope.quarantine".to_string())
+        ));
+        assert!(rule_touches_threat_state(
+            &any,
+            &Action::AddTag("threat:false_positive".to_string())
+        ));
+        assert!(!rule_touches_threat_state(&any, &inbox));
+        let (match_expr, action) = quarantine_rule_json();
+        let shipped = StoredRuleAction::parse(&action).unwrap().action;
+        let shipped_match: MatchExpr = serde_json::from_str(&match_expr).unwrap();
+        assert!(rule_touches_threat_state(&shipped_match, &shipped));
     }
 
     #[test]

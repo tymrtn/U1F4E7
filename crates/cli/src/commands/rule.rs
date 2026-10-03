@@ -8,6 +8,7 @@ use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::imap;
 use envelope_email_transport::rule_exec::{self, ActionAttribution, ImapRuleMailbox, RunAccount};
 use envelope_email_transport::rules::{self, Action, MessageContext};
+use envelope_email_transport::threat::persist::rule_touches_threat_state;
 
 use super::agent_context;
 use super::common::setup_credentials;
@@ -202,8 +203,10 @@ pub fn run_create(
 
     // Parse and serialize the action (confirm rule references are flattened now)
     let action = parse_authored_action_str(action_str, &db, account_id)?;
-    // A threat:* tag is a verdict, so only the operator writes a rule that sets one.
-    if action.sets_threat_tag() {
+    // Threat verdicts and quarantine are the operator's, so only the operator
+    // writes a rule that sets or selects by a verdict or moves mail into
+    // quarantine.
+    if rule_touches_threat_state(&match_expr, &action) {
         agent_context::require_cli_operator(
             &db,
             agent.as_ref(),
@@ -731,7 +734,9 @@ pub fn run_enable(
     if agent.is_some() {
         let current = rules::StoredRuleAction::parse(&rule.action)
             .with_context(|| format!("rule '{name}' has an invalid action"))?;
-        if current.action.sets_threat_tag() {
+        let match_expr: rules::MatchExpr = serde_json::from_str(&rule.match_expr)
+            .with_context(|| format!("rule '{name}' has an invalid match expression"))?;
+        if rule_touches_threat_state(&match_expr, &current.action) {
             agent_context::require_cli_operator(
                 &db,
                 agent.as_ref(),

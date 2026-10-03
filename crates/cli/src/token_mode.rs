@@ -21,6 +21,7 @@ use crate::{
 };
 use envelope_email_transport::PolicyDenial;
 use envelope_email_transport::threat::is_threat_tag;
+use envelope_email_transport::threat::persist::{is_quarantine_folder, is_quarantine_rule_name};
 
 /// How a command runs under an agent token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,13 +102,26 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
             }
         }
         Commands::Send { .. } => Gated(SEND),
-        Commands::Move { .. } | Commands::Copy { .. } => Gated(MOVE),
+        // Moving or copying mail out of quarantine releases it.
+        Commands::Move { folder, .. } | Commands::Copy { folder, .. } => {
+            if is_quarantine_folder(folder) {
+                OperatorOnly
+            } else {
+                Gated(MOVE)
+            }
+        }
         Commands::Delete { .. } => Gated(DELETE),
         Commands::Flag { subcommand } => match subcommand {
             FlagCmd::Add { .. } | FlagCmd::Remove { .. } => Gated(FLAG),
         },
         Commands::Bulk { subcommand } => match subcommand {
-            BulkCmd::Move { .. } | BulkCmd::Copy { .. } => Gated(BULK_MOVE),
+            BulkCmd::Move { common, .. } | BulkCmd::Copy { common, .. } => {
+                if is_quarantine_folder(&common.folder) {
+                    OperatorOnly
+                } else {
+                    Gated(BULK_MOVE)
+                }
+            }
             BulkCmd::Flag { .. } => Gated(BULK_FLAG),
             BulkCmd::Delete { .. } => Gated(BULK_DELETE),
             BulkCmd::Tag { tag, .. } => {
@@ -240,20 +254,28 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
             | RuleCmd::Test { .. }
             | RuleCmd::Preview { .. }
             | RuleCmd::Export { .. } => ReadOnly,
-            // `rule create` and `rule enable` refuse an agent a rule that sets
-            // a threat:* tag once the action is parsed.
-            RuleCmd::Create { .. }
-            | RuleCmd::Enable { .. }
-            | RuleCmd::Disable { .. }
-            | RuleCmd::Delete { .. } => Gated(RULES_EDIT),
-            // Without --confirm, `rule run` only explains itself.
-            RuleCmd::Run { confirm, .. } => {
-                if *confirm {
-                    Gated(RULES_RUN)
+            // The shipped quarantine rule is the operator's. Once its definition
+            // is parsed, `rule create` and `rule enable` also refuse an agent a
+            // rule that touches threat verdicts or quarantine.
+            RuleCmd::Create { name, .. }
+            | RuleCmd::Enable { name, .. }
+            | RuleCmd::Disable { name, .. }
+            | RuleCmd::Delete { name, .. } => {
+                if is_quarantine_rule_name(name) {
+                    OperatorOnly
                 } else {
-                    ReadOnly
+                    Gated(RULES_EDIT)
                 }
             }
+            // Without --confirm, `rule run` only explains itself. Run on the
+            // quarantine folder, rules could release its mail.
+            RuleCmd::Run {
+                folder, confirm, ..
+            } => match (*confirm, is_quarantine_folder(folder)) {
+                (false, _) => ReadOnly,
+                (true, false) => Gated(RULES_RUN),
+                (true, true) => OperatorOnly,
+            },
             // --host sends the mailbox password to the named server. Without
             // --confirm, publish-sieve is a dry run.
             RuleCmd::PublishSieve { host, confirm, .. } => {
@@ -282,13 +304,16 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                 ReadOnly
             }
         }
-        // --webhook and --deliver push each new message to a URL.
+        // --webhook and --deliver push each new message to a URL. Rules run
+        // on the quarantine folder could release its mail.
         Commands::Watch {
+            folder,
             webhook,
             deliver,
             run_rules,
             ..
         } => match (webhook.is_some() || *deliver, *run_rules) {
+            (_, true) if is_quarantine_folder(folder) => OperatorOnly,
             (false, false) => ReadOnly,
             (true, false) => Gated(WATCH_HOOK),
             (false, true) => Gated(RULES_RUN),
@@ -403,11 +428,27 @@ mod tests {
         ("send --to a@b.test --subject s", Gated(SEND)),
         ("move 1 --to-folder X", Gated(MOVE)),
         ("copy 1 --to-folder X", Gated(MOVE)),
+        (
+            "move 1 --folder Envelope/Quarantine --to-folder INBOX",
+            OperatorOnly,
+        ),
+        (
+            "copy 1 --folder Envelope/Quarantine --to-folder INBOX",
+            OperatorOnly,
+        ),
         ("delete 1", Gated(DELETE)),
         ("flag add 1 seen", Gated(FLAG)),
         ("flag remove 1 seen", Gated(FLAG)),
         ("bulk move --to-folder X --uids 1", Gated(BULK_MOVE)),
         ("bulk copy --to-folder X --uids 1", Gated(BULK_MOVE)),
+        (
+            "bulk move --to-folder X --folder Envelope/Quarantine --uids 1",
+            OperatorOnly,
+        ),
+        (
+            "bulk copy --to-folder X --folder Envelope/Quarantine --uids 1",
+            OperatorOnly,
+        ),
         (
             "bulk flag --flag seen --action add --uids 1",
             Gated(BULK_FLAG),
@@ -506,6 +547,11 @@ mod tests {
         ("rule preview", ReadOnly),
         ("rule run", ReadOnly),
         ("rule run --confirm", Gated(RULES_RUN)),
+        ("rule run --folder Envelope/Quarantine", ReadOnly),
+        (
+            "rule run --confirm --folder Envelope/Quarantine",
+            OperatorOnly,
+        ),
         ("rule enable n", Gated(RULES_EDIT)),
         ("rule disable n", Gated(RULES_EDIT)),
         ("rule delete n", Gated(RULES_EDIT)),
@@ -531,6 +577,10 @@ mod tests {
         ("watch --deliver --run-rules", Gated(WATCH_HOOK_AND_RULES)),
         ("watch --webhook https://h.example/x", Gated(WATCH_HOOK)),
         ("watch --run-rules", Gated(RULES_RUN)),
+        (
+            "watch --run-rules --folder Envelope/Quarantine",
+            OperatorOnly,
+        ),
         (
             "watch --webhook https://h.example/x --run-rules",
             Gated(WATCH_HOOK_AND_RULES),
@@ -672,6 +722,9 @@ mod tests {
         if argv.to_lowercase().contains("threat:") {
             key.push_str(" with a threat:* tag");
         }
+        if argv.contains("Envelope/Quarantine") {
+            key.push_str(" from the quarantine folder");
+        }
         key
     }
 
@@ -715,6 +768,34 @@ mod tests {
             .filter(|key| !seen.contains(*key))
             .collect();
         assert!(stale.is_empty(), "not commands in MATRIX: {stale:?}");
+    }
+
+    #[test]
+    fn the_shipped_quarantine_rule_is_the_operators() {
+        let name = envelope_email_transport::threat::persist::QUARANTINE_RULE_NAME;
+        for argv in [
+            vec![
+                "rule",
+                "create",
+                "--name",
+                name,
+                "--match-from",
+                "*",
+                "--action",
+                "flag=seen",
+            ],
+            vec!["rule", "enable", name],
+            vec!["rule", "disable", " envelope THREAT quarantine"],
+            vec!["rule", "delete", name],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("envelope").chain(argv.clone()))
+                .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(
+                token_mode_permission(&cli.command),
+                OperatorOnly,
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

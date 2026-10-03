@@ -289,7 +289,7 @@ fn authorize_tool_call_with_db(
     let Some(ctx) = ctx else {
         return Ok(());
     };
-    if writes_threat_tag(tool_name, params) {
+    if writes_threat_tag(tool_name, params) || releases_quarantine(tool_name, params) {
         return Err(agent_context::operator_only_denial().to_json().to_string());
     }
     let account = authoritative_policy_account(db, tool_name, params)?;
@@ -337,6 +337,32 @@ fn writes_threat_tag(tool_name: &str, params: &Value) -> bool {
                     .get("tag")
                     .and_then(Value::as_str)
                     .is_some_and(is_threat_tag)
+        }
+        _ => false,
+    }
+}
+
+/// A move or copy out of the quarantine folder, or a real rule run there,
+/// which would release quarantined mail. Only the operator does that.
+fn releases_quarantine(tool_name: &str, params: &Value) -> bool {
+    use envelope_email_transport::threat::persist::is_quarantine_folder;
+    let folder = || {
+        params
+            .get("folder")
+            .and_then(Value::as_str)
+            .unwrap_or("INBOX")
+    };
+    match tool_name {
+        "move_message" => is_quarantine_folder(move_source_folder(params)),
+        "bulk" => {
+            matches!(
+                params.get("op").and_then(Value::as_str),
+                Some("move" | "copy")
+            ) && is_quarantine_folder(folder())
+        }
+        "rules_run" => {
+            params.get("dry_run").and_then(Value::as_bool) == Some(false)
+                && is_quarantine_folder(folder())
         }
         _ => false,
     }
@@ -3130,6 +3156,36 @@ mod tests {
                 Some(&ctx),
                 "tag",
                 &json!({"account": acct, "uid": 1, "tags": ["newsletter"]}),
+            )
+            .is_ok()
+        );
+
+        // Releasing quarantined mail is the operator's too.
+        let quarantine = "envelope.quarantine";
+        for (tool, params) in [
+            (
+                "move_message",
+                json!({"account": acct, "uid": 1, "from_folder": quarantine, "to_folder": "INBOX"}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "copy", "folder": quarantine, "to_folder": "INBOX", "uids": [1]}),
+            ),
+            (
+                "rules_run",
+                json!({"account": acct, "folder": quarantine, "dry_run": false}),
+            ),
+        ] {
+            let denial = authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).unwrap_err();
+            assert!(denial.contains("operator_only_command"), "{tool}: {denial}");
+        }
+        // A preview there changes nothing.
+        assert!(
+            authorize_tool_call_with_db(
+                &db,
+                Some(&ctx),
+                "rules_run",
+                &json!({"account": acct, "folder": quarantine}),
             )
             .is_ok()
         );

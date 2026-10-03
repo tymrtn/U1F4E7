@@ -577,6 +577,116 @@ fn cli_rule_that_sets_a_threat_tag_is_operator_only() {
 }
 
 #[test]
+fn cli_quarantine_is_the_operators() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let quarantine_rule = "Envelope threat quarantine";
+    let created = run(
+        home,
+        &[
+            "rule",
+            "create",
+            "--name",
+            quarantine_rule,
+            "--match-score-above",
+            "threat=69.5",
+            "--action",
+            "move=Envelope/Quarantine",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let token = create_agent_token(home, "skippy");
+    allow_actions(home, "skippy", "rules.write,rules.run,move");
+
+    let create = |name: &str, condition: &[&str], action: &str| {
+        let mut args = vec!["--json", "rule", "create", "--name", name];
+        args.extend_from_slice(condition);
+        args.extend_from_slice(&["--action", action]);
+        run_as(home, &token, &args)
+    };
+    for out in [
+        // Selecting by a threat verdict, in any spelling.
+        create(
+            "release",
+            &["--match-tag", "threat:quarantined"],
+            "move=INBOX",
+        ),
+        create(
+            "release2",
+            &["--match-tag", " THREAT:Quarantined"],
+            "flag=seen",
+        ),
+        // Moving into the quarantine folder, however it is spelled.
+        create(
+            "hide",
+            &["--match-from", "*@sender.example"],
+            "move=envelope.quarantine",
+        ),
+        create(
+            "offer",
+            &["--match-from", "*@sender.example"],
+            r#"{"confirm":{"prompt":"p","then":[{"move":"INBOX/Envelope/Quarantine"}]}}"#,
+        ),
+        // The shipped rule's name: replacing, disabling or deleting it.
+        create(
+            quarantine_rule,
+            &["--match-from", "*@nobody.example"],
+            "flag=seen",
+        ),
+        run_as(
+            home,
+            &token,
+            &["--json", "rule", "disable", quarantine_rule],
+        ),
+        run_as(home, &token, &["--json", "rule", "delete", quarantine_rule]),
+        run_as(home, &token, &["--json", "rule", "enable", quarantine_rule]),
+        // Running rules, or moving mail, out of the quarantine folder.
+        run_as(
+            home,
+            &token,
+            &[
+                "--json",
+                "rule",
+                "run",
+                "--folder",
+                "Envelope/Quarantine",
+                "--confirm",
+            ],
+        ),
+        run_as(
+            home,
+            &token,
+            &[
+                "--json",
+                "move",
+                "1",
+                "--folder",
+                "Envelope/Quarantine",
+                "--to-folder",
+                "INBOX",
+            ],
+        ),
+    ] {
+        assert_denied(&out, "operator_only_command");
+    }
+    assert_eq!(rule_count(home), 1, "only the operator's rule may exist");
+    let enabled: i64 = open_db(home)
+        .conn()
+        .query_row(
+            "SELECT enabled FROM rules WHERE name = 'Envelope threat quarantine'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("quarantine rule");
+    assert_eq!(enabled, 1, "the shipped rule stays enabled");
+}
+
+#[test]
 fn cli_webhook_rule_with_grant_is_allowed() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();

@@ -50,6 +50,21 @@ pub enum MatchExpr {
 }
 
 impl MatchExpr {
+    /// True when any condition selects by a `threat:*` tag, compared as
+    /// [`crate::threat::is_threat_tag`] does.
+    pub fn references_threat_tag(&self) -> bool {
+        match self {
+            MatchExpr::HasTag(tag) | MatchExpr::ContactHasTag(tag) => {
+                crate::threat::is_threat_tag(tag)
+            }
+            MatchExpr::And(exprs) | MatchExpr::Or(exprs) => {
+                exprs.iter().any(MatchExpr::references_threat_tag)
+            }
+            MatchExpr::Not(inner) => inner.references_threat_tag(),
+            _ => false,
+        }
+    }
+
     /// True when any `and`/`or` in the tree has no children. `and []` is
     /// vacuously true and `not (or [])` is too, so such a rule can match
     /// every message; it is refused on save and skipped when rules run.
