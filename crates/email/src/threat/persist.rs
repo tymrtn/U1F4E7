@@ -168,7 +168,7 @@ pub fn scan_raw(
 ) -> (ThreatVerdict, ScannedMessage) {
     let (verdict, mut scanned) =
         evaluate_input(prepare_input(db, account_id, account_address, raw), config);
-    scanned.content_fingerprint = Some(super::content_fingerprint(raw));
+    scanned.content_fingerprint = super::content_fingerprint(raw);
     scanned.observed_message_ids = super::message_id_values(raw);
     (verdict, scanned)
 }
@@ -711,7 +711,7 @@ pub fn blocked_attachments(
             db,
             account_id,
             message_id.as_deref(),
-            Some(&fingerprint),
+            fingerprint.as_deref(),
             filename,
             &content_type,
             attachment.contents(),
@@ -1080,7 +1080,7 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     let (verdict, mut scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
         .await
         .context("threat analyzers panicked")?;
-    scanned.content_fingerprint = Some(super::content_fingerprint(&raw));
+    scanned.content_fingerprint = super::content_fingerprint(&raw);
     scanned.observed_message_ids = super::message_id_values(&raw);
     db.with_db(|d| -> Result<()> {
         let target = VerdictTarget {
@@ -1138,21 +1138,27 @@ pub fn verdict_on_open(
         folder,
         uid,
         message_id: message_id.as_deref(),
-        content_fingerprint: Some(&fingerprint),
+        content_fingerprint: fingerprint.as_deref(),
         observed_message_ids: &observed,
     };
-    let key = threat_key(db, account_id, here.message_id, Some(&fingerprint))?;
-    if let (Some(mid), Some(key)) = (here.message_id, key.as_deref()) {
-        rebind_legacy_mark(db, &here, mid, key, &fingerprint)?;
+    let key = threat_key(db, account_id, here.message_id, here.content_fingerprint)?;
+    if let (Some(mid), Some(key), Some(fingerprint)) =
+        (here.message_id, key.as_deref(), here.content_fingerprint)
+    {
+        rebind_legacy_mark(db, &here, mid, key, fingerprint)?;
     }
-    let matched = matching_verdict(
-        db,
-        account_id,
-        folder,
-        uid,
-        message_id.as_deref(),
-        &fingerprint,
-    )?;
+    // Bytes without a fingerprint match no stored verdict.
+    let matched = match here.content_fingerprint {
+        Some(fingerprint) => matching_verdict(
+            db,
+            account_id,
+            folder,
+            uid,
+            message_id.as_deref(),
+            fingerprint,
+        )?,
+        None => None,
+    };
     if !config.enabled || !config.on_read {
         return Ok(matched.map(|m| m.verdict));
     }
@@ -1236,7 +1242,12 @@ pub async fn scan_uid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::threat::{ENGINE_VERSION, content_fingerprint};
+    use crate::threat::ENGINE_VERSION;
+
+    /// Every fixture here has a fingerprint.
+    fn content_fingerprint(raw: &[u8]) -> String {
+        crate::threat::content_fingerprint(raw).expect("fixture has a content fingerprint")
+    }
 
     const ACCT: &str = "acct-1";
     const EMAIL: &str = "me@example.org";
@@ -2289,6 +2300,105 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             gate(&original_fp).is_none(),
             "the marked original's are released"
         );
+    }
+
+    /// A resend with the marked message's header fields and body, plus text
+    /// after a form-feed-only line that the reader shows as body, is a
+    /// different message: scanned, scored and gated as itself.
+    #[tokio::test]
+    async fn resend_of_marked_safe_content_with_text_after_a_form_feed_line_is_not_released() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = ordinary("ff@x");
+        let original_fp = content_fingerprint(&original);
+        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("ff@x"),
+                content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+
+        let resend = String::from_utf8(original.clone())
+            .unwrap()
+            .replace(
+                "Subject: Lunch\r\n\r\n",
+                "Subject: Lunch\r\n\x0c\r\nVerify your mailbox at http://examp1e.org/login\r\n\r\n",
+            )
+            .into_bytes();
+        let shown = ThreatInput::from_raw(&resend, EMAIL).unwrap().text.unwrap();
+        assert!(shown.contains("examp1e.org"), "{shown:?}");
+
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, resend.clone());
+        let results = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+        let entry = results[0].1.as_ref().unwrap();
+        assert!(entry.score > 0, "{entry:?}");
+        let resend_fp = content_fingerprint(&resend);
+        let resend_key = fp_key(&resend);
+        assert!(!is_marked_safe(&db, ACCT, "ff@x", Some(&resend_fp)).unwrap());
+        assert!(!is_marked_safe(&db, ACCT, &resend_key, Some(&resend_fp)).unwrap());
+        assert_eq!(
+            db.get_scores(ACCT, &resend_key).unwrap()[0].value,
+            f64::from(entry.score)
+        );
+        assert!(!tags(&db, &resend_key).contains(&TAG_FALSE_POSITIVE.to_string()));
+        assert!(is_marked_safe(&db, ACCT, "ff@x", Some(&original_fp)).unwrap());
+
+        // Opened elsewhere, the resend is scanned rather than given the
+        // marked original's verdict.
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "Archive", 3, Some(&resend), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.score, entry.score);
+    }
+
+    /// A Message-ID spelling another message's fingerprint key is unusable,
+    /// so that message's threat data never lands under the other's key.
+    #[tokio::test]
+    async fn message_id_spelling_a_fingerprint_key_does_not_share_that_key() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let victim = String::from_utf8(ordinary("v@x"))
+            .unwrap()
+            .replace("Message-ID: <v@x>\r\n", "")
+            .into_bytes();
+        let victim_key = fp_key(&victim);
+        let forged = phish(&victim_key);
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(1, forged.clone());
+        mbox.raw.insert(2, victim.clone());
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[1, 2], &config).await;
+
+        assert!(
+            !tags(&db, &victim_key).contains(&TAG_MALWARE.to_string()),
+            "{:?}",
+            tags(&db, &victim_key)
+        );
+        assert_eq!(
+            tags(&db, &fp_key(&forged)),
+            vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED]
+        );
+        let victim_fp = content_fingerprint(&victim);
+        let gate = attachment_block(
+            &db,
+            ACCT,
+            None,
+            Some(&victim_fp),
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF",
+        )
+        .unwrap();
+        assert!(gate.is_none(), "{gate:?}");
     }
 
     /// Mark safe as stored before fingerprints: the tag and a `label_applied`

@@ -295,7 +295,7 @@ pub async fn run_mark_safe(
     let recorded = persist::stored_verdict_for_uid(&db, &account_id, folder, uid)?
         .and_then(|s| Some((s.message_id, s.content_fingerprint?)));
     let (message_id, fingerprint) = match recorded {
-        Some(identity) => identity,
+        Some((message_id, fingerprint)) => (message_id, Some(fingerprint)),
         None => {
             let mut client = imap::connect(&creds)
                 .await
@@ -314,7 +314,7 @@ pub async fn run_mark_safe(
             folder,
             uid,
             message_id: message_id.as_deref(),
-            content_fingerprint: Some(&fingerprint),
+            content_fingerprint: fingerprint.as_deref(),
             observed_message_ids: &[],
         },
         "cli",
@@ -360,7 +360,7 @@ pub async fn run_release(
         &db,
         &account_id,
         message_id.as_deref(),
-        Some(&threat::content_fingerprint(&raw)),
+        threat::content_fingerprint(&raw).as_deref(),
     )?;
 
     let ctx = MessageContext {
@@ -439,7 +439,7 @@ pub async fn run_report(
         folder,
         uid,
         message_id: message_id.as_deref(),
-        content_fingerprint: Some(&fingerprint),
+        content_fingerprint: fingerprint.as_deref(),
         observed_message_ids: &observed,
     };
     let verdict = match persist::stored_verdict_for_uid(&db, &account_id, folder, uid)? {
@@ -592,7 +592,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 folder: "INBOX",
                 uid: 1,
                 message_id: Some("twin@x"),
-                content_fingerprint: Some(&threat::content_fingerprint(clean)),
+                content_fingerprint: threat::content_fingerprint(clean).as_deref(),
                 observed_message_ids: &[],
             },
             "cli",

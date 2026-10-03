@@ -112,9 +112,9 @@ pub fn verdict_for_open(
                 db,
                 account_id,
                 threat::sole_message_id(raw).as_deref(),
-                Some(&fingerprint),
+                fingerprint.as_deref(),
             )?;
-            (key, Some(fingerprint))
+            (key, fingerprint)
         }
         None => persist::stored_verdict_for_uid(db, account_id, folder, uid)?
             .map(|s| (s.key, s.content_fingerprint))
@@ -211,7 +211,13 @@ pub fn mark_safe_message(
     raw: &[u8],
 ) -> Response {
     let message_id = threat::sole_message_id(raw);
-    let fingerprint = threat::content_fingerprint(raw);
+    let Some(fingerprint) = threat::content_fingerprint(raw) else {
+        return error(
+            StatusCode::CONFLICT,
+            persist::RESCAN_REQUIRED,
+            "the message's content could not be fingerprinted, so it cannot be marked safe",
+        );
+    };
     let matched = persist::matching_verdict(
         db,
         account_id,
@@ -335,7 +341,7 @@ pub async fn report_draft(
                 folder: &q.folder,
                 uid,
                 message_id: threat::sole_message_id(&raw).as_deref(),
-                content_fingerprint: Some(&threat::content_fingerprint(&raw)),
+                content_fingerprint: threat::content_fingerprint(&raw).as_deref(),
                 observed_message_ids: &[],
             },
             &lookups,
@@ -811,6 +817,19 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
         ] {
             sweep_scan(&db, uid, raw).await;
         }
+        assert!(
+            unscanned_uids(&db, "a", "INBOX", &summaries).is_empty(),
+            "scanned once, then skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_scans_a_message_whose_message_id_looks_like_a_fingerprint_key_once() {
+        let db = Database::open_memory().unwrap();
+        let raw = with_message_ids("Message-ID: <fp:v1:0123>\r\n");
+        let summaries = [envelope_summary(5, Some("<fp:v1:0123>"))];
+        assert_eq!(unscanned_uids(&db, "a", "INBOX", &summaries), vec![5]);
+        sweep_scan(&db, 5, &raw).await;
         assert!(
             unscanned_uids(&db, "a", "INBOX", &summaries).is_empty(),
             "scanned once, then skipped"

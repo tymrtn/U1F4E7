@@ -2839,7 +2839,7 @@ where
     let fingerprint = crate::threat::content_fingerprint(body);
     for attachment in parsed.attachments() {
         if attachment.attachment_name().unwrap_or("unnamed") == filename {
-            return downloaded_attachment(uid, attachment, message_id, Some(fingerprint));
+            return downloaded_attachment(uid, attachment, message_id, fingerprint);
         }
     }
     Err(ImapError::Protocol(format!(
@@ -4020,7 +4020,7 @@ Subject: hi\r\n\r\nbody\r\n";
             assert_eq!(partial.message_id, whole.message_id, "{filename}");
             assert_eq!(
                 whole.content_fingerprint,
-                Some(crate::threat::content_fingerprint(big_rfc822().as_bytes())),
+                crate::threat::content_fingerprint(big_rfc822().as_bytes()),
                 "{filename}"
             );
             assert_eq!(

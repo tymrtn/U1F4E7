@@ -317,74 +317,51 @@ const FINGERPRINT_HEADERS: &[&str] = &[
     "list-unsubscribe-post",
 ];
 
-/// The identity of a message's content: `v1:` and the SHA-256 of its
+/// The identity of a message's content: `v2:` and the SHA-256 of its
 /// fingerprinted header fields (every occurrence, in wire order, as sent) and
-/// its raw body after the first blank line. Stored verdicts and Mark safe
-/// apply only to a message with the same fingerprint.
-pub fn content_fingerprint(raw: &[u8]) -> String {
-    let (fields, body) = raw_header_fields(raw);
+/// its raw body. The header/body split and the header fields are
+/// mail_parser's, the parser that renders and scans the message, so bytes it
+/// reads as body are never skipped as header lines. Stored verdicts and Mark
+/// safe apply only to a message with the same fingerprint.
+///
+/// `None` when mail_parser gives no root part or its offsets do not fit the
+/// bytes: such a message reuses no verdict and cannot be marked safe.
+pub fn content_fingerprint(raw: &[u8]) -> Option<String> {
+    let parsed = mail_parser::MessageParser::default().parse(raw)?;
+    let root = parsed.parts.first()?;
+    let (header_start, body_start) = (root.raw_header_offset(), root.raw_body_offset());
+    if header_start > body_start || body_start > raw.len() {
+        return None;
+    }
     let mut hasher = Sha256::new();
     // Length-prefixed, so two different messages never hash the same bytes.
     let mut part = |bytes: &[u8]| {
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     };
-    for field in fields.into_iter().filter(|f| fingerprinted(f)) {
-        part(field);
+    for header in &root.headers {
+        let (start, end) = (header.offset_field, header.offset_end);
+        if start < header_start || start > end || end > body_start {
+            return None;
+        }
+        if fingerprinted(header.name.as_str()) {
+            part(&raw[start..end]);
+        }
     }
-    part(body);
+    part(&raw[body_start..]);
     let hex: String = hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    format!("v1:{hex}")
+    Some(format!("v2:{hex}"))
 }
 
 /// `Content-*` fields change how the body is read, a top-level
 /// `Content-Disposition` included, so all of them are fingerprinted.
-fn fingerprinted(field: &[u8]) -> bool {
-    let Some(colon) = field.iter().position(|&b| b == b':') else {
-        return false;
-    };
-    let name = field[..colon].trim_ascii().to_ascii_lowercase();
-    name.starts_with(b"content-") || FINGERPRINT_HEADERS.iter().any(|h| h.as_bytes() == name)
-}
-
-/// Each header field's bytes as sent (first line plus folded continuations,
-/// without the final line break), and the body after the first blank line.
-/// Lines split as in [`parse_header_block`].
-fn raw_header_fields(raw: &[u8]) -> (Vec<&[u8]>, &[u8]) {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut pos = 0;
-    while pos < raw.len() {
-        let end = raw[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(raw.len(), |i| pos + i);
-        let line_end = if end > pos && raw[end - 1] == b'\r' {
-            end - 1
-        } else {
-            end
-        };
-        let next = (end + 1).min(raw.len());
-        if line_end == pos {
-            return (spans_of(raw, &spans), &raw[next..]);
-        }
-        if matches!(raw[pos], b' ' | b'\t') {
-            if let Some(last) = spans.last_mut() {
-                last.1 = line_end;
-            }
-        } else {
-            spans.push((pos, line_end));
-        }
-        pos = next;
-    }
-    (spans_of(raw, &spans), &[])
-}
-
-fn spans_of<'a>(raw: &'a [u8], spans: &[(usize, usize)]) -> Vec<&'a [u8]> {
-    spans.iter().map(|&(start, end)| &raw[start..end]).collect()
+fn fingerprinted(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("content-") || FINGERPRINT_HEADERS.contains(&name.as_str())
 }
 
 /// Threat data for a message without one usable Message-ID is keyed by this
@@ -394,8 +371,8 @@ pub const FINGERPRINT_KEY_PREFIX: &str = "fp:";
 /// The message's identity as every threat path reads it (scanner, attachment
 /// gate, quarantine, views): the canonical Message-ID when the header block
 /// has exactly one Message-ID field holding one non-empty id. `None` when it
-/// has none, several, or an empty or malformed one; that message's threat
-/// data is keyed by its fingerprint instead.
+/// has none, several, or an empty, malformed or `fp:`-prefixed one; that
+/// message's threat data is keyed by its fingerprint instead.
 pub fn sole_message_id(raw: &[u8]) -> Option<String> {
     sole_message_id_in(&parse_header_block(raw))
 }
@@ -405,7 +382,11 @@ pub(crate) fn sole_message_id_in(headers: &[(String, String)]) -> Option<String>
     let [id] = message_id_values_in(headers).try_into().ok()?;
     let one_id =
         !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>');
-    one_id.then_some(id)
+    // Fingerprint keys own the `fp:` prefix.
+    let fingerprint_shaped = id
+        .get(..FINGERPRINT_KEY_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(FINGERPRINT_KEY_PREFIX));
+    (one_id && !fingerprint_shaped).then_some(id)
 }
 
 /// The canonical value of every Message-ID field, in wire order, empty ones
@@ -832,8 +813,9 @@ mod tests {
     #[test]
     fn fingerprint_ignores_receiver_headers() {
         let fp = content_fingerprint(LUNCH.as_bytes());
-        assert!(fp.starts_with("v1:"), "{fp}");
-        assert_eq!(fp.len(), 3 + 64, "{fp}");
+        let hex = fp.as_deref().unwrap();
+        assert!(hex.starts_with("v2:"), "{hex}");
+        assert_eq!(hex.len(), 3 + 64, "{hex}");
 
         let delivered = format!(
             "Return-Path: <alice@partner.example>\r\n\
@@ -852,6 +834,7 @@ mod tests {
     #[test]
     fn fingerprint_changes_with_body_attachment_or_second_from() {
         let fp = content_fingerprint(LUNCH.as_bytes());
+        assert!(fp.is_some());
         let body = LUNCH.replace("Thursday?", "Friday?");
         let attachment = LUNCH.replace(
             "--b--\r\n",
@@ -898,6 +881,10 @@ mod tests {
             ("Message-ID: \r\nMessage-ID: <b@x>\r\n", None),
             ("Message-ID: <a@x> <b@x>\r\n", None),
             ("Message-ID: (c) <a@x> (trailing)\r\n", None),
+            ("Message-ID: <fp:v1:abc>\r\n", None),
+            ("Message-ID: <FP:abc@host>\r\n", None),
+            ("Message-ID: fp:abc@host\r\n", None),
+            ("Message-ID: <fpabc@host>\r\n", Some("fpabc@host")),
         ];
         for (header, expected) in cases {
             let raw = format!("From: a@x\r\nTo: me@y\r\nSubject: s\r\n{header}\r\nbody\r\n");
@@ -907,6 +894,34 @@ mod tests {
                 "{header:?}"
             );
         }
+    }
+
+    /// The reader ends the header block at a line holding only `separator`;
+    /// text after it is body, so it must be fingerprinted as body.
+    fn assert_body_after_separator_line_is_fingerprinted(separator: &str) {
+        const HDR: &str = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                           Subject: Lunch\r\nMessage-ID: <m1@partner.example>\r\n";
+        let original = format!("{HDR}\r\nThursday?\r\n");
+        let injected =
+            format!("{HDR}{separator}\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n");
+        assert_ne!(
+            parsed_view(original.as_bytes()),
+            parsed_view(injected.as_bytes()),
+            "the reader shows the injected text"
+        );
+        let original = content_fingerprint(original.as_bytes()).unwrap();
+        let injected = content_fingerprint(injected.as_bytes()).unwrap();
+        assert_ne!(original, injected);
+    }
+
+    #[test]
+    fn fingerprint_covers_body_after_a_form_feed_only_line() {
+        assert_body_after_separator_line_is_fingerprinted("\x0c");
+    }
+
+    #[test]
+    fn fingerprint_covers_body_after_a_bare_cr_line() {
+        assert_body_after_separator_line_is_fingerprinted("\r");
     }
 
     /// What mail_parser would show of a message.
@@ -971,6 +986,18 @@ mod tests {
             (
                 html.clone(),
                 format!("{HDR}X-Pad: 1\r\n Content-Type: text/html\r\n\r\n<b>Thursday?</b>\r\n"),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\x0c\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\r\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
             ),
             (base.clone(), base.replace("\r\n", "\n")),
             (

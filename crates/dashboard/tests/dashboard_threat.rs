@@ -74,7 +74,7 @@ fn state() -> (AppState, Draft) {
             folder: "INBOX",
             uid: 7,
             message_id: Some("phish@x"),
-            content_fingerprint: Some(&content_fingerprint(PHISH)),
+            content_fingerprint: content_fingerprint(PHISH).as_deref(),
             observed_message_ids: &[],
         },
         &dangerous,
@@ -344,7 +344,7 @@ async fn mark_safe_binds_to_the_bytes_at_that_uid() {
     let (state, _) = state();
     let db = state.db.clone();
     let app = dashboard_router(state);
-    let fp = content_fingerprint(PHISH);
+    let fp = content_fingerprint(PHISH).unwrap();
     let resend = String::from_utf8_lossy(PHISH)
         .replace("see attached", "pay today")
         .into_bytes();
