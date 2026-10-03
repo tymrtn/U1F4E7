@@ -600,6 +600,22 @@ fn cli_quarantine_is_the_operators() {
         "stderr: {}",
         String::from_utf8_lossy(&created.stderr)
     );
+    // A rule an agent could not create, left disabled by the operator.
+    let parked = run(
+        home,
+        &[
+            "rule",
+            "create",
+            "--name",
+            "verdict release",
+            "--match-tag",
+            "threat:quarantined",
+            "--action",
+            "move=INBOX",
+            "--disabled",
+        ],
+    );
+    assert!(parked.status.success(), "operator rule create failed");
     let token = create_agent_token(home, "skippy");
     allow_actions(home, "skippy", "rules.write,rules.run,move");
 
@@ -645,6 +661,11 @@ fn cli_quarantine_is_the_operators() {
         ),
         run_as(home, &token, &["--json", "rule", "delete", quarantine_rule]),
         run_as(home, &token, &["--json", "rule", "enable", quarantine_rule]),
+        run_as(
+            home,
+            &token,
+            &["--json", "rule", "enable", "verdict release"],
+        ),
         // Running rules, or moving mail, out of the quarantine folder.
         run_as(
             home,
@@ -674,16 +695,25 @@ fn cli_quarantine_is_the_operators() {
     ] {
         assert_denied(&out, "operator_only_command");
     }
-    assert_eq!(rule_count(home), 1, "only the operator's rule may exist");
-    let enabled: i64 = open_db(home)
-        .conn()
-        .query_row(
-            "SELECT enabled FROM rules WHERE name = 'Envelope threat quarantine'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("quarantine rule");
-    assert_eq!(enabled, 1, "the shipped rule stays enabled");
+    assert_eq!(rule_count(home), 2, "only the operator's rules may exist");
+    let enabled = |name: &str| -> i64 {
+        open_db(home)
+            .conn()
+            .query_row("SELECT enabled FROM rules WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .expect("operator rule")
+    };
+    assert_eq!(
+        enabled(quarantine_rule),
+        1,
+        "the shipped rule stays enabled"
+    );
+    assert_eq!(
+        enabled("verdict release"),
+        0,
+        "the parked rule stays disabled"
+    );
 }
 
 #[test]
