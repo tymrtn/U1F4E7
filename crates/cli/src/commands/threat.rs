@@ -9,7 +9,7 @@
 //! creates a draft and never sends.
 
 use anyhow::{Context, Result, anyhow, bail};
-use envelope_email_store::{CredentialBackend, Database, canonical_message_id};
+use envelope_email_store::{CredentialBackend, Database};
 use envelope_email_transport::imap::{self, ImapClient};
 use envelope_email_transport::rule_exec::{
     ActionAttribution, ActionSource, ImapRuleMailbox, MessageTarget, RunAccount, execute_action,
@@ -18,7 +18,7 @@ use envelope_email_transport::rules::{Action, MessageContext};
 use envelope_email_transport::threat::persist::{self, StoredVerdict, VerdictTarget};
 use envelope_email_transport::threat::rdap;
 use envelope_email_transport::threat::report::{self, AbuseOutcome};
-use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig, ThreatInput};
+use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig};
 use serde_json::json;
 
 use super::common::setup_credentials;
@@ -32,16 +32,6 @@ fn require_enabled(config: &ThreatConfig) -> Result<()> {
         bail!("threat.enabled is false; run `envelope config set threat.enabled true` to scan");
     }
     Ok(())
-}
-
-fn message_id_of(raw: &[u8]) -> Option<String> {
-    ThreatInput::from_raw(raw, "")
-        .ok()?
-        .headers
-        .into_iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
-        .map(|(_, v)| canonical_message_id(&v).to_string())
-        .filter(|m| !m.is_empty())
 }
 
 async fn fetch_raw(client: &mut ImapClient, folder: &str, uid: u32) -> Result<Vec<u8>> {
@@ -79,12 +69,13 @@ async fn current_verdict(
         .ok_or_else(|| anyhow!("scan of UID {uid} recorded no verdict"))
 }
 
-fn tags_of(db: &Database, account_id: &str, message_id: Option<&str>) -> Result<Vec<String>> {
-    let Some(mid) = message_id else {
+/// The `threat:*` tags stored under a message's threat key.
+fn tags_of(db: &Database, account_id: &str, key: Option<&str>) -> Result<Vec<String>> {
+    let Some(key) = key else {
         return Ok(Vec::new());
     };
     let mut tags: Vec<String> = db
-        .get_tags(account_id, mid)?
+        .get_tags(account_id, key)?
         .into_iter()
         .map(|t| t.tag)
         .filter(|t| t.starts_with("threat:"))
@@ -105,7 +96,7 @@ pub fn verdict_json(
         "uid": stored.uid,
         "message_id": stored.message_id,
         "recorded_at": stored.recorded_at,
-        "tags": tags_of(db, account_id, stored.message_id.as_deref())?,
+        "tags": tags_of(db, account_id, stored.key.as_deref())?,
         "verdict": stored.verdict,
         "explain": threat::explain(&stored.verdict),
     }))
@@ -302,7 +293,7 @@ pub async fn run_mark_safe(
     // The mark binds to content: the fingerprint the UID's verdict recorded,
     // else that of the message's bytes.
     let recorded = persist::stored_verdict_for_uid(&db, &account_id, folder, uid)?
-        .and_then(|s| Some((s.message_id?, s.content_fingerprint?)));
+        .and_then(|s| Some((s.message_id, s.content_fingerprint?)));
     let (message_id, fingerprint) = match recorded {
         Some(identity) => identity,
         None => {
@@ -310,9 +301,10 @@ pub async fn run_mark_safe(
                 .await
                 .context("IMAP connection failed")?;
             let raw = fetch_raw(&mut client, folder, uid).await?;
-            let message_id = message_id_of(&raw)
-                .ok_or_else(|| anyhow!("UID {uid} in {folder} has no Message-ID to tag"))?;
-            (message_id, threat::content_fingerprint(&raw))
+            (
+                threat::sole_message_id(&raw),
+                threat::content_fingerprint(&raw),
+            )
         }
     };
     persist::mark_safe(
@@ -321,7 +313,7 @@ pub async fn run_mark_safe(
             account_id: &account_id,
             folder,
             uid,
-            message_id: Some(&message_id),
+            message_id: message_id.as_deref(),
             content_fingerprint: Some(&fingerprint),
         },
         "cli",
@@ -361,7 +353,12 @@ pub async fn run_release(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
-    let message_id = message_id_of(&fetch_raw(&mut client, folder, uid).await?);
+    let raw = fetch_raw(&mut client, folder, uid).await?;
+    let message_id = threat::sole_message_id(&raw);
+    let key = persist::threat_key(
+        message_id.as_deref(),
+        Some(&threat::content_fingerprint(&raw)),
+    );
 
     let ctx = MessageContext {
         from_addr: String::new(),
@@ -394,8 +391,8 @@ pub async fn run_release(
     )
     .await
     .with_context(|| format!("release of UID {uid} from {folder} failed"))?;
-    if let Some(mid) = message_id.as_deref() {
-        db.remove_tag(&account_id, mid, TAG_QUARANTINED)?;
+    if let Some(key) = key.as_deref() {
+        db.remove_tag(&account_id, key, TAG_QUARANTINED)?;
     }
     if json {
         println!(
@@ -431,7 +428,7 @@ pub async fn run_report(
     let raw = fetch_raw(&mut client, folder, uid).await?;
     drop(client);
 
-    let message_id = message_id_of(&raw);
+    let message_id = threat::sole_message_id(&raw);
     let fingerprint = threat::content_fingerprint(&raw);
     let target = VerdictTarget {
         account_id: &account_id,
@@ -620,14 +617,5 @@ mod tests {
             serialized.get("content_fingerprint").is_none(),
             "{serialized}"
         );
-    }
-
-    #[test]
-    fn message_id_is_read_from_raw_headers() {
-        assert_eq!(
-            message_id_of(b"Message-ID: <abc@host>\r\nFrom: a@b\r\n\r\nx").as_deref(),
-            Some("abc@host")
-        );
-        assert_eq!(message_id_of(b"From: a@b\r\n\r\nx"), None);
     }
 }

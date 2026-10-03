@@ -45,25 +45,25 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
     (status, Json(json!({"code": code, "error": message.into()}))).into_response()
 }
 
-/// The reader's view of a verdict on the message with `message_id` and
-/// content `fingerprint`. Level and malware come from the verdict itself;
-/// `marked_safe` holds only for a Mark safe bound to this content. `tags`
-/// lists the Message-ID's `threat:*` tags as stored.
+/// The reader's view of a verdict on the message with threat `key` (see
+/// [`persist::threat_key`]) and content `fingerprint`. Level and malware come
+/// from the verdict itself; `marked_safe` holds only for a Mark safe bound to
+/// this content. `tags` lists the `threat:*` tags stored under the key.
 pub fn verdict_view(
     db: &Database,
     account_id: &str,
-    message_id: Option<&str>,
+    key: Option<&str>,
     fingerprint: Option<&str>,
     verdict: &ThreatVerdict,
 ) -> anyhow::Result<Value> {
-    let (tags, marked_safe) = match message_id {
-        Some(mid) => (
-            db.get_tags(account_id, mid)?
+    let (tags, marked_safe) = match key {
+        Some(key) => (
+            db.get_tags(account_id, key)?
                 .into_iter()
                 .map(|t| t.tag)
                 .filter(|t| t.starts_with("threat:"))
                 .collect(),
-            persist::is_marked_safe(db, account_id, mid, fingerprint)?,
+            persist::is_marked_safe(db, account_id, key, fingerprint)?,
         ),
         None => (Vec::<String>::new(), false),
     };
@@ -84,7 +84,7 @@ fn stored_view(db: &Database, account_id: &str, stored: &StoredVerdict) -> anyho
     verdict_view(
         db,
         account_id,
-        stored.message_id.as_deref(),
+        stored.key.as_deref(),
         stored.content_fingerprint.as_deref(),
         &stored.verdict,
     )
@@ -105,25 +105,19 @@ pub fn verdict_for_open(
         persist::verdict_on_open(db, account_id, account_address, folder, uid, raw, config)?;
     // The message's own identity: its bytes when read whole, else what the
     // verdict at this UID recorded (a message read part by part).
-    let (message_id, fingerprint) = match raw {
-        Some(raw) => (
-            persist::raw_message_id(raw, account_address),
-            Some(threat::content_fingerprint(raw)),
-        ),
+    let (key, fingerprint) = match raw {
+        Some(raw) => {
+            let fingerprint = threat::content_fingerprint(raw);
+            let key =
+                persist::threat_key(threat::sole_message_id(raw).as_deref(), Some(&fingerprint));
+            (key, Some(fingerprint))
+        }
         None => persist::stored_verdict_for_uid(db, account_id, folder, uid)?
-            .map(|s| (s.message_id, s.content_fingerprint))
+            .map(|s| (s.key, s.content_fingerprint))
             .unwrap_or_default(),
     };
     verdict
-        .map(|v| {
-            verdict_view(
-                db,
-                account_id,
-                message_id.as_deref(),
-                fingerprint.as_deref(),
-                &v,
-            )
-        })
+        .map(|v| verdict_view(db, account_id, key.as_deref(), fingerprint.as_deref(), &v))
         .transpose()
 }
 
@@ -181,7 +175,7 @@ pub async fn mark_safe(
             }
         }
     }
-    let (client_arc, creds) = match state.get_or_create_imap(&account_id).await {
+    let (client_arc, _creds) = match state.get_or_create_imap(&account_id).await {
         Ok(c) => c,
         Err(e) => return error(StatusCode::BAD_GATEWAY, "imap_error", format!("{e:#}")),
     };
@@ -198,14 +192,7 @@ pub async fn mark_safe(
         }
     };
     let db = state.db.lock().await;
-    mark_safe_message(
-        &db,
-        &account_id,
-        &creds.account.username,
-        &q.folder,
-        uid,
-        &raw,
-    )
+    mark_safe_message(&db, &account_id, &q.folder, uid, &raw)
 }
 
 /// Mark safe the message whose bytes are `raw` at folder/UID. The mark is
@@ -215,12 +202,11 @@ pub async fn mark_safe(
 pub fn mark_safe_message(
     db: &Database,
     account_id: &str,
-    account_address: &str,
     folder: &str,
     uid: u32,
     raw: &[u8],
 ) -> Response {
-    let message_id = persist::raw_message_id(raw, account_address);
+    let message_id = threat::sole_message_id(raw);
     let fingerprint = threat::content_fingerprint(raw);
     let matched = persist::matching_verdict(
         db,
@@ -247,18 +233,11 @@ pub fn mark_safe_message(
             );
         }
     };
-    let Some(message_id) = message_id.as_deref() else {
-        return error(
-            StatusCode::CONFLICT,
-            "no_message_id",
-            "the message has no Message-ID to tag",
-        );
-    };
     let target = VerdictTarget {
         account_id,
         folder,
         uid,
-        message_id: Some(message_id),
+        message_id: message_id.as_deref(),
         content_fingerprint: Some(&fingerprint),
     };
     if let Err(e) = persist::mark_safe(db, &target, "reader", None) {
@@ -268,10 +247,11 @@ pub fn mark_safe_message(
             format!("{e:#}"),
         );
     }
+    let key = persist::threat_key(message_id.as_deref(), Some(&fingerprint));
     match verdict_view(
         db,
         account_id,
-        Some(message_id),
+        key.as_deref(),
         Some(&fingerprint),
         &stored.verdict,
     ) {
@@ -346,7 +326,7 @@ pub async fn report_draft(
                 account_id: &account_id,
                 folder: &q.folder,
                 uid,
-                message_id: stored.as_ref().and_then(|s| s.message_id.as_deref()),
+                message_id: threat::sole_message_id(&raw).as_deref(),
                 content_fingerprint: Some(&threat::content_fingerprint(&raw)),
             },
             &lookups,

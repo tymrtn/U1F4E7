@@ -106,14 +106,7 @@ async fn mark_bytes_safe(
     uid: u32,
     raw: &[u8],
 ) -> (StatusCode, serde_json::Value) {
-    let response = mark_safe_message(
-        &*db.lock().await,
-        "acc1",
-        "me@example.org",
-        "INBOX",
-        uid,
-        raw,
-    );
+    let response = mark_safe_message(&*db.lock().await, "acc1", "INBOX", uid, raw);
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

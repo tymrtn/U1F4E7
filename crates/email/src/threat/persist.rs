@@ -15,16 +15,16 @@
 //! - the attachment gate every download/upload chokepoint calls.
 
 use anyhow::{Context, Result, anyhow, bail};
+use envelope_email_store::Database;
 use envelope_email_store::event_catalog::{LABEL_APPLIED, LOOKUP_PERFORMED, THREAT_VERDICT};
 use envelope_email_store::models::{Event, Rule};
-use envelope_email_store::{Database, canonical_message_id};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Analyzer, Level, LookupLog, LookupRecord, Quarantine, Signal, TAG_DANGEROUS,
-    TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED, TAG_SUSPICIOUS, THREAT_DIMENSION,
-    ThreatConfig, ThreatInput, ThreatVerdict, configured_analyzers, evaluate,
+    Analyzer, FINGERPRINT_KEY_PREFIX, Level, LookupLog, LookupRecord, Quarantine, Signal,
+    TAG_DANGEROUS, TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED, TAG_SUSPICIOUS,
+    THREAT_DIMENSION, ThreatConfig, ThreatInput, ThreatVerdict, configured_analyzers, evaluate,
 };
 use crate::imap::{self, ImapClient};
 use crate::rule_exec::{
@@ -66,6 +66,7 @@ impl RawFetch for ImapRuleMailbox<'_> {
 /// outside lookups the scan made.
 #[derive(Debug, Clone, Default)]
 pub struct ScannedMessage {
+    /// [`super::sole_message_id`] of the message.
     pub message_id: Option<String>,
     pub from_addr: String,
     pub to_addr: String,
@@ -144,9 +145,7 @@ fn scanned_message(input: &ThreatInput) -> ScannedMessage {
             .map(|(_, v)| v.clone())
     };
     ScannedMessage {
-        message_id: header("message-id")
-            .map(|m| canonical_message_id(&m).to_string())
-            .filter(|m| !m.is_empty()),
+        message_id: super::sole_message_id_in(&input.headers),
         from_addr: input.from_addr.clone(),
         to_addr: header("to").unwrap_or_default(),
         subject: header("subject").unwrap_or_default(),
@@ -170,14 +169,25 @@ pub fn scan_raw(
     (verdict, scanned)
 }
 
+/// The key a message's threat tags, score and events are stored under: its
+/// [`super::sole_message_id`], else [`FINGERPRINT_KEY_PREFIX`] and its
+/// content fingerprint. `None` only when neither is known.
+pub fn threat_key(message_id: Option<&str>, fingerprint: Option<&str>) -> Option<String> {
+    match (message_id, fingerprint) {
+        (Some(mid), _) => Some(mid.to_string()),
+        (None, Some(fp)) => Some(format!("{FINGERPRINT_KEY_PREFIX}{fp}")),
+        (None, None) => None,
+    }
+}
+
 /// Where a verdict is stored.
 #[derive(Debug, Clone, Copy)]
 pub struct VerdictTarget<'a> {
     pub account_id: &'a str,
     pub folder: &'a str,
     pub uid: u32,
-    /// Canonical Message-ID. Without one, only the event is written (scores
-    /// and tags are keyed by Message-ID).
+    /// The message's [`super::sole_message_id`]. Scores, tags and events are
+    /// keyed by [`threat_key`] of this and the fingerprint.
     pub message_id: Option<&'a str>,
     /// [`super::content_fingerprint`] of the message's bytes, stored beside
     /// the verdict. `None` only where no complete bytes were read.
@@ -203,16 +213,16 @@ struct VerdictPayload {
 pub fn is_marked_safe(
     db: &Database,
     account_id: &str,
-    message_id: &str,
+    key: &str,
     fingerprint: Option<&str>,
 ) -> Result<bool> {
     let Some(fingerprint) = fingerprint else {
         return Ok(false);
     };
-    if !has_safe_tag(db, account_id, message_id)? {
+    if !has_safe_tag(db, account_id, key)? {
         return Ok(false);
     }
-    Ok(safe_marks(db, account_id, message_id)?
+    Ok(safe_marks(db, account_id, key)?
         .iter()
         .any(|(_, mark)| mark.content_fingerprint.as_deref() == Some(fingerprint)))
 }
@@ -291,7 +301,8 @@ pub fn record_verdict(
     target: &VerdictTarget<'_>,
     verdict: &ThreatVerdict,
 ) -> Result<()> {
-    if let Some(mid) = target.message_id {
+    if let Some(key) = threat_key(target.message_id, target.content_fingerprint) {
+        let mid = key.as_str();
         let uid = Some(i64::from(target.uid));
         let folder = Some(target.folder);
         let safe = is_marked_safe(db, target.account_id, mid, target.content_fingerprint)?;
@@ -346,7 +357,7 @@ fn record_verdict_event(
         event_type: THREAT_VERDICT.to_string(),
         folder: target.folder.to_string(),
         uid: Some(i64::from(target.uid)),
-        message_id: target.message_id.map(str::to_string),
+        message_id: threat_key(target.message_id, target.content_fingerprint),
         from_addr: None,
         subject: None,
         snippet: None,
@@ -382,7 +393,7 @@ pub fn record_lookups(
             event_type: LOOKUP_PERFORMED.to_string(),
             folder: target.folder.to_string(),
             uid: Some(i64::from(target.uid)),
-            message_id: target.message_id.map(str::to_string),
+            message_id: threat_key(target.message_id, target.content_fingerprint),
             from_addr: None,
             subject: None,
             snippet: None,
@@ -403,7 +414,12 @@ pub fn record_lookups(
 pub struct StoredVerdict {
     pub folder: String,
     pub uid: Option<i64>,
+    /// The message's Message-ID, when it had one usable Message-ID.
     pub message_id: Option<String>,
+    /// What the verdict's message has its threat tags and score under (see
+    /// [`threat_key`]). Not part of any JSON output.
+    #[serde(skip)]
+    pub key: Option<String>,
     pub recorded_at: String,
     pub verdict: ThreatVerdict,
     /// The fingerprint of the bytes the verdict judged; `None` for a verdict
@@ -446,10 +462,12 @@ pub fn matching_verdict(
     {
         return Ok(Some(own));
     }
-    let Some(mid) = message_id else {
+    let Some(key) = threat_key(message_id, Some(fingerprint)) else {
         return Ok(None);
     };
-    for event in db.events_for_message(account_id, THREAT_VERDICT, mid, FINGERPRINT_SEARCH_LIMIT)? {
+    for event in
+        db.events_for_message(account_id, THREAT_VERDICT, &key, FINGERPRINT_SEARCH_LIMIT)?
+    {
         let stored = stored_verdict(event)?;
         if stored.content_fingerprint.as_deref() == Some(fingerprint) {
             return Ok(Some(stored));
@@ -464,10 +482,15 @@ fn stored_verdict(event: Event) -> Result<StoredVerdict> {
         .ok_or_else(|| anyhow!("threat_verdict event {} has no payload", event.id))?;
     let payload: VerdictPayload =
         serde_json::from_str(&payload).context("stored threat_verdict payload is not a verdict")?;
+    let message_id = event
+        .message_id
+        .clone()
+        .filter(|key| !key.starts_with(FINGERPRINT_KEY_PREFIX));
     Ok(StoredVerdict {
         folder: event.folder,
         uid: event.uid,
-        message_id: event.message_id,
+        message_id,
+        key: event.message_id,
         recorded_at: event.created_at,
         verdict: payload.verdict,
         content_fingerprint: payload.content_fingerprint,
@@ -487,9 +510,10 @@ pub struct AttachmentBlock {
     pub signals: Vec<Signal>,
 }
 
-/// The attachment gate. Refuses bytes that look like malware, or whose
-/// message carries `threat:malware`, or whose message content (by
-/// `fingerprint`) has a malware verdict on file. Only a Mark safe bound to
+/// The attachment gate, for an attachment of the message with
+/// [`super::sole_message_id`] `message_id` and content `fingerprint`. Refuses
+/// bytes that look like malware, or whose message carries `threat:malware`,
+/// or whose message content (by `fingerprint`) has a malware verdict on file. Only a Mark safe bound to
 /// this fingerprint releases them, so an attachment fetched without one (part
 /// by part, from an over-cap message) is never released by Mark safe.
 pub fn attachment_block(
@@ -501,8 +525,9 @@ pub fn attachment_block(
     content_type: &str,
     bytes: &[u8],
 ) -> Result<Option<AttachmentBlock>> {
-    if let Some(mid) = message_id
-        && is_marked_safe(db, account_id, mid, fingerprint)?
+    let key = threat_key(message_id, fingerprint);
+    if let Some(key) = key.as_deref()
+        && is_marked_safe(db, account_id, key, fingerprint)?
     {
         return Ok(None);
     }
@@ -516,8 +541,8 @@ pub fn attachment_block(
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
-    } else if let Some(mid) = message_id {
-        message_malware_reason(db, account_id, mid, fingerprint)?
+    } else if let Some(key) = key.as_deref() {
+        message_malware_reason(db, account_id, key, fingerprint)?
     } else {
         None
     };
@@ -581,7 +606,7 @@ pub fn blocked_attachments(
     let parsed = mail_parser::MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed for the attachment gate"))?;
-    let message_id = parsed.message_id().map(canonical_message_id);
+    let message_id = super::sole_message_id(raw);
     let fingerprint = super::content_fingerprint(raw);
     let mut out = Vec::new();
     for attachment in parsed.attachments() {
@@ -594,7 +619,7 @@ pub fn blocked_attachments(
         if let Some(block) = attachment_block(
             db,
             account_id,
-            message_id,
+            message_id.as_deref(),
             Some(&fingerprint),
             filename,
             &content_type,
@@ -616,13 +641,6 @@ pub fn mark_safe(
     source: &str,
     agent_id: Option<&str>,
 ) -> Result<()> {
-    let mid = target.message_id.ok_or_else(|| {
-        anyhow!(
-            "UID {} in {} has no Message-ID; cannot tag it",
-            target.uid,
-            target.folder
-        )
-    })?;
     let fingerprint = target.content_fingerprint.ok_or_else(|| {
         anyhow!(
             "{RESCAN_REQUIRED}: UID {} in {} has no content fingerprint to bind Mark safe to; \
@@ -631,6 +649,9 @@ pub fn mark_safe(
             target.folder
         )
     })?;
+    let key = threat_key(target.message_id, Some(fingerprint))
+        .ok_or_else(|| anyhow!("UID {} in {} has no threat key", target.uid, target.folder))?;
+    let mid = key.as_str();
     let uid = Some(i64::from(target.uid));
     for tag in [TAG_SUSPICIOUS, TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED] {
         db.remove_tag(target.account_id, mid, tag)?;
@@ -724,25 +745,24 @@ pub fn ensure_quarantine_rule(db: &Database, account_id: &str) -> Result<Rule> {
     )?)
 }
 
-/// Build the rule context for a scanned message from the stores.
+/// Build the rule context for a scanned message from the stores, with its
+/// tags and scores read under its threat `key`.
 fn rule_context(
     db: &Database,
     account_id: &str,
+    key: &str,
     scanned: &ScannedMessage,
 ) -> Result<MessageContext> {
-    let (tags, scores) = match scanned.message_id.as_deref() {
-        Some(mid) => (
-            db.get_tags(account_id, mid)?
-                .into_iter()
-                .map(|t| t.tag)
-                .collect(),
-            db.get_scores(account_id, mid)?
-                .into_iter()
-                .map(|s| (s.dimension, s.value))
-                .collect(),
-        ),
-        None => (Vec::new(), Default::default()),
-    };
+    let tags = db
+        .get_tags(account_id, key)?
+        .into_iter()
+        .map(|t| t.tag)
+        .collect();
+    let scores = db
+        .get_scores(account_id, key)?
+        .into_iter()
+        .map(|s| (s.dimension, s.value))
+        .collect();
     Ok(MessageContext {
         from_addr: scanned.from_addr.clone(),
         to_addr: scanned.to_addr.clone(),
@@ -779,10 +799,11 @@ pub async fn apply_quarantine<M: RuleMailbox, D: ExecDb>(
     if verdict.level != Level::Dangerous || config.quarantine == Quarantine::None {
         return Ok(QuarantineOutcome::NotApplied);
     }
-    let Some(mid) = scanned.message_id.as_deref() else {
+    let fingerprint = scanned.content_fingerprint.as_deref();
+    let Some(key) = threat_key(scanned.message_id.as_deref(), fingerprint) else {
         return Ok(QuarantineOutcome::NotApplied);
     };
-    let fingerprint = scanned.content_fingerprint.as_deref();
+    let mid = key.as_str();
     let safe = db
         .with_db(|d| is_marked_safe(d, account.id, mid, fingerprint))
         .await?;
@@ -808,7 +829,7 @@ pub async fn apply_quarantine<M: RuleMailbox, D: ExecDb>(
         .with_db(|d| -> Result<(Rule, MessageContext)> {
             Ok((
                 ensure_quarantine_rule(d, account.id)?,
-                rule_context(d, account.id, scanned)?,
+                rule_context(d, account.id, mid, scanned)?,
             ))
         })
         .await?;
@@ -923,19 +944,6 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     })
 }
 
-/// The canonical Message-ID of a raw message; `None` when it has none.
-pub fn raw_message_id(raw: &[u8], account_address: &str) -> Option<String> {
-    ThreatInput::from_raw(raw, account_address)
-        .ok()
-        .and_then(|i| {
-            i.headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
-                .map(|(_, v)| canonical_message_id(v).to_string())
-        })
-        .filter(|m| !m.is_empty())
-}
-
 /// Scan one message on open when no current verdict judged these bytes (and
 /// `threat.on_read` is on). Returns the verdict to show.
 ///
@@ -960,7 +968,7 @@ pub fn verdict_on_open(
     let Some(raw) = raw else {
         return Ok(stored_verdict_for_uid(db, account_id, folder, uid)?.map(|s| s.verdict));
     };
-    let message_id = raw_message_id(raw, account_address);
+    let message_id = super::sole_message_id(raw);
     let fingerprint = super::content_fingerprint(raw);
     let here = VerdictTarget {
         account_id,
@@ -1515,6 +1523,138 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
             "{}",
             blocked[0].1.reason
         );
+    }
+
+    /// A message with an innocent and a malware-grade attachment, from a
+    /// lookalike sender, with the given Message-ID header lines.
+    fn two_attachments(message_id_headers: &str) -> Vec<u8> {
+        format!(
+            "From: IT Desk <it@examp1e.org>\r\nTo: me@example.org\r\n{message_id_headers}\
+Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
+--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// The key threat data is stored under for a message without one usable
+    /// Message-ID.
+    fn fp_key(raw: &[u8]) -> String {
+        format!("fp:{}", content_fingerprint(raw))
+    }
+
+    fn blocked_names(db: &Database, raw: &[u8]) -> Vec<String> {
+        blocked_attachments(db, ACCT, raw)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The scanner and the attachment gate read the same identity, so a
+    /// second Message-ID header cannot split a verdict from its attachments.
+    #[test]
+    fn two_message_id_headers_block_the_attachments() {
+        let db = Database::open_memory().unwrap();
+        let dup = two_attachments("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n");
+        let verdict = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Some(&dup),
+            &ThreatConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(verdict.is_malware());
+        assert_eq!(blocked_names(&db, &dup), ["notes.pdf", "invoice.pdf.exe"]);
+        assert_eq!(tags(&db, &fp_key(&dup)), [TAG_DANGEROUS, TAG_MALWARE]);
+        assert!(tags(&db, "first@x").is_empty() && tags(&db, "second@x").is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_message_id_is_quarantined_tagged_and_scored() {
+        let db = Database::open_memory().unwrap();
+        let header = |mid: &str| format!("Message-ID: <{mid}>\r\n");
+        let empty_first = String::from_utf8(phish("real@x"))
+            .unwrap()
+            .replace(&header("real@x"), "Message-ID:\r\nMessage-ID: <real@x>\r\n")
+            .into_bytes();
+        let empty_only = String::from_utf8(phish("gone@x"))
+            .unwrap()
+            .replace(&header("gone@x"), "Message-ID: \r\n")
+            .into_bytes();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(3, empty_first.clone());
+        mbox.raw.insert(4, empty_only.clone());
+        let results = scan_new_mail(
+            &mut mbox,
+            &db,
+            &account(),
+            "INBOX",
+            &[3, 4],
+            &ThreatConfig::default(),
+        )
+        .await;
+        for ((uid, result), raw) in results.iter().zip([&empty_first, &empty_only]) {
+            let entry = result.as_ref().unwrap();
+            assert_eq!(entry.level, Level::Dangerous, "UID {uid}");
+            assert_eq!(entry.quarantine, QuarantineOutcome::Tagged, "UID {uid}");
+            let key = fp_key(raw);
+            assert_eq!(
+                tags(&db, &key),
+                [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED],
+                "UID {uid}"
+            );
+            assert_eq!(
+                db.get_scores(ACCT, &key).unwrap()[0].value,
+                f64::from(entry.score),
+                "UID {uid}"
+            );
+        }
+        assert!(tags(&db, "real@x").is_empty());
+    }
+
+    #[test]
+    fn without_a_message_id_the_gate_checks_the_fingerprint_verdict() {
+        let db = Database::open_memory().unwrap();
+        let none = two_attachments("");
+        let fp = content_fingerprint(&none);
+        let clamd = super::super::combine(
+            vec![Signal::new("clamd_found", 100, "Eicar").malware()],
+            vec![],
+            vec![],
+            false,
+        );
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 4,
+                message_id: None,
+                content_fingerprint: Some(&fp),
+            },
+            &clamd,
+        )
+        .unwrap();
+        let block = attachment_block(
+            &db,
+            ACCT,
+            None,
+            Some(&fp),
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF-1.4",
+        )
+        .unwrap()
+        .expect("the clamd verdict on these bytes blocks every attachment");
+        assert!(block.reason.contains("malware"), "{}", block.reason);
+        assert_eq!(blocked_names(&db, &none), ["notes.pdf", "invoice.pdf.exe"]);
     }
 
     /// The gate reads a bounded window of a Message-ID's verdicts. When the

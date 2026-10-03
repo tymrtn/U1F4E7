@@ -387,6 +387,34 @@ fn spans_of<'a>(raw: &'a [u8], spans: &[(usize, usize)]) -> Vec<&'a [u8]> {
     spans.iter().map(|&(start, end)| &raw[start..end]).collect()
 }
 
+/// Threat data for a message without one usable Message-ID is keyed by this
+/// prefix and the message's content fingerprint.
+pub const FINGERPRINT_KEY_PREFIX: &str = "fp:";
+
+/// The message's identity as every threat path reads it (scanner, attachment
+/// gate, quarantine, views): the canonical Message-ID when the header block
+/// has exactly one Message-ID field holding one non-empty id. `None` when it
+/// has none, several, or an empty or malformed one; that message's threat
+/// data is keyed by its fingerprint instead.
+pub fn sole_message_id(raw: &[u8]) -> Option<String> {
+    sole_message_id_in(&parse_header_block(raw))
+}
+
+/// [`sole_message_id`] over already parsed header fields.
+pub(crate) fn sole_message_id_in(headers: &[(String, String)]) -> Option<String> {
+    let mut fields = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("message-id"));
+    let (_, value) = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let id = envelope_email_store::canonical_message_id(value);
+    let one_id =
+        !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>');
+    one_id.then(|| id.to_string())
+}
+
 /// The `by` host of a `Received` header, if it names one.
 pub fn received_by_host(value: &str) -> Option<String> {
     let lower = value.to_lowercase();
@@ -845,5 +873,152 @@ mod tests {
             "x",
         );
         assert_eq!(input.receiving_host.as_deref(), Some("mx.google.com"));
+    }
+
+    #[test]
+    fn sole_message_id_needs_exactly_one_non_empty_id() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("Message-ID: <abc@host>\r\n", Some("abc@host")),
+            ("message-id: <a@x>\r\n", Some("a@x")),
+            ("Message-ID: a@x\r\n", Some("a@x")),
+            ("Message-ID:\r\n <a@x>\r\n", Some("a@x")),
+            ("Message-ID: < a@x >\r\n", Some("a@x")),
+            ("", None),
+            ("Message-ID: \r\n", None),
+            ("Message-ID: <>\r\n", None),
+            ("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n", None),
+            ("Message-ID: \r\nMessage-ID: <b@x>\r\n", None),
+            ("Message-ID: <a@x> <b@x>\r\n", None),
+            ("Message-ID: (c) <a@x> (trailing)\r\n", None),
+        ];
+        for (header, expected) in cases {
+            let raw = format!("From: a@x\r\nTo: me@y\r\nSubject: s\r\n{header}\r\nbody\r\n");
+            assert_eq!(
+                sole_message_id(raw.as_bytes()).as_deref(),
+                *expected,
+                "{header:?}"
+            );
+        }
+    }
+
+    /// What mail_parser would show of a message.
+    fn parsed_view(raw: &[u8]) -> String {
+        let Some(m) = mail_parser::MessageParser::default().parse(raw) else {
+            return "unparseable".into();
+        };
+        format!(
+            "from={:?} subject={:?} ct={:?} text={:?} html={:?} attachments={:?}",
+            m.from().and_then(|f| f.first()).and_then(|a| a.address()),
+            m.subject(),
+            m.content_type()
+                .map(|c| format!("{}/{:?}", c.ctype(), c.subtype())),
+            m.body_text(0),
+            m.body_html(0),
+            m.attachments()
+                .map(|a| a.attachment_name().unwrap_or("?").to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Two messages that read differently never share a fingerprint, across
+    /// header-block and line-ending edge cases.
+    #[test]
+    fn fingerprint_differs_whenever_the_parsed_message_differs() {
+        const HDR: &str = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                           Subject: Lunch\r\nMessage-ID: <m1@partner.example>\r\n";
+        let base = format!("{HDR}X-Pad: 1\r\n\r\nThursday?\r\n");
+        let html = format!("{HDR}X-Pad: 1\r\n\r\n<b>Thursday?</b>\r\n");
+        let with = |extra: &str| format!("{HDR}{extra}\r\nX-Pad: 1\r\n\r\nThursday?\r\n");
+        let html_with =
+            |extra: &str| format!("{HDR}{extra}\r\nX-Pad: 1\r\n\r\n<b>Thursday?</b>\r\n");
+        let mut pairs: Vec<(String, String)> = vec![
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n \r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\t\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\nPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\r\nPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\rContent-Type: text/html\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\rPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                html.clone(),
+                format!("{HDR}X-Pad: 1\r\n Content-Type: text/html\r\n\r\n<b>Thursday?</b>\r\n"),
+            ),
+            (base.clone(), base.replace("\r\n", "\n")),
+            (
+                format!(
+                    "{HDR}Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\n<b>x</b>\r\n"
+                ),
+                format!(
+                    "{HDR}Content-Type: text/html\r\nContent-Type: text/plain\r\n\r\n<b>x</b>\r\n"
+                ),
+            ),
+            (base.clone(), format!(" junk\r\n{base}")),
+            (
+                format!("{HDR}\r\n<b>x</b>\r\n"),
+                format!("{HDR}Content-Type : text/html\r\n\r\n<b>x</b>\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\n\0\r\nPay now\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n<html><a href=\"http://evil.example\">Pay</a></html>\r\n\r\nThursday?\r\n"
+                ),
+            ),
+        ];
+        for extra in [
+            "Resent-From: Bank <security@bank.example>",
+            "X-Original-From: ceo@example.org",
+            "In-Reply-To: <thread@example.org>",
+            "References: <thread@example.org>",
+            "Return-Path: <x@evil.example>",
+            "Disposition-Notification-To: x@evil.example",
+            "Comments: Pay at http://evil.example",
+            "Keywords: urgent",
+            "Importance: high",
+        ] {
+            pairs.push((base.clone(), with(extra)));
+        }
+        for extra in [
+            "From\x0b: Bank <sec@bank.example>",
+            "Subject\x0b: URGENT pay",
+            "\u{feff}Content-Type: text/html",
+            "From\u{a0}: Bank <sec@bank.example>",
+            "\x0cContent-Type: text/html",
+            "X-Content-Type: text/html",
+            "Content\x0b-Type: text/html",
+            "Content_Type: text/html",
+        ] {
+            pairs.push((html.clone(), html_with(extra)));
+        }
+        for (a, b) in &pairs {
+            let same_fingerprint =
+                content_fingerprint(a.as_bytes()) == content_fingerprint(b.as_bytes());
+            let same_view = parsed_view(a.as_bytes()) == parsed_view(b.as_bytes());
+            assert!(!same_fingerprint || same_view, "{b:?}");
+        }
     }
 }
