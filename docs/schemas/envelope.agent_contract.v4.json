@@ -21,10 +21,11 @@
         "rules.batch_ack": "also needed by `envelope rule enable --acknowledge-batch-actions`",
         "rules.webhook": "also needed by `envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
         "rules.write": "`envelope rule create`, `rule enable`, `rule disable` and `rule delete`",
-        "sieve.publish": "`envelope rule publish-sieve --confirm`",
+        "sieve.publish": "`envelope rule publish-sieve --confirm` to the account's own ManageSieve endpoint; naming another with --host is operator-only",
         "unsubscribe": "`envelope unsubscribe --confirm`",
-        "watch.webhook": "`envelope watch --webhook <url>`"
+        "watch.webhook": "`envelope watch --webhook <url>` and `envelope watch --deliver`"
       },
+      "actor": "Under a token, `envelope actions exec --actor` must name the agent itself (its name or id); any other actor is refused with operator_only_command.",
       "classes": {
         "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. Some gated commands then apply more of the policy (see send and actions).",
         "operator_only": "Changes credentials, agent identities or policy, configuration, authentication, delivery routes, or a decision that belongs to a person, or runs the dashboard server. Refused under any agent token with operator_only_command, whatever the policy grants. The operator runs it without the token, for example `env -u ENVELOPE_AGENT_TOKEN envelope config set ...`.",
@@ -67,9 +68,6 @@
         "bulk tag": [
           "bulk",
           "tag"
-        ],
-        "contacts import": [
-          "contacts.read"
         ],
         "copy": [
           "move"
@@ -152,6 +150,13 @@
         "unsubscribe --confirm": [
           "unsubscribe"
         ],
+        "watch --deliver": [
+          "watch.webhook"
+        ],
+        "watch --deliver --run-rules": [
+          "watch.webhook",
+          "rules.run"
+        ],
         "watch --run-rules": [
           "rules.run"
         ],
@@ -180,6 +185,7 @@
         "evidence attachment export --unsafe",
         "rule publish-sieve --host",
         "rule publish-sieve --confirm --host",
+        "doctor --repair",
         "serve",
         "license activate",
         "license status",
@@ -195,6 +201,7 @@
         "events routes remove",
         "events deliveries retry",
         "contacts add",
+        "contacts import",
         "contacts tag",
         "contacts untag",
         "config set",

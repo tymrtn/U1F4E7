@@ -47,7 +47,6 @@ const DELETE: &[&str] = &["delete"];
 const FLAG: &[&str] = &["flag"];
 const TAG: &[&str] = &["tag"];
 const SNOOZE: &[&str] = &["snooze"];
-const CONTACTS: &[&str] = &["contacts.read"];
 const BULK_MOVE: &[&str] = &["bulk", "move"];
 const BULK_FLAG: &[&str] = &["bulk", "flag"];
 const BULK_DELETE: &[&str] = &["bulk", "delete"];
@@ -87,13 +86,20 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
         | Commands::Folders { .. }
         | Commands::Code { .. }
         | Commands::Paths
-        | Commands::Doctor { .. }
         | Commands::Quickstart { .. }
         | Commands::Contract { .. }
         | Commands::Compose { .. }
         | Commands::Attributes { .. }
         // MCP authorizes every tool call against the agent's policy itself.
         | Commands::Mcp { .. } => ReadOnly,
+        // --repair copies the database and credentials to --backup-dir.
+        Commands::Doctor { repair, .. } => {
+            if *repair {
+                OperatorOnly
+            } else {
+                ReadOnly
+            }
+        }
         Commands::Send { .. } => Gated(SEND),
         Commands::Move { .. } | Commands::Copy { .. } => Gated(MOVE),
         Commands::Delete { .. } => Gated(DELETE),
@@ -173,7 +179,8 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
         },
         Commands::Actions { subcommand } => match subcommand {
             ActionsCmd::Tail { .. } => ReadOnly,
-            // Records a local audit note; changes no mail.
+            // Records a local audit note; changes no mail. An agent records
+            // it as itself (see `check_actor`).
             ActionsCmd::Exec { subcommand, .. } => match subcommand {
                 ActionsExecCmd::MarkHandled => ReadOnly,
             },
@@ -266,12 +273,11 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
         },
         Commands::Contacts { subcommand } => match subcommand {
             ContactsCmd::List { .. } | ContactsCmd::Show { .. } => ReadOnly,
-            // Imported senders are recorded as agent-curated, as over MCP.
-            ContactsCmd::Import { .. } => Gated(CONTACTS),
             // These record a person as the curator, which vouches for the address.
-            ContactsCmd::Add { .. } | ContactsCmd::Tag { .. } | ContactsCmd::Untag { .. } => {
-                OperatorOnly
-            }
+            ContactsCmd::Add { .. }
+            | ContactsCmd::Import { .. }
+            | ContactsCmd::Tag { .. }
+            | ContactsCmd::Untag { .. } => OperatorOnly,
         },
         // Without --confirm, unsubscribe is a dry run.
         Commands::Unsubscribe { confirm, .. } => {
@@ -281,10 +287,13 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                 ReadOnly
             }
         }
-        // --deliver pushes to routes the operator configured.
+        // --webhook and --deliver push each new message to a URL.
         Commands::Watch {
-            webhook, run_rules, ..
-        } => match (webhook.is_some(), *run_rules) {
+            webhook,
+            deliver,
+            run_rules,
+            ..
+        } => match (webhook.is_some() || *deliver, *run_rules) {
             (false, false) => ReadOnly,
             (true, false) => Gated(WATCH_HOOK),
             (false, true) => Gated(RULES_RUN),
@@ -313,10 +322,12 @@ pub(crate) fn enforce(command: &Commands, json: bool) -> anyhow::Result<()> {
         Ok(None) => return Ok(()),
         Err(e) => return Err(agent_context::print_cli_denial(e, json)),
     };
-    decide(token_mode_permission(command), &agent).map_err(|denial| {
-        record_denial(&agent, &denial);
-        agent_context::print_cli_denial(CliDenial(denial).into(), json)
-    })
+    decide(token_mode_permission(command), &agent)
+        .and_then(|()| check_actor(command, &agent))
+        .map_err(|denial| {
+            record_denial(&agent, &denial);
+            agent_context::print_cli_denial(CliDenial(denial).into(), json)
+        })
 }
 
 /// The pure decision for one command and one agent.
@@ -328,6 +339,26 @@ fn decide(permission: Permission, agent: &AgentContext) -> Result<(), PolicyDeni
             .try_for_each(|action| agent.allows_action(action)),
         OperatorOnly => Err(agent_context::operator_only_denial()),
     }
+}
+
+/// `actions exec --actor` under a token: an agent records an action under
+/// its own name or id, never another's.
+fn check_actor(command: &Commands, agent: &AgentContext) -> Result<(), PolicyDenial> {
+    if let Commands::Actions {
+        subcommand: ActionsCmd::Exec { actor, .. },
+    } = command
+        && actor != &agent.agent_name
+        && actor != &agent.agent_id
+    {
+        return Err(PolicyDenial {
+            code: agent_context::OPERATOR_ONLY_CODE,
+            reason: format!(
+                "only the operator records an action under another actor; pass --actor {}",
+                agent.agent_name
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// File the refusal in the agent's action log. The account is not resolved
@@ -500,12 +531,13 @@ mod tests {
         ("contacts show a@b.test", ReadOnly),
         ("contacts tag a@b.test --tag vip", OperatorOnly),
         ("contacts untag a@b.test --tag vip", OperatorOnly),
-        ("contacts import", Gated(CONTACTS)),
+        ("contacts import", OperatorOnly),
         ("unsubscribe 1", ReadOnly),
         ("unsubscribe 1 --confirm", Gated(LIST_UNSUBSCRIBE)),
         ("code --from a@b.test", ReadOnly),
         ("watch", ReadOnly),
-        ("watch --deliver", ReadOnly),
+        ("watch --deliver", Gated(WATCH_HOOK)),
+        ("watch --deliver --run-rules", Gated(WATCH_HOOK_AND_RULES)),
         ("watch --webhook https://h.example/x", Gated(WATCH_HOOK)),
         ("watch --run-rules", Gated(RULES_RUN)),
         (
@@ -514,6 +546,7 @@ mod tests {
         ),
         ("paths", ReadOnly),
         ("doctor", ReadOnly),
+        ("doctor --repair", OperatorOnly),
         ("config get k", ReadOnly),
         ("config set k v", OperatorOnly),
         ("config unset k", OperatorOnly),
@@ -635,7 +668,9 @@ mod tests {
             "--unsafe",
             "--confirm",
             "--host",
+            "--repair",
             "--webhook",
+            "--deliver",
             "--run-rules",
         ];
         let mut key = path_of(argv);
@@ -689,6 +724,24 @@ mod tests {
             .filter(|key| !seen.contains(*key))
             .collect();
         assert!(stale.is_empty(), "not commands in MATRIX: {stale:?}");
+    }
+
+    #[test]
+    fn an_agent_records_actions_only_as_itself() {
+        let skippy = agent(&["*"], SendMode::DraftOnly);
+        let exec = |actor: &str| {
+            parse(&format!(
+                "actions exec --event-id e --actor {actor} mark-handled"
+            ))
+            .command
+        };
+        assert!(check_actor(&exec("skippy"), &skippy).is_ok());
+        assert!(check_actor(&exec("agent-1"), &skippy).is_ok());
+        for other in ["tyler", "Skippy", "agent-2"] {
+            let denial = check_actor(&exec(other), &skippy).unwrap_err();
+            assert_eq!(denial.code, agent_context::OPERATOR_ONLY_CODE, "{other}");
+        }
+        assert!(check_actor(&parse("actions tail").command, &skippy).is_ok());
     }
 
     #[test]

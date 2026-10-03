@@ -477,6 +477,20 @@ fn cli_webhook_rule_without_grant_is_denied_and_writes_nothing() {
     let out = run_as(home, &token, WEBHOOK_RULE);
     assert_denied(&out, "agent_policy_denied_action");
     assert_eq!(rule_count(home), 0, "no rule row may be written");
+
+    // rules.write admits `rule create`; a webhook action still needs its own grant.
+    allow_actions(home, "skippy", "rules.write");
+    let out = run_as(home, &token, WEBHOOK_RULE);
+    assert_denied(&out, "agent_policy_denied_action");
+    assert!(
+        json_stdout(&out)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("rules.webhook"),
+        "{}",
+        json_stdout(&out)
+    );
+    assert_eq!(rule_count(home), 0, "no rule row may be written");
 }
 
 #[test]
@@ -596,7 +610,20 @@ fn cli_publish_sieve_confirm_is_denied_before_network() {
     let token = create_agent_token(home, "skippy");
     let (port, connected) = connection_probe();
     let port = port.to_string();
+    let to_probe = [
+        "--json",
+        "rule",
+        "publish-sieve",
+        "--confirm",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--timeout-secs",
+        "1",
+    ];
 
+    // The account's own endpoint needs sieve.publish, which "*" does not grant.
     let out = run_as(
         home,
         &token,
@@ -605,15 +632,18 @@ fn cli_publish_sieve_confirm_is_denied_before_network() {
             "rule",
             "publish-sieve",
             "--confirm",
-            "--host",
-            "127.0.0.1",
             "--port",
             &port,
-            "--timeout-secs",
-            "1",
         ],
     );
     assert_denied(&out, "agent_policy_denied_action");
+
+    // Naming another server is the operator's call, with or without the grant.
+    let out = run_as(home, &token, &to_probe);
+    assert_denied(&out, "operator_only_command");
+    allow_actions(home, "skippy", "sieve.publish");
+    let out = run_as(home, &token, &to_probe);
+    assert_denied(&out, "operator_only_command");
     assert!(
         connected
             .recv_timeout(std::time::Duration::from_millis(200))

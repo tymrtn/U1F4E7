@@ -433,6 +433,17 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
             "--host",
             "sieve.attacker.example",
         ],
+        vec!["doctor", "--repair", "--account", account],
+        vec!["contacts", "import", "--account", account],
+        vec![
+            "actions",
+            "exec",
+            "--event-id",
+            "evt_none",
+            "--actor",
+            "tyler",
+            "mark-handled",
+        ],
     ]
     .into_iter()
     .map(|args| args.into_iter().map(str::to_string).collect())
@@ -473,6 +484,7 @@ fn named_grant_commands(f: &Fixture) -> Vec<Vec<String>> {
             "informational",
         ],
         vec!["rule", "publish-sieve", "--account", account, "--confirm"],
+        vec!["watch", "--account", account, "--deliver"],
     ]
     .into_iter()
     .map(|args| args.into_iter().map(str::to_string).collect())
@@ -532,7 +544,6 @@ fn mailbox_commands(f: &Fixture) -> Vec<Vec<String>> {
         vec!["threat", "report", "1", "--account", account],
         vec!["rule", "run", "--confirm", "--account", account],
         vec!["watch", "--account", account, "--run-rules"],
-        vec!["contacts", "import", "--account", account],
     ]
     .into_iter()
     .map(|args| args.into_iter().map(str::to_string).collect())
