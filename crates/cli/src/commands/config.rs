@@ -27,8 +27,8 @@ pub const DASHBOARD_TAILSCALE_ALLOW_KEY: &str = "dashboard.tailscale_allow";
 pub const ENV_DASHBOARD_TAILSCALE_ALLOW: &str = "ENVELOPE_DASHBOARD_TAILSCALE_ALLOW";
 
 /// Accounts whose one-time codes may come from senders their mail provider
-/// did not authenticate. Operator-only: set with `envelope config`, refused
-/// under an agent token, and not reachable over MCP.
+/// did not authenticate. Operator-only: `envelope config set` never runs with
+/// an agent token, and no MCP tool writes it.
 pub const OTP_ALLOW_UNVERIFIED_KEY: &str = "otp.allow_unverified_senders";
 const OTP_ALLOW_UNVERIFIED_POINTER: &str = "/otp/allow_unverified_senders";
 
@@ -210,7 +210,6 @@ fn run_otp_unverified_field(cmd: ConfigCmd, json_output: bool) -> Result<()> {
         ConfigCmd::Set { value, .. } => {
             let db = envelope_email_store::Database::open_default()
                 .context("open the database to check the accounts")?;
-            refuse_agent_token(&db, json_output)?;
             let mut accounts = Vec::new();
             for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
                 let account = super::common::resolve_account(&db, Some(entry))?;
@@ -229,9 +228,6 @@ fn run_otp_unverified_field(cmd: ConfigCmd, json_output: bool) -> Result<()> {
             json!(accounts)
         }
         ConfigCmd::Unset { .. } => {
-            let db = envelope_email_store::Database::open_default()
-                .context("open the database to check the caller")?;
-            refuse_agent_token(&db, json_output)?;
             unset_nested(&mut config, key)?;
             write_config_value(&path, &config)?;
             Value::Null
@@ -251,24 +247,6 @@ fn run_otp_unverified_field(cmd: ConfigCmd, json_output: bool) -> Result<()> {
         println!("Set {key}={}", display_value(&written));
     }
     Ok(())
-}
-
-/// Operator settings cannot be changed by a caller holding an agent token.
-fn refuse_agent_token(db: &envelope_email_store::Database, json_output: bool) -> Result<()> {
-    use super::agent_context::{CliDenial, cli_agent};
-    if cli_agent(db, json_output)?.is_none() {
-        return Ok(());
-    }
-    let denial = envelope_email_transport::PolicyDenial {
-        code: "agent_policy_denied_action",
-        reason: format!(
-            "{OTP_ALLOW_UNVERIFIED_KEY} is an operator setting and cannot be changed with an agent token"
-        ),
-    };
-    if json_output {
-        println!("{}", json!({"status": "denied", "error": denial.to_json()}));
-    }
-    Err(CliDenial(denial).into())
 }
 
 fn otp_unverified_accounts(config: &Value) -> Result<Vec<String>> {

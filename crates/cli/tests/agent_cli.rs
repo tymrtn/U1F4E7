@@ -485,7 +485,7 @@ fn cli_webhook_rule_with_grant_is_allowed() {
     let home = temp.path();
     seed_account(home);
     let token = create_agent_token(home, "skippy");
-    allow_actions(home, "skippy", "rules.webhook");
+    allow_actions(home, "skippy", "rules.write,rules.webhook");
 
     let out = run_as(home, &token, WEBHOOK_RULE);
     assert!(
@@ -866,7 +866,7 @@ fn otp_unverified_opt_in_is_operator_only() {
         &token,
         &["--json", "config", "set", key, "test@example.test"],
     );
-    assert_denied(&out, "agent_policy_denied_action");
+    assert_denied(&out, "operator_only_command");
     let shown = json_stdout(&run(home, &["--json", "config", "get", key]));
     assert_eq!(shown["value"], json!([]), "{shown}");
 
@@ -880,7 +880,7 @@ fn otp_unverified_opt_in_is_operator_only() {
     assert_eq!(shown["value"], json!(["test@example.test"]), "{shown}");
 
     let out = run_as(home, &token, &["--json", "config", "unset", key]);
-    assert_denied(&out, "agent_policy_denied_action");
+    assert_denied(&out, "operator_only_command");
     let out = run(home, &["config", "set", key, "nobody@example.test"]);
     assert!(!out.status.success(), "an unknown account must be refused");
 }

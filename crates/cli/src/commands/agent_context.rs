@@ -40,9 +40,19 @@ pub const AGENT_TOKEN_ENV: &str = "ENVELOPE_AGENT_TOKEN";
 pub const UNSAFE_ANONYMOUS_ENV: &str = "ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS";
 
 /// CLI actions an agent token may perform only when its policy names them.
-/// Each one sends mail data off the machine or changes how the mail server
-/// filters mail, so a `"*"` policy does not include them.
-pub const EXPLICIT_GRANT_ACTIONS: &[&str] = &[RULES_WEBHOOK, RULES_BATCH_ACK, SIEVE_PUBLISH];
+/// Each one sends mail data off the machine, contacts a sender, or changes
+/// what runs on mail without anyone asking, so a `"*"` policy does not
+/// include them.
+pub const EXPLICIT_GRANT_ACTIONS: &[&str] = &[
+    RULES_WRITE,
+    RULES_WEBHOOK,
+    RULES_BATCH_ACK,
+    SIEVE_PUBLISH,
+    WATCH_WEBHOOK,
+    UNSUBSCRIBE,
+];
+/// Create, enable, disable or delete a rule.
+pub const RULES_WRITE: &str = "rules.write";
 /// Create or enable a rule whose action posts message data to a webhook.
 pub const RULES_WEBHOOK: &str = "rules.webhook";
 /// `rule enable --acknowledge-batch-actions`: let snooze and unsubscribe
@@ -50,8 +60,14 @@ pub const RULES_WEBHOOK: &str = "rules.webhook";
 pub const RULES_BATCH_ACK: &str = "rules.batch_ack";
 /// `rule publish-sieve --confirm`: upload the rules to the mail server.
 pub const SIEVE_PUBLISH: &str = "sieve.publish";
+/// `watch --webhook <url>`: post each new message's event to a URL.
+pub const WATCH_WEBHOOK: &str = "watch.webhook";
+/// `unsubscribe --confirm`: contact a list's unsubscribe address.
+pub const UNSUBSCRIBE: &str = "unsubscribe";
 /// Stable code for a set `ENVELOPE_AGENT_TOKEN` that matches no active agent.
 pub const AGENT_TOKEN_INVALID_CODE: &str = "agent_token_invalid";
+/// Stable code for a command that never runs with an agent token.
+pub const OPERATOR_ONLY_CODE: &str = "operator_only_command";
 
 /// A CLI command refused for the acting agent, as a stable `{code, reason}`.
 #[derive(Debug)]
@@ -102,17 +118,32 @@ impl AgentContext {
         account: &str,
         folder: Option<&str>,
     ) -> Result<(), PolicyDenial> {
-        if EXPLICIT_GRANT_ACTIONS.contains(&action)
-            && !self.policy.allowed_actions.iter().any(|a| a == action)
-        {
-            return Err(PolicyDenial {
-                code: "agent_policy_denied_action",
-                reason: format!(
-                    "agent policy does not permit action '{action}'; it must be granted by name"
-                ),
-            });
-        }
+        self.allows_action(action)?;
         self.policy.authorize(action, account, folder)
+    }
+
+    /// The action check alone, for a CLI command whose account is not known
+    /// yet. An [`EXPLICIT_GRANT_ACTIONS`] action must be named; any other is
+    /// granted by its name or by `"*"`.
+    pub fn allows_action(&self, action: &str) -> Result<(), PolicyDenial> {
+        let allowed = &self.policy.allowed_actions;
+        let granted = if EXPLICIT_GRANT_ACTIONS.contains(&action) {
+            allowed.iter().any(|a| a == action)
+        } else {
+            allowed.iter().any(|a| a == action || a == "*")
+        };
+        if granted {
+            return Ok(());
+        }
+        let reason = if EXPLICIT_GRANT_ACTIONS.contains(&action) {
+            format!("agent policy does not permit action '{action}'; it must be granted by name")
+        } else {
+            format!("agent policy does not permit action '{action}'")
+        };
+        Err(PolicyDenial {
+            code: "agent_policy_denied_action",
+            reason,
+        })
     }
 
     /// Clamp a requested send mode down to this agent's policy ceiling.
@@ -174,11 +205,33 @@ pub fn human_approval_hint() -> Value {
 ///
 /// The raw token is never echoed into the error.
 pub fn resolve_from_env(db: &Database) -> anyhow::Result<Option<AgentContext>> {
-    let raw = std::env::var(AGENT_TOKEN_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let raw = agent_token_from_env()?;
     let unsafe_anonymous = std::env::var(UNSAFE_ANONYMOUS_ENV).ok().as_deref() == Some("1");
     resolve_from_values(db, raw, unsafe_anonymous)
+}
+
+/// The raw `ENVELOPE_AGENT_TOKEN`. Unset or blank is `None`, the operator. A
+/// value that is not valid UTF-8 can match no token, so it is refused rather
+/// than read as unset.
+pub fn agent_token_from_env() -> anyhow::Result<Option<String>> {
+    let Some(raw) = std::env::var_os(AGENT_TOKEN_ENV) else {
+        return Ok(None);
+    };
+    match raw.into_string() {
+        Ok(token) if token.trim().is_empty() => Ok(None),
+        Ok(token) => Ok(Some(token)),
+        Err(_) => Err(invalid_token().into()),
+    }
+}
+
+fn invalid_token() -> CliDenial {
+    CliDenial(PolicyDenial {
+        code: AGENT_TOKEN_INVALID_CODE,
+        reason: format!(
+            "{AGENT_TOKEN_ENV} is set but does not match any active agent identity \
+             (unknown or revoked token)"
+        ),
+    })
 }
 
 /// Pure startup-policy core, separated from process environment lookup so the
@@ -238,10 +291,7 @@ fn context_for(db: &Database, identity: &AgentIdentity) -> anyhow::Result<AgentC
 ///
 /// The raw token is never echoed into the error.
 pub fn resolve_cli_from_env(db: &Database) -> anyhow::Result<Option<AgentContext>> {
-    let raw = std::env::var(AGENT_TOKEN_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    resolve_cli_from_values(db, raw)
+    resolve_cli_from_values(db, agent_token_from_env()?)
 }
 
 fn resolve_cli_from_values(
@@ -252,16 +302,26 @@ fn resolve_cli_from_values(
         return Ok(None);
     };
     let Some(identity) = db.get_agent_by_token(&raw)? else {
-        return Err(CliDenial(PolicyDenial {
-            code: AGENT_TOKEN_INVALID_CODE,
-            reason: format!(
-                "{AGENT_TOKEN_ENV} is set but does not match any active agent identity \
-                 (unknown or revoked token)"
-            ),
-        })
-        .into());
+        return Err(invalid_token().into());
     };
     context_for(db, &identity).map(Some)
+}
+
+/// [`resolve_cli_from_env`] without writing anything: the token is checked
+/// on a read-only connection to an existing database, and no database means
+/// no agent can match. Used before every CLI command, so commands that must
+/// not create or change files (`quickstart --skip-network`) stay that way.
+pub fn peek_cli_agent() -> anyhow::Result<Option<AgentContext>> {
+    let Some(raw) = agent_token_from_env()? else {
+        return Ok(None);
+    };
+    let Some(db) = Database::open_default_readonly_existing()? else {
+        return Err(invalid_token().into());
+    };
+    let Some(identity) = db.find_active_agent_by_token(&raw)? else {
+        return Err(invalid_token().into());
+    };
+    context_for(&db, &identity).map(Some)
 }
 
 /// The CLI's acting agent. An invalid token is refused and, in JSON mode,
@@ -298,7 +358,7 @@ pub fn authorize_cli_action(
         })
 }
 
-fn print_cli_denial(error: anyhow::Error, json: bool) -> anyhow::Error {
+pub(crate) fn print_cli_denial(error: anyhow::Error, json: bool) -> anyhow::Error {
     if json && let Some(CliDenial(denial)) = error.downcast_ref::<CliDenial>() {
         println!("{}", json!({"status": "denied", "error": denial.to_json()}));
     }

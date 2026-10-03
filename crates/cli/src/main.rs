@@ -3,6 +3,7 @@
 
 mod commands;
 mod mcp;
+mod token_mode;
 
 use clap::{ArgGroup, Parser, Subcommand};
 
@@ -2147,6 +2148,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // With ENVELOPE_AGENT_TOKEN set, the command must be one that agent may
+    // run, checked before anything else happens.
+    if let Err(e) = token_mode::enforce(&cli.command, cli.json) {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
 
     let result = match cli.command {
         Commands::Accounts { subcommand } => commands::accounts::run(subcommand, cli.json, backend),

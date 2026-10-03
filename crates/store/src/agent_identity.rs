@@ -188,6 +188,20 @@ impl Database {
     /// The raw token is hashed and compared in constant time; it is never
     /// logged or embedded in any error.
     pub fn get_agent_by_token(&self, raw_token: &str) -> Result<Option<AgentIdentity>> {
+        let Some(identity) = self.find_active_agent_by_token(raw_token)? else {
+            return Ok(None);
+        };
+        self.conn().execute(
+            "UPDATE agent_identities SET last_used_at = datetime('now') WHERE id = ?1",
+            params![identity.id],
+        )?;
+        // Return the identity with the freshly-stamped last_used_at.
+        self.get_agent_by_id(&identity.id)
+    }
+
+    /// [`Self::get_agent_by_token`] without stamping `last_used_at`: it only
+    /// reads, so it works on a read-only connection.
+    pub fn find_active_agent_by_token(&self, raw_token: &str) -> Result<Option<AgentIdentity>> {
         let candidate_hash = hash_token(raw_token);
         let mut stmt = self.conn().prepare(
             "SELECT id, name, token_hash, token_prefix, created_at, revoked_at, last_used_at
@@ -216,13 +230,7 @@ impl Database {
         if revoked_at.is_some() {
             return Ok(None);
         }
-
-        self.conn().execute(
-            "UPDATE agent_identities SET last_used_at = datetime('now') WHERE id = ?1",
-            params![identity.id],
-        )?;
-        // Return the identity with the freshly-stamped last_used_at.
-        self.get_agent_by_id(&identity.id)
+        Ok(Some(identity))
     }
 
     /// Fetch an agent by its human name.
