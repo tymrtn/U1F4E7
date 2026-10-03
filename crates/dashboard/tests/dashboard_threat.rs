@@ -369,9 +369,9 @@ async fn mark_safe_binds_to_the_bytes_at_that_uid() {
     let label = db
         .lock()
         .await
-        .latest_event_for_message("acc1", "label_applied", "phish@x")
+        .events_for_message("acc1", "label_applied", "phish@x", 1)
         .unwrap()
-        .unwrap();
+        .remove(0);
     let payload: serde_json::Value = serde_json::from_str(&label.payload.unwrap()).unwrap();
     assert_eq!(payload["content_fingerprint"], fp.as_str());
     assert_eq!((label.folder.as_str(), label.uid), ("INBOX", Some(7)));

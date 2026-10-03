@@ -290,26 +290,6 @@ impl Database {
         Ok(stmt.query_row(params![event_id], map_event).optional()?)
     }
 
-    /// Newest `event_type` event about one message (by canonical Message-ID).
-    pub fn latest_event_for_message(
-        &self,
-        account_id: &str,
-        event_type: &str,
-        message_id: &str,
-    ) -> Result<Option<Event>> {
-        let mut stmt = self.conn().prepare(
-            "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
-                    snippet, payload, idempotency_key, secure_pending, acked_at, created_at
-             FROM events
-             WHERE account_id = ?1 AND event_type = ?2 AND message_id = ?3
-             ORDER BY created_at DESC, rowid DESC
-             LIMIT 1",
-        )?;
-        Ok(stmt
-            .query_row(params![account_id, event_type, message_id], map_event)
-            .optional()?)
-    }
-
     /// The newest `limit` `event_type` events about one message (by canonical
     /// Message-ID), newest first, under whatever folder/UID they were recorded.
     pub fn events_for_message(

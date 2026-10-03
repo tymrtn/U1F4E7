@@ -1342,9 +1342,9 @@ mod tests {
             .unwrap();
         assert_eq!(stored.verdict, verdict);
         let event = db
-            .latest_event_for_message(ACCT, THREAT_VERDICT, "p1@x")
+            .events_for_message(ACCT, THREAT_VERDICT, "p1@x", 1)
             .unwrap()
-            .unwrap();
+            .remove(0);
         let payload = event.payload.unwrap();
         assert!(
             !payload.contains("verify your account"),
@@ -1592,9 +1592,9 @@ mod tests {
         );
         assert_eq!(tags(&db, "a@x"), vec![TAG_FALSE_POSITIVE]);
         let label = db
-            .latest_event_for_message(ACCT, LABEL_APPLIED, "a@x")
+            .events_for_message(ACCT, LABEL_APPLIED, "a@x", 1)
             .unwrap()
-            .unwrap();
+            .remove(0);
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
     }
 
