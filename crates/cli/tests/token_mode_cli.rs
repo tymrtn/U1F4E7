@@ -298,6 +298,12 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
             "dashboard.auth_token",
             "agent-chosen-token",
         ],
+        vec![
+            "config",
+            "set",
+            "threat.receiver_domain",
+            "me@example.test=attacker.example",
+        ],
         vec!["config", "set", "otp.allow_unverified_senders", account],
         vec!["config", "unset", "threat.enabled"],
         vec![
@@ -669,6 +675,27 @@ fn without_a_token_operator_commands_are_unchanged() {
     }
     assert_eq!(count(home, "SELECT COUNT(*) FROM event_routes"), 1);
     assert_eq!(count(home, "SELECT COUNT(*) FROM rules"), 2);
+
+    let out = run(
+        home,
+        &[
+            "--json",
+            "config",
+            "set",
+            "threat.receiver_domain",
+            "Me@Example.test=mx.self.example",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config: Value = serde_json::from_slice(&config_bytes(home).unwrap()).unwrap();
+    assert_eq!(
+        config["threat"]["receiver_domain"],
+        serde_json::json!({"me@example.test": "self.example"})
+    );
 }
 
 #[test]

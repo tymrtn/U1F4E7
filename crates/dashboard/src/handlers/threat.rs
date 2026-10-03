@@ -232,9 +232,10 @@ pub async fn report_draft(
         let stored = persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid)
             .ok()
             .flatten();
-        let targets = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
-            .map(|input| report::report_targets(&input, stored.as_ref().map(|s| &s.verdict)))
-            .unwrap_or_default();
+        let targets =
+            persist::prepare_input(&db, &account_id, &creds.account.username, &raw, &config)
+                .map(|input| report::report_targets(&input, stored.as_ref().map(|s| &s.verdict)))
+                .unwrap_or_default();
         (
             stored,
             targets,

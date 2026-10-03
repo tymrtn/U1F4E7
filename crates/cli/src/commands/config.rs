@@ -178,7 +178,8 @@ fn require_supported_key(key: &str) -> Result<()> {
              {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}, threat.enabled, \
              threat.quarantine, threat.on_read, threat.report_to, threat.analyzers.<name>, \
              threat.reputation.provider, threat.reputation.dqs_key, threat.clamd.address, \
-             threat.clamd.required, sync.poll_interval_secs, {OTP_ALLOW_UNVERIFIED_KEY}"
+             threat.clamd.required, threat.receiver_domain, sync.poll_interval_secs, \
+             {OTP_ALLOW_UNVERIFIED_KEY}"
         ),
     }
 }
@@ -375,6 +376,7 @@ fn effective_threat_value(key: &str, config: &ThreatConfig) -> Value {
             .map(|a| json!(a.display()))
             .unwrap_or(json!("off")),
         "threat.clamd.required" => json!(config.clamd_required),
+        "threat.receiver_domain" => json!(config.receiver_domains),
         _ => key
             .strip_prefix("threat.analyzers.")
             .map(|name| json!(config.analyzer_enabled(name)))

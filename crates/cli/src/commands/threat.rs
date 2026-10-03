@@ -444,7 +444,7 @@ pub async fn run_report(
         }
         None => None,
     };
-    let targets = persist::prepare_input(&db, &account_id, &creds.account.username, &raw)
+    let targets = persist::prepare_input(&db, &account_id, &creds.account.username, &raw, &config)
         .map(|input| report::report_targets(&input, verdict.as_ref()))
         .unwrap_or_default();
     let (abuse, lookups) = report::resolve_abuse_contacts(&rdap::PublicRdap, &targets).await;

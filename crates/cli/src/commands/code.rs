@@ -9,6 +9,7 @@ use envelope_email_transport::code_extractor::extract_code;
 use envelope_email_transport::imap;
 use envelope_email_transport::threat::ThreatInput;
 use envelope_email_transport::threat::auth_results::{SenderAuth, sender_auth};
+use envelope_email_transport::threat::config::ThreatConfig;
 use envelope_email_transport::threat::domains::ascii_host;
 use serde_json::{Value, json};
 
@@ -42,16 +43,19 @@ enum Classified {
 
 /// Judge one raw message. The From filter, subject, code and sender
 /// authentication all come from the same bytes. A candidate needs a pass
-/// for the very domain in its From header.
+/// for the very domain in its From header, from results written in
+/// `receiver_domain`, the account's receiving mail domain.
 fn classify(
     raw: &[u8],
     account: &str,
+    receiver_domain: Option<&str>,
     from_filter: Option<&str>,
     subject_filter: Option<&str>,
 ) -> Classified {
-    let Ok(input) = ThreatInput::from_raw(raw, account) else {
+    let Ok(mut input) = ThreatInput::from_raw(raw, account) else {
         return Classified::NoMatch;
     };
+    input.receiver_domain = receiver_domain.map(str::to_string);
     if from_filter.is_some_and(|filter| !sender_matches(&input.from_addr, filter)) {
         return Classified::NoMatch;
     }
@@ -237,6 +241,9 @@ pub async fn run(
 
     let (_db, creds) = setup_credentials(account, backend)?;
     let allow_unverified = super::config::otp_unverified_senders_allowed(&creds.account)?;
+    let receiver_domain = ThreatConfig::load()
+        .context("threat configuration is invalid; fix it with `envelope config`")?
+        .receiver_domain(&creds.account.username, Some(&creds.account.imap_host));
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
@@ -293,6 +300,7 @@ pub async fn run(
             classified.push(classify(
                 &raw,
                 &creds.account.username,
+                receiver_domain.as_deref(),
                 from_filter,
                 subject_filter,
             ));
@@ -503,7 +511,13 @@ mod tests {
         "mx1.example.org; dkim=pass header.d=issuer.example; dmarc=pass header.from=issuer.example";
 
     fn classify_issuer(raw: &[u8]) -> Classified {
-        classify(raw, "me@example.org", Some("issuer.example"), None)
+        classify(
+            raw,
+            "me@example.org",
+            Some("example.org"),
+            Some("issuer.example"),
+            None,
+        )
     }
 
     fn forged(code: &str) -> Classified {
@@ -564,6 +578,28 @@ mod tests {
     }
 
     #[test]
+    fn classify_trusts_only_the_accounts_receiver() {
+        let raw = otp_message(Some(ISSUER_PASS), "Issuer <otp@issuer.example>", "555555");
+        for receiver in [None, Some("attacker.example")] {
+            match classify(
+                &raw,
+                "me@example.org",
+                receiver,
+                Some("issuer.example"),
+                None,
+            ) {
+                Classified::Rejected(c) => {
+                    assert!(
+                        matches!(c.auth, SenderAuth::Unverifiable(_)),
+                        "{receiver:?}"
+                    )
+                }
+                other => panic!("{receiver:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn classify_accepts_either_spelling_of_an_international_domain() {
         let raw = otp_message(
             Some("mx1.example.org; dmarc=pass header.from=xn--bnk-qla.example"),
@@ -575,7 +611,13 @@ mod tests {
             "b\u{e4}nk.example",
             "otp@xn--bnk-qla.example",
         ] {
-            match classify(&raw, "me@example.org", Some(filter), None) {
+            match classify(
+                &raw,
+                "me@example.org",
+                Some("example.org"),
+                Some(filter),
+                None,
+            ) {
                 Classified::Candidate(c) => assert_eq!(c.code, "777777", "{filter}"),
                 other => panic!("--from {filter}: {other:?}"),
             }

@@ -7,10 +7,18 @@
 //! receiving MTA should strip pre-existing headers carrying its own
 //! authserv-id, but many do not, so header *order* is the defence.
 //!
-//! The receiving host is named by the topmost `Received` with a DNS `by`
-//! host; the receiver writes that line, and nothing a sender supplies can sit
-//! above it. Results with the receiving domain's authserv-id above that line
-//! are the receiver's own: an `Authentication-Results`, or Gmail's
+//! The receiving domain comes from the account ([`ThreatInput::receiver_domain`]),
+//! never from the message. The receiver's line is the topmost `Received`
+//! with a `by` host in that domain; every `by` word is checked, so a sender's
+//! HELO can add a match to that line but cannot hide it. Receiver-internal
+//! lines above it that record no hop (no `from` clause, like Gmail's
+//! `Received: by 2002:...`) are skipped. A line with a `from` clause and no
+//! `by` host in the domain ends the search: the receiver wrote it without
+//! naming its domain (`by mail`, an IP literal), so any line below that
+//! names the domain could be the sender's, and nothing is trusted.
+//!
+//! Results whose authserv-id is in the receiving domain above that line are
+//! the receiver's own: an `Authentication-Results`, or Gmail's
 //! `ARC-Authentication-Results`, since Gmail writes its plain A-R below its
 //! edge `Received`.
 //!
@@ -26,7 +34,7 @@
 //! authserv-ids are ignored entirely.
 
 use super::domains::{ascii_host, registrable};
-use super::{Signal, ThreatInput, is_dns_name, received_by_host};
+use super::{Signal, ThreatInput, is_dns_name, received_by_hosts};
 
 pub const AR_FORGED: u32 = 40;
 pub const DMARC_FAIL: u32 = 35;
@@ -54,27 +62,60 @@ struct TrustedAr {
     above_receiver: bool,
 }
 
-/// `None` when no Received header names a receiving host.
-fn trusted_ar(input: &ThreatInput) -> Option<ReceivingAr> {
-    let receiving_domain = registrable(input.receiving_host.as_deref()?);
-    let is_received = |name: &str| name.eq_ignore_ascii_case("received");
-    let dns_by_host = |value: &str| received_by_host(value).filter(|host| is_dns_name(host));
+/// A `Received` that records a hop from another host. The receiver writes
+/// the `from` clause first, so a sender cannot remove it.
+fn records_a_hop(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("from"))
+}
 
-    // The receiver's first Received: the one `receiving_host` comes from.
-    let anchor = input
-        .headers
-        .iter()
-        .position(|(name, value)| is_received(name) && dns_by_host(value).is_some())?;
-    // The first Received written by another domain. Opaque internal hops like
-    // `by 2002:a05:...` do not end the receiving run.
+/// `Err` carries why nothing in the message can be trusted.
+fn trusted_ar(input: &ThreatInput) -> Result<ReceivingAr, String> {
+    let receiving_domain = input
+        .receiver_domain
+        .clone()
+        .ok_or("no receiving mail domain is known for this account")?;
+    let is_received = |name: &str| name.eq_ignore_ascii_case("received");
+    let names_receiver = |value: &str| {
+        received_by_hosts(value)
+            .iter()
+            .any(|host| registrable(host) == receiving_domain)
+    };
+
+    // The receiver's line.
+    let mut anchor = None;
+    for (idx, (name, value)) in input.headers.iter().enumerate() {
+        if !is_received(name) {
+            continue;
+        }
+        if names_receiver(value) {
+            anchor = Some(idx);
+            break;
+        }
+        if records_a_hop(value) {
+            return Err(format!(
+                "the receiving host's Received line does not name {receiving_domain}"
+            ));
+        }
+    }
+    let anchor =
+        anchor.ok_or_else(|| format!("no Received header names a host in {receiving_domain}"))?;
+    // The first Received below it written by another domain. Opaque internal
+    // hops like `by 2002:a05:...` do not end the receiving run.
     let boundary = input
         .headers
         .iter()
-        .position(|(name, value)| {
-            is_received(name)
-                && matches!(dns_by_host(value), Some(host) if registrable(&host) != receiving_domain)
+        .enumerate()
+        .skip(anchor + 1)
+        .find(|(_, (name, value))| {
+            is_received(name) && !names_receiver(value) && {
+                let hosts = received_by_hosts(value);
+                hosts.iter().any(|host| is_dns_name(host))
+            }
         })
-        .unwrap_or(input.headers.len());
+        .map_or(input.headers.len(), |(idx, _)| idx);
 
     let mut above: Option<(String, String, bool)> = None;
     let mut below: Option<(String, String)> = None;
@@ -129,7 +170,7 @@ fn trusted_ar(input: &ThreatInput) -> Option<ReceivingAr> {
         }),
         (None, None) => None,
     };
-    Some(ReceivingAr {
+    Ok(ReceivingAr {
         receiving_domain,
         trusted,
         forged,
@@ -137,17 +178,15 @@ fn trusted_ar(input: &ThreatInput) -> Option<ReceivingAr> {
 }
 
 pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
-    let Some(ReceivingAr {
+    let ReceivingAr {
         receiving_domain,
         trusted,
         forged,
-    }) = trusted_ar(input)
-    else {
-        return vec![Signal::new(
-            "auth_unverifiable",
-            AUTH_UNVERIFIABLE,
-            "no Received header names a receiving host",
-        )];
+    } = match trusted_ar(input) {
+        Ok(receiving) => receiving,
+        Err(reason) => {
+            return vec![Signal::new("auth_unverifiable", AUTH_UNVERIFIABLE, reason)];
+        }
     };
 
     let mut signals = Vec::new();
@@ -272,8 +311,9 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     let Some(from_domain) = single_from_domain(input) else {
         return SenderAuth::Fail;
     };
-    let Some(receiving) = trusted_ar(input) else {
-        return SenderAuth::Unverifiable("no Received header names a receiving host".to_string());
+    let receiving = match trusted_ar(input) {
+        Ok(receiving) => receiving,
+        Err(reason) => return SenderAuth::Unverifiable(reason),
     };
     let Some(TrustedAr {
         authserv_id,
@@ -450,6 +490,13 @@ mod tests {
     use super::super::test_support::{codes, input_from};
     use super::*;
 
+    /// A message delivered to an account whose mail `receiver` accepts.
+    fn received_by(receiver: &str, headers: &[&str], body: &str) -> ThreatInput {
+        let mut input = input_from(headers, body);
+        input.receiver_domain = Some(receiver.to_string());
+        input
+    }
+
     const RECEIVED_EDGE: &str = "Received: from mail.sender.example (mail.sender.example [203.0.113.5]) by mx1.example.org with ESMTPS id abc; Mon, 21 Sep 2026 10:00:00 +0000";
     const RECEIVED_INTERNAL: &str = "Received: from mx1.example.org by mailstore.example.org with LMTP id def; Mon, 21 Sep 2026 10:00:01 +0000";
     const RECEIVED_SENDER: &str = "Received: from laptop by mail.sender.example with ESMTPSA id ghi; Mon, 21 Sep 2026 09:59:59 +0000";
@@ -541,7 +588,8 @@ mod tests {
 
     #[test]
     fn gmail_layout_with_opaque_internal_hop_is_trusted() {
-        let input = input_from(
+        let input = received_by(
+            "google.com",
             &[
                 "Received: by 2002:a05:6a10:8f0e:b0:5f1:1234 with SMTP id x; Mon, 21 Sep 2026 10:00:02 -0700",
                 "Authentication-Results: mx.google.com; dkim=pass header.i=@sender.example; spf=pass; dmarc=pass (p=NONE) header.from=sender.example",
@@ -567,7 +615,8 @@ mod tests {
         // Migadu writes its A-R below its own Received lines, where a sender's
         // copy would also sit when Migadu writes none. A pass there proves
         // nothing; it is not treated as forged either.
-        let input = input_from(
+        let input = received_by(
+            "migadu.com",
             &[
                 "Delivered-To: alice@example.net",
                 MIGADU_LMTP,
@@ -585,7 +634,8 @@ mod tests {
     #[test]
     fn migadu_pass_without_any_upstream_received_is_unverifiable() {
         // SES and many ESPs add no Received of their own.
-        let input = input_from(
+        let input = received_by(
+            "migadu.com",
             &[
                 "Delivered-To: alice@example.net",
                 "Received: from mizu0.migadu.com ([51.38.57.138]) by soraStorage0.migadu.com with LMTP id q1 for <alice@example.net>; Sat, 26 Sep 2026 07:00:22 +0000",
@@ -601,7 +651,8 @@ mod tests {
 
     #[test]
     fn migadu_dmarc_failure_is_evaluated() {
-        let input = input_from(
+        let input = received_by(
+            "migadu.com",
             &[
                 MIGADU_LMTP,
                 "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q3; Mon, 28 Sep 2026 04:43:18 +0000",
@@ -618,7 +669,8 @@ mod tests {
         // The attacker writes Migadu's authserv-id into the message before
         // submission; their MSA's Received lands above it. Migadu's genuine
         // A-R (dmarc=fail) is still the one trusted.
-        let input = input_from(
+        let input = received_by(
+            "migadu.com",
             &[
                 MIGADU_LMTP,
                 "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q4; Mon, 28 Sep 2026 04:43:18 +0000",
@@ -636,7 +688,8 @@ mod tests {
 
     #[test]
     fn lone_sender_inserted_ar_below_an_upstream_received_is_forged() {
-        let input = input_from(
+        let input = received_by(
+            "migadu.com",
             &[
                 MIGADU_LMTP,
                 "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q6; Mon, 28 Sep 2026 04:43:18 +0000",
@@ -654,7 +707,8 @@ mod tests {
 
     #[test]
     fn gmail_layout_with_upstream_sender_hops_is_trusted() {
-        let input = input_from(
+        let input = received_by(
+            "google.com",
             &[
                 "Delivered-To: alice@example.com",
                 "Received: by 2002:a05:6a10:8f0e:b0:5f1:1234 with SMTP id x; Mon, 21 Sep 2026 10:00:02 -0700",
@@ -689,6 +743,10 @@ mod tests {
 
     fn auth_of(headers: &[&str]) -> SenderAuth {
         sender_auth(&input_from(headers, "Your code is 123456"))
+    }
+
+    fn auth_at(receiver: &str, headers: &[&str]) -> SenderAuth {
+        sender_auth(&received_by(receiver, headers, "Your code is 123456"))
     }
 
     fn passed(via: &str, domain: &str, authserv_id: &str) -> SenderAuth {
@@ -729,12 +787,15 @@ mod tests {
         assert_eq!(auth, passed("dkim", "bank.example", "mx1.example.org"));
 
         // Gmail reports the signing domain as header.i.
-        let auth = auth_of(&[
-            "Received: by 2002:a05:6a10:8f0e:b0:5f1:1234 with SMTP id x; Mon, 21 Sep 2026 10:00:02 -0700",
-            "Authentication-Results: mx.google.com; dkim=pass header.i=@bank.example; spf=softfail",
-            "Received: from mail.bank.example (mail.bank.example. [203.0.113.5]) by mx.google.com with ESMTPS id y; Mon, 21 Sep 2026 10:00:01 -0700",
-            "From: alerts@login.bank.example",
-        ]);
+        let auth = auth_at(
+            "google.com",
+            &[
+                "Received: by 2002:a05:6a10:8f0e:b0:5f1:1234 with SMTP id x; Mon, 21 Sep 2026 10:00:02 -0700",
+                "Authentication-Results: mx.google.com; dkim=pass header.i=@bank.example; spf=softfail",
+                "Received: from mail.bank.example (mail.bank.example. [203.0.113.5]) by mx.google.com with ESMTPS id y; Mon, 21 Sep 2026 10:00:01 -0700",
+                "From: alerts@login.bank.example",
+            ],
+        );
         assert_eq!(auth, passed("dkim", "login.bank.example", "mx.google.com"));
     }
 
@@ -843,9 +904,9 @@ mod tests {
         headers
     }
 
-    fn auth_of_owned(headers: &[String]) -> SenderAuth {
+    fn gmail_auth(headers: &[String]) -> SenderAuth {
         let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-        auth_of(&refs)
+        auth_at("google.com", &refs)
     }
 
     const BANK_PASS: &str = "dkim=pass header.i=@bank.example header.s=s1 header.b=abc; spf=pass smtp.mailfrom=noreply@bank.example; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=bank.example";
@@ -910,11 +971,11 @@ mod tests {
             ],
         );
         assert_eq!(
-            auth_of_owned(&headers),
+            gmail_auth(&headers),
             passed("dmarc", "bank.example", "mx.google.com")
         );
         let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-        assert!(analyze(&input_from(&refs, "hi")).is_empty());
+        assert!(analyze(&received_by("google.com", &refs, "hi")).is_empty());
 
         // Gmail's own failing result wins over a passing copy the sender
         // placed under it.
@@ -925,10 +986,10 @@ mod tests {
                 "Authentication-Results: mx.google.com; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
             ],
         );
-        assert_eq!(auth_of_owned(&headers), SenderAuth::Fail);
+        assert_eq!(gmail_auth(&headers), SenderAuth::Fail);
         let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
         assert_eq!(
-            codes(&analyze(&input_from(&refs, "hi"))),
+            codes(&analyze(&received_by("google.com", &refs, "hi"))),
             vec!["ar_forged", "dmarc_fail", "spf_fail"]
         );
     }
@@ -941,7 +1002,10 @@ mod tests {
             "Received: from mail.bank.example (203.0.113.5) by mizu0.migadu.com with ESMTPS id q8; Mon, 28 Sep 2026 04:43:18 +0000",
             "From: Bank <alerts@bank.example>",
         ];
-        assert!(matches!(auth_of(&headers), SenderAuth::Unverifiable(_)));
+        assert!(matches!(
+            auth_at("migadu.com", &headers),
+            SenderAuth::Unverifiable(_)
+        ));
     }
 
     #[test]
@@ -954,7 +1018,7 @@ mod tests {
             "Authentication-Results: mx13.migadu.com; dkim=none; spf=fail smtp.mailfrom=bank.example; dmarc=fail (policy=reject) header.from=bank.example",
             "From: Bank <alerts@bank.example>",
         ];
-        assert_eq!(auth_of(&headers), SenderAuth::Fail);
+        assert_eq!(auth_at("migadu.com", &headers), SenderAuth::Fail);
     }
 
     #[test]
@@ -966,7 +1030,150 @@ mod tests {
             "Authentication-Results: mx.outlook.com; dmarc=pass header.from=bank.example",
             "From: Bank <alerts@bank.example>",
         ];
-        assert!(matches!(auth_of(&headers), SenderAuth::Unverifiable(_)));
+        assert!(matches!(
+            auth_at("outlook.com", &headers),
+            SenderAuth::Unverifiable(_)
+        ));
+    }
+
+    // ── The receiver comes from the account, never the message ─────
+
+    fn at(receiver: Option<&str>, headers: &[String]) -> ThreatInput {
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let mut input = received_by("outlook.com", &refs, "Your code is 482913");
+        input.receiver_domain = receiver.map(str::to_string);
+        input
+    }
+
+    /// A Gmail delivery whose own results fail, from a client that announced
+    /// `helo` and put its own passing results under Gmail's lines.
+    fn gmail_helo_attack(helo: &str) -> Vec<String> {
+        vec![
+            "Received: by 2002:a05:7300:1234 with SMTP id abc; Mon, 07 Oct 2026 08:12:35 -0700".to_string(),
+            format!("ARC-Authentication-Results: i=1; mx.google.com; {BANK_FAIL}"),
+            format!("Received: from {helo} (h.sender.example. [203.0.113.9]) by mx.google.com with ESMTPS id q1si; Mon, 07 Oct 2026 08:12:34 -0700"),
+            format!("Authentication-Results: mx.google.com; {BANK_FAIL}"),
+            format!("ARC-Authentication-Results: i=1; mx.evil.example; {BANK_PASS}"),
+            format!("Authentication-Results: mx.evil.example; {BANK_PASS}"),
+            "Received: from laptop (unknown [192.0.2.10]) by mx.evil.example with ESMTPSA id z; Mon, 07 Oct 2026 08:12:33 -0700".to_string(),
+            "From: Bank <noreply@bank.example>".to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_sender_helo_cannot_move_the_receivers_line() {
+        for helo in ["x by 10.0.0.1", "x by evil.example", "x by mx.google.com"] {
+            let input = at(Some("google.com"), &gmail_helo_attack(helo));
+            assert_eq!(sender_auth(&input), SenderAuth::Fail, "HELO {helo}");
+            assert!(
+                codes(&analyze(&input)).contains(&"dmarc_fail"),
+                "HELO {helo}: {:?}",
+                analyze(&input)
+            );
+        }
+    }
+
+    #[test]
+    fn a_receiver_line_that_does_not_name_its_domain_ends_the_search() {
+        // Postfix with `myhostname = mail` writes `by mail`. A line below it
+        // naming the receiver's domain was written by the sender.
+        let mut headers = vec![
+            "Received: from attacker.example (attacker.example [198.51.100.7]) by mail (Postfix) with ESMTPS id 4Q; Mon, 21 Sep 2026 10:00:01 +0000".to_string(),
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example".to_string(),
+            "Received: from laptop by mx1.example.org with ESMTP id q; Mon, 21 Sep 2026 10:00:00 +0000".to_string(),
+            "From: Bank <alerts@bank.example>".to_string(),
+        ];
+        let input = at(Some("example.org"), &headers);
+        assert!(
+            matches!(sender_auth(&input), SenderAuth::Unverifiable(_)),
+            "{:?}",
+            sender_auth(&input)
+        );
+        assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+
+        // The same with a receiver that writes an IP literal.
+        headers[0] = "Received: from attacker.example ([198.51.100.7]) by [10.0.0.5] with ESMTP id 4Q; Mon, 21 Sep 2026 10:00:01 +0000".to_string();
+        let input = at(Some("example.org"), &headers);
+        assert!(
+            matches!(sender_auth(&input), SenderAuth::Unverifiable(_)),
+            "{:?}",
+            sender_auth(&input)
+        );
+    }
+
+    #[test]
+    fn a_sender_arc_set_below_the_edge_is_not_trusted() {
+        let mut headers = vec![
+            "Received: by 2002:a05:7300:1234 with SMTP id abc; Mon, 07 Oct 2026 08:12:35 -0700".to_string(),
+            "Received: from out.bank.example (out.bank.example. [192.0.2.201]) by mx.google.com with ESMTPS id x3; Mon, 07 Oct 2026 08:12:34 -0700".to_string(),
+            format!("Authentication-Results: mx.google.com; {BANK_FAIL}"),
+            format!("ARC-Authentication-Results: i=1; mx.google.com; {BANK_PASS}"),
+            "From: Bank <noreply@bank.example>".to_string(),
+        ];
+        assert_eq!(
+            sender_auth(&at(Some("google.com"), &headers)),
+            SenderAuth::Fail
+        );
+        // Without Gmail's failing result, the passing ARC set still proves nothing.
+        headers.remove(2);
+        assert!(matches!(
+            sender_auth(&at(Some("google.com"), &headers)),
+            SenderAuth::Unverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn results_are_read_only_for_the_accounts_receiver() {
+        let gmail = gmail_delivery(BANK_PASS, BANK_PASS, &[]);
+        assert_eq!(
+            sender_auth(&at(Some("google.com"), &gmail)),
+            passed("dmarc", "bank.example", "mx.google.com")
+        );
+        // An account whose mail Google does not accept, and an unknown one.
+        for receiver in [Some("example.org"), None] {
+            let input = at(receiver, &gmail);
+            assert!(
+                matches!(sender_auth(&input), SenderAuth::Unverifiable(_)),
+                "{receiver:?}: {:?}",
+                sender_auth(&input)
+            );
+            assert_eq!(
+                codes(&analyze(&input)),
+                vec!["auth_unverifiable"],
+                "{receiver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authserv_id_must_be_in_the_receivers_registrable_domain() {
+        for authserv in [
+            "mx.google.com.evil.example",
+            "google.com-mx.example",
+            "notgoogle.com",
+        ] {
+            let headers = vec![
+                format!("ARC-Authentication-Results: i=1; {authserv}; {BANK_PASS}"),
+                "Received: from out.bank.example (out.bank.example. [192.0.2.201]) by mx.google.com with ESMTPS id x3; Mon, 07 Oct 2026 08:12:34 -0700".to_string(),
+                "From: Bank <noreply@bank.example>".to_string(),
+            ];
+            assert!(
+                matches!(
+                    sender_auth(&at(Some("google.com"), &headers)),
+                    SenderAuth::Unverifiable(_)
+                ),
+                "{authserv}"
+            );
+        }
+        let headers = vec![
+            format!("ARC-Authentication-Results: i=1; MX.Google.COM.; {BANK_PASS}"),
+            "Received: from out.bank.example (out.bank.example. [192.0.2.201]) by mx.google.com with ESMTPS id x3; Mon, 07 Oct 2026 08:12:34 -0700".to_string(),
+            "From: Bank <noreply@bank.example>".to_string(),
+        ];
+        assert!(matches!(
+            sender_auth(&at(Some("google.com"), &headers)),
+            SenderAuth::Pass { .. }
+        ));
     }
 
     // ── Alignment uses the Public Suffix List ───────────────────────

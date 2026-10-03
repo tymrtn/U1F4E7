@@ -15,6 +15,7 @@
 //! | `threat.reputation.dqs_key` | unset (env `ENVELOPE_REPUTATION_API_KEY`) |
 //! | `threat.clamd.address` | unset = off (`unix:/path` or `tcp:host:port`) |
 //! | `threat.clamd.required` | `false` |
+//! | `threat.receiver_domain` | unset (`<account>=<domain>[,...]`; see [`ThreatConfig::receiver_domain`]) |
 //! | `sync.poll_interval_secs` | `300` |
 //!
 //! A present-but-invalid value is an error, never a silent default.
@@ -25,7 +26,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::ANALYZER_NAMES;
+use super::domains::ascii_host;
+use super::{ANALYZER_NAMES, is_dns_name};
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const DEFAULT_REPORT_TO: &str = "reportphishing@apwg.org";
@@ -153,6 +155,29 @@ pub struct ThreatConfig {
     /// A clamd error makes the verdict `unavailable` instead of being
     /// recorded as a skipped analyzer.
     pub clamd_required: bool,
+    /// The operator's receiving mail domain per account address, for
+    /// accounts whose IMAP host is not in the domain of the hosts that accept
+    /// their mail. Values are registrable domains.
+    pub receiver_domains: BTreeMap<String, String>,
+}
+
+/// Providers whose mail is accepted by hosts in another registrable domain
+/// than their IMAP host. Only entries checked against the provider's own
+/// headers or documentation belong here.
+const PROVIDER_RECEIVER_DOMAINS: &[(&str, &str)] = &[
+    // IMAP imap.gmail.com; mail accepted by mx.google.com, which is also the
+    // authserv-id of its Authentication-Results.
+    ("gmail.com", "google.com"),
+];
+
+/// The registrable domain of a DNS host name; `None` for an IP literal, a
+/// single label, or a host with no registrable domain.
+fn registrable_dns_domain(host: &str) -> Option<String> {
+    let host = ascii_host(host);
+    if !is_dns_name(&host) {
+        return None;
+    }
+    psl::domain_str(&host).map(str::to_string)
 }
 
 impl Default for ThreatConfig {
@@ -168,6 +193,7 @@ impl Default for ThreatConfig {
             dqs_key: None,
             clamd: None,
             clamd_required: false,
+            receiver_domains: BTreeMap::new(),
         }
     }
 }
@@ -185,6 +211,7 @@ pub fn is_threat_key(key: &str) -> bool {
             | "threat.clamd.address"
             | "threat.clamd.required"
             | "sync.poll_interval_secs"
+            | "threat.receiver_domain"
     ) || key
         .strip_prefix("threat.analyzers.")
         .is_some_and(|name| ANALYZER_NAMES.contains(&name))
@@ -230,6 +257,23 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
             }
             Ok(Value::String(raw.to_string()))
         }
+        "threat.receiver_domain" => {
+            let mut map = serde_json::Map::new();
+            for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                let (account, domain) = entry
+                    .split_once('=')
+                    .map(|(a, d)| (a.trim().to_lowercase(), d.trim()))
+                    .filter(|(a, _)| a.contains('@'))
+                    .with_context(|| {
+                        format!("threat.receiver_domain entries are <account address>=<domain> (got `{entry}`)")
+                    })?;
+                map.insert(account, Value::String(parse_receiver_domain(domain)?));
+            }
+            if map.is_empty() {
+                bail!("threat.receiver_domain needs <account address>=<domain>[,...]");
+            }
+            Ok(Value::Object(map))
+        }
         "sync.poll_interval_secs" => {
             let secs: u64 = raw.parse().with_context(|| {
                 format!("sync.poll_interval_secs must be seconds (got `{raw}`)")
@@ -243,7 +287,38 @@ pub fn parse_value(key: &str, raw: &str) -> Result<Value> {
     }
 }
 
+fn parse_receiver_domain(raw: &str) -> Result<String> {
+    registrable_dns_domain(raw).with_context(|| {
+        format!("threat.receiver_domain needs a DNS domain such as example.org (got `{raw}`)")
+    })
+}
+
 impl ThreatConfig {
+    /// The registrable domain of the hosts that accept `account_address`'s
+    /// mail: the operator's `threat.receiver_domain` entry for it, else its
+    /// IMAP host's, mapped for providers that accept mail under another
+    /// domain. `None` when neither gives a DNS domain; Authentication-Results
+    /// are then never trusted.
+    pub fn receiver_domain(
+        &self,
+        account_address: &str,
+        imap_host: Option<&str>,
+    ) -> Option<String> {
+        if let Some(domain) = self
+            .receiver_domains
+            .get(&account_address.trim().to_lowercase())
+        {
+            return Some(domain.clone());
+        }
+        let domain = registrable_dns_domain(imap_host?)?;
+        Some(
+            PROVIDER_RECEIVER_DOMAINS
+                .iter()
+                .find(|(imap, _)| *imap == domain)
+                .map_or(domain, |(_, mail)| mail.to_string()),
+        )
+    }
+
     pub fn analyzer_enabled(&self, name: &str) -> bool {
         self.analyzers.get(name).copied().unwrap_or(true)
     }
@@ -343,6 +418,18 @@ impl ThreatConfig {
                 out.analyzers.insert(name.clone(), enabled);
             }
         }
+        if let Some(entries) = config.pointer("/threat/receiver_domain") {
+            let map = entries
+                .as_object()
+                .context("threat.receiver_domain must be an object in config.json")?;
+            for (account, domain) in map {
+                let domain = domain.as_str().with_context(|| {
+                    format!("threat.receiver_domain.{account} must be a string")
+                })?;
+                out.receiver_domains
+                    .insert(account.to_lowercase(), parse_receiver_domain(domain)?);
+            }
+        }
         match config.pointer("/sync/poll_interval_secs") {
             None | Some(Value::Null) => {}
             Some(v) => {
@@ -383,6 +470,63 @@ impl ThreatConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn receiver_domain_comes_from_the_operator_or_the_imap_host() {
+        let c = ThreatConfig::default();
+        assert_eq!(
+            c.receiver_domain("me@gmail.com", Some("imap.gmail.com"))
+                .as_deref(),
+            Some("google.com")
+        );
+        assert_eq!(
+            c.receiver_domain("a@example.net", Some("imap.migadu.com"))
+                .as_deref(),
+            Some("migadu.com")
+        );
+        assert_eq!(
+            c.receiver_domain("a@bank.co.uk", Some("Mail.Bank.CO.UK."))
+                .as_deref(),
+            Some("bank.co.uk")
+        );
+        for host in ["127.0.0.1", "::1", "[10.0.0.5]", "localhost", "mail", ""] {
+            assert_eq!(c.receiver_domain("a@b.example", Some(host)), None, "{host}");
+        }
+        assert_eq!(c.receiver_domain("a@b.example", None), None);
+
+        let value = parse_value(
+            "threat.receiver_domain",
+            "Me@Self.Host=mx.self.host, other@x.example=mail.x.example",
+        )
+        .unwrap();
+        let c = ThreatConfig::from_config_value(&json!({"threat": {"receiver_domain": value}}))
+            .unwrap();
+        assert_eq!(
+            c.receiver_domain("me@self.host", Some("127.0.0.1"))
+                .as_deref(),
+            Some("self.host")
+        );
+        assert_eq!(
+            c.receiver_domain("OTHER@x.example", Some("imap.gmail.com"))
+                .as_deref(),
+            Some("x.example")
+        );
+        for bad in [
+            "me@self.host",
+            "me@self.host=10.0.0.1",
+            "=self.host",
+            "me@self.host=mail",
+            "",
+        ] {
+            assert!(parse_value("threat.receiver_domain", bad).is_err(), "{bad}");
+        }
+        assert!(
+            ThreatConfig::from_config_value(
+                &json!({"threat": {"receiver_domain": {"a@b.example": "10.0.0.1"}}})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn defaults_when_nothing_is_configured() {

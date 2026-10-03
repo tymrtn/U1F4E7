@@ -75,15 +75,21 @@ pub fn load_ledger(db: &Database, account_id: &str, input: &mut ThreatInput) {
         .map_err(|e| format!("correspondent ledger unreadable: {e}"));
 }
 
-/// Parse raw bytes and load the ledger: the part of a scan that needs the
-/// database.
+/// Parse raw bytes, set the account's receiving mail domain, and load the
+/// ledger: the part of a scan that needs the database.
 pub fn prepare_input(
     db: &Database,
     account_id: &str,
     account_address: &str,
     raw: &[u8],
+    config: &ThreatConfig,
 ) -> Result<ThreatInput, String> {
     let mut input = ThreatInput::from_raw(raw, account_address)?;
+    let imap_host = db
+        .get_account(account_id)
+        .map_err(|e| format!("account {account_id} unreadable: {e}"))?
+        .map(|account| account.imap_host);
+    input.receiver_domain = config.receiver_domain(account_address, imap_host.as_deref());
     load_ledger(db, account_id, &mut input);
     Ok(input)
 }
@@ -155,7 +161,10 @@ pub fn scan_raw(
     raw: &[u8],
     config: &ThreatConfig,
 ) -> (ThreatVerdict, ScannedMessage) {
-    evaluate_input(prepare_input(db, account_id, account_address, raw), config)
+    evaluate_input(
+        prepare_input(db, account_id, account_address, raw, config),
+        config,
+    )
 }
 
 /// Where a verdict is stored.
@@ -687,7 +696,7 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
         .await?
         .ok_or_else(|| anyhow!("UID {uid} vanished from {folder} before it was scanned"))?;
     let input = db
-        .with_db(|d| prepare_input(d, account.id, account.email, &raw))
+        .with_db(|d| prepare_input(d, account.id, account.email, &raw, config))
         .await;
     // Opt-in analyzers block on clamd and DNS: run them off the async
     // workers and without holding the database.
@@ -1293,7 +1302,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         ))];
         let raw = "Message-ID: <l1@x>\r\nFrom: IT <it@examp1e.org>\r\nTo: me@example.org\r\n\
                    Subject: s\r\n\r\nReset at https://portal.partner.example/reset?t=SECRET\r\n";
-        let input = prepare_input(&db, ACCT, EMAIL, raw.as_bytes());
+        let input = prepare_input(&db, ACCT, EMAIL, raw.as_bytes(), &ThreatConfig::default());
         let (verdict, scanned) = evaluate_with(input, &ThreatConfig::default(), &analyzers, &log);
         assert_eq!(verdict.signals[0].code, "domain_blocklisted");
         assert_eq!(verdict.signals[0].weight, 60);
