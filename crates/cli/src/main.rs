@@ -2143,7 +2143,12 @@ fn main() {
         .install_default()
         .ok();
 
-    let cli = Cli::parse();
+    // Parsed in two steps so token mode can read the raw arguments too.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| {
+        e.format(&mut <Cli as clap::CommandFactory>::command())
+            .exit()
+    });
 
     let backend: envelope_email_store::CredentialBackend = match cli.credential_store.parse() {
         Ok(b) => b,
@@ -2155,7 +2160,7 @@ fn main() {
 
     // With ENVELOPE_AGENT_TOKEN set, the command must be one that agent may
     // run, checked before anything else happens.
-    if let Err(e) = token_mode::enforce(&cli.command, cli.json) {
+    if let Err(e) = token_mode::enforce(&cli.command, &matches, cli.json) {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }

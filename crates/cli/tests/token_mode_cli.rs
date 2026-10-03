@@ -677,6 +677,95 @@ fn watch_webhook_and_unsubscribe_run_with_their_grants() {
 }
 
 #[test]
+fn only_reading_happens_in_quarantine() {
+    let (f, token) = fixture();
+    let home = f.home();
+    let account = f.account;
+    let before = snapshot(home);
+
+    // The default `*` policy grants every one of these elsewhere.
+    for args in [
+        vec!["delete", "1", "--folder", "Envelope/Quarantine"],
+        vec![
+            "delete",
+            "1",
+            "--permanent",
+            "--confirm",
+            "--folder",
+            "INBOX.Envelope.Quarantine",
+        ],
+        vec![
+            "snooze",
+            "set",
+            "1",
+            "--until",
+            "2h",
+            "--folder",
+            "envelope/quarantine/",
+        ],
+        vec![
+            "flag",
+            "add",
+            "1",
+            "seen",
+            "--folder",
+            "Envelope/Quarantine",
+        ],
+        vec![
+            "tag",
+            "set",
+            "1",
+            "--tag",
+            "x",
+            "--folder",
+            "Envelope/Quarantine",
+        ],
+        vec![
+            "bulk",
+            "delete",
+            "--uids",
+            "1",
+            "--confirm",
+            "--folder",
+            "Envelope/Quarantine",
+        ],
+        vec!["draft", "forward", "1", "--folder", "Envelope/Quarantine"],
+    ] {
+        let mut args: Vec<&str> = std::iter::once("--json").chain(args).collect();
+        args.extend_from_slice(&["--account", account]);
+        let (out, timed_out) = run_as(home, &token, &args);
+        assert_refused(&out, timed_out, "operator_only_command", &args);
+    }
+    assert_eq!(snapshot(home), before, "a refused command changed state");
+    assert_eq!(
+        f.probe.connections(),
+        0,
+        "a refused command reached the mail servers"
+    );
+
+    // Reading there is allowed, and goes on to the mail server.
+    let args = [
+        "--json",
+        "inbox",
+        "--folder",
+        "Envelope/Quarantine",
+        "--account",
+        account,
+    ];
+    let (out, _) = run_as(home, &token, &args);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!output.contains("\"denied\""), "{output}");
+    assert!(
+        f.probe.connections() >= 1,
+        "the read reached the mail server"
+    );
+}
+
+#[test]
 fn star_can_add_the_named_grants() {
     let (f, token) = fixture();
     let home = f.home();

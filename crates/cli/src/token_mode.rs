@@ -6,8 +6,9 @@
 //! Every command is classified by [`token_mode_permission`]: read-only,
 //! gated on named policy actions, or operator-only. The match is exhaustive
 //! over every command and subcommand enum, with no catch-all arm, so a new
-//! command does not compile until it is classified here. [`enforce`] runs
-//! before dispatch.
+//! command does not compile until it is classified here. [`permission`] then
+//! makes any command that is not read-only operator-only when its `--folder`
+//! is the quarantine folder. [`enforce`] runs before dispatch.
 
 use crate::commands::agent_context::{
     self, AgentContext, CliDenial, RULES_WRITE, SIEVE_PUBLISH, UNSUBSCRIBE, WATCH_WEBHOOK,
@@ -19,6 +20,7 @@ use crate::{
     GovernorCmd, LicenseCmd, MigrateCmd, RuleCmd, ScheduledCmd, SignatureCmd, SnoozeCmd, TagCmd,
     ThreadCmd, ThreatCmd,
 };
+use clap::ArgMatches;
 use envelope_email_transport::PolicyDenial;
 use envelope_email_transport::threat::is_threat_tag;
 use envelope_email_transport::threat::persist::{is_quarantine_folder, is_quarantine_rule_name};
@@ -102,26 +104,13 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
             }
         }
         Commands::Send { .. } => Gated(SEND),
-        // Moving or copying mail out of quarantine releases it.
-        Commands::Move { folder, .. } | Commands::Copy { folder, .. } => {
-            if is_quarantine_folder(folder) {
-                OperatorOnly
-            } else {
-                Gated(MOVE)
-            }
-        }
+        Commands::Move { .. } | Commands::Copy { .. } => Gated(MOVE),
         Commands::Delete { .. } => Gated(DELETE),
         Commands::Flag { subcommand } => match subcommand {
             FlagCmd::Add { .. } | FlagCmd::Remove { .. } => Gated(FLAG),
         },
         Commands::Bulk { subcommand } => match subcommand {
-            BulkCmd::Move { common, .. } | BulkCmd::Copy { common, .. } => {
-                if is_quarantine_folder(&common.folder) {
-                    OperatorOnly
-                } else {
-                    Gated(BULK_MOVE)
-                }
-            }
+            BulkCmd::Move { .. } | BulkCmd::Copy { .. } => Gated(BULK_MOVE),
             BulkCmd::Flag { .. } => Gated(BULK_FLAG),
             BulkCmd::Delete { .. } => Gated(BULK_DELETE),
             BulkCmd::Tag { tag, .. } => {
@@ -267,15 +256,14 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                     Gated(RULES_EDIT)
                 }
             }
-            // Without --confirm, `rule run` only explains itself. Run on the
-            // quarantine folder, rules could release its mail.
-            RuleCmd::Run {
-                folder, confirm, ..
-            } => match (*confirm, is_quarantine_folder(folder)) {
-                (false, _) => ReadOnly,
-                (true, false) => Gated(RULES_RUN),
-                (true, true) => OperatorOnly,
-            },
+            // Without --confirm, `rule run` only explains itself.
+            RuleCmd::Run { confirm, .. } => {
+                if *confirm {
+                    Gated(RULES_RUN)
+                } else {
+                    ReadOnly
+                }
+            }
             // --host sends the mailbox password to the named server. Without
             // --confirm, publish-sieve is a dry run.
             RuleCmd::PublishSieve { host, confirm, .. } => {
@@ -304,16 +292,13 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                 ReadOnly
             }
         }
-        // --webhook and --deliver push each new message to a URL. Rules run
-        // on the quarantine folder could release its mail.
+        // --webhook and --deliver push each new message to a URL.
         Commands::Watch {
-            folder,
             webhook,
             deliver,
             run_rules,
             ..
         } => match (webhook.is_some() || *deliver, *run_rules) {
-            (_, true) if is_quarantine_folder(folder) => OperatorOnly,
             (false, false) => ReadOnly,
             (true, false) => Gated(WATCH_HOOK),
             (false, true) => Gated(RULES_RUN),
@@ -326,12 +311,40 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
     }
 }
 
+/// The class of the command parsed into `command` and `matches`: its
+/// [`token_mode_permission`], except that a command that is not read-only
+/// is operator-only when its `--folder` is the quarantine folder. Changing
+/// mail there, by any route, releases it.
+pub(crate) fn permission(command: &Commands, matches: &ArgMatches) -> Permission {
+    let class = token_mode_permission(command);
+    if class != ReadOnly && source_is_quarantine(matches) {
+        OperatorOnly
+    } else {
+        class
+    }
+}
+
+/// Whether the command's `folder` argument, the folder it takes mail from,
+/// names the quarantine folder. Every command calls its source folder
+/// `folder` and a destination `to_folder` (a test holds every command to
+/// that), so a new command is covered without being listed.
+fn source_is_quarantine(matches: &ArgMatches) -> bool {
+    let mut leaf = matches;
+    while let Some((_, sub)) = leaf.subcommand() {
+        leaf = sub;
+    }
+    leaf.try_get_raw("folder")
+        .ok()
+        .flatten()
+        .is_some_and(|mut values| values.any(|v| v.to_str().is_none_or(is_quarantine_folder)))
+}
+
 /// Check `command` against the agent token, if one is set, before it runs.
 ///
 /// No (or a blank) token: the operator; nothing changes. Any other token must
 /// belong to an active agent, or every command fails closed with
 /// `agent_token_invalid`. Then the command's [`Permission`] decides.
-pub(crate) fn enforce(command: &Commands, json: bool) -> anyhow::Result<()> {
+pub(crate) fn enforce(command: &Commands, matches: &ArgMatches, json: bool) -> anyhow::Result<()> {
     // `envelope mcp` resolves the token at startup and refuses to start on a
     // bad one, then authorizes every tool call itself.
     if matches!(command, Commands::Mcp { .. }) {
@@ -342,7 +355,7 @@ pub(crate) fn enforce(command: &Commands, json: bool) -> anyhow::Result<()> {
         Ok(None) => return Ok(()),
         Err(e) => return Err(agent_context::print_cli_denial(e, json)),
     };
-    decide(token_mode_permission(command), &agent)
+    decide(permission(command, matches), &agent)
         .and_then(|()| check_actor(command, &agent))
         .map_err(|denial| {
             record_denial(&agent, &denial);
@@ -437,6 +450,9 @@ mod tests {
             OperatorOnly,
         ),
         ("delete 1", Gated(DELETE)),
+        ("delete 1 --folder Envelope/Quarantine", OperatorOnly),
+        ("inbox --folder Envelope/Quarantine", ReadOnly),
+        ("read 1 --folder INBOX.Envelope.Quarantine", ReadOnly),
         ("flag add 1 seen", Gated(FLAG)),
         ("flag remove 1 seen", Gated(FLAG)),
         ("bulk move --to-folder X --uids 1", Gated(BULK_MOVE)),
@@ -521,6 +537,10 @@ mod tests {
         ("events deliveries list", ReadOnly),
         ("events deliveries retry d", OperatorOnly),
         ("snooze set 1 --until 2h", Gated(SNOOZE)),
+        (
+            "snooze set 1 --until 2h --folder envelope/quarantine/",
+            OperatorOnly,
+        ),
         ("snooze list", ReadOnly),
         ("snooze check-replies", Gated(SNOOZE)),
         ("snooze cancel 1", Gated(SNOOZE)),
@@ -596,9 +616,14 @@ mod tests {
         ("mcp", ReadOnly),
     ];
 
-    fn parse(argv: &str) -> Cli {
+    fn parse(argv: &str) -> (Cli, ArgMatches) {
         let args = std::iter::once("envelope").chain(argv.split_whitespace());
-        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("`{argv}` does not parse: {e}"))
+        let matches = Cli::command()
+            .try_get_matches_from(args)
+            .unwrap_or_else(|e| panic!("`{argv}` does not parse: {e}"));
+        let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+            .unwrap_or_else(|e| panic!("`{argv}` does not parse: {e}"));
+        (cli, matches)
     }
 
     /// Every leaf command path the CLI exposes, e.g. `rule publish-sieve`.
@@ -651,8 +676,8 @@ mod tests {
 
         let mut covered = BTreeSet::new();
         for (argv, expected) in MATRIX {
-            let cli = parse(argv);
-            assert_eq!(token_mode_permission(&cli.command), *expected, "`{argv}`");
+            let (cli, matches) = parse(argv);
+            assert_eq!(permission(&cli.command, &matches), *expected, "`{argv}`");
             covered.insert(path_of(argv));
         }
         let missing: Vec<_> = leaves.difference(&covered).collect();
@@ -722,9 +747,6 @@ mod tests {
         if argv.to_lowercase().contains("threat:") {
             key.push_str(" with a threat:* tag");
         }
-        if argv.contains("Envelope/Quarantine") {
-            key.push_str(" from the quarantine folder");
-        }
         key
     }
 
@@ -744,7 +766,12 @@ mod tests {
 
         let mut seen = BTreeSet::new();
         for (argv, permission) in MATRIX {
-            let key = contract_key(argv);
+            let in_quarantine = argv.split_whitespace().any(is_quarantine_folder);
+            let key = if in_quarantine && *permission == OperatorOnly {
+                crate::commands::contract::QUARANTINE_SOURCE_COMMANDS.to_string()
+            } else {
+                contract_key(argv)
+            };
             match permission {
                 ReadOnly => assert!(
                     !operator_only.contains(&key) && !gated.contains_key(&key),
@@ -768,6 +795,26 @@ mod tests {
             .filter(|key| !seen.contains(*key))
             .collect();
         assert!(stale.is_empty(), "not commands in MATRIX: {stale:?}");
+    }
+
+    /// [`source_is_quarantine`] reads the argument `folder`. A source folder
+    /// under another name would go unchecked.
+    #[test]
+    fn every_folder_argument_is_a_source_or_a_destination() {
+        fn walk(cmd: &clap::Command, path: &str) {
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    !id.contains("folder")
+                        || matches!(id, "folder" | "to_folder" | "allow_folders"),
+                    "`{path}` takes `{id}`: name a source folder `folder`, a destination `to_folder`"
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()));
+            }
+        }
+        walk(&Cli::command(), "envelope");
     }
 
     #[test]
@@ -805,6 +852,7 @@ mod tests {
             parse(&format!(
                 "actions exec --event-id e --actor {actor} mark-handled"
             ))
+            .0
             .command
         };
         assert!(check_actor(&exec("skippy"), &skippy).is_ok());
@@ -813,7 +861,7 @@ mod tests {
             let denial = check_actor(&exec(other), &skippy).unwrap_err();
             assert_eq!(denial.code, agent_context::OPERATOR_ONLY_CODE, "{other}");
         }
-        assert!(check_actor(&parse("actions tail").command, &skippy).is_ok());
+        assert!(check_actor(&parse("actions tail").0.command, &skippy).is_ok());
     }
 
     #[test]

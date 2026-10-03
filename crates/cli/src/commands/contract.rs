@@ -39,6 +39,11 @@ pub fn run(surface_name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The operator-only entry for every command that is not read-only, run on
+/// the quarantine folder.
+pub(crate) const QUARANTINE_SOURCE_COMMANDS: &str =
+    "any command that is not read-only, with --folder set to the quarantine folder";
+
 /// Commands that need named policy actions under `ENVELOPE_AGENT_TOKEN`, as
 /// `token_mode::token_mode_permission` classifies them; a test there keeps
 /// the two in step.
@@ -105,12 +110,7 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "evidence attachment export --unsafe",
     "rule publish-sieve --host",
     "rule publish-sieve --confirm --host",
-    "move from the quarantine folder",
-    "copy from the quarantine folder",
-    "bulk move from the quarantine folder",
-    "bulk copy from the quarantine folder",
-    "rule run --confirm from the quarantine folder",
-    "watch --run-rules from the quarantine folder",
+    QUARANTINE_SOURCE_COMMANDS,
     "doctor --repair",
     "serve",
     "license activate",
@@ -267,7 +267,7 @@ pub fn agent_contract() -> Value {
                 "gated_commands": cli_gated_commands(),
                 "operator_only_commands": CLI_OPERATOR_ONLY_COMMANDS,
                 "threat_tags": "Under a token, setting a threat:* tag is operator-only: `tag set` and `bulk tag` with one, and `rule create` with an action that sets one (read after JSON decoding, trimmed and case-insensitive, including actions a confirm offer takes from another rule) or `rule enable` of such a rule, are refused with operator_only_command.",
-                "quarantine": "Under a token, quarantine is operator-only. Refused with operator_only_command: moving or copying mail out of the quarantine folder (Envelope/Quarantine, compared case-insensitively with `.` or `/` as the separator and with or without an INBOX prefix), with the CLI or the MCP move_message and bulk tools; a real rule run there (`rule run --confirm`, `watch --run-rules`, MCP rules_run with dry_run false); `rule create` or `rule enable` of a rule whose match selects by a threat:* tag or whose action moves mail into quarantine; and `rule create`, `enable`, `disable` or `delete` naming the shipped rule \"Envelope threat quarantine\".",
+                "quarantine": "Under a token, quarantine is operator-only. Refused with operator_only_command: any CLI command that is not read-only whose --folder is the quarantine folder (Envelope/Quarantine, compared case-insensitively with `.` or `/` as the separator, a trailing separator, and with or without an INBOX prefix), such as move, copy, delete, flag, tag, snooze, bulk, draft reply or forward, `rule run --confirm` and `watch --run-rules`; any MCP tool call other than a read whose folder or from_folder is the quarantine folder (rules_run counts as a read with dry_run left true, snooze with action list); `rule create` or `rule enable` of a rule whose match selects by a threat:* tag or whose action moves mail into quarantine; and `rule create`, `enable`, `disable` or `delete` naming the shipped rule \"Envelope threat quarantine\".",
                 "actor": "Under a token, `envelope actions exec --actor` must name the agent itself (its name or id); any other actor is refused with operator_only_command.",
                 "send": "`envelope send` and `envelope draft send` also check the `send` action for the resolved account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
                 "actions": {

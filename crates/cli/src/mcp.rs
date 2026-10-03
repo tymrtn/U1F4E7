@@ -289,7 +289,7 @@ fn authorize_tool_call_with_db(
     let Some(ctx) = ctx else {
         return Ok(());
     };
-    if writes_threat_tag(tool_name, params) || releases_quarantine(tool_name, params) {
+    if writes_threat_tag(tool_name, params) || changes_quarantine(tool_name, params) {
         return Err(agent_context::operator_only_denial().to_json().to_string());
     }
     let account = authoritative_policy_account(db, tool_name, params)?;
@@ -342,30 +342,41 @@ fn writes_threat_tag(tool_name: &str, params: &Value) -> bool {
     }
 }
 
-/// A move or copy out of the quarantine folder, or a real rule run there,
-/// which would release quarantined mail. Only the operator does that.
-fn releases_quarantine(tool_name: &str, params: &Value) -> bool {
+/// A call other than a read whose source folder (`folder`, or `from_folder`
+/// for move_message) is the quarantine folder. Changing mail there, by any
+/// route, releases it; only the operator does that. An unknown tool counts
+/// as a change.
+fn changes_quarantine(tool_name: &str, params: &Value) -> bool {
     use envelope_email_transport::threat::persist::is_quarantine_folder;
-    let folder = || {
-        params
-            .get("folder")
-            .and_then(Value::as_str)
-            .unwrap_or("INBOX")
+    let reads = match tool_name {
+        "rules_run" => params.get("dry_run").and_then(Value::as_bool) != Some(false),
+        "snooze" => {
+            params
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list")
+                == "list"
+        }
+        _ => matches!(
+            agent_context::tool_action(tool_name),
+            Some(
+                "accounts.list"
+                    | "inbox.read"
+                    | "folders.list"
+                    | "contacts.read"
+                    | "draft.read"
+                    | "rules.read"
+                    | "watch.read"
+            )
+        ),
     };
-    match tool_name {
-        "move_message" => is_quarantine_folder(move_source_folder(params)),
-        "bulk" => {
-            matches!(
-                params.get("op").and_then(Value::as_str),
-                Some("move" | "copy")
-            ) && is_quarantine_folder(folder())
-        }
-        "rules_run" => {
-            params.get("dry_run").and_then(Value::as_bool) == Some(false)
-                && is_quarantine_folder(folder())
-        }
-        _ => false,
-    }
+    !reads
+        && ["folder", "from_folder"].iter().any(|key| {
+            params
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(is_quarantine_folder)
+        })
 }
 
 fn authorize_tool_call(
@@ -3175,20 +3186,41 @@ mod tests {
                 "rules_run",
                 json!({"account": acct, "folder": quarantine, "dry_run": false}),
             ),
+            (
+                "snooze",
+                json!({"account": acct, "action": "set", "uid": 1, "until": "2h", "folder": "INBOX.Envelope.Quarantine"}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "delete", "folder": quarantine, "uids": [1]}),
+            ),
+            (
+                "flag",
+                json!({"account": acct, "uid": 1, "folder": quarantine, "flag": "seen"}),
+            ),
+            (
+                "create_forward_draft",
+                json!({"account": acct, "uid": 1, "folder": quarantine, "to": "a@b.test"}),
+            ),
         ] {
             let denial = authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).unwrap_err();
             assert!(denial.contains("operator_only_command"), "{tool}: {denial}");
         }
-        // A preview there changes nothing.
-        assert!(
-            authorize_tool_call_with_db(
-                &db,
-                Some(&ctx),
-                "rules_run",
-                &json!({"account": acct, "folder": quarantine}),
-            )
-            .is_ok()
-        );
+        // Reading there is allowed, and a preview changes nothing.
+        for (tool, params) in [
+            ("rules_run", json!({"account": acct, "folder": quarantine})),
+            ("inbox", json!({"account": acct, "folder": quarantine})),
+            (
+                "read",
+                json!({"account": acct, "uid": 1, "folder": quarantine}),
+            ),
+            ("snooze", json!({"account": acct, "action": "list"})),
+        ] {
+            assert!(
+                authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).is_ok(),
+                "{tool}"
+            );
+        }
     }
 
     #[test]
