@@ -172,8 +172,15 @@ pub struct AttachmentInput {
 /// Everything the analyzers look at, built once per message.
 #[derive(Debug, Clone)]
 pub struct ThreatInput {
-    /// Header fields in wire order (top first), unfolded.
+    /// Header fields in wire order (top first), unfolded, as
+    /// [`parse_header_block`] reads them. Analyzers read only the fields the
+    /// receiving server adds (`Received`, `Authentication-Results`) from it;
+    /// those are outside the content fingerprint by design. Everything else
+    /// an analyzer reads comes from mail_parser, whose reading the
+    /// fingerprint covers.
     pub headers: Vec<(String, String)>,
+    /// Every Subject field mail_parser reads, decoded, in wire order.
+    pub subjects: Vec<String>,
     /// Lowercased From address.
     pub from_addr: String,
     pub from_display: Option<String>,
@@ -242,9 +249,19 @@ impl ThreatInput {
             })
             .collect();
 
+        let subjects = parsed
+            .root_part()
+            .headers
+            .iter()
+            .filter(|h| h.name == mail_parser::HeaderName::Subject)
+            .filter_map(|h| h.value.as_text())
+            .map(str::to_string)
+            .collect();
+
         let receiving_host = receiving_host(&headers);
         Ok(ThreatInput {
             headers,
+            subjects,
             from_addr,
             from_display,
             reply_to,
@@ -358,9 +375,11 @@ pub fn content_fingerprint(raw: &[u8]) -> Option<String> {
 }
 
 /// `Content-*` fields change how the body is read, a top-level
-/// `Content-Disposition` included, so all of them are fingerprinted.
+/// `Content-Disposition` included, so all of them are fingerprinted. Names
+/// are trimmed as [`parse_header_block`] trims them, so a field either
+/// reader files under a fingerprinted name is fingerprinted.
 fn fingerprinted(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+    let name = name.trim().to_ascii_lowercase();
     name.starts_with("content-") || FINGERPRINT_HEADERS.contains(&name.as_str())
 }
 
@@ -922,6 +941,34 @@ mod tests {
     #[test]
     fn fingerprint_covers_body_after_a_bare_cr_line() {
         assert_body_after_separator_line_is_fingerprinted("\r");
+    }
+
+    /// A line the reader does not file as Subject (its name carries a
+    /// character the raw header reader trims) is not scored as one.
+    #[test]
+    fn content_analyzer_reads_subject_as_the_reader_does() {
+        let original = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                        Subject: Lunch\r\n\r\nThursday?\r\n";
+        for prefix in ["\u{a0}", "\u{2003}", "\x0b"] {
+            let twin = original.replacen(
+                "Subject: Lunch",
+                &format!(
+                    "{prefix}Subject: urgent verify your account immediately\r\nSubject: Lunch"
+                ),
+                1,
+            );
+            let read = |raw: &str| ThreatInput::from_raw(raw.as_bytes(), "me@example.org").unwrap();
+            assert_eq!(
+                parsed_view(twin.as_bytes()),
+                parsed_view(original.as_bytes()),
+                "{prefix:?}: the reader shows the same message"
+            );
+            assert_eq!(
+                codes(&content::analyze(&read(&twin))),
+                codes(&content::analyze(&read(original))),
+                "{prefix:?}"
+            );
+        }
     }
 
     /// What mail_parser would show of a message.

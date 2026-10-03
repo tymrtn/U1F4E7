@@ -2440,6 +2440,42 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         assert_eq!(opened.score, entry.score);
     }
 
+    /// A Subject line only the raw header reader files as Subject changes the
+    /// fingerprint, so a message carrying one never reuses the verdict of the
+    /// message without it.
+    #[test]
+    fn a_subject_line_only_the_raw_reader_files_never_reuses_a_verdict() {
+        let config = ThreatConfig::default();
+        let original = ordinary("s@x");
+        for (uid, prefix) in [(2, "\u{a0}"), (3, "\u{2003}"), (4, "\x0b")] {
+            let db = Database::open_memory().unwrap();
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+            let twin = String::from_utf8(original.clone())
+                .unwrap()
+                .replacen(
+                    "Subject: Lunch",
+                    &format!(
+                        "{prefix}Subject: urgent verify your account immediately\r\nSubject: Lunch"
+                    ),
+                    1,
+                )
+                .into_bytes();
+            let twin_fp = content_fingerprint(&twin);
+            assert_ne!(twin_fp, content_fingerprint(&original), "{prefix:?}");
+            assert!(
+                matching_verdict(&db, ACCT, "INBOX", uid, Some("s@x"), &twin_fp)
+                    .unwrap()
+                    .is_none(),
+                "{prefix:?}"
+            );
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", uid, Some(&twin), &config).unwrap();
+            let own = stored_verdict_for_uid(&db, ACCT, "INBOX", uid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(own.content_fingerprint.as_deref(), Some(twin_fp.as_str()));
+        }
+    }
+
     /// A Message-ID spelling another message's fingerprint key is unusable,
     /// so that message's threat data never lands under the other's key.
     #[tokio::test]
