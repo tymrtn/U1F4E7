@@ -11,7 +11,7 @@ use crate::flag_transitions::{ObservedFlags, SEEN_SOURCE_INDEX_REFRESH};
 use crate::models::{
     IndexedMessageInput, IndexedMessageSummary, MessageIndexAccountFreshness, MessageSummary,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 /// Parse an envelope date (RFC 2822 as IMAP carries it, or RFC 3339) to unix
 /// seconds. Returns None rather than guessing when the string is unreadable.
@@ -367,28 +367,6 @@ impl Database {
             },
         )?;
         Ok(rows.filter_map(|row| row.ok()).collect())
-    }
-
-    /// The Message-ID the index holds for a folder/UID, newest row first: the
-    /// table also keys on UIDVALIDITY, so an old row can share the UID.
-    pub fn indexed_message_id(
-        &self,
-        account_id: &str,
-        folder: &str,
-        uid: u32,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT message_id FROM indexed_message_summaries
-                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3
-                   AND message_id IS NOT NULL AND message_id != ''
-                 ORDER BY indexed_at DESC
-                 LIMIT 1",
-                params![account_id, folder, i64::from(uid)],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 }
 
@@ -800,72 +778,6 @@ mod tests {
         assert_eq!(recovered.freshness, "fresh");
         assert_eq!(recovered.message_count, 1);
         assert!(recovered.indexed_at.is_some());
-    }
-
-    // ── Message-ID by folder/UID (#188) ─────────────────────────────────
-
-    #[test]
-    fn indexed_message_id_returns_the_stored_id_for_the_uid() {
-        let db = Database::open_memory().unwrap();
-        db.test_insert_account_row("acct-a", "a@example.test")
-            .unwrap();
-        db.upsert_indexed_message_summaries(
-            "acct-a",
-            "INBOX",
-            1,
-            &[msg(9, "Sun, 23 Aug 2026 10:00:00 +0000", "s")],
-        )
-        .unwrap();
-
-        assert_eq!(
-            db.indexed_message_id("acct-a", "INBOX", 9).unwrap(),
-            Some("9@x".to_string()),
-            "stored bare, without angle brackets"
-        );
-        assert_eq!(db.indexed_message_id("acct-a", "INBOX", 10).unwrap(), None);
-        assert_eq!(db.indexed_message_id("acct-a", "Archive", 9).unwrap(), None);
-        assert_eq!(db.indexed_message_id("acct-b", "INBOX", 9).unwrap(), None);
-    }
-
-    #[test]
-    fn indexed_message_id_skips_rows_without_an_id() {
-        let db = Database::open_memory().unwrap();
-        db.test_insert_account_row("acct-a", "a@example.test")
-            .unwrap();
-        let mut row = msg(9, "Sun, 23 Aug 2026 10:00:00 +0000", "s");
-        row.message_id = None;
-        db.upsert_indexed_message_summaries("acct-a", "INBOX", 1, &[row])
-            .unwrap();
-
-        assert_eq!(db.indexed_message_id("acct-a", "INBOX", 9).unwrap(), None);
-    }
-
-    #[test]
-    fn indexed_message_id_prefers_the_newest_row_across_uidvalidity() {
-        let db = Database::open_memory().unwrap();
-        db.test_insert_account_row("acct-a", "a@example.test")
-            .unwrap();
-        // The upsert replaces a folder's rows wholesale, so two UIDVALIDITY
-        // generations of one UID can only coexist through a direct write. The
-        // old row goes in first, so table and key order both find it first.
-        for (uidvalidity, mid, indexed_at) in [
-            (1, "old@x", "2026-09-01T00:00:00+00:00"),
-            (2, "new@x", "2026-09-02T00:00:00+00:00"),
-        ] {
-            db.conn()
-                .execute(
-                    "INSERT INTO indexed_message_summaries
-                        (account_id, folder, uidvalidity, uid, message_id, indexed_at)
-                     VALUES ('acct-a', 'INBOX', ?1, 9, ?2, ?3)",
-                    params![uidvalidity, mid, indexed_at],
-                )
-                .unwrap();
-        }
-
-        assert_eq!(
-            db.indexed_message_id("acct-a", "INBOX", 9).unwrap(),
-            Some("new@x".to_string())
-        );
     }
 
     #[test]

@@ -186,6 +186,10 @@ struct PlannedExport {
     uid: u32,
     source: evidence_core::AttachmentSourceMessage,
     attachments: Vec<evidence_core::ExtractedAttachment>,
+    /// The message's identity as `attachment download` reads it, for the
+    /// threat gate.
+    message_id: Option<String>,
+    fingerprint: Option<String>,
 }
 
 /// The `attachment download` gate over every selected attachment, run before
@@ -198,11 +202,6 @@ fn check_attachment_gate(
     allow_unsafe: bool,
 ) -> Result<()> {
     for plan in plans {
-        let message_id = plan
-            .source
-            .message_id
-            .as_deref()
-            .map(envelope_email_store::canonical_message_id);
         for att in &plan.attachments {
             let content_type = ingress::normalize_content_type(
                 att.mime_type
@@ -212,7 +211,8 @@ fn check_attachment_gate(
             let block = envelope_email_transport::threat::persist::attachment_block(
                 db,
                 account_id,
-                message_id,
+                plan.message_id.as_deref(),
+                plan.fingerprint.as_deref(),
                 &att.original_filename,
                 &content_type,
                 &att.bytes,
@@ -314,6 +314,8 @@ fn export_fetched_attachments(
             uid,
             source,
             attachments: selected,
+            message_id: envelope_email_transport::threat::sole_message_id(&raw.rfc822),
+            fingerprint: envelope_email_transport::threat::content_fingerprint(&raw.rfc822),
         });
     }
 
@@ -327,6 +329,7 @@ fn export_fetched_attachments(
         uid,
         source,
         attachments,
+        ..
     } in plans
     {
         let mut written = Vec::new();

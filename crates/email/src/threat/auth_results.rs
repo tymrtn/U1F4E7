@@ -32,6 +32,11 @@
 //! (below a foreign hop, below the receiver's own results, or a second one)
 //! was supplied by someone else: `ar_forged`. A-R headers from other
 //! authserv-ids are ignored entirely.
+//!
+//! Header order matters here, so this reads the raw header list
+//! ([`ThreatInput::headers`]), and only `Received` and
+//! `Authentication-Results`: fields the receiving server adds, which the
+//! content fingerprint leaves out by design.
 
 use super::domains::{ascii_host, registrable};
 use super::{Signal, ThreatInput, is_dns_name, received_by_hosts};

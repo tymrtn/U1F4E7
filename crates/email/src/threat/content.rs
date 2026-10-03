@@ -64,11 +64,9 @@ fn count(haystack: &str, phrases: &[&str]) -> usize {
 
 pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
     let mut haystack = String::new();
-    for (name, value) in &input.headers {
-        if name.eq_ignore_ascii_case("subject") {
-            haystack.push_str(value);
-            haystack.push('\n');
-        }
+    for subject in &input.subjects {
+        haystack.push_str(subject);
+        haystack.push('\n');
     }
     if let Some(text) = &input.text {
         haystack.push_str(text);

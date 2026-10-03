@@ -199,6 +199,7 @@ pub async fn upload(
             &db,
             &account_id,
             None,
+            None,
             &filename,
             content_type_hint,
             &data,

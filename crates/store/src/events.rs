@@ -290,24 +290,28 @@ impl Database {
         Ok(stmt.query_row(params![event_id], map_event).optional()?)
     }
 
-    /// Newest `event_type` event about one message (by canonical Message-ID).
-    pub fn latest_event_for_message(
+    /// The newest `limit` `event_type` events about one message (by canonical
+    /// Message-ID), newest first, under whatever folder/UID they were recorded.
+    pub fn events_for_message(
         &self,
         account_id: &str,
         event_type: &str,
         message_id: &str,
-    ) -> Result<Option<Event>> {
+        limit: usize,
+    ) -> Result<Vec<Event>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, account_id, event_type, folder, uid, message_id, from_addr, subject,
                     snippet, payload, idempotency_key, secure_pending, acked_at, created_at
              FROM events
              WHERE account_id = ?1 AND event_type = ?2 AND message_id = ?3
              ORDER BY created_at DESC, rowid DESC
-             LIMIT 1",
+             LIMIT ?4",
         )?;
-        Ok(stmt
-            .query_row(params![account_id, event_type, message_id], map_event)
-            .optional()?)
+        let rows = stmt.query_map(
+            params![account_id, event_type, message_id, limit as i64],
+            map_event,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Newest `event_type` event recorded for a folder/UID.
@@ -655,5 +659,76 @@ mod tests {
         let fetched = db.get_event("evt-1").unwrap().unwrap();
         assert!(fetched.acked_at.is_some());
         assert!(db.list_unacked("acc-1", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn events_for_message_are_newest_first_up_to_the_limit() {
+        let db = test_db();
+        let event = |id: &str, mid: &str, event_type: &str, at: &str| Event {
+            id: id.to_string(),
+            account_id: "acc-1".to_string(),
+            event_type: event_type.to_string(),
+            folder: "INBOX".to_string(),
+            uid: Some(1),
+            message_id: Some(mid.to_string()),
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: None,
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: None,
+            created_at: at.to_string(),
+        };
+        db.insert_event(&event(
+            "old",
+            "<m@x>",
+            "threat_verdict",
+            "2026-10-01T10:00:00Z",
+        ))
+        .unwrap();
+        db.insert_event(&event(
+            "new",
+            "m@x",
+            "threat_verdict",
+            "2026-10-03T10:00:00Z",
+        ))
+        .unwrap();
+        db.insert_event(&event(
+            "mid",
+            "m@x",
+            "threat_verdict",
+            "2026-10-02T10:00:00Z",
+        ))
+        .unwrap();
+        db.insert_event(&event(
+            "label",
+            "m@x",
+            "label_applied",
+            "2026-10-04T10:00:00Z",
+        ))
+        .unwrap();
+        db.insert_event(&event(
+            "other",
+            "o@x",
+            "threat_verdict",
+            "2026-10-05T10:00:00Z",
+        ))
+        .unwrap();
+
+        let ids = |limit| -> Vec<String> {
+            db.events_for_message("acc-1", "threat_verdict", "m@x", limit)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(ids(10), ["new", "mid", "old"]);
+        assert_eq!(ids(2), ["new", "mid"]);
+        assert!(
+            db.events_for_message("acc-2", "threat_verdict", "m@x", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

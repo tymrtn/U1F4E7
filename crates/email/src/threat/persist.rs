@@ -5,7 +5,9 @@
 //!
 //! - `message_scores` dimension `threat` (so `score_above threat N` rules
 //!   match) and the `threat:*` tags;
-//! - one pre-acked `threat_verdict` event per scan, payload = the verdict;
+//! - one pre-acked `threat_verdict` event per scan, payload = the verdict
+//!   plus the content fingerprint of the bytes it judged. A stored verdict
+//!   and a Mark safe apply only to a message with the same fingerprint;
 //! - quarantine: `tag` adds `threat:quarantined`; `move` also runs the shipped,
 //!   editable rule `score_above threat 70 → move Envelope/Quarantine` through
 //!   the unified executor as agent `envelope:threat`. Only `dangerous` mail
@@ -13,16 +15,16 @@
 //! - the attachment gate every download/upload chokepoint calls.
 
 use anyhow::{Context, Result, anyhow, bail};
+use envelope_email_store::Database;
 use envelope_email_store::event_catalog::{LABEL_APPLIED, LOOKUP_PERFORMED, THREAT_VERDICT};
-use envelope_email_store::models::{Event, Rule};
-use envelope_email_store::{Database, canonical_message_id};
-use serde::Serialize;
+use envelope_email_store::models::{Event, MessageScore, MessageTag, Rule};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Analyzer, Level, LookupLog, LookupRecord, Quarantine, Signal, TAG_DANGEROUS,
-    TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED, TAG_SUSPICIOUS, THREAT_DIMENSION,
-    ThreatConfig, ThreatInput, ThreatVerdict, configured_analyzers, evaluate,
+    Analyzer, FINGERPRINT_KEY_PREFIX, Level, LookupLog, LookupRecord, Quarantine, Signal,
+    TAG_DANGEROUS, TAG_FALSE_POSITIVE, TAG_MALWARE, TAG_QUARANTINED, TAG_SUSPICIOUS,
+    THREAT_DIMENSION, ThreatConfig, ThreatInput, ThreatVerdict, configured_analyzers, evaluate,
 };
 use crate::imap::{self, ImapClient};
 use crate::rule_exec::{
@@ -70,6 +72,10 @@ pub const THREAT_AGENT_ID: &str = "envelope:threat";
 pub const QUARANTINE_THRESHOLD: f64 = 69.5;
 /// Stable HTTP/CLI code for a refused attachment.
 pub const ATTACHMENT_BLOCKED: &str = "attachment_blocked";
+/// Stable code for a Mark safe with no content fingerprint to bind to.
+pub const RESCAN_REQUIRED: &str = "rescan_required";
+/// How many of a Message-ID's newest events a fingerprint lookup reads.
+const FINGERPRINT_SEARCH_LIMIT: usize = 1000;
 
 /// Mailbox sources of raw message bytes for scanning. Implementations must
 /// read without setting `\Seen` (EXAMINE + BODY.PEEK[]).
@@ -90,12 +96,17 @@ impl RawFetch for ImapRuleMailbox<'_> {
 /// outside lookups the scan made.
 #[derive(Debug, Clone, Default)]
 pub struct ScannedMessage {
+    /// [`super::sole_message_id`] of the message.
     pub message_id: Option<String>,
+    /// [`super::message_id_values`] of the scanned bytes.
+    pub observed_message_ids: Vec<String>,
     pub from_addr: String,
     pub to_addr: String,
     pub subject: String,
     /// Store with [`record_lookups`].
     pub lookups: Vec<LookupRecord>,
+    /// [`super::content_fingerprint`] of the scanned bytes.
+    pub content_fingerprint: Option<String>,
 }
 
 /// Fill the correspondent facts from the local store.
@@ -172,13 +183,13 @@ fn scanned_message(input: &ThreatInput) -> ScannedMessage {
             .map(|(_, v)| v.clone())
     };
     ScannedMessage {
-        message_id: header("message-id")
-            .map(|m| canonical_message_id(&m).to_string())
-            .filter(|m| !m.is_empty()),
+        message_id: super::sole_message_id_in(&input.headers),
+        observed_message_ids: Vec::new(),
         from_addr: input.from_addr.clone(),
         to_addr: header("to").unwrap_or_default(),
         subject: header("subject").unwrap_or_default(),
         lookups: Vec::new(),
+        content_fingerprint: None,
     }
 }
 
@@ -191,10 +202,49 @@ pub fn scan_raw(
     raw: &[u8],
     config: &ThreatConfig,
 ) -> (ThreatVerdict, ScannedMessage) {
-    evaluate_input(
+    let (verdict, mut scanned) = evaluate_input(
         prepare_input(db, account_id, account_address, raw, config),
         config,
-    )
+    );
+    scanned.content_fingerprint = super::content_fingerprint(raw);
+    scanned.observed_message_ids = super::message_id_values(raw);
+    (verdict, scanned)
+}
+
+/// The key a message's threat tags, score and events are stored under: its
+/// [`super::sole_message_id`] while no other content has a verdict under that
+/// Message-ID, else [`FINGERPRINT_KEY_PREFIX`] and its content fingerprint.
+/// So the first content scanned under a Message-ID keeps it, and a later
+/// message that reuses it (a collision) never shares, raises or lowers the
+/// first one's tags and score. A verdict stored before fingerprints counts
+/// as other content. Without a fingerprint the key is the Message-ID; `None`
+/// when neither is known.
+pub fn threat_key(
+    db: &Database,
+    account_id: &str,
+    message_id: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<Option<String>> {
+    let fingerprint_key = |fp: &str| format!("{FINGERPRINT_KEY_PREFIX}{fp}");
+    Ok(match (message_id, fingerprint) {
+        (Some(mid), Some(fp)) => {
+            let held_by_other = db
+                .events_for_message(account_id, THREAT_VERDICT, mid, FINGERPRINT_SEARCH_LIMIT)?
+                .into_iter()
+                .map(stored_verdict)
+                .collect::<Result<Vec<_>>>()?
+                .iter()
+                .any(|stored| stored.content_fingerprint.as_deref() != Some(fp));
+            Some(if held_by_other {
+                fingerprint_key(fp)
+            } else {
+                mid.to_string()
+            })
+        }
+        (Some(mid), None) => Some(mid.to_string()),
+        (None, Some(fp)) => Some(fingerprint_key(fp)),
+        (None, None) => None,
+    })
 }
 
 /// Where a verdict is stored.
@@ -203,16 +253,132 @@ pub struct VerdictTarget<'a> {
     pub account_id: &'a str,
     pub folder: &'a str,
     pub uid: u32,
-    /// Canonical Message-ID. Without one, only the event is written (scores
-    /// and tags are keyed by Message-ID).
+    /// The message's [`super::sole_message_id`]. Scores, tags and events are
+    /// keyed by [`threat_key`] of this and the fingerprint.
     pub message_id: Option<&'a str>,
+    /// [`super::content_fingerprint`] of the message's bytes, stored beside
+    /// the verdict. `None` only where no complete bytes were read.
+    pub content_fingerprint: Option<&'a str>,
+    /// [`super::message_id_values`] of the message. Stored with a verdict on
+    /// a message without one usable Message-ID, so the sweep can tell it is
+    /// the message still at that folder/UID.
+    pub observed_message_ids: &'a [String],
 }
 
-pub fn is_marked_safe(db: &Database, account_id: &str, message_id: &str) -> Result<bool> {
+/// The `threat_verdict` event payload: the verdict with the fingerprint of
+/// the bytes it judged as a sibling field, which readers that parse only a
+/// [`ThreatVerdict`] ignore.
+#[derive(Debug, Serialize, Deserialize)]
+struct VerdictPayload {
+    #[serde(flatten)]
+    verdict: ThreatVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_fingerprint: Option<String>,
+    /// The message's Message-ID when other content already held it, so this
+    /// verdict is keyed by fingerprint: the record of the collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reused_message_id: Option<String>,
+    /// For a message without one usable Message-ID, the values of its
+    /// Message-ID fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    observed_message_ids: Vec<String>,
+}
+
+/// True when Mark safe applies to the message with these bytes: its threat
+/// `key` carries `threat:false_positive` and a Mark safe was recorded there
+/// for this fingerprint. A mark on other bytes with the same Message-ID, or
+/// one made before fingerprints, does not apply; without a fingerprint
+/// nothing is marked safe.
+pub fn is_marked_safe(
+    db: &Database,
+    account_id: &str,
+    key: &str,
+    fingerprint: Option<&str>,
+) -> Result<bool> {
+    let Some(fingerprint) = fingerprint else {
+        return Ok(false);
+    };
+    if !has_safe_tag(db, account_id, key)? {
+        return Ok(false);
+    }
+    Ok(safe_marks(db, account_id, key)?
+        .iter()
+        .any(|(_, mark)| mark.content_fingerprint.as_deref() == Some(fingerprint)))
+}
+
+fn has_safe_tag(db: &Database, account_id: &str, message_id: &str) -> Result<bool> {
     Ok(db
         .get_tags(account_id, message_id)?
         .iter()
         .any(|t| t.tag == TAG_FALSE_POSITIVE))
+}
+
+/// A Mark safe as its `label_applied` payload recorded it.
+#[derive(Deserialize)]
+struct SafeMark {
+    label: String,
+    #[serde(default)]
+    content_fingerprint: Option<String>,
+}
+
+/// The Mark safe events for a Message-ID, newest first. A payload that does
+/// not parse is not counted as a mark.
+fn safe_marks(db: &Database, account_id: &str, message_id: &str) -> Result<Vec<(Event, SafeMark)>> {
+    Ok(db
+        .events_for_message(
+            account_id,
+            LABEL_APPLIED,
+            message_id,
+            FINGERPRINT_SEARCH_LIMIT,
+        )?
+        .into_iter()
+        .filter_map(|event| {
+            let mark: SafeMark = serde_json::from_str(event.payload.as_deref()?).ok()?;
+            (mark.label == TAG_FALSE_POSITIVE).then_some((event, mark))
+        })
+        .collect())
+}
+
+/// A Mark safe made before fingerprints (stored under the Message-ID) on
+/// this folder/UID carries over to the bytes there now, under their threat
+/// `key`. Legacy marks made anywhere else stay inert.
+fn rebind_legacy_mark(
+    db: &Database,
+    target: &VerdictTarget<'_>,
+    message_id: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    if !has_safe_tag(db, target.account_id, message_id)?
+        || is_marked_safe(db, target.account_id, key, Some(fingerprint))?
+    {
+        return Ok(());
+    }
+    let legacy_here = safe_marks(db, target.account_id, message_id)?
+        .iter()
+        .any(|(event, mark)| {
+            mark.content_fingerprint.is_none()
+                && event.folder == target.folder
+                && event.uid == Some(i64::from(target.uid))
+        });
+    if legacy_here {
+        db.add_tag(
+            target.account_id,
+            key,
+            TAG_FALSE_POSITIVE,
+            Some(i64::from(target.uid)),
+            Some(target.folder),
+        )?;
+        record_safe_mark(
+            db,
+            target,
+            key,
+            fingerprint,
+            "legacy_rebind",
+            Some(THREAT_AGENT_ID),
+        )?;
+    }
+    Ok(())
 }
 
 /// Persist a verdict: score, level tags, and the `threat_verdict` event.
@@ -223,10 +389,16 @@ pub fn record_verdict(
     target: &VerdictTarget<'_>,
     verdict: &ThreatVerdict,
 ) -> Result<()> {
-    if let Some(mid) = target.message_id {
+    let key = threat_key(
+        db,
+        target.account_id,
+        target.message_id,
+        target.content_fingerprint,
+    )?;
+    if let Some(mid) = key.as_deref() {
         let uid = Some(i64::from(target.uid));
         let folder = Some(target.folder);
-        let safe = is_marked_safe(db, target.account_id, mid)?;
+        let safe = is_marked_safe(db, target.account_id, mid, target.content_fingerprint)?;
         for tag in [TAG_SUSPICIOUS, TAG_DANGEROUS, TAG_MALWARE] {
             db.remove_tag(target.account_id, mid, tag)?;
         }
@@ -262,7 +434,20 @@ pub fn record_verdict(
             }
         }
     }
+    record_verdict_event(db, target, key.as_deref(), verdict)
+}
 
+/// The `threat_verdict` event alone, under the target's threat `key`,
+/// without touching scores or tags.
+fn record_verdict_event(
+    db: &Database,
+    target: &VerdictTarget<'_>,
+    key: Option<&str>,
+    verdict: &ThreatVerdict,
+) -> Result<()> {
+    let reused_message_id = target
+        .message_id
+        .filter(|_| key.is_some_and(|k| k.starts_with(FINGERPRINT_KEY_PREFIX)));
     let now = chrono::Utc::now().to_rfc3339();
     let event = Event {
         id: uuid::Uuid::new_v4().to_string(),
@@ -270,11 +455,22 @@ pub fn record_verdict(
         event_type: THREAT_VERDICT.to_string(),
         folder: target.folder.to_string(),
         uid: Some(i64::from(target.uid)),
-        message_id: target.message_id.map(str::to_string),
+        message_id: key.map(str::to_string),
         from_addr: None,
         subject: None,
         snippet: None,
-        payload: Some(serde_json::to_string(verdict).context("serialize verdict")?),
+        payload: Some(
+            serde_json::to_string(&VerdictPayload {
+                verdict: verdict.clone(),
+                content_fingerprint: target.content_fingerprint.map(str::to_string),
+                reused_message_id: reused_message_id.map(str::to_string),
+                observed_message_ids: match target.message_id {
+                    Some(_) => Vec::new(),
+                    None => target.observed_message_ids.to_vec(),
+                },
+            })
+            .context("serialize verdict")?,
+        ),
         idempotency_key: None,
         secure_pending: false,
         acked_at: Some(now.clone()),
@@ -292,6 +488,15 @@ pub fn record_lookups(
     target: &VerdictTarget<'_>,
     lookups: &[LookupRecord],
 ) -> Result<()> {
+    if lookups.is_empty() {
+        return Ok(());
+    }
+    let key = threat_key(
+        db,
+        target.account_id,
+        target.message_id,
+        target.content_fingerprint,
+    )?;
     for lookup in lookups {
         let now = chrono::Utc::now().to_rfc3339();
         let event = Event {
@@ -300,7 +505,7 @@ pub fn record_lookups(
             event_type: LOOKUP_PERFORMED.to_string(),
             folder: target.folder.to_string(),
             uid: Some(i64::from(target.uid)),
-            message_id: target.message_id.map(str::to_string),
+            message_id: key.clone(),
             from_addr: None,
             subject: None,
             snippet: None,
@@ -316,33 +521,56 @@ pub fn record_lookups(
     Ok(())
 }
 
-/// The newest stored verdict for a message: by Message-ID when known, else
-/// by folder/UID.
-pub fn latest_verdict(
-    db: &Database,
-    account_id: &str,
-    message_id: Option<&str>,
-    folder: &str,
-    uid: u32,
-) -> Result<Option<ThreatVerdict>> {
-    let event = match message_id {
-        Some(mid) => db.latest_event_for_message(account_id, THREAT_VERDICT, mid)?,
-        None => db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)?,
-    };
-    event
-        .and_then(|e| e.payload)
-        .map(|p| serde_json::from_str(&p).context("stored threat_verdict payload is not a verdict"))
-        .transpose()
-}
-
 /// A stored verdict with the message identity its event recorded.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StoredVerdict {
     pub folder: String,
     pub uid: Option<i64>,
+    /// The message's Message-ID, when it had one usable Message-ID.
     pub message_id: Option<String>,
+    /// What the verdict's message has its threat tags and score under (see
+    /// [`threat_key`]). Not part of any JSON output.
+    #[serde(skip)]
+    pub key: Option<String>,
+    /// For a message without one usable Message-ID, the values of its
+    /// Message-ID fields. Not part of any JSON output.
+    #[serde(skip)]
+    pub observed_message_ids: Vec<String>,
     pub recorded_at: String,
     pub verdict: ThreatVerdict,
+    /// The fingerprint of the bytes the verdict judged; `None` for a verdict
+    /// stored before fingerprints. Not part of any JSON output.
+    #[serde(skip)]
+    pub content_fingerprint: Option<String>,
+}
+
+impl StoredVerdict {
+    /// Whether this verdict is for the message a server reports with
+    /// `message_id`: its own Message-ID, or, for a message without one
+    /// usable Message-ID, one of the values its scan read (an absent or
+    /// empty one matching a scan that read none or an empty one).
+    pub fn is_for_message_id(&self, message_id: Option<&str>) -> bool {
+        let reported = message_id
+            .map(envelope_email_store::canonical_message_id)
+            .filter(|m| !m.is_empty());
+        let observed = &self.observed_message_ids;
+        match (self.message_id.as_deref(), reported) {
+            (Some(own), reported) => reported == Some(own),
+            (None, Some(reported)) => observed.iter().any(|m| m == reported),
+            (None, None) => observed.is_empty() || observed.iter().any(String::is_empty),
+        }
+    }
+
+    /// Whether this verdict is for the message `seen` describes: the same
+    /// fingerprint when the bytes are known, else the same Message-ID.
+    pub fn is_for(&self, seen: Seen<'_>) -> bool {
+        match seen {
+            Seen::Bytes(fingerprint) => {
+                fingerprint.is_some() && self.content_fingerprint.as_deref() == fingerprint
+            }
+            Seen::MessageId(message_id) => self.is_for_message_id(message_id),
+        }
+    }
 }
 
 /// The newest verdict recorded for a folder/UID, with its Message-ID.
@@ -352,34 +580,66 @@ pub fn stored_verdict_for_uid(
     folder: &str,
     uid: u32,
 ) -> Result<Option<StoredVerdict>> {
-    stored_verdict(db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)?)
+    db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)?
+        .map(stored_verdict)
+        .transpose()
 }
 
-/// The newest verdict recorded for a Message-ID, under whatever folder/UID
-/// it was scanned.
-pub fn stored_verdict_for_message(
+/// The stored verdict that judged these bytes at folder/UID: the UID's own
+/// verdict when its Message-ID matches and its fingerprint is equal, else
+/// the newest verdict for the Message-ID with the same fingerprint. A
+/// verdict stored without a fingerprint, or on other bytes that share the
+/// Message-ID, never applies.
+pub fn matching_verdict(
     db: &Database,
     account_id: &str,
-    message_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: Option<&str>,
+    fingerprint: &str,
 ) -> Result<Option<StoredVerdict>> {
-    stored_verdict(db.latest_event_for_message(account_id, THREAT_VERDICT, message_id)?)
-}
-
-fn stored_verdict(event: Option<Event>) -> Result<Option<StoredVerdict>> {
-    let Some(event) = event else {
+    if let Some(own) = stored_verdict_for_uid(db, account_id, folder, uid)?
+        && own.message_id.as_deref() == message_id
+        && own.content_fingerprint.as_deref() == Some(fingerprint)
+    {
+        return Ok(Some(own));
+    }
+    let Some(key) = threat_key(db, account_id, message_id, Some(fingerprint))? else {
         return Ok(None);
     };
+    for event in
+        db.events_for_message(account_id, THREAT_VERDICT, &key, FINGERPRINT_SEARCH_LIMIT)?
+    {
+        let stored = stored_verdict(event)?;
+        if stored.content_fingerprint.as_deref() == Some(fingerprint) {
+            return Ok(Some(stored));
+        }
+    }
+    Ok(None)
+}
+
+fn stored_verdict(event: Event) -> Result<StoredVerdict> {
     let payload = event
         .payload
         .ok_or_else(|| anyhow!("threat_verdict event {} has no payload", event.id))?;
-    Ok(Some(StoredVerdict {
+    let payload: VerdictPayload =
+        serde_json::from_str(&payload).context("stored threat_verdict payload is not a verdict")?;
+    let message_id = payload.reused_message_id.or_else(|| {
+        event
+            .message_id
+            .clone()
+            .filter(|key| !key.starts_with(FINGERPRINT_KEY_PREFIX))
+    });
+    Ok(StoredVerdict {
         folder: event.folder,
         uid: event.uid,
-        message_id: event.message_id,
+        message_id,
+        key: event.message_id,
         recorded_at: event.created_at,
-        verdict: serde_json::from_str(&payload)
-            .context("stored threat_verdict payload is not a verdict")?,
-    }))
+        verdict: payload.verdict,
+        content_fingerprint: payload.content_fingerprint,
+        observed_message_ids: payload.observed_message_ids,
+    })
 }
 
 /// Scan when there is no verdict or it came from an older engine.
@@ -395,25 +655,30 @@ pub struct AttachmentBlock {
     pub signals: Vec<Signal>,
 }
 
-/// The attachment gate. Refuses bytes when the message carries
-/// `threat:malware` or the attachment itself is malware-grade, under its
-/// original name or the sanitized name it is written under, unless the
-/// message was marked safe.
+/// The attachment gate, for an attachment of the message with
+/// [`super::sole_message_id`] `message_id` and content `fingerprint`. Refuses
+/// bytes that look like malware, under their original name or the sanitized
+/// name they are written under; or whose message carries `threat:malware`
+/// under its threat key, or under its Message-ID when another message's
+/// content holds that (strictness may spread between messages sharing a
+/// Message-ID, leniency never does); or whose content has a malware verdict
+/// on file. Only a Mark safe bound to this fingerprint releases them, so an
+/// attachment fetched without one (part by part, from an over-cap message)
+/// is never released by Mark safe.
 pub fn attachment_block(
     db: &Database,
     account_id: &str,
     message_id: Option<&str>,
+    fingerprint: Option<&str>,
     filename: &str,
     content_type: &str,
     bytes: &[u8],
 ) -> Result<Option<AttachmentBlock>> {
-    let mut tagged = false;
-    if let Some(mid) = message_id {
-        let tags = db.get_tags(account_id, mid)?;
-        if tags.iter().any(|t| t.tag == TAG_FALSE_POSITIVE) {
-            return Ok(None);
-        }
-        tagged = tags.iter().any(|t| t.tag == TAG_MALWARE);
+    let key = threat_key(db, account_id, message_id, fingerprint)?;
+    if let Some(key) = key.as_deref()
+        && is_marked_safe(db, account_id, key, fingerprint)?
+    {
+        return Ok(None);
     }
     // Bytes reach disk under the sanitized name, so check it as well as the
     // original; either one blocking refuses.
@@ -426,26 +691,72 @@ pub fn attachment_block(
             }
         }
     }
-    if !tagged && signals.is_empty() {
-        return Ok(None);
-    }
-    let reason = if signals.is_empty() {
-        "the message is tagged threat:malware".to_string()
-    } else {
-        format!(
+    let reason = if !signals.is_empty() {
+        Some(format!(
             "attachment looks like malware ({})",
             signals
                 .iter()
                 .map(|s| s.code.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )
+        ))
+    } else if let Some(key) = key.as_deref() {
+        message_malware_reason(db, account_id, key, message_id, fingerprint)?
+    } else {
+        None
     };
-    Ok(Some(AttachmentBlock {
+    Ok(reason.map(|reason| AttachmentBlock {
         code: ATTACHMENT_BLOCKED,
         reason,
         signals,
     }))
+}
+
+/// Why the message makes every attachment refused, if it does: a malware
+/// tag under its threat key or its Message-ID, or a malware verdict on these
+/// exact bytes. When the verdict history is longer than the window read, a
+/// malware verdict cannot be ruled out and the attachment is refused.
+fn message_malware_reason(
+    db: &Database,
+    account_id: &str,
+    key: &str,
+    message_id: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<Option<String>> {
+    let tagged = |k: &str| -> Result<bool> {
+        Ok(db
+            .get_tags(account_id, k)?
+            .iter()
+            .any(|t| t.tag == TAG_MALWARE))
+    };
+    if tagged(key)? {
+        return Ok(Some("the message is tagged threat:malware".to_string()));
+    }
+    if let Some(mid) = message_id
+        && mid != key
+        && tagged(mid)?
+    {
+        return Ok(Some(
+            "a message with this Message-ID is tagged threat:malware".to_string(),
+        ));
+    }
+    let Some(fingerprint) = fingerprint else {
+        return Ok(None);
+    };
+    let events =
+        db.events_for_message(account_id, THREAT_VERDICT, key, FINGERPRINT_SEARCH_LIMIT)?;
+    let window_full = events.len() >= FINGERPRINT_SEARCH_LIMIT;
+    for event in events {
+        let stored = stored_verdict(event)?;
+        if stored.content_fingerprint.as_deref() == Some(fingerprint) && stored.verdict.is_malware()
+        {
+            return Ok(Some(
+                "the message's stored threat verdict is malware".to_string(),
+            ));
+        }
+    }
+    Ok(window_full
+        .then(|| "the message has more stored verdicts than the attachment gate reads".to_string()))
 }
 
 /// Every attachment of `raw` the download gate would refuse, by filename, in
@@ -461,7 +772,8 @@ pub fn blocked_attachments(
     let parsed = mail_parser::MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed for the attachment gate"))?;
-    let message_id = parsed.message_id().map(canonical_message_id);
+    let message_id = super::sole_message_id(raw);
+    let fingerprint = super::content_fingerprint(raw);
     let mut out = Vec::new();
     for attachment in parsed.attachments() {
         let filename = attachment.attachment_name().unwrap_or("unnamed");
@@ -473,7 +785,8 @@ pub fn blocked_attachments(
         if let Some(block) = attachment_block(
             db,
             account_id,
-            message_id,
+            message_id.as_deref(),
+            fingerprint.as_deref(),
             filename,
             &content_type,
             attachment.contents(),
@@ -485,20 +798,26 @@ pub fn blocked_attachments(
 }
 
 /// `threat mark-safe`: tag `threat:false_positive`, clear the level,
-/// malware and quarantine tags, zero the score, and log `label_applied`.
+/// malware and quarantine tags, zero the score, and log `label_applied` with
+/// the content fingerprint the mark is bound to. Refused with
+/// [`RESCAN_REQUIRED`] when the target has no fingerprint.
 pub fn mark_safe(
     db: &Database,
     target: &VerdictTarget<'_>,
     source: &str,
     agent_id: Option<&str>,
 ) -> Result<()> {
-    let mid = target.message_id.ok_or_else(|| {
+    let fingerprint = target.content_fingerprint.ok_or_else(|| {
         anyhow!(
-            "UID {} in {} has no Message-ID; cannot tag it",
+            "{RESCAN_REQUIRED}: UID {} in {} has no content fingerprint to bind Mark safe to; \
+             open or scan the message first",
             target.uid,
             target.folder
         )
     })?;
+    let key = threat_key(db, target.account_id, target.message_id, Some(fingerprint))?
+        .ok_or_else(|| anyhow!("UID {} in {} has no threat key", target.uid, target.folder))?;
+    let mid = key.as_str();
     let uid = Some(i64::from(target.uid));
     for tag in [TAG_SUSPICIOUS, TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED] {
         db.remove_tag(target.account_id, mid, tag)?;
@@ -518,18 +837,38 @@ pub fn mark_safe(
         uid,
         Some(target.folder),
     )?;
+    record_safe_mark(db, target, mid, fingerprint, source, agent_id)
+}
+
+/// The `label_applied` event, under a threat `key`, that binds a Mark safe
+/// to a fingerprint.
+fn record_safe_mark(
+    db: &Database,
+    target: &VerdictTarget<'_>,
+    key: &str,
+    fingerprint: &str,
+    source: &str,
+    agent_id: Option<&str>,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let event = Event {
         id: uuid::Uuid::new_v4().to_string(),
         account_id: target.account_id.to_string(),
         event_type: LABEL_APPLIED.to_string(),
         folder: target.folder.to_string(),
-        uid,
-        message_id: Some(mid.to_string()),
+        uid: Some(i64::from(target.uid)),
+        message_id: Some(key.to_string()),
         from_addr: None,
         subject: None,
         snippet: None,
-        payload: Some(json!({"label": TAG_FALSE_POSITIVE, "source": source}).to_string()),
+        payload: Some(
+            json!({
+                "label": TAG_FALSE_POSITIVE,
+                "source": source,
+                "content_fingerprint": fingerprint,
+            })
+            .to_string(),
+        ),
         idempotency_key: None,
         secure_pending: false,
         acked_at: Some(now.clone()),
@@ -573,10 +912,13 @@ pub fn ensure_quarantine_rule(db: &Database, account_id: &str) -> Result<Rule> {
     )?)
 }
 
-/// Build the rule context for a scanned message from the stores.
+/// Build the rule context for the scanned message at folder/UID from the
+/// stores, its threat data from its own verdict.
 fn rule_context(
     db: &Database,
     account_id: &str,
+    folder: &str,
+    uid: u32,
     scanned: &ScannedMessage,
 ) -> Result<MessageContext> {
     let (tags, scores) = match scanned.message_id.as_deref() {
@@ -592,14 +934,220 @@ fn rule_context(
         ),
         None => (Vec::new(), Default::default()),
     };
-    Ok(MessageContext {
+    let mut ctx = MessageContext {
         from_addr: scanned.from_addr.clone(),
         to_addr: scanned.to_addr.clone(),
         subject: scanned.subject.clone(),
         tags,
         scores,
         contact_tags: db.get_contact_tags(account_id, &scanned.from_addr)?,
-    })
+    };
+    bind_threat_context(
+        db,
+        account_id,
+        folder,
+        uid,
+        Seen::Bytes(scanned.content_fingerprint.as_deref()),
+        &mut ctx,
+    )?;
+    Ok(ctx)
+}
+
+/// Replace a rule context's threat data (the `threat` score and every
+/// `threat:*` tag) with [`bound_threat`] for this folder/UID.
+pub fn bind_threat_context(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    seen: Seen<'_>,
+    ctx: &mut MessageContext,
+) -> Result<()> {
+    ctx.tags.retain(|t| !t.starts_with("threat:"));
+    ctx.scores.remove(THREAT_DIMENSION);
+    let bound = bound_threat(db, account_id, folder, uid, seen)?;
+    if let Some(score) = bound.score {
+        ctx.scores.insert(THREAT_DIMENSION.to_string(), score.value);
+    }
+    ctx.tags.extend(bound.tags.into_iter().map(|t| t.tag));
+    Ok(())
+}
+
+/// What a caller knows of the message at a folder/UID now, to tell whether
+/// the verdict stored there is for it.
+#[derive(Debug, Clone, Copy)]
+pub enum Seen<'a> {
+    /// Its bytes: their content fingerprint, `None` when they have none.
+    Bytes(Option<&'a str>),
+    /// Only its Message-ID, as the server reports it.
+    MessageId(Option<&'a str>),
+}
+
+/// What a reader fetched of the message it opened at a folder/UID.
+#[derive(Debug, Clone, Copy)]
+pub enum Opened<'a> {
+    /// Its complete bytes.
+    Whole(&'a [u8]),
+    /// Its parts, read one by one because it is over the whole-message fetch
+    /// cap: no complete bytes, only its Message-ID.
+    Parts { message_id: Option<&'a str> },
+}
+
+impl<'a> Opened<'a> {
+    /// A fetch that returned the message's Message-ID and, unless it is over
+    /// the cap, its bytes.
+    pub fn new(raw: Option<&'a [u8]>, message_id: Option<&'a str>) -> Self {
+        match raw {
+            Some(raw) => Opened::Whole(raw),
+            None => Opened::Parts { message_id },
+        }
+    }
+}
+
+/// The verdict stored at folder/UID when it is for the message opened there
+/// ([`StoredVerdict::is_for`]: the same fingerprint when its bytes are at
+/// hand, else the same Message-ID). One left by another message at a reused
+/// UID is not shown.
+pub fn stored_verdict_for(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    opened: Opened<'_>,
+) -> Result<Option<StoredVerdict>> {
+    let fingerprint = match opened {
+        Opened::Whole(raw) => super::content_fingerprint(raw),
+        Opened::Parts { .. } => None,
+    };
+    let seen = match opened {
+        Opened::Whole(_) => Seen::Bytes(fingerprint.as_deref()),
+        Opened::Parts { message_id } => Seen::MessageId(message_id),
+    };
+    Ok(stored_verdict_for_uid(db, account_id, folder, uid)?.filter(|s| s.is_for(seen)))
+}
+
+/// One message's own threat data.
+#[derive(Debug, Default)]
+pub struct BoundThreat {
+    pub score: Option<MessageScore>,
+    pub tags: Vec<MessageTag>,
+}
+
+/// The `threat` score and `threat:*` tags the verdict stored for this
+/// folder/UID gives its message, read under that message's own threat key.
+/// Stores keyed by Message-ID are shared by every message with that
+/// Message-ID, so they never decide one message's threat data. A UID
+/// without a verdict has none, and so does one whose verdict is for another
+/// message by `seen` (the UID was reused). A tag or score stored under the
+/// key keeps its record; one the verdict implies without a record is dated
+/// by it.
+pub fn bound_threat(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    seen: Seen<'_>,
+) -> Result<BoundThreat> {
+    let mut bound = BoundThreat::default();
+    let Some(stored) =
+        stored_verdict_for_uid(db, account_id, folder, uid)?.filter(|stored| stored.is_for(seen))
+    else {
+        return Ok(bound);
+    };
+    let verdict = &stored.verdict;
+    let key = stored.key.as_deref();
+    let safe = match key {
+        Some(key) => is_marked_safe(db, account_id, key, stored.content_fingerprint.as_deref())?,
+        None => false,
+    };
+    if verdict.level != Level::Unavailable {
+        let value = if safe { 0.0 } else { f64::from(verdict.score) };
+        let recorded = match key {
+            Some(key) => db
+                .get_scores(account_id, key)?
+                .into_iter()
+                .find(|s| s.dimension == THREAT_DIMENSION),
+            None => None,
+        };
+        bound.score = Some(match recorded {
+            Some(score) => MessageScore { value, ..score },
+            None => MessageScore {
+                account_id: account_id.to_string(),
+                message_id: key.unwrap_or_default().to_string(),
+                dimension: THREAT_DIMENSION.to_string(),
+                value,
+                uid: Some(i64::from(uid)),
+                folder: Some(folder.to_string()),
+                created_at: stored.recorded_at.clone(),
+                updated_at: stored.recorded_at.clone(),
+            },
+        });
+    }
+    let Some(key) = key else {
+        return Ok(bound);
+    };
+    let recorded = db.get_tags(account_id, key)?;
+    let mut names = Vec::new();
+    if safe {
+        names.push(TAG_FALSE_POSITIVE);
+    } else {
+        match verdict.level {
+            Level::Suspicious => names.push(TAG_SUSPICIOUS),
+            Level::Dangerous => names.push(TAG_DANGEROUS),
+            Level::Clean | Level::Unavailable => {}
+        }
+        if verdict.is_malware() {
+            names.push(TAG_MALWARE);
+        }
+        if recorded.iter().any(|t| t.tag == TAG_QUARANTINED) {
+            names.push(TAG_QUARANTINED);
+        }
+    }
+    bound.tags = names
+        .into_iter()
+        .map(|name| {
+            recorded
+                .iter()
+                .find(|t| t.tag == name)
+                .cloned()
+                .unwrap_or_else(|| MessageTag {
+                    account_id: account_id.to_string(),
+                    message_id: key.to_string(),
+                    tag: name.to_string(),
+                    uid: Some(i64::from(uid)),
+                    folder: Some(folder.to_string()),
+                    created_at: stored.recorded_at.clone(),
+                })
+        })
+        .collect();
+    Ok(bound)
+}
+
+/// The tags and scores a tag view shows for the message at this folder/UID,
+/// fetched as `raw` (`None` when read part by part): those stored under its
+/// Message-ID, with the threat data replaced by [`bound_threat`], as rule
+/// contexts read it.
+pub fn shown_tags_and_scores(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: &str,
+    raw: Option<&[u8]>,
+) -> Result<(Vec<MessageTag>, Vec<MessageScore>)> {
+    let fingerprint = raw.map(super::content_fingerprint);
+    let seen = match &fingerprint {
+        Some(fingerprint) => Seen::Bytes(fingerprint.as_deref()),
+        None => Seen::MessageId(Some(message_id)),
+    };
+    let bound = bound_threat(db, account_id, folder, uid, seen)?;
+    let mut tags = db.get_tags(account_id, message_id)?;
+    tags.retain(|t| !t.tag.starts_with("threat:"));
+    tags.extend(bound.tags);
+    let mut scores = db.get_scores(account_id, message_id)?;
+    scores.retain(|s| s.dimension != THREAT_DIMENSION);
+    scores.extend(bound.score);
+    Ok((tags, scores))
 }
 
 /// What quarantine did to one message.
@@ -628,10 +1176,24 @@ pub async fn apply_quarantine<M: RuleMailbox, D: ExecDb>(
     if verdict.level != Level::Dangerous || config.quarantine == Quarantine::None {
         return Ok(QuarantineOutcome::NotApplied);
     }
-    let Some(mid) = scanned.message_id.as_deref() else {
+    let fingerprint = scanned.content_fingerprint.as_deref();
+    let message_id = scanned.message_id.as_deref();
+    let (key, safe) = db
+        .with_db(|d| -> Result<(Option<String>, bool)> {
+            let key = threat_key(d, account.id, message_id, fingerprint)?;
+            let safe = match key.as_deref() {
+                Some(key) => is_marked_safe(d, account.id, key, fingerprint)?,
+                None => false,
+            };
+            Ok((key, safe))
+        })
+        .await?;
+    // Keyed by content, so the move's replay guard is per message and
+    // never treats another message with this Message-ID as already moved.
+    let Some(key) = key else {
         return Ok(QuarantineOutcome::NotApplied);
     };
-    let safe = db.with_db(|d| is_marked_safe(d, account.id, mid)).await?;
+    let mid = key.as_str();
     if safe {
         return Ok(QuarantineOutcome::NotApplied);
     }
@@ -654,7 +1216,7 @@ pub async fn apply_quarantine<M: RuleMailbox, D: ExecDb>(
         .with_db(|d| -> Result<(Rule, MessageContext)> {
             Ok((
                 ensure_quarantine_rule(d, account.id)?,
-                rule_context(d, account.id, scanned)?,
+                rule_context(d, account.id, folder, uid, scanned)?,
             ))
         })
         .await?;
@@ -742,15 +1304,19 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     // Opt-in analyzers block on clamd and DNS: run them off the async
     // workers and without holding the database.
     let owned = config.clone();
-    let (verdict, scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
+    let (verdict, mut scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
         .await
         .context("threat analyzers panicked")?;
+    scanned.content_fingerprint = super::content_fingerprint(&raw);
+    scanned.observed_message_ids = super::message_id_values(&raw);
     db.with_db(|d| -> Result<()> {
         let target = VerdictTarget {
             account_id: account.id,
             folder,
             uid,
             message_id: scanned.message_id.as_deref(),
+            content_fingerprint: scanned.content_fingerprint.as_deref(),
+            observed_message_ids: &scanned.observed_message_ids,
         };
         record_verdict(d, &target, &verdict)?;
         record_lookups(d, &target, &scanned.lookups)
@@ -767,41 +1333,80 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     })
 }
 
-/// The canonical Message-ID of a raw message; `None` when it has none.
-pub fn raw_message_id(raw: &[u8], account_address: &str) -> Option<String> {
-    ThreatInput::from_raw(raw, account_address)
-        .ok()
-        .and_then(|i| {
-            i.headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
-                .map(|(_, v)| canonical_message_id(v).to_string())
-        })
-        .filter(|m| !m.is_empty())
-}
-
-/// Scan one message on open when it has no current verdict (and
+/// Scan one message on open when no current verdict judged these bytes (and
 /// `threat.on_read` is on). Returns the verdict to show.
 ///
-/// `raw` is `None` for a message read part by part (over the whole-message
-/// fetch cap). There is nothing complete to scan, so this returns the stored
-/// verdict, if any, and records nothing.
+/// A verdict judged the bytes when [`matching_verdict`] finds it with this
+/// fingerprint from the current engine. One stored before fingerprints, or
+/// from an older engine, is rescanned. One reused from another folder/UID is
+/// also recorded under this UID (event only; scores and tags stay as they
+/// are).
+///
+/// A message read part by part ([`Opened::Parts`]) has nothing complete to
+/// scan, so this returns the verdict stored for its Message-ID at the UID,
+/// if any, and records nothing.
 pub fn verdict_on_open(
     db: &Database,
     account_id: &str,
     account_address: &str,
     folder: &str,
     uid: u32,
-    raw: Option<&[u8]>,
+    opened: Opened<'_>,
     config: &ThreatConfig,
 ) -> Result<Option<ThreatVerdict>> {
-    let Some(raw) = raw else {
-        return latest_verdict(db, account_id, None, folder, uid);
+    let raw = match opened {
+        Opened::Whole(raw) => raw,
+        Opened::Parts { .. } => {
+            return Ok(stored_verdict_for(db, account_id, folder, uid, opened)?.map(|s| s.verdict));
+        }
     };
-    let message_id = raw_message_id(raw, account_address);
-    let existing = latest_verdict(db, account_id, message_id.as_deref(), folder, uid)?;
-    if !config.enabled || !config.on_read || !needs_scan(existing.as_ref()) {
-        return Ok(existing);
+    let message_id = super::sole_message_id(raw);
+    let fingerprint = super::content_fingerprint(raw);
+    let observed = super::message_id_values(raw);
+    let here = VerdictTarget {
+        account_id,
+        folder,
+        uid,
+        message_id: message_id.as_deref(),
+        content_fingerprint: fingerprint.as_deref(),
+        observed_message_ids: &observed,
+    };
+    let key = threat_key(db, account_id, here.message_id, here.content_fingerprint)?;
+    if let (Some(mid), Some(key), Some(fingerprint)) =
+        (here.message_id, key.as_deref(), here.content_fingerprint)
+    {
+        rebind_legacy_mark(db, &here, mid, key, fingerprint)?;
+    }
+    // Bytes without a fingerprint match no stored verdict.
+    let matched = match here.content_fingerprint {
+        Some(fingerprint) => matching_verdict(
+            db,
+            account_id,
+            folder,
+            uid,
+            message_id.as_deref(),
+            fingerprint,
+        )?,
+        None => None,
+    };
+    if !config.enabled || !config.on_read {
+        // Nothing scans. A verdict stored here without a fingerprint may be
+        // shown; it is never reused or marked safe.
+        let shown = match matched {
+            Some(m) => Some(m.verdict),
+            None => stored_verdict_for_uid(db, account_id, folder, uid)?
+                .filter(|own| own.content_fingerprint.is_none() && own.message_id == message_id)
+                .map(|own| own.verdict),
+        };
+        return Ok(shown);
+    }
+    if let Some(m) = matched
+        && !needs_scan(Some(&m.verdict))
+    {
+        if (m.folder.as_str(), m.uid) != (folder, Some(i64::from(uid))) {
+            record_verdict_event(db, &here, key.as_deref(), &m.verdict)?;
+        }
+        return Ok(Some(m.verdict));
     }
     let (verdict, scanned) = scan_raw(db, account_id, account_address, raw, config);
     let target = VerdictTarget {
@@ -809,6 +1414,8 @@ pub fn verdict_on_open(
         folder,
         uid,
         message_id: scanned.message_id.as_deref(),
+        content_fingerprint: scanned.content_fingerprint.as_deref(),
+        observed_message_ids: &scanned.observed_message_ids,
     };
     record_verdict(db, &target, &verdict)?;
     record_lookups(db, &target, &scanned.lookups)?;
@@ -873,6 +1480,11 @@ pub async fn scan_uid(
 mod tests {
     use super::*;
     use crate::threat::ENGINE_VERSION;
+
+    /// Every fixture here has a fingerprint.
+    fn content_fingerprint(raw: &[u8]) -> String {
+        crate::threat::content_fingerprint(raw).expect("fixture has a content fingerprint")
+    }
 
     const ACCT: &str = "acct-1";
     const EMAIL: &str = "me@example.org";
@@ -989,6 +1601,8 @@ mod tests {
                 folder: "INBOX",
                 uid: 7,
                 message_id: scanned.message_id.as_deref(),
+                content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &verdict,
         )
@@ -998,14 +1612,14 @@ mod tests {
         assert_eq!(score[0].dimension, THREAT_DIMENSION);
         assert_eq!(score[0].value, f64::from(verdict.score));
 
-        let stored = latest_verdict(&db, ACCT, Some("p1@x"), "INBOX", 7)
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 7)
             .unwrap()
             .unwrap();
-        assert_eq!(stored, verdict);
+        assert_eq!(stored.verdict, verdict);
         let event = db
-            .latest_event_for_message(ACCT, THREAT_VERDICT, "p1@x")
+            .events_for_message(ACCT, THREAT_VERDICT, "p1@x", 1)
             .unwrap()
-            .unwrap();
+            .remove(0);
         let payload = event.payload.unwrap();
         assert!(
             !payload.contains("verify your account"),
@@ -1023,6 +1637,8 @@ mod tests {
             folder: "INBOX",
             uid: 1,
             message_id: Some("m@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("m@x"), &ThreatConfig::default());
         record_verdict(&db, &target, &bad).unwrap();
@@ -1030,18 +1646,20 @@ mod tests {
         assert!(tags(&db, "m@x").is_empty());
         assert!(db.get_scores(ACCT, "m@x").unwrap().is_empty());
         assert_eq!(
-            latest_verdict(&db, ACCT, Some("m@x"), "INBOX", 1)
+            stored_verdict_for_uid(&db, ACCT, "INBOX", 1)
                 .unwrap()
                 .unwrap()
+                .verdict
                 .level,
             Level::Unavailable
         );
     }
 
     #[test]
-    fn stored_verdict_for_message_finds_it_under_the_scanned_uid() {
+    fn stored_verdict_is_found_only_under_the_scanned_uid_or_its_bytes() {
         let db = Database::open_memory().unwrap();
-        let (verdict, _) = scan_raw(&db, ACCT, EMAIL, &phish("m@x"), &ThreatConfig::default());
+        let raw = phish("m@x");
+        let (verdict, scanned) = scan_raw(&db, ACCT, EMAIL, &raw, &ThreatConfig::default());
         record_verdict(
             &db,
             &VerdictTarget {
@@ -1049,12 +1667,14 @@ mod tests {
                 folder: "INBOX",
                 uid: 7,
                 message_id: Some("m@x"),
+                content_fingerprint: scanned.content_fingerprint.as_deref(),
+                observed_message_ids: &[],
             },
             &verdict,
         )
         .unwrap();
 
-        let stored = stored_verdict_for_message(&db, ACCT, "m@x")
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 7)
             .unwrap()
             .unwrap();
         assert_eq!(stored.verdict, verdict);
@@ -1065,10 +1685,87 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            stored_verdict_for_message(&db, ACCT, "other@x")
+        let found = |fp: &str| {
+            matching_verdict(&db, ACCT, "INBOX", 9, Some("m@x"), fp)
                 .unwrap()
-                .is_none()
+                .map(|s| s.uid)
+        };
+        assert_eq!(found(&content_fingerprint(&raw)), Some(Some(7)));
+        assert_eq!(found(&content_fingerprint(&ordinary("m@x"))), None);
+    }
+
+    #[test]
+    fn verdict_event_carries_the_fingerprint_beside_the_verdict() {
+        let db = Database::open_memory().unwrap();
+        let raw = phish("f@x");
+        let fp = content_fingerprint(&raw);
+        let (verdict, scanned) = scan_raw(&db, ACCT, EMAIL, &raw, &ThreatConfig::default());
+        assert_eq!(scanned.content_fingerprint.as_deref(), Some(fp.as_str()));
+        let target = |uid, content_fingerprint| VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid,
+            message_id: Some("f@x"),
+            content_fingerprint,
+            observed_message_ids: &[],
+        };
+        let payload = |uid| {
+            db.latest_event_for_uid(ACCT, THREAT_VERDICT, "INBOX", uid)
+                .unwrap()
+                .unwrap()
+                .payload
+                .unwrap()
+        };
+
+        record_verdict(&db, &target(3, Some(fp.as_str())), &verdict).unwrap();
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(stored.verdict, verdict);
+        // The payload is the verdict plus one sibling field, so a reader
+        // that knows only the verdict still parses it.
+        let mut expected = serde_json::to_value(&verdict).unwrap();
+        expected["content_fingerprint"] = json!(fp);
+        let stored_payload = payload(3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_str::<ThreatVerdict>(&stored_payload).unwrap(),
+            verdict
+        );
+
+        record_verdict(&db, &target(4, None), &verdict).unwrap();
+        let legacy = stored_verdict_for_uid(&db, ACCT, "INBOX", 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.content_fingerprint, None);
+        assert!(!payload(4).contains("content_fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn new_mail_pass_records_the_fingerprint_of_the_bytes_it_scanned() {
+        let db = Database::open_memory().unwrap();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(5, ordinary("n@x"));
+        let results = scan_new_mail(
+            &mut mbox,
+            &db,
+            &account(),
+            "INBOX",
+            &[5],
+            &ThreatConfig::default(),
+        )
+        .await;
+        results[0].1.as_ref().unwrap();
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.content_fingerprint,
+            Some(content_fingerprint(&ordinary("n@x")))
         );
     }
 
@@ -1128,23 +1825,40 @@ mod tests {
     #[test]
     fn attachment_gate_honours_malware_tag_bytes_and_mark_safe() {
         let db = Database::open_memory().unwrap();
+        let fp = Some("v1:a");
         // Untagged message, clean PDF bytes: allowed.
         assert!(
-            attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-                .unwrap()
-                .is_none()
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf",
+                "application/pdf",
+                b"%PDF"
+            )
+            .unwrap()
+            .is_none()
         );
         // Malware-grade bytes are refused even with no verdict on file.
-        let block = attachment_block(&db, ACCT, None, "r.pdf.exe", "application/pdf", b"MZ")
+        let block = attachment_block(&db, ACCT, None, None, "r.pdf.exe", "application/pdf", b"MZ")
             .unwrap()
             .unwrap();
         assert_eq!(block.code, ATTACHMENT_BLOCKED);
         // A threat:malware message refuses even innocent-looking bytes.
         db.add_tag(ACCT, "a@x", TAG_MALWARE, Some(3), Some("INBOX"))
             .unwrap();
-        let block = attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-            .unwrap()
-            .unwrap();
+        let block = attachment_block(
+            &db,
+            ACCT,
+            Some("a@x"),
+            fp,
+            "r.pdf",
+            "application/pdf",
+            b"%PDF",
+        )
+        .unwrap()
+        .unwrap();
         assert!(block.reason.contains("threat:malware"));
         // Marked safe: released.
         let target = VerdictTarget {
@@ -1152,18 +1866,57 @@ mod tests {
             folder: "INBOX",
             uid: 3,
             message_id: Some("a@x"),
+            content_fingerprint: Some("v1:a"),
+            observed_message_ids: &[],
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         assert!(
-            attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-                .unwrap()
-                .is_none()
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf",
+                "application/pdf",
+                b"%PDF"
+            )
+            .unwrap()
+            .is_none()
+        );
+        // The mark releases the content it was bound to, even bytes the gate
+        // would refuse; an over-cap download has no fingerprint and is never
+        // released by it.
+        assert!(
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf.exe",
+                "application/pdf",
+                b"MZ"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                None,
+                "r.pdf.exe",
+                "application/pdf",
+                b"MZ"
+            )
+            .unwrap()
+            .is_some()
         );
         assert_eq!(tags(&db, "a@x"), vec![TAG_FALSE_POSITIVE]);
         let label = db
-            .latest_event_for_message(ACCT, LABEL_APPLIED, "a@x")
+            .events_for_message(ACCT, LABEL_APPLIED, "a@x", 1)
             .unwrap()
-            .unwrap();
+            .remove(0);
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
     }
 
@@ -1173,13 +1926,13 @@ mod tests {
     fn attachment_gate_checks_the_name_written_to_disk() {
         let db = Database::open_memory().unwrap();
         for name in ["payload.js\u{1}", "payload.js\u{0}", "payload.js "] {
-            let block = attachment_block(&db, ACCT, None, name, "text/plain", b"alert(1)")
+            let block = attachment_block(&db, ACCT, None, None, name, "text/plain", b"alert(1)")
                 .unwrap()
                 .unwrap_or_else(|| panic!("{name:?} must be blocked"));
             assert_eq!(block.code, ATTACHMENT_BLOCKED);
         }
         assert!(
-            attachment_block(&db, ACCT, None, "notes.txt\u{1}", "text/plain", b"hi")
+            attachment_block(&db, ACCT, None, None, "notes.txt\u{1}", "text/plain", b"hi")
                 .unwrap()
                 .is_none()
         );
@@ -1210,6 +1963,398 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         assert!(blocked[0].1.reason.contains("threat:malware"));
     }
 
+    /// A clean message that reuses a malware message's Message-ID leaves the
+    /// original's attachments blocked: by its tag, and by its own verdict,
+    /// found by fingerprint, once a rescan has cleared the tag.
+    #[test]
+    fn clean_resend_does_not_unblock_original_malware_attachment() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = b"From: IT Desk <it@examp1e.org>\r\nTo: me@example.org\r\n\
+Message-ID: <orig@x>\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
+--b--\r\n";
+        let scanned = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(original),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(scanned.is_malware());
+        let resend = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&ordinary("orig@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resend.level, Level::Clean);
+        assert!(
+            tags(&db, "orig@x").contains(&TAG_MALWARE.to_string()),
+            "the resend is keyed by its own content and cannot clear the tag"
+        );
+        assert_eq!(
+            blocked_names(&db, original),
+            ["notes.pdf", "invoice.pdf.exe"]
+        );
+
+        // A rescan of the original that comes back unavailable clears its
+        // tags; its malware verdict on file still blocks.
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("orig@x"),
+                content_fingerprint: Some(&content_fingerprint(original)),
+                observed_message_ids: &[],
+            },
+            &ThreatVerdict::unavailable("clamd down"),
+        )
+        .unwrap();
+        assert!(!tags(&db, "orig@x").contains(&TAG_MALWARE.to_string()));
+        let blocked = blocked_attachments(&db, ACCT, original).unwrap();
+        let names: Vec<&str> = blocked.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["notes.pdf", "invoice.pdf.exe"]);
+        assert!(
+            blocked[0].1.reason.contains("verdict"),
+            "{}",
+            blocked[0].1.reason
+        );
+    }
+
+    /// A message with an innocent and a malware-grade attachment, from a
+    /// lookalike sender, with the given Message-ID header lines.
+    fn two_attachments(message_id_headers: &str) -> Vec<u8> {
+        format!(
+            "From: IT Desk <it@examp1e.org>\r\nTo: me@example.org\r\n{message_id_headers}\
+Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
+--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// The key threat data is stored under for a message without one usable
+    /// Message-ID.
+    fn fp_key(raw: &[u8]) -> String {
+        format!("fp:{}", content_fingerprint(raw))
+    }
+
+    fn blocked_names(db: &Database, raw: &[u8]) -> Vec<String> {
+        blocked_attachments(db, ACCT, raw)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The scanner and the attachment gate read the same identity, so a
+    /// second Message-ID header cannot split a verdict from its attachments.
+    #[test]
+    fn two_message_id_headers_block_the_attachments() {
+        let db = Database::open_memory().unwrap();
+        let dup = two_attachments("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n");
+        let verdict = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&dup),
+            &ThreatConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(verdict.is_malware());
+        assert_eq!(blocked_names(&db, &dup), ["notes.pdf", "invoice.pdf.exe"]);
+        assert_eq!(tags(&db, &fp_key(&dup)), [TAG_DANGEROUS, TAG_MALWARE]);
+        assert!(tags(&db, "first@x").is_empty() && tags(&db, "second@x").is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_message_id_is_quarantined_tagged_and_scored() {
+        let db = Database::open_memory().unwrap();
+        let header = |mid: &str| format!("Message-ID: <{mid}>\r\n");
+        let empty_first = String::from_utf8(phish("real@x"))
+            .unwrap()
+            .replace(&header("real@x"), "Message-ID:\r\nMessage-ID: <real@x>\r\n")
+            .into_bytes();
+        let empty_only = String::from_utf8(phish("gone@x"))
+            .unwrap()
+            .replace(&header("gone@x"), "Message-ID: \r\n")
+            .into_bytes();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(3, empty_first.clone());
+        mbox.raw.insert(4, empty_only.clone());
+        let results = scan_new_mail(
+            &mut mbox,
+            &db,
+            &account(),
+            "INBOX",
+            &[3, 4],
+            &ThreatConfig::default(),
+        )
+        .await;
+        for ((uid, result), raw) in results.iter().zip([&empty_first, &empty_only]) {
+            let entry = result.as_ref().unwrap();
+            assert_eq!(entry.level, Level::Dangerous, "UID {uid}");
+            assert_eq!(entry.quarantine, QuarantineOutcome::Tagged, "UID {uid}");
+            let key = fp_key(raw);
+            assert_eq!(
+                tags(&db, &key),
+                [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED],
+                "UID {uid}"
+            );
+            assert_eq!(
+                db.get_scores(ACCT, &key).unwrap()[0].value,
+                f64::from(entry.score),
+                "UID {uid}"
+            );
+        }
+        assert!(tags(&db, "real@x").is_empty());
+    }
+
+    #[test]
+    fn without_a_message_id_the_gate_checks_the_fingerprint_verdict() {
+        let db = Database::open_memory().unwrap();
+        let none = two_attachments("");
+        let fp = content_fingerprint(&none);
+        let clamd = super::super::combine(
+            vec![Signal::new("clamd_found", 100, "Eicar").malware()],
+            vec![],
+            vec![],
+            false,
+        );
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 4,
+                message_id: None,
+                content_fingerprint: Some(&fp),
+                observed_message_ids: &[],
+            },
+            &clamd,
+        )
+        .unwrap();
+        let block = attachment_block(
+            &db,
+            ACCT,
+            None,
+            Some(&fp),
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF-1.4",
+        )
+        .unwrap()
+        .expect("the clamd verdict on these bytes blocks every attachment");
+        assert!(block.reason.contains("malware"), "{}", block.reason);
+        assert_eq!(blocked_names(&db, &none), ["notes.pdf", "invoice.pdf.exe"]);
+    }
+
+    fn rule_context_for(db: &Database, uid: u32, mid: &str) -> MessageContext {
+        let summary = envelope_email_store::MessageSummary {
+            uid,
+            message_id: Some(format!("<{mid}>")),
+            from_addr: "it@examp1e.org".into(),
+            to_addr: EMAIL.into(),
+            subject: "s".into(),
+            date: None,
+            flags: vec![],
+            size: 0,
+            provider_spam: None,
+        };
+        crate::rule_exec::build_summary_context(&summary, "INBOX", db, ACCT).unwrap()
+    }
+
+    fn threat_tags(ctx: &MessageContext) -> Vec<&str> {
+        let mut tags: Vec<&str> = ctx
+            .tags
+            .iter()
+            .map(String::as_str)
+            .filter(|t| t.starts_with("threat:"))
+            .collect();
+        tags.sort_unstable();
+        tags
+    }
+
+    /// Twins share a Message-ID; each one's rule context carries its own
+    /// verdict, whichever was scanned first.
+    #[tokio::test]
+    async fn rules_see_each_twin_s_own_threat_data() {
+        for order in [[10, 11], [11, 10]] {
+            let db = Database::open_memory().unwrap();
+            let mut mbox = FakeMailbox::default();
+            mbox.raw.insert(10, phish("twin@x"));
+            mbox.raw.insert(11, ordinary("twin@x"));
+            let results = scan_new_mail(
+                &mut mbox,
+                &db,
+                &account(),
+                "INBOX",
+                &order,
+                &ThreatConfig::default(),
+            )
+            .await;
+            let score = |uid| {
+                results
+                    .iter()
+                    .find(|(u, _)| *u == uid)
+                    .map(|(_, r)| f64::from(r.as_ref().unwrap().score))
+                    .unwrap()
+            };
+
+            let bad = rule_context_for(&db, 10, "twin@x");
+            assert_eq!(
+                bad.scores.get(THREAT_DIMENSION),
+                Some(&score(10)),
+                "{order:?}"
+            );
+            assert_eq!(
+                threat_tags(&bad),
+                [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED],
+                "{order:?}"
+            );
+            let clean = rule_context_for(&db, 11, "twin@x");
+            assert_eq!(
+                clean.scores.get(THREAT_DIMENSION),
+                Some(&score(11)),
+                "{order:?}"
+            );
+            assert!(
+                threat_tags(&clean).is_empty(),
+                "{order:?}: {:?}",
+                clean.tags
+            );
+        }
+    }
+
+    /// Mark safe on one twin never lowers the other's threat data: rules,
+    /// `threat show` tags and the attachment gate still see it as flagged.
+    #[tokio::test]
+    async fn mark_safe_on_one_twin_leaves_the_other_flagged() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let a = ordinary("q@x");
+        let a_fp = content_fingerprint(&a);
+        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&a), &config).unwrap();
+        let b = two_attachments("Message-ID: <q@x>\r\n");
+        let b_fp = content_fingerprint(&b);
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, b.clone());
+        let results = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+        let b_entry = results[0].1.as_ref().unwrap();
+        assert_eq!(b_entry.quarantine, QuarantineOutcome::Tagged);
+
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("q@x"),
+                content_fingerprint: Some(&a_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+
+        let ctx = rule_context_for(&db, 2, "q@x");
+        assert_eq!(
+            ctx.scores.get(THREAT_DIMENSION),
+            Some(&f64::from(b_entry.score))
+        );
+        assert_eq!(
+            threat_tags(&ctx),
+            [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED]
+        );
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.message_id.as_deref(), Some("q@x"));
+        assert_eq!(
+            stored.key,
+            Some(fp_key(&b)),
+            "the reuse is keyed by content"
+        );
+        assert_eq!(
+            tags(&db, stored.key.as_deref().unwrap()),
+            [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED]
+        );
+        assert_eq!(blocked_names(&db, &b), ["notes.pdf", "invoice.pdf.exe"]);
+        assert!(!is_marked_safe(&db, ACCT, stored.key.as_deref().unwrap(), Some(&b_fp)).unwrap());
+
+        let a_ctx = rule_context_for(&db, 1, "q@x");
+        assert_eq!(threat_tags(&a_ctx), [TAG_FALSE_POSITIVE]);
+        assert_eq!(a_ctx.scores.get(THREAT_DIMENSION), Some(&0.0));
+    }
+
+    /// The gate reads a bounded window of a message's verdicts. When the
+    /// window is full and holds no malware verdict for these bytes, it cannot
+    /// rule one out (here, clean rescans of the same content pushed it out),
+    /// so it refuses.
+    #[test]
+    fn attachment_gate_fails_closed_past_the_verdict_history_it_reads() {
+        let db = Database::open_memory().unwrap();
+        let malware = super::super::combine(
+            vec![Signal::new("clamd_found", 100, "Eicar").malware()],
+            vec![],
+            vec![],
+            false,
+        );
+        let clean = super::super::combine(vec![], vec![], vec![], false);
+        let target = |uid| VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid,
+            message_id: Some("long@x"),
+            content_fingerprint: Some("v1:orig"),
+            observed_message_ids: &[],
+        };
+        record_verdict_event(&db, &target(1), Some("long@x"), &malware).unwrap();
+        let gate = || {
+            attachment_block(
+                &db,
+                ACCT,
+                Some("long@x"),
+                Some("v1:orig"),
+                "r.pdf",
+                "application/pdf",
+                b"%PDF",
+            )
+            .unwrap()
+        };
+        assert!(gate().unwrap().reason.contains("verdict"));
+        for uid in 2..=FINGERPRINT_SEARCH_LIMIT as u32 + 1 {
+            record_verdict_event(&db, &target(uid), Some("long@x"), &clean).unwrap();
+        }
+        let block = gate().expect("refused when the history is longer than the window");
+        assert!(
+            block.reason.contains("more stored verdicts"),
+            "{}",
+            block.reason
+        );
+    }
+
     /// A part-by-part read of an over-cap message passes no raw bytes: there
     /// is nothing complete to scan, so the stored verdict (if any) is returned
     /// and nothing is recorded.
@@ -1218,13 +2363,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let db = Database::open_memory().unwrap();
         let config = ThreatConfig::default();
         assert!(config.enabled && config.on_read);
+        let big = Opened::Parts {
+            message_id: Some("big@x"),
+        };
         assert!(
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config)
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, big, &config)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            latest_verdict(&db, ACCT, None, "INBOX", 2379)
+            stored_verdict_for_uid(&db, ACCT, "INBOX", 2379)
                 .unwrap()
                 .is_none(),
             "a partial read must not record a verdict"
@@ -1235,23 +2383,784 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 2379,
             message_id: Some("big@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let stored = ThreatVerdict::unavailable("clamd down");
         record_verdict(&db, &target, &stored).unwrap();
         assert_eq!(
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config).unwrap(),
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, big, &config).unwrap(),
             Some(stored)
         );
+    }
+
+    /// An over-cap message at a reused UID: the verdict there is for the
+    /// message that held it before, so the reader shows none.
+    #[test]
+    fn open_without_raw_bytes_shows_no_verdict_left_by_another_message() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let old = b"Message-ID: <old@x>\r\nFrom: a@example.test\r\nTo: me@example.org\r\n\
+Subject: s\r\n\r\nhi\r\n";
+        let scanned = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 7, Opened::Whole(old), &config)
+            .unwrap()
+            .unwrap();
+        let open = |message_id| {
+            let parts = Opened::Parts { message_id };
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 7, parts, &config).unwrap()
+        };
+
+        assert_eq!(open(Some("big@x")), None);
+        assert_eq!(open(None), None);
+        assert_eq!(open(Some("<old@x>")), Some(scanned));
+    }
+
+    /// A verdict stored before fingerprints is shown, and rescanned when the
+    /// message is opened with the engine on.
+    #[test]
+    fn legacy_verdict_is_rescanned_on_open() {
+        let db = Database::open_memory().unwrap();
+        let raw = phish("legacy@x");
+        let clean = super::super::combine(vec![], vec!["sender".into()], vec![], false);
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 4,
+                message_id: Some("legacy@x"),
+                content_fingerprint: None,
+                observed_message_ids: &[],
+            },
+            &clean,
+        )
+        .unwrap();
+        let off = ThreatConfig {
+            on_read: false,
+            ..ThreatConfig::default()
+        };
+        assert_eq!(
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Opened::Whole(&raw), &off).unwrap(),
+            Some(clean)
+        );
+
+        let config = ThreatConfig::default();
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Opened::Whole(&raw), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.level, Level::Dangerous);
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.verdict, opened);
+        assert_eq!(stored.content_fingerprint, Some(content_fingerprint(&raw)));
+    }
+
+    /// A second message reusing a scanned Message-ID is scanned on open, and
+    /// the first keeps its own verdict.
+    #[test]
+    fn open_same_message_id_different_bytes_scans() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let first = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&ordinary("dup@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.level, Level::Clean);
+
+        let second = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&phish("dup@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.level, Level::Dangerous);
+        assert!(second.is_malware());
+        assert_eq!(
+            tags(&db, &fp_key(&phish("dup@x"))),
+            vec![TAG_DANGEROUS, TAG_MALWARE],
+            "the second message is tagged as itself"
+        );
+        assert!(
+            tags(&db, "dup@x").is_empty(),
+            "the first keeps its own tags"
+        );
+
+        let again = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&ordinary("dup@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(again, first);
+    }
+
+    /// The same bytes under a new folder/UID (moved, or copied back) reuse the
+    /// verdict and its Mark safe without a rescan, and the verdict is recorded
+    /// under the new UID too.
+    #[test]
+    fn moved_copy_reuses_verdict_and_mark_safe_without_rescan() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let raw = phish("mv@x");
+        let fp = content_fingerprint(&raw);
+        let verdict = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&raw), &config)
+            .unwrap()
+            .unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("mv@x"),
+                content_fingerprint: Some(&fp),
+                observed_message_ids: &[],
+            },
+            "cli",
+            None,
+        )
+        .unwrap();
+
+        let moved = verdict_on_open(&db, ACCT, EMAIL, "Archive", 9, Opened::Whole(&raw), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved, verdict,
+            "computed_at included: nothing was rescanned"
+        );
+        let copy = stored_verdict_for_uid(&db, ACCT, "Archive", 9)
+            .unwrap()
+            .expect("the reused verdict is recorded under the new UID");
+        assert_eq!(copy.verdict, verdict);
+        assert_eq!(copy.message_id.as_deref(), Some("mv@x"));
+        assert_eq!(copy.content_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(
+            db.events_for_message(ACCT, THREAT_VERDICT, "mv@x", 10)
+                .unwrap()
+                .len(),
+            2,
+            "one scan and one copy"
+        );
+        assert_eq!(tags(&db, "mv@x"), vec![TAG_FALSE_POSITIVE]);
+        assert_eq!(db.get_scores(ACCT, "mv@x").unwrap()[0].value, 0.0);
+        assert!(is_marked_safe(&db, ACCT, "mv@x", Some(&fp)).unwrap());
+    }
+
+    /// Mark safe binds to the bytes that were marked. A later message that
+    /// reuses the Message-ID is scanned, scored, tagged and quarantined as
+    /// itself.
+    #[tokio::test]
+    async fn resend_of_marked_safe_message_id_with_different_content_is_scanned_and_not_released() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        assert_eq!(config.quarantine, Quarantine::Tag);
+        let original = ordinary("reuse@x");
+        let original_fp = content_fingerprint(&original);
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("reuse@x"),
+                content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+
+        let resend = phish("reuse@x");
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, resend.clone());
+        let results = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+        let entry = results[0].1.as_ref().unwrap();
+        assert_eq!(entry.level, Level::Dangerous);
+        assert_eq!(entry.quarantine, QuarantineOutcome::Tagged);
+        // The resend is scored and tagged as itself, under its own key; the
+        // marked original keeps score 0 and its mark.
+        let resend_key = fp_key(&resend);
+        assert_eq!(
+            db.get_scores(ACCT, &resend_key).unwrap()[0].value,
+            f64::from(entry.score)
+        );
+        assert_eq!(
+            tags(&db, &resend_key),
+            vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED]
+        );
+        assert_eq!(db.get_scores(ACCT, "reuse@x").unwrap()[0].value, 0.0);
+        assert_eq!(tags(&db, "reuse@x"), vec![TAG_FALSE_POSITIVE]);
+        let opened = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&resend),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(opened.level, Level::Dangerous);
+        let resend_fp = content_fingerprint(&resend);
+        assert!(!is_marked_safe(&db, ACCT, "reuse@x", Some(&resend_fp)).unwrap());
+        assert!(!is_marked_safe(&db, ACCT, &resend_key, Some(&resend_fp)).unwrap());
+        assert!(is_marked_safe(&db, ACCT, "reuse@x", Some(&original_fp)).unwrap());
+        let gate = |fp: &str| {
+            attachment_block(
+                &db,
+                ACCT,
+                Some("reuse@x"),
+                Some(fp),
+                "notes.pdf",
+                "application/pdf",
+                b"%PDF",
+            )
+            .unwrap()
+        };
+        assert!(
+            gate(&resend_fp).is_some(),
+            "the resend's attachments stay blocked"
+        );
+        assert!(
+            gate(&original_fp).is_none(),
+            "the marked original's are released"
+        );
+    }
+
+    /// A resend with the marked message's header fields and body, plus text
+    /// after a form-feed-only line that the reader shows as body, is a
+    /// different message: scanned, scored and gated as itself.
+    #[tokio::test]
+    async fn resend_of_marked_safe_content_with_text_after_a_form_feed_line_is_not_released() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = ordinary("ff@x");
+        let original_fp = content_fingerprint(&original);
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("ff@x"),
+                content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+
+        let resend = String::from_utf8(original.clone())
+            .unwrap()
+            .replace(
+                "Subject: Lunch\r\n\r\n",
+                "Subject: Lunch\r\n\x0c\r\nVerify your mailbox at http://examp1e.org/login\r\n\r\n",
+            )
+            .into_bytes();
+        let shown = ThreatInput::from_raw(&resend, EMAIL).unwrap().text.unwrap();
+        assert!(shown.contains("examp1e.org"), "{shown:?}");
+
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, resend.clone());
+        let results = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+        let entry = results[0].1.as_ref().unwrap();
+        assert!(entry.score > 0, "{entry:?}");
+        let resend_fp = content_fingerprint(&resend);
+        let resend_key = fp_key(&resend);
+        assert!(!is_marked_safe(&db, ACCT, "ff@x", Some(&resend_fp)).unwrap());
+        assert!(!is_marked_safe(&db, ACCT, &resend_key, Some(&resend_fp)).unwrap());
+        assert_eq!(
+            db.get_scores(ACCT, &resend_key).unwrap()[0].value,
+            f64::from(entry.score)
+        );
+        assert!(!tags(&db, &resend_key).contains(&TAG_FALSE_POSITIVE.to_string()));
+        assert!(is_marked_safe(&db, ACCT, "ff@x", Some(&original_fp)).unwrap());
+
+        // Opened elsewhere, the resend is scanned rather than given the
+        // marked original's verdict.
+        let opened = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "Archive",
+            3,
+            Opened::Whole(&resend),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(opened.score, entry.score);
+    }
+
+    /// A Subject line only the raw header reader files as Subject changes the
+    /// fingerprint, so a message carrying one never reuses the verdict of the
+    /// message without it.
+    #[test]
+    fn a_subject_line_only_the_raw_reader_files_never_reuses_a_verdict() {
+        let config = ThreatConfig::default();
+        let original = ordinary("s@x");
+        for (uid, prefix) in [(2, "\u{a0}"), (3, "\u{2003}"), (4, "\x0b")] {
+            let db = Database::open_memory().unwrap();
+            verdict_on_open(
+                &db,
+                ACCT,
+                EMAIL,
+                "INBOX",
+                1,
+                Opened::Whole(&original),
+                &config,
+            )
+            .unwrap();
+            let twin = String::from_utf8(original.clone())
+                .unwrap()
+                .replacen(
+                    "Subject: Lunch",
+                    &format!(
+                        "{prefix}Subject: urgent verify your account immediately\r\nSubject: Lunch"
+                    ),
+                    1,
+                )
+                .into_bytes();
+            let twin_fp = content_fingerprint(&twin);
+            assert_ne!(twin_fp, content_fingerprint(&original), "{prefix:?}");
+            assert!(
+                matching_verdict(&db, ACCT, "INBOX", uid, Some("s@x"), &twin_fp)
+                    .unwrap()
+                    .is_none(),
+                "{prefix:?}"
+            );
+            verdict_on_open(
+                &db,
+                ACCT,
+                EMAIL,
+                "INBOX",
+                uid,
+                Opened::Whole(&twin),
+                &config,
+            )
+            .unwrap();
+            let own = stored_verdict_for_uid(&db, ACCT, "INBOX", uid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(own.content_fingerprint.as_deref(), Some(twin_fp.as_str()));
+        }
+    }
+
+    /// A verdict stored without a content fingerprint judged no known bytes:
+    /// it is shown when nothing scans, but never reused or marked safe.
+    #[test]
+    fn a_verdict_without_a_fingerprint_is_shown_but_never_reused_or_marked() {
+        let db = Database::open_memory().unwrap();
+        let raw = ordinary("u@x");
+        let fp = content_fingerprint(&raw);
+        let unbound = VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid: 1,
+            message_id: Some("u@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
+        };
+        let clean = crate::threat::combine(vec![], vec![], vec![], false);
+        record_verdict(&db, &unbound, &clean).unwrap();
+        assert!(
+            matching_verdict(&db, ACCT, "INBOX", 1, Some("u@x"), &fp)
+                .unwrap()
+                .is_none()
+        );
+
+        let off = ThreatConfig {
+            enabled: false,
+            ..ThreatConfig::default()
+        };
+        let shown =
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&raw), &off).unwrap();
+        assert_eq!(shown, Some(clean));
+
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&raw),
+            &ThreatConfig::default(),
+        )
+        .unwrap();
+        let own = stored_verdict_for_uid(&db, ACCT, "INBOX", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.content_fingerprint.as_deref(), Some(fp.as_str()));
+    }
+
+    /// A Message-ID spelling another message's fingerprint key is unusable,
+    /// so that message's threat data never lands under the other's key.
+    #[tokio::test]
+    async fn message_id_spelling_a_fingerprint_key_does_not_share_that_key() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let victim = String::from_utf8(ordinary("v@x"))
+            .unwrap()
+            .replace("Message-ID: <v@x>\r\n", "")
+            .into_bytes();
+        let victim_key = fp_key(&victim);
+        let forged = phish(&victim_key);
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(1, forged.clone());
+        mbox.raw.insert(2, victim.clone());
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[1, 2], &config).await;
+
+        assert!(
+            !tags(&db, &victim_key).contains(&TAG_MALWARE.to_string()),
+            "{:?}",
+            tags(&db, &victim_key)
+        );
+        assert_eq!(
+            tags(&db, &fp_key(&forged)),
+            vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED]
+        );
+        let victim_fp = content_fingerprint(&victim);
+        let gate = attachment_block(
+            &db,
+            ACCT,
+            None,
+            Some(&victim_fp),
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF",
+        )
+        .unwrap();
+        assert!(gate.is_none(), "{gate:?}");
+    }
+
+    /// The verdict stored at a folder/UID gives threat data only to the
+    /// message it judged: after a UIDVALIDITY reset, another message at that
+    /// UID shows none.
+    #[tokio::test]
+    async fn bound_threat_ignores_a_verdict_for_another_message_at_the_uid() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let before = phish("before@x");
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(5, before.clone());
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[5], &config).await;
+        let tag_names = |seen: Seen<'_>| -> Vec<String> {
+            let mut names: Vec<String> = bound_threat(&db, ACCT, "INBOX", 5, seen)
+                .unwrap()
+                .tags
+                .into_iter()
+                .map(|t| t.tag)
+                .collect();
+            names.sort();
+            names
+        };
+        let before_fp = content_fingerprint(&before);
+        let flagged = vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED];
+        assert_eq!(tag_names(Seen::Bytes(Some(&before_fp))), flagged);
+        assert_eq!(tag_names(Seen::MessageId(Some("before@x"))), flagged);
+
+        let after = ordinary("after@x");
+        let after_fp = content_fingerprint(&after);
+        for seen in [
+            Seen::Bytes(Some(&after_fp)),
+            Seen::Bytes(None),
+            Seen::MessageId(Some("after@x")),
+            Seen::MessageId(None),
+        ] {
+            let bound = bound_threat(&db, ACCT, "INBOX", 5, seen).unwrap();
+            assert!(bound.tags.is_empty(), "{seen:?}: {:?}", bound.tags);
+            assert!(bound.score.is_none(), "{seen:?}");
+        }
+        let (tags, _) =
+            shown_tags_and_scores(&db, ACCT, "INBOX", 5, "after@x", Some(&after)).unwrap();
+        assert!(tags.is_empty(), "{tags:?}");
+    }
+
+    /// A tag view shows the message's own threat data: a twin of a marked
+    /// message never shows the mark, and a UID without a verdict shows none.
+    #[tokio::test]
+    async fn tag_view_of_a_twin_does_not_show_the_marked_original_s_threat_tags() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = ordinary("twin@x");
+        let original_fp = content_fingerprint(&original);
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("twin@x"),
+                content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+        db.add_tag(ACCT, "twin@x", "work", Some(1), Some("INBOX"))
+            .unwrap();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, phish("twin@x"));
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+
+        let shown = |uid: u32| {
+            let (tags, scores) =
+                shown_tags_and_scores(&db, ACCT, "INBOX", uid, "twin@x", None).unwrap();
+            let mut tags: Vec<String> = tags.into_iter().map(|t| t.tag).collect();
+            tags.sort();
+            let threat: Vec<f64> = scores
+                .iter()
+                .filter(|s| s.dimension == THREAT_DIMENSION)
+                .map(|s| s.value)
+                .collect();
+            (tags, threat)
+        };
+        let (twin_tags, twin_threat) = shown(2);
+        assert_eq!(
+            twin_tags,
+            vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED, "work"]
+        );
+        assert_eq!(twin_threat.len(), 1);
+        assert!(twin_threat[0] > 0.0, "{twin_threat:?}");
+        assert_eq!(
+            shown(1),
+            (
+                vec![TAG_FALSE_POSITIVE.to_string(), "work".to_string()],
+                vec![0.0]
+            )
+        );
+        assert_eq!(shown(9), (vec!["work".to_string()], vec![]));
+    }
+
+    /// Mark safe as stored before fingerprints: the tag and a `label_applied`
+    /// event without one.
+    fn legacy_mark(db: &Database, mid: &str, folder: &str, uid: u32) {
+        db.add_tag(
+            ACCT,
+            mid,
+            TAG_FALSE_POSITIVE,
+            Some(i64::from(uid)),
+            Some(folder),
+        )
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_event(&Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id: ACCT.to_string(),
+            event_type: LABEL_APPLIED.to_string(),
+            folder: folder.to_string(),
+            uid: Some(i64::from(uid)),
+            message_id: Some(mid.to_string()),
+            from_addr: None,
+            subject: None,
+            snippet: None,
+            payload: Some(json!({"label": TAG_FALSE_POSITIVE, "source": "cli"}).to_string()),
+            idempotency_key: None,
+            secure_pending: false,
+            acked_at: Some(now.clone()),
+            created_at: now,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_mark_safe_is_not_honoured() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        legacy_mark(&db, "old@x", "INBOX", 1);
+        let raw = phish("old@x");
+
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 5, Opened::Whole(&raw), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.level, Level::Dangerous);
+        assert_eq!(
+            db.get_scores(ACCT, "old@x").unwrap()[0].value,
+            f64::from(opened.score)
+        );
+        assert_eq!(
+            tags(&db, "old@x"),
+            vec![TAG_DANGEROUS, TAG_FALSE_POSITIVE, TAG_MALWARE]
+        );
+        assert!(!is_marked_safe(&db, ACCT, "old@x", Some(&content_fingerprint(&raw))).unwrap());
+
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(6, raw.clone());
+        let results = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[6], &config).await;
+        assert_eq!(
+            results[0].1.as_ref().unwrap().quarantine,
+            QuarantineOutcome::Tagged
+        );
+
+        let unbound = VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid: 5,
+            message_id: Some("old@x"),
+            content_fingerprint: None,
+            observed_message_ids: &[],
+        };
+        let err = mark_safe(&db, &unbound, "cli", None).unwrap_err();
+        assert!(format!("{err:#}").contains(RESCAN_REQUIRED), "{err:#}");
+        assert!(tags(&db, "old@x").contains(&TAG_QUARANTINED.to_string()));
+    }
+
+    /// The one legacy mark that still applies: opening the message at the
+    /// folder/UID it was made on binds it to the bytes there.
+    #[test]
+    fn legacy_mark_safe_at_the_same_slot_is_rebound_on_open() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        legacy_mark(&db, "slot@x", "INBOX", 3);
+        let raw = phish("slot@x");
+        let fp = content_fingerprint(&raw);
+
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 3, Opened::Whole(&raw), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.level, Level::Dangerous, "the engine's view is kept");
+        assert!(is_marked_safe(&db, ACCT, "slot@x", Some(&fp)).unwrap());
+        assert_eq!(tags(&db, "slot@x"), vec![TAG_FALSE_POSITIVE]);
+        assert_eq!(db.get_scores(ACCT, "slot@x").unwrap()[0].value, 0.0);
+        let other = content_fingerprint(&ordinary("slot@x"));
+        assert!(!is_marked_safe(&db, ACCT, "slot@x", Some(&other)).unwrap());
+    }
+
+    /// A message scanned and marked safe before fingerprints, at the slot it
+    /// is opened from: the mark carries over to its content, wherever its
+    /// threat data is now keyed.
+    #[test]
+    fn legacy_verdict_and_mark_at_the_same_slot_are_rebound_on_open() {
+        let db = Database::open_memory().unwrap();
+        let raw = phish("both@x");
+        let (legacy, _) = scan_raw(&db, ACCT, EMAIL, &raw, &ThreatConfig::default());
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 3,
+                message_id: Some("both@x"),
+                content_fingerprint: None,
+                observed_message_ids: &[],
+            },
+            &legacy,
+        )
+        .unwrap();
+        legacy_mark(&db, "both@x", "INBOX", 3);
+
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            3,
+            Opened::Whole(&raw),
+            &ThreatConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 3)
+            .unwrap()
+            .unwrap();
+        let key = stored.key.as_deref().unwrap();
+        let fp = content_fingerprint(&raw);
+        assert!(is_marked_safe(&db, ACCT, key, Some(&fp)).unwrap());
+        assert_eq!(tags(&db, key), vec![TAG_FALSE_POSITIVE]);
+        assert_eq!(db.get_scores(ACCT, key).unwrap()[0].value, 0.0);
+        assert!(
+            blocked_names(&db, &raw).is_empty(),
+            "released by the rebound mark"
+        );
+    }
+
+    /// A malware tag stored before fingerprints keeps blocking the message's
+    /// attachments after the upgrade, before it is rescanned.
+    #[test]
+    fn legacy_malware_tag_blocks_until_the_message_is_rescanned() {
+        let db = Database::open_memory().unwrap();
+        let raw = two_attachments("Message-ID: <old@x>\r\n");
+        let (legacy, _) = scan_raw(&db, ACCT, EMAIL, &raw, &ThreatConfig::default());
+        assert!(legacy.is_malware());
+        record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("old@x"),
+                content_fingerprint: None,
+                observed_message_ids: &[],
+            },
+            &legacy,
+        )
+        .unwrap();
+        assert_eq!(blocked_names(&db, &raw), ["notes.pdf", "invoice.pdf.exe"]);
     }
 
     #[test]
     fn marked_safe_message_rescans_to_score_zero_without_tags() {
         let db = Database::open_memory().unwrap();
+        let fp = content_fingerprint(&phish("s@x"));
         let target = VerdictTarget {
             account_id: ACCT,
             folder: "INBOX",
             uid: 1,
             message_id: Some("s@x"),
+            content_fingerprint: Some(&fp),
+            observed_message_ids: &[],
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("s@x"), &ThreatConfig::default());
@@ -1361,6 +3270,8 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 1,
             message_id: Some(mid),
+            content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("a@x"), &ThreatConfig::default());
         let (good, _) = scan_raw(&db, ACCT, EMAIL, &ordinary("b@x"), &ThreatConfig::default());
@@ -1458,6 +3369,8 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 9,
             message_id: scanned.message_id.as_deref(),
+            content_fingerprint: None,
+            observed_message_ids: &[],
         };
         record_verdict(&db, &target, &verdict).unwrap();
         record_lookups(&db, &target, &scanned.lookups).unwrap();

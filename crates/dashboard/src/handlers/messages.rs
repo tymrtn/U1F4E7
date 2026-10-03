@@ -1084,7 +1084,10 @@ pub async fn read(
                                 &creds.account.username,
                                 &q.folder,
                                 uid,
-                                raw.as_deref(),
+                                envelope_email_transport::threat::persist::Opened::new(
+                                    raw.as_deref(),
+                                    msg.message_id.as_deref(),
+                                ),
                                 &config,
                             )
                         },
@@ -1132,7 +1135,9 @@ pub async fn read(
 /// Attachments the download route would refuse, so the reader can show them
 /// as blocked with the reason instead of a link that fails. Asks the same gate
 /// as the download chokepoint. Without whole-message bytes (a message read
-/// part by part) it gates on the metadata alone. If the gate itself fails,
+/// part by part) it gates on the metadata alone, under the parsed Message-ID;
+/// for a message with more than one, that can show an attachment blocked that
+/// the download gate would allow, never the reverse. If the gate itself fails,
 /// every attachment is reported blocked with that error: the download route
 /// would refuse them too.
 fn attachment_blocks_view(
@@ -1152,6 +1157,7 @@ fn attachment_blocks_view(
                     db,
                     account_id,
                     msg.message_id.as_deref(),
+                    None,
                     &a.filename,
                     &a.content_type,
                     &[],

@@ -35,6 +35,7 @@ pub mod sender;
 
 use mail_parser::MimeHeaders;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub use config::{Quarantine, ReputationProvider, ThreatConfig};
 pub use envelope_email_store::correspondents::CorrespondentFacts;
@@ -180,8 +181,15 @@ pub struct AttachmentInput {
 /// Everything the analyzers look at, built once per message.
 #[derive(Debug, Clone)]
 pub struct ThreatInput {
-    /// Header fields in wire order (top first), unfolded.
+    /// Header fields in wire order (top first), unfolded, as
+    /// [`parse_header_block`] reads them. Analyzers read only the fields the
+    /// receiving server adds (`Received`, `Authentication-Results`) from it;
+    /// those are outside the content fingerprint by design. Everything else
+    /// an analyzer reads comes from mail_parser, whose reading the
+    /// fingerprint covers.
     pub headers: Vec<(String, String)>,
+    /// Every Subject field mail_parser reads, decoded, in wire order.
+    pub subjects: Vec<String>,
     /// Lowercased From address.
     pub from_addr: String,
     pub from_display: Option<String>,
@@ -252,8 +260,18 @@ impl ThreatInput {
             })
             .collect();
 
+        let subjects = parsed
+            .root_part()
+            .headers
+            .iter()
+            .filter(|h| h.name == mail_parser::HeaderName::Subject)
+            .filter_map(|h| h.value.as_text())
+            .map(str::to_string)
+            .collect();
+
         Ok(ThreatInput {
             headers,
+            subjects,
             from_addr,
             from_display,
             reply_to,
@@ -306,6 +324,127 @@ pub fn parse_header_block(raw: &[u8]) -> Vec<(String, String)> {
         }
     }
     headers
+}
+
+/// Header fields a content fingerprint covers besides every `Content-*` field:
+/// the ones the sender writes. Fields a receiving server adds (`Received`,
+/// `Authentication-Results`, `Delivered-To`, spam scores) are left out, so a
+/// message keeps its fingerprint in every folder it is delivered or moved to.
+const FINGERPRINT_HEADERS: &[&str] = &[
+    "from",
+    "sender",
+    "reply-to",
+    "to",
+    "cc",
+    "subject",
+    "date",
+    "message-id",
+    "mime-version",
+    "list-unsubscribe",
+    "list-unsubscribe-post",
+];
+
+/// The identity of a message's content: `v2:` and the SHA-256 of its
+/// fingerprinted header fields (every occurrence, in wire order, as sent) and
+/// its raw body. The header/body split and the header fields are
+/// mail_parser's, the parser that renders and scans the message, so bytes it
+/// reads as body are never skipped as header lines. Stored verdicts and Mark
+/// safe apply only to a message with the same fingerprint.
+///
+/// `None` when mail_parser gives no root part or its offsets do not fit the
+/// bytes: such a message reuses no verdict and cannot be marked safe.
+pub fn content_fingerprint(raw: &[u8]) -> Option<String> {
+    let parsed = mail_parser::MessageParser::default().parse(raw)?;
+    let root = parsed.parts.first()?;
+    let (header_start, body_start) = (root.raw_header_offset(), root.raw_body_offset());
+    if header_start > body_start || body_start > raw.len() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    // Length-prefixed, so two different messages never hash the same bytes.
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    for header in &root.headers {
+        let (start, end) = (header.offset_field, header.offset_end);
+        if start < header_start || start > end || end > body_start {
+            return None;
+        }
+        if fingerprinted(header.name.as_str()) {
+            part(&raw[start..end]);
+        }
+    }
+    part(&raw[body_start..]);
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(format!("v2:{hex}"))
+}
+
+/// `Content-*` fields change how the body is read, a top-level
+/// `Content-Disposition` included, so all of them are fingerprinted. Names
+/// are trimmed as [`parse_header_block`] trims them, so a field either
+/// reader files under a fingerprinted name is fingerprinted.
+fn fingerprinted(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name.starts_with("content-") || FINGERPRINT_HEADERS.contains(&name.as_str())
+}
+
+/// Threat data for a message without one usable Message-ID is keyed by this
+/// prefix and the message's content fingerprint.
+pub const FINGERPRINT_KEY_PREFIX: &str = "fp:";
+
+/// The message's identity as every threat path reads it (scanner, attachment
+/// gate, quarantine, views): the canonical Message-ID when the header block
+/// has exactly one Message-ID field holding one non-empty id. `None` when it
+/// has none, several, or an empty, malformed or `fp:`-prefixed one; that
+/// message's threat data is keyed by its fingerprint instead.
+pub fn sole_message_id(raw: &[u8]) -> Option<String> {
+    sole_message_id_in(&parse_header_block(raw))
+}
+
+/// [`sole_message_id`] over already parsed header fields.
+pub(crate) fn sole_message_id_in(headers: &[(String, String)]) -> Option<String> {
+    let [id] = message_id_values_in(headers).try_into().ok()?;
+    usable(&id).then_some(id)
+}
+
+/// A Message-ID value as threat data and tags may be keyed by it: its
+/// canonical id, unless that is empty, malformed or `fp:`-prefixed. Every
+/// tag write keyed by a Message-ID goes through this, so the `fp:` key space
+/// stays the content fingerprint's.
+pub fn usable_message_id(value: &str) -> Option<&str> {
+    let id = envelope_email_store::canonical_message_id(value);
+    usable(id).then_some(id)
+}
+
+/// Whether a canonical Message-ID is one non-empty, well-formed id outside
+/// the `fp:` key space.
+fn usable(id: &str) -> bool {
+    let one_id =
+        !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>');
+    let fingerprint_shaped = id
+        .get(..FINGERPRINT_KEY_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(FINGERPRINT_KEY_PREFIX));
+    one_id && !fingerprint_shaped
+}
+
+/// The canonical value of every Message-ID field, in wire order, empty ones
+/// included: what a server may report as the message's Message-ID.
+pub(crate) fn message_id_values_in(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("message-id"))
+        .map(|(_, value)| envelope_email_store::canonical_message_id(value).to_string())
+        .collect()
+}
+
+/// [`message_id_values_in`] of a raw message.
+pub fn message_id_values(raw: &[u8]) -> Vec<String> {
+    message_id_values_in(&parse_header_block(raw))
 }
 
 /// Every word that follows `by` in a `Received` header, in order. A sender's
@@ -697,6 +836,59 @@ mod tests {
         assert_eq!(received_by_hosts(&headers[0].1), vec!["mx.example.org"]);
     }
 
+    const LUNCH: &str = "From: Alice <alice@partner.example>\r\n\
+                         To: me@example.org\r\n\
+                         Subject: Lunch\r\n\
+                         Date: Mon, 21 Sep 2026 10:00:00 +0000\r\n\
+                         Message-ID: <m1@partner.example>\r\n\
+                         MIME-Version: 1.0\r\n\
+                         Content-Type: multipart/mixed; boundary=b\r\n\
+                         \r\n\
+                         --b\r\nContent-Type: text/plain\r\n\r\nThursday?\r\n--b--\r\n";
+
+    #[test]
+    fn fingerprint_ignores_receiver_headers() {
+        let fp = content_fingerprint(LUNCH.as_bytes());
+        let hex = fp.as_deref().unwrap();
+        assert!(hex.starts_with("v2:"), "{hex}");
+        assert_eq!(hex.len(), 3 + 64, "{hex}");
+
+        let delivered = format!(
+            "Return-Path: <alice@partner.example>\r\n\
+             Delivered-To: me@example.org\r\n\
+             Received: from mail.partner.example by mx1.example.org with ESMTPS; \
+             Mon, 21 Sep 2026 10:00:01 +0000\r\n\
+             Authentication-Results: mx1.example.org; spf=pass; dkim=pass; dmarc=pass\r\n\
+             X-Spam-Status: No, score=-0.1\r\n{LUNCH}"
+        );
+        assert_eq!(content_fingerprint(delivered.as_bytes()), fp);
+        let interleaved =
+            LUNCH.replacen("Subject:", "X-Original-To: me@example.org\r\nSubject:", 1);
+        assert_eq!(content_fingerprint(interleaved.as_bytes()), fp);
+    }
+
+    #[test]
+    fn fingerprint_changes_with_body_attachment_or_second_from() {
+        let fp = content_fingerprint(LUNCH.as_bytes());
+        assert!(fp.is_some());
+        let body = LUNCH.replace("Thursday?", "Friday?");
+        let attachment = LUNCH.replace(
+            "--b--\r\n",
+            "--b\r\nContent-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n",
+        );
+        let second_from = LUNCH.replacen("To:", "From: IT Desk <it@examp1e.org>\r\nTo:", 1);
+        let subject = LUNCH.replace("Subject: Lunch", "Subject: Lunch!");
+        let disposition = LUNCH.replacen(
+            "MIME-Version: 1.0\r\n",
+            "MIME-Version: 1.0\r\nContent-Disposition: attachment; filename=\"a.exe\"\r\n",
+            1,
+        );
+        for changed in [body, attachment, second_from, subject, disposition] {
+            assert_ne!(content_fingerprint(changed.as_bytes()), fp, "{changed}");
+        }
+    }
+
     #[test]
     fn received_by_hosts_lists_every_by_word() {
         assert_eq!(
@@ -713,5 +905,224 @@ mod tests {
             received_by_hosts("from a ([198.51.100.7]) by [10.0.0.5] with ESMTP"),
             vec!["10.0.0.5"]
         );
+    }
+
+    #[test]
+    fn sole_message_id_needs_exactly_one_non_empty_id() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("Message-ID: <abc@host>\r\n", Some("abc@host")),
+            ("message-id: <a@x>\r\n", Some("a@x")),
+            ("Message-ID: a@x\r\n", Some("a@x")),
+            ("Message-ID:\r\n <a@x>\r\n", Some("a@x")),
+            ("Message-ID: < a@x >\r\n", Some("a@x")),
+            ("", None),
+            ("Message-ID: \r\n", None),
+            ("Message-ID: <>\r\n", None),
+            ("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n", None),
+            ("Message-ID: \r\nMessage-ID: <b@x>\r\n", None),
+            ("Message-ID: <a@x> <b@x>\r\n", None),
+            ("Message-ID: (c) <a@x> (trailing)\r\n", None),
+            ("Message-ID: <fp:v1:abc>\r\n", None),
+            ("Message-ID: <FP:abc@host>\r\n", None),
+            ("Message-ID: fp:abc@host\r\n", None),
+            ("Message-ID: <fpabc@host>\r\n", Some("fpabc@host")),
+        ];
+        for (header, expected) in cases {
+            let raw = format!("From: a@x\r\nTo: me@y\r\nSubject: s\r\n{header}\r\nbody\r\n");
+            assert_eq!(
+                sole_message_id(raw.as_bytes()).as_deref(),
+                *expected,
+                "{header:?}"
+            );
+        }
+    }
+
+    /// The reader ends the header block at a line holding only `separator`;
+    /// text after it is body, so it must be fingerprinted as body.
+    fn assert_body_after_separator_line_is_fingerprinted(separator: &str) {
+        const HDR: &str = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                           Subject: Lunch\r\nMessage-ID: <m1@partner.example>\r\n";
+        let original = format!("{HDR}\r\nThursday?\r\n");
+        let injected =
+            format!("{HDR}{separator}\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n");
+        assert_ne!(
+            parsed_view(original.as_bytes()),
+            parsed_view(injected.as_bytes()),
+            "the reader shows the injected text"
+        );
+        let original = content_fingerprint(original.as_bytes()).unwrap();
+        let injected = content_fingerprint(injected.as_bytes()).unwrap();
+        assert_ne!(original, injected);
+    }
+
+    #[test]
+    fn fingerprint_covers_body_after_a_form_feed_only_line() {
+        assert_body_after_separator_line_is_fingerprinted("\x0c");
+    }
+
+    #[test]
+    fn fingerprint_covers_body_after_a_bare_cr_line() {
+        assert_body_after_separator_line_is_fingerprinted("\r");
+    }
+
+    /// A line the reader does not file as Subject (its name carries a
+    /// character the raw header reader trims) is not scored as one.
+    #[test]
+    fn content_analyzer_reads_subject_as_the_reader_does() {
+        let original = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                        Subject: Lunch\r\n\r\nThursday?\r\n";
+        for prefix in ["\u{a0}", "\u{2003}", "\x0b"] {
+            let twin = original.replacen(
+                "Subject: Lunch",
+                &format!(
+                    "{prefix}Subject: urgent verify your account immediately\r\nSubject: Lunch"
+                ),
+                1,
+            );
+            let read = |raw: &str| ThreatInput::from_raw(raw.as_bytes(), "me@example.org").unwrap();
+            assert_eq!(
+                parsed_view(twin.as_bytes()),
+                parsed_view(original.as_bytes()),
+                "{prefix:?}: the reader shows the same message"
+            );
+            assert_eq!(
+                codes(&content::analyze(&read(&twin))),
+                codes(&content::analyze(&read(original))),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// What mail_parser would show of a message.
+    fn parsed_view(raw: &[u8]) -> String {
+        let Some(m) = mail_parser::MessageParser::default().parse(raw) else {
+            return "unparseable".into();
+        };
+        format!(
+            "from={:?} subject={:?} ct={:?} text={:?} html={:?} attachments={:?}",
+            m.from().and_then(|f| f.first()).and_then(|a| a.address()),
+            m.subject(),
+            m.content_type()
+                .map(|c| format!("{}/{:?}", c.ctype(), c.subtype())),
+            m.body_text(0),
+            m.body_html(0),
+            m.attachments()
+                .map(|a| a.attachment_name().unwrap_or("?").to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Two messages that read differently never share a fingerprint, across
+    /// header-block and line-ending edge cases.
+    #[test]
+    fn fingerprint_differs_whenever_the_parsed_message_differs() {
+        const HDR: &str = "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n\
+                           Subject: Lunch\r\nMessage-ID: <m1@partner.example>\r\n";
+        let base = format!("{HDR}X-Pad: 1\r\n\r\nThursday?\r\n");
+        let html = format!("{HDR}X-Pad: 1\r\n\r\n<b>Thursday?</b>\r\n");
+        let with = |extra: &str| format!("{HDR}{extra}\r\nX-Pad: 1\r\n\r\nThursday?\r\n");
+        let html_with =
+            |extra: &str| format!("{HDR}{extra}\r\nX-Pad: 1\r\n\r\n<b>Thursday?</b>\r\n");
+        let mut pairs: Vec<(String, String)> = vec![
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n \r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\t\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\nPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\r\nPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\rContent-Type: text/html\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\rPay now at evil.example\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                html.clone(),
+                format!("{HDR}X-Pad: 1\r\n Content-Type: text/html\r\n\r\n<b>Thursday?</b>\r\n"),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\x0c\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n\r\r\nPay at http://evil.example/login\r\n\r\nThursday?\r\n"
+                ),
+            ),
+            (base.clone(), base.replace("\r\n", "\n")),
+            (
+                format!(
+                    "{HDR}Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\n<b>x</b>\r\n"
+                ),
+                format!(
+                    "{HDR}Content-Type: text/html\r\nContent-Type: text/plain\r\n\r\n<b>x</b>\r\n"
+                ),
+            ),
+            (base.clone(), format!(" junk\r\n{base}")),
+            (
+                format!("{HDR}\r\n<b>x</b>\r\n"),
+                format!("{HDR}Content-Type : text/html\r\n\r\n<b>x</b>\r\n"),
+            ),
+            (
+                base.clone(),
+                format!("{HDR}X-Pad: 1\r\n\0\r\nPay now\r\n\r\nThursday?\r\n"),
+            ),
+            (
+                base.clone(),
+                format!(
+                    "{HDR}X-Pad: 1\r\n<html><a href=\"http://evil.example\">Pay</a></html>\r\n\r\nThursday?\r\n"
+                ),
+            ),
+        ];
+        for extra in [
+            "Resent-From: Bank <security@bank.example>",
+            "X-Original-From: ceo@example.org",
+            "In-Reply-To: <thread@example.org>",
+            "References: <thread@example.org>",
+            "Return-Path: <x@evil.example>",
+            "Disposition-Notification-To: x@evil.example",
+            "Comments: Pay at http://evil.example",
+            "Keywords: urgent",
+            "Importance: high",
+        ] {
+            pairs.push((base.clone(), with(extra)));
+        }
+        for extra in [
+            "From\x0b: Bank <sec@bank.example>",
+            "Subject\x0b: URGENT pay",
+            "\u{feff}Content-Type: text/html",
+            "From\u{a0}: Bank <sec@bank.example>",
+            "\x0cContent-Type: text/html",
+            "X-Content-Type: text/html",
+            "Content\x0b-Type: text/html",
+            "Content_Type: text/html",
+        ] {
+            pairs.push((html.clone(), html_with(extra)));
+        }
+        for (a, b) in &pairs {
+            let same_fingerprint =
+                content_fingerprint(a.as_bytes()) == content_fingerprint(b.as_bytes());
+            let same_view = parsed_view(a.as_bytes()) == parsed_view(b.as_bytes());
+            assert!(!same_fingerprint || same_view, "{b:?}");
+        }
     }
 }
