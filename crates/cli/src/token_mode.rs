@@ -317,11 +317,23 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
 /// mail there, by any route, releases it.
 pub(crate) fn permission(command: &Commands, matches: &ArgMatches) -> Permission {
     let class = token_mode_permission(command);
-    if class != ReadOnly && source_is_quarantine(matches) {
+    if class != ReadOnly && !leaves_its_source_alone(command) && source_is_quarantine(matches) {
         OperatorOnly
     } else {
         class
     }
+}
+
+/// Commands that are not read-only yet never change the message in their
+/// `--folder`: `threat report` reads it and drafts a report, so it runs from
+/// quarantine.
+fn leaves_its_source_alone(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Threat {
+            subcommand: ThreatCmd::Report { .. }
+        }
+    )
 }
 
 /// Whether the command's `folder` argument, the folder it takes mail from,
@@ -527,6 +539,11 @@ mod tests {
         ("threat mark-safe 1", OperatorOnly),
         ("threat release 1", OperatorOnly),
         ("threat report 1", Gated(DRAFT_CREATE)),
+        // It reads the message and drafts a report; the message stays put.
+        (
+            "threat report 1 --folder Envelope/Quarantine",
+            Gated(DRAFT_CREATE),
+        ),
         ("threat stats", ReadOnly),
         ("analytics show 1", ReadOnly),
         ("events list", ReadOnly),
