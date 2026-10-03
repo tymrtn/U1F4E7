@@ -1,6 +1,6 @@
 # Envelope Agent Contract
 
-Envelope exposes a versioned agent contract as `envelope.agent_contract.v3`.
+Envelope exposes a versioned agent contract as `envelope.agent_contract.v4`.
 
 Generate the live contract:
 
@@ -17,13 +17,26 @@ envelope contract --surface inbox
 The checked-in schema snapshot is:
 
 ```text
-docs/schemas/envelope.agent_contract.v3.json
+docs/schemas/envelope.agent_contract.v4.json
 ```
 
-The prior `envelope.agent_contract.v2` snapshot is retained unchanged at
-`docs/schemas/envelope.agent_contract.v2.json` as historical documentation.
+The prior `envelope.agent_contract.v3` and `envelope.agent_contract.v2`
+snapshots are retained unchanged at `docs/schemas/envelope.agent_contract.v3.json`
+and `docs/schemas/envelope.agent_contract.v2.json` as historical documentation.
 
-## v3 migration (breaking)
+## v4 migration (breaking)
+
+v4 changes who can authorize a send and which one-time codes `envelope code` returns:
+
+- **Send authority comes from the agent's policy.** With an agent identity (an MCP session, or the CLI with `ENVELOPE_AGENT_TOKEN` set), `send`, `reply`, `send_draft`, `envelope send` and `envelope draft send` evaluate the send policy with the agent's stored recipient allowlist (`allow_recipients`) and take confirmation from a human approval of the draft's current revision. The `confirm_send` and `allow_recipient` inputs (CLI `--confirm-send`, `--allow-recipient`) state intent only. The operator CLI with no token, and MCP under the explicit `ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS=1` override, keep using the caller's values. See `outbound_safety.send_authority`.
+- **Confirm-send drafts for a person.** Under a `confirm-send` mode an agent's `send` and `reply` save a draft and return `status: "drafted"` with `"confirmation": {"required": "human_approval", "surface": "dashboard"}`. `send_draft` (and CLI `draft send` with a token) is denied with `send_confirmation_required` and the same `confirmation` object until a human approves the draft's current revision; any edit needs a new approval. A draft that changes after the policy admitted it is refused with `draft_changed` and nothing is queued or sent.
+- **CLI agent token.** When `ENVELOPE_AGENT_TOKEN` is set, the CLI applies that agent's policy to sending (above) and to three new policy actions: `rules.webhook` (`rule create` with a webhook action, `rule enable` of a webhook rule), `rules.batch_ack` (`rule enable --acknowledge-batch-actions`) and `sieve.publish` (`rule publish-sieve --confirm`). These three must be granted by name; a `"*"` policy does not include them. They are checked before any write or network call. An unknown or revoked token fails closed with `agent_token_invalid`. With no token the CLI is unchanged. See [CLI with an agent token](#cli-with-an-agent-token).
+- **One-time codes require an authenticated sender.** `envelope code` accepts a code only when the receiving mail host's trusted `Authentication-Results` show `dmarc=pass` for `header.from` equal to the From domain, or `dkim=pass` with a signing domain (`header.d`, else `header.i`) in the same registrable domain as the From domain. SPF alone never counts, and a message without exactly one From mailbox fails. Only the `Authentication-Results` written by the receiving host count. Results carry `sender_auth` (`{result: "pass", via: "dmarc"|"dkim", domain, authserv_id}`) and `rejected_candidates` (`[{from, sender_auth}]`, never their codes).
+- **The wait runs to the end.** Arrivals that fail or cannot be verified never end the wait; an accepted code still waits out the 5-second stabilization window, and two accepted codes return `ambiguous_matches`. If only rejected arrivals came, the result is `{error: "sender_unverifiable"}` (a sender could not be verified) or `{error: "sender_unauthenticated"}` (every sender failed), with `reason`, `waited_seconds` and `rejected_candidates`. With nothing at all the result is still `timeout`.
+- **Operator opt-in for unverified senders.** Some providers record no `Authentication-Results` this mailbox can trust. An operator can let an account accept those senders with `envelope config set otp.allow_unverified_senders <account>[,<account>...]` (stored in Envelope's `config.json`; `envelope config unset otp.allow_unverified_senders` removes it). A code accepted this way reports `sender_auth: {"result": "unverifiable", "reason": ...}`. A sender that failed authentication is never accepted. The setting is refused under `ENVELOPE_AGENT_TOKEN` and has no MCP tool.
+- **Plain-text `envelope code` requires `--from`**, an exact sender address or full domain, before credentials or IMAP are opened. Messages are read with `BODY.PEEK[]` and never marked read.
+
+## v3 migration (historical)
 
 v3 is a breaking contract change for unattended OTP retrieval:
 
@@ -48,15 +61,15 @@ v2 is a breaking contract change for the outbound send surfaces:
 
 ## Compatibility rules
 
-- Existing command `--json` output shapes are not changed by the contract export except for documented breaking migrations (v2 outbound attribution and v3 OTP JSON binding/stabilization).
-- Optional additions are compatible within `envelope.agent_contract.v3`.
+- Existing command `--json` output shapes are not changed by the contract export except for documented breaking migrations (v2 outbound attribution, v3 OTP JSON binding/stabilization, and v4 send authority and OTP sender authentication).
+- Optional additions are compatible within `envelope.agent_contract.v4`.
 - Draft/reply/forward creation and draft edits support optional `--attach` paths. Attachment bytes are snapshotted into draft storage for review/send continuity, but contract/JSON output exposes only non-secret summaries (`filename`, `content_type`, `size`). Draft edits also support removing named attachments or clearing all attachments. Forwarding original source-message attachments is explicit via `draft forward --include-attachments`; it is not the default.
 - Removals, renames, required-field changes, or type changes require a new schema id.
 - MCP tool input schemas are derived from `crates/cli/src/commands/contract.rs` so CLI, MCP, Hermes, and Codex advertise the same surface.
 
 ## Surfaces
 
-The v3 contract covers:
+The v4 contract covers:
 
 - inbox
 - read
@@ -149,6 +162,8 @@ Agent-facing send modes are stable strings:
 - `autonomous-send`
 
 MCP defaults agent send/reply flows to `draft-only`. Denials use stable JSON codes and policy audit events avoid secret material and full recipient addresses.
+
+**Send authority.** With an agent identity, the recipient allowlist for `allowlisted-send` is the agent's stored `allow_recipients`, and the confirmation for `confirm-send` is a human approval of the draft's current revision (see [Human approval](#human-approval-durable-host-attestation)). The call's `confirm_send` and `allow_recipient` values are intent only. Under `confirm-send`, `send` and `reply` return a draft with `"confirmation": {"required": "human_approval", "surface": "dashboard"}`; `send_draft` proceeds once a person approves that revision in the dashboard. The send then acts only on the revision the policy admitted (`draft_changed` otherwise).
 
 Allowed actual-send paths do **not** transmit immediately by default. They queue into the outbox/scheduled-send mechanism with a cooldown (`send_after`, default 60 seconds; override via `cooldown_seconds` or `ENVELOPE_SEND_COOLDOWN_SECONDS`). Immediate transmission is an explicit emergency bypass only: `send_now`/`--send-now` or `cooldown_seconds=0` plus `confirm_send_now`/`--confirm-send-now`; missing confirmation returns `immediate_send_requires_confirmation` and sends nothing.
 
@@ -248,12 +263,29 @@ An MCP server process can run under a specific agent identity by setting `ENVELO
 - **Startup semantics.** A valid, non-revoked `ENVELOPE_AGENT_TOKEN` is required. Unset/blank, unknown, or revoked tokens make MCP startup fail closed. Legacy anonymous full-mailbox MCP is available only through the conspicuous operator compatibility override `ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS=1`; generated `envelope mcp --config` output never sets it and instead includes a required token placeholder.
 - **Authoritative resource scope.** Identity-bound MCP resolves the actual account before policy evaluation. Draft reads, edits, and sends authorize from the draft's stored account id and reject a conflicting optional account parameter. Aggregate diagnostics (`accounts`, `watch_status`, and account-omitted snooze listing) fail closed for identity-bound sessions rather than exposing other accounts. The stable additional denial code is `agent_policy_account_required`.
 - **Authorization.** Every identity-bound MCP tool call is authorized before dispatch against the authoritative resolved account; caller-provided account aliases are never the policy subject. The policy action is derived from the tool name (`tool_action_map` in the contract export; an unknown tool is denied), and the folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies; a single `"*"` allows all.
-- **Denials.** Return the stable `{code, reason}` object as a normal MCP tool error — `agent_policy_denied_action`, `agent_policy_denied_account`, `agent_policy_denied_folder`, or `agent_policy_account_required` — never leaking recipient addresses, secrets, or body content.
-- **Send-mode clamp.** `send`, `reply`, and `send_draft` requests are clamped down to the agent's `send_mode_ceiling` and never widened. Under a `draft-only` ceiling an autonomous request still produces only a draft.
+- **Denials.** Return the stable `{code, reason}` object as a normal MCP tool error — `agent_policy_denied_action`, `agent_policy_denied_account`, `agent_policy_denied_folder`, or `agent_policy_account_required` — never leaking recipient addresses, secrets, or body content. The CLI adds `agent_token_invalid`.
+- **Send-mode clamp.** `send`, `reply`, and `send_draft` requests are clamped down to the agent's `send_mode_ceiling` and never widened. Under a `draft-only` ceiling an autonomous request still produces only a draft. The allowlist and confirmation come from the policy and a human approval (see [Send safety](#send-safety)).
 - **Attribution.** Mutating tool calls (`send`/`reply`/`send_draft`, `move_message`, `flag`, `tag`) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision). Filter the audit trail with `envelope actions tail --agent <name-or-id>`.
 - **Free tier / licensing.** Up to **2 active** (non-revoked) agents are free. Creating more requires an activated license (`envelope license activate`, using its hidden prompt or `--key-stdin`); over-limit `envelope agent create` returns the stable code `agent_limit_license_required`.
 
 Policy fields are managed with `envelope agent policy set <name> [--allow-accounts …] [--allow-folders …] [--allow-actions …] [--send-mode-ceiling <mode>] [--allow-recipients …]` and inspected with `envelope agent policy show <name>`. `--allow-*` accepts `*` (allow all) or a comma-separated list. See the additive `agent_identity` block in the contract export for the full machine-readable description.
+
+### CLI with an agent token
+
+The CLI reads `ENVELOPE_AGENT_TOKEN` too (`agent_identity.cli_token_gates`):
+
+- **No token** (or a blank one): the operator. Every command behaves as before.
+- **A token for an active agent**: these commands apply that agent's policy.
+  - `envelope send` and `envelope draft send` need the `send` action for the account and follow the agent's ceiling, recipient allowlist and human approval. A `draft-only` agent gets a draft and nothing reaches the outbox.
+  - `envelope rule create` with a webhook action, and `envelope rule enable` of a webhook rule, need `rules.webhook`.
+  - `envelope rule enable --acknowledge-batch-actions` needs `rules.batch_ack`.
+  - `envelope rule publish-sieve --confirm` needs `sieve.publish`.
+  - `envelope config set|unset otp.allow_unverified_senders` is refused: it is an operator setting.
+- **An unknown or revoked token**: those commands fail closed with `agent_token_invalid`. The token is never echoed.
+
+`rules.webhook`, `rules.batch_ack` and `sieve.publish` must be named in `--allow-actions`; a `"*"` policy does not include them. Grant one with, for example, `envelope agent policy set <name> --allow-actions 'inbox.read,rules.read,rules.webhook'`. Each check runs before any write or network call. A refusal prints `{"status":"denied","error":{"code":…,"reason":…}}` with `--json` and exits nonzero; a refused policy action is also recorded in the agent's action log.
+
+These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator.
 
 ### Revoked-token session persistence (finding F4)
 
@@ -292,7 +324,7 @@ The `evidence` surface is read-only against source mailboxes (IMAP `EXAMINE` + `
 After intentional contract changes, regenerate from a default build (without `--features governor`). The committed schema documents the public build; a governor build differs only in `outbound_safety.governor_gate.smtp_mode`, and the drift test accounts for that.
 
 ```bash
-cargo run -q -p envelope-email -- contract > docs/schemas/envelope.agent_contract.v3.json
-python3 -m json.tool docs/schemas/envelope.agent_contract.v3.json >/dev/null
+cargo run -q -p envelope-email -- contract > docs/schemas/envelope.agent_contract.v4.json
+python3 -m json.tool docs/schemas/envelope.agent_contract.v4.json >/dev/null
 cargo test -p envelope-email --test contract_drift
 ```

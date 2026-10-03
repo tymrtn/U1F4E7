@@ -92,3 +92,15 @@ tool. Read the error if it fails:
 
 When `accounts` lists the user's addresses, setup is done. Continue with the
 envelope skill.
+
+## If one-time codes are refused
+
+`envelope code --from <sender>` returns a code only when the user's mail
+provider authenticated the sender (DMARC, or DKIM aligned with the From
+domain). Always pass `--from` with the exact sender address or domain.
+
+| Error | Meaning and fix |
+|---|---|
+| `sender_unauthenticated` | The sender failed authentication. Do not use a code from that message; tell the user. |
+| `sender_unverifiable` | The provider recorded no authentication Envelope can trust (some providers do not record it). The user can allow unverified senders for that account in their own terminal: `envelope config set otp.allow_unverified_senders you@example.com`. Ask them; do not run it yourself. |
+| `timeout` | No matching code arrived. Check `--from`, `--account` and `--wait`. |

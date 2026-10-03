@@ -619,8 +619,8 @@ fn contract_export_declares_untrusted_trust_model() {
     assert!(output.status.success());
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
 
-    // v3 documents the OTP JSON breaking change.
-    assert_eq!(contract["schema"], "envelope.agent_contract.v3");
+    // v4 documents the send-authority and OTP authentication changes.
+    assert_eq!(contract["schema"], "envelope.agent_contract.v4");
 
     let untrusted = &contract["trust_model"]["untrusted_content"];
     assert_eq!(untrusted["marker_key"], "_envelope_trust");
@@ -1685,7 +1685,7 @@ fn contract_export_declares_wave3_tools_and_gates() {
         .expect("run contract");
     assert!(output.status.success());
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
-    assert_eq!(contract["schema"], "envelope.agent_contract.v3");
+    assert_eq!(contract["schema"], "envelope.agent_contract.v4");
 
     let map = &contract["agent_identity"]["tool_action_map"];
     assert_eq!(map["bulk"], "bulk");

@@ -3,21 +3,22 @@
 
 //! Versioned agent-facing JSON contract for Envelope CLI and MCP surfaces.
 //!
-//! v3 is a breaking change to unattended OTP retrieval: `envelope code --json`
-//! now requires an explicit account and narrow sender binding. v2's outbound-send
-//! changes remain documented in the retained historical schema. Any further
-//! breaking contract change must create a new `envelope.agent_contract.vN` schema.
+//! v4 is a breaking change to send authority and one-time codes: with an agent
+//! identity, a send's confirmation and recipient allowlist come from the
+//! agent's policy and a human approval, never from the call, and
+//! `envelope code` accepts a code only from an authenticated sender. v2 and v3
+//! remain documented in the retained historical schemas. Any further breaking
+//! contract change must create a new `envelope.agent_contract.vN` schema.
 
 use anyhow::Result;
 use envelope_email_transport::outbound::GovernorConfig;
 use serde_json::{Value, json};
 
-pub const AGENT_CONTRACT_SCHEMA: &str = "envelope.agent_contract.v3";
+pub const AGENT_CONTRACT_SCHEMA: &str = "envelope.agent_contract.v4";
 
 /// The prior contract id, retained as historical compatibility documentation
-/// (`docs/schemas/envelope.agent_contract.v2.json`). v3 makes OTP JSON
-/// automation's account/sender binding requirements explicit.
-pub const AGENT_CONTRACT_SCHEMA_V2: &str = "envelope.agent_contract.v2";
+/// (`docs/schemas/envelope.agent_contract.v3.json`).
+pub const AGENT_CONTRACT_SCHEMA_V3: &str = "envelope.agent_contract.v3";
 
 /// Default summary count returned by read-only agent list/search surfaces.
 pub const DEFAULT_AGENT_LIST_LIMIT: u32 = 25;
@@ -43,9 +44,16 @@ pub fn agent_contract() -> Value {
         "schema": AGENT_CONTRACT_SCHEMA,
         "compatibility": {
             "breaking_change_policy": "Field removals, required-field additions, type changes, and semantic renames require a new schema id. New optional fields are backward-compatible.",
-            "output_contract": "v3 is a BREAKING change to unattended OTP retrieval: `envelope code --json` now REQUIRES `account` (the expected mailbox) and `from` (an exact mailbox address or fully-qualified domain), waits a fixed 5-second stabilization window before releasing a singleton, and fails closed with error=ambiguous_matches across polling iterations. `from` and `subject` remain untrusted message fields, not authenticated sender identity. v2's outbound-send changes remain historical. Every other change is an additive optional field.",
+            "output_contract": "v4 is a BREAKING change to send authority and one-time codes. With an agent identity (an MCP session, or the CLI with ENVELOPE_AGENT_TOKEN), a send's confirmation is a human approval of the draft's current revision and its recipient allowlist is the agent's stored policy; the confirm_send and allow_recipient call parameters are intent only. `envelope code` returns a code only from a sender whose From domain the receiving mail host authenticated (DMARC, or DKIM aligned with the From domain), reports sender_auth, fails with sender_unverifiable or sender_unauthenticated, and requires --from in plain-text mode too. v3's OTP binding and v2's outbound-send changes remain historical. Every other change is an additive optional field.",
             "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval.",
-            "previous_schema": AGENT_CONTRACT_SCHEMA_V2,
+            "previous_schema": AGENT_CONTRACT_SCHEMA_V3,
+            "v4_changes": [
+                "Send authority (BREAKING for agents): with an agent identity, send/reply/send_draft evaluate the send policy with the agent's stored recipient allowlist and with confirmation taken from a human approval of the draft's current revision. The confirm_send and allow_recipient parameters are intent only: neither confirms a send nor admits a recipient. The unsafe anonymous MCP override and the operator CLI (no token) keep using the caller's values.",
+                "Under a confirm-send mode, an agent's send and reply save a draft and return status=drafted with confirmation={required: human_approval, surface: dashboard}. send_draft is denied with send_confirmation_required (and the same confirmation hint) until a human approves the current revision; an edit after approval needs a new approval. A draft that changes after the policy admitted it is refused with draft_changed.",
+                "CLI agent token: when ENVELOPE_AGENT_TOKEN is set, `envelope send` and `envelope draft send` apply that agent's policy (send grant, ceiling, recipient allowlist, human approval), and `rule create`/`rule enable` with a webhook action, `rule enable --acknowledge-batch-actions`, and `rule publish-sieve --confirm` require the new policy actions rules.webhook, rules.batch_ack and sieve.publish. A \"*\" policy does not include these three; each must be granted by name. An unknown or revoked token fails closed with agent_token_invalid. With no token the CLI is unchanged. See agent_identity.cli_token_gates.",
+                "One-time codes (BREAKING): `envelope code` accepts a code only when the receiving host's trusted Authentication-Results show dmarc=pass for the From domain, or dkim=pass with a signing domain in the same registrable domain as the From domain. SPF alone never counts, and a message without exactly one From mailbox fails. Other arrivals never end the wait. Results carry sender_auth; when only rejected arrivals came the error is sender_unverifiable or sender_unauthenticated with rejected_candidates (sender and result only, never their codes). An operator can let an account accept senders whose provider records no usable authentication with `envelope config set otp.allow_unverified_senders <account>`; such a result reports sender_auth.result=unverifiable. Agents cannot change that setting. Plain-text `envelope code` now requires --from.",
+                "v3 (envelope.agent_contract.v3) is retained as historical documentation at docs/schemas/envelope.agent_contract.v3.json."
+            ],
             "v3_changes": [
                 "OTP JSON automation now requires account plus exact mailbox/full-domain sender binding; it waits a fixed 5-second stabilization window and fails closed with error=ambiguous_matches/candidate_count when multiple candidates are observed across polling iterations. Returned from/subject values are untrusted header/content fields, not authenticated identity.",
                 "Attribution protocol (envelope.attribution.v1): send/reply/send_draft REQUIRE a non-empty `attributes` array of factual catalog keys (enforced at the handler boundary, including draft-only outcomes). A bot-originated send with no declared attribute is rejected with attributes_required BEFORE Governor scoring even when host facts are derivable — host-derived facts never substitute for the bot's declaration. Unknown/attestation-only/contradicting/host-unverifiable/impossible declarations are rejected with attributes_invalid. Both are top-level `invalid`-status codes. A declared host-derived key counts only when Envelope independently observes it true (declaration + host corroboration); observed-false is conflicts_with_host_observation and unobservable is host_verification_unavailable.",
@@ -73,6 +81,14 @@ pub fn agent_contract() -> Value {
                 "recovery": "A row left `sending` by a process that died is resolved by the next send, `draft show`, `draft list`, and every scheduled-send sweep: an attempt that never reached the body returns to draft (a scheduled row comes due again); one that had started the body becomes delivery_uncertain. Liveness is an operating-system lock the sending process holds for the whole attempt, so a live but slow sender is never touched. A row whose owner cannot be checked (another host) is resolved the same way after a 15-minute lease.",
                 "receipts": "Every send transition writes one action-log row with action_type=send, draft_id (the operation id), message_id, agent_id, and action_status: the row's status after the transition in `draft show` terms (queued, drafted, sending, sent, delivery_uncertain, pending_review, blocked); a replay's receipt carries the underlying status with replay=true. action_taken is JSON (envelope.send_receipt.v1): surface, attempt_id, seq, from, to, phase, reason, replay, retryable, recipients (local only), recipient_count, payload_sha256 (envelope.payload.v1, every transmitted field; the same digest the intent records for idempotency matching), key_kind, and evidence. The receipt commits in the same transaction as the state change; send_completed events carry the Message-ID in their message_id column. Agent webhooks (agent_action) carry identifiers and a recipient count, never recipient addresses.",
                 "durability": "SQLite runs with synchronous=FULL, so a committed intent, claim, or receipt survives power loss as well as a process crash."
+            },
+            "send_authority": {
+                "agent_identity": "With an agent identity (MCP with ENVELOPE_AGENT_TOKEN, or the CLI with ENVELOPE_AGENT_TOKEN set), send, reply, send_draft, `envelope send` and `envelope draft send` take their recipient allowlist from the agent's stored policy (allow_recipients) and their confirmation from a human approval of the draft's current revision. The confirm_send/--confirm-send and allow_recipient/--allow-recipient inputs are intent only.",
+                "operator": "Without an agent identity (the CLI with no token, or MCP under the explicit ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS=1 override) the caller's own confirm_send and allow_recipient values apply as before.",
+                "confirm_send_mode": "Under a confirm-send mode a new message cannot carry an approval yet: send and reply save a draft and return status=drafted with the confirmation hint. send_draft is allowed only when a human approved the draft's current revision; otherwise it is denied with send_confirmation_required and the confirmation hint. Any edit bumps the revision, so it needs a new approval.",
+                "confirmation_hint": crate::commands::agent_context::human_approval_hint(),
+                "revision_binding": "The queue or immediate send acts only on the revision the policy admitted. A draft that changed in between is refused with error.code=draft_changed (retryable) and nothing is queued or sent.",
+                "denial_codes": ["send_confirmation_required", "send_recipient_not_allowlisted", "send_recipient_parse_failed", "draft_changed"]
             },
             "actual_send_cooldown": {
                 "default_seconds": 60,
@@ -135,15 +151,30 @@ pub fn agent_contract() -> Value {
             "env": "ENVELOPE_AGENT_TOKEN",
             "anonymous_compatibility": "MCP startup requires ENVELOPE_AGENT_TOKEN. Legacy anonymous full-mailbox MCP is disabled by default and is available only when an operator explicitly sets ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS=1; generated MCP configuration never sets this unsafe override.",
             "semantics": "Envelope resolves ENVELOPE_AGENT_TOKEN to a stored agent identity and enforces that agent's policy on every tool call. An unset/blank token fails MCP startup; a set-but-unknown/revoked token also fails startup and never falls back to anonymous. The raw token is shown exactly once at `envelope agent create` and is never stored, logged, or recoverable.",
+            "cli_token_gates": {
+                "env": "ENVELOPE_AGENT_TOKEN",
+                "resolution": "With no (or a blank) token the CLI runs as the operator and behaves as before. A token for an active agent applies that agent's policy to the commands below. An unknown or revoked token fails those commands closed with error.code=agent_token_invalid; it never falls back to the operator. The token is never echoed.",
+                "send": "`envelope send` and `envelope draft send` require the `send` action for the account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
+                "actions": {
+                    "rules.webhook": "`envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
+                    "rules.batch_ack": "`envelope rule enable --acknowledge-batch-actions`",
+                    "sieve.publish": "`envelope rule publish-sieve --confirm`"
+                },
+                "explicit_grant": "rules.webhook, rules.batch_ack and sieve.publish must be named in the agent's allowed actions; a \"*\" policy does not include them. They are checked before any write or network call.",
+                "operator_only_settings": ["otp.allow_unverified_senders"],
+                "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. Codes: agent_policy_denied_action, agent_policy_denied_account, agent_token_invalid, or the send-policy codes for send and draft send.",
+                "isolation": "These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator."
+            },
             "policy_enforcement": {
                 "authorize": "Every identity-bound MCP tool call is authorized before dispatch against an authoritative resolved account, never a caller-provided account spelling. Draft resources resolve account ownership from the persisted draft id and reject a mismatched optional account. Aggregate diagnostics (accounts, watch_status, and account-omitted snooze listing) fail closed for identity-bound sessions rather than authorizing a default account then reading other accounts. The folder is checked when the tool selects one. Deny-by-default: an empty allow-list denies, a single \"*\" allows all.",
-                "send_mode_clamp": "send/reply/send_draft requests are clamped down to the agent's send_mode_ceiling and never widened. Under a draft-only ceiling an autonomous request still produces only a draft.",
+                "send_mode_clamp": "send/reply/send_draft requests are clamped down to the agent's send_mode_ceiling and never widened. Under a draft-only ceiling an autonomous request still produces only a draft. The allowlist and the confirmation come from the policy and a human approval, never from the call (see outbound_safety.send_authority).",
                 "attribution": "Mutating tool calls (send/reply/send_draft, move_message, flag, tag) and their send-policy/Governor audit rows are attributed to the acting agent id (audit-only; attribution never widens a decision).",
                 "denial_codes": [
                     "agent_policy_denied_action",
                     "agent_policy_denied_account",
                     "agent_policy_denied_folder",
-                    "agent_policy_account_required"
+                    "agent_policy_account_required",
+                    "agent_token_invalid"
                 ],
                 "denial_shape": "Denials return the stable {code, reason} object as a normal MCP tool error and never include recipient addresses, account secrets, or body content."
             },
@@ -389,6 +420,7 @@ fn surfaces() -> Value {
                 "send_at": string("ISO8601 time an `envelope send --at` scheduled draft becomes due for the outbox sweep (scheduled-path field; the cooldown path uses send_after)"),
                 "sent": json!({"type": "boolean", "description": "MCP send/reply result flag when available"}),
                 "send_mode": string("Applied send safety mode when policy was evaluated"),
+                "confirmation": json!({"type": "object", "description": "Present when an agent's confirm-send mode needs a person: {required: human_approval, surface: dashboard}. The draft is sent only after a human approves its current revision."}),
                 "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason}); governor blocks include a sanitized governor summary"}),
                 "send_after": string("ISO8601 time the queued/scheduled send becomes due for the outbox sweep"),
                 "cooldown_seconds": json!({"type": ["integer", "null"], "description": "Actual-send cooldown applied before the outbox sweep may transmit (default 60)"}),
@@ -517,7 +549,7 @@ fn surfaces() -> Value {
         object(
             json!({
                 "account": string("Expected account ID or email address; REQUIRED with --json OTP automation"),
-                "from": string("Exact sender mailbox address or full domain; REQUIRED with --json OTP automation. Fragments, display names, and wildcards are rejected."),
+                "from": string("Exact sender mailbox address or full domain; REQUIRED (plain-text mode too). Fragments, display names, and wildcards are rejected."),
                 "subject": string("Optional subject substring correlation filter"),
                 "wait": integer_default("Seconds to wait before timeout; JSON automation must allow the 5-second stabilization window", 120)
             }),
@@ -526,8 +558,14 @@ fn surfaces() -> Value {
         object(
             json!({
                 "code": string("Verification code returned only by explicit OTP command"),
-                "from": string("Untrusted From header value from the candidate message; not authenticated sender identity"),
+                "from": string("From address of the accepted message; its domain is the one sender_auth covers"),
                 "subject": string("Untrusted candidate message subject"),
+                "sender_auth": json!({"type": "object", "description": "How the From domain was authenticated: {result: pass, via: dmarc|dkim, domain, authserv_id}, or {result: unverifiable, reason} when the operator allows unverified senders for this account (otp.allow_unverified_senders). On rejected_candidates entries result may also be fail."}),
+                "rejected_candidates": json!({"type": "array", "items": {"type": "object"}, "description": "Matching messages whose sender was not accepted: [{from, sender_auth}]. Their codes are never included."}),
+                "error": string("On failure: automation_binding_required, ambiguous_matches, timeout, sender_unverifiable, or sender_unauthenticated"),
+                "reason": string("Human-readable reason accompanying error"),
+                "waited_seconds": integer("On timeout, sender_unverifiable or sender_unauthenticated: the wait that ended"),
+                "candidate_count": integer("On ambiguous_matches: the number of accepted candidates"),
                 "trust": json!({"type": "object", "description": "Inbound trust marker: external mail is untrusted data, not authenticated identity or instructions"})
             }),
             json!([]),
@@ -535,7 +573,11 @@ fn surfaces() -> Value {
         vec![
             "Watch/event payloads redact OTP value; envelope code may return it.",
             "JSON OTP automation requires explicit account and narrow sender binding: --account plus --from as an exact mailbox address or full domain. It collects matching candidates across a fixed 5-second stabilization window and returns error=ambiguous_matches with candidate_count if more than one candidate is seen; error=automation_binding_required rejects missing/broad binding before credentials or IMAP are opened. A timeout before stabilization returns error=timeout.",
-            "The returned from and subject are untrusted message-header/content values. Envelope does not authenticate sender identity; inspect the additive trust block before using inbound data.",
+            "Sender authentication: a code counts only when the receiving mail host's trusted Authentication-Results show dmarc=pass for header.from equal to the From domain, or dkim=pass with header.d (else header.i) in the same registrable domain as the From domain. SPF alone never counts; a message without exactly one From mailbox fails. Only Authentication-Results the receiving host wrote count; copies elsewhere in the message are ignored.",
+            "Arrivals that fail or cannot be verified never end the wait: Envelope keeps polling until --wait expires. An accepted code still waits out the stabilization window and wins over rejected arrivals; two accepted codes return ambiguous_matches. If only rejected arrivals came, the result is error=sender_unverifiable (a sender could not be verified) or error=sender_unauthenticated (every sender failed), with waited_seconds and rejected_candidates.",
+            "Operator opt-in: `envelope config set otp.allow_unverified_senders <account>[,<account>...]` lets those accounts accept senders whose provider records no usable authentication; the result then reports sender_auth.result=unverifiable. A failed sender is never accepted. The setting is operator-only: it is refused under ENVELOPE_AGENT_TOKEN and has no MCP tool.",
+            "--from is required in plain-text mode too; without it the command stops before credentials or IMAP are opened. Messages are read with BODY.PEEK[] and never marked read.",
+            "The returned subject is untrusted message content; inspect the additive trust block before using inbound data.",
         ],
     ));
     items.push(surface_entry(
@@ -696,7 +738,7 @@ fn mcp_tool_entries() -> Value {
         ),
         (
             "send_draft",
-            "Send a draft by draft id. Requires explicit confirmation in agent contexts and a factual `attributes` declaration (required factual labels for this message; the attributes parameter lists them). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+            "Send a draft by draft id. Requires confirm_send=true as intent (under an agent's confirm-send mode a human must also have approved the draft's current revision) and a factual `attributes` declaration (required factual labels for this message; the attributes parameter lists them). A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. By default it QUEUES the draft into the outbox with a cooldown (default 60s, status=scheduled) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
         ),
         ("move_message", "Move a message to another IMAP folder."),
         (
@@ -805,6 +847,7 @@ fn sent_copy_output_schema() -> Value {
             "queued_reason": string("Human-readable queued-send explanation"),
             "queued_reason_code": string("Stable queued-send reason code"),
             "send_mode": string("Applied send safety mode when policy was evaluated"),
+            "confirmation": json!({"type": "object", "description": "Present when an agent's confirm-send mode needs a person: {required: human_approval, surface: dashboard}. The draft is sent only after a human approves its current revision."}),
             "error": json!({"type": "object", "description": "Stable denial/block object ({code, reason})"}),
             "attribution": json!({"type": ["object", "null"], "description": "Additive sanitized attribution block on a SUCCESSFUL result (immediate send, or queued/scheduled acceptance). Contains protocol, catalog, catalog_version, attribution_state, declared_attrs, derived_attrs, governor_attrs, accepted_redundant, rejected_attrs, and a governor sub-object ({decision, route, mode}) — null on queued/scheduled acceptance, where the real Governor decision runs later at the scheduled-send sweep (governor_decision_pending is then present), or {decision: disabled, route: null, mode: off} in a build without the `governor` feature. Never a score, weight, threshold, body, raw recipient, secret, or attachment byte."}),
             "in_reply_to": json!({"type": ["string", "null"], "description": "In-Reply-To header of the sent/queued reply; null when the parent had no Message-ID"}),
@@ -829,11 +872,11 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "attributes": attributes_schema(),
                     "reply_all": json!({"type": "boolean", "description": "Reply to all recipients", "default": false}),
                     "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "draft-only", "description": "MCP reply safety mode"}),
-                    "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
+                    "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send. With an agent identity this is intent only: confirmation is a human approval, and an unapproved reply becomes a draft"}),
                     "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
-                    "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send"})),
+                    "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send. With an agent identity this is intent only: the agent policy's allow_recipients decide"})),
                     "attach": array_of(string("File attachment path to snapshot or send")),
                     "attachments": array_of(string("File attachment path alias for attach")),
                     "folder": string_default("IMAP folder of original message", "INBOX"),
@@ -920,7 +963,7 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                 json!({
                     "draft_id": string("Local draft id"),
                     "attributes": attributes_schema(),
-                    "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP", "default": false}),
+                    "confirm_send": json!({"type": "boolean", "description": "Required to send a draft from MCP. It states intent only: under an agent's confirm-send mode a human must also approve the draft's current revision", "default": false}),
                     "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds). Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
@@ -1332,8 +1375,8 @@ fn send_input_schema() -> Value {
             "attach": array_of(string("File attachment path to snapshot or send")),
             "attachments": array_of(string("File attachment path alias for attach")),
             "send_mode": json!({"type": "string", "enum": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"], "default": "autonomous-send", "description": "CLI send safety mode; MCP defaults this field to draft-only"}),
-            "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send"}),
-            "allow_recipient": array_of(string("Allowed email address or domain for allowlisted-send")),
+            "confirm_send": json!({"type": "boolean", "default": false, "description": "Required when send_mode is confirm-send. With an agent identity this is intent only: confirmation is a human approval, and an unapproved send becomes a draft"}),
+            "allow_recipient": array_of(string("Allowed email address or domain for allowlisted-send. With an agent identity this is intent only: the agent policy's allow_recipients decide")),
             "cooldown_seconds": json!({"type": "integer", "description": "Override the default actual-send cooldown (seconds) before the outbox sweep may transmit. Default 60; also settable via ENVELOPE_SEND_COOLDOWN_SECONDS"}),
             "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
             "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
@@ -1543,6 +1586,78 @@ mod tests {
         let sd_props = &send_draft["inputSchema"]["properties"];
         assert!(sd_props["send_now"].is_object());
         assert!(sd_props["confirm_send_now"].is_object());
+    }
+
+    #[test]
+    fn contract_v4_documents_send_authority_cli_gates_and_otp_auth() {
+        let contract = agent_contract();
+        assert_eq!(contract["schema"], "envelope.agent_contract.v4");
+        assert_eq!(
+            contract["compatibility"]["previous_schema"],
+            "envelope.agent_contract.v3"
+        );
+        assert!(contract["compatibility"]["v4_changes"].is_array());
+
+        let authority = &contract["outbound_safety"]["send_authority"];
+        assert_eq!(
+            authority["confirmation_hint"],
+            json!({"required": "human_approval", "surface": "dashboard"})
+        );
+        for tool in ["send", "reply"] {
+            let entry = mcp_tool_list()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == tool)
+                .cloned()
+                .unwrap();
+            let props = &entry["inputSchema"]["properties"];
+            for field in ["confirm_send", "allow_recipient"] {
+                let text = props[field].to_string();
+                assert!(text.contains("intent"), "{tool}.{field}: {text}");
+            }
+        }
+        for name in ["send", "reply", "send_draft"] {
+            let out = send_family_output(name);
+            assert!(out["properties"]["confirmation"].is_object(), "{name}");
+        }
+
+        let gates = &contract["agent_identity"]["cli_token_gates"];
+        for action in ["rules.webhook", "rules.batch_ack", "sieve.publish"] {
+            assert!(gates["actions"][action].is_string(), "{action}");
+        }
+        let codes = contract["agent_identity"]["policy_enforcement"]["denial_codes"]
+            .as_array()
+            .unwrap();
+        assert!(codes.iter().any(|c| c == "agent_token_invalid"));
+
+        let otp = surface("otp").expect("otp surface");
+        let out = &otp["output_schema"]["properties"];
+        assert!(out["sender_auth"].is_object());
+        assert!(out["rejected_candidates"].is_object());
+        let notes = otp["compatibility_notes"].to_string();
+        for needle in [
+            "sender_unverifiable",
+            "sender_unauthenticated",
+            "otp.allow_unverified_senders",
+            "--from",
+        ] {
+            assert!(notes.contains(needle), "otp notes must mention {needle}");
+        }
+    }
+
+    /// The published output schema of send, reply or send_draft.
+    fn send_family_output(name: &str) -> Value {
+        match name {
+            "send" => surface("send").unwrap()["output_schema"].clone(),
+            _ => {
+                mcp_only_inputs()
+                    .into_iter()
+                    .find(|(tool, _, _)| *tool == name)
+                    .unwrap()
+                    .2
+            }
+        }
     }
 
     // ── Block 6: schema/handler parity — validate real response variants ─────

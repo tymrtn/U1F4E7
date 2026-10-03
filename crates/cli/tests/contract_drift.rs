@@ -2,14 +2,14 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 //! Schema pinning test: `envelope contract` output must equal
-//! docs/schemas/envelope.agent_contract.v3.json exactly (parsed-JSON equality,
+//! docs/schemas/envelope.agent_contract.v4.json exactly (parsed-JSON equality,
 //! not string comparison — key order is not significant).
 //!
 //! If this test fails, either:
 //!   a) A code change altered the contract — update the schema file and commit
 //!      both together per CLAUDE.md's agent contract invariants, OR
 //!   b) The schema file was edited without updating the code — regenerate with
-//!      `envelope contract > docs/schemas/envelope.agent_contract.v3.json`
+//!      `envelope contract > docs/schemas/envelope.agent_contract.v4.json`
 //!      after verifying the change is intentional.
 //!
 //! Regenerate from a default build (no `--features governor`): the committed
@@ -32,7 +32,7 @@ fn schema_path() -> std::path::PathBuf {
     Path::new(manifest_dir)
         .join("..") // crates/
         .join("..") // repo root
-        .join("docs/schemas/envelope.agent_contract.v3.json")
+        .join("docs/schemas/envelope.agent_contract.v4.json")
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn contract_output_matches_committed_schema() {
     let schema_bytes = std::fs::read(&schema_file).unwrap_or_else(|e| {
         panic!(
             "Could not read schema file at {}: {e}\n\
-             Run `envelope contract > docs/schemas/envelope.agent_contract.v3.json` \
+             Run `envelope contract > docs/schemas/envelope.agent_contract.v4.json` \
              to generate it.",
             schema_file.display()
         )
@@ -114,10 +114,10 @@ fn contract_output_matches_committed_schema() {
 
         panic!(
             "Contract drift detected: `envelope contract` output does not match \
-             docs/schemas/envelope.agent_contract.v3.json.\n\
+             docs/schemas/envelope.agent_contract.v4.json.\n\
              Diverging top-level keys:\n{}\n\n\
              If this change is intentional, regenerate the schema:\n  \
-             envelope contract > docs/schemas/envelope.agent_contract.v3.json\n\
+             envelope contract > docs/schemas/envelope.agent_contract.v4.json\n\
              and commit both files together.",
             diffs.join("\n")
         );

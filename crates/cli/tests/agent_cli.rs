@@ -333,8 +333,8 @@ fn contract_export_declares_agent_identity_block() {
     assert!(output.status.success());
     let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
 
-    // v3 documents the OTP JSON breaking change.
-    assert_eq!(contract["schema"], "envelope.agent_contract.v3");
+    // v4 documents the send-authority and OTP authentication changes.
+    assert_eq!(contract["schema"], "envelope.agent_contract.v4");
 
     let block = &contract["agent_identity"];
     assert_eq!(block["env"], "ENVELOPE_AGENT_TOKEN");
@@ -353,6 +353,7 @@ fn contract_export_declares_agent_identity_block() {
         "agent_policy_denied_action",
         "agent_policy_denied_account",
         "agent_policy_denied_folder",
+        "agent_token_invalid",
     ] {
         assert!(
             codes.iter().any(|c| c == code),

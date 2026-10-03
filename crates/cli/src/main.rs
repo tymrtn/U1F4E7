@@ -3088,7 +3088,7 @@ mod tests {
         ));
 
         let contract = commands::contract::agent_contract();
-        assert_eq!(contract["schema"], "envelope.agent_contract.v3");
+        assert_eq!(contract["schema"], "envelope.agent_contract.v4");
         let surfaces = contract["surfaces"].as_array().expect("surfaces array");
         for required in [
             "inbox", "read", "search", "thread", "draft", "send", "watch", "otp", "rules",
