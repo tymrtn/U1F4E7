@@ -105,4 +105,7 @@ policy on the agent token as context for the send.
   credential-store contents.
 - Don't mutate a mailbox you weren't asked to change. Don't leak secrets.
 - Confirm `envelope paths` before concluding accounts are missing.
+- With an agent token, the CLI refuses commands that change accounts,
+  agents, policy or configuration (`operator_only_command`). Ask the user to
+  run them; see the envelope-setup skill.
 - Full operating guide: `docs/agents/envelope-skill.md`.

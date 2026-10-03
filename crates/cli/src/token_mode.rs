@@ -580,6 +580,66 @@ mod tests {
         }
     }
 
+    /// The contract's name for an argv: its command path plus any flag that
+    /// changes its class.
+    fn contract_key(argv: &str) -> String {
+        const CLASS_FLAGS: &[&str] = &[
+            "--copy-password",
+            "--unsafe",
+            "--confirm",
+            "--webhook",
+            "--run-rules",
+        ];
+        let mut key = path_of(argv);
+        for word in argv.split_whitespace().filter(|w| CLASS_FLAGS.contains(w)) {
+            key.push(' ');
+            key.push_str(word);
+        }
+        key
+    }
+
+    #[test]
+    fn the_contract_publishes_this_table() {
+        let contract = crate::commands::contract::agent_contract();
+        let gates = &contract["agent_identity"]["cli_token_gates"];
+        let operator_only: BTreeSet<String> = gates["operator_only_commands"]
+            .as_array()
+            .expect("cli_token_gates.operator_only_commands")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let gated = gates["gated_commands"]
+            .as_object()
+            .expect("cli_token_gates.gated_commands");
+
+        let mut seen = BTreeSet::new();
+        for (argv, permission) in MATRIX {
+            let key = contract_key(argv);
+            match permission {
+                ReadOnly => assert!(
+                    !operator_only.contains(&key) && !gated.contains_key(&key),
+                    "`{key}` is read-only"
+                ),
+                OperatorOnly => assert!(
+                    operator_only.contains(&key),
+                    "list `{key}` in operator_only_commands"
+                ),
+                Gated(actions) => assert_eq!(
+                    gated.get(&key),
+                    Some(&serde_json::json!(actions)),
+                    "gated_commands[`{key}`]"
+                ),
+            }
+            seen.insert(key);
+        }
+        let stale: Vec<_> = operator_only
+            .iter()
+            .chain(gated.keys())
+            .filter(|key| !seen.contains(*key))
+            .collect();
+        assert!(stale.is_empty(), "not commands in MATRIX: {stale:?}");
+    }
+
     #[test]
     fn gated_commands_need_every_listed_action() {
         let only_bulk = agent(&["bulk"], SendMode::DraftOnly);

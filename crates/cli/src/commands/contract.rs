@@ -39,19 +39,107 @@ pub fn run(surface_name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Commands that need named policy actions under `ENVELOPE_AGENT_TOKEN`, as
+/// `token_mode::token_mode_permission` classifies them; a test there keeps
+/// the two in step.
+const CLI_GATED_COMMANDS: &[(&str, &[&str])] = &[
+    ("send", &["send"]),
+    ("draft send", &["send"]),
+    ("move", &["move"]),
+    ("copy", &["move"]),
+    ("delete", &["delete"]),
+    ("flag add", &["flag"]),
+    ("flag remove", &["flag"]),
+    ("bulk move", &["bulk", "move"]),
+    ("bulk copy", &["bulk", "move"]),
+    ("bulk flag", &["bulk", "flag"]),
+    ("bulk delete", &["bulk", "delete"]),
+    ("bulk tag", &["bulk", "tag"]),
+    ("draft create", &["draft.create"]),
+    ("draft reply", &["draft.create"]),
+    ("draft forward", &["draft.create"]),
+    ("threat report", &["draft.create"]),
+    ("draft edit", &["draft.modify"]),
+    ("draft discard", &["draft.modify"]),
+    ("scheduled hold", &["draft.modify"]),
+    ("scheduled cancel", &["draft.modify"]),
+    ("snooze set", &["snooze"]),
+    ("snooze check-replies", &["snooze"]),
+    ("snooze cancel", &["snooze"]),
+    ("unsnooze", &["snooze"]),
+    ("tag set", &["tag"]),
+    ("rule create", &["rules.write"]),
+    ("rule enable", &["rules.write"]),
+    ("rule disable", &["rules.write"]),
+    ("rule delete", &["rules.write"]),
+    ("rule run --confirm", &["rules.run"]),
+    ("rule publish-sieve --confirm", &["sieve.publish"]),
+    ("contacts import", &["contacts.read"]),
+    ("unsubscribe --confirm", &["unsubscribe"]),
+    ("watch --webhook", &["watch.webhook"]),
+    ("watch --run-rules", &["rules.run"]),
+    (
+        "watch --webhook --run-rules",
+        &["watch.webhook", "rules.run"],
+    ),
+];
+
+/// Commands refused under `ENVELOPE_AGENT_TOKEN`.
+const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
+    "accounts add",
+    "accounts rekey",
+    "accounts import-keychain",
+    "accounts setup-instructions --copy-password",
+    "accounts copy-password",
+    "accounts remove",
+    "accounts signature set",
+    "accounts signature clear",
+    "migrate folders",
+    "migrate run",
+    "backup restore",
+    "attachment download --unsafe",
+    "serve",
+    "license activate",
+    "license status",
+    "license deactivate",
+    "agent create",
+    "agent revoke",
+    "agent policy set",
+    "actions confirm",
+    "actions dismiss",
+    "threat mark-safe",
+    "threat release",
+    "events routes add",
+    "events routes remove",
+    "events deliveries retry",
+    "contacts add",
+    "contacts tag",
+    "contacts untag",
+    "config set",
+    "config unset",
+];
+
+fn cli_gated_commands() -> Value {
+    CLI_GATED_COMMANDS
+        .iter()
+        .map(|(command, actions)| (command.to_string(), json!(actions)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 pub fn agent_contract() -> Value {
     json!({
         "schema": AGENT_CONTRACT_SCHEMA,
         "compatibility": {
             "breaking_change_policy": "Field removals, required-field additions, type changes, and semantic renames require a new schema id. New optional fields are backward-compatible.",
-            "output_contract": "v4 is a BREAKING change to send authority and one-time codes. With an agent identity (an MCP session, or the CLI with ENVELOPE_AGENT_TOKEN), a send's confirmation is a human approval of the draft's current revision and its recipient allowlist is the agent's stored policy; the confirm_send and allow_recipient call parameters are intent only. `envelope code` returns a code only from a sender whose From domain the receiving mail host authenticated (DMARC, or DKIM aligned with the From domain), reports sender_auth, fails with sender_unverifiable or sender_unauthenticated, and requires --from in plain-text mode too. v3's OTP binding and v2's outbound-send changes remain historical. Every other change is an additive optional field.",
+            "output_contract": "v4 is a BREAKING change to send authority, to what the CLI runs under an agent token, and to one-time codes. Under ENVELOPE_AGENT_TOKEN every CLI command is read-only, gated on named policy actions, or operator-only (see agent_identity.cli_token_gates). With an agent identity (an MCP session, or the CLI with ENVELOPE_AGENT_TOKEN), a send's confirmation is a human approval of the draft's current revision and its recipient allowlist is the agent's stored policy; the confirm_send and allow_recipient call parameters are intent only. `envelope code` returns a code only from a sender whose From domain the receiving mail host authenticated (DMARC, or DKIM aligned with the From domain), reports sender_auth, fails with sender_unverifiable or sender_unauthenticated, and requires --from in plain-text mode too. v3's OTP binding and v2's outbound-send changes remain historical. Every other change is an additive optional field.",
             "secrets_policy": "Contracts, examples, tests, logs, and errors must not include passwords, OAuth tokens, app passwords, or raw OTP values unless the command purpose is OTP retrieval.",
             "previous_schema": AGENT_CONTRACT_SCHEMA_V3,
             "v4_changes": [
                 "Send authority (BREAKING for agents): with an agent identity, send/reply/send_draft evaluate the send policy with the agent's stored recipient allowlist and with confirmation taken from a human approval of the draft's current revision. The confirm_send and allow_recipient parameters are intent only: neither confirms a send nor admits a recipient. The unsafe anonymous MCP override and the operator CLI (no token) keep using the caller's values.",
                 "Under a confirm-send mode, an agent's send and reply save a draft and return status=drafted with confirmation={required: human_approval, surface: dashboard}. send_draft is denied with send_confirmation_required (and the same confirmation hint) until a human approves the current revision; an edit after approval needs a new approval. A draft that changes after the policy admitted it is refused with draft_changed.",
-                "CLI agent token: when ENVELOPE_AGENT_TOKEN is set, `envelope send` and `envelope draft send` apply that agent's policy (send grant, ceiling, recipient allowlist, human approval), and `rule create`/`rule enable` with a webhook action, `rule enable --acknowledge-batch-actions`, and `rule publish-sieve --confirm` require the new policy actions rules.webhook, rules.batch_ack and sieve.publish. A \"*\" policy does not include these three; each must be granted by name. An unknown or revoked token fails closed with agent_token_invalid. With no token the CLI is unchanged. See agent_identity.cli_token_gates.",
-                "One-time codes (BREAKING): `envelope code` accepts a code only when the receiving host's trusted Authentication-Results show dmarc=pass for the From domain, or dkim=pass with a signing domain in the same registrable domain as the From domain. SPF alone never counts, and a message without exactly one From mailbox fails. Other arrivals never end the wait. Results carry sender_auth; when only rejected arrivals came the error is sender_unverifiable or sender_unauthenticated with rejected_candidates (sender and result only, never their codes). An operator can let an account accept senders whose provider records no usable authentication with `envelope config set otp.allow_unverified_senders <account>`; such a result reports sender_auth.result=unverifiable. Agents cannot change that setting. Plain-text `envelope code` now requires --from.",
+                "CLI agent token (BREAKING for agents): when ENVELOPE_AGENT_TOKEN is set, every CLI command is classified before it runs. Read-only commands run as before. Gated commands need every policy action listed for them in cli_token_gates.gated_commands, else agent_policy_denied_action. Operator-only commands (credentials, agents and policy, configuration, authentication, delivery routes, the dashboard server, and decisions that belong to a person) are refused with the new code operator_only_command. `envelope send` and `envelope draft send` also apply the agent's ceiling, recipient allowlist and human approval. New named actions: rules.write, rules.webhook, rules.batch_ack, sieve.publish, watch.webhook and unsubscribe; a \"*\" policy does not include them. An unknown or revoked token, or one that is not valid UTF-8, fails every command closed with agent_token_invalid. With no token the CLI is unchanged. See agent_identity.cli_token_gates.",
+                "One-time codes (BREAKING): `envelope code` accepts a code only when the receiving host's trusted Authentication-Results show dmarc=pass for the From domain, or, when DMARC did not fail, dkim=pass with a signing domain in the same registrable domain (Public Suffix List) as the From domain. Only results above the receiving host's first Received are trusted for a pass, so providers that write theirs below it, and Microsoft 365, report unverifiable. SPF alone never counts, and a message without exactly one From mailbox fails. Other arrivals never end the wait. Results carry sender_auth; when only rejected arrivals came the error is sender_unverifiable or sender_unauthenticated with rejected_candidates (sender and result only, never their codes). An operator can let an account accept senders whose provider records no usable authentication with `envelope config set otp.allow_unverified_senders <account>`; such a result reports sender_auth.result=unverifiable. Agents cannot change that setting. Plain-text `envelope code` now requires --from.",
                 "v3 (envelope.agent_contract.v3) is retained as historical documentation at docs/schemas/envelope.agent_contract.v3.json."
             ],
             "v3_changes": [
@@ -153,16 +241,33 @@ pub fn agent_contract() -> Value {
             "semantics": "Envelope resolves ENVELOPE_AGENT_TOKEN to a stored agent identity and enforces that agent's policy on every tool call. An unset/blank token fails MCP startup; a set-but-unknown/revoked token also fails startup and never falls back to anonymous. The raw token is shown exactly once at `envelope agent create` and is never stored, logged, or recoverable.",
             "cli_token_gates": {
                 "env": "ENVELOPE_AGENT_TOKEN",
-                "resolution": "With no (or a blank) token the CLI runs as the operator and behaves as before. A token for an active agent applies that agent's policy to the commands below. An unknown or revoked token fails those commands closed with error.code=agent_token_invalid; it never falls back to the operator. The token is never echoed.",
-                "send": "`envelope send` and `envelope draft send` require the `send` action for the account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
-                "actions": {
-                    "rules.webhook": "`envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
-                    "rules.batch_ack": "`envelope rule enable --acknowledge-batch-actions`",
-                    "sieve.publish": "`envelope rule publish-sieve --confirm`"
+                "resolution": "With no token, or a blank one, the CLI runs as the operator and behaves as before. Any other value must be the token of an active agent: an unknown or revoked token, or one that is not valid UTF-8, fails every command closed with error.code=agent_token_invalid before it runs and never falls back to the operator. The token is never echoed. `envelope mcp` checks the token at startup instead (see semantics).",
+                "classes": {
+                    "read_only": "Reads mail or local state. Runs under any active agent's token as it does for the operator. Every command not listed in gated_commands or operator_only_commands is read-only.",
+                    "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. Some gated commands then apply more of the policy (see send and actions).",
+                    "operator_only": "Changes credentials, agent identities or policy, configuration, authentication, delivery routes, or a decision that belongs to a person, or runs the dashboard server. Refused under any agent token with operator_only_command, whatever the policy grants. The operator runs it without the token, for example `env -u ENVELOPE_AGENT_TOKEN envelope config set ...`."
                 },
-                "explicit_grant": "rules.webhook, rules.batch_ack and sieve.publish must be named in the agent's allowed actions; a \"*\" policy does not include them. They are checked before any write or network call.",
-                "operator_only_settings": ["otp.allow_unverified_senders"],
-                "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. Codes: agent_policy_denied_action, agent_policy_denied_account, agent_token_invalid, or the send-policy codes for send and draft send.",
+                "gated_commands": cli_gated_commands(),
+                "operator_only_commands": CLI_OPERATOR_ONLY_COMMANDS,
+                "send": "`envelope send` and `envelope draft send` also check the `send` action for the resolved account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
+                "actions": {
+                    "rules.write": "`envelope rule create`, `rule enable`, `rule disable` and `rule delete`",
+                    "rules.webhook": "also needed by `envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
+                    "rules.batch_ack": "also needed by `envelope rule enable --acknowledge-batch-actions`",
+                    "sieve.publish": "`envelope rule publish-sieve --confirm`",
+                    "watch.webhook": "`envelope watch --webhook <url>`",
+                    "unsubscribe": "`envelope unsubscribe --confirm`"
+                },
+                "explicit_grant_actions": crate::commands::agent_context::EXPLICIT_GRANT_ACTIONS,
+                "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them.",
+                "scope": "Before dispatch only actions are checked. `send`, `draft send`, and the rule commands that need rules.webhook, rules.batch_ack or sieve.publish also check the account. Other commands do not apply the policy's account or folder lists.",
+                "denial_codes": [
+                    "agent_token_invalid",
+                    "operator_only_command",
+                    "agent_policy_denied_action",
+                    "agent_policy_denied_account"
+                ],
+                "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. `send` and `draft send` can also return the send-policy codes (outbound_safety.send_authority.denial_codes).",
                 "isolation": "These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator."
             },
             "policy_enforcement": {
@@ -400,6 +505,7 @@ fn surfaces() -> Value {
         vec![
             "MCP threat_show is read-only: it returns the stored verdict and never opens IMAP; status=not_scanned when none exists.",
             "The CLI scans (EXAMINE + BODY.PEEK[]) when no current verdict is stored.",
+            "Authentication signals use the receiving host's results as `envelope code` does: a pass the receiver did not provably write adds auth_unverifiable, and other headers claiming the receiving domain add ar_forged. Registrable domains (look-alike, link and alignment checks) follow the Public Suffix List.",
         ],
     ));
     items.push(surface_entry(
@@ -573,7 +679,9 @@ fn surfaces() -> Value {
         vec![
             "Watch/event payloads redact OTP value; envelope code may return it.",
             "JSON OTP automation requires explicit account and narrow sender binding: --account plus --from as an exact mailbox address or full domain. It collects matching candidates across a fixed 5-second stabilization window and returns error=ambiguous_matches with candidate_count if more than one candidate is seen; error=automation_binding_required rejects missing/broad binding before credentials or IMAP are opened. A timeout before stabilization returns error=timeout.",
-            "Sender authentication: a code counts only when the receiving mail host's trusted Authentication-Results show dmarc=pass for header.from equal to the From domain, or dkim=pass with header.d (else header.i) in the same registrable domain as the From domain. SPF alone never counts; a message without exactly one From mailbox fails. Only Authentication-Results the receiving host wrote count; copies elsewhere in the message are ignored.",
+            "Sender authentication: a code counts only when the receiving mail host's trusted Authentication-Results show dmarc=pass for header.from equal to the From domain, or dkim=pass with header.d (else header.i) in the same registrable domain as the From domain under the Public Suffix List. A dmarc=fail result is final: no DKIM pass overrides it. SPF alone never counts; a message without exactly one From mailbox fails. Domains compare in ASCII form, so a Unicode domain and its punycode spelling match, in --from too.",
+            "Trusted results: the receiving host is the one named by the first Received header from the top with a DNS host name, and only results whose authserv-id is in that host's registrable domain count. Authentication-Results or ARC-Authentication-Results above that Received line are the receiver's own. An Authentication-Results below it, before the first Received from another domain, could have come with the message: its failures count, and a pass there is unverifiable. Results anywhere else never count.",
+            "Microsoft 365 writes Authentication-Results without an authserv-id, so its results never count and its senders are unverifiable. Providers that write their results below their own Received line (Migadu, for one) are unverifiable on a pass. Those accounts need the operator opt-in below to accept codes.",
             "Arrivals that fail or cannot be verified never end the wait: Envelope keeps polling until --wait expires. An accepted code still waits out the stabilization window and wins over rejected arrivals; two accepted codes return ambiguous_matches. If only rejected arrivals came, the result is error=sender_unverifiable (a sender could not be verified) or error=sender_unauthenticated (every sender failed), with waited_seconds and rejected_candidates.",
             "Operator opt-in: `envelope config set otp.allow_unverified_senders <account>[,<account>...]` lets those accounts accept senders whose provider records no usable authentication; the result then reports sender_auth.result=unverifiable. A failed sender is never accepted. The setting is operator-only: it is refused under ENVELOPE_AGENT_TOKEN and has no MCP tool.",
             "--from is required in plain-text mode too; without it the command stops before credentials or IMAP are opened. Messages are read with BODY.PEEK[] and never marked read.",
@@ -1644,6 +1752,47 @@ mod tests {
         ] {
             assert!(notes.contains(needle), "otp notes must mention {needle}");
         }
+    }
+
+    #[test]
+    fn contract_v4_documents_token_mode_classes_and_receiver_results() {
+        use crate::commands::agent_context::EXPLICIT_GRANT_ACTIONS;
+        let contract = agent_contract();
+
+        let gates = &contract["agent_identity"]["cli_token_gates"];
+        assert_eq!(
+            gates["explicit_grant_actions"],
+            json!(EXPLICIT_GRANT_ACTIONS)
+        );
+        for action in EXPLICIT_GRANT_ACTIONS {
+            assert!(gates["actions"][action].is_string(), "{action}");
+        }
+        for class in ["read_only", "gated", "operator_only"] {
+            assert!(gates["classes"][class].is_string(), "{class}");
+        }
+        let codes = gates["denial_codes"].as_array().expect("denial_codes");
+        for code in [
+            "operator_only_command",
+            "agent_token_invalid",
+            "agent_policy_denied_action",
+        ] {
+            assert!(codes.iter().any(|c| c == code), "{code}");
+        }
+
+        let notes = surface("otp").unwrap()["compatibility_notes"].to_string();
+        assert!(!notes.contains("copies elsewhere"), "{notes}");
+        for needle in [
+            "first Received",
+            "ARC-Authentication-Results",
+            "dmarc=fail",
+            "Public Suffix List",
+            "Microsoft 365",
+            "punycode",
+        ] {
+            assert!(notes.contains(needle), "otp notes must mention {needle}");
+        }
+        let threat = surface("threat_show").unwrap()["compatibility_notes"].to_string();
+        assert!(threat.contains("auth_unverifiable"), "{threat}");
     }
 
     /// The published output schema of send, reply or send_draft.
