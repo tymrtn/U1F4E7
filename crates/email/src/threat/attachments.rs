@@ -68,6 +68,30 @@ pub const DANGEROUS_EXTENSIONS: &[&str] = &[
     "chm",
     "inf",
     "url",
+    // macOS: shell scripts Terminal runs, installers, disk images, apps,
+    // AppleScript, Automator, and Finder location files.
+    "command",
+    "terminal",
+    "tool",
+    "pkg",
+    "mpkg",
+    "app",
+    "dmg",
+    "scpt",
+    "scptd",
+    "applescript",
+    "workflow",
+    "action",
+    "prefpane",
+    "saver",
+    "fileloc",
+    "inetloc",
+    "webloc",
+];
+/// macOS bundles: folders that open as one program, so inside an archive
+/// the name is on a folder, never on the files.
+const BUNDLE_EXTENSIONS: &[&str] = &[
+    "app", "pkg", "mpkg", "scptd", "workflow", "action", "prefpane", "saver",
 ];
 const MACRO_EXTENSIONS: &[&str] = &[
     "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppsm", "sldm",
@@ -173,6 +197,15 @@ fn inspect_zip(bytes: &[u8]) -> ZipFinding {
                 || MACRO_EXTENSIONS.contains(&ext.as_str()))
         {
             return ZipFinding::DangerousMember(ext.clone());
+        }
+        let mut folders: Vec<&str> = member.name().split('/').collect();
+        folders.pop();
+        if let Some(ext) = folders
+            .iter()
+            .filter_map(|folder| extensions(folder).into_iter().next())
+            .find(|ext| BUNDLE_EXTENSIONS.contains(&ext.as_str()))
+        {
+            return ZipFinding::DangerousMember(ext);
         }
     }
     if zip.len() > MAX_ZIP_MEMBERS {
@@ -353,6 +386,29 @@ mod tests {
 
         let s = analyze_attachment(&att("payload.js", "text/plain", b"var x"));
         assert_eq!(codes(&s), vec!["dangerous_extension"]);
+    }
+
+    #[test]
+    fn macos_executables_are_malware() {
+        for name in ["Setup.dmg", "run.command", "update.pkg", "Invoice.scpt"] {
+            let s = analyze_attachment(&att(name, "application/octet-stream", b"x"));
+            assert_eq!(codes(&s), vec!["dangerous_extension"], "{name}");
+        }
+        let s = analyze_attachment(&att("invoice.pdf.command", "application/pdf", b"#!/bin/sh"));
+        assert_eq!(codes(&s), vec!["double_extension"]);
+
+        // An app bundle travels zipped, as a folder of files.
+        let app = zip_with(
+            &[("Invoice.app/Contents/MacOS/Invoice", b"\xcf\xfa\xed\xfe")],
+            false,
+        );
+        let s = analyze_attachment(&att("Invoice.zip", "application/zip", &app));
+        assert_eq!(codes(&s), vec!["archive_dangerous_member"]);
+        assert!(s[0].evidence.starts_with("member ext=.app"));
+
+        // A folder named like a Windows extension is only a folder.
+        let site = zip_with(&[("example.com/report.pdf", b"%PDF")], false);
+        assert!(analyze_attachment(&att("site.zip", "application/zip", &site)).is_empty());
     }
 
     #[test]
