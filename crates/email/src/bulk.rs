@@ -476,13 +476,12 @@ async fn execute_tag(
             }
         };
 
-        let Some(message_id) = msg.message_id.as_deref() else {
-            failed.push(BulkFailure {
-                uid: *uid,
-                code: "no_message_id".to_string(),
-                reason: format!("message UID {uid} has no Message-ID header"),
-            });
-            continue;
+        let message_id = match tag_key(*uid, folder, msg.message_id.as_deref()) {
+            Ok(key) => key,
+            Err(failure) => {
+                failed.push(failure);
+                continue;
+            }
         };
 
         match db.add_tag(account_id, message_id, tag, Some(*uid as i64), Some(folder)) {
@@ -504,9 +503,43 @@ async fn execute_tag(
     })
 }
 
+/// The key a bulk tag is stored under for the message at `uid`: its usable
+/// Message-ID ([`crate::threat::usable_message_id`]), as `tag set` keys it.
+fn tag_key<'a>(
+    uid: u32,
+    folder: &str,
+    message_id: Option<&'a str>,
+) -> Result<&'a str, BulkFailure> {
+    let failure = |reason: String| BulkFailure {
+        uid,
+        code: "no_message_id".to_string(),
+        reason,
+    };
+    let message_id =
+        message_id.ok_or_else(|| failure(format!("message UID {uid} has no Message-ID header")))?;
+    crate::threat::usable_message_id(message_id).ok_or_else(|| {
+        failure(format!(
+            "message UID {uid} in {folder} has no usable Message-ID ({message_id})"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_tags_use_the_key_tag_set_uses() {
+        assert_eq!(
+            tag_key(1, "INBOX", Some("<a@b.example>")),
+            Ok("a@b.example")
+        );
+        for unusable in ["fp:v2:00", "<>", "a@b c@d"] {
+            let failure = tag_key(2, "INBOX", Some(unusable)).unwrap_err();
+            assert_eq!(failure.code, "no_message_id", "{unusable}");
+        }
+        assert_eq!(tag_key(3, "INBOX", None).unwrap_err().code, "no_message_id");
+    }
 
     #[test]
     fn coalesce_contiguous_and_gaps() {
