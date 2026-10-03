@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.15] — 2026-10-03
+
+A fix to how MCP `send_draft` applies an agent's send policy.
+
 ### Fixed
 
 - MCP `send_draft` now stops when the agent's send policy denies a send, and an `allowlisted-send` policy admits only the recipients on that agent's allowlist.
