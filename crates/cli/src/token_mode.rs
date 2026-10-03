@@ -123,7 +123,14 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
         },
         Commands::Evidence { subcommand } => match subcommand {
             EvidenceCmd::Collect { .. } | EvidenceCmd::Verify { .. } => ReadOnly,
-            EvidenceCmd::Attachment(EvidenceAttachmentCmd::Export { .. }) => ReadOnly,
+            // --unsafe overrides the threat engine's attachment block.
+            EvidenceCmd::Attachment(EvidenceAttachmentCmd::Export { allow_unsafe, .. }) => {
+                if *allow_unsafe {
+                    OperatorOnly
+                } else {
+                    ReadOnly
+                }
+            }
         },
         Commands::Deliverability { subcommand } => match subcommand {
             DeliverabilityCmd::Check { .. } => ReadOnly,
@@ -394,6 +401,10 @@ mod tests {
         (
             "evidence attachment export --account a --uid 1 --out /x",
             ReadOnly,
+        ),
+        (
+            "evidence attachment export --account a --uid 1 --out /x --unsafe",
+            OperatorOnly,
         ),
         ("deliverability check --domain example.test", ReadOnly),
         ("attachment list 1", ReadOnly),

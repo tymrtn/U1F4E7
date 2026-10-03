@@ -98,6 +98,7 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "migrate run",
     "backup restore",
     "attachment download --unsafe",
+    "evidence attachment export --unsafe",
     "serve",
     "license activate",
     "license status",

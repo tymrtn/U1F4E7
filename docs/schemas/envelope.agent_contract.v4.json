@@ -177,6 +177,7 @@
         "migrate run",
         "backup restore",
         "attachment download --unsafe",
+        "evidence attachment export --unsafe",
         "serve",
         "license activate",
         "license status",

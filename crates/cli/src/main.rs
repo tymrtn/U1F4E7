@@ -1842,6 +1842,9 @@ pub enum EvidenceAttachmentCmd {
         /// Extract plain text from DOCX/text attachments alongside originals
         #[arg(long)]
         extract_text: bool,
+        /// Write the bytes even when the threat engine flags them as malware
+        #[arg(long = "unsafe")]
+        allow_unsafe: bool,
     },
 }
 

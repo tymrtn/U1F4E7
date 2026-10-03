@@ -279,6 +279,8 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
     let account = f.account;
     let restore_dir = f.home().join("no-archive");
     let restore_dir = restore_dir.to_str().unwrap();
+    let export_dir = f.home().join("no-export");
+    let export_dir = export_dir.to_str().unwrap();
     [
         vec!["agent", "create", "minted"],
         vec!["agent", "revoke", "skippy"],
@@ -401,6 +403,18 @@ fn operator_only_commands(f: &Fixture) -> Vec<Vec<String>> {
             "--unsafe",
             "--account",
             account,
+        ],
+        vec![
+            "evidence",
+            "attachment",
+            "export",
+            "--account",
+            account,
+            "--uid",
+            "1",
+            "--out",
+            export_dir,
+            "--unsafe",
         ],
     ]
     .into_iter()
