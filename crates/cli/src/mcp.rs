@@ -1600,7 +1600,7 @@ async fn handle_send_draft(
     // send_now, and confirm_send_now. This mirrors handle_send/handle_reply:
     // a draft-only decision yields a non-sent status=drafted outcome referencing
     // the already-existing draft (no new draft is created, no SMTP is reached).
-    if ctx.is_some() {
+    if let Some(agent) = ctx {
         let db = Database::open_default().map_err(|e| e.to_string())?;
         let draft = db
             .get_draft(id)
@@ -1608,15 +1608,17 @@ async fn handle_send_draft(
             .ok_or_else(|| format!("draft not found: {id}"))?;
         // send_draft's confirm flags express full send intent, so the requested
         // mode is the maximal one; the ceiling clamps it down. A draft-only
-        // ceiling therefore blocks; any looser ceiling passes through to the
-        // normal Governor-gated dispatch below.
+        // ceiling yields a draft and a denial stops the call; only an allowed
+        // decision passes through to the normal Governor-gated dispatch below.
         let send_mode = clamp_mode(ctx, SendMode::AutonomousSend);
         let policy_input = SendPolicyInput {
             to: &draft.to_addr,
             cc: draft.cc_addr.as_deref(),
             bcc: draft.bcc_addr.as_deref(),
             confirm_send,
-            allow_recipients: &[],
+            // send_draft takes no per-call allowlist: an allowlisted-send
+            // ceiling admits only the agent's stored recipient allowlist.
+            allow_recipients: &agent.policy.allow_recipients,
         };
         let decision = evaluate(send_mode, &policy_input);
         record_send_policy_event(
@@ -1627,12 +1629,25 @@ async fn handle_send_draft(
             &policy_input,
             agent_context::agent_id_of(ctx),
         )?;
-        if matches!(decision, SendPolicyDecision::DraftOnly) {
-            return Ok(crate::commands::contract::send_body::mcp_drafted(
-                json!(send_mode),
-                &draft.id,
-                ui::draft_ui(&draft.account_id, &draft.id),
-            ));
+        match decision {
+            SendPolicyDecision::Allowed => {}
+            SendPolicyDecision::DraftOnly => {
+                return Ok(crate::commands::contract::send_body::mcp_drafted(
+                    json!(send_mode),
+                    &draft.id,
+                    ui::draft_ui(&draft.account_id, &draft.id),
+                ));
+            }
+            SendPolicyDecision::Denied(denial) => {
+                return Err(json!({
+                    "status": "denied",
+                    "error": denial,
+                    "send_mode": send_mode,
+                    "draft_id": draft.id,
+                    "ui": ui::draft_ui(&draft.account_id, &draft.id),
+                })
+                .to_string());
+            }
         }
     }
 

@@ -1123,6 +1123,159 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
     );
 }
 
+/// Give an agent the `send` action, an `allowlisted-send` ceiling, and a stored
+/// recipient allowlist (comma-separated email/@domain patterns).
+fn set_allowlisted_send_policy(home: &std::path::Path, name: &str, recipients: &str) {
+    let out = run_cli(
+        home,
+        &[
+            "agent",
+            "policy",
+            "set",
+            name,
+            "--allow-accounts",
+            "*",
+            "--allow-folders",
+            "*",
+            "--allow-actions",
+            "send",
+            "--send-mode-ceiling",
+            "allowlisted-send",
+            "--allow-recipients",
+            recipients,
+        ],
+        None,
+    );
+    assert!(out.status.success(), "policy set failed");
+}
+
+/// The draft's send schedule and status, read straight from the store.
+fn draft_schedule(home: &std::path::Path, draft_id: &str) -> (Option<String>, String) {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let draft = db
+        .get_draft(draft_id)
+        .expect("read draft")
+        .expect("draft exists");
+    (draft.send_after, draft.status.as_str().to_string())
+}
+
+/// The send-policy event types recorded for an agent, oldest first.
+fn send_policy_events(home: &std::path::Path, agent_id: &str) -> Vec<String> {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT event_type FROM events WHERE agent_id = ?1 AND event_type LIKE 'send_policy.%' ORDER BY created_at",
+        )
+        .expect("prepare events query");
+    stmt.query_map([agent_id], |row| row.get::<_, String>(0))
+        .expect("query events")
+        .map(|r| r.expect("event row"))
+        .collect()
+}
+
+fn confirmed_send_draft(draft_id: &str) -> Value {
+    json!({
+        "draft_id": draft_id,
+        "attributes": ["informational"],
+        "confirm_send": true
+    })
+}
+
+#[test]
+fn send_draft_allowlisted_denies_unlisted_and_never_queues() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, agent_id) = create_agent(home, "skippy");
+    set_allowlisted_send_policy(home, "skippy", "ok@example.test");
+    let draft_id = create_local_draft(home, "stranger@example.test");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send_draft",
+        confirmed_send_draft(&draft_id),
+    );
+
+    assert!(is_error, "a policy denial is a tool error: {payload}");
+    assert_eq!(payload["status"], "denied", "{payload}");
+    assert_eq!(
+        payload["error"]["code"], "send_recipient_not_allowlisted",
+        "{payload}"
+    );
+    assert_eq!(payload["send_mode"], "allowlisted-send", "{payload}");
+    assert_eq!(payload["draft_id"], draft_id.as_str(), "{payload}");
+    let (send_after, status) = draft_schedule(home, &draft_id);
+    assert_eq!(send_after, None, "a denied draft must never be queued");
+    assert_eq!(status, "draft");
+    assert_eq!(
+        send_policy_events(home, &agent_id),
+        vec!["send_policy.denied".to_string()]
+    );
+}
+
+#[test]
+fn send_draft_allowlisted_admits_listed_recipient() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, agent_id) = create_agent(home, "skippy");
+    set_allowlisted_send_policy(home, "skippy", "ok@example.test");
+    let draft_id = create_local_draft(home, "ok@example.test");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send_draft",
+        confirmed_send_draft(&draft_id),
+    );
+
+    // Admitted by the stored allowlist, then the default outbox cooldown queues it.
+    assert!(!is_error, "a listed recipient must be admitted: {payload}");
+    assert_eq!(payload["status"], "scheduled", "{payload}");
+    assert_eq!(payload["draft_id"], draft_id.as_str(), "{payload}");
+    let (send_after, _status) = draft_schedule(home, &draft_id);
+    assert!(
+        send_after.is_some(),
+        "an admitted draft queues for the sweep"
+    );
+    assert_eq!(
+        send_policy_events(home, &agent_id),
+        vec!["send_policy.allowed".to_string()],
+        "the policy itself must admit the recipient"
+    );
+}
+
+#[test]
+fn send_draft_denied_decision_never_queues() {
+    // A recipient that cannot be parsed is a different denial than an unlisted
+    // one; every denial must stop the send the same way.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_allowlisted_send_policy(home, "skippy", "ok@example.test");
+    let draft_id = create_local_draft(home, "not-an-address");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send_draft",
+        confirmed_send_draft(&draft_id),
+    );
+
+    assert!(is_error, "a policy denial is a tool error: {payload}");
+    assert_eq!(payload["status"], "denied", "{payload}");
+    assert_eq!(
+        payload["error"]["code"], "send_recipient_parse_failed",
+        "{payload}"
+    );
+    let (send_after, status) = draft_schedule(home, &draft_id);
+    assert_eq!(send_after, None, "a denied draft must never be queued");
+    assert_eq!(status, "draft");
+}
+
 /// A send_draft whose earlier attempt may have been delivered returns
 /// `status: "delivery_uncertain"` as a normal result, as the CLI exits 0: the
 /// agent must read `status` and must not treat the draft as sent.
