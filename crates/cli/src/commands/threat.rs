@@ -299,16 +299,20 @@ pub async fn run_mark_safe(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
-    let recorded =
-        persist::stored_verdict_for_uid(&db, &account_id, folder, uid)?.and_then(|s| s.message_id);
-    let message_id = match recorded {
-        Some(mid) => mid,
+    // The mark binds to content: the fingerprint the UID's verdict recorded,
+    // else that of the message's bytes.
+    let recorded = persist::stored_verdict_for_uid(&db, &account_id, folder, uid)?
+        .and_then(|s| Some((s.message_id?, s.content_fingerprint?)));
+    let (message_id, fingerprint) = match recorded {
+        Some(identity) => identity,
         None => {
             let mut client = imap::connect(&creds)
                 .await
                 .context("IMAP connection failed")?;
-            message_id_of(&fetch_raw(&mut client, folder, uid).await?)
-                .ok_or_else(|| anyhow!("UID {uid} in {folder} has no Message-ID to tag"))?
+            let raw = fetch_raw(&mut client, folder, uid).await?;
+            let message_id = message_id_of(&raw)
+                .ok_or_else(|| anyhow!("UID {uid} in {folder} has no Message-ID to tag"))?;
+            (message_id, threat::content_fingerprint(&raw))
         }
     };
     persist::mark_safe(
@@ -318,7 +322,7 @@ pub async fn run_mark_safe(
             folder,
             uid,
             message_id: Some(&message_id),
-            content_fingerprint: None,
+            content_fingerprint: Some(&fingerprint),
         },
         "cli",
         None,

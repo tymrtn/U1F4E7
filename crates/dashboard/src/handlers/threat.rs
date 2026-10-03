@@ -128,20 +128,91 @@ pub async fn show(
     }
 }
 
-/// `POST /api/accounts/{id}/messages/{uid}/threat/mark-safe`.
+/// `POST /api/accounts/{id}/messages/{uid}/threat/mark-safe`. Mark safe is
+/// bound to the message's content, so this reads the message (read-only
+/// fetch) and marks those bytes.
 pub async fn mark_safe(
     State(state): State<AppState>,
     Path((account_id, uid)): Path<(String, u32)>,
     Query(q): Query<FolderQuery>,
 ) -> Response {
+    // Nothing to override: answer before opening a mailbox connection.
+    {
+        let db = state.db.lock().await;
+        match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    "not_scanned",
+                    "this message has no threat verdict to override",
+                );
+            }
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store_error",
+                    format!("{e:#}"),
+                );
+            }
+        }
+    }
+    let (client_arc, creds) = match state.get_or_create_imap(&account_id).await {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "imap_error", format!("{e:#}")),
+    };
+    let raw = {
+        let mut client = client_arc.lock().await;
+        envelope_email_transport::imap::fetch_raw_message(&mut client, &q.folder, uid).await
+    };
+    let raw = match raw {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "message not found"),
+        Err(e) => {
+            state.evict_imap(&account_id).await;
+            return error(StatusCode::BAD_GATEWAY, "imap_error", format!("{e}"));
+        }
+    };
     let db = state.db.lock().await;
-    let stored = match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
+    mark_safe_message(
+        &db,
+        &account_id,
+        &creds.account.username,
+        &q.folder,
+        uid,
+        &raw,
+    )
+}
+
+/// Mark safe the message whose bytes are `raw` at folder/UID. The mark is
+/// bound to their fingerprint and needs a stored verdict that judged them;
+/// when the verdict on file is for other content the answer is
+/// `rescan_required`.
+pub fn mark_safe_message(
+    db: &Database,
+    account_id: &str,
+    account_address: &str,
+    folder: &str,
+    uid: u32,
+    raw: &[u8],
+) -> Response {
+    let message_id = persist::raw_message_id(raw, account_address);
+    let fingerprint = threat::content_fingerprint(raw);
+    let matched = persist::matching_verdict(
+        db,
+        account_id,
+        folder,
+        uid,
+        message_id.as_deref(),
+        &fingerprint,
+    );
+    let stored = match matched {
         Ok(Some(stored)) => stored,
         Ok(None) => {
             return error(
                 StatusCode::CONFLICT,
-                "not_scanned",
-                "this message has no threat verdict to override",
+                persist::RESCAN_REQUIRED,
+                "the stored verdict is for different content; open the message to scan it",
             );
         }
         Err(e) => {
@@ -152,7 +223,7 @@ pub async fn mark_safe(
             );
         }
     };
-    let Some(message_id) = stored.message_id.as_deref() else {
+    let Some(message_id) = message_id.as_deref() else {
         return error(
             StatusCode::CONFLICT,
             "no_message_id",
@@ -160,21 +231,21 @@ pub async fn mark_safe(
         );
     };
     let target = VerdictTarget {
-        account_id: &account_id,
-        folder: &q.folder,
+        account_id,
+        folder,
         uid,
         message_id: Some(message_id),
-        content_fingerprint: None,
+        content_fingerprint: Some(&fingerprint),
     };
-    if let Err(e) = persist::mark_safe(&db, &target, "reader", None) {
+    if let Err(e) = persist::mark_safe(db, &target, "reader", None) {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store_error",
             format!("{e:#}"),
         );
     }
-    Json(json!({"status": "marked_safe", "threat": stored_view(&db, &account_id, &stored)}))
-        .into_response()
+    let view = verdict_view(db, account_id, Some(message_id), &stored.verdict);
+    Json(json!({"status": "marked_safe", "threat": view})).into_response()
 }
 
 /// `POST /api/accounts/{id}/messages/{uid}/threat/report` — a draft to

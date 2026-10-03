@@ -3,8 +3,10 @@
 //
 // Threat engine through the real dashboard router: the draft-upload
 // chokepoint refuses malware bytes with the stable `attachment_blocked` code,
-// and the banner's verdict / Mark safe endpoints read and write only the
-// local store (no IMAP).
+// and the banner's verdict endpoint reads only the local store (no IMAP).
+// Mark safe reads the message's bytes from IMAP before marking, so these
+// tests drive it through `mark_safe_message` with the bytes, and through the
+// router only where it answers before any IMAP connection.
 
 use axum::Router;
 use axum::body::Body;
@@ -12,6 +14,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use envelope_email_dashboard::dashboard_router;
+use envelope_email_dashboard::handlers::threat::mark_safe_message;
 use envelope_email_dashboard::state::AppState;
 use envelope_email_store::models::IndexedMessageInput;
 use envelope_email_store::{CredentialBackend, Database, Draft};
@@ -97,6 +100,27 @@ async fn mint_csrf(app: &Router) -> String {
     json["token"].as_str().unwrap().to_string()
 }
 
+/// Mark safe the bytes at INBOX `uid`, as the handler does after fetching them.
+async fn mark_bytes_safe(
+    db: &tokio::sync::Mutex<Database>,
+    uid: u32,
+    raw: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let response = mark_safe_message(
+        &*db.lock().await,
+        "acc1",
+        "me@example.org",
+        "INBOX",
+        uid,
+        raw,
+    );
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn send(
     app: &Router,
     method: &str,
@@ -176,7 +200,7 @@ async fn draft_upload_refuses_malware_with_attachment_blocked() {
 }
 
 #[tokio::test]
-async fn banner_verdict_and_mark_safe_use_only_the_local_store() {
+async fn banner_verdict_uses_only_the_local_store_and_mark_safe_marks_its_bytes() {
     let (state, _) = state();
     let db = state.db.clone();
     let app = dashboard_router(state);
@@ -212,15 +236,7 @@ async fn banner_verdict_and_mark_safe_use_only_the_local_store() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["threat"].is_null());
 
-    let token = mint_csrf(&app).await;
-    let (status, body) = send(
-        &app,
-        "POST",
-        "/api/accounts/acc1/messages/7/threat/mark-safe",
-        Some(&token),
-        None,
-    )
-    .await;
+    let (status, body) = mark_bytes_safe(&db, 7, PHISH).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["threat"]["marked_safe"], true);
     let tags: Vec<String> = db
@@ -233,6 +249,8 @@ async fn banner_verdict_and_mark_safe_use_only_the_local_store() {
         .collect();
     assert_eq!(tags, vec![threat::TAG_FALSE_POSITIVE.to_string()]);
 
+    // No verdict at UID 8: refused before any IMAP connection.
+    let token = mint_csrf(&app).await;
     let (status, body) = send(
         &app,
         "POST",
@@ -284,6 +302,16 @@ async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["threat"].is_null(), "{body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/accounts/acc1/messages/9/threat/mark-safe?folder=INBOX",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "not_scanned");
 
     // Opening UID 9 matches its bytes to the verdict scanned at UID 7.
     let opened = envelope_email_dashboard::handlers::threat::verdict_for_open(
@@ -299,14 +327,7 @@ async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
     .unwrap();
     assert_eq!(opened["level"], "dangerous", "{opened}");
 
-    let (status, body) = send(
-        &app,
-        "POST",
-        "/api/accounts/acc1/messages/9/threat/mark-safe?folder=INBOX",
-        Some(&token),
-        None,
-    )
-    .await;
+    let (status, body) = mark_bytes_safe(&db, 9, PHISH).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "marked_safe");
     assert_eq!(body["threat"]["marked_safe"], true);
