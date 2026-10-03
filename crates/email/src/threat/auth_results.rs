@@ -216,11 +216,17 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
     if strip_comments_and_quotes(&value).is_none() {
         // The receiver's header cannot be parsed. Its failures still count,
         // read token by token; a pass never does.
-        for (method, code, weight) in [
-            ("dmarc", "dmarc_fail", DMARC_FAIL),
-            ("dkim", "dkim_fail", DKIM_FAIL),
+        for (method, code, weight, failures) in [
+            (
+                "dmarc",
+                "dmarc_fail",
+                DMARC_FAIL,
+                &["fail", "permerror"][..],
+            ),
+            ("dkim", "dkim_fail", DKIM_FAIL, &["fail", "permerror"][..]),
+            ("spf", "spf_fail", SPF_FAIL, &["fail"][..]),
         ] {
-            if let Some(result) = lenient_failure(&value, method) {
+            if let Some(result) = lenient_failure(&value, method, failures) {
                 signals.push(Signal::new(
                     code,
                     weight,
@@ -295,33 +301,47 @@ pub fn authserv_id(value: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_lowercase())
 }
 
-/// A `<method>=fail` or `<method>=permerror` token anywhere in `value`, read
-/// without parsing. Used only on a header that cannot be parsed: a failure
-/// found this way can only make a verdict stricter.
-fn lenient_failure(value: &str, method: &str) -> Option<&'static str> {
-    let tokens: Vec<String> = value
-        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '(' | ')' | '"'))
-        .map(str::to_lowercase)
-        .collect();
-    ["fail", "permerror"]
-        .into_iter()
-        .find(|result| tokens.contains(&format!("{method}={result}")))
+/// The first of `failures` that `value` reports for `method`, read without
+/// parsing: `<method>[/<version>]=<result>` at a keyword boundary, with
+/// spacing allowed around `/` and `=`. Used only on a header that cannot be
+/// parsed: a failure found this way can only make a verdict stricter.
+fn lenient_failure(value: &str, method: &str, failures: &[&'static str]) -> Option<&'static str> {
+    let text = value.to_ascii_lowercase();
+    let keyword_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mut reported = Vec::new();
+    for (at, _) in text.match_indices(method) {
+        if text[..at].chars().next_back().is_some_and(keyword_char) {
+            continue;
+        }
+        let mut rest = text[at + method.len()..].trim_start();
+        if let Some(version) = rest.strip_prefix('/') {
+            rest = version
+                .trim_start()
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start();
+        }
+        let Some(result) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let result: String = result
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        reported.push(result);
+    }
+    failures
+        .iter()
+        .copied()
+        .find(|failure| reported.iter().any(|result| result == failure))
 }
 
 /// `(method, result)` pairs after the authserv-id, lowercased. A header
 /// with a comment or quoted string left open has none.
 pub fn method_results(value: &str) -> Vec<(String, String)> {
-    let cleaned = strip_comments_and_quotes(value).unwrap_or_default();
-    cleaned
-        .split(';')
-        .skip(1)
-        .filter_map(|clause| {
-            let clause = clause.trim();
-            let (method, rest) = clause.split_once('=')?;
-            let method = method.trim().to_lowercase();
-            let result = rest.split_whitespace().next()?.trim().to_lowercase();
-            Some((method, result))
-        })
+    method_clauses(value)
+        .into_iter()
+        .map(|clause| (clause.method, clause.result))
         .collect()
 }
 
@@ -476,12 +496,13 @@ pub fn method_clauses(value: &str) -> Vec<MethodClause> {
         .split(';')
         .skip(1)
         .filter_map(|clause| {
-            let mut tokens = clause.split_whitespace();
-            let (method, result) = tokens.next()?.split_once('=')?;
+            // `method[/version] = result`, spacing allowed around `/` and `=`.
+            let (method, rest) = clause.split_once('=')?;
             let method = method.split('/').next()?.trim().to_lowercase();
+            let mut tokens = rest.split_whitespace();
             let mut parsed = MethodClause {
                 method,
-                result: result.trim().to_lowercase(),
+                result: tokens.next()?.to_lowercase(),
                 header_from: None,
                 header_d: None,
                 header_i: None,
@@ -1039,6 +1060,57 @@ mod tests {
         );
         assert_eq!(codes(&analyze(&silent)), vec!["auth_unverifiable"]);
         assert_eq!(sender_auth(&silent), SenderAuth::Fail);
+    }
+
+    #[test]
+    fn spacing_and_method_versions_do_not_hide_a_failure() {
+        let migadu = |ar: &str| {
+            received_by(
+                "migadu.com",
+                &[
+                    MIGADU_LMTP,
+                    "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q3; Mon, 28 Sep 2026 04:43:18 +0000",
+                    ar,
+                    "From: Bank <alerts@bank.example>",
+                ],
+                "hi",
+            )
+        };
+        // An unclosed comment: only the failures-only scan reads these.
+        for (results, expected) in [
+            ("dmarc = fail header.from=bank.example", "dmarc_fail"),
+            ("dmarc/1=fail header.from=bank.example", "dmarc_fail"),
+            ("dmarc / 1 = permerror", "dmarc_fail"),
+            ("dkim = fail header.d=bank.example", "dkim_fail"),
+            ("spf = fail smtp.mailfrom=a@evil.example", "spf_fail"),
+        ] {
+            let input = migadu(&format!(
+                "Authentication-Results: mx13.migadu.com; {results}; spf=pass (mx13.migadu.com: domain of a(b@evil.example"
+            ));
+            assert_eq!(
+                codes(&analyze(&input)),
+                vec![expected, "auth_unverifiable"],
+                "{results}"
+            );
+        }
+        // A keyword that only ends in a method name is another method.
+        let input = migadu(
+            "Authentication-Results: mx13.migadu.com; x-dmarc=fail; spf=pass (a(b@evil.example",
+        );
+        assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+
+        // A parseable header reads them the same way.
+        for results in [
+            "dmarc = fail header.from=bank.example; dkim=pass header.d=bank.example",
+            "dmarc/1=fail header.from=bank.example; dkim=pass header.d=bank.example",
+        ] {
+            let headers = gmail_delivery(results, results, &[]);
+            assert_eq!(gmail_auth(&headers), SenderAuth::Fail, "{results}");
+            let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+            let mut input = input_from(&refs, "hi");
+            input.receiver_domain = Some("google.com".to_string());
+            assert_eq!(codes(&analyze(&input)), vec!["dmarc_fail"], "{results}");
+        }
     }
 
     #[test]
