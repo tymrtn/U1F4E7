@@ -314,7 +314,7 @@ async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
         "me@example.org",
         "INBOX",
         9,
-        Some(PHISH),
+        persist::Opened::Whole(PHISH),
         &ThreatConfig::default(),
     )
     .unwrap()
@@ -359,7 +359,7 @@ async fn mark_safe_binds_to_the_bytes_at_that_uid() {
         "me@example.org",
         "INBOX",
         8,
-        Some(&resend),
+        persist::Opened::Whole(&resend),
         &ThreatConfig::default(),
     )
     .unwrap()
@@ -414,7 +414,7 @@ To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
                 "me@example.org",
                 "INBOX",
                 uid,
-                Some(raw),
+                persist::Opened::Whole(raw),
                 &ThreatConfig::default(),
             )
             .unwrap()

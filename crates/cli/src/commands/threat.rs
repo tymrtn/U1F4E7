@@ -15,7 +15,7 @@ use envelope_email_transport::rule_exec::{
     ActionAttribution, ActionSource, ImapRuleMailbox, MessageTarget, RunAccount, execute_action,
 };
 use envelope_email_transport::rules::{Action, MessageContext};
-use envelope_email_transport::threat::persist::{self, StoredVerdict, VerdictTarget};
+use envelope_email_transport::threat::persist::{self, Opened, StoredVerdict, VerdictTarget};
 use envelope_email_transport::threat::rdap;
 use envelope_email_transport::threat::report::{self, AbuseOutcome};
 use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig};
@@ -41,8 +41,25 @@ async fn fetch_raw(client: &mut ImapClient, folder: &str, uid: u32) -> Result<Ve
         .ok_or_else(|| anyhow!("message UID {uid} not found in {folder}"))
 }
 
-/// The current verdict for a UID, scanning when none is stored or the engine
-/// changed since.
+/// The stored verdict `threat show` serves for the message at folder/UID,
+/// whose bytes are `raw`: the one that judged these bytes with the current
+/// engine, else none and a scan is due.
+fn current_stored(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    raw: &[u8],
+) -> Result<Option<StoredVerdict>> {
+    Ok(
+        persist::stored_verdict_for(db, account_id, folder, uid, Opened::Whole(raw))?
+            .filter(|stored| !persist::needs_scan(Some(&stored.verdict))),
+    )
+}
+
+/// The current verdict for the message at a UID, scanning when no stored
+/// verdict judged its bytes or the engine changed since. A message that
+/// cannot be read whole (over the size cap) shows none.
 async fn current_verdict(
     db: &Database,
     creds: &envelope_email_store::AccountWithCredentials,
@@ -51,15 +68,14 @@ async fn current_verdict(
     config: &ThreatConfig,
 ) -> Result<StoredVerdict> {
     let account_id = creds.account.id.as_str();
-    if let Some(stored) = persist::stored_verdict_for_uid(db, account_id, folder, uid)?
-        && !persist::needs_scan(Some(&stored.verdict))
-    {
-        return Ok(stored);
-    }
-    require_enabled(config)?;
     let mut client = imap::connect(creds)
         .await
         .context("IMAP connection failed")?;
+    let raw = fetch_raw(&mut client, folder, uid).await?;
+    if let Some(stored) = current_stored(db, account_id, folder, uid, &raw)? {
+        return Ok(stored);
+    }
+    require_enabled(config)?;
     let account = RunAccount {
         id: account_id,
         email: &creds.account.username,
@@ -109,7 +125,7 @@ pub(crate) fn verdict_for_read(
     creds: &envelope_email_store::AccountWithCredentials,
     folder: &str,
     uid: u32,
-    raw: Option<&[u8]>,
+    opened: Opened<'_>,
 ) -> Result<Option<threat::ThreatVerdict>> {
     let config = load_config()?;
     persist::verdict_on_open(
@@ -118,7 +134,7 @@ pub(crate) fn verdict_for_read(
         &creds.account.username,
         folder,
         uid,
-        raw,
+        opened,
         &config,
     )
 }
@@ -613,10 +629,26 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
 --b\r\nContent-Type: application/octet-stream\r\n\
 Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--\r\n";
-        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(clean), &config)
-            .unwrap();
-        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 2, Some(phish), &config)
-            .unwrap();
+        persist::verdict_on_open(
+            &db,
+            "a",
+            "me@example.org",
+            "INBOX",
+            1,
+            Opened::Whole(clean),
+            &config,
+        )
+        .unwrap();
+        persist::verdict_on_open(
+            &db,
+            "a",
+            "me@example.org",
+            "INBOX",
+            2,
+            Opened::Whole(phish),
+            &config,
+        )
+        .unwrap();
         persist::mark_safe(
             &db,
             &VerdictTarget {
@@ -644,18 +676,45 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
         );
     }
 
-    /// UID 1 held `a@x`, whose verdict is on file there; it now holds
-    /// another message.
+    /// The message UID 1 held when it was scanned, and the one it holds now
+    /// (the UID was reused).
+    const OLD: &[u8] = b"Message-ID: <a@x>\r\nFrom: Alice <alice@partner.example>\r\n\
+To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
+    const NOW: &[u8] = b"Message-ID: <b@x>\r\nFrom: Bob <bob@partner.example>\r\n\
+To: me@example.org\r\nSubject: Hi\r\n\r\nFriday?\r\n";
+
+    /// Scans `raw` at INBOX UID 1.
+    fn open_at_uid_1(db: &Database, raw: &[u8]) {
+        let config = ThreatConfig::default();
+        persist::verdict_on_open(
+            db,
+            "a",
+            "me@example.org",
+            "INBOX",
+            1,
+            Opened::Whole(raw),
+            &config,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn threat_show_never_serves_the_verdict_left_by_another_message_at_the_uid() {
+        let db = Database::open_memory().unwrap();
+        open_at_uid_1(&db, OLD);
+
+        let shown = current_stored(&db, "a", "INBOX", 1, NOW).unwrap();
+
+        assert!(shown.is_none(), "{shown:?}");
+        let own = current_stored(&db, "a", "INBOX", 1, OLD).unwrap();
+        assert_eq!(own.unwrap().message_id.as_deref(), Some("a@x"));
+    }
+
     #[test]
     fn mark_safe_never_marks_the_verdict_left_by_another_message_at_the_uid() {
         let db = Database::open_memory().unwrap();
-        let config = ThreatConfig::default();
-        let old: &[u8] = b"Message-ID: <a@x>\r\nFrom: Alice <alice@partner.example>\r\n\
-To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
-        let now: &[u8] = b"Message-ID: <b@x>\r\nFrom: Bob <bob@partner.example>\r\n\
-To: me@example.org\r\nSubject: Hi\r\n\r\nFriday?\r\n";
-        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(old), &config)
-            .unwrap();
+        let (old, now) = (OLD, NOW);
+        open_at_uid_1(&db, old);
         let old_fingerprint = threat::content_fingerprint(old).unwrap();
 
         let marked = mark_safe_bytes(&db, "a", "INBOX", 1, now);
@@ -677,8 +736,7 @@ To: me@example.org\r\nSubject: Hi\r\n\r\nFriday?\r\n";
         assert!(!tags.contains(&threat::TAG_FALSE_POSITIVE), "{tags:?}");
 
         // Once a scan has judged the bytes now at UID 1, the mark binds them.
-        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(now), &config)
-            .unwrap();
+        open_at_uid_1(&db, now);
         let marked = mark_safe_bytes(&db, "a", "INBOX", 1, now).unwrap();
         assert_eq!(marked.as_deref(), Some("b@x"));
         let label = db

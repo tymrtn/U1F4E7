@@ -343,8 +343,16 @@ pub(crate) mod tests {
         let (original, twin) = (message("Thursday?"), message("Friday?"));
         let config = ThreatConfig::default();
         for (uid, raw) in [(1, &original), (2, &twin)] {
-            persist::verdict_on_open(db, ACCT, "me@example.org", "INBOX", uid, Some(raw), &config)
-                .unwrap();
+            persist::verdict_on_open(
+                db,
+                ACCT,
+                "me@example.org",
+                "INBOX",
+                uid,
+                persist::Opened::Whole(raw),
+                &config,
+            )
+            .unwrap();
             if uid == 1 {
                 let fingerprint = envelope_email_transport::threat::content_fingerprint(raw);
                 persist::mark_safe(

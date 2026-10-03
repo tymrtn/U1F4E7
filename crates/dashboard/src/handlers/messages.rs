@@ -1084,7 +1084,10 @@ pub async fn read(
                                 &creds.account.username,
                                 &q.folder,
                                 uid,
-                                raw.as_deref(),
+                                envelope_email_transport::threat::persist::Opened::new(
+                                    raw.as_deref(),
+                                    msg.message_id.as_deref(),
+                                ),
                                 &config,
                             )
                         },

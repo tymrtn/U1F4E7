@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use envelope_email_store::Database;
 use envelope_email_store::models::MessageSummary;
 use envelope_email_transport::rule_exec::RunAccount;
-use envelope_email_transport::threat::persist::{self, StoredVerdict, VerdictTarget};
+use envelope_email_transport::threat::persist::{self, Opened, StoredVerdict, VerdictTarget};
 use envelope_email_transport::threat::report;
 use envelope_email_transport::threat::{self, ThreatConfig, ThreatVerdict};
 use serde::Deserialize;
@@ -98,15 +98,16 @@ pub fn verdict_for_open(
     account_address: &str,
     folder: &str,
     uid: u32,
-    raw: Option<&[u8]>,
+    opened: Opened<'_>,
     config: &ThreatConfig,
 ) -> anyhow::Result<Option<Value>> {
     let verdict =
-        persist::verdict_on_open(db, account_id, account_address, folder, uid, raw, config)?;
+        persist::verdict_on_open(db, account_id, account_address, folder, uid, opened, config)?;
     // The message's own identity: its bytes when read whole, else what the
-    // verdict at this UID recorded (a message read part by part).
-    let (key, fingerprint) = match raw {
-        Some(raw) => {
+    // verdict stored for it at this UID recorded (a message read part by
+    // part).
+    let (key, fingerprint) = match opened {
+        Opened::Whole(raw) => {
             let fingerprint = threat::content_fingerprint(raw);
             let key = persist::threat_key(
                 db,
@@ -116,7 +117,7 @@ pub fn verdict_for_open(
             )?;
             (key, fingerprint)
         }
-        None => persist::stored_verdict_for_uid(db, account_id, folder, uid)?
+        Opened::Parts { .. } => persist::stored_verdict_for(db, account_id, folder, uid, opened)?
             .map(|s| (s.key, s.content_fingerprint))
             .unwrap_or_default(),
     };
@@ -573,7 +574,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 "me@example.org",
                 "INBOX",
                 uid,
-                Some(raw),
+                Opened::Whole(raw),
                 &ThreatConfig::default(),
             )
             .unwrap()

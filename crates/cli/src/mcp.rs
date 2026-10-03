@@ -608,9 +608,17 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
-    let verdict =
-        crate::commands::threat::verdict_for_read(&db, &creds, folder, uid, raw.as_deref())
-            .map_err(|e| format!("{e:#}"))?;
+    let verdict = crate::commands::threat::verdict_for_read(
+        &db,
+        &creds,
+        folder,
+        uid,
+        envelope_email_transport::threat::persist::Opened::new(
+            raw.as_deref(),
+            message.message_id.as_deref(),
+        ),
+    )
+    .map_err(|e| format!("{e:#}"))?;
 
     let mut value = message_row(&db, &creds.account.id, folder, message.uid, &message);
     crate::commands::threat::apply_read_policy(&mut value, verdict.as_ref());

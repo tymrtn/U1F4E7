@@ -934,6 +934,49 @@ pub enum Seen<'a> {
     MessageId(Option<&'a str>),
 }
 
+/// What a reader fetched of the message it opened at a folder/UID.
+#[derive(Debug, Clone, Copy)]
+pub enum Opened<'a> {
+    /// Its complete bytes.
+    Whole(&'a [u8]),
+    /// Its parts, read one by one because it is over the whole-message fetch
+    /// cap: no complete bytes, only its Message-ID.
+    Parts { message_id: Option<&'a str> },
+}
+
+impl<'a> Opened<'a> {
+    /// A fetch that returned the message's Message-ID and, unless it is over
+    /// the cap, its bytes.
+    pub fn new(raw: Option<&'a [u8]>, message_id: Option<&'a str>) -> Self {
+        match raw {
+            Some(raw) => Opened::Whole(raw),
+            None => Opened::Parts { message_id },
+        }
+    }
+}
+
+/// The verdict stored at folder/UID when it is for the message opened there
+/// ([`StoredVerdict::is_for`]: the same fingerprint when its bytes are at
+/// hand, else the same Message-ID). One left by another message at a reused
+/// UID is not shown.
+pub fn stored_verdict_for(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    opened: Opened<'_>,
+) -> Result<Option<StoredVerdict>> {
+    let fingerprint = match opened {
+        Opened::Whole(raw) => super::content_fingerprint(raw),
+        Opened::Parts { .. } => None,
+    };
+    let seen = match opened {
+        Opened::Whole(_) => Seen::Bytes(fingerprint.as_deref()),
+        Opened::Parts { message_id } => Seen::MessageId(message_id),
+    };
+    Ok(stored_verdict_for_uid(db, account_id, folder, uid)?.filter(|s| s.is_for(seen)))
+}
+
 /// One message's own threat data.
 #[derive(Debug, Default)]
 pub struct BoundThreat {
@@ -1250,20 +1293,23 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
 /// also recorded under this UID (event only; scores and tags stay as they
 /// are).
 ///
-/// `raw` is `None` for a message read part by part (over the whole-message
-/// fetch cap). There is nothing complete to scan, so this returns the stored
-/// verdict, if any, and records nothing.
+/// A message read part by part ([`Opened::Parts`]) has nothing complete to
+/// scan, so this returns the verdict stored for its Message-ID at the UID,
+/// if any, and records nothing.
 pub fn verdict_on_open(
     db: &Database,
     account_id: &str,
     account_address: &str,
     folder: &str,
     uid: u32,
-    raw: Option<&[u8]>,
+    opened: Opened<'_>,
     config: &ThreatConfig,
 ) -> Result<Option<ThreatVerdict>> {
-    let Some(raw) = raw else {
-        return Ok(stored_verdict_for_uid(db, account_id, folder, uid)?.map(|s| s.verdict));
+    let raw = match opened {
+        Opened::Whole(raw) => raw,
+        Opened::Parts { .. } => {
+            return Ok(stored_verdict_for(db, account_id, folder, uid, opened)?.map(|s| s.verdict));
+        }
     };
     let message_id = super::sole_message_id(raw);
     let fingerprint = super::content_fingerprint(raw);
@@ -1821,9 +1867,17 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
 --b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
 --b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
 --b--\r\n";
-        let scanned = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(original), &config)
-            .unwrap()
-            .unwrap();
+        let scanned = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(original),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
         assert!(scanned.is_malware());
         let resend = verdict_on_open(
             &db,
@@ -1831,7 +1885,7 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
             EMAIL,
             "INBOX",
             2,
-            Some(&ordinary("orig@x")),
+            Opened::Whole(&ordinary("orig@x")),
             &config,
         )
         .unwrap()
@@ -1912,7 +1966,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             EMAIL,
             "INBOX",
             2,
-            Some(&dup),
+            Opened::Whole(&dup),
             &ThreatConfig::default(),
         )
         .unwrap()
@@ -2090,7 +2144,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let config = ThreatConfig::default();
         let a = ordinary("q@x");
         let a_fp = content_fingerprint(&a);
-        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&a), &config).unwrap();
+        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&a), &config).unwrap();
         let b = two_attachments("Message-ID: <q@x>\r\n");
         let b_fp = content_fingerprint(&b);
         let mut mbox = FakeMailbox::default();
@@ -2199,8 +2253,11 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let db = Database::open_memory().unwrap();
         let config = ThreatConfig::default();
         assert!(config.enabled && config.on_read);
+        let big = Opened::Parts {
+            message_id: Some("big@x"),
+        };
         assert!(
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config)
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, big, &config)
                 .unwrap()
                 .is_none()
         );
@@ -2222,9 +2279,30 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let stored = ThreatVerdict::unavailable("clamd down");
         record_verdict(&db, &target, &stored).unwrap();
         assert_eq!(
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, None, &config).unwrap(),
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2379, big, &config).unwrap(),
             Some(stored)
         );
+    }
+
+    /// An over-cap message at a reused UID: the verdict there is for the
+    /// message that held it before, so the reader shows none.
+    #[test]
+    fn open_without_raw_bytes_shows_no_verdict_left_by_another_message() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let old = b"Message-ID: <old@x>\r\nFrom: a@example.test\r\nTo: me@example.org\r\n\
+Subject: s\r\n\r\nhi\r\n";
+        let scanned = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 7, Opened::Whole(old), &config)
+            .unwrap()
+            .unwrap();
+        let open = |message_id| {
+            let parts = Opened::Parts { message_id };
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 7, parts, &config).unwrap()
+        };
+
+        assert_eq!(open(Some("big@x")), None);
+        assert_eq!(open(None), None);
+        assert_eq!(open(Some("<old@x>")), Some(scanned));
     }
 
     /// A verdict stored before fingerprints is shown, and rescanned when the
@@ -2252,12 +2330,12 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             ..ThreatConfig::default()
         };
         assert_eq!(
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Some(&raw), &off).unwrap(),
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Opened::Whole(&raw), &off).unwrap(),
             Some(clean)
         );
 
         let config = ThreatConfig::default();
-        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Some(&raw), &config)
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 4, Opened::Whole(&raw), &config)
             .unwrap()
             .unwrap();
         assert_eq!(opened.level, Level::Dangerous);
@@ -2280,16 +2358,24 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             EMAIL,
             "INBOX",
             1,
-            Some(&ordinary("dup@x")),
+            Opened::Whole(&ordinary("dup@x")),
             &config,
         )
         .unwrap()
         .unwrap();
         assert_eq!(first.level, Level::Clean);
 
-        let second = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2, Some(&phish("dup@x")), &config)
-            .unwrap()
-            .unwrap();
+        let second = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&phish("dup@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(second.level, Level::Dangerous);
         assert!(second.is_malware());
         assert_eq!(
@@ -2308,7 +2394,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             EMAIL,
             "INBOX",
             1,
-            Some(&ordinary("dup@x")),
+            Opened::Whole(&ordinary("dup@x")),
             &config,
         )
         .unwrap()
@@ -2325,7 +2411,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let config = ThreatConfig::default();
         let raw = phish("mv@x");
         let fp = content_fingerprint(&raw);
-        let verdict = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&raw), &config)
+        let verdict = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&raw), &config)
             .unwrap()
             .unwrap();
         mark_safe(
@@ -2343,7 +2429,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         )
         .unwrap();
 
-        let moved = verdict_on_open(&db, ACCT, EMAIL, "Archive", 9, Some(&raw), &config)
+        let moved = verdict_on_open(&db, ACCT, EMAIL, "Archive", 9, Opened::Whole(&raw), &config)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2378,7 +2464,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         assert_eq!(config.quarantine, Quarantine::Tag);
         let original = ordinary("reuse@x");
         let original_fp = content_fingerprint(&original);
-        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
         mark_safe(
             &db,
             &VerdictTarget {
@@ -2414,9 +2509,17 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         );
         assert_eq!(db.get_scores(ACCT, "reuse@x").unwrap()[0].value, 0.0);
         assert_eq!(tags(&db, "reuse@x"), vec![TAG_FALSE_POSITIVE]);
-        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 2, Some(&resend), &config)
-            .unwrap()
-            .unwrap();
+        let opened = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Opened::Whole(&resend),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(opened.level, Level::Dangerous);
         let resend_fp = content_fingerprint(&resend);
         assert!(!is_marked_safe(&db, ACCT, "reuse@x", Some(&resend_fp)).unwrap());
@@ -2453,7 +2556,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let config = ThreatConfig::default();
         let original = ordinary("ff@x");
         let original_fp = content_fingerprint(&original);
-        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
         mark_safe(
             &db,
             &VerdictTarget {
@@ -2497,9 +2609,17 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
 
         // Opened elsewhere, the resend is scanned rather than given the
         // marked original's verdict.
-        let opened = verdict_on_open(&db, ACCT, EMAIL, "Archive", 3, Some(&resend), &config)
-            .unwrap()
-            .unwrap();
+        let opened = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "Archive",
+            3,
+            Opened::Whole(&resend),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(opened.score, entry.score);
     }
 
@@ -2512,7 +2632,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let original = ordinary("s@x");
         for (uid, prefix) in [(2, "\u{a0}"), (3, "\u{2003}"), (4, "\x0b")] {
             let db = Database::open_memory().unwrap();
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+            verdict_on_open(
+                &db,
+                ACCT,
+                EMAIL,
+                "INBOX",
+                1,
+                Opened::Whole(&original),
+                &config,
+            )
+            .unwrap();
             let twin = String::from_utf8(original.clone())
                 .unwrap()
                 .replacen(
@@ -2531,7 +2660,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                     .is_none(),
                 "{prefix:?}"
             );
-            verdict_on_open(&db, ACCT, EMAIL, "INBOX", uid, Some(&twin), &config).unwrap();
+            verdict_on_open(
+                &db,
+                ACCT,
+                EMAIL,
+                "INBOX",
+                uid,
+                Opened::Whole(&twin),
+                &config,
+            )
+            .unwrap();
             let own = stored_verdict_for_uid(&db, ACCT, "INBOX", uid)
                 .unwrap()
                 .unwrap();
@@ -2566,7 +2704,8 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             enabled: false,
             ..ThreatConfig::default()
         };
-        let shown = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&raw), &off).unwrap();
+        let shown =
+            verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Opened::Whole(&raw), &off).unwrap();
         assert_eq!(shown, Some(clean));
 
         verdict_on_open(
@@ -2575,7 +2714,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             EMAIL,
             "INBOX",
             1,
-            Some(&raw),
+            Opened::Whole(&raw),
             &ThreatConfig::default(),
         )
         .unwrap();
@@ -2676,7 +2815,16 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let config = ThreatConfig::default();
         let original = ordinary("twin@x");
         let original_fp = content_fingerprint(&original);
-        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+        verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            1,
+            Opened::Whole(&original),
+            &config,
+        )
+        .unwrap();
         mark_safe(
             &db,
             &VerdictTarget {
@@ -2764,7 +2912,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         legacy_mark(&db, "old@x", "INBOX", 1);
         let raw = phish("old@x");
 
-        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 5, Some(&raw), &config)
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 5, Opened::Whole(&raw), &config)
             .unwrap()
             .unwrap();
         assert_eq!(opened.level, Level::Dangerous);
@@ -2809,7 +2957,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let raw = phish("slot@x");
         let fp = content_fingerprint(&raw);
 
-        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 3, Some(&raw), &config)
+        let opened = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 3, Opened::Whole(&raw), &config)
             .unwrap()
             .unwrap();
         assert_eq!(opened.level, Level::Dangerous, "the engine's view is kept");
@@ -2849,7 +2997,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             EMAIL,
             "INBOX",
             3,
-            Some(&raw),
+            Opened::Whole(&raw),
             &ThreatConfig::default(),
         )
         .unwrap()
