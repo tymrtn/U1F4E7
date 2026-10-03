@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use envelope_email_store::event_catalog::{LABEL_APPLIED, LOOKUP_PERFORMED, THREAT_VERDICT};
 use envelope_email_store::models::{Event, Rule};
 use envelope_email_store::{Database, canonical_message_id};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
@@ -66,6 +66,8 @@ pub struct ScannedMessage {
     pub subject: String,
     /// Store with [`record_lookups`].
     pub lookups: Vec<LookupRecord>,
+    /// [`super::content_fingerprint`] of the scanned bytes.
+    pub content_fingerprint: Option<String>,
 }
 
 /// Fill the correspondent facts from the local store.
@@ -143,6 +145,7 @@ fn scanned_message(input: &ThreatInput) -> ScannedMessage {
         to_addr: header("to").unwrap_or_default(),
         subject: header("subject").unwrap_or_default(),
         lookups: Vec::new(),
+        content_fingerprint: None,
     }
 }
 
@@ -155,7 +158,10 @@ pub fn scan_raw(
     raw: &[u8],
     config: &ThreatConfig,
 ) -> (ThreatVerdict, ScannedMessage) {
-    evaluate_input(prepare_input(db, account_id, account_address, raw), config)
+    let (verdict, mut scanned) =
+        evaluate_input(prepare_input(db, account_id, account_address, raw), config);
+    scanned.content_fingerprint = Some(super::content_fingerprint(raw));
+    (verdict, scanned)
 }
 
 /// Where a verdict is stored.
@@ -167,6 +173,20 @@ pub struct VerdictTarget<'a> {
     /// Canonical Message-ID. Without one, only the event is written (scores
     /// and tags are keyed by Message-ID).
     pub message_id: Option<&'a str>,
+    /// [`super::content_fingerprint`] of the message's bytes, stored beside
+    /// the verdict. `None` only where no complete bytes were read.
+    pub content_fingerprint: Option<&'a str>,
+}
+
+/// The `threat_verdict` event payload: the verdict with the fingerprint of
+/// the bytes it judged as a sibling field, which readers that parse only a
+/// [`ThreatVerdict`] ignore.
+#[derive(Debug, Serialize, Deserialize)]
+struct VerdictPayload {
+    #[serde(flatten)]
+    verdict: ThreatVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_fingerprint: Option<String>,
 }
 
 pub fn is_marked_safe(db: &Database, account_id: &str, message_id: &str) -> Result<bool> {
@@ -235,7 +255,13 @@ pub fn record_verdict(
         from_addr: None,
         subject: None,
         snippet: None,
-        payload: Some(serde_json::to_string(verdict).context("serialize verdict")?),
+        payload: Some(
+            serde_json::to_string(&VerdictPayload {
+                verdict: verdict.clone(),
+                content_fingerprint: target.content_fingerprint.map(str::to_string),
+            })
+            .context("serialize verdict")?,
+        ),
         idempotency_key: None,
         secure_pending: false,
         acked_at: Some(now.clone()),
@@ -304,6 +330,10 @@ pub struct StoredVerdict {
     pub message_id: Option<String>,
     pub recorded_at: String,
     pub verdict: ThreatVerdict,
+    /// The fingerprint of the bytes the verdict judged; `None` for a verdict
+    /// stored before fingerprints. Not part of any JSON output.
+    #[serde(skip)]
+    pub content_fingerprint: Option<String>,
 }
 
 /// The newest verdict recorded for a folder/UID, with its Message-ID.
@@ -333,13 +363,15 @@ fn stored_verdict(event: Option<Event>) -> Result<Option<StoredVerdict>> {
     let payload = event
         .payload
         .ok_or_else(|| anyhow!("threat_verdict event {} has no payload", event.id))?;
+    let payload: VerdictPayload =
+        serde_json::from_str(&payload).context("stored threat_verdict payload is not a verdict")?;
     Ok(Some(StoredVerdict {
         folder: event.folder,
         uid: event.uid,
         message_id: event.message_id,
         recorded_at: event.created_at,
-        verdict: serde_json::from_str(&payload)
-            .context("stored threat_verdict payload is not a verdict")?,
+        verdict: payload.verdict,
+        content_fingerprint: payload.content_fingerprint,
     }))
 }
 
@@ -692,15 +724,17 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
     // Opt-in analyzers block on clamd and DNS: run them off the async
     // workers and without holding the database.
     let owned = config.clone();
-    let (verdict, scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
+    let (verdict, mut scanned) = tokio::task::spawn_blocking(move || evaluate_input(input, &owned))
         .await
         .context("threat analyzers panicked")?;
+    scanned.content_fingerprint = Some(super::content_fingerprint(&raw));
     db.with_db(|d| -> Result<()> {
         let target = VerdictTarget {
             account_id: account.id,
             folder,
             uid,
             message_id: scanned.message_id.as_deref(),
+            content_fingerprint: scanned.content_fingerprint.as_deref(),
         };
         record_verdict(d, &target, &verdict)?;
         record_lookups(d, &target, &scanned.lookups)
@@ -759,6 +793,7 @@ pub fn verdict_on_open(
         folder,
         uid,
         message_id: scanned.message_id.as_deref(),
+        content_fingerprint: scanned.content_fingerprint.as_deref(),
     };
     record_verdict(db, &target, &verdict)?;
     record_lookups(db, &target, &scanned.lookups)?;
@@ -822,7 +857,7 @@ pub async fn scan_uid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::threat::ENGINE_VERSION;
+    use crate::threat::{ENGINE_VERSION, content_fingerprint};
 
     const ACCT: &str = "acct-1";
     const EMAIL: &str = "me@example.org";
@@ -939,6 +974,7 @@ mod tests {
                 folder: "INBOX",
                 uid: 7,
                 message_id: scanned.message_id.as_deref(),
+                content_fingerprint: None,
             },
             &verdict,
         )
@@ -973,6 +1009,7 @@ mod tests {
             folder: "INBOX",
             uid: 1,
             message_id: Some("m@x"),
+            content_fingerprint: None,
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("m@x"), &ThreatConfig::default());
         record_verdict(&db, &target, &bad).unwrap();
@@ -999,6 +1036,7 @@ mod tests {
                 folder: "INBOX",
                 uid: 7,
                 message_id: Some("m@x"),
+                content_fingerprint: None,
             },
             &verdict,
         )
@@ -1019,6 +1057,80 @@ mod tests {
             stored_verdict_for_message(&db, ACCT, "other@x")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn verdict_event_carries_the_fingerprint_beside_the_verdict() {
+        let db = Database::open_memory().unwrap();
+        let raw = phish("f@x");
+        let fp = content_fingerprint(&raw);
+        let (verdict, scanned) = scan_raw(&db, ACCT, EMAIL, &raw, &ThreatConfig::default());
+        assert_eq!(scanned.content_fingerprint.as_deref(), Some(fp.as_str()));
+        let target = |uid, content_fingerprint| VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid,
+            message_id: Some("f@x"),
+            content_fingerprint,
+        };
+        let payload = |uid| {
+            db.latest_event_for_uid(ACCT, THREAT_VERDICT, "INBOX", uid)
+                .unwrap()
+                .unwrap()
+                .payload
+                .unwrap()
+        };
+
+        record_verdict(&db, &target(3, Some(fp.as_str())), &verdict).unwrap();
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(stored.verdict, verdict);
+        // The payload is the verdict plus one sibling field, so a reader
+        // that knows only the verdict still parses it.
+        let mut expected = serde_json::to_value(&verdict).unwrap();
+        expected["content_fingerprint"] = json!(fp);
+        let stored_payload = payload(3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_str::<ThreatVerdict>(&stored_payload).unwrap(),
+            verdict
+        );
+
+        record_verdict(&db, &target(4, None), &verdict).unwrap();
+        let legacy = stored_verdict_for_uid(&db, ACCT, "INBOX", 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.content_fingerprint, None);
+        assert!(!payload(4).contains("content_fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn new_mail_pass_records_the_fingerprint_of_the_bytes_it_scanned() {
+        let db = Database::open_memory().unwrap();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(5, ordinary("n@x"));
+        let results = scan_new_mail(
+            &mut mbox,
+            &db,
+            &account(),
+            "INBOX",
+            &[5],
+            &ThreatConfig::default(),
+        )
+        .await;
+        results[0].1.as_ref().unwrap();
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.content_fingerprint,
+            Some(content_fingerprint(&ordinary("n@x")))
         );
     }
 
@@ -1059,6 +1171,7 @@ mod tests {
             folder: "INBOX",
             uid: 3,
             message_id: Some("a@x"),
+            content_fingerprint: None,
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         assert!(
@@ -1124,6 +1237,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 2379,
             message_id: Some("big@x"),
+            content_fingerprint: None,
         };
         let stored = ThreatVerdict::unavailable("clamd down");
         record_verdict(&db, &target, &stored).unwrap();
@@ -1141,6 +1255,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 1,
             message_id: Some("s@x"),
+            content_fingerprint: None,
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("s@x"), &ThreatConfig::default());
@@ -1250,6 +1365,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 1,
             message_id: Some(mid),
+            content_fingerprint: None,
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("a@x"), &ThreatConfig::default());
         let (good, _) = scan_raw(&db, ACCT, EMAIL, &ordinary("b@x"), &ThreatConfig::default());
@@ -1305,6 +1421,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             folder: "INBOX",
             uid: 9,
             message_id: scanned.message_id.as_deref(),
+            content_fingerprint: None,
         };
         record_verdict(&db, &target, &verdict).unwrap();
         record_lookups(&db, &target, &scanned.lookups).unwrap();

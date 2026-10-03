@@ -63,6 +63,7 @@ fn state() -> (AppState, Draft) {
             folder: "INBOX",
             uid: 7,
             message_id: Some("phish@x"),
+            content_fingerprint: None,
         },
         &dangerous,
     )

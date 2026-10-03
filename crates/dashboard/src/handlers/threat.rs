@@ -181,6 +181,7 @@ pub async fn mark_safe(
         folder: &q.folder,
         uid,
         message_id: Some(message_id),
+        content_fingerprint: None,
     };
     if let Err(e) = persist::mark_safe(&db, &target, "reader", None) {
         return error(
@@ -256,6 +257,7 @@ pub async fn report_draft(
                 folder: &q.folder,
                 uid,
                 message_id: stored.as_ref().and_then(|s| s.message_id.as_deref()),
+                content_fingerprint: Some(&threat::content_fingerprint(&raw)),
             },
             &lookups,
         );
@@ -486,6 +488,7 @@ mod tests {
                 folder: "INBOX",
                 uid: 571,
                 message_id: Some("phish@x"),
+                content_fingerprint: None,
             },
             &verdict,
         )
@@ -518,6 +521,7 @@ mod tests {
                 folder: "INBOX",
                 uid: 2,
                 message_id: Some("two@x"),
+                content_fingerprint: None,
             },
             &verdict,
         )
@@ -531,6 +535,7 @@ mod tests {
                 folder: "INBOX",
                 uid: 3,
                 message_id: Some("three@x"),
+                content_fingerprint: None,
             },
             &old,
         )

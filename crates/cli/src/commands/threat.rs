@@ -318,6 +318,7 @@ pub async fn run_mark_safe(
             folder,
             uid,
             message_id: Some(&message_id),
+            content_fingerprint: None,
         },
         "cli",
         None,
@@ -427,11 +428,13 @@ pub async fn run_report(
     drop(client);
 
     let message_id = message_id_of(&raw);
+    let fingerprint = threat::content_fingerprint(&raw);
     let target = VerdictTarget {
         account_id: &account_id,
         folder,
         uid,
         message_id: message_id.as_deref(),
+        content_fingerprint: Some(&fingerprint),
     };
     let verdict = match persist::stored_verdict_for_uid(&db, &account_id, folder, uid)? {
         Some(stored) => Some(stored.verdict),
@@ -556,6 +559,63 @@ mod tests {
         apply_read_policy(&mut msg, None);
         assert_eq!(msg["sanitized"], false);
         assert!(msg["threat"].is_null());
+    }
+
+    /// `threat show --json` and MCP `threat_show` serve `verdict_json`; the
+    /// fingerprint stored beside a verdict must not change that shape.
+    #[test]
+    fn threat_show_json_shape_is_unchanged_by_the_stored_fingerprint() {
+        let db = Database::open_memory().unwrap();
+        let verdict = threat::combine(
+            vec![threat::Signal::new("x", 40, "e")],
+            vec!["sender".into()],
+            vec![],
+            false,
+        );
+        persist::record_verdict(
+            &db,
+            &VerdictTarget {
+                account_id: "a",
+                folder: "INBOX",
+                uid: 3,
+                message_id: Some("m@x"),
+                content_fingerprint: Some("v1:00"),
+            },
+            &verdict,
+        )
+        .unwrap();
+        let stored = persist::stored_verdict_for_uid(&db, "a", "INBOX", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content_fingerprint.as_deref(), Some("v1:00"));
+
+        let value = verdict_json(&db, "a", &stored).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account_id",
+                "explain",
+                "folder",
+                "message_id",
+                "recorded_at",
+                "tags",
+                "uid",
+                "verdict"
+            ]
+        );
+        assert_eq!(value["verdict"], serde_json::to_value(&verdict).unwrap());
+        let serialized = serde_json::to_value(&stored).unwrap();
+        assert!(
+            serialized.get("content_fingerprint").is_none(),
+            "{serialized}"
+        );
     }
 
     #[test]
