@@ -16,6 +16,7 @@ use envelope_email_transport::{
 };
 use std::str::FromStr;
 
+use super::agent_context;
 use super::attachments::{attachment_summaries, snapshot_attachments};
 use super::authored_body::{AuthoredBody, attach_notice};
 use super::common::setup_credentials;
@@ -105,17 +106,41 @@ pub async fn run(
     }
 
     let (db, creds) = setup_credentials(account, backend)?;
+    // With an agent token the send runs under that agent's policy, as an MCP
+    // send does: its send action and account grant, its ceiling, its
+    // recipient allowlist, and a human's approval in place of --confirm-send.
+    let agent = agent_context::cli_agent(&db, json)?;
+    let agent_id = agent_context::agent_id_of(agent.as_ref());
+    agent_context::authorize_cli_action(&db, agent.as_ref(), "send", &creds.account.id, json)?;
     let from = validate_from_override(from)?;
     let mode = SendMode::from_str(send_mode).map_err(|e| anyhow::anyhow!(e))?;
+    let mode = match &agent {
+        Some(agent) => agent.clamp_send_mode(mode),
+        None => mode,
+    };
+    let authority =
+        agent_context::agent_policy_input(agent.as_ref(), confirm_send, allow_recipients, None);
     let policy_input = SendPolicyInput {
         to,
         cc,
         bcc,
-        confirm_send,
-        allow_recipients,
+        confirm_send: authority.confirm_send,
+        allow_recipients: authority.allow_recipients,
     };
-    let decision = evaluate(mode, &policy_input);
-    record_send_policy_event(&db, &creds.account.id, mode, &decision, &policy_input)?;
+    let awaiting_approval = agent_context::awaits_human_approval(agent.as_ref(), mode);
+    let decision = if awaiting_approval {
+        SendPolicyDecision::DraftOnly
+    } else {
+        evaluate(mode, &policy_input)
+    };
+    record_send_policy_event(
+        &db,
+        &creds.account.id,
+        mode,
+        &decision,
+        &policy_input,
+        agent_id,
+    )?;
 
     match &decision {
         SendPolicyDecision::Allowed => {}
@@ -141,22 +166,26 @@ pub async fn run(
             persist_from_override(&db, &draft.id, from)?;
             let attachment_summary = attachment_summaries(&draft_attachments);
             if json {
-                emit_json(
-                    crate::commands::contract::send_body::cli_drafted(
-                        serde_json::json!(mode),
-                        &draft.id,
-                        to,
-                        subject,
-                        serde_json::json!(attachment_summary),
-                        ui::draft_ui(&creds.account.id, &draft.id),
-                    ),
-                    &authored,
+                let mut body = crate::commands::contract::send_body::cli_drafted(
+                    serde_json::json!(mode),
+                    &draft.id,
+                    to,
+                    subject,
+                    serde_json::json!(attachment_summary),
+                    ui::draft_ui(&creds.account.id, &draft.id),
                 );
+                if awaiting_approval {
+                    body["confirmation"] = agent_context::human_approval_hint();
+                }
+                emit_json(body, &authored);
             } else {
                 println!(
                     "Drafted instead of sending ({mode}). Draft ID: {}",
                     draft.id
                 );
+                if awaiting_approval {
+                    println!("A person must approve it in the dashboard before it can be sent.");
+                }
                 if !attachment_summary.is_empty() {
                     println!("Attachments: {}", attachment_summary.len());
                     for a in &attachment_summary {
@@ -213,7 +242,7 @@ pub async fn run(
         html,
         &declared,
     );
-    if let Some(outcome) = precheck_attribution(&db, &creds.account.id, &precheck_req, None)? {
+    if let Some(outcome) = precheck_attribution(&db, &creds.account.id, &precheck_req, agent_id)? {
         if json {
             println!(
                 "{}",
@@ -246,8 +275,10 @@ pub async fn run(
     let request = SendRequest {
         surface: SendSurface::Cli,
         label: "cli_send",
-        principal: "local".to_string(),
-        agent_id: None,
+        principal: agent_id
+            .map(|id| format!("agent:{id}"))
+            .unwrap_or_else(|| "local".to_string()),
+        agent_id,
         idempotency_key,
         to,
         cc,
@@ -655,12 +686,13 @@ mod tests {
     }
 }
 
-fn record_send_policy_event(
+pub(crate) fn record_send_policy_event(
     db: &Database,
     account_id: &str,
     mode: SendMode,
     decision: &SendPolicyDecision,
     input: &SendPolicyInput<'_>,
+    agent_id: Option<&str>,
 ) -> Result<()> {
     let audit = audit_event_for(mode, decision, input);
     let event = Event {
@@ -679,6 +711,6 @@ fn record_send_policy_event(
         acked_at: Some(chrono::Utc::now().to_rfc3339()),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    db.insert_event(&event)
+    db.insert_event_with_agent(&event, agent_id)
         .context("audit_unavailable: could not record the send-policy decision; nothing was sent")
 }

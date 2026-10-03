@@ -643,3 +643,209 @@ fn cli_revoked_or_unknown_token_fails_closed() {
     assert_denied(&out, "agent_token_invalid");
     assert_eq!(rule_count(home), 0);
 }
+
+// ── CLI sends with an agent token ───────────────────────────────────
+
+fn set_send_policy(home: &Path, name: &str, ceiling: &str, recipients: Option<&str>) {
+    let mut args = vec![
+        "agent",
+        "policy",
+        "set",
+        name,
+        "--allow-actions",
+        "send",
+        "--send-mode-ceiling",
+        ceiling,
+    ];
+    if let Some(recipients) = recipients {
+        args.extend(["--allow-recipients", recipients]);
+    }
+    assert!(run(home, &args).status.success(), "policy set failed");
+}
+
+/// (all drafts, drafts waiting in the outbox)
+fn draft_counts(home: &Path) -> (i64, i64) {
+    open_db(home)
+        .conn()
+        .query_row("SELECT COUNT(*), COUNT(send_after) FROM drafts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("count drafts")
+}
+
+fn send_args<'a>(to: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "--json",
+        "send",
+        "--to",
+        to,
+        "--subject",
+        "hi",
+        "--body",
+        "x",
+        "--attr",
+        "informational",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// Insert a draft row directly; `draft create` would need a live IMAP APPEND.
+fn local_draft(home: &Path, to: &str) -> String {
+    let db = open_db(home);
+    let account_id: String = db
+        .conn()
+        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .expect("seed account id");
+    db.create_draft(
+        &account_id,
+        to,
+        Some("hi"),
+        Some("x"),
+        None,
+        None,
+        None,
+        None,
+        Some("cli"),
+    )
+    .expect("create draft")
+    .id
+}
+
+fn send_after(home: &Path, draft_id: &str) -> Option<String> {
+    open_db(home)
+        .get_draft(draft_id)
+        .expect("read draft")
+        .expect("draft exists")
+        .send_after
+}
+
+#[test]
+fn cli_send_with_draft_only_token_creates_a_draft_and_no_outbox_entry() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    set_send_policy(home, "skippy", "draft-only", None);
+
+    let out = run_as(home, &token, &send_args("a@b.test", &[]));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload = json_stdout(&out);
+    assert_eq!(payload["status"], "drafted", "{payload}");
+    assert_eq!(payload["send_mode"], "draft-only", "{payload}");
+    assert_eq!(draft_counts(home), (1, 0), "a draft and nothing queued");
+}
+
+#[test]
+fn cli_send_allowlisted_token_denies_unlisted_recipient() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    set_send_policy(home, "skippy", "allowlisted-send", Some("ok@example.test"));
+
+    let out = run_as(
+        home,
+        &token,
+        &send_args(
+            "stranger@example.test",
+            &[
+                "--send-mode",
+                "allowlisted-send",
+                "--allow-recipient",
+                "stranger@example.test",
+            ],
+        ),
+    );
+    assert_denied(&out, "send_recipient_not_allowlisted");
+    assert_eq!(draft_counts(home), (0, 0), "nothing may be written");
+
+    let out = run_as(home, &token, &send_args("ok@example.test", &[]));
+    let payload = json_stdout(&out);
+    assert_eq!(payload["status"], "queued", "{payload}");
+}
+
+#[test]
+fn cli_send_without_token_is_unchanged() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    create_agent_token(home, "skippy");
+
+    let out = run(home, &send_args("a@b.test", &[]));
+    let payload = json_stdout(&out);
+    assert_eq!(payload["status"], "queued", "{payload}");
+    assert_eq!(payload["send_mode"], "autonomous-send", "{payload}");
+    assert_eq!(draft_counts(home), (1, 1));
+}
+
+#[test]
+fn cli_draft_send_with_draft_only_token_does_not_queue() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    set_send_policy(home, "skippy", "draft-only", None);
+    let draft_id = local_draft(home, "a@b.test");
+
+    let out = run_as(
+        home,
+        &token,
+        &[
+            "--json",
+            "draft",
+            "send",
+            &draft_id,
+            "--attr",
+            "informational",
+        ],
+    );
+    let payload = json_stdout(&out);
+    assert_eq!(payload["status"], "drafted", "{payload}");
+    assert_eq!(payload["send_mode"], "draft-only", "{payload}");
+    assert_eq!(send_after(home, &draft_id), None);
+}
+
+#[test]
+fn cli_draft_send_with_confirm_token_requires_human_approval() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    set_send_policy(home, "skippy", "confirm-send", None);
+    let draft_id = local_draft(home, "a@b.test");
+    let args = [
+        "--json",
+        "draft",
+        "send",
+        &draft_id,
+        "--attr",
+        "informational",
+    ];
+
+    let out = run_as(home, &token, &args);
+    assert_denied(&out, "send_confirmation_required");
+    assert_eq!(
+        json_stdout(&out)["confirmation"],
+        json!({"required": "human_approval", "surface": "dashboard"})
+    );
+    assert_eq!(send_after(home, &draft_id), None);
+
+    let db = open_db(home);
+    let draft = db.get_draft(&draft_id).unwrap().unwrap();
+    db.record_draft_human_approval(
+        &draft_id,
+        draft.revision,
+        "human:dashboard",
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .expect("approve");
+    let out = run_as(home, &token, &args);
+    let payload = json_stdout(&out);
+    assert_eq!(payload["status"], "scheduled", "{payload}");
+    assert!(send_after(home, &draft_id).is_some());
+}

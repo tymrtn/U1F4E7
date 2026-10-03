@@ -2101,6 +2101,91 @@ pub async fn run_send(
     use envelope_email_transport::outbound::{
         IMMEDIATE_SEND_CONFIRM_CODE, SendDisposition, resolve_cooldown_seconds, resolve_disposition,
     };
+    use envelope_email_transport::{SendMode, SendPolicyDecision, SendPolicyInput, evaluate};
+
+    // ── Agent policy (with ENVELOPE_AGENT_TOKEN) ──
+    // The same evaluation MCP send_draft runs: the agent's send grant, its
+    // ceiling, its recipient allowlist, and a human approval of this revision.
+    // Without a token this is the operator and nothing here applies.
+    let (agent, admitted_revision) = {
+        let db = Database::open_default().context("failed to open database")?;
+        let agent = super::agent_context::cli_agent(&db, json)?;
+        let admitted_revision = match &agent {
+            None => None,
+            Some(ctx) => {
+                let draft = db
+                    .get_draft(id)
+                    .context("failed to load draft")?
+                    .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
+                super::agent_context::authorize_cli_action(
+                    &db,
+                    Some(ctx),
+                    "send",
+                    &draft.account_id,
+                    json,
+                )?;
+                let send_mode = ctx.clamp_send_mode(SendMode::AutonomousSend);
+                let authority =
+                    super::agent_context::agent_policy_input(Some(ctx), false, &[], Some(&draft));
+                let policy_input = SendPolicyInput {
+                    to: &draft.to_addr,
+                    cc: draft.cc_addr.as_deref(),
+                    bcc: draft.bcc_addr.as_deref(),
+                    confirm_send: authority.confirm_send,
+                    allow_recipients: authority.allow_recipients,
+                };
+                let decision = evaluate(send_mode, &policy_input);
+                super::send::record_send_policy_event(
+                    &db,
+                    &draft.account_id,
+                    send_mode,
+                    &decision,
+                    &policy_input,
+                    Some(&ctx.agent_id),
+                )?;
+                match decision {
+                    SendPolicyDecision::Allowed => Some(draft.revision),
+                    SendPolicyDecision::DraftOnly => {
+                        if json {
+                            println!(
+                                "{}",
+                                crate::commands::contract::send_body::mcp_drafted(
+                                    serde_json::json!(send_mode),
+                                    &draft.id,
+                                    ui::draft_ui(&draft.account_id, &draft.id),
+                                )
+                            );
+                        } else {
+                            println!(
+                                "Not sent: this agent may only draft ({send_mode}). Draft ID: {}",
+                                draft.id
+                            );
+                        }
+                        return Ok(());
+                    }
+                    SendPolicyDecision::Denied(denial) => {
+                        if json {
+                            let mut refusal = serde_json::json!({
+                                "status": "denied",
+                                "error": denial,
+                                "send_mode": send_mode,
+                                "draft_id": draft.id,
+                                "ui": ui::draft_ui(&draft.account_id, &draft.id),
+                            });
+                            if send_mode == SendMode::ConfirmSend {
+                                refusal["confirmation"] =
+                                    super::agent_context::human_approval_hint();
+                            }
+                            println!("{refusal}");
+                        }
+                        bail!("send denied by policy: {} ({})", denial.reason, denial.code);
+                    }
+                }
+            }
+        };
+        (agent, admitted_revision)
+    };
+    let agent_id = super::agent_context::agent_id_of(agent.as_ref());
 
     // ── Attribution precheck (before ANY side effect, incl. queueing) ──
     //
@@ -2111,7 +2196,7 @@ pub async fn run_send(
     let declared: Vec<String> = attr.to_vec();
     let precheck = {
         let db = Database::open_default().context("failed to open database")?;
-        let precheck = precheck_draft(&db, id, SendSurface::Cli, &declared, None)?;
+        let precheck = precheck_draft(&db, id, SendSurface::Cli, &declared, agent_id)?;
         if let Some(outcome) = &precheck.refusal {
             if json {
                 println!(
@@ -2127,6 +2212,16 @@ pub async fn run_send(
         }
         precheck
     };
+    if admitted_revision.is_some_and(|revision| revision != precheck.revision) {
+        let refusal = draft_changed_since_admitted(id);
+        if json {
+            println!("{refusal}");
+        }
+        bail!(
+            "{}",
+            refusal["error"]["reason"].as_str().unwrap_or_default()
+        );
+    }
 
     // ── Default actual-send cooldown (outbox queueing) ──
     // `draft send` queues by default: it sets send_after on the draft so the
@@ -2172,7 +2267,7 @@ pub async fn run_send(
                 &declared,
                 &envelope_email_store::QueueContext {
                     surface: "cli_draft_send",
-                    agent_id: None,
+                    agent_id,
                     cooldown_seconds: Some(cd),
                 },
             )?;
@@ -2208,8 +2303,9 @@ pub async fn run_send(
         SendDisposition::Immediate => {}
     }
 
-    // Catalog event: the operator approved this draft for immediate send. This
-    // is the human-confirmed transition (--send-now --confirm-send-now).
+    // Catalog event: the caller approved this draft for immediate send
+    // (--send-now --confirm-send-now), attributed to the agent when a token
+    // is set.
     {
         let db = Database::open_default().context("failed to open database")?;
         if let Some(draft) = db.get_draft(id).context("failed to load draft")? {
@@ -2217,7 +2313,7 @@ pub async fn run_send(
                 &draft.account_id,
                 envelope_email_store::event_catalog::DRAFT_APPROVED,
                 Some(serde_json::json!({ "draft_id": id })),
-                None,
+                agent_id,
             )
             .context("audit_unavailable: could not record the send approval; nothing was sent")?;
         }
@@ -2229,8 +2325,8 @@ pub async fn run_send(
         backend,
         SendSurface::Cli,
         &declared,
-        None,
-        None,
+        agent_id,
+        admitted_revision,
     )
     .await
     {
