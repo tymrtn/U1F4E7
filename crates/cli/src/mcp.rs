@@ -753,15 +753,21 @@ async fn handle_send(
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
+    let authority = agent_context::agent_policy_input(ctx, confirm_send, &allow_recipients, None);
     let policy_input = SendPolicyInput {
         to,
         cc,
         bcc,
-        confirm_send,
-        allow_recipients: &allow_recipients,
+        confirm_send: authority.confirm_send,
+        allow_recipients: authority.allow_recipients,
     };
 
-    let decision = evaluate(send_mode, &policy_input);
+    let awaiting_approval = agent_context::awaits_human_approval(ctx, send_mode);
+    let decision = if awaiting_approval {
+        SendPolicyDecision::DraftOnly
+    } else {
+        evaluate(send_mode, &policy_input)
+    };
     record_send_policy_event(
         &db,
         &creds.account.id,
@@ -795,14 +801,18 @@ async fn handle_send(
             }
             crate::commands::drafts::persist_from_override(&db, &draft.id, from)
                 .map_err(|e| e.to_string())?;
-            return Ok(json!({
+            let mut result = json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
-            }));
+            });
+            if awaiting_approval {
+                result["confirmation"] = agent_context::human_approval_hint();
+            }
+            return Ok(result);
         }
         SendPolicyDecision::Denied(denial) => {
             return Err(json!({
@@ -1209,14 +1219,20 @@ async fn handle_reply(
     } else {
         Some(headers.cc.join(", "))
     };
+    let authority = agent_context::agent_policy_input(ctx, confirm_send, &allow_recipients, None);
     let policy_input = SendPolicyInput {
         to: &headers.to,
         cc: cc_str.as_deref(),
         bcc: None,
-        confirm_send,
-        allow_recipients: &allow_recipients,
+        confirm_send: authority.confirm_send,
+        allow_recipients: authority.allow_recipients,
     };
-    let decision = evaluate(send_mode, &policy_input);
+    let awaiting_approval = agent_context::awaits_human_approval(ctx, send_mode);
+    let decision = if awaiting_approval {
+        SendPolicyDecision::DraftOnly
+    } else {
+        evaluate(send_mode, &policy_input)
+    };
     record_send_policy_event(
         &db,
         &creds.account.id,
@@ -1258,7 +1274,7 @@ async fn handle_reply(
                 }),
             )
             .map_err(|e| e.to_string())?;
-            return Ok(json!({
+            let mut result = json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
@@ -1266,7 +1282,11 @@ async fn handle_reply(
                 "in_reply_to": headers.in_reply_to,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
-            }));
+            });
+            if awaiting_approval {
+                result["confirmation"] = agent_context::human_approval_hint();
+            }
+            return Ok(result);
         }
         SendPolicyDecision::Denied(denial) => {
             return Err(json!({
@@ -1600,7 +1620,11 @@ async fn handle_send_draft(
     // send_now, and confirm_send_now. This mirrors handle_send/handle_reply:
     // a draft-only decision yields a non-sent status=drafted outcome referencing
     // the already-existing draft (no new draft is created, no SMTP is reached).
-    if let Some(agent) = ctx {
+    //
+    // The revision the policy admitted. Everything after this must act on
+    // exactly that revision, so a human approval never covers a later edit.
+    let mut admitted_revision = None;
+    if ctx.is_some() {
         let db = Database::open_default().map_err(|e| e.to_string())?;
         let draft = db
             .get_draft(id)
@@ -1611,14 +1635,15 @@ async fn handle_send_draft(
         // ceiling yields a draft and a denial stops the call; only an allowed
         // decision passes through to the normal Governor-gated dispatch below.
         let send_mode = clamp_mode(ctx, SendMode::AutonomousSend);
+        // Confirmation is a human approval of this revision and the allowlist
+        // is the agent's own; the call's confirm_send is intent only.
+        let authority = agent_context::agent_policy_input(ctx, confirm_send, &[], Some(&draft));
         let policy_input = SendPolicyInput {
             to: &draft.to_addr,
             cc: draft.cc_addr.as_deref(),
             bcc: draft.bcc_addr.as_deref(),
-            confirm_send,
-            // send_draft takes no per-call allowlist: an allowlisted-send
-            // ceiling admits only the agent's stored recipient allowlist.
-            allow_recipients: &agent.policy.allow_recipients,
+            confirm_send: authority.confirm_send,
+            allow_recipients: authority.allow_recipients,
         };
         let decision = evaluate(send_mode, &policy_input);
         record_send_policy_event(
@@ -1630,7 +1655,7 @@ async fn handle_send_draft(
             agent_context::agent_id_of(ctx),
         )?;
         match decision {
-            SendPolicyDecision::Allowed => {}
+            SendPolicyDecision::Allowed => admitted_revision = Some(draft.revision),
             SendPolicyDecision::DraftOnly => {
                 return Ok(crate::commands::contract::send_body::mcp_drafted(
                     json!(send_mode),
@@ -1639,14 +1664,17 @@ async fn handle_send_draft(
                 ));
             }
             SendPolicyDecision::Denied(denial) => {
-                return Err(json!({
+                let mut refusal = json!({
                     "status": "denied",
                     "error": denial,
                     "send_mode": send_mode,
                     "draft_id": draft.id,
                     "ui": ui::draft_ui(&draft.account_id, &draft.id),
-                })
-                .to_string());
+                });
+                if send_mode == SendMode::ConfirmSend {
+                    refusal["confirmation"] = agent_context::human_approval_hint();
+                }
+                return Err(refusal.to_string());
             }
         }
     }
@@ -1672,6 +1700,9 @@ async fn handle_send_draft(
         }
         precheck
     };
+    if admitted_revision.is_some_and(|revision| revision != precheck.revision) {
+        return Err(crate::commands::drafts::draft_changed_since_admitted(id).to_string());
+    }
 
     let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
     let send_now = params
@@ -1751,6 +1782,7 @@ async fn handle_send_draft(
         SendSurface::Mcp,
         &declared,
         agent_context::agent_id_of(ctx),
+        admitted_revision,
     )
     .await
     {

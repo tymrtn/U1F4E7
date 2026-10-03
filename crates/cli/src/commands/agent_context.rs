@@ -24,10 +24,11 @@
 //!    [`parse_allow_list`].
 
 use envelope_email_store::{
-    AgentIdentity, AgentPolicy as StoreAgentPolicy, Database,
+    AgentIdentity, AgentPolicy as StoreAgentPolicy, Database, Draft,
     SendModeCeiling as StoreSendModeCeiling,
 };
 use envelope_email_transport::{AgentPolicy as TransportPolicy, PolicyDenial, SendMode};
+use serde_json::{Value, json};
 
 /// Env var carrying the raw bearer token that selects an agent identity for the
 /// MCP session.
@@ -80,6 +81,49 @@ impl AgentContext {
     pub fn clamp_send_mode(&self, requested: SendMode) -> SendMode {
         self.policy.clamp_send_mode(requested)
     }
+}
+
+/// The confirmation and recipient allowlist a send is evaluated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendAuthority<'a> {
+    pub confirm_send: bool,
+    pub allow_recipients: &'a [String],
+}
+
+/// Where send authority comes from for one send-policy evaluation.
+///
+/// With an agent identity, the allowlist is the agent's stored policy and
+/// confirmation is a human approval of the draft's current revision (a message
+/// that is not a draft yet has none). The caller's own `confirm_send` and
+/// `allow_recipient` values are intent only. Without an identity (the operator
+/// CLI, or the unsafe anonymous MCP override) the caller's values apply.
+pub fn agent_policy_input<'a>(
+    ctx: Option<&'a AgentContext>,
+    tool_confirm: bool,
+    tool_allow: &'a [String],
+    draft: Option<&Draft>,
+) -> SendAuthority<'a> {
+    match ctx {
+        Some(ctx) => SendAuthority {
+            confirm_send: draft.is_some_and(Draft::human_approved),
+            allow_recipients: &ctx.policy.allow_recipients,
+        },
+        None => SendAuthority {
+            confirm_send: tool_confirm,
+            allow_recipients: tool_allow,
+        },
+    }
+}
+
+/// True when an agent's new message must wait for a human: under confirm-send
+/// it cannot carry an approval yet, so it is saved as a draft instead of sent.
+pub fn awaits_human_approval(ctx: Option<&AgentContext>, mode: SendMode) -> bool {
+    ctx.is_some() && mode == SendMode::ConfirmSend
+}
+
+/// Tells the agent that a human must approve the draft before it can be sent.
+pub fn human_approval_hint() -> Value {
+    json!({"required": "human_approval", "surface": "dashboard"})
 }
 
 /// Resolve the MCP agent context from the environment.
@@ -361,6 +405,84 @@ mod tests {
         assert_eq!(bulk_underlying_action("delete"), Some("delete"));
         assert_eq!(bulk_underlying_action("tag"), Some("tag"));
         assert_eq!(bulk_underlying_action("nope"), None);
+    }
+
+    fn allowlisted_ctx(ceiling: SendMode) -> AgentContext {
+        AgentContext {
+            agent_id: "id".to_string(),
+            agent_name: "skippy".to_string(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".to_string()],
+                allowed_folders: vec!["*".to_string()],
+                allowed_actions: vec!["send".to_string()],
+                send_mode_ceiling: ceiling,
+                allow_recipients: vec!["ok@example.test".to_string()],
+            },
+        }
+    }
+
+    fn draft_at_revision(revision: i64, approved_revision: Option<i64>) -> Draft {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Test",
+                "me@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let mut draft = db
+            .create_draft(
+                &account.id,
+                "a@b.test",
+                Some("hi"),
+                Some("x"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        draft.revision = revision;
+        draft.metadata = approved_revision.map(|r| {
+            json!({"human_approval": {
+                "approved_by": "human:dashboard",
+                "approved_at": "2026-10-03T10:00:00Z",
+                "revision": r,
+            }})
+        });
+        draft
+    }
+
+    #[test]
+    fn agent_send_authority_ignores_the_call_and_reads_the_policy() {
+        let ctx = allowlisted_ctx(SendMode::AllowlistedSend);
+        let tool_allow = vec!["stranger@example.test".to_string()];
+        let authority = agent_policy_input(Some(&ctx), true, &tool_allow, None);
+        assert!(!authority.confirm_send, "a call cannot confirm itself");
+        assert_eq!(authority.allow_recipients, ["ok@example.test".to_string()]);
+
+        let approved = draft_at_revision(3, Some(3));
+        assert!(agent_policy_input(Some(&ctx), false, &[], Some(&approved)).confirm_send);
+        let stale = draft_at_revision(4, Some(3));
+        assert!(!agent_policy_input(Some(&ctx), true, &[], Some(&stale)).confirm_send);
+    }
+
+    #[test]
+    fn operator_send_authority_is_the_callers_own() {
+        let tool_allow = vec!["c@d.test".to_string()];
+        let authority = agent_policy_input(None, true, &tool_allow, None);
+        assert!(authority.confirm_send);
+        assert_eq!(authority.allow_recipients, tool_allow.as_slice());
+        assert!(!awaits_human_approval(None, SendMode::ConfirmSend));
+        let ctx = allowlisted_ctx(SendMode::ConfirmSend);
+        assert!(awaits_human_approval(Some(&ctx), SendMode::ConfirmSend));
+        assert!(!awaits_human_approval(Some(&ctx), SendMode::DraftOnly));
     }
 
     #[test]

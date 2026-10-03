@@ -1087,8 +1087,8 @@ fn mcp_send_draft_under_draft_only_ceiling_never_sends() {
 
 #[test]
 fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
-    // A confirm-send ceiling (with confirm_send=true) must NOT be blocked by the
-    // ceiling logic itself: the send clears the ceiling and proceeds to the
+    // A confirm-send ceiling on a human-approved draft must NOT be blocked by
+    // the ceiling logic itself: the send clears the ceiling and proceeds to the
     // normal dispatch (here it queues into the outbox). It must not return the
     // ceiling-denial (status=drafted / send_mode=draft-only). A valid `attributes`
     // declaration is supplied (v2 requires it) and the default cooldown queue path
@@ -1100,6 +1100,8 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
     set_policy(home, "skippy", "send", "confirm-send");
 
     let draft_id = create_local_draft(home, "a@b.test");
+    // Confirmation is a human approval; the call's confirm_send is intent only.
+    approve_draft(home, &draft_id);
 
     let (payload, _is_error) = tool_call(
         home,
@@ -1121,6 +1123,7 @@ fn mcp_send_draft_confirm_send_ceiling_passes_ceiling_check() {
         payload["send_mode"], "draft-only",
         "confirm-send ceiling must not clamp to draft-only: {payload}"
     );
+    assert_eq!(payload["status"], "scheduled", "{payload}");
 }
 
 /// Give an agent the `send` action, an `allowlisted-send` ceiling, and a stored
@@ -1274,6 +1277,227 @@ fn send_draft_denied_decision_never_queues() {
     let (send_after, status) = draft_schedule(home, &draft_id);
     assert_eq!(send_after, None, "a denied draft must never be queued");
     assert_eq!(status, "draft");
+}
+
+// ── Send authority comes from the agent's policy ────────────────────
+
+/// Drafts waiting in the outbox for the scheduled-send sweep.
+fn queued_draft_count(home: &std::path::Path) -> i64 {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drafts WHERE send_after IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count queued drafts")
+}
+
+/// Record a human approval of the draft's current revision, as the dashboard
+/// approve action does.
+fn approve_draft(home: &std::path::Path, draft_id: &str) {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    let draft = db
+        .get_draft(draft_id)
+        .expect("read draft")
+        .expect("draft exists");
+    db.record_draft_human_approval(
+        draft_id,
+        draft.revision,
+        "human:dashboard",
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .expect("record human approval");
+}
+
+fn bump_draft_revision(home: &std::path::Path, draft_id: &str) {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .execute(
+            "UPDATE drafts SET text_content = 'edited', revision = revision + 1 WHERE id = ?1",
+            [draft_id],
+        )
+        .expect("edit draft");
+}
+
+#[test]
+fn tool_allow_recipient_ignored() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_allowlisted_send_policy(home, "skippy", "ok@example.test");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send",
+        json!({
+            "to": "stranger@example.test",
+            "subject": "hi",
+            "body": "x",
+            "attributes": ["informational"],
+            "send_mode": "allowlisted-send",
+            "allow_recipient": ["stranger@example.test"]
+        }),
+    );
+
+    assert!(is_error, "the tool's allowlist must not admit: {payload}");
+    assert_eq!(payload["status"], "denied", "{payload}");
+    assert_eq!(
+        payload["error"]["code"], "send_recipient_not_allowlisted",
+        "{payload}"
+    );
+    assert_eq!(queued_draft_count(home), 0, "nothing may reach the outbox");
+}
+
+#[test]
+fn tool_confirm_send_does_not_confirm() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_policy(home, "skippy", "send", "confirm-send");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send",
+        json!({
+            "to": "a@b.test",
+            "subject": "hi",
+            "body": "x",
+            "attributes": ["informational"],
+            "send_mode": "confirm-send",
+            "confirm_send": true
+        }),
+    );
+
+    assert!(!is_error, "an unconfirmed send becomes a draft: {payload}");
+    assert_eq!(payload["status"], "drafted", "{payload}");
+    assert_eq!(payload["sent"], false, "{payload}");
+    assert_eq!(queued_draft_count(home), 0, "nothing may reach the outbox");
+}
+
+#[test]
+fn confirm_ceiling_drafts_with_approval_hint() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_policy(home, "skippy", "send", "confirm-send");
+
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send",
+        json!({
+            "to": "a@b.test",
+            "subject": "hi",
+            "body": "x",
+            "attributes": ["informational"],
+            "send_mode": "autonomous-send"
+        }),
+    );
+
+    assert!(!is_error, "a confirm-send ceiling drafts: {payload}");
+    assert_eq!(payload["status"], "drafted", "{payload}");
+    assert_eq!(payload["send_mode"], "confirm-send", "{payload}");
+    assert_eq!(
+        payload["confirmation"],
+        json!({"required": "human_approval", "surface": "dashboard"}),
+        "{payload}"
+    );
+    let draft_id = payload["draft_id"].as_str().expect("draft id");
+    let (send_after, status) = draft_schedule(home, draft_id);
+    assert_eq!(send_after, None, "the draft waits for a human");
+    assert_eq!(status, "draft");
+}
+
+#[test]
+fn send_draft_confirm_requires_current_human_approval() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _agent_id) = create_agent(home, "skippy");
+    set_policy(home, "skippy", "send", "confirm-send");
+
+    let approved = create_local_draft(home, "a@b.test");
+    approve_draft(home, &approved);
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send_draft",
+        confirmed_send_draft(&approved),
+    );
+    assert!(!is_error, "an approved revision may be sent: {payload}");
+    assert_eq!(payload["status"], "scheduled", "{payload}");
+    assert!(draft_schedule(home, &approved).0.is_some());
+
+    let edited = create_local_draft(home, "a@b.test");
+    approve_draft(home, &edited);
+    bump_draft_revision(home, &edited);
+    let (payload, is_error) = tool_call(
+        home,
+        Some(&token),
+        "send_draft",
+        confirmed_send_draft(&edited),
+    );
+    assert!(is_error, "an edit after approval must be denied: {payload}");
+    assert_eq!(payload["status"], "denied", "{payload}");
+    assert_eq!(
+        payload["error"]["code"], "send_confirmation_required",
+        "{payload}"
+    );
+    assert_eq!(
+        payload["confirmation"],
+        json!({"required": "human_approval", "surface": "dashboard"}),
+        "{payload}"
+    );
+    let (send_after, status) = draft_schedule(home, &edited);
+    assert_eq!(send_after, None, "a denied draft must never be queued");
+    assert_eq!(status, "draft");
+}
+
+#[test]
+fn anonymous_send_keeps_tool_confirm_and_allowlist() {
+    // The explicit unsafe anonymous override has no agent policy, so the
+    // caller's own confirm_send and allow_recipient still apply.
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "send",
+        json!({
+            "to": "a@b.test",
+            "subject": "hi",
+            "body": "x",
+            "attributes": ["informational"],
+            "send_mode": "confirm-send",
+            "confirm_send": true
+        }),
+    );
+    assert!(!is_error, "{payload}");
+    assert_eq!(payload["status"], "queued", "{payload}");
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "send",
+        json!({
+            "to": "c@d.test",
+            "subject": "hi again",
+            "body": "y",
+            "attributes": ["informational"],
+            "send_mode": "allowlisted-send",
+            "allow_recipient": ["c@d.test"]
+        }),
+    );
+    assert!(!is_error, "{payload}");
+    assert_eq!(payload["status"], "queued", "{payload}");
 }
 
 /// A send_draft whose earlier attempt may have been delivered returns

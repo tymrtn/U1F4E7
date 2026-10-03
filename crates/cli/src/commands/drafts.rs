@@ -2223,29 +2223,38 @@ pub async fn run_send(
         }
     }
 
-    let outcome =
-        match send_existing_draft(id, account, backend, SendSurface::Cli, &declared, None).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // An unknown outcome is a result (exit 0): the caller reads
-                // `status` and must not treat the draft as sent.
-                if let Some(body) = super::send_attempt::uncertain_outcome(&e) {
-                    if json {
-                        println!("{body}");
-                    } else {
-                        super::send_attempt::print_uncertain(body);
-                    }
-                    return Ok(());
+    let outcome = match send_existing_draft(
+        id,
+        account,
+        backend,
+        SendSurface::Cli,
+        &declared,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // An unknown outcome is a result (exit 0): the caller reads
+            // `status` and must not treat the draft as sent.
+            if let Some(body) = super::send_attempt::uncertain_outcome(&e) {
+                if json {
+                    println!("{body}");
+                } else {
+                    super::send_attempt::print_uncertain(body);
                 }
-                if json
-                    && let Some(not_confirmed) =
-                        e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
-                {
-                    println!("{}", not_confirmed.body);
-                }
-                return Err(e);
+                return Ok(());
             }
-        };
+            if json
+                && let Some(not_confirmed) =
+                    e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
+            {
+                println!("{}", not_confirmed.body);
+            }
+            return Err(e);
+        }
+    };
     if json {
         println!("{}", outcome.json);
     } else {
@@ -2497,12 +2506,29 @@ pub(crate) fn queue_bot_draft_for_send(
     .context("failed to atomically queue draft (declaration + schedule + due status)")
 }
 
+/// The refusal for a draft that changed after an agent's send policy admitted
+/// it: the decision covered the earlier revision only.
+pub(crate) fn draft_changed_since_admitted(draft_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "denied",
+        "draft_id": draft_id,
+        "retryable": true,
+        "error": {
+            "code": "draft_changed",
+            "reason": "the draft changed after the send policy admitted it; check it and send again",
+        },
+    })
+}
+
 /// Send an already-created draft (by local UUID or IMAP UID) without printing
 /// anything. The draft id is the operation key: the row is claimed for one
 /// attempt, transmitted through the shared attempt core, and left `sent`,
 /// released (nothing sent), or `delivery_uncertain`. Rerunning it on a `sent`
 /// draft answers from the record; on a `sending` row whose owner has exited,
 /// recovery resolves the row first.
+///
+/// `admitted_revision` is the revision an agent's send policy admitted; any
+/// other revision is refused before the claim.
 pub(crate) async fn send_existing_draft(
     id: &str,
     account: Option<&str>,
@@ -2510,6 +2536,7 @@ pub(crate) async fn send_existing_draft(
     surface: SendSurface,
     declared: &[String],
     agent_id: Option<&str>,
+    admitted_revision: Option<i64>,
 ) -> Result<SentDraftOutcome> {
     use super::send_attempt::{
         AttemptSurface, SendNotConfirmed, claim_row, state_report, transmit_claimed,
@@ -2583,6 +2610,12 @@ pub(crate) async fn send_existing_draft(
 
     // ── Bind credentials to the draft's account (before any network work) ──
     ensure_draft_account_binding(&draft.id, &draft.account_id, &acct.id, &acct.username)?;
+    if admitted_revision.is_some_and(|revision| revision != draft.revision) {
+        return Err(SendNotConfirmed {
+            body: draft_changed_since_admitted(&draft.id),
+        }
+        .into());
+    }
 
     // ── Exclusive durable send claim ──
     // An in-flight claim, a provider sync, a concurrent edit (stale revision),
