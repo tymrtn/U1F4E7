@@ -280,6 +280,54 @@ pub async fn run_explain(
     Ok(())
 }
 
+/// Mark safe the message at folder/UID, whose bytes are `raw`, as the
+/// dashboard does: the mark binds to their fingerprint and needs a stored
+/// verdict that judged them. Returns its Message-ID.
+fn mark_safe_bytes(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    raw: &[u8],
+) -> Result<Option<String>> {
+    let message_id = threat::sole_message_id(raw);
+    let Some(fingerprint) = threat::content_fingerprint(raw) else {
+        bail!(
+            "{}: UID {uid} in {folder} could not be fingerprinted, so it cannot be marked safe",
+            persist::RESCAN_REQUIRED
+        );
+    };
+    let matched = persist::matching_verdict(
+        db,
+        account_id,
+        folder,
+        uid,
+        message_id.as_deref(),
+        &fingerprint,
+    )?;
+    if matched.is_none() {
+        bail!(
+            "{}: no stored verdict judged the message now at UID {uid} in {folder}; \
+             scan it with `envelope threat show {uid} --folder {folder}`",
+            persist::RESCAN_REQUIRED
+        );
+    }
+    persist::mark_safe(
+        db,
+        &VerdictTarget {
+            account_id,
+            folder,
+            uid,
+            message_id: message_id.as_deref(),
+            content_fingerprint: Some(&fingerprint),
+            observed_message_ids: &[],
+        },
+        "cli",
+        None,
+    )?;
+    Ok(message_id)
+}
+
 #[tokio::main]
 pub async fn run_mark_safe(
     uid: u32,
@@ -289,37 +337,21 @@ pub async fn run_mark_safe(
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
-    let account_id = creds.account.id.clone();
-    // The mark binds to content: the fingerprint the UID's verdict recorded,
-    // else that of the message's bytes.
-    let recorded = persist::stored_verdict_for_uid(&db, &account_id, folder, uid)?
-        .and_then(|s| Some((s.message_id, s.content_fingerprint?)));
-    let (message_id, fingerprint) = match recorded {
-        Some((message_id, fingerprint)) => (message_id, Some(fingerprint)),
-        None => {
-            let mut client = imap::connect(&creds)
-                .await
-                .context("IMAP connection failed")?;
-            let raw = fetch_raw(&mut client, folder, uid).await?;
-            (
-                threat::sole_message_id(&raw),
-                threat::content_fingerprint(&raw),
-            )
-        }
-    };
-    persist::mark_safe(
-        &db,
-        &VerdictTarget {
-            account_id: &account_id,
-            folder,
-            uid,
-            message_id: message_id.as_deref(),
-            content_fingerprint: fingerprint.as_deref(),
-            observed_message_ids: &[],
-        },
-        "cli",
-        None,
-    )?;
+    // A message that cannot be read whole (over the size cap) is not marked.
+    let raw = async {
+        let mut client = imap::connect(&creds)
+            .await
+            .context("IMAP connection failed")?;
+        fetch_raw(&mut client, folder, uid).await
+    }
+    .await
+    .with_context(|| {
+        format!(
+            "{}: UID {uid} in {folder} could not be read, so it cannot be marked safe",
+            persist::RESCAN_REQUIRED
+        )
+    })?;
+    let message_id = mark_safe_bytes(&db, &creds.account.id, folder, uid, &raw)?;
     if json {
         println!(
             "{}",
@@ -609,6 +641,57 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
             value["tags"],
             json!([threat::TAG_DANGEROUS, threat::TAG_MALWARE]),
             "{value}"
+        );
+    }
+
+    /// UID 1 held `a@x`, whose verdict is on file there; it now holds
+    /// another message.
+    #[test]
+    fn mark_safe_never_marks_the_verdict_left_by_another_message_at_the_uid() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let old: &[u8] = b"Message-ID: <a@x>\r\nFrom: Alice <alice@partner.example>\r\n\
+To: me@example.org\r\nSubject: Lunch\r\n\r\nThursday?\r\n";
+        let now: &[u8] = b"Message-ID: <b@x>\r\nFrom: Bob <bob@partner.example>\r\n\
+To: me@example.org\r\nSubject: Hi\r\n\r\nFriday?\r\n";
+        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(old), &config)
+            .unwrap();
+        let old_fingerprint = threat::content_fingerprint(old).unwrap();
+
+        let marked = mark_safe_bytes(&db, "a", "INBOX", 1, now);
+
+        let err = marked.expect_err("no verdict on file judged the bytes now at UID 1");
+        assert!(
+            format!("{err:#}").contains(persist::RESCAN_REQUIRED),
+            "{err:#}"
+        );
+        let old_view = persist::bound_threat(
+            &db,
+            "a",
+            "INBOX",
+            1,
+            persist::Seen::Bytes(Some(&old_fingerprint)),
+        )
+        .unwrap();
+        let tags: Vec<&str> = old_view.tags.iter().map(|t| t.tag.as_str()).collect();
+        assert!(!tags.contains(&threat::TAG_FALSE_POSITIVE), "{tags:?}");
+
+        // Once a scan has judged the bytes now at UID 1, the mark binds them.
+        persist::verdict_on_open(&db, "a", "me@example.org", "INBOX", 1, Some(now), &config)
+            .unwrap();
+        let marked = mark_safe_bytes(&db, "a", "INBOX", 1, now).unwrap();
+        assert_eq!(marked.as_deref(), Some("b@x"));
+        let label = db
+            .events_for_message("a", "label_applied", "b@x", 1)
+            .unwrap()
+            .remove(0);
+        let payload: serde_json::Value = serde_json::from_str(&label.payload.unwrap()).unwrap();
+        let now_fingerprint = threat::content_fingerprint(now).unwrap();
+        assert_eq!(payload["content_fingerprint"], now_fingerprint.as_str());
+        assert!(
+            db.events_for_message("a", "label_applied", "a@x", 1)
+                .unwrap()
+                .is_empty()
         );
     }
 
