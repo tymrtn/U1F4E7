@@ -545,6 +545,7 @@ pub async fn apply_core(
         client,
         db,
         account_id,
+        agent_run: attribution.agent_id.is_some(),
     };
     let report = rule_exec::apply_rules_to_summaries(
         &mut mbox,
@@ -669,7 +670,9 @@ pub async fn run_apply(
         .await
         .context("IMAP connection failed")?;
 
-    let attribution = ActionAttribution::new(rule_exec::ActionSource::Cli);
+    let agent = agent_context::cli_agent(&db, json)?;
+    let attribution = ActionAttribution::new(rule_exec::ActionSource::Cli)
+        .with_agent(agent_context::agent_id_of(agent.as_ref()));
     let result = apply_core(
         &mut client,
         &db,

@@ -1989,6 +1989,38 @@ fn is_sent_destination(dest: &str, sent_folder: Option<&str>) -> bool {
         || sent_folder.is_some_and(|sent| sent.eq_ignore_ascii_case(dest.trim()))
 }
 
+/// Refuse an agent's move, copy, snooze or delete of a message the threat
+/// engine holds, wherever it is seen ([`agent_context::held_message_denial`]).
+async fn refuse_held(
+    client: &mut envelope_email_transport::imap::ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    tool_name: &str,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<(), String> {
+    let denial = agent_context::held_message_denial(client, db, ctx, account_id, folder, uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    refuse_with(db, ctx, tool_name, account_id, denial)
+}
+
+/// Refuse the call with `denial`, recorded as a policy refusal is.
+fn refuse_with(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    tool_name: &str,
+    account_id: &str,
+    denial: Option<envelope_email_transport::PolicyDenial>,
+) -> Result<(), String> {
+    let Some(denial) = denial else {
+        return Ok(());
+    };
+    record_tool_denial(db, ctx, Some(account_id), tool_name, denial.code);
+    Err(denial.to_json().to_string())
+}
+
 async fn handle_move(
     params: &Value,
     backend: CredentialBackend,
@@ -2012,6 +2044,16 @@ async fn handle_move(
         .await
         .map_err(|e| e.to_string())?;
     refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
+    refuse_held(
+        &mut client,
+        &db,
+        ctx,
+        "move_message",
+        &creds.account.id,
+        from_folder,
+        uid,
+    )
+    .await?;
 
     envelope_email_transport::imap::move_message(&mut client, uid, from_folder, to_folder)
         .await
@@ -2484,7 +2526,7 @@ async fn handle_bulk(
     backend: CredentialBackend,
     ctx: Option<&AgentContext>,
 ) -> Result<Value, String> {
-    let (req, op_str, forced_dry_run) = parse_bulk_request(params)?;
+    let (mut req, op_str, forced_dry_run) = parse_bulk_request(params)?;
 
     // Two-action gate: `bulk` (already checked by authorize_tool_call) AND the
     // underlying single action for this op must both be allowed. Deny with the
@@ -2511,6 +2553,10 @@ async fn handle_bulk(
     {
         refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
     }
+    let held = agent_context::held_bulk_denial(&mut client, &db, ctx, &creds.account.id, &mut req)
+        .await
+        .map_err(|e| e.to_string())?;
+    refuse_with(&db, ctx, "bulk", &creds.account.id, held)?;
 
     let result = envelope_email_transport::bulk::execute(&mut client, &db, &creds.account.id, &req)
         .await
@@ -2805,6 +2851,16 @@ async fn handle_snooze(
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
                 .map_err(|e| e.to_string())?;
+            refuse_held(
+                &mut client,
+                &db,
+                ctx,
+                "snooze",
+                &creds.account.id,
+                folder,
+                uid,
+            )
+            .await?;
             let _ = envelope_email_transport::imap::create_folder(&mut client, "Snoozed").await;
             let msg = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
                 .await

@@ -759,6 +759,121 @@ fn message_malware_reason(
         .then(|| "the message has more stored verdicts than the attachment gate reads".to_string()))
 }
 
+/// Why an agent may not move, copy or delete this message, if the threat
+/// engine holds it: its threat key or its Message-ID carries
+/// `threat:quarantined` or `threat:malware`, or a malware or dangerous
+/// verdict is stored for these bytes. The check reads content, not the
+/// folder, because a server can show one message in several folders (Gmail
+/// lists a quarantined message in `[Gmail]/All Mail` too). `raw` is `None`
+/// over the fetch cap; the header Message-ID then stands in and any verdict
+/// under it counts. A message with neither is held, and so is one whose
+/// verdict history is longer than the window read. Only a Mark safe bound to
+/// these bytes releases it.
+pub fn held_reason(
+    db: &Database,
+    account_id: &str,
+    raw: Option<&[u8]>,
+    header_message_id: Option<&str>,
+) -> Result<Option<String>> {
+    let (message_id, fingerprint) = match raw {
+        Some(raw) => (super::sole_message_id(raw), super::content_fingerprint(raw)),
+        None => (
+            header_message_id
+                .and_then(super::usable_message_id)
+                .map(str::to_string),
+            None,
+        ),
+    };
+    let (message_id, fingerprint) = (message_id.as_deref(), fingerprint.as_deref());
+    let Some(key) = threat_key(db, account_id, message_id, fingerprint)? else {
+        return Ok(Some(
+            "the message has no Message-ID or readable content to check".to_string(),
+        ));
+    };
+    if is_marked_safe(db, account_id, &key, fingerprint)? {
+        return Ok(None);
+    }
+    let holding_tag = |k: &str| -> Result<Option<String>> {
+        Ok(db
+            .get_tags(account_id, k)?
+            .into_iter()
+            .map(|t| t.tag)
+            .find(|t| t == TAG_QUARANTINED || t == TAG_MALWARE))
+    };
+    if let Some(tag) = holding_tag(&key)? {
+        return Ok(Some(format!("the message is tagged {tag}")));
+    }
+    if let Some(mid) = message_id
+        && mid != key
+        && let Some(tag) = holding_tag(mid)?
+    {
+        return Ok(Some(format!(
+            "a message with this Message-ID is tagged {tag}"
+        )));
+    }
+    let events =
+        db.events_for_message(account_id, THREAT_VERDICT, &key, FINGERPRINT_SEARCH_LIMIT)?;
+    let window_full = events.len() >= FINGERPRINT_SEARCH_LIMIT;
+    for event in events {
+        let stored = stored_verdict(event)?;
+        let same_content =
+            fingerprint.is_none_or(|fp| stored.content_fingerprint.as_deref() == Some(fp));
+        if !same_content {
+            continue;
+        }
+        if stored.verdict.is_malware() {
+            return Ok(Some(
+                "the message's stored threat verdict is malware".to_string(),
+            ));
+        }
+        if stored.verdict.level == Level::Dangerous {
+            return Ok(Some(
+                "the message's stored threat verdict is dangerous".to_string(),
+            ));
+        }
+    }
+    Ok(
+        window_full
+            .then(|| "the message has more stored verdicts than the check reads".to_string()),
+    )
+}
+
+/// [`held_reason`] for the message at `folder`/`uid`, read from the server
+/// without marking it seen. A message that is not there is an error.
+pub async fn held_at(
+    client: &mut ImapClient,
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<String>> {
+    let fetched = imap::fetch_message_with_raw(client, folder, uid).await;
+    held_of_fetch(db, account_id, folder, uid, fetched)
+}
+
+/// [`held_at`] for the result of reading `folder`/`uid` with
+/// [`imap::fetch_message_with_raw`].
+pub(crate) fn held_of_fetch(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    fetched: Result<
+        Option<(envelope_email_store::models::Message, Option<Vec<u8>>)>,
+        crate::errors::ImapError,
+    >,
+) -> Result<Option<String>> {
+    let (message, raw) = fetched
+        .with_context(|| format!("failed to read UID {uid} in {folder} for the threat check"))?
+        .ok_or_else(|| anyhow!("message UID {uid} not found in {folder}"))?;
+    held_reason(
+        db,
+        account_id,
+        raw.as_deref(),
+        message.message_id.as_deref(),
+    )
+}
+
 /// Every attachment of `raw` the download gate would refuse, by filename, in
 /// message order. The reader uses it to show a blocked attachment as blocked
 /// instead of offering a download the server will refuse. Names and content
@@ -1472,6 +1587,7 @@ pub async fn scan_uid(
         client,
         db,
         account_id: account.id,
+        agent_run: false,
     };
     scan_one(&mut mbox, db, account, folder, uid, config).await
 }
@@ -3243,6 +3359,81 @@ Subject: s\r\n\r\nhi\r\n";
         assert_eq!(
             mbox.calls.iter().filter(|c| c.starts_with("move")).count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn content_the_engine_holds_is_held_in_any_folder() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig {
+            quarantine: Quarantine::Move,
+            ..ThreatConfig::default()
+        };
+        let quarantined = phish("q@x");
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(7, quarantined.clone());
+        let r = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[7], &config).await;
+        assert_eq!(
+            r[0].1.as_ref().unwrap().quarantine,
+            QuarantineOutcome::Moved
+        );
+
+        // Gmail also lists the message in [Gmail]/All Mail, under another
+        // UID: the same bytes, seen from another folder.
+        let held = held_reason(&db, ACCT, Some(&quarantined), Some("<q@x>")).unwrap();
+        assert!(
+            held.as_deref()
+                .is_some_and(|r| r.contains(TAG_QUARANTINED) || r.contains(TAG_MALWARE)),
+            "{held:?}"
+        );
+        // Over the fetch cap only the header Message-ID is known.
+        assert!(
+            held_reason(&db, ACCT, None, Some("<q@x>"))
+                .unwrap()
+                .is_some()
+        );
+        // Other content under the same Message-ID is held as well.
+        assert!(
+            held_reason(&db, ACCT, Some(&ordinary("q@x")), None)
+                .unwrap()
+                .is_some()
+        );
+        // Mail the engine does not hold, scanned or not, is not held.
+        assert_eq!(
+            held_reason(&db, ACCT, Some(&ordinary("o@x")), None).unwrap(),
+            None
+        );
+        // With neither bytes nor a usable Message-ID nothing can be checked.
+        assert!(held_reason(&db, ACCT, None, None).unwrap().is_some());
+
+        // The stored verdict on these bytes holds them without the tags.
+        for tag in [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED] {
+            db.remove_tag(ACCT, "q@x", tag).unwrap();
+        }
+        let held = held_reason(&db, ACCT, Some(&quarantined), None).unwrap();
+        assert!(
+            held.as_deref().is_some_and(|r| r.contains("verdict")),
+            "{held:?}"
+        );
+
+        // Mark safe on these bytes releases them.
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: QUARANTINE_FOLDER,
+                uid: 7,
+                message_id: Some("q@x"),
+                content_fingerprint: Some(&content_fingerprint(&quarantined)),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            held_reason(&db, ACCT, Some(&quarantined), None).unwrap(),
+            None
         );
     }
 

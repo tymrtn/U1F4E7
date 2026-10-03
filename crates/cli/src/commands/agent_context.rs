@@ -27,6 +27,9 @@ use envelope_email_store::{
     AgentIdentity, AgentPolicy as StoreAgentPolicy, Database, Draft,
     SendModeCeiling as StoreSendModeCeiling,
 };
+use envelope_email_transport::bulk::{self, BulkOp, BulkRequest, BulkTarget};
+use envelope_email_transport::imap::ImapClient;
+use envelope_email_transport::threat::persist;
 use envelope_email_transport::{AgentPolicy as TransportPolicy, PolicyDenial, SendMode};
 use serde_json::{Value, json};
 
@@ -78,6 +81,71 @@ pub fn operator_only_denial() -> PolicyDenial {
                  without an agent token"
             .to_string(),
     }
+}
+
+/// The refusal for an agent's move, copy, snooze or delete of a message the
+/// threat engine holds, `reason` from [`persist::held_reason`]. The check
+/// reads the message's content, so it applies in every folder that shows it.
+pub fn held_denial(folder: &str, uid: u32, reason: &str) -> PolicyDenial {
+    PolicyDenial {
+        code: OPERATOR_ONLY_CODE,
+        reason: format!(
+            "UID {uid} in {folder} is held by the threat engine ({reason}), so only the \
+             operator moves, copies, snoozes or deletes it, without an agent token"
+        ),
+    }
+}
+
+/// For an agent, the refusal to move, copy, snooze or delete the message at
+/// `folder`/`uid` when the threat engine holds it. The operator (`None`) is
+/// never checked.
+pub async fn held_message_denial(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> anyhow::Result<Option<PolicyDenial>> {
+    if ctx.is_none() {
+        return Ok(None);
+    }
+    Ok(persist::held_at(client, db, account_id, folder, uid)
+        .await?
+        .map(|reason| held_denial(folder, uid, &reason)))
+}
+
+/// For an agent, the refusal of a bulk move, copy or delete when any message
+/// it targets is held ([`held_message_denial`]). The request is pinned to the
+/// UIDs checked, so the run acts on exactly those. A dry run, another op, a
+/// target over the bulk limit (which the run refuses) and the operator are
+/// not checked.
+pub async fn held_bulk_denial(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    req: &mut BulkRequest,
+) -> anyhow::Result<Option<PolicyDenial>> {
+    let moves_mail = matches!(
+        req.op,
+        BulkOp::Move { .. } | BulkOp::Copy { .. } | BulkOp::Delete
+    );
+    if ctx.is_none() || req.dry_run || !moves_mail {
+        return Ok(None);
+    }
+    let uids = bulk::resolve_target(client, &req.folder, &req.target).await?;
+    if uids.len() <= bulk::BULK_UID_LIMIT {
+        for &uid in &uids {
+            if let Some(denial) =
+                held_message_denial(client, db, ctx, account_id, &req.folder, uid).await?
+            {
+                return Ok(Some(denial));
+            }
+        }
+    }
+    req.target = BulkTarget::Uids(uids);
+    Ok(None)
 }
 
 /// A CLI command refused for the acting agent, as a stable `{code, reason}`.
@@ -379,6 +447,39 @@ pub fn require_cli_operator(
             operator_only_denial(),
             json,
         )),
+    }
+}
+
+/// [`held_message_denial`] for the CLI: a held message refuses the command,
+/// recorded and printed as [`authorize_cli_action`] does.
+#[allow(clippy::too_many_arguments)]
+pub async fn refuse_held_cli(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let denial = held_message_denial(client, db, ctx, account_id, folder, uid).await?;
+    refuse_cli_with(db, ctx, action, account_id, denial, json)
+}
+
+/// Refuse with `denial`, recorded and printed as [`authorize_cli_action`]
+/// does. The operator (`None`) is never refused.
+pub fn refuse_cli_with(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    denial: Option<PolicyDenial>,
+    json: bool,
+) -> anyhow::Result<()> {
+    match (ctx, denial) {
+        (Some(agent), Some(denial)) => Err(refuse_cli(db, agent, action, account_id, denial, json)),
+        _ => Ok(()),
     }
 }
 

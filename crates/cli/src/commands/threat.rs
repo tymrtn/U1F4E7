@@ -431,6 +431,7 @@ pub async fn run_release(
         client: &mut client,
         db: &db,
         account_id: &account_id,
+        agent_run: false,
     };
     let outcome = execute_action(
         &mut mbox,

@@ -128,6 +128,29 @@ pub struct ImapRuleMailbox<'a> {
     pub client: &'a mut ImapClient,
     pub db: &'a Database,
     pub account_id: &'a str,
+    /// An agent runs the rules: a message the threat engine holds is never
+    /// moved or deleted ([`crate::threat::persist::held_at`]), wherever it
+    /// is seen. Moving mail into quarantine still runs.
+    pub agent_run: bool,
+}
+
+impl ImapRuleMailbox<'_> {
+    /// For an agent's run, refuse to move or delete a held message.
+    async fn refuse_held(&mut self, folder: &str, uid: u32) -> Result<()> {
+        if !self.agent_run {
+            return Ok(());
+        }
+        let held =
+            crate::threat::persist::held_at(self.client, self.db, self.account_id, folder, uid)
+                .await?;
+        if let Some(reason) = held {
+            bail!(
+                "operator_only_command: UID {uid} in {folder} is held by the threat engine \
+                 ({reason}), so an agent's rule run does not move or delete it"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl RuleMailbox for ImapRuleMailbox<'_> {
@@ -141,6 +164,9 @@ impl RuleMailbox for ImapRuleMailbox<'_> {
     }
 
     async fn move_message(&mut self, folder: &str, uid: u32, dest: &str) -> Result<()> {
+        if !crate::threat::persist::is_quarantine_folder(dest) {
+            self.refuse_held(folder, uid).await?;
+        }
         imap::move_message(self.client, uid, folder, dest)
             .await
             .with_context(|| format!("failed to move UID {uid} to {dest}"))
@@ -159,6 +185,7 @@ impl RuleMailbox for ImapRuleMailbox<'_> {
     }
 
     async fn delete_message(&mut self, folder: &str, uid: u32) -> Result<()> {
+        self.refuse_held(folder, uid).await?;
         imap::delete_message(self.client, folder, uid)
             .await
             .with_context(|| format!("failed to delete UID {uid}"))

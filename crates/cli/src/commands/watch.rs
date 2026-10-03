@@ -37,6 +37,7 @@ pub async fn run(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
+    let agent_run = super::agent_context::cli_agent(&db, json)?.is_some();
 
     // Refuse a private or unresolvable --webhook up front. Each POST re-checks
     // the host, since DNS can change over a long-running watch.
@@ -215,6 +216,7 @@ pub async fn run(
                                 client: &mut client,
                                 db: &db,
                                 account_id: &account_id,
+                                agent_run,
                             };
                             let account = RunAccount {
                                 id: &account_id,

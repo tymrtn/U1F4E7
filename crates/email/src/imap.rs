@@ -3853,6 +3853,56 @@ Subject: hi\r\n\r\nbody\r\n";
         (message, raw, server.await.unwrap())
     }
 
+    /// An agent copying a quarantined message out of another folder is held
+    /// by its content: Gmail lists the message in `[Gmail]/All Mail` too.
+    #[tokio::test]
+    async fn a_quarantined_message_read_from_another_folder_is_held() {
+        use crate::threat::persist::{QUARANTINE_FOLDER, held_of_fetch};
+        const RFC822: &str =
+            "Message-ID: <q@x>\r\nFrom: a@partner.example\r\nSubject: s\r\n\r\nbody\r\n";
+        const ALL_MAIL: &str = "[Gmail]/All Mail";
+        async fn read_all_mail() -> Result<Option<(Message, Option<Vec<u8>>)>, ImapError> {
+            let (mut session, server) = scripted_session(vec![
+                select_turn(),
+                size_turn(RFC822.len()),
+                fetch_turn(format!(
+                    "* 1 FETCH (UID {BIG_UID} FLAGS (\\Seen) BODY[] {{{}}}\r\n{RFC822})",
+                    RFC822.len()
+                )),
+            ])
+            .await;
+            let fetched = fetch_message_with_raw_in(&mut session, ALL_MAIL, BIG_UID).await;
+            server.await.unwrap();
+            fetched
+        }
+        let db = envelope_email_store::Database::open_memory().unwrap();
+
+        let held = held_of_fetch(&db, "acct-1", ALL_MAIL, BIG_UID, read_all_mail().await);
+        assert_eq!(held.unwrap(), None);
+
+        db.add_tag(
+            "acct-1",
+            "q@x",
+            crate::threat::TAG_QUARANTINED,
+            Some(7),
+            Some(QUARANTINE_FOLDER),
+        )
+        .unwrap();
+        let held = held_of_fetch(&db, "acct-1", ALL_MAIL, BIG_UID, read_all_mail().await);
+        let held = held.unwrap();
+        assert!(
+            held.as_deref()
+                .is_some_and(|r| r.contains(crate::threat::TAG_QUARANTINED)),
+            "{held:?}"
+        );
+
+        let missing = held_of_fetch(&db, "acct-1", ALL_MAIL, BIG_UID, Ok(None));
+        assert!(
+            missing.unwrap_err().to_string().contains("not found"),
+            "a UID the folder lacks is an error"
+        );
+    }
+
     async fn download_whole(rfc822: &str, filename: &str) -> DownloadedAttachment {
         let (mut session, server) = scripted_session(vec![
             select_turn(),

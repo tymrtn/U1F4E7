@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
 use envelope_email_transport::bulk::{BULK_UID_LIMIT, BulkOp, BulkRequest, BulkResult, BulkTarget};
 
+use super::agent_context;
 use super::common::setup_credentials;
 
 /// Parse a UID spec like `1,2,9:14` into an explicit UID list. Ranges are
@@ -96,12 +97,17 @@ pub async fn run(
         .context("IMAP connection failed")?;
 
     let action_type = op.action_type();
-    let req = BulkRequest {
+    let mut req = BulkRequest {
         target,
         op,
         folder: folder.to_string(),
         dry_run,
     };
+    let ctx = agent_context::cli_agent(&db, json)?;
+    let held =
+        agent_context::held_bulk_denial(&mut client, &db, ctx.as_ref(), &account_id, &mut req)
+            .await?;
+    agent_context::refuse_cli_with(&db, ctx.as_ref(), action_type, &account_id, held, json)?;
 
     let result =
         match envelope_email_transport::bulk::execute(&mut client, &db, &account_id, &req).await {
