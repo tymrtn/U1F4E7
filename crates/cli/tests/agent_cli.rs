@@ -637,6 +637,12 @@ fn cli_quarantine_is_the_operators() {
             &["--match-tag", " THREAT:Quarantined"],
             "flag=seen",
         ),
+        // Selecting by the threat score, which the verdict sets.
+        create(
+            "scored",
+            &["--match-score-above", "threat=10"],
+            "move=INBOX",
+        ),
         // Moving into the quarantine folder, however it is spelled.
         create(
             "hide",

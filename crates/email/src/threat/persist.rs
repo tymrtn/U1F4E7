@@ -63,7 +63,7 @@ pub fn rule_touches_threat_state(match_expr: &MatchExpr, action: &Action) -> boo
         ),
         _ => false,
     };
-    moves_to_quarantine || action.sets_threat_tag() || match_expr.references_threat_tag()
+    moves_to_quarantine || action.sets_threat_tag() || match_expr.references_threat_verdict()
 }
 /// Agent id every engine-driven action and event is attributed to.
 pub const THREAT_AGENT_ID: &str = "envelope:threat";
@@ -1803,6 +1803,27 @@ mod tests {
             &Action::AddTag("threat:false_positive".to_string())
         ));
         assert!(!rule_touches_threat_state(&any, &inbox));
+        // The threat score is the verdict's, so selecting by it is too.
+        for score in [
+            MatchExpr::ScoreAbove {
+                dimension: "threat".to_string(),
+                threshold: 50.0,
+            },
+            MatchExpr::Or(vec![
+                any.clone(),
+                MatchExpr::ScoreBelow {
+                    dimension: " Threat ".to_string(),
+                    threshold: 10.0,
+                },
+            ]),
+        ] {
+            assert!(rule_touches_threat_state(&score, &inbox), "{score:?}");
+        }
+        let urgency = MatchExpr::ScoreAbove {
+            dimension: "urgent".to_string(),
+            threshold: 0.5,
+        };
+        assert!(!rule_touches_threat_state(&urgency, &inbox));
         let (match_expr, action) = quarantine_rule_json();
         let shipped = StoredRuleAction::parse(&action).unwrap().action;
         let shipped_match: MatchExpr = serde_json::from_str(&match_expr).unwrap();

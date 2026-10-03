@@ -50,17 +50,23 @@ pub enum MatchExpr {
 }
 
 impl MatchExpr {
-    /// True when any condition selects by a `threat:*` tag, compared as
-    /// [`crate::threat::is_threat_tag`] does.
-    pub fn references_threat_tag(&self) -> bool {
+    /// True when any condition selects by the threat verdict: a `threat:*`
+    /// tag, compared as [`crate::threat::is_threat_tag`] does, or the `threat`
+    /// score (trimmed, case-insensitive).
+    pub fn references_threat_verdict(&self) -> bool {
         match self {
             MatchExpr::HasTag(tag) | MatchExpr::ContactHasTag(tag) => {
                 crate::threat::is_threat_tag(tag)
             }
-            MatchExpr::And(exprs) | MatchExpr::Or(exprs) => {
-                exprs.iter().any(MatchExpr::references_threat_tag)
+            MatchExpr::ScoreAbove { dimension, .. } | MatchExpr::ScoreBelow { dimension, .. } => {
+                dimension
+                    .trim()
+                    .eq_ignore_ascii_case(crate::threat::THREAT_DIMENSION)
             }
-            MatchExpr::Not(inner) => inner.references_threat_tag(),
+            MatchExpr::And(exprs) | MatchExpr::Or(exprs) => {
+                exprs.iter().any(MatchExpr::references_threat_verdict)
+            }
+            MatchExpr::Not(inner) => inner.references_threat_verdict(),
             _ => false,
         }
     }
