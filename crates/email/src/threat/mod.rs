@@ -402,17 +402,25 @@ pub fn sole_message_id(raw: &[u8]) -> Option<String> {
 
 /// [`sole_message_id`] over already parsed header fields.
 pub(crate) fn sole_message_id_in(headers: &[(String, String)]) -> Option<String> {
-    let mut fields = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("message-id"));
-    let (_, value) = fields.next()?;
-    if fields.next().is_some() {
-        return None;
-    }
-    let id = envelope_email_store::canonical_message_id(value);
+    let [id] = message_id_values_in(headers).try_into().ok()?;
     let one_id =
         !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>');
-    one_id.then(|| id.to_string())
+    one_id.then_some(id)
+}
+
+/// The canonical value of every Message-ID field, in wire order, empty ones
+/// included: what a server may report as the message's Message-ID.
+pub(crate) fn message_id_values_in(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("message-id"))
+        .map(|(_, value)| envelope_email_store::canonical_message_id(value).to_string())
+        .collect()
+}
+
+/// [`message_id_values_in`] of a raw message.
+pub fn message_id_values(raw: &[u8]) -> Vec<String> {
+    message_id_values_in(&parse_header_block(raw))
 }
 
 /// The `by` host of a `Received` header, if it names one.

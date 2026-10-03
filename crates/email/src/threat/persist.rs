@@ -68,6 +68,8 @@ impl RawFetch for ImapRuleMailbox<'_> {
 pub struct ScannedMessage {
     /// [`super::sole_message_id`] of the message.
     pub message_id: Option<String>,
+    /// [`super::message_id_values`] of the scanned bytes.
+    pub observed_message_ids: Vec<String>,
     pub from_addr: String,
     pub to_addr: String,
     pub subject: String,
@@ -146,6 +148,7 @@ fn scanned_message(input: &ThreatInput) -> ScannedMessage {
     };
     ScannedMessage {
         message_id: super::sole_message_id_in(&input.headers),
+        observed_message_ids: Vec::new(),
         from_addr: input.from_addr.clone(),
         to_addr: header("to").unwrap_or_default(),
         subject: header("subject").unwrap_or_default(),
@@ -166,6 +169,7 @@ pub fn scan_raw(
     let (verdict, mut scanned) =
         evaluate_input(prepare_input(db, account_id, account_address, raw), config);
     scanned.content_fingerprint = Some(super::content_fingerprint(raw));
+    scanned.observed_message_ids = super::message_id_values(raw);
     (verdict, scanned)
 }
 
@@ -217,6 +221,10 @@ pub struct VerdictTarget<'a> {
     /// [`super::content_fingerprint`] of the message's bytes, stored beside
     /// the verdict. `None` only where no complete bytes were read.
     pub content_fingerprint: Option<&'a str>,
+    /// [`super::message_id_values`] of the message. Stored with a verdict on
+    /// a message without one usable Message-ID, so the sweep can tell it is
+    /// the message still at that folder/UID.
+    pub observed_message_ids: &'a [String],
 }
 
 /// The `threat_verdict` event payload: the verdict with the fingerprint of
@@ -232,6 +240,10 @@ struct VerdictPayload {
     /// verdict is keyed by fingerprint: the record of the collision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reused_message_id: Option<String>,
+    /// For a message without one usable Message-ID, the values of its
+    /// Message-ID fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    observed_message_ids: Vec<String>,
 }
 
 /// True when Mark safe applies to the message with these bytes: its threat
@@ -414,6 +426,10 @@ fn record_verdict_event(
                 verdict: verdict.clone(),
                 content_fingerprint: target.content_fingerprint.map(str::to_string),
                 reused_message_id: reused_message_id.map(str::to_string),
+                observed_message_ids: match target.message_id {
+                    Some(_) => Vec::new(),
+                    None => target.observed_message_ids.to_vec(),
+                },
             })
             .context("serialize verdict")?,
         ),
@@ -478,6 +494,10 @@ pub struct StoredVerdict {
     /// [`threat_key`]). Not part of any JSON output.
     #[serde(skip)]
     pub key: Option<String>,
+    /// For a message without one usable Message-ID, the values of its
+    /// Message-ID fields. Not part of any JSON output.
+    #[serde(skip)]
+    pub observed_message_ids: Vec<String>,
     pub recorded_at: String,
     pub verdict: ThreatVerdict,
     /// The fingerprint of the bytes the verdict judged; `None` for a verdict
@@ -554,6 +574,7 @@ fn stored_verdict(event: Event) -> Result<StoredVerdict> {
         recorded_at: event.created_at,
         verdict: payload.verdict,
         content_fingerprint: payload.content_fingerprint,
+        observed_message_ids: payload.observed_message_ids,
     })
 }
 
@@ -1060,6 +1081,7 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
         .await
         .context("threat analyzers panicked")?;
     scanned.content_fingerprint = Some(super::content_fingerprint(&raw));
+    scanned.observed_message_ids = super::message_id_values(&raw);
     db.with_db(|d| -> Result<()> {
         let target = VerdictTarget {
             account_id: account.id,
@@ -1067,6 +1089,7 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
             uid,
             message_id: scanned.message_id.as_deref(),
             content_fingerprint: scanned.content_fingerprint.as_deref(),
+            observed_message_ids: &scanned.observed_message_ids,
         };
         record_verdict(d, &target, &verdict)?;
         record_lookups(d, &target, &scanned.lookups)
@@ -1109,12 +1132,14 @@ pub fn verdict_on_open(
     };
     let message_id = super::sole_message_id(raw);
     let fingerprint = super::content_fingerprint(raw);
+    let observed = super::message_id_values(raw);
     let here = VerdictTarget {
         account_id,
         folder,
         uid,
         message_id: message_id.as_deref(),
         content_fingerprint: Some(&fingerprint),
+        observed_message_ids: &observed,
     };
     let key = threat_key(db, account_id, here.message_id, Some(&fingerprint))?;
     if let (Some(mid), Some(key)) = (here.message_id, key.as_deref()) {
@@ -1147,6 +1172,7 @@ pub fn verdict_on_open(
         uid,
         message_id: scanned.message_id.as_deref(),
         content_fingerprint: scanned.content_fingerprint.as_deref(),
+        observed_message_ids: &scanned.observed_message_ids,
     };
     record_verdict(db, &target, &verdict)?;
     record_lookups(db, &target, &scanned.lookups)?;
@@ -1328,6 +1354,7 @@ mod tests {
                 uid: 7,
                 message_id: scanned.message_id.as_deref(),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &verdict,
         )
@@ -1363,6 +1390,7 @@ mod tests {
             uid: 1,
             message_id: Some("m@x"),
             content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("m@x"), &ThreatConfig::default());
         record_verdict(&db, &target, &bad).unwrap();
@@ -1392,6 +1420,7 @@ mod tests {
                 uid: 7,
                 message_id: Some("m@x"),
                 content_fingerprint: scanned.content_fingerprint.as_deref(),
+                observed_message_ids: &[],
             },
             &verdict,
         )
@@ -1430,6 +1459,7 @@ mod tests {
             uid,
             message_id: Some("f@x"),
             content_fingerprint,
+            observed_message_ids: &[],
         };
         let payload = |uid| {
             db.latest_event_for_uid(ACCT, THREAT_VERDICT, "INBOX", uid)
@@ -1546,6 +1576,7 @@ mod tests {
             uid: 3,
             message_id: Some("a@x"),
             content_fingerprint: Some("v1:a"),
+            observed_message_ids: &[],
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         assert!(
@@ -1672,6 +1703,7 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
                 uid: 1,
                 message_id: Some("orig@x"),
                 content_fingerprint: Some(&content_fingerprint(original)),
+                observed_message_ids: &[],
             },
             &ThreatVerdict::unavailable("clamd down"),
         )
@@ -1800,6 +1832,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 4,
                 message_id: None,
                 content_fingerprint: Some(&fp),
+                observed_message_ids: &[],
             },
             &clamd,
         )
@@ -1921,6 +1954,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 1,
                 message_id: Some("q@x"),
                 content_fingerprint: Some(&a_fp),
+                observed_message_ids: &[],
             },
             "reader",
             None,
@@ -1977,6 +2011,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid,
             message_id: Some("long@x"),
             content_fingerprint: Some("v1:orig"),
+            observed_message_ids: &[],
         };
         record_verdict_event(&db, &target(1), Some("long@x"), &malware).unwrap();
         let gate = || {
@@ -2029,6 +2064,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid: 2379,
             message_id: Some("big@x"),
             content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let stored = ThreatVerdict::unavailable("clamd down");
         record_verdict(&db, &target, &stored).unwrap();
@@ -2053,6 +2089,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 4,
                 message_id: Some("legacy@x"),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &clean,
         )
@@ -2146,6 +2183,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 1,
                 message_id: Some("mv@x"),
                 content_fingerprint: Some(&fp),
+                observed_message_ids: &[],
             },
             "cli",
             None,
@@ -2196,6 +2234,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 1,
                 message_id: Some("reuse@x"),
                 content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
             },
             "reader",
             None,
@@ -2318,6 +2357,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid: 5,
             message_id: Some("old@x"),
             content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let err = mark_safe(&db, &unbound, "cli", None).unwrap_err();
         assert!(format!("{err:#}").contains(RESCAN_REQUIRED), "{err:#}");
@@ -2361,6 +2401,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 3,
                 message_id: Some("both@x"),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &legacy,
         )
@@ -2408,6 +2449,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
                 uid: 1,
                 message_id: Some("old@x"),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &legacy,
         )
@@ -2425,6 +2467,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid: 1,
             message_id: Some("s@x"),
             content_fingerprint: Some(&fp),
+            observed_message_ids: &[],
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("s@x"), &ThreatConfig::default());
@@ -2535,6 +2578,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid: 1,
             message_id: Some(mid),
             content_fingerprint: None,
+            observed_message_ids: &[],
         };
         let (bad, _) = scan_raw(&db, ACCT, EMAIL, &phish("a@x"), &ThreatConfig::default());
         let (good, _) = scan_raw(&db, ACCT, EMAIL, &ordinary("b@x"), &ThreatConfig::default());
@@ -2591,6 +2635,7 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
             uid: 9,
             message_id: scanned.message_id.as_deref(),
             content_fingerprint: None,
+            observed_message_ids: &[],
         };
         record_verdict(&db, &target, &verdict).unwrap();
         record_lookups(&db, &target, &scanned.lookups).unwrap();

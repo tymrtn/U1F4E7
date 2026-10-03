@@ -315,6 +315,7 @@ pub async fn run_mark_safe(
             uid,
             message_id: message_id.as_deref(),
             content_fingerprint: Some(&fingerprint),
+            observed_message_ids: &[],
         },
         "cli",
         None,
@@ -432,12 +433,14 @@ pub async fn run_report(
 
     let message_id = threat::sole_message_id(&raw);
     let fingerprint = threat::content_fingerprint(&raw);
+    let observed = threat::message_id_values(&raw);
     let target = VerdictTarget {
         account_id: &account_id,
         folder,
         uid,
         message_id: message_id.as_deref(),
         content_fingerprint: Some(&fingerprint),
+        observed_message_ids: &observed,
     };
     let verdict = match persist::stored_verdict_for_uid(&db, &account_id, folder, uid)? {
         Some(stored) => Some(stored.verdict),
@@ -590,6 +593,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 uid: 1,
                 message_id: Some("twin@x"),
                 content_fingerprint: Some(&threat::content_fingerprint(clean)),
+                observed_message_ids: &[],
             },
             "cli",
             None,
@@ -627,6 +631,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 uid: 3,
                 message_id: Some("m@x"),
                 content_fingerprint: Some("v1:00"),
+                observed_message_ids: &[],
             },
             &verdict,
         )

@@ -243,6 +243,7 @@ pub fn mark_safe_message(
         uid,
         message_id: message_id.as_deref(),
         content_fingerprint: Some(&fingerprint),
+        observed_message_ids: &[],
     };
     if let Err(e) = persist::mark_safe(db, &target, "reader", None) {
         return error(
@@ -335,6 +336,7 @@ pub async fn report_draft(
                 uid,
                 message_id: threat::sole_message_id(&raw).as_deref(),
                 content_fingerprint: Some(&threat::content_fingerprint(&raw)),
+                observed_message_ids: &[],
             },
             &lookups,
         );
@@ -408,7 +410,10 @@ pub async fn report_draft(
 
 /// UIDs among `summaries` with no current verdict, newest first, capped. A
 /// verdict counts only when it was stored for the same folder/UID and the
-/// same Message-ID; a message reusing a scanned Message-ID is scanned.
+/// same Message-ID; a message reusing a scanned Message-ID is scanned. For a
+/// message without one usable Message-ID, the summary's Message-ID (as the
+/// server reports it) must be one the scan read in its header block; an
+/// absent or empty one matches a header block with none or an empty one.
 pub fn unscanned_uids(
     db: &Database,
     account_id: &str,
@@ -427,7 +432,16 @@ pub fn unscanned_uids(
             let existing = persist::stored_verdict_for_uid(db, account_id, folder, s.uid)
                 .ok()
                 .flatten()
-                .filter(|stored| stored.message_id.as_deref() == mid)
+                .filter(|stored| match stored.message_id.as_deref() {
+                    Some(stored_mid) => mid == Some(stored_mid),
+                    None => match mid {
+                        Some(mid) => stored.observed_message_ids.iter().any(|m| m == mid),
+                        None => {
+                            stored.observed_message_ids.is_empty()
+                                || stored.observed_message_ids.iter().any(String::is_empty)
+                        }
+                    },
+                })
                 .map(|stored| stored.verdict);
             persist::needs_scan(existing.as_ref())
         })
@@ -599,6 +613,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 uid: 2,
                 message_id: Some("two@x"),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &verdict,
         )
@@ -613,6 +628,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 uid: 3,
                 message_id: Some("three@x"),
                 content_fingerprint: None,
+                observed_message_ids: &[],
             },
             &old,
         )
@@ -645,6 +661,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
                 uid,
                 message_id: Some(message_id),
                 content_fingerprint: Some(&fingerprint),
+                observed_message_ids: &[],
             },
             &verdict,
         )
@@ -674,5 +691,142 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
         record(&db, 7, "new@x");
         let uids = unscanned_uids(&db, "a", "INBOX", &[summary(3, "new@x")]);
         assert_eq!(uids, vec![3]);
+    }
+
+    /// The sweep's mailbox: serves fixture bytes, never touches a network.
+    #[derive(Default)]
+    struct FixtureMailbox {
+        raw: HashMap<u32, Vec<u8>>,
+    }
+
+    impl envelope_email_transport::rule_exec::RuleMailbox for FixtureMailbox {
+        async fn resolve_folder(&mut self, dest: &str) -> anyhow::Result<String> {
+            Ok(dest.to_string())
+        }
+        async fn move_message(&mut self, _: &str, _: u32, _: &str) -> anyhow::Result<()> {
+            unreachable!("tag-mode quarantine never moves")
+        }
+        async fn set_flag(&mut self, _: &str, _: u32, _: &str) -> anyhow::Result<()> {
+            unreachable!("the sweep never sets flags")
+        }
+        async fn remove_flag(&mut self, _: &str, _: u32, _: &str) -> anyhow::Result<()> {
+            unreachable!("the sweep never removes flags")
+        }
+        async fn delete_message(&mut self, _: &str, _: u32) -> anyhow::Result<()> {
+            unreachable!("the sweep never deletes")
+        }
+        async fn ensure_folder(&mut self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_unsubscribe_headers(
+            &mut self,
+            _: &str,
+            _: u32,
+        ) -> anyhow::Result<(Option<String>, Option<String>)> {
+            Ok((None, None))
+        }
+    }
+
+    impl persist::RawFetch for FixtureMailbox {
+        async fn fetch_raw(&mut self, _: &str, uid: u32) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.raw.get(&uid).cloned())
+        }
+    }
+
+    /// One sweep scan of `uid`, as `sweep_account` runs it.
+    async fn sweep_scan(db: &Database, uid: u32, raw: &[u8]) {
+        let mut mbox = FixtureMailbox::default();
+        mbox.raw.insert(uid, raw.to_vec());
+        let account = RunAccount {
+            id: "a",
+            email: "me@example.org",
+        };
+        let results = persist::scan_new_mail(
+            &mut mbox,
+            db,
+            &account,
+            "INBOX",
+            &[uid],
+            &ThreatConfig::default(),
+        )
+        .await;
+        results[0].1.as_ref().unwrap();
+    }
+
+    /// The summary the sweep reads, with the Message-ID as the server's
+    /// ENVELOPE gives it.
+    fn envelope_summary(uid: u32, message_id: Option<&str>) -> MessageSummary {
+        MessageSummary {
+            message_id: message_id.map(str::to_string),
+            ..summary(uid, "unused")
+        }
+    }
+
+    fn with_message_ids(headers: &str) -> Vec<u8> {
+        format!(
+            "From: Alice <alice@partner.example>\r\nTo: me@example.org\r\n{headers}\
+             Subject: Lunch\r\n\r\nThursday?\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn sweep_scans_a_duplicate_message_id_message_once() {
+        let db = Database::open_memory().unwrap();
+        let raw = with_message_ids("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n");
+        // Servers differ in which Message-ID the ENVELOPE reports.
+        let summaries = [
+            envelope_summary(5, Some("<first@x>")),
+            envelope_summary(6, Some("<second@x>")),
+        ];
+        assert_eq!(unscanned_uids(&db, "a", "INBOX", &summaries), vec![6, 5]);
+        sweep_scan(&db, 5, &raw).await;
+        sweep_scan(&db, 6, &raw).await;
+        assert!(
+            unscanned_uids(&db, "a", "INBOX", &summaries).is_empty(),
+            "scanned once, then skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_scans_an_empty_message_id_message_once() {
+        let db = Database::open_memory().unwrap();
+        let empty = with_message_ids("Message-ID: \r\n");
+        let empty_first = with_message_ids("Message-ID:\r\nMessage-ID: <b@x>\r\n");
+        let summaries = [
+            envelope_summary(5, None),
+            envelope_summary(6, Some("")),
+            envelope_summary(7, None),
+            envelope_summary(8, Some("<b@x>")),
+        ];
+        assert_eq!(
+            unscanned_uids(&db, "a", "INBOX", &summaries),
+            vec![8, 7, 6, 5]
+        );
+        for (uid, raw) in [
+            (5, &empty),
+            (6, &empty),
+            (7, &empty_first),
+            (8, &empty_first),
+        ] {
+            sweep_scan(&db, uid, raw).await;
+        }
+        assert!(
+            unscanned_uids(&db, "a", "INBOX", &summaries).is_empty(),
+            "scanned once, then skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_rescans_a_slot_whose_observed_message_id_differs() {
+        // UID 5 held a message with two Message-IDs; after a UIDVALIDITY
+        // change another message sits at UID 5.
+        let db = Database::open_memory().unwrap();
+        let raw = with_message_ids("Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\n");
+        sweep_scan(&db, 5, &raw).await;
+        let summaries = [envelope_summary(5, Some("<other@x>"))];
+        assert_eq!(unscanned_uids(&db, "a", "INBOX", &summaries), vec![5]);
+        let summaries = [envelope_summary(5, None)];
+        assert_eq!(unscanned_uids(&db, "a", "INBOX", &summaries), vec![5]);
     }
 }

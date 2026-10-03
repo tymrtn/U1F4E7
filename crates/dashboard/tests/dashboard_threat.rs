@@ -75,6 +75,7 @@ fn state() -> (AppState, Draft) {
             uid: 7,
             message_id: Some("phish@x"),
             content_fingerprint: Some(&content_fingerprint(PHISH)),
+            observed_message_ids: &[],
         },
         &dangerous,
     )
