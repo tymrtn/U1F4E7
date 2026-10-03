@@ -360,3 +360,286 @@ fn contract_export_declares_agent_identity_block() {
         );
     }
 }
+
+// ── CLI commands run with an agent token ────────────────────────────
+
+fn run_as(home: &Path, token: &str, args: &[&str]) -> std::process::Output {
+    Command::new(envelope_bin())
+        .args(args)
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env("ENVELOPE_AGENT_TOKEN", token)
+        .output()
+        .expect("run envelope as agent")
+}
+
+/// Seed one offline account. Uses the insecure machine key (test-only).
+fn seed_account(home: &Path) {
+    let mut child = Command::new(envelope_bin())
+        .args([
+            "accounts",
+            "add",
+            "--skip-login-check",
+            "--email",
+            "test@example.test",
+            "--password-stdin",
+            "--smtp-host",
+            "smtp.example.test",
+            "--smtp-port",
+            "587",
+            "--imap-host",
+            "imap.example.test",
+            "--imap-port",
+            "993",
+            "--insecure-machine-key",
+            "--json",
+        ])
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn accounts add");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"pw\n")
+        .expect("write password");
+    let out = child.wait_with_output().expect("wait accounts add");
+    assert!(out.status.success(), "seed account failed");
+}
+
+fn open_db(home: &Path) -> envelope_email_store::Database {
+    envelope_email_store::Database::open(&home.join("envelope-email/envelope.db"))
+        .expect("open isolated test db")
+}
+
+fn rule_count(home: &Path) -> i64 {
+    open_db(home)
+        .conn()
+        .query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))
+        .expect("count rules")
+}
+
+fn create_agent_token(home: &Path, name: &str) -> String {
+    let created = json_stdout(&run(home, &["--json", "agent", "create", name]));
+    created["token"].as_str().expect("agent token").to_string()
+}
+
+fn allow_actions(home: &Path, name: &str, actions: &str) {
+    let out = run(
+        home,
+        &["agent", "policy", "set", name, "--allow-actions", actions],
+    );
+    assert!(out.status.success(), "policy set failed");
+}
+
+const WEBHOOK_RULE: &[&str] = &[
+    "--json",
+    "rule",
+    "create",
+    "--name",
+    "hook",
+    "--match-from",
+    "*@sender.example",
+    "--action",
+    "webhook=https://hooks.example.com/rule",
+];
+
+fn assert_denied(out: &std::process::Output, code: &str) {
+    assert!(
+        !out.status.success(),
+        "a denial must exit nonzero; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let payload = json_stdout(out);
+    assert_eq!(payload["status"], "denied", "{payload}");
+    assert_eq!(payload["error"]["code"], code, "{payload}");
+    assert!(payload["error"]["reason"].is_string(), "{payload}");
+}
+
+#[test]
+fn cli_webhook_rule_without_grant_is_denied_and_writes_nothing() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    // The default policy allows "*": a wildcard does not grant webhooks.
+    let token = create_agent_token(home, "skippy");
+
+    let out = run_as(home, &token, WEBHOOK_RULE);
+    assert_denied(&out, "agent_policy_denied_action");
+    assert_eq!(rule_count(home), 0, "no rule row may be written");
+
+    allow_actions(home, "skippy", "rules.read,rules.run");
+    let out = run_as(home, &token, WEBHOOK_RULE);
+    assert_denied(&out, "agent_policy_denied_action");
+    assert_eq!(rule_count(home), 0, "no rule row may be written");
+}
+
+#[test]
+fn cli_webhook_rule_with_grant_is_allowed() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    allow_actions(home, "skippy", "rules.webhook");
+
+    let out = run_as(home, &token, WEBHOOK_RULE);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(rule_count(home), 1);
+}
+
+#[test]
+fn cli_webhook_rule_without_token_is_unchanged() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+
+    let out = run(home, WEBHOOK_RULE);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(rule_count(home), 1);
+}
+
+#[test]
+fn cli_batch_ack_is_denied_without_grant() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let created = run(
+        home,
+        &[
+            "rule",
+            "create",
+            "--name",
+            "later",
+            "--match-from",
+            "*@sender.example",
+            "--action",
+            "snooze=tomorrow",
+            "--disabled",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let stored = |home: &Path| -> (String, i64) {
+        open_db(home)
+            .conn()
+            .query_row("SELECT action, enabled FROM rules", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("read rule")
+    };
+    let before = stored(home);
+    let token = create_agent_token(home, "skippy");
+
+    let out = run_as(
+        home,
+        &token,
+        &[
+            "--json",
+            "rule",
+            "enable",
+            "later",
+            "--acknowledge-batch-actions",
+        ],
+    );
+    assert_denied(&out, "agent_policy_denied_action");
+    assert_eq!(stored(home), before, "the rule must not change");
+}
+
+/// A local listener that records whether anything connected to it.
+fn connection_probe() -> (u16, std::sync::mpsc::Receiver<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().expect("probe address").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if listener.accept().is_ok() {
+            let _ = tx.send(());
+        }
+    });
+    (port, rx)
+}
+
+#[test]
+fn cli_publish_sieve_confirm_is_denied_before_network() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let created = run(
+        home,
+        &[
+            "rule",
+            "create",
+            "--name",
+            "archive",
+            "--match-from",
+            "*@sender.example",
+            "--action",
+            "move=Archive",
+        ],
+    );
+    assert!(created.status.success());
+    let token = create_agent_token(home, "skippy");
+    let (port, connected) = connection_probe();
+    let port = port.to_string();
+
+    let out = run_as(
+        home,
+        &token,
+        &[
+            "--json",
+            "rule",
+            "publish-sieve",
+            "--confirm",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--timeout-secs",
+            "1",
+        ],
+    );
+    assert_denied(&out, "agent_policy_denied_action");
+    assert!(
+        connected
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "a denied publish must not open a connection"
+    );
+}
+
+#[test]
+fn cli_revoked_or_unknown_token_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let token = create_agent_token(home, "skippy");
+    allow_actions(home, "skippy", "rules.webhook");
+    assert!(run(home, &["agent", "revoke", "skippy"]).status.success());
+
+    let out = run_as(home, &token, WEBHOOK_RULE);
+    assert_denied(&out, "agent_token_invalid");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(&token)
+            && !String::from_utf8_lossy(&out.stderr).contains(&token),
+        "the token must never be echoed"
+    );
+    assert_eq!(rule_count(home), 0);
+
+    let out = run_as(home, "envtok_not_a_real_token", WEBHOOK_RULE);
+    assert_denied(&out, "agent_token_invalid");
+    assert_eq!(rule_count(home), 0);
+}

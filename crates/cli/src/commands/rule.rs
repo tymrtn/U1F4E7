@@ -9,6 +9,7 @@ use envelope_email_transport::imap;
 use envelope_email_transport::rule_exec::{self, ActionAttribution, ImapRuleMailbox, RunAccount};
 use envelope_email_transport::rules::{self, Action, MessageContext};
 
+use super::agent_context;
 use super::common::setup_credentials;
 use super::provenance;
 use super::ui;
@@ -194,12 +195,22 @@ pub fn run_create(
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
     let account_id = &acct.id;
+    let agent = agent_context::cli_agent(&db, json)?;
 
     let match_expr_json =
         serde_json::to_string(&match_expr).context("failed to serialize match expression")?;
 
     // Parse and serialize the action (confirm rule references are flattened now)
     let action = parse_authored_action_str(action_str, &db, account_id)?;
+    if matches!(action, Action::Webhook(_)) {
+        agent_context::authorize_cli_action(
+            &db,
+            agent.as_ref(),
+            agent_context::RULES_WEBHOOK,
+            account_id,
+            json,
+        )?;
+    }
     let action_json = serde_json::to_string(&action).context("failed to serialize action")?;
 
     // Check for duplicate name
@@ -700,10 +711,35 @@ pub fn run_enable(
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
 
+    let agent = agent_context::cli_agent(&db, json)?;
+
     let rule = db
         .find_rule_by_name(&acct.id, name)
         .context("database error")?
         .ok_or_else(|| anyhow::anyhow!("rule '{name}' not found"))?;
+
+    if agent.is_some() {
+        let current = rules::StoredRuleAction::parse(&rule.action)
+            .with_context(|| format!("rule '{name}' has an invalid action"))?;
+        if matches!(current.action, Action::Webhook(_)) {
+            agent_context::authorize_cli_action(
+                &db,
+                agent.as_ref(),
+                agent_context::RULES_WEBHOOK,
+                &acct.id,
+                json,
+            )?;
+        }
+        if acknowledge_batch_actions {
+            agent_context::authorize_cli_action(
+                &db,
+                agent.as_ref(),
+                agent_context::RULES_BATCH_ACK,
+                &acct.id,
+                json,
+            )?;
+        }
+    }
 
     let stored = if acknowledge_batch_actions {
         rule_exec::acknowledge_batch_actions(&db, &rule.id)?
@@ -1115,6 +1151,16 @@ pub async fn run_publish_sieve(
     let acct = super::common::resolve_account(&db, account)?;
     let account_id = acct.id.clone();
     let imap_host = acct.imap_host.clone();
+    if confirm {
+        let agent = agent_context::cli_agent(&db, json)?;
+        agent_context::authorize_cli_action(
+            &db,
+            agent.as_ref(),
+            agent_context::SIEVE_PUBLISH,
+            &account_id,
+            json,
+        )?;
+    }
 
     let rules = db
         .list_enabled_rules(&account_id)

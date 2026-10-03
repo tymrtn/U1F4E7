@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-//! Per-agent identity context for the MCP transport.
+//! Per-agent identity context for the MCP transport and token-gated CLI commands.
 //!
 //! At MCP startup Envelope requires `ENVELOPE_AGENT_TOKEN` and resolves it to a
 //! stored [`AgentIdentity`] and its policy; every subsequent MCP tool call is
@@ -39,6 +39,32 @@ pub const AGENT_TOKEN_ENV: &str = "ENVELOPE_AGENT_TOKEN";
 /// conspicuously rather than receiving it as an unset-token default.
 pub const UNSAFE_ANONYMOUS_ENV: &str = "ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS";
 
+/// CLI actions an agent token may perform only when its policy names them.
+/// Each one sends mail data off the machine or changes how the mail server
+/// filters mail, so a `"*"` policy does not include them.
+pub const EXPLICIT_GRANT_ACTIONS: &[&str] = &[RULES_WEBHOOK, RULES_BATCH_ACK, SIEVE_PUBLISH];
+/// Create or enable a rule whose action posts message data to a webhook.
+pub const RULES_WEBHOOK: &str = "rules.webhook";
+/// `rule enable --acknowledge-batch-actions`: let snooze and unsubscribe
+/// rules act in batch runs.
+pub const RULES_BATCH_ACK: &str = "rules.batch_ack";
+/// `rule publish-sieve --confirm`: upload the rules to the mail server.
+pub const SIEVE_PUBLISH: &str = "sieve.publish";
+/// Stable code for a set `ENVELOPE_AGENT_TOKEN` that matches no active agent.
+pub const AGENT_TOKEN_INVALID_CODE: &str = "agent_token_invalid";
+
+/// A CLI command refused for the acting agent, as a stable `{code, reason}`.
+#[derive(Debug)]
+pub struct CliDenial(pub PolicyDenial);
+
+impl std::fmt::Display for CliDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.0.reason, self.0.code)
+    }
+}
+
+impl std::error::Error for CliDenial {}
+
 /// A resolved agent identity plus its enforcement policy for one MCP session.
 #[derive(Debug, Clone)]
 pub struct AgentContext {
@@ -68,12 +94,24 @@ impl AgentContext {
     /// Authorize a bare policy action (already resolved, not a tool name)
     /// against `account`/`folder`. Used for the bulk two-action gate, where the
     /// coarse `bulk` action and the underlying operation action must both pass.
+    /// An [`EXPLICIT_GRANT_ACTIONS`] action must be named in the policy; a
+    /// `"*"` wildcard does not grant it.
     pub fn authorize_action(
         &self,
         action: &str,
         account: &str,
         folder: Option<&str>,
     ) -> Result<(), PolicyDenial> {
+        if EXPLICIT_GRANT_ACTIONS.contains(&action)
+            && !self.policy.allowed_actions.iter().any(|a| a == action)
+        {
+            return Err(PolicyDenial {
+                code: "agent_policy_denied_action",
+                reason: format!(
+                    "agent policy does not permit action '{action}'; it must be granted by name"
+                ),
+            });
+        }
         self.policy.authorize(action, account, folder)
     }
 
@@ -173,17 +211,98 @@ fn resolve_from_values(
              Create one with `envelope agent create <name>`."
         )
     })?;
+    context_for(db, &identity).map(Some)
+}
 
+fn context_for(db: &Database, identity: &AgentIdentity) -> anyhow::Result<AgentContext> {
     let store_policy = db
         .get_agent_policy(&identity.id)?
         .unwrap_or_else(|| StoreAgentPolicy::default_for(&identity.id));
     let policy = map_store_policy(&store_policy)?;
 
-    Ok(Some(AgentContext {
+    Ok(AgentContext {
         agent_id: identity.id.clone(),
         agent_name: identity.name.clone(),
         policy,
-    }))
+    })
+}
+
+/// Resolve who is running a CLI command.
+///
+/// - No (or a blank) `ENVELOPE_AGENT_TOKEN`: the operator, `Ok(None)`. The
+///   command behaves exactly as it does without agent identities.
+/// - A token for an active agent: `Ok(Some(ctx))`; token-gated commands then
+///   apply that agent's policy.
+/// - Any other token: a [`CliDenial`] with [`AGENT_TOKEN_INVALID_CODE`]. A bad
+///   token never falls back to the operator.
+///
+/// The raw token is never echoed into the error.
+pub fn resolve_cli_from_env(db: &Database) -> anyhow::Result<Option<AgentContext>> {
+    let raw = std::env::var(AGENT_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    resolve_cli_from_values(db, raw)
+}
+
+fn resolve_cli_from_values(
+    db: &Database,
+    raw: Option<String>,
+) -> anyhow::Result<Option<AgentContext>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(identity) = db.get_agent_by_token(&raw)? else {
+        return Err(CliDenial(PolicyDenial {
+            code: AGENT_TOKEN_INVALID_CODE,
+            reason: format!(
+                "{AGENT_TOKEN_ENV} is set but does not match any active agent identity \
+                 (unknown or revoked token)"
+            ),
+        })
+        .into());
+    };
+    context_for(db, &identity).map(Some)
+}
+
+/// The CLI's acting agent. An invalid token is refused and, in JSON mode,
+/// printed as `{"status":"denied","error":{code,reason}}`.
+pub fn cli_agent(db: &Database, json: bool) -> anyhow::Result<Option<AgentContext>> {
+    resolve_cli_from_env(db).map_err(|e| print_cli_denial(e, json))
+}
+
+/// Authorize `action` on `account_id` for the CLI's acting agent before any
+/// write or network call. The operator (`None`) is always allowed. A denial
+/// is recorded in the agent's action log, printed in JSON mode, and returned
+/// as the command's error so it exits nonzero.
+pub fn authorize_cli_action(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    ctx.authorize_action(action, account_id, None)
+        .map_err(|denial| {
+            if let Err(e) = db.log_denied_action_with_agent(
+                account_id,
+                action,
+                denial.code,
+                Some(&ctx.agent_id),
+            ) {
+                tracing::warn!("could not record the refused {action} in the action log: {e}");
+            }
+            print_cli_denial(CliDenial(denial).into(), json)
+        })
+}
+
+fn print_cli_denial(error: anyhow::Error, json: bool) -> anyhow::Error {
+    if json && let Some(CliDenial(denial)) = error.downcast_ref::<CliDenial>() {
+        println!("{}", json!({"status": "denied", "error": denial.to_json()}));
+    }
+    error
 }
 
 /// Map a stored agent policy row into the pure transport policy the enforcement
@@ -322,6 +441,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(unknown.contains("unknown or revoked"));
+    }
+
+    #[test]
+    fn cli_identity_is_the_operator_without_a_token_and_fails_closed_on_a_bad_one() {
+        let db = Database::open_memory().unwrap();
+        assert!(resolve_cli_from_values(&db, None).unwrap().is_none());
+
+        let err = resolve_cli_from_values(&db, Some("envtok_unknown".into())).unwrap_err();
+        let denial = err.downcast_ref::<CliDenial>().expect("a stable denial");
+        assert_eq!(denial.0.code, AGENT_TOKEN_INVALID_CODE);
+        assert!(!err.to_string().contains("envtok_unknown"));
+
+        let created = db.create_agent("skippy").unwrap();
+        let ctx = resolve_cli_from_values(&db, Some(created.token.clone()))
+            .unwrap()
+            .expect("an active agent");
+        assert_eq!(ctx.agent_id, created.identity.id);
+
+        db.revoke_agent(&created.identity.id).unwrap();
+        let err = resolve_cli_from_values(&db, Some(created.token)).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliDenial>().unwrap().0.code,
+            AGENT_TOKEN_INVALID_CODE
+        );
+    }
+
+    #[test]
+    fn a_wildcard_policy_does_not_grant_explicit_grant_actions() {
+        let mut ctx = allowlisted_ctx(SendMode::DraftOnly);
+        ctx.policy.allowed_actions = vec!["*".to_string()];
+        for action in EXPLICIT_GRANT_ACTIONS {
+            let denial = ctx.authorize_action(action, "acct", None).unwrap_err();
+            assert_eq!(denial.code, "agent_policy_denied_action");
+        }
+        assert!(ctx.authorize_action("rules.run", "acct", None).is_ok());
+
+        ctx.policy.allowed_actions = vec![RULES_WEBHOOK.to_string()];
+        assert!(ctx.authorize_action(RULES_WEBHOOK, "acct", None).is_ok());
+        assert!(ctx.authorize_action(SIEVE_PUBLISH, "acct", None).is_err());
     }
 
     #[test]
