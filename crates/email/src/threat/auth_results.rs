@@ -213,6 +213,28 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         ));
         return signals;
     };
+    if strip_comments_and_quotes(&value).is_none() {
+        // The receiver's header cannot be parsed. Its failures still count,
+        // read token by token; a pass never does.
+        for (method, code, weight) in [
+            ("dmarc", "dmarc_fail", DMARC_FAIL),
+            ("dkim", "dkim_fail", DKIM_FAIL),
+        ] {
+            if let Some(result) = lenient_failure(&value, method) {
+                signals.push(Signal::new(
+                    code,
+                    weight,
+                    format!("authserv-id {authserv}: {method}={result}"),
+                ));
+            }
+        }
+        signals.push(Signal::new(
+            "auth_unverifiable",
+            AUTH_UNVERIFIABLE,
+            format!("the Authentication-Results from {authserv} cannot be parsed"),
+        ));
+        return signals;
+    }
     let before = signals.len();
 
     let results = method_results(&value);
@@ -257,11 +279,33 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
 }
 
 /// The authserv-id: the first token before `;`, comments stripped, optional
-/// version number dropped.
+/// version number dropped. A head that cannot be parsed is read leniently,
+/// up to the first `(` or space, so a header claiming the receiving domain
+/// is still classified (and can be counted as forged).
 pub fn authserv_id(value: &str) -> Option<String> {
-    let head = strip_comments_and_quotes(value.split(';').next()?)?;
-    let id = head.split_whitespace().next()?.trim().trim_end_matches('.');
+    let head = value.split(';').next()?;
+    let cleaned = strip_comments_and_quotes(head);
+    let id = cleaned
+        .as_deref()
+        .unwrap_or(head)
+        .trim_start()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()?
+        .trim_end_matches('.');
     (!id.is_empty()).then(|| id.to_lowercase())
+}
+
+/// A `<method>=fail` or `<method>=permerror` token anywhere in `value`, read
+/// without parsing. Used only on a header that cannot be parsed: a failure
+/// found this way can only make a verdict stricter.
+fn lenient_failure(value: &str, method: &str) -> Option<&'static str> {
+    let tokens: Vec<String> = value
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '(' | ')' | '"'))
+        .map(str::to_lowercase)
+        .collect();
+    ["fail", "permerror"]
+        .into_iter()
+        .find(|result| tokens.contains(&format!("{method}={result}")))
 }
 
 /// `(method, result)` pairs after the authserv-id, lowercased. A header
@@ -328,6 +372,12 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
         ));
     };
 
+    // A header the receiver wrote but that cannot be parsed proves nothing.
+    // It is a failure, never unverifiable, because an account that accepts
+    // unverifiable senders would then take the code.
+    if strip_comments_and_quotes(&value).is_none() {
+        return SenderAuth::Fail;
+    }
     let clauses = method_clauses(&value);
     let has = |method: &str, result: &str, covers: &dyn Fn(&MethodClause) -> bool| {
         clauses
@@ -940,6 +990,55 @@ mod tests {
             let headers = gmail_delivery(results, results, &[]);
             assert_eq!(gmail_auth(&headers), SenderAuth::Fail, "{results}");
         }
+    }
+
+    #[test]
+    fn a_garbled_copy_of_the_receivers_ar_is_still_forged() {
+        let probe =
+            r#"Authentication-Results: mx.google.com ("; dmarc=pass header.from=bank.example"#;
+        let headers = gmail_delivery(BANK_PASS, BANK_PASS, &[probe]);
+        let input = at(Some("google.com"), &headers);
+        assert_eq!(codes(&analyze(&input)), vec!["ar_forged"]);
+        // Nothing else trusted: the garbled copy never passes.
+        let headers = [
+            "Received: from out.bank.example (out.bank.example. [192.0.2.201]) by mx.google.com with ESMTPS id x3; Mon, 07 Oct 2026 08:12:34 -0700",
+            probe,
+            "From: Bank <noreply@bank.example>",
+        ];
+        assert_ne!(
+            sender_auth(&at(Some("google.com"), &headers.map(String::from))),
+            passed("dmarc", "bank.example", "mx.google.com")
+        );
+    }
+
+    #[test]
+    fn a_garbled_trusted_ar_keeps_its_failures_and_is_unverifiable() {
+        let migadu = |ar: &str| {
+            received_by(
+                "migadu.com",
+                &[
+                    MIGADU_LMTP,
+                    "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q3; Mon, 28 Sep 2026 04:43:18 +0000",
+                    ar,
+                    "From: Bank <alerts@bank.example>",
+                ],
+                "hi",
+            )
+        };
+        let failing = migadu(
+            "Authentication-Results: mx13.migadu.com; dkim=none; dmarc=fail (p=reject) header.from=bank.example; spf=pass (mx13.migadu.com: domain of a(b@evil.example designates 198.51.100.7 as permitted sender) smtp.mailfrom=a(b@evil.example",
+        );
+        assert_eq!(
+            codes(&analyze(&failing)),
+            vec!["dmarc_fail", "auth_unverifiable"]
+        );
+        assert_eq!(sender_auth(&failing), SenderAuth::Fail);
+
+        let silent = migadu(
+            "Authentication-Results: mx13.migadu.com; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example; spf=pass (mx13.migadu.com: domain of a(b@evil.example",
+        );
+        assert_eq!(codes(&analyze(&silent)), vec!["auth_unverifiable"]);
+        assert_eq!(sender_auth(&silent), SenderAuth::Fail);
     }
 
     #[test]
