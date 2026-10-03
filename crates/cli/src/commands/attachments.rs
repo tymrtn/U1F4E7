@@ -269,6 +269,7 @@ fn write_checked_download(
         db,
         account_id,
         attachment.message_id.as_deref(),
+        attachment.content_fingerprint.as_deref(),
         &attachment.filename,
         &attachment.content_type,
         &attachment.bytes,
@@ -362,6 +363,7 @@ mod tests {
             content_type: "application/pdf".to_string(),
             bytes: bytes.to_vec(),
             message_id: mid.map(str::to_string),
+            content_fingerprint: None,
         }
     }
 

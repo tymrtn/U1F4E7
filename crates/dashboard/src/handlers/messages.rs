@@ -1152,6 +1152,7 @@ fn attachment_blocks_view(
                     db,
                     account_id,
                     msg.message_id.as_deref(),
+                    None,
                     &a.filename,
                     &a.content_type,
                     &[],

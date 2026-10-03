@@ -504,46 +504,85 @@ pub struct AttachmentBlock {
     pub signals: Vec<Signal>,
 }
 
-/// The attachment gate. Refuses bytes when the message carries
-/// `threat:malware` or the attachment itself is malware-grade, unless the
-/// message was marked safe.
+/// The attachment gate. Refuses bytes that look like malware, or whose
+/// message carries `threat:malware`, or whose message content (by
+/// `fingerprint`) has a malware verdict on file. Only a Mark safe bound to
+/// this fingerprint releases them, so an attachment fetched without one (part
+/// by part, from an over-cap message) is never released by Mark safe.
 pub fn attachment_block(
     db: &Database,
     account_id: &str,
     message_id: Option<&str>,
+    fingerprint: Option<&str>,
     filename: &str,
     content_type: &str,
     bytes: &[u8],
 ) -> Result<Option<AttachmentBlock>> {
-    let mut tagged = false;
-    if let Some(mid) = message_id {
-        let tags = db.get_tags(account_id, mid)?;
-        if tags.iter().any(|t| t.tag == TAG_FALSE_POSITIVE) {
-            return Ok(None);
-        }
-        tagged = tags.iter().any(|t| t.tag == TAG_MALWARE);
-    }
-    let signals = super::attachments::gate(filename, content_type, bytes);
-    if !tagged && signals.is_empty() {
+    if let Some(mid) = message_id
+        && is_marked_safe(db, account_id, mid, fingerprint)?
+    {
         return Ok(None);
     }
-    let reason = if signals.is_empty() {
-        "the message is tagged threat:malware".to_string()
-    } else {
-        format!(
+    let signals = super::attachments::gate(filename, content_type, bytes);
+    let reason = if !signals.is_empty() {
+        Some(format!(
             "attachment looks like malware ({})",
             signals
                 .iter()
                 .map(|s| s.code.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )
+        ))
+    } else if let Some(mid) = message_id {
+        message_malware_reason(db, account_id, mid, fingerprint)?
+    } else {
+        None
     };
-    Ok(Some(AttachmentBlock {
+    Ok(reason.map(|reason| AttachmentBlock {
         code: ATTACHMENT_BLOCKED,
         reason,
         signals,
     }))
+}
+
+/// Why the message makes every attachment refused, if it does: the
+/// Message-ID's malware tag, or a malware verdict on these exact bytes. When
+/// the verdict history is longer than the window read, a malware verdict
+/// cannot be ruled out and the attachment is refused.
+fn message_malware_reason(
+    db: &Database,
+    account_id: &str,
+    message_id: &str,
+    fingerprint: Option<&str>,
+) -> Result<Option<String>> {
+    if db
+        .get_tags(account_id, message_id)?
+        .iter()
+        .any(|t| t.tag == TAG_MALWARE)
+    {
+        return Ok(Some("the message is tagged threat:malware".to_string()));
+    }
+    let Some(fingerprint) = fingerprint else {
+        return Ok(None);
+    };
+    let events = db.events_for_message(
+        account_id,
+        THREAT_VERDICT,
+        message_id,
+        FINGERPRINT_SEARCH_LIMIT,
+    )?;
+    let window_full = events.len() >= FINGERPRINT_SEARCH_LIMIT;
+    for event in events {
+        let stored = stored_verdict(event)?;
+        if stored.content_fingerprint.as_deref() == Some(fingerprint) && stored.verdict.is_malware()
+        {
+            return Ok(Some(
+                "the message's stored threat verdict is malware".to_string(),
+            ));
+        }
+    }
+    Ok(window_full
+        .then(|| "the message has more stored verdicts than the attachment gate reads".to_string()))
 }
 
 /// Every attachment of `raw` the download gate would refuse, by filename, in
@@ -560,6 +599,7 @@ pub fn blocked_attachments(
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed for the attachment gate"))?;
     let message_id = parsed.message_id().map(canonical_message_id);
+    let fingerprint = super::content_fingerprint(raw);
     let mut out = Vec::new();
     for attachment in parsed.attachments() {
         let filename = attachment.attachment_name().unwrap_or("unnamed");
@@ -572,6 +612,7 @@ pub fn blocked_attachments(
             db,
             account_id,
             message_id,
+            Some(&fingerprint),
             filename,
             &content_type,
             attachment.contents(),
@@ -1331,23 +1372,40 @@ mod tests {
     #[test]
     fn attachment_gate_honours_malware_tag_bytes_and_mark_safe() {
         let db = Database::open_memory().unwrap();
+        let fp = Some("v1:a");
         // Untagged message, clean PDF bytes: allowed.
         assert!(
-            attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-                .unwrap()
-                .is_none()
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf",
+                "application/pdf",
+                b"%PDF"
+            )
+            .unwrap()
+            .is_none()
         );
         // Malware-grade bytes are refused even with no verdict on file.
-        let block = attachment_block(&db, ACCT, None, "r.pdf.exe", "application/pdf", b"MZ")
+        let block = attachment_block(&db, ACCT, None, None, "r.pdf.exe", "application/pdf", b"MZ")
             .unwrap()
             .unwrap();
         assert_eq!(block.code, ATTACHMENT_BLOCKED);
         // A threat:malware message refuses even innocent-looking bytes.
         db.add_tag(ACCT, "a@x", TAG_MALWARE, Some(3), Some("INBOX"))
             .unwrap();
-        let block = attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-            .unwrap()
-            .unwrap();
+        let block = attachment_block(
+            &db,
+            ACCT,
+            Some("a@x"),
+            fp,
+            "r.pdf",
+            "application/pdf",
+            b"%PDF",
+        )
+        .unwrap()
+        .unwrap();
         assert!(block.reason.contains("threat:malware"));
         // Marked safe: released.
         let target = VerdictTarget {
@@ -1359,9 +1417,46 @@ mod tests {
         };
         mark_safe(&db, &target, "cli", None).unwrap();
         assert!(
-            attachment_block(&db, ACCT, Some("a@x"), "r.pdf", "application/pdf", b"%PDF")
-                .unwrap()
-                .is_none()
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf",
+                "application/pdf",
+                b"%PDF"
+            )
+            .unwrap()
+            .is_none()
+        );
+        // The mark releases the content it was bound to, even bytes the gate
+        // would refuse; an over-cap download has no fingerprint and is never
+        // released by it.
+        assert!(
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                fp,
+                "r.pdf.exe",
+                "application/pdf",
+                b"MZ"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            attachment_block(
+                &db,
+                ACCT,
+                Some("a@x"),
+                None,
+                "r.pdf.exe",
+                "application/pdf",
+                b"MZ"
+            )
+            .unwrap()
+            .is_some()
         );
         assert_eq!(tags(&db, "a@x"), vec![TAG_FALSE_POSITIVE]);
         let label = db
@@ -1394,6 +1489,93 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let names: Vec<&str> = blocked.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["notes.pdf", "invoice.pdf.exe"]);
         assert!(blocked[0].1.reason.contains("threat:malware"));
+    }
+
+    /// A clean message that reuses a malware message's Message-ID clears the
+    /// Message-ID's malware tag, but the original's attachments stay blocked:
+    /// its own verdict, found by fingerprint, is still malware.
+    #[test]
+    fn clean_resend_does_not_unblock_original_malware_attachment() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = b"From: IT Desk <it@examp1e.org>\r\nTo: me@example.org\r\n\
+Message-ID: <orig@x>\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZharmless\r\n\
+--b--\r\n";
+        let scanned = verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(original), &config)
+            .unwrap()
+            .unwrap();
+        assert!(scanned.is_malware());
+        let resend = verdict_on_open(
+            &db,
+            ACCT,
+            EMAIL,
+            "INBOX",
+            2,
+            Some(&ordinary("orig@x")),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resend.level, Level::Clean);
+        assert!(!tags(&db, "orig@x").contains(&TAG_MALWARE.to_string()));
+
+        let blocked = blocked_attachments(&db, ACCT, original).unwrap();
+        let names: Vec<&str> = blocked.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["notes.pdf", "invoice.pdf.exe"]);
+        assert!(
+            blocked[0].1.reason.contains("verdict"),
+            "{}",
+            blocked[0].1.reason
+        );
+    }
+
+    /// The gate reads a bounded window of a Message-ID's verdicts. When the
+    /// window is full and holds no malware verdict for these bytes, it cannot
+    /// rule one out, so it refuses.
+    #[test]
+    fn attachment_gate_fails_closed_past_the_verdict_history_it_reads() {
+        let db = Database::open_memory().unwrap();
+        let malware = super::super::combine(
+            vec![Signal::new("clamd_found", 100, "Eicar").malware()],
+            vec![],
+            vec![],
+            false,
+        );
+        let clean = super::super::combine(vec![], vec![], vec![], false);
+        let target = |uid, fp| VerdictTarget {
+            account_id: ACCT,
+            folder: "INBOX",
+            uid,
+            message_id: Some("long@x"),
+            content_fingerprint: Some(fp),
+        };
+        record_verdict_event(&db, &target(1, "v1:orig"), &malware).unwrap();
+        let gate = || {
+            attachment_block(
+                &db,
+                ACCT,
+                Some("long@x"),
+                Some("v1:orig"),
+                "r.pdf",
+                "application/pdf",
+                b"%PDF",
+            )
+            .unwrap()
+        };
+        assert!(gate().unwrap().reason.contains("verdict"));
+        for uid in 2..=FINGERPRINT_SEARCH_LIMIT as u32 + 1 {
+            record_verdict_event(&db, &target(uid, "v1:other"), &clean).unwrap();
+        }
+        let block = gate().expect("refused when the history is longer than the window");
+        assert!(
+            block.reason.contains("more stored verdicts"),
+            "{}",
+            block.reason
+        );
     }
 
     /// A part-by-part read of an over-cap message passes no raw bytes: there
@@ -1614,6 +1796,26 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         let resend_fp = content_fingerprint(&resend);
         assert!(!is_marked_safe(&db, ACCT, "reuse@x", Some(&resend_fp)).unwrap());
         assert!(is_marked_safe(&db, ACCT, "reuse@x", Some(&original_fp)).unwrap());
+        let gate = |fp: &str| {
+            attachment_block(
+                &db,
+                ACCT,
+                Some("reuse@x"),
+                Some(fp),
+                "notes.pdf",
+                "application/pdf",
+                b"%PDF",
+            )
+            .unwrap()
+        };
+        assert!(
+            gate(&resend_fp).is_some(),
+            "the resend's attachments stay blocked"
+        );
+        assert!(
+            gate(&original_fp).is_none(),
+            "the marked original's are released"
+        );
     }
 
     /// Mark safe as stored before fingerprints: the tag and a `label_applied`

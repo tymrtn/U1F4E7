@@ -1468,7 +1468,7 @@ where
                 .message_id()
                 .map(|m| envelope_email_store::canonical_message_id(m).to_string())
         });
-    downloaded_attachment(uid, &parsed.parts[id], message_id)
+    downloaded_attachment(uid, &parsed.parts[id], message_id, None)
 }
 
 /// Raw RFC822 bytes of one message, opened with `EXAMINE` and fetched with
@@ -2760,7 +2760,7 @@ pub async fn remove_flag(
 }
 
 /// One attachment fetched for download, with the identity of the message it
-/// came from (the threat gate checks that message's verdict tags).
+/// came from (the threat gate checks that message's tags and verdicts).
 #[derive(Debug, Clone)]
 pub struct DownloadedAttachment {
     pub filename: String,
@@ -2768,6 +2768,10 @@ pub struct DownloadedAttachment {
     pub bytes: Vec<u8>,
     /// Canonical (unbracketed) Message-ID of the containing message.
     pub message_id: Option<String>,
+    /// Content fingerprint of the containing message. `None` for an
+    /// attachment fetched part by part from an over-cap message: there are
+    /// no complete bytes to fingerprint.
+    pub content_fingerprint: Option<String>,
 }
 
 /// Fetch a specific attachment by filename from a message.
@@ -2839,9 +2843,10 @@ where
     let message_id = parsed
         .message_id()
         .map(|m| envelope_email_store::canonical_message_id(m).to_string());
+    let fingerprint = crate::threat::content_fingerprint(body);
     for attachment in parsed.attachments() {
         if attachment.attachment_name().unwrap_or("unnamed") == filename {
-            return downloaded_attachment(uid, attachment, message_id);
+            return downloaded_attachment(uid, attachment, message_id, Some(fingerprint));
         }
     }
     Err(ImapError::Protocol(format!(
@@ -2855,6 +2860,7 @@ fn downloaded_attachment(
     uid: u32,
     attachment: &mail_parser::MessagePart<'_>,
     message_id: Option<String>,
+    content_fingerprint: Option<String>,
 ) -> Result<DownloadedAttachment, ImapError> {
     let att_name = attachment
         .attachment_name()
@@ -2875,6 +2881,7 @@ fn downloaded_attachment(
         content_type: ingress::normalize_content_type(&content_type),
         bytes: attachment.contents().to_vec(),
         message_id,
+        content_fingerprint,
     })
 }
 
@@ -4018,6 +4025,15 @@ Subject: hi\r\n\r\nbody\r\n";
             assert_eq!(partial.filename, whole.filename, "{filename}");
             assert_eq!(partial.content_type, whole.content_type, "{filename}");
             assert_eq!(partial.message_id, whole.message_id, "{filename}");
+            assert_eq!(
+                whole.content_fingerprint,
+                Some(crate::threat::content_fingerprint(big_rfc822().as_bytes())),
+                "{filename}"
+            );
+            assert_eq!(
+                partial.content_fingerprint, None,
+                "no complete message to fingerprint: {filename}"
+            );
         }
     }
 
