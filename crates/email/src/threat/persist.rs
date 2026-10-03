@@ -1049,7 +1049,10 @@ mod tests {
         assert!(!needs_scan(Some(&v)));
         v.engine_version = "rshield-0".to_string();
         assert!(needs_scan(Some(&v)));
-        assert_eq!(ENGINE_VERSION, "rshield-1");
+        // 1.3.15's verdicts predate the account-set receiving domain.
+        v.engine_version = "rshield-1".to_string();
+        assert!(needs_scan(Some(&v)));
+        assert_eq!(ENGINE_VERSION, "rshield-2");
     }
 
     #[test]

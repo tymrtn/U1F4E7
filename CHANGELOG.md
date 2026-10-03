@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registrable domains now come from the Public Suffix List (the `psl` crate; the list is compiled in and nothing is fetched at run time). Two addresses under a shared suffix such as `com.pl` or `github.io` no longer count as the same domain for DKIM alignment, look-alike checks, link checks or reputation lookups.
 - The threat scan reads the receiving host's results the same way. A pass the receiver did not provably write adds `auth_unverifiable` (+5), so passing Migadu mail now carries that signal; failures still count wherever the receiver's results sit.
 - Plain `envelope code` (without `--json`) now requires `--from`.
+- The threat engine version is now `rshield-2`, because sender authentication changed. Verdicts stored by earlier versions are rescanned when their message is opened.
 
 ### Fixed
 

@@ -41,7 +41,7 @@ pub use envelope_email_store::correspondents::CorrespondentFacts;
 
 /// Bumped whenever an analyzer or weight changes; a stored verdict from an
 /// older engine is rescanned on open.
-pub const ENGINE_VERSION: &str = "rshield-1";
+pub const ENGINE_VERSION: &str = "rshield-2";
 
 /// `message_scores.dimension` holding the verdict score, so `score_above
 /// threat N` rules match without any new rule primitive.
