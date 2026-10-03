@@ -26,15 +26,19 @@ pub const SPF_SOFTFAIL: u32 = 8;
 pub const DKIM_FAIL: u32 = 12;
 pub const AUTH_UNVERIFIABLE: u32 = 5;
 
-pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
-    let Some(receiving) = input.receiving_host.as_deref() else {
-        return vec![Signal::new(
-            "auth_unverifiable",
-            AUTH_UNVERIFIABLE,
-            "no Received header names a receiving host",
-        )];
-    };
-    let receiving_domain = registrable(receiving);
+/// The receiving host's Authentication-Results, separated from copies that
+/// claim its authserv-id from anywhere else.
+struct ReceivingAr {
+    receiving_domain: String,
+    /// `(authserv-id, header value)` of the one header that is trusted.
+    trusted: Option<(String, String)>,
+    /// Other headers claiming the receiving domain.
+    forged: usize,
+}
+
+/// `None` when no Received header names a receiving host.
+fn trusted_ar(input: &ThreatInput) -> Option<ReceivingAr> {
+    let receiving_domain = registrable(input.receiving_host.as_deref()?);
 
     // Boundary: the first Received header written by another domain. Opaque
     // internal hops like `by 2002:a05:...` do not end the receiving run.
@@ -49,7 +53,7 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         .unwrap_or(input.headers.len());
 
     let mut trusted: Option<(String, String)> = None;
-    let mut forged: Vec<usize> = Vec::new();
+    let mut forged = 0;
     for (idx, (name, value)) in input.headers.iter().enumerate() {
         if !name.eq_ignore_ascii_case("authentication-results") {
             continue;
@@ -63,18 +67,37 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
         if idx < boundary && trusted.is_none() {
             trusted = Some((authserv, value.clone()));
         } else {
-            forged.push(idx);
+            forged += 1;
         }
     }
+    Some(ReceivingAr {
+        receiving_domain,
+        trusted,
+        forged,
+    })
+}
+
+pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
+    let Some(ReceivingAr {
+        receiving_domain,
+        trusted,
+        forged,
+    }) = trusted_ar(input)
+    else {
+        return vec![Signal::new(
+            "auth_unverifiable",
+            AUTH_UNVERIFIABLE,
+            "no Received header names a receiving host",
+        )];
+    };
 
     let mut signals = Vec::new();
-    if !forged.is_empty() {
+    if forged > 0 {
         signals.push(Signal::new(
             "ar_forged",
             AR_FORGED,
             format!(
-                "{} Authentication-Results header(s) claim {receiving_domain} outside the receiving host's block",
-                forged.len()
+                "{forged} Authentication-Results header(s) claim {receiving_domain} outside the receiving host's block"
             ),
         ));
     }
@@ -142,6 +165,180 @@ pub fn method_results(value: &str) -> Vec<(String, String)> {
             Some((method, result))
         })
         .collect()
+}
+
+/// Whether the message's From domain is authenticated, by the receiving
+/// host's own Authentication-Results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SenderAuth {
+    /// `via` is `dmarc` or `dkim`; `domain` is the From domain it covers.
+    Pass {
+        via: String,
+        domain: String,
+        authserv_id: String,
+    },
+    /// The receiving host evaluated the message and the From domain did not
+    /// pass, or the message does not have exactly one From mailbox.
+    Fail,
+    /// No result from the receiving host can be trusted.
+    Unverifiable(String),
+}
+
+/// Authenticate the From domain.
+///
+/// Pass requires the trusted Authentication-Results to show `dmarc=pass` for
+/// `header.from=<From domain>`, or `dkim=pass` with a signing domain
+/// (`header.d`, else `header.i`) relaxed-aligned with the From domain (the
+/// same registrable domain). SPF alone never counts: it covers the envelope
+/// sender, not the From header. A message without exactly one From mailbox
+/// fails.
+pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
+    let Some(from_domain) = single_from_domain(input) else {
+        return SenderAuth::Fail;
+    };
+    let Some(receiving) = trusted_ar(input) else {
+        return SenderAuth::Unverifiable("no Received header names a receiving host".to_string());
+    };
+    let Some((authserv_id, value)) = receiving.trusted else {
+        return SenderAuth::Unverifiable(format!(
+            "no trusted Authentication-Results from {}",
+            receiving.receiving_domain
+        ));
+    };
+
+    let clauses = method_clauses(&value);
+    let passed = |method: &str, covers: &dyn Fn(&MethodClause) -> bool| {
+        clauses
+            .iter()
+            .any(|c| c.method == method && c.result == "pass" && covers(c))
+    };
+    let via = if passed("dmarc", &|c| {
+        c.header_from.as_deref() == Some(from_domain.as_str())
+    }) {
+        "dmarc"
+    } else if passed("dkim", &|c| {
+        c.signing_domain()
+            .is_some_and(|d| registrable(&d) == registrable(&from_domain))
+    }) {
+        "dkim"
+    } else {
+        return SenderAuth::Fail;
+    };
+    SenderAuth::Pass {
+        via: via.to_string(),
+        domain: from_domain,
+        authserv_id,
+    }
+}
+
+/// The domain of the message's only From mailbox, lowercased. `None` when
+/// there is no From header, more than one, or it lists other than one mailbox.
+fn single_from_domain(input: &ThreatInput) -> Option<String> {
+    let mut from_headers = input
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("from"));
+    let (_, value) = from_headers.next()?;
+    if from_headers.next().is_some() {
+        return None;
+    }
+    let raw = format!("From: {value}\r\n\r\n");
+    let parsed = mail_parser::MessageParser::default().parse(raw.as_bytes())?;
+    let mut mailboxes = parsed.from()?.iter();
+    let mailbox = mailboxes.next()?;
+    if mailboxes.next().is_some() {
+        return None;
+    }
+    let (_, domain) = mailbox.address.as_deref()?.trim().rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    (!domain.is_empty()).then_some(domain)
+}
+
+/// One `method=result` clause of an Authentication-Results header with the
+/// properties sender authentication needs, lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodClause {
+    pub method: String,
+    pub result: String,
+    pub header_from: Option<String>,
+    pub header_d: Option<String>,
+    pub header_i: Option<String>,
+}
+
+impl MethodClause {
+    /// The DKIM signing domain: `header.d`, or the domain of `header.i` when
+    /// the receiver reported only that.
+    fn signing_domain(&self) -> Option<String> {
+        if let Some(d) = &self.header_d {
+            return Some(d.clone());
+        }
+        let identity = self.header_i.as_deref()?;
+        let domain = identity.rsplit_once('@').map_or(identity, |(_, d)| d);
+        (!domain.is_empty()).then(|| domain.to_string())
+    }
+}
+
+/// The clauses after the authserv-id. Comments and quoted strings (such as a
+/// `reason`) are dropped first, so neither can supply a property.
+pub fn method_clauses(value: &str) -> Vec<MethodClause> {
+    strip_comments_and_quotes(value)
+        .split(';')
+        .skip(1)
+        .filter_map(|clause| {
+            let mut tokens = clause.split_whitespace();
+            let (method, result) = tokens.next()?.split_once('=')?;
+            let method = method.split('/').next()?.trim().to_lowercase();
+            let mut parsed = MethodClause {
+                method,
+                result: result.trim().to_lowercase(),
+                header_from: None,
+                header_d: None,
+                header_i: None,
+            };
+            for token in tokens {
+                let Some((property, value)) = token.split_once('=') else {
+                    continue;
+                };
+                let value = Some(value.trim().trim_end_matches('.').to_lowercase())
+                    .filter(|v| !v.is_empty());
+                match property.to_lowercase().as_str() {
+                    "header.from" => parsed.header_from = value,
+                    "header.d" => parsed.header_d = value,
+                    "header.i" => parsed.header_i = value,
+                    _ => {}
+                }
+            }
+            Some(parsed)
+        })
+        .collect()
+}
+
+/// [`strip_comments`] that also drops quoted strings and leaves parentheses
+/// inside quotes alone.
+fn strip_comments_and_quotes(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in value.chars() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' if depth == 0 => quoted = true,
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn strip_comments(value: &str) -> String {
@@ -391,6 +588,157 @@ mod tests {
             "hi",
         );
         assert_eq!(codes(&analyze(&input)), vec!["auth_unverifiable"]);
+    }
+
+    // ── sender_auth: is the From domain authenticated? ──────────────
+
+    fn auth_of(headers: &[&str]) -> SenderAuth {
+        sender_auth(&input_from(headers, "Your code is 123456"))
+    }
+
+    fn passed(via: &str, domain: &str, authserv_id: &str) -> SenderAuth {
+        SenderAuth::Pass {
+            via: via.to_string(),
+            domain: domain.to_string(),
+            authserv_id: authserv_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn dmarc_pass_for_from_domain() {
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; spf=pass smtp.mailfrom=bounce.bank.example; dkim=none; dmarc=pass (p=reject) header.from=bank.example",
+            RECEIVED_EDGE,
+            "From: Bank <alerts@bank.example>",
+        ]);
+        assert_eq!(auth, passed("dmarc", "bank.example", "mx1.example.org"));
+    }
+
+    #[test]
+    fn dmarc_pass_for_other_header_from_fails() {
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=attacker.example; dmarc=pass header.from=attacker.example",
+            RECEIVED_EDGE,
+            "From: Bank <alerts@bank.example>",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+    }
+
+    #[test]
+    fn relaxed_dkim_alignment_passes() {
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=mail.bank.example header.s=s1; spf=none; dmarc=none",
+            RECEIVED_EDGE,
+            "From: alerts@bank.example",
+        ]);
+        assert_eq!(auth, passed("dkim", "bank.example", "mx1.example.org"));
+
+        // Gmail reports the signing domain as header.i.
+        let auth = auth_of(&[
+            "Received: by 2002:a05:6a10:8f0e:b0:5f1:1234 with SMTP id x; Mon, 21 Sep 2026 10:00:02 -0700",
+            "Authentication-Results: mx.google.com; dkim=pass header.i=@bank.example; spf=softfail",
+            "Received: from mail.bank.example (mail.bank.example. [203.0.113.5]) by mx.google.com with ESMTPS id y; Mon, 21 Sep 2026 10:00:01 -0700",
+            "From: alerts@login.bank.example",
+        ]);
+        assert_eq!(auth, passed("dkim", "login.bank.example", "mx.google.com"));
+    }
+
+    #[test]
+    fn unaligned_dkim_fails() {
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bulk-sender.example; spf=pass smtp.mailfrom=bulk-sender.example; dmarc=none header.from=bank.example",
+            RECEIVED_EDGE,
+            "From: alerts@bank.example",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+
+        // header.d is the signing domain; an aligned header.i does not override it.
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; dkim=pass header.d=bulk-sender.example header.i=@bank.example",
+            RECEIVED_EDGE,
+            "From: alerts@bank.example",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+    }
+
+    #[test]
+    fn spf_pass_alone_fails() {
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; spf=pass smtp.mailfrom=bank.example; dkim=none; dmarc=none header.from=bank.example",
+            RECEIVED_EDGE,
+            "From: alerts@bank.example",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+    }
+
+    #[test]
+    fn pass_only_in_forged_header_is_unverifiable() {
+        let auth = auth_of(&[
+            MIGADU_LMTP,
+            "Received: from mail.spoofer.example (198.51.100.7) by mizu0.migadu.com with ESMTPS id q6; Mon, 28 Sep 2026 04:43:18 +0000",
+            "Received: from laptop (unknown [192.0.2.44]) by mail.spoofer.example with ESMTPSA id q7; Mon, 28 Sep 2026 04:43:16 +0000",
+            "Authentication-Results: mx13.migadu.com; dkim=pass header.d=bank.example; spf=pass; dmarc=pass header.from=bank.example",
+            "From: Bank <alerts@bank.example>",
+        ]);
+        assert!(matches!(auth, SenderAuth::Unverifiable(_)), "{auth:?}");
+    }
+
+    #[test]
+    fn no_trusted_ar_is_unverifiable() {
+        let auth = auth_of(&[RECEIVED_EDGE, "From: alerts@bank.example"]);
+        assert!(matches!(auth, SenderAuth::Unverifiable(_)), "{auth:?}");
+
+        // A pass from another authserv-id is not the receiving host's word.
+        let auth = auth_of(&[
+            RECEIVED_EDGE,
+            "Authentication-Results: mx.attacker.example; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example",
+            "From: alerts@bank.example",
+        ]);
+        assert!(matches!(auth, SenderAuth::Unverifiable(_)), "{auth:?}");
+
+        let auth = auth_of(&[
+            "Authentication-Results: mx1.example.org; dmarc=pass header.from=bank.example",
+            "From: alerts@bank.example",
+        ]);
+        assert!(matches!(auth, SenderAuth::Unverifiable(_)), "{auth:?}");
+    }
+
+    #[test]
+    fn two_from_mailboxes_fails() {
+        let pass = "Authentication-Results: mx1.example.org; dkim=pass header.d=bank.example; dmarc=pass header.from=bank.example";
+        let auth = auth_of(&[
+            pass,
+            RECEIVED_EDGE,
+            "From: alerts@bank.example",
+            "From: attacker@evil.example",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+
+        let auth = auth_of(&[
+            pass,
+            RECEIVED_EDGE,
+            "From: alerts@bank.example, attacker@evil.example",
+        ]);
+        assert_eq!(auth, SenderAuth::Fail);
+
+        let auth = auth_of(&[pass, RECEIVED_EDGE, "Subject: no sender"]);
+        assert_eq!(auth, SenderAuth::Fail);
+    }
+
+    #[test]
+    fn method_clauses_read_the_alignment_properties() {
+        let clauses = method_clauses(
+            "mx13.migadu.com; dkim=pass header.d=Sender.Example header.s=google header.b=OP5j; spf=pass (mx13: ok) smtp.mailfrom=bob@sender.example; dmarc=fail reason=\"SPF not aligned (relaxed), header.from=x.example\" header.from=example.net (policy=reject)",
+        );
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0].method, "dkim");
+        assert_eq!(clauses[0].result, "pass");
+        assert_eq!(clauses[0].header_d.as_deref(), Some("sender.example"));
+        assert_eq!(clauses[1].method, "spf");
+        assert_eq!(clauses[1].header_from, None);
+        assert_eq!(clauses[2].result, "fail");
+        // A quoted reason never supplies a property.
+        assert_eq!(clauses[2].header_from.as_deref(), Some("example.net"));
     }
 
     #[test]
