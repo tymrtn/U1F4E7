@@ -259,14 +259,15 @@ pub fn analyze(input: &ThreatInput) -> Vec<Signal> {
 /// The authserv-id: the first token before `;`, comments stripped, optional
 /// version number dropped.
 pub fn authserv_id(value: &str) -> Option<String> {
-    let head = strip_comments(value.split(';').next()?);
+    let head = strip_comments_and_quotes(value.split(';').next()?)?;
     let id = head.split_whitespace().next()?.trim().trim_end_matches('.');
     (!id.is_empty()).then(|| id.to_lowercase())
 }
 
-/// `(method, result)` pairs after the authserv-id, lowercased.
+/// `(method, result)` pairs after the authserv-id, lowercased. A header
+/// with a comment or quoted string left open has none.
 pub fn method_results(value: &str) -> Vec<(String, String)> {
-    let cleaned = strip_comments(value);
+    let cleaned = strip_comments_and_quotes(value).unwrap_or_default();
     cleaned
         .split(';')
         .skip(1)
@@ -333,13 +334,21 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
             .iter()
             .any(|c| c.method == method && c.result == result && covers(c))
     };
+    // A failure for a method outweighs any pass for it in the same header.
+    let failed = |method: &str| {
+        clauses
+            .iter()
+            .any(|c| c.method == method && matches!(c.result.as_str(), "fail" | "permerror"))
+    };
+    // A failed DMARC evaluation is final; no DKIM pass overrides it.
+    if failed("dmarc") {
+        return SenderAuth::Fail;
+    }
     let via = if has("dmarc", "pass", &|c| {
         c.header_from.as_deref().map(ascii_host) == Some(from_domain.clone())
     }) {
         "dmarc"
-    } else if has("dmarc", "fail", &|_| true) {
-        // The receiver evaluated DMARC and it failed; a DKIM pass for some
-        // other signature does not override that.
+    } else if failed("dkim") {
         return SenderAuth::Fail;
     } else if has("dkim", "pass", &|c| {
         c.signing_domain()
@@ -409,9 +418,11 @@ impl MethodClause {
 }
 
 /// The clauses after the authserv-id. Comments and quoted strings (such as a
-/// `reason`) are dropped first, so neither can supply a property.
+/// `reason`) are dropped first, so neither can supply a property. A header
+/// with a comment or quoted string left open has none.
 pub fn method_clauses(value: &str) -> Vec<MethodClause> {
     strip_comments_and_quotes(value)
+        .unwrap_or_default()
         .split(';')
         .skip(1)
         .filter_map(|clause| {
@@ -443,46 +454,32 @@ pub fn method_clauses(value: &str) -> Vec<MethodClause> {
         .collect()
 }
 
-/// [`strip_comments`] that also drops quoted strings and leaves parentheses
-/// inside quotes alone.
-fn strip_comments_and_quotes(value: &str) -> String {
+/// `value` without its comments and quoted strings. Comments nest, and a
+/// backslash escapes the next character inside either. A quoted string is
+/// opaque inside a comment too, because receivers copy quoted envelope
+/// senders into their comments. `None` when a comment or quoted string is
+/// left open, so a garbled header supplies nothing.
+fn strip_comments_and_quotes(value: &str) -> Option<String> {
     let mut out = String::with_capacity(value.len());
     let mut depth = 0usize;
     let mut quoted = false;
     let mut escaped = false;
     for c in value.chars() {
-        if quoted {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => quoted = false,
-                _ => {}
-            }
+        if escaped {
+            escaped = false;
             continue;
         }
         match c {
-            '"' if depth == 0 => quoted = true,
+            '\\' if quoted || depth > 0 => escaped = true,
+            '"' => quoted = !quoted,
+            _ if quoted => {}
             '(' => depth += 1,
             ')' if depth > 0 => depth -= 1,
             _ if depth == 0 => out.push(c),
             _ => {}
         }
     }
-    out
-}
-
-fn strip_comments(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut depth = 0usize;
-    for c in value.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            _ if depth == 0 => out.push(c),
-            _ => {}
-        }
-    }
-    out
+    (depth == 0 && !quoted && !escaped).then_some(out)
 }
 
 #[cfg(test)]
@@ -911,6 +908,60 @@ mod tests {
 
     const BANK_PASS: &str = "dkim=pass header.i=@bank.example header.s=s1 header.b=abc; spf=pass smtp.mailfrom=noreply@bank.example; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=bank.example";
     const BANK_FAIL: &str = "dkim=none; spf=fail smtp.mailfrom=noreply@bank.example; dmarc=fail (p=REJECT) header.from=bank.example";
+
+    #[test]
+    fn a_quoted_mail_from_cannot_add_a_clause() {
+        // Gmail copies the envelope sender, quotes and all, into its comment
+        // and into smtp.mailfrom.
+        let mail_from = r#""x);dmarc=pass header.from=bank.example;dkim=pass;("@evil.example"#;
+        let results = format!(
+            "dkim=fail header.i=@bank.example; spf=pass (google.com: domain of {mail_from} designates 203.0.113.9 as permitted sender) smtp.mailfrom={mail_from}"
+        );
+        let headers = gmail_delivery(&results, &results, &[]);
+        assert_eq!(gmail_auth(&headers), SenderAuth::Fail);
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let signals = analyze(&received_by("google.com", &refs, "hi"));
+        assert!(codes(&signals).contains(&"dkim_fail"), "{signals:?}");
+
+        // A backslash escapes a parenthesis inside a comment too.
+        let escaped = r"spf=pass (google.com: x\) ; dmarc=pass header.from=bank.example; ) smtp.mailfrom=a@evil.example";
+        assert_eq!(
+            gmail_auth(&gmail_delivery(escaped, escaped, &[])),
+            SenderAuth::Fail
+        );
+    }
+
+    #[test]
+    fn a_comment_or_quote_left_open_yields_no_results() {
+        for results in [
+            "dmarc=pass header.from=bank.example; spf=pass (google.com: unterminated",
+            "dmarc=pass header.from=bank.example; spf=pass smtp.mailfrom=\"unterminated",
+        ] {
+            let headers = gmail_delivery(results, results, &[]);
+            assert_eq!(gmail_auth(&headers), SenderAuth::Fail, "{results}");
+        }
+    }
+
+    #[test]
+    fn a_failure_beats_a_pass_for_the_same_method() {
+        for results in [
+            "dmarc=pass header.from=bank.example; dmarc=fail header.from=bank.example",
+            "dmarc=fail header.from=bank.example; dmarc=pass header.from=bank.example",
+            "dmarc=permerror header.from=bank.example; dmarc=pass header.from=bank.example",
+            "dkim=pass header.d=bank.example; dkim=fail header.d=bank.example",
+            "dkim=permerror header.d=bank.example; dkim=pass header.d=bank.example",
+        ] {
+            let headers = gmail_delivery(results, results, &[]);
+            assert_eq!(gmail_auth(&headers), SenderAuth::Fail, "{results}");
+        }
+        // Another method's failure does not undo a pass.
+        let results =
+            "dkim=fail header.d=other.example; spf=fail; dmarc=pass header.from=bank.example";
+        assert_eq!(
+            gmail_auth(&gmail_delivery(results, results, &[])),
+            passed("dmarc", "bank.example", "mx.google.com")
+        );
+    }
 
     #[test]
     fn direct_to_mx_injection_without_receiver_ar_is_unverifiable() {
