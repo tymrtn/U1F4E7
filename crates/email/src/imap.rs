@@ -1461,14 +1461,8 @@ where
 
     let skeleton = structure.skeleton(&bodies);
     let parsed = parse_skeleton(&skeleton, &order, uid)?;
-    let message_id = mail_parser::MessageParser::default()
-        .parse(structure.header.as_slice())
-        .and_then(|header| {
-            header
-                .message_id()
-                .map(|m| envelope_email_store::canonical_message_id(m).to_string())
-        });
-    downloaded_attachment(uid, &parsed.parts[id], message_id)
+    let message_id = crate::threat::sole_message_id(&structure.header);
+    downloaded_attachment(uid, &parsed.parts[id], message_id, None)
 }
 
 /// Raw RFC822 bytes of one message, opened with `EXAMINE` and fetched with
@@ -2760,14 +2754,19 @@ pub async fn remove_flag(
 }
 
 /// One attachment fetched for download, with the identity of the message it
-/// came from (the threat gate checks that message's verdict tags).
+/// came from (the threat gate checks that message's tags and verdicts).
 #[derive(Debug, Clone)]
 pub struct DownloadedAttachment {
     pub filename: String,
     pub content_type: String,
     pub bytes: Vec<u8>,
-    /// Canonical (unbracketed) Message-ID of the containing message.
+    /// [`crate::threat::sole_message_id`] of the containing message: the
+    /// identity the threat engine stored its verdict under.
     pub message_id: Option<String>,
+    /// Content fingerprint of the containing message. `None` for an
+    /// attachment fetched part by part from an over-cap message: there are
+    /// no complete bytes to fingerprint.
+    pub content_fingerprint: Option<String>,
 }
 
 /// Fetch a specific attachment by filename from a message.
@@ -2836,12 +2835,11 @@ where
         .parse(body)
         .ok_or_else(|| ImapError::Protocol(format!("failed to parse message UID {uid}")))?;
 
-    let message_id = parsed
-        .message_id()
-        .map(|m| envelope_email_store::canonical_message_id(m).to_string());
+    let message_id = crate::threat::sole_message_id(body);
+    let fingerprint = crate::threat::content_fingerprint(body);
     for attachment in parsed.attachments() {
         if attachment.attachment_name().unwrap_or("unnamed") == filename {
-            return downloaded_attachment(uid, attachment, message_id);
+            return downloaded_attachment(uid, attachment, message_id, fingerprint);
         }
     }
     Err(ImapError::Protocol(format!(
@@ -2855,6 +2853,7 @@ fn downloaded_attachment(
     uid: u32,
     attachment: &mail_parser::MessagePart<'_>,
     message_id: Option<String>,
+    content_fingerprint: Option<String>,
 ) -> Result<DownloadedAttachment, ImapError> {
     let att_name = attachment
         .attachment_name()
@@ -2875,6 +2874,7 @@ fn downloaded_attachment(
         content_type: ingress::normalize_content_type(&content_type),
         bytes: attachment.contents().to_vec(),
         message_id,
+        content_fingerprint,
     })
 }
 
@@ -4018,7 +4018,34 @@ Subject: hi\r\n\r\nbody\r\n";
             assert_eq!(partial.filename, whole.filename, "{filename}");
             assert_eq!(partial.content_type, whole.content_type, "{filename}");
             assert_eq!(partial.message_id, whole.message_id, "{filename}");
+            assert_eq!(
+                whole.content_fingerprint,
+                crate::threat::content_fingerprint(big_rfc822().as_bytes()),
+                "{filename}"
+            );
+            assert_eq!(
+                partial.content_fingerprint, None,
+                "no complete message to fingerprint: {filename}"
+            );
         }
+    }
+
+    /// The download gate reads the message identity the scanner reads: a
+    /// message with two Message-ID headers has no sole Message-ID.
+    #[tokio::test]
+    async fn download_reads_the_message_identity_the_scanner_reads() {
+        let rfc822 = "From: a@example.org\r\nTo: me@example.org\r\n\
+Message-ID: <first@x>\r\nMessage-ID: <second@x>\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b--\r\n";
+        let downloaded = download_whole(rfc822, "notes.pdf").await;
+        assert_eq!(downloaded.message_id, None);
+        assert_eq!(
+            downloaded.message_id,
+            crate::threat::sole_message_id(rfc822.as_bytes())
+        );
     }
 
     /// BODYSTRUCTURE for [`big_rfc822`] with one attachment's declared

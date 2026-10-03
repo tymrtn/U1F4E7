@@ -372,10 +372,12 @@ pub fn flatten_authored_action(
     })
 }
 
-/// Build a rule-evaluation context from a header-only summary plus the local
-/// tag/score/contact stores. No body fetch.
+/// Build a rule-evaluation context from a header-only summary in `folder`
+/// plus the local tag/score/contact stores. No body fetch. Threat data comes
+/// from the message's own verdict ([`crate::threat::persist::bind_threat_context`]).
 pub fn build_summary_context(
     summary: &MessageSummary,
+    folder: &str,
     db: &Database,
     account_id: &str,
 ) -> Result<MessageContext> {
@@ -410,14 +412,24 @@ pub fn build_summary_context(
         .get_contact_tags(account_id, &summary.from_addr)
         .context("failed to get contact tags")?;
 
-    Ok(MessageContext {
+    let mut ctx = MessageContext {
         from_addr: summary.from_addr.clone(),
         to_addr: summary.to_addr.clone(),
         subject: summary.subject.clone(),
         tags,
         scores,
         contact_tags,
-    })
+    };
+    crate::threat::persist::bind_threat_context(
+        db,
+        account_id,
+        folder,
+        summary.uid,
+        crate::threat::persist::Seen::MessageId(summary.message_id.as_deref()),
+        &mut ctx,
+    )
+    .context("failed to read the message's threat verdict")?;
+    Ok(ctx)
 }
 
 /// Display-safe action JSON: webhook URLs are redacted.
@@ -531,8 +543,9 @@ async fn perform<M: RuleMailbox, D: ExecDb>(
             Ok("deleted".to_string())
         }
         Action::AddTag(tag) => {
-            let Some(message_id) = target.message_id.filter(|m| !m.is_empty()) else {
-                bail!("add_tag:{tag} needs a Message-ID; UID {uid} in {folder} has none");
+            let Some(message_id) = target.message_id.and_then(crate::threat::usable_message_id)
+            else {
+                bail!("add_tag:{tag} needs a usable Message-ID; UID {uid} in {folder} has none");
             };
             db.with_db(|d| {
                 d.add_tag(
@@ -1139,7 +1152,7 @@ pub async fn apply_rules_to_summaries<M: RuleMailbox, D: ExecDb>(
     }
     for summary in summaries {
         let ctx = db
-            .with_db(|d| build_summary_context(summary, d, account.id))
+            .with_db(|d| build_summary_context(summary, folder, d, account.id))
             .await?;
         let message_id = summary
             .message_id
@@ -1289,6 +1302,29 @@ mod tests {
         assert_eq!(taken["source"], "rule");
         assert_eq!(taken["rule_name"], "travel");
         assert!(mbox.calls.is_empty(), "add_tag must not touch IMAP");
+    }
+
+    /// Fingerprint keys own the `fp:` prefix: a Message-ID shaped like one
+    /// never keys a tag write.
+    #[tokio::test]
+    async fn add_tag_refuses_a_message_id_shaped_like_a_fingerprint_key() {
+        let db = Database::open_memory().unwrap();
+        rule(&db, "travel", r#"{"add_tag":"travel"}"#);
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[
+                summary(7, "fp:v2:abc", "x@airline.example"),
+                summary(8, "FP:v2:def", "x@airline.example"),
+            ],
+        )
+        .await;
+
+        assert!(db.get_tags(ACCT, "fp:v2:abc").unwrap().is_empty());
+        assert!(db.get_tags(ACCT, "FP:v2:def").unwrap().is_empty());
+        assert_eq!(report.actions, 0, "{report:?}");
     }
 
     #[tokio::test]
@@ -1576,7 +1612,7 @@ mod tests {
     async fn offer_with_move_to_trash_is_refused_at_execution() {
         // Built in code, bypassing serde, to prove the executor re-validates.
         let db = Database::open_memory().unwrap();
-        let ctx = build_summary_context(&summary(1, "m@x", "a@b"), &db, ACCT).unwrap();
+        let ctx = build_summary_context(&summary(1, "m@x", "a@b"), "INBOX", &db, ACCT).unwrap();
         let target = MessageTarget {
             account_id: ACCT,
             account_email: EMAIL,

@@ -100,9 +100,11 @@ fn sanitize_action_display(action: &str) -> String {
     }
 }
 
-/// Build a `MessageContext` from a fetched message + its tags/scores in the store.
+/// Build a `MessageContext` from a message fetched from `folder` + its
+/// tags/scores in the store; threat data from the message's own verdict.
 fn build_message_context(
     msg: &envelope_email_store::Message,
+    folder: &str,
     db: &envelope_email_store::Database,
     account_id: &str,
 ) -> Result<MessageContext> {
@@ -137,14 +139,24 @@ fn build_message_context(
         .get_contact_tags(account_id, &msg.from_addr)
         .context("failed to get contact tags")?;
 
-    Ok(MessageContext {
+    let mut ctx = MessageContext {
         from_addr: msg.from_addr.clone(),
         to_addr: msg.to_addr.clone(),
         subject: msg.subject.clone(),
         tags,
         scores,
         contact_tags,
-    })
+    };
+    envelope_email_transport::threat::persist::bind_threat_context(
+        db,
+        account_id,
+        folder,
+        msg.uid,
+        envelope_email_transport::threat::persist::Seen::MessageId(msg.message_id.as_deref()),
+        &mut ctx,
+    )
+    .context("failed to read the message's threat verdict")?;
+    Ok(ctx)
 }
 
 /// `envelope rule create` — create a new rule.
@@ -339,7 +351,7 @@ pub async fn run_test(
         .context("failed to fetch message")?
         .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
 
-    let ctx = build_message_context(&msg, &db, &account_id)?;
+    let ctx = build_message_context(&msg, folder, &db, &account_id)?;
 
     let enabled_rules = db
         .list_enabled_rules(&account_id)
@@ -452,7 +464,7 @@ pub async fn preview_core(
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();
     for summary in &summaries {
-        let ctx = rule_exec::build_summary_context(summary, db, account_id)?;
+        let ctx = rule_exec::build_summary_context(summary, folder, db, account_id)?;
         for (rule, match_expr) in &preview_rules {
             if !rules::evaluate(match_expr, &ctx) {
                 continue;
@@ -935,7 +947,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, "INBOX", &db, "test-account").unwrap();
 
         assert_eq!(ctx.from_addr, "alice@example.com");
         assert_eq!(ctx.to_addr, "bob@example.com");
@@ -960,7 +972,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, "INBOX", &db, "test-account").unwrap();
         let expr = rules::MatchExpr::Subject("*Test*".to_string());
 
         assert!(rules::evaluate(&expr, &ctx));
@@ -981,7 +993,7 @@ mod tests {
             provider_spam: None,
         };
 
-        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, "INBOX", &db, "test-account").unwrap();
         let expr = rules::MatchExpr::From("*@spam.com".to_string());
 
         assert!(rules::evaluate(&expr, &ctx));
@@ -1002,7 +1014,7 @@ mod tests {
             provider_spam: Some(6.5),
         };
 
-        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, "INBOX", &db, "test-account").unwrap();
 
         assert_eq!(
             ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),
@@ -1044,7 +1056,7 @@ mod tests {
             provider_spam: Some(9.9),
         };
 
-        let ctx = rule_exec::build_summary_context(&summary, &db, "test-account").unwrap();
+        let ctx = rule_exec::build_summary_context(&summary, "INBOX", &db, "test-account").unwrap();
 
         assert_eq!(
             ctx.scores.get(rules::PROVIDER_SPAM_DIMENSION),

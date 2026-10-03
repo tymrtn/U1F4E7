@@ -95,6 +95,7 @@ pub async fn download(
             &db,
             &account_id,
             attachment.message_id.as_deref(),
+            attachment.content_fingerprint.as_deref(),
             &attachment.filename,
             &attachment.content_type,
             &attachment.bytes,

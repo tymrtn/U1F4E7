@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
 use envelope_email_transport::threat::Level;
+use envelope_email_transport::threat::persist::Opened;
 
 use super::common::setup_credentials;
 use super::provenance;
@@ -28,8 +29,13 @@ pub async fn run(
 
     match message {
         Some((msg, raw)) => {
-            let verdict =
-                super::threat::verdict_for_read(&db, &creds, folder, uid, raw.as_deref())?;
+            let verdict = super::threat::verdict_for_read(
+                &db,
+                &creds,
+                folder,
+                uid,
+                Opened::new(raw.as_deref(), msg.message_id.as_deref()),
+            )?;
             if json {
                 let mut value = ui::with_ui(
                     &msg,
