@@ -850,13 +850,12 @@ pub(crate) async fn create_reply_draft(
 /// sensitive/large files. The output uses the same draft attachment JSON shape as
 /// CLI `--attach`: metadata plus a base64 payload for later draft send.
 async fn snapshot_source_attachments(
+    db: &Database,
     creds: &AccountWithCredentials,
     uid: u32,
     folder: &str,
     source_attachments: &[AttachmentMeta],
 ) -> Result<Vec<serde_json::Value>> {
-    use base64::Engine as _;
-
     if source_attachments.is_empty() {
         return Ok(Vec::new());
     }
@@ -864,20 +863,61 @@ async fn snapshot_source_attachments(
     let mut client = imap::connect(creds)
         .await
         .context("failed to connect to IMAP for source attachments")?;
-    let mut snapshots = Vec::with_capacity(source_attachments.len());
+    let mut downloads = Vec::with_capacity(source_attachments.len());
     for meta in source_attachments {
         let downloaded = imap::download_attachment(&mut client, uid, &meta.filename, folder)
             .await
             .with_context(|| format!("failed to download source attachment: {}", meta.filename))?;
-        let data = downloaded.bytes;
-        snapshots.push(serde_json::json!({
-            "filename": downloaded.filename,
-            "content_type": meta.content_type,
-            "size": data.len(),
-            "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
-        }));
+        downloads.push((downloaded, meta.content_type.clone()));
     }
-    Ok(snapshots)
+    forwarded_attachment_snapshots(db, &creds.account.id, uid, downloads)
+}
+
+/// Draft snapshots of a forwarded message's attachments, each paired with the
+/// content type the message lists for it. Every attachment first passes the
+/// `attachment download` gate under the message's own identity, so a draft
+/// never holds bytes a download would refuse; one refused stops the forward
+/// before anything is stored.
+fn forwarded_attachment_snapshots(
+    db: &Database,
+    account_id: &str,
+    uid: u32,
+    downloads: Vec<(imap::DownloadedAttachment, String)>,
+) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+    for (downloaded, _) in &downloads {
+        let block = envelope_email_transport::threat::persist::attachment_block(
+            db,
+            account_id,
+            downloaded.message_id.as_deref(),
+            downloaded.content_fingerprint.as_deref(),
+            &downloaded.filename,
+            &downloaded.content_type,
+            &downloaded.bytes,
+        )
+        .context("threat check for a forwarded attachment failed")?;
+        if let Some(block) = block {
+            bail!(
+                "{}: {} ({:?} in UID {uid}). The forward was not created; forward without \
+                 its attachments, or `envelope threat mark-safe` if the message is legitimate.",
+                block.code,
+                block.reason,
+                downloaded.filename
+            );
+        }
+    }
+    Ok(downloads
+        .into_iter()
+        .map(|(downloaded, content_type)| {
+            let data = downloaded.bytes;
+            serde_json::json!({
+                "filename": downloaded.filename,
+                "content_type": content_type,
+                "size": data.len(),
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+            })
+        })
+        .collect())
 }
 
 /// Build a contextual forward draft. Shared by the CLI and MCP surfaces.
@@ -906,7 +946,7 @@ pub(crate) async fn create_forward_draft(
             .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?
     };
     let mut attachment_snapshots = if include_attachments {
-        snapshot_source_attachments(creds, uid, folder, &parent.attachments).await?
+        snapshot_source_attachments(db, creds, uid, folder, &parent.attachments).await?
     } else {
         Vec::new()
     };
@@ -3013,6 +3053,69 @@ pub async fn run_discard(
 mod tests {
     use super::*;
     use envelope_email_store::models::DraftStatus;
+
+    fn source_attachment(
+        filename: &str,
+        bytes: &[u8],
+        message_id: Option<&str>,
+    ) -> (imap::DownloadedAttachment, String) {
+        (
+            imap::DownloadedAttachment {
+                filename: filename.to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: bytes.to_vec(),
+                message_id: message_id.map(str::to_string),
+                content_fingerprint: None,
+            },
+            "application/octet-stream".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_forward_carries_no_attachment_the_download_gate_refuses() {
+        let db = Database::open_memory().unwrap();
+        let account_id = "acct-1";
+        db.add_tag(
+            account_id,
+            "flagged@example.test",
+            "threat:malware",
+            Some(9),
+            Some("INBOX"),
+        )
+        .unwrap();
+        for (downloads, refused) in [
+            (
+                vec![
+                    source_attachment("notes.txt", b"hi", None),
+                    source_attachment("invoice.pdf.exe", b"MZ\x90", None),
+                ],
+                "invoice.pdf.exe",
+            ),
+            (
+                vec![source_attachment(
+                    "notes.txt",
+                    b"hi",
+                    Some("flagged@example.test"),
+                )],
+                "notes.txt",
+            ),
+        ] {
+            let err = forwarded_attachment_snapshots(&db, account_id, 7, downloads)
+                .expect_err("a blocked attachment refuses the forward");
+            let err = format!("{err:#}");
+            assert!(err.contains("attachment_blocked"), "{err}");
+            assert!(err.contains(refused), "{err}");
+        }
+        let fine = forwarded_attachment_snapshots(
+            &db,
+            account_id,
+            7,
+            vec![source_attachment("notes.txt", b"hi", None)],
+        )
+        .unwrap();
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0]["filename"], "notes.txt");
+    }
 
     #[test]
     fn draft_dashboard_path_encodes_account_and_draft_segments() {
