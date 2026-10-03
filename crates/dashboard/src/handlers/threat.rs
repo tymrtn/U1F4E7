@@ -45,38 +45,47 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
     (status, Json(json!({"code": code, "error": message.into()}))).into_response()
 }
 
-/// The reader's view of a verdict.
+/// The reader's view of a verdict on the message with `message_id` and
+/// content `fingerprint`. Level and malware come from the verdict itself;
+/// `marked_safe` holds only for a Mark safe bound to this content. `tags`
+/// lists the Message-ID's `threat:*` tags as stored.
 pub fn verdict_view(
     db: &Database,
     account_id: &str,
     message_id: Option<&str>,
+    fingerprint: Option<&str>,
     verdict: &ThreatVerdict,
-) -> Value {
-    let tags: Vec<String> = message_id
-        .and_then(|mid| db.get_tags(account_id, mid).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.tag)
-        .filter(|t| t.starts_with("threat:"))
-        .collect();
-    json!({
+) -> anyhow::Result<Value> {
+    let (tags, marked_safe) = match message_id {
+        Some(mid) => (
+            db.get_tags(account_id, mid)?
+                .into_iter()
+                .map(|t| t.tag)
+                .filter(|t| t.starts_with("threat:"))
+                .collect(),
+            persist::is_marked_safe(db, account_id, mid, fingerprint)?,
+        ),
+        None => (Vec::<String>::new(), false),
+    };
+    Ok(json!({
         "level": verdict.level,
         "score": verdict.score,
         "signals": verdict.signals,
         "explain": threat::explain(verdict),
         "engine_version": verdict.engine_version,
         "computed_at": verdict.computed_at,
-        "marked_safe": tags.iter().any(|t| t == threat::TAG_FALSE_POSITIVE),
-        "malware": tags.iter().any(|t| t == threat::TAG_MALWARE),
+        "marked_safe": marked_safe,
+        "malware": verdict.is_malware(),
         "tags": tags,
-    })
+    }))
 }
 
-fn stored_view(db: &Database, account_id: &str, stored: &StoredVerdict) -> Value {
+fn stored_view(db: &Database, account_id: &str, stored: &StoredVerdict) -> anyhow::Result<Value> {
     verdict_view(
         db,
         account_id,
         stored.message_id.as_deref(),
+        stored.content_fingerprint.as_deref(),
         &stored.verdict,
     )
 }
@@ -94,16 +103,28 @@ pub fn verdict_for_open(
 ) -> anyhow::Result<Option<Value>> {
     let verdict =
         persist::verdict_on_open(db, account_id, account_address, folder, uid, raw, config)?;
-    // Tags are keyed by Message-ID, so take it from the message itself: a
-    // message moved back or delivered again has a new UID, and the stored
-    // verdict's UID no longer matches.
-    let message_id = match raw.and_then(|r| persist::raw_message_id(r, account_address)) {
-        Some(mid) => Some(mid),
-        None => {
-            persist::stored_verdict_for_uid(db, account_id, folder, uid)?.and_then(|s| s.message_id)
-        }
+    // The message's own identity: its bytes when read whole, else what the
+    // verdict at this UID recorded (a message read part by part).
+    let (message_id, fingerprint) = match raw {
+        Some(raw) => (
+            persist::raw_message_id(raw, account_address),
+            Some(threat::content_fingerprint(raw)),
+        ),
+        None => persist::stored_verdict_for_uid(db, account_id, folder, uid)?
+            .map(|s| (s.message_id, s.content_fingerprint))
+            .unwrap_or_default(),
     };
-    Ok(verdict.map(|v| verdict_view(db, account_id, message_id.as_deref(), &v)))
+    verdict
+        .map(|v| {
+            verdict_view(
+                db,
+                account_id,
+                message_id.as_deref(),
+                fingerprint.as_deref(),
+                &v,
+            )
+        })
+        .transpose()
 }
 
 /// `GET /api/accounts/{id}/messages/{uid}/threat` — the stored verdict only,
@@ -115,11 +136,14 @@ pub async fn show(
     Query(q): Query<FolderQuery>,
 ) -> Response {
     let db = state.db.lock().await;
-    match persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid) {
-        Ok(Some(stored)) => {
-            Json(json!({"threat": stored_view(&db, &account_id, &stored)})).into_response()
-        }
-        Ok(None) => Json(json!({"threat": null})).into_response(),
+    let view =
+        persist::stored_verdict_for_uid(&db, &account_id, &q.folder, uid).and_then(|stored| {
+            stored
+                .map(|s| stored_view(&db, &account_id, &s))
+                .transpose()
+        });
+    match view {
+        Ok(view) => Json(json!({"threat": view})).into_response(),
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store_error",
@@ -244,8 +268,20 @@ pub fn mark_safe_message(
             format!("{e:#}"),
         );
     }
-    let view = verdict_view(db, account_id, Some(message_id), &stored.verdict);
-    Json(json!({"status": "marked_safe", "threat": view})).into_response()
+    match verdict_view(
+        db,
+        account_id,
+        Some(message_id),
+        Some(&fingerprint),
+        &stored.verdict,
+    ) {
+        Ok(view) => Json(json!({"status": "marked_safe", "threat": view})).into_response(),
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+            format!("{e:#}"),
+        ),
+    }
 }
 
 /// `POST /api/accounts/{id}/messages/{uid}/threat/report` — a draft to
@@ -383,7 +419,9 @@ pub async fn report_draft(
     }
 }
 
-/// UIDs among `summaries` with no current verdict, newest first, capped.
+/// UIDs among `summaries` with no current verdict, newest first, capped. A
+/// verdict counts only when it was stored for the same folder/UID and the
+/// same Message-ID; a message reusing a scanned Message-ID is scanned.
 pub fn unscanned_uids(
     db: &Database,
     account_id: &str,
@@ -398,9 +436,12 @@ pub fn unscanned_uids(
                 .as_deref()
                 .map(envelope_email_store::canonical_message_id)
                 .filter(|m| !m.is_empty());
-            let existing = persist::latest_verdict(db, account_id, mid, folder, s.uid)
+            // A store error reads as "no verdict": the message is scanned.
+            let existing = persist::stored_verdict_for_uid(db, account_id, folder, s.uid)
                 .ok()
-                .flatten();
+                .flatten()
+                .filter(|stored| stored.message_id.as_deref() == mid)
+                .map(|stored| stored.verdict);
             persist::needs_scan(existing.as_ref())
         })
         .map(|s| s.uid)
@@ -604,5 +645,47 @@ Content-Disposition: attachment; filename=\"invoice.pdf.exe\"\r\n\r\nMZ\r\n--b--
             vec![3, 1],
             "new and stale-engine verdicts, newest first"
         );
+    }
+
+    fn record(db: &Database, uid: u32, message_id: &str) {
+        let verdict = combine(vec![Signal::new("x", 10, "e")], vec![], vec![], false);
+        let fingerprint = format!("v1:{message_id}");
+        persist::record_verdict(
+            db,
+            &VerdictTarget {
+                account_id: "a",
+                folder: "INBOX",
+                uid,
+                message_id: Some(message_id),
+                content_fingerprint: Some(&fingerprint),
+            },
+            &verdict,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sweep_scans_reused_message_id_at_new_uid() {
+        // UID 2 was scanned; UID 5 is another message with its Message-ID.
+        let db = Database::open_memory().unwrap();
+        record(&db, 2, "two@x");
+        let uids = unscanned_uids(
+            &db,
+            "a",
+            "INBOX",
+            &[summary(2, "two@x"), summary(5, "two@x")],
+        );
+        assert_eq!(uids, vec![5]);
+    }
+
+    #[test]
+    fn sweep_rescans_when_slot_verdict_has_other_message_id() {
+        // UID 3's verdict judged another message (the folder's UIDs were
+        // reset); the Message-ID now at UID 3 was scanned at UID 7.
+        let db = Database::open_memory().unwrap();
+        record(&db, 3, "old@x");
+        record(&db, 7, "new@x");
+        let uids = unscanned_uids(&db, "a", "INBOX", &[summary(3, "new@x")]);
+        assert_eq!(uids, vec![3]);
     }
 }

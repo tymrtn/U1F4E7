@@ -5,7 +5,9 @@
 //!
 //! - `message_scores` dimension `threat` (so `score_above threat N` rules
 //!   match) and the `threat:*` tags;
-//! - one pre-acked `threat_verdict` event per scan, payload = the verdict;
+//! - one pre-acked `threat_verdict` event per scan, payload = the verdict
+//!   plus the content fingerprint of the bytes it judged. A stored verdict
+//!   and a Mark safe apply only to a message with the same fingerprint;
 //! - quarantine: `tag` adds `threat:quarantined`; `move` also runs the shipped,
 //!   editable rule `score_above threat 70 → move Envelope/Quarantine` through
 //!   the unified executor as agent `envelope:threat`. Only `dangerous` mail
@@ -394,25 +396,6 @@ pub fn record_lookups(
             .context("failed to record lookup_performed event")?;
     }
     Ok(())
-}
-
-/// The newest stored verdict for a message: by Message-ID when known, else
-/// by folder/UID.
-pub fn latest_verdict(
-    db: &Database,
-    account_id: &str,
-    message_id: Option<&str>,
-    folder: &str,
-    uid: u32,
-) -> Result<Option<ThreatVerdict>> {
-    let event = match message_id {
-        Some(mid) => db.latest_event_for_message(account_id, THREAT_VERDICT, mid)?,
-        None => db.latest_event_for_uid(account_id, THREAT_VERDICT, folder, uid)?,
-    };
-    event
-        .and_then(|e| e.payload)
-        .map(|p| serde_json::from_str(&p).context("stored threat_verdict payload is not a verdict"))
-        .transpose()
 }
 
 /// A stored verdict with the message identity its event recorded.
@@ -975,7 +958,7 @@ pub fn verdict_on_open(
     config: &ThreatConfig,
 ) -> Result<Option<ThreatVerdict>> {
     let Some(raw) = raw else {
-        return latest_verdict(db, account_id, None, folder, uid);
+        return Ok(stored_verdict_for_uid(db, account_id, folder, uid)?.map(|s| s.verdict));
     };
     let message_id = raw_message_id(raw, account_address);
     let fingerprint = super::content_fingerprint(raw);
@@ -1206,10 +1189,10 @@ mod tests {
         assert_eq!(score[0].dimension, THREAT_DIMENSION);
         assert_eq!(score[0].value, f64::from(verdict.score));
 
-        let stored = latest_verdict(&db, ACCT, Some("p1@x"), "INBOX", 7)
+        let stored = stored_verdict_for_uid(&db, ACCT, "INBOX", 7)
             .unwrap()
             .unwrap();
-        assert_eq!(stored, verdict);
+        assert_eq!(stored.verdict, verdict);
         let event = db
             .latest_event_for_message(ACCT, THREAT_VERDICT, "p1@x")
             .unwrap()
@@ -1239,9 +1222,10 @@ mod tests {
         assert!(tags(&db, "m@x").is_empty());
         assert!(db.get_scores(ACCT, "m@x").unwrap().is_empty());
         assert_eq!(
-            latest_verdict(&db, ACCT, Some("m@x"), "INBOX", 1)
+            stored_verdict_for_uid(&db, ACCT, "INBOX", 1)
                 .unwrap()
                 .unwrap()
+                .verdict
                 .level,
             Level::Unavailable
         );
@@ -1592,7 +1576,7 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
                 .is_none()
         );
         assert!(
-            latest_verdict(&db, ACCT, None, "INBOX", 2379)
+            stored_verdict_for_uid(&db, ACCT, "INBOX", 2379)
                 .unwrap()
                 .is_none(),
             "a partial read must not record a verdict"

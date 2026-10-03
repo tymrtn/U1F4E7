@@ -344,3 +344,62 @@ async fn mark_safe_finds_the_verdict_when_the_message_has_a_new_uid() {
     assert_eq!(body["threat"]["level"], "dangerous", "{body}");
     assert_eq!(body["threat"]["marked_safe"], true);
 }
+
+#[tokio::test]
+async fn mark_safe_binds_to_the_bytes_at_that_uid() {
+    let (state, _) = state();
+    let db = state.db.clone();
+    let app = dashboard_router(state);
+    let fp = content_fingerprint(PHISH);
+    let resend = String::from_utf8_lossy(PHISH)
+        .replace("see attached", "pay today")
+        .into_bytes();
+    let third = String::from_utf8_lossy(PHISH)
+        .replace("see attached", "final notice")
+        .into_bytes();
+
+    // UID 8 holds another message with <phish@x>; opening it scans it.
+    envelope_email_dashboard::handlers::threat::verdict_for_open(
+        &*db.lock().await,
+        "acc1",
+        "me@example.org",
+        "INBOX",
+        8,
+        Some(&resend),
+        &ThreatConfig::default(),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (status, body) = mark_bytes_safe(&db, 7, PHISH).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let label = db
+        .lock()
+        .await
+        .latest_event_for_message("acc1", "label_applied", "phish@x")
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&label.payload.unwrap()).unwrap();
+    assert_eq!(payload["content_fingerprint"], fp.as_str());
+    assert_eq!((label.folder.as_str(), label.uid), ("INBOX", Some(7)));
+
+    let banner = |uid: u32| {
+        let app = app.clone();
+        async move {
+            let uri = format!("/api/accounts/acc1/messages/{uid}/threat?folder=INBOX");
+            let (status, body) = send(&app, "GET", &uri, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            body["threat"].clone()
+        }
+    };
+    assert_eq!(banner(7).await["marked_safe"], true);
+    let other = banner(8).await;
+    assert_eq!(other["marked_safe"], false, "{other}");
+    assert_eq!(other["level"], "dangerous", "{other}");
+
+    // Bytes no verdict judged cannot be marked: the one on file for UID 8
+    // is for other content.
+    let (status, body) = mark_bytes_safe(&db, 8, &third).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "rescan_required");
+}
