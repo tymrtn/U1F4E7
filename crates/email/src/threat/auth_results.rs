@@ -25,7 +25,7 @@
 //! was supplied by someone else: `ar_forged`. A-R headers from other
 //! authserv-ids are ignored entirely.
 
-use super::domains::registrable;
+use super::domains::{ascii_host, registrable};
 use super::{Signal, ThreatInput, is_dns_name, received_by_host};
 
 pub const AR_FORGED: u32 = 40;
@@ -245,7 +245,8 @@ pub fn method_results(value: &str) -> Vec<(String, String)> {
 /// host's own Authentication-Results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SenderAuth {
-    /// `via` is `dmarc` or `dkim`; `domain` is the From domain it covers.
+    /// `via` is `dmarc` or `dkim`; `domain` is the From domain it covers, in
+    /// ASCII (IDNA) form.
     Pass {
         via: String,
         domain: String,
@@ -260,12 +261,13 @@ pub enum SenderAuth {
 
 /// Authenticate the From domain.
 ///
-/// Pass requires the trusted Authentication-Results to show `dmarc=pass` for
-/// `header.from=<From domain>`, or `dkim=pass` with a signing domain
-/// (`header.d`, else `header.i`) relaxed-aligned with the From domain (the
-/// same registrable domain). SPF alone never counts: it covers the envelope
-/// sender, not the From header. A message without exactly one From mailbox
-/// fails.
+/// Pass requires the receiving host's own Authentication-Results (see the
+/// module docs) to show `dmarc=pass` for `header.from=<From domain>`, or,
+/// when DMARC did not fail, `dkim=pass` with a signing domain (`header.d`,
+/// else `header.i`) relaxed-aligned with the From domain: the same
+/// registrable domain under the Public Suffix List. Domains compare in ASCII
+/// (IDNA) form. SPF alone never counts: it covers the envelope sender, not
+/// the From header. A message without exactly one From mailbox fails.
 pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     let Some(from_domain) = single_from_domain(input) else {
         return SenderAuth::Fail;
@@ -286,16 +288,20 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     };
 
     let clauses = method_clauses(&value);
-    let passed = |method: &str, covers: &dyn Fn(&MethodClause) -> bool| {
+    let has = |method: &str, result: &str, covers: &dyn Fn(&MethodClause) -> bool| {
         clauses
             .iter()
-            .any(|c| c.method == method && c.result == "pass" && covers(c))
+            .any(|c| c.method == method && c.result == result && covers(c))
     };
-    let via = if passed("dmarc", &|c| {
-        c.header_from.as_deref() == Some(from_domain.as_str())
+    let via = if has("dmarc", "pass", &|c| {
+        c.header_from.as_deref().map(ascii_host) == Some(from_domain.clone())
     }) {
         "dmarc"
-    } else if passed("dkim", &|c| {
+    } else if has("dmarc", "fail", &|_| true) {
+        // The receiver evaluated DMARC and it failed; a DKIM pass for some
+        // other signature does not override that.
+        return SenderAuth::Fail;
+    } else if has("dkim", "pass", &|c| {
         c.signing_domain()
             .is_some_and(|d| registrable(&d) == registrable(&from_domain))
     }) {
@@ -315,7 +321,7 @@ pub fn sender_auth(input: &ThreatInput) -> SenderAuth {
     }
 }
 
-/// The domain of the message's only From mailbox, lowercased. `None` when
+/// The domain of the message's only From mailbox, in ASCII form. `None` when
 /// there is no From header, more than one, or it lists other than one mailbox.
 fn single_from_domain(input: &ThreatInput) -> Option<String> {
     let mut from_headers = input
@@ -334,7 +340,7 @@ fn single_from_domain(input: &ThreatInput) -> Option<String> {
         return None;
     }
     let (_, domain) = mailbox.address.as_deref()?.trim().rsplit_once('@')?;
-    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    let domain = ascii_host(domain);
     (!domain.is_empty()).then_some(domain)
 }
 
@@ -961,6 +967,91 @@ mod tests {
             "From: Bank <alerts@bank.example>",
         ];
         assert!(matches!(auth_of(&headers), SenderAuth::Unverifiable(_)));
+    }
+
+    // ── Alignment uses the Public Suffix List ───────────────────────
+
+    fn dkim_only(from: &str, signing_domain: &str, dmarc: &str) -> SenderAuth {
+        let ar = format!(
+            "Authentication-Results: mx1.example.org; dkim=pass header.d={signing_domain}; spf=pass smtp.mailfrom={signing_domain}; {dmarc}"
+        );
+        let from = format!("From: {from}");
+        auth_of(&[ar.as_str(), RECEIVED_EDGE, from.as_str()])
+    }
+
+    #[test]
+    fn dkim_pass_does_not_override_dmarc_fail() {
+        assert_eq!(
+            dkim_only(
+                "otp@bank.com.pl",
+                "attacker.com.pl",
+                "dmarc=fail (p=reject) header.from=bank.com.pl"
+            ),
+            SenderAuth::Fail
+        );
+        // Even an aligned signature does not rescue a DMARC failure.
+        assert_eq!(
+            dkim_only(
+                "otp@bank.example",
+                "mail.bank.example",
+                "dmarc=fail (p=reject) header.from=bank.example"
+            ),
+            SenderAuth::Fail
+        );
+    }
+
+    #[test]
+    fn public_suffix_siblings_do_not_align() {
+        for (from, signer) in [
+            ("otp@victim.github.io", "attacker.github.io"),
+            ("otp@bank.com.pl", "attacker.com.pl"),
+            ("otp@bank.eu.org", "attacker.eu.org"),
+            ("otp@bank.co.il", "attacker.co.il"),
+            ("otp@bank.me.uk", "attacker.me.uk"),
+        ] {
+            assert_eq!(
+                dkim_only(from, signer, "dmarc=none header.from=x"),
+                SenderAuth::Fail,
+                "{from} signed by {signer}"
+            );
+        }
+    }
+
+    #[test]
+    fn relaxed_alignment_under_a_real_registrable_domain_still_passes() {
+        for (from, signer, domain) in [
+            ("otp@bank.com", "mail.bank.com", "bank.com"),
+            ("otp@login.bank.co.uk", "bank.co.uk", "login.bank.co.uk"),
+            ("otp@bank.com.pl", "mx.bank.com.pl", "bank.com.pl"),
+        ] {
+            assert_eq!(
+                dkim_only(from, signer, "dmarc=none"),
+                passed("dkim", domain, "mx1.example.org"),
+                "{from} signed by {signer}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_and_punycode_from_domains_compare_equal() {
+        let unicode_from = auth_of(&[
+            "Authentication-Results: mx1.example.org; dmarc=pass header.from=xn--bnk-qla.example",
+            RECEIVED_EDGE,
+            "From: otp@b\u{e4}nk.example",
+        ]);
+        assert_eq!(
+            unicode_from,
+            passed("dmarc", "xn--bnk-qla.example", "mx1.example.org")
+        );
+        let unicode_ar = auth_of(&[
+            "Authentication-Results: mx1.example.org; dmarc=pass header.from=b\u{e4}nk.example",
+            RECEIVED_EDGE,
+            "From: otp@xn--bnk-qla.example",
+        ]);
+        assert_eq!(
+            unicode_ar,
+            passed("dmarc", "xn--bnk-qla.example", "mx1.example.org")
+        );
     }
 
     #[test]

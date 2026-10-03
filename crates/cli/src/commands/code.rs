@@ -9,6 +9,7 @@ use envelope_email_transport::code_extractor::extract_code;
 use envelope_email_transport::imap;
 use envelope_email_transport::threat::ThreatInput;
 use envelope_email_transport::threat::auth_results::{SenderAuth, sender_auth};
+use envelope_email_transport::threat::domains::ascii_host;
 use serde_json::{Value, json};
 
 use super::common::setup_credentials;
@@ -68,7 +69,7 @@ fn classify(
     };
     let auth = sender_auth(&input);
     let authenticated = matches!(&auth, SenderAuth::Pass { domain, .. }
-        if input.from_domain().as_deref() == Some(domain.as_str()));
+        if input.from_domain().map(|d| ascii_host(&d)).as_deref() == Some(domain.as_str()));
     let candidate = OtpCandidate {
         code,
         from: input.from_addr.clone(),
@@ -388,9 +389,11 @@ fn is_narrow_sender_filter(raw_filter: &str) -> bool {
     }
 
     if let Some((local, domain)) = filter.rsplit_once('@') {
-        return !local.is_empty() && !local.contains('@') && is_fully_qualified_domain(domain);
+        return !local.is_empty()
+            && !local.contains('@')
+            && is_fully_qualified_domain(&ascii_host(domain));
     }
-    is_fully_qualified_domain(filter.trim_start_matches('@'))
+    is_fully_qualified_domain(&ascii_host(filter.trim_start_matches('@')))
 }
 
 fn is_fully_qualified_domain(domain: &str) -> bool {
@@ -405,7 +408,8 @@ fn is_fully_qualified_domain(domain: &str) -> bool {
 }
 
 /// Extract a mailbox from a header and compare exact case-insensitive mailbox
-/// identity or a whole domain. Display names are never candidates.
+/// identity or a whole domain, domains in ASCII (IDNA) form. Display names
+/// are never candidates.
 fn sender_matches(raw_sender: &str, raw_filter: &str) -> bool {
     let sender = mailbox_from_header(raw_sender);
     let filter = raw_filter
@@ -413,17 +417,17 @@ fn sender_matches(raw_sender: &str, raw_filter: &str) -> bool {
         .trim_matches('<')
         .trim_matches('>')
         .to_lowercase();
-    if sender.is_empty() || filter.is_empty() {
+    let Some((sender_local, sender_domain)) = sender.rsplit_once('@') else {
         return false;
-    }
+    };
+    let sender_domain = ascii_host(sender_domain);
     if filter.contains('@') && !filter.starts_with('@') {
-        return sender == filter;
+        return filter.rsplit_once('@').is_some_and(|(local, domain)| {
+            local == sender_local && ascii_host(domain) == sender_domain
+        });
     }
     let domain = filter.trim_start_matches('@');
-    !domain.is_empty()
-        && sender
-            .rsplit_once('@')
-            .is_some_and(|(_, value)| value == domain)
+    !domain.is_empty() && ascii_host(domain) == sender_domain
 }
 
 fn mailbox_from_header(raw: &str) -> String {
@@ -556,6 +560,25 @@ mod tests {
                 assert!(matches!(c.auth, SenderAuth::Pass { .. }));
             }
             other => panic!("an authenticated sender is a candidate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_accepts_either_spelling_of_an_international_domain() {
+        let raw = otp_message(
+            Some("mx1.example.org; dmarc=pass header.from=xn--bnk-qla.example"),
+            "Bank <otp@b\u{e4}nk.example>",
+            "777777",
+        );
+        for filter in [
+            "xn--bnk-qla.example",
+            "b\u{e4}nk.example",
+            "otp@xn--bnk-qla.example",
+        ] {
+            match classify(&raw, "me@example.org", Some(filter), None) {
+                Classified::Candidate(c) => assert_eq!(c.code, "777777", "{filter}"),
+                other => panic!("--from {filter}: {other:?}"),
+            }
         }
     }
 

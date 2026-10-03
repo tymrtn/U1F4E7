@@ -65,6 +65,9 @@ webpki-roots.workspace = true
 futures-util.workspace = true
 ammonia = "4.2.0"
 idna = "1"
+# Registrable domains for DKIM alignment and look-alike checks. The list is
+# compiled in; the crate has no runtime dependencies or network access.
+psl = "2.1"
 
 [dev-dependencies]
 tempfile = "3"
