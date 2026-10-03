@@ -405,6 +405,21 @@ mod tests {
         );
         assert!(!pdf.exists());
 
+        // The gate checks the name the file is written under too.
+        let js = base.join("payload.js");
+        for name in ["payload.js\u{1}", "payload.js\u{0}"] {
+            let err = write_checked_download(
+                &db,
+                "acct",
+                &downloaded(name, b"alert(1)", None),
+                false,
+                Some(js.to_str().unwrap()),
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("attachment_blocked"), "{err:#}");
+            assert!(!js.exists(), "no bytes may reach disk");
+        }
+
         // --unsafe is the only override.
         let written = write_checked_download(
             &db,

@@ -975,6 +975,21 @@ mod tests {
 
     /// One fetched message, UID 7, carrying a single attachment.
     fn fetched(message_id: &str, filename: &str, bytes: &[u8]) -> HashMap<u32, imap::RawMessage> {
+        fetched_with(
+            message_id,
+            &format!("filename=\"{filename}\""),
+            "application/pdf",
+            bytes,
+        )
+    }
+
+    /// As [`fetched`], with the Content-Disposition filename parameter as given.
+    fn fetched_with(
+        message_id: &str,
+        filename_param: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> HashMap<u32, imap::RawMessage> {
         use base64::Engine;
         let body = base64::engine::general_purpose::STANDARD.encode(bytes);
         let rfc822 = format!(
@@ -982,8 +997,8 @@ mod tests {
              Message-ID: <{message_id}>\r\nMIME-Version: 1.0\r\n\
              Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
              --b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
-             --b\r\nContent-Type: application/pdf; name=\"{filename}\"\r\n\
-             Content-Disposition: attachment; filename=\"{filename}\"\r\n\
+             --b\r\nContent-Type: {content_type}\r\n\
+             Content-Disposition: attachment; {filename_param}\r\n\
              Content-Transfer-Encoding: base64\r\n\r\n{body}\r\n--b--\r\n"
         );
         HashMap::from([(
@@ -1050,6 +1065,20 @@ mod tests {
         let err = export(&pdf, false).unwrap_err();
         assert!(format!("{err:#}").contains("attachment_blocked"), "{err:#}");
         assert!(!out.exists(), "no bytes may reach disk");
+
+        // The gate checks the name the file is written under too.
+        for param in [
+            "filename*=utf-8''payload.js%01",
+            "filename*=utf-8''payload.js%00",
+        ] {
+            let js = fetched_with("b@x", param, "text/plain", b"alert(1)");
+            let err = export(&js, false).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("attachment_blocked"),
+                "{param}: {err:#}"
+            );
+            assert!(!out.exists(), "{param}: no bytes may reach disk");
+        }
 
         // --unsafe is the only override.
         export(&exe, true).unwrap();

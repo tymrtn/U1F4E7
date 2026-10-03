@@ -366,7 +366,8 @@ pub struct AttachmentBlock {
 }
 
 /// The attachment gate. Refuses bytes when the message carries
-/// `threat:malware` or the attachment itself is malware-grade, unless the
+/// `threat:malware` or the attachment itself is malware-grade, under its
+/// original name or the sanitized name it is written under, unless the
 /// message was marked safe.
 pub fn attachment_block(
     db: &Database,
@@ -384,7 +385,17 @@ pub fn attachment_block(
         }
         tagged = tags.iter().any(|t| t.tag == TAG_MALWARE);
     }
-    let signals = super::attachments::gate(filename, content_type, bytes);
+    // Bytes reach disk under the sanitized name, so check it as well as the
+    // original; either one blocking refuses.
+    let mut signals = super::attachments::gate(filename, content_type, bytes);
+    let written = crate::ingress::normalize_attachment_filename(filename);
+    if written != filename {
+        for signal in super::attachments::gate(&written, content_type, bytes) {
+            if !signals.iter().any(|s| s.code == signal.code) {
+                signals.push(signal);
+            }
+        }
+    }
     if !tagged && signals.is_empty() {
         return Ok(None);
     }
@@ -1081,6 +1092,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
+    }
+
+    /// Bytes are written under the sanitized name, so the gate checks that
+    /// name as well as the original.
+    #[test]
+    fn attachment_gate_checks_the_name_written_to_disk() {
+        let db = Database::open_memory().unwrap();
+        for name in ["payload.js\u{1}", "payload.js\u{0}", "payload.js "] {
+            let block = attachment_block(&db, ACCT, None, name, "text/plain", b"alert(1)")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name:?} must be blocked"));
+            assert_eq!(block.code, ATTACHMENT_BLOCKED);
+        }
+        assert!(
+            attachment_block(&db, ACCT, None, "notes.txt\u{1}", "text/plain", b"hi")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The reader shows a blocked attachment as blocked, so it asks the same
