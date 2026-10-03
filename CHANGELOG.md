@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The agent contract is now `envelope.agent_contract.v4`. `envelope contract` and the MCP tool list report the new id, and `docs/schemas/envelope.agent_contract.v4.json` is the new snapshot. The v3 and v2 snapshots stay in `docs/schemas/` unchanged.
+- One-time codes require an authenticated sender. `envelope code` returns a code only when the receiving mail host's `Authentication-Results` show DMARC passing for the From domain, or DKIM passing with a signing domain aligned with it. SPF alone does not count. A code from any other sender is skipped and the wait continues until `--wait` runs out; it then ends with `sender_unverifiable` or `sender_unauthenticated` and lists the skipped senders in `rejected_candidates`, without their codes. Every result reports `sender_auth`.
+- Some providers record no authentication results Envelope can use. For those, an operator can let an account accept unverified senders with `envelope config set otp.allow_unverified_senders <account>`; a code accepted that way reports `sender_auth.result: "unverifiable"`. The setting is refused when `ENVELOPE_AGENT_TOKEN` is set, and no MCP tool changes it.
+- Plain `envelope code` (without `--json`) now requires `--from`.
+
+### Fixed
+
+- Send authority comes from the agent's policy and human approval, not from tool parameters. With an agent token, the `confirm_send` and `allow_recipient` parameters of MCP `send`, `reply` and `send_draft` state intent only: the recipient allowlist is the one in the agent's policy, and confirmation is a person's approval of the draft's current revision. Under a `confirm-send` ceiling, `send` and `reply` save a draft and return `"confirmation": {"required": "human_approval", "surface": "dashboard"}`, and `send_draft` waits for that approval. Sessions started with `ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS=1` behave as before.
+- With an agent token, the CLI applies that agent's policy to sending and to rule webhooks, batch actions and Sieve publishing. `envelope send` and `envelope draft send` follow the agent's ceiling, recipient allowlist and human approval. `rule create` and `rule enable` with a webhook action, `rule enable --acknowledge-batch-actions` and `rule publish-sieve --confirm` need the new policy actions `rules.webhook`, `rules.batch_ack` and `sieve.publish`, which a `"*"` policy does not include. An unknown or revoked token is refused with `agent_token_invalid`. Without a token the CLI works as before.
+
 ## [1.3.15] — 2026-10-03
 
 A fix to how MCP `send_draft` applies an agent's send policy.
