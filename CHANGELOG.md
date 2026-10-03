@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Threat verdicts and Mark safe are bound to the message's content: a stored verdict or a Mark safe applies only to the same message, and every new message is scanned.
+- Threat verdicts and Mark safe are bound to the message's content: a stored verdict or a Mark safe applies only to the same message, and every new message is scanned. `envelope tag show` and the MCP `tag` tool show each message's own threat tags and threat score.
 
 ## [1.3.15] — 2026-10-03
 

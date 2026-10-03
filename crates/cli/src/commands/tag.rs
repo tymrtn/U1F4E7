@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::imap;
+use envelope_email_transport::threat::persist;
 
 use super::common::setup_credentials;
 
@@ -131,12 +132,8 @@ pub async fn run_show(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("message UID {uid} has no Message-ID header"))?;
 
-    let tags = db
-        .get_tags(account_id, message_id)
-        .context("failed to get tags")?;
-    let scores = db
-        .get_scores(account_id, message_id)
-        .context("failed to get scores")?;
+    let (tags, scores) = persist::shown_tags_and_scores(&db, account_id, folder, uid, message_id)
+        .context("failed to get tags and scores")?;
 
     if json {
         println!(

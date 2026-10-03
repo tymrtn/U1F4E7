@@ -2114,11 +2114,14 @@ async fn handle_tag(
         }
     }
 
-    let current_tags = db
-        .get_tags(&creds.account.id, message_id)
-        .map_err(|e| e.to_string())?;
-    let current_scores = db
-        .get_scores(&creds.account.id, message_id)
+    let (current_tags, current_scores) =
+        envelope_email_transport::threat::persist::shown_tags_and_scores(
+            &db,
+            &creds.account.id,
+            folder,
+            uid,
+            message_id,
+        )
         .map_err(|e| e.to_string())?;
 
     let audit = log_agent_mutation(

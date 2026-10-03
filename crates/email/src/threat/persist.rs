@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use envelope_email_store::Database;
 use envelope_email_store::event_catalog::{LABEL_APPLIED, LOOKUP_PERFORMED, THREAT_VERDICT};
-use envelope_email_store::models::{Event, Rule};
+use envelope_email_store::models::{Event, MessageScore, MessageTag, Rule};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -872,10 +872,7 @@ fn rule_context(
 }
 
 /// Replace a rule context's threat data (the `threat` score and every
-/// `threat:*` tag) with what the verdict stored for this folder/UID says,
-/// read under that message's own threat key. Stores keyed by Message-ID are
-/// shared by every message with that Message-ID, so they never decide one
-/// message's threat data. A UID without a verdict has none.
+/// `threat:*` tag) with [`bound_threat`] for this folder/UID.
 pub fn bind_threat_context(
     db: &Database,
     account_id: &str,
@@ -885,42 +882,124 @@ pub fn bind_threat_context(
 ) -> Result<()> {
     ctx.tags.retain(|t| !t.starts_with("threat:"));
     ctx.scores.remove(THREAT_DIMENSION);
+    let bound = bound_threat(db, account_id, folder, uid)?;
+    if let Some(score) = bound.score {
+        ctx.scores.insert(THREAT_DIMENSION.to_string(), score.value);
+    }
+    ctx.tags.extend(bound.tags.into_iter().map(|t| t.tag));
+    Ok(())
+}
+
+/// One message's own threat data.
+#[derive(Debug, Default)]
+pub struct BoundThreat {
+    pub score: Option<MessageScore>,
+    pub tags: Vec<MessageTag>,
+}
+
+/// The `threat` score and `threat:*` tags the verdict stored for this
+/// folder/UID gives its message, read under that message's own threat key.
+/// Stores keyed by Message-ID are shared by every message with that
+/// Message-ID, so they never decide one message's threat data. A UID
+/// without a verdict has none. A tag or score stored under the key keeps
+/// its record; one the verdict implies without a record is dated by it.
+pub fn bound_threat(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<BoundThreat> {
+    let mut bound = BoundThreat::default();
     let Some(stored) = stored_verdict_for_uid(db, account_id, folder, uid)? else {
-        return Ok(());
+        return Ok(bound);
     };
     let verdict = &stored.verdict;
-    let Some(key) = stored.key.as_deref() else {
-        if verdict.level != Level::Unavailable {
-            ctx.scores
-                .insert(THREAT_DIMENSION.to_string(), f64::from(verdict.score));
-        }
-        return Ok(());
+    let key = stored.key.as_deref();
+    let safe = match key {
+        Some(key) => is_marked_safe(db, account_id, key, stored.content_fingerprint.as_deref())?,
+        None => false,
     };
-    let safe = is_marked_safe(db, account_id, key, stored.content_fingerprint.as_deref())?;
     if verdict.level != Level::Unavailable {
-        let score = if safe { 0.0 } else { f64::from(verdict.score) };
-        ctx.scores.insert(THREAT_DIMENSION.to_string(), score);
+        let value = if safe { 0.0 } else { f64::from(verdict.score) };
+        let recorded = match key {
+            Some(key) => db
+                .get_scores(account_id, key)?
+                .into_iter()
+                .find(|s| s.dimension == THREAT_DIMENSION),
+            None => None,
+        };
+        bound.score = Some(match recorded {
+            Some(score) => MessageScore { value, ..score },
+            None => MessageScore {
+                account_id: account_id.to_string(),
+                message_id: key.unwrap_or_default().to_string(),
+                dimension: THREAT_DIMENSION.to_string(),
+                value,
+                uid: Some(i64::from(uid)),
+                folder: Some(folder.to_string()),
+                created_at: stored.recorded_at.clone(),
+                updated_at: stored.recorded_at.clone(),
+            },
+        });
     }
+    let Some(key) = key else {
+        return Ok(bound);
+    };
+    let recorded = db.get_tags(account_id, key)?;
+    let mut names = Vec::new();
     if safe {
-        ctx.tags.push(TAG_FALSE_POSITIVE.to_string());
-        return Ok(());
+        names.push(TAG_FALSE_POSITIVE);
+    } else {
+        match verdict.level {
+            Level::Suspicious => names.push(TAG_SUSPICIOUS),
+            Level::Dangerous => names.push(TAG_DANGEROUS),
+            Level::Clean | Level::Unavailable => {}
+        }
+        if verdict.is_malware() {
+            names.push(TAG_MALWARE);
+        }
+        if recorded.iter().any(|t| t.tag == TAG_QUARANTINED) {
+            names.push(TAG_QUARANTINED);
+        }
     }
-    match verdict.level {
-        Level::Suspicious => ctx.tags.push(TAG_SUSPICIOUS.to_string()),
-        Level::Dangerous => ctx.tags.push(TAG_DANGEROUS.to_string()),
-        Level::Clean | Level::Unavailable => {}
-    }
-    if verdict.is_malware() {
-        ctx.tags.push(TAG_MALWARE.to_string());
-    }
-    if db
-        .get_tags(account_id, key)?
-        .iter()
-        .any(|t| t.tag == TAG_QUARANTINED)
-    {
-        ctx.tags.push(TAG_QUARANTINED.to_string());
-    }
-    Ok(())
+    bound.tags = names
+        .into_iter()
+        .map(|name| {
+            recorded
+                .iter()
+                .find(|t| t.tag == name)
+                .cloned()
+                .unwrap_or_else(|| MessageTag {
+                    account_id: account_id.to_string(),
+                    message_id: key.to_string(),
+                    tag: name.to_string(),
+                    uid: Some(i64::from(uid)),
+                    folder: Some(folder.to_string()),
+                    created_at: stored.recorded_at.clone(),
+                })
+        })
+        .collect();
+    Ok(bound)
+}
+
+/// The tags and scores a tag view shows for the message at this folder/UID:
+/// those stored under its Message-ID, with the threat data replaced by
+/// [`bound_threat`], as rule contexts read it.
+pub fn shown_tags_and_scores(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    message_id: &str,
+) -> Result<(Vec<MessageTag>, Vec<MessageScore>)> {
+    let bound = bound_threat(db, account_id, folder, uid)?;
+    let mut tags = db.get_tags(account_id, message_id)?;
+    tags.retain(|t| !t.tag.starts_with("threat:"));
+    tags.extend(bound.tags);
+    let mut scores = db.get_scores(account_id, message_id)?;
+    scores.retain(|s| s.dimension != THREAT_DIMENSION);
+    scores.extend(bound.score);
+    Ok((tags, scores))
 }
 
 /// What quarantine did to one message.
@@ -2399,6 +2478,63 @@ Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"
         )
         .unwrap();
         assert!(gate.is_none(), "{gate:?}");
+    }
+
+    /// A tag view shows the message's own threat data: a twin of a marked
+    /// message never shows the mark, and a UID without a verdict shows none.
+    #[tokio::test]
+    async fn tag_view_of_a_twin_does_not_show_the_marked_original_s_threat_tags() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig::default();
+        let original = ordinary("twin@x");
+        let original_fp = content_fingerprint(&original);
+        verdict_on_open(&db, ACCT, EMAIL, "INBOX", 1, Some(&original), &config).unwrap();
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: "INBOX",
+                uid: 1,
+                message_id: Some("twin@x"),
+                content_fingerprint: Some(&original_fp),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+        db.add_tag(ACCT, "twin@x", "work", Some(1), Some("INBOX"))
+            .unwrap();
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(2, phish("twin@x"));
+        scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[2], &config).await;
+
+        let shown = |uid: u32| {
+            let (tags, scores) = shown_tags_and_scores(&db, ACCT, "INBOX", uid, "twin@x").unwrap();
+            let mut tags: Vec<String> = tags.into_iter().map(|t| t.tag).collect();
+            tags.sort();
+            let threat: Vec<f64> = scores
+                .iter()
+                .filter(|s| s.dimension == THREAT_DIMENSION)
+                .map(|s| s.value)
+                .collect();
+            (tags, threat)
+        };
+        let (twin_tags, twin_threat) = shown(2);
+        assert_eq!(
+            twin_tags,
+            vec![TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED, "work"]
+        );
+        assert_eq!(twin_threat.len(), 1);
+        assert!(twin_threat[0] > 0.0, "{twin_threat:?}");
+        assert_eq!(
+            shown(1),
+            (
+                vec![TAG_FALSE_POSITIVE.to_string(), "work".to_string()],
+                vec![0.0]
+            )
+        );
+        assert_eq!(shown(9), (vec!["work".to_string()], vec![]));
     }
 
     /// Mark safe as stored before fingerprints: the tag and a `label_applied`
