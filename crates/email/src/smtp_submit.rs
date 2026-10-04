@@ -272,10 +272,7 @@ impl SmtpConnect for AccountConnector<'_> {
                         reply_code: None,
                         // A network blip is worth retrying; a refused grant is not.
                         permanent: !matches!(e, crate::oauth::OAuthError::Http(_)),
-                        error: format!(
-                            "OAuth sign-in for {username} failed: {e}; {}",
-                            crate::oauth_session::reauth_hint(&username)
-                        ),
+                        error: crate::oauth_session::token_failure(&username, &e),
                     })?;
                 let _ = token_slot.set(token);
             }

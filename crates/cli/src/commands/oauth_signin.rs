@@ -124,7 +124,8 @@ pub async fn google_sign_in(email: &str, paste: bool, contacts: bool) -> Result<
 pub fn check_google_tokens(email: &str, tokens: &TokenSet) -> Result<()> {
     if !tokens.has_scope(GMAIL_SCOPE) {
         bail!(
-            "Google didn't grant Gmail access: the box for reading, composing and sending mail was unticked. Run the command again and leave it ticked."
+            "Google didn't grant Gmail access (it granted only: {}). Run the command again and, on Google's consent page, tick the box to read, compose, send and delete your Gmail email, or tick Select all.",
+            tokens.scope
         );
     }
     let identity = tokens.identity()?;
@@ -190,7 +191,10 @@ mod tests {
             r#"{"email":"you@gmail.com","email_verified":true}"#,
         );
         let err = check_google_tokens("you@gmail.com", &t).unwrap_err();
-        assert!(err.to_string().contains("unticked"), "{err}");
+        assert!(
+            err.to_string().contains("granted only: openid email"),
+            "{err}"
+        );
     }
 
     #[test]

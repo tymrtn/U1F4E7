@@ -109,3 +109,46 @@ pub async fn access_token_using(
 pub fn reauth_hint(username: &str) -> String {
     format!("run `envelope accounts reauth {username}` to sign in again")
 }
+
+/// Why getting a token for `username` failed, and the fix that applies:
+/// signing in again cannot repair a wrong client or a network failure.
+pub fn token_failure(username: &str, e: &OAuthError) -> String {
+    let fix = match e {
+        OAuthError::InvalidConfig(_) => {
+            "check ENVELOPE_GOOGLE_CLIENT_ID and ENVELOPE_GOOGLE_CLIENT_SECRET".to_string()
+        }
+        OAuthError::Provider { error, .. }
+            if error == "invalid_client" || error == "unauthorized_client" =>
+        {
+            "this build's OAuth client ID or secret is wrong; check ENVELOPE_GOOGLE_CLIENT_ID and ENVELOPE_GOOGLE_CLIENT_SECRET".to_string()
+        }
+        OAuthError::Http(_) => "check the network connection and try again".to_string(),
+        _ => reauth_hint(username),
+    };
+    format!("OAuth sign-in for {username} failed: {e}; {fix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_refused_grant_points_at_reauth() {
+        let revoked = OAuthError::ReauthRequired {
+            error: "invalid_grant".into(),
+            description: "Token has been expired or revoked.".into(),
+        };
+        assert!(token_failure("me@gmail.com", &revoked).contains("accounts reauth me@gmail.com"));
+
+        let bad_client = OAuthError::Provider {
+            error: "invalid_client".into(),
+            description: "The provided client secret is invalid.".into(),
+        };
+        let msg = token_failure("me@gmail.com", &bad_client);
+        assert!(msg.contains("ENVELOPE_GOOGLE_CLIENT_SECRET"), "{msg}");
+        assert!(!msg.contains("accounts reauth"), "{msg}");
+
+        let offline = OAuthError::Http("connection refused".into());
+        assert!(!token_failure("me@gmail.com", &offline).contains("accounts reauth"));
+    }
+}
