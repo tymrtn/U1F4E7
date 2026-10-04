@@ -369,9 +369,9 @@ where
         let token = crate::oauth_session::access_token(grant)
             .await
             .map_err(|e| {
-                ImapError::Auth(format!(
-                    "OAuth sign-in for {username} failed: {e}; {}",
-                    crate::oauth_session::reauth_hint(&account.account.username)
+                ImapError::Auth(crate::oauth_session::token_failure(
+                    &account.account.username,
+                    &e,
                 ))
             })?;
         let authenticator = Xoauth2Authenticator {
