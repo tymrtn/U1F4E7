@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.16] — 2026-10-03
+
+Security fixes. Threat verdicts and Mark safe follow a message's content, agent tokens get only the authority their policy grants, and one-time codes need an authenticated sender. Agents that use the newly gated commands need the matching grants; see the agent contract v4.
+
 ### Changed
 
 - The agent contract is now `envelope.agent_contract.v4`. `envelope contract` and the MCP tool list report the new id, and `docs/schemas/envelope.agent_contract.v4.json` is the new snapshot. The v3 and v2 snapshots stay in `docs/schemas/` unchanged.
