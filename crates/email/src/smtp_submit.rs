@@ -28,7 +28,7 @@ use envelope_email_store::models::AccountWithCredentials;
 use lettre::Message;
 use lettre::address::Envelope;
 use lettre::transport::smtp::Error as LettreError;
-use lettre::transport::smtp::authentication::{Credentials, DEFAULT_MECHANISMS};
+use lettre::transport::smtp::authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
 use lettre::transport::smtp::commands::{Data, Mail, Rcpt};
 use lettre::transport::smtp::extension::{ClientId, Extension, MailBodyParameter, MailParameter};
@@ -213,17 +213,33 @@ pub trait SmtpConnect {
 
     /// Credentials for AUTH, when the server requires them.
     fn credentials(&self) -> Option<Credentials>;
+
+    /// SASL mechanisms to offer, most preferred first.
+    fn mechanisms(&self) -> &'static [Mechanism] {
+        DEFAULT_MECHANISMS
+    }
+
+    /// Set for an OAuth sign-in. An AUTH failure then means the sign-in has
+    /// to be redone, so it is permanent and carries what to run.
+    fn reauth_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Connects to an account's SMTP server: implicit TLS on port 465, STARTTLS
 /// (required) on every other port, the same choice the relay transport made.
 pub struct AccountConnector<'a> {
     account: &'a AccountWithCredentials,
+    /// The OAuth access token, fetched in `connect` before AUTH needs it.
+    token: std::sync::OnceLock<String>,
 }
 
 impl<'a> AccountConnector<'a> {
     pub fn new(account: &'a AccountWithCredentials) -> Self {
-        Self { account }
+        Self {
+            account,
+            token: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -231,7 +247,38 @@ impl SmtpConnect for AccountConnector<'_> {
     fn connect(&self) -> impl Future<Output = Result<AsyncSmtpConnection, ConnectFailure>> + Send {
         let host = self.account.account.smtp_host.clone();
         let port = self.account.account.smtp_port;
+        let username = self.account.account.username.clone();
+        let grant = self.account.oauth.clone();
+        let placeholder = grant.is_none()
+            && envelope_email_store::oauth_grants::is_oauth_password(
+                self.account.effective_smtp_password(),
+            );
+        let token_slot = &self.token;
         async move {
+            if placeholder {
+                return Err(ConnectFailure {
+                    reply_code: None,
+                    permanent: true,
+                    error: format!(
+                        "{username} signs in with OAuth but no sign-in was loaded; {}",
+                        crate::oauth_session::reauth_hint(&username)
+                    ),
+                });
+            }
+            if let Some(grant) = &grant {
+                let token = crate::oauth_session::access_token(grant)
+                    .await
+                    .map_err(|e| ConnectFailure {
+                        reply_code: None,
+                        // A network blip is worth retrying; a refused grant is not.
+                        permanent: !matches!(e, crate::oauth::OAuthError::Http(_)),
+                        error: format!(
+                            "OAuth sign-in for {username} failed: {e}; {}",
+                            crate::oauth_session::reauth_hint(&username)
+                        ),
+                    })?;
+                let _ = token_slot.set(token);
+            }
             let hello = ClientId::default();
             let tls = TlsParameters::new(host.clone())?;
             if port == 465 {
@@ -259,10 +306,34 @@ impl SmtpConnect for AccountConnector<'_> {
     }
 
     fn credentials(&self) -> Option<Credentials> {
+        let user = self.account.effective_smtp_username().to_string();
+        if self.account.oauth.is_some() {
+            // `connect` either stored the token or failed, so an empty token
+            // cannot reach AUTH; the server would refuse it rather than skip it.
+            return Some(Credentials::new(
+                user,
+                self.token.get().cloned().unwrap_or_default(),
+            ));
+        }
         Some(Credentials::new(
-            self.account.effective_smtp_username().to_string(),
+            user,
             self.account.effective_smtp_password().to_string(),
         ))
+    }
+
+    fn mechanisms(&self) -> &'static [Mechanism] {
+        if self.account.oauth.is_some() {
+            &[Mechanism::Xoauth2]
+        } else {
+            DEFAULT_MECHANISMS
+        }
+    }
+
+    fn reauth_hint(&self) -> Option<String> {
+        self.account
+            .oauth
+            .as_ref()
+            .map(|_| crate::oauth_session::reauth_hint(&self.account.account.username))
     }
 }
 
@@ -330,9 +401,27 @@ async fn open_steps<C: SmtpConnect>(
 
     if let Some(credentials) = connector.credentials() {
         stage.store(SubmitStage::Auth as u8, Ordering::SeqCst);
-        if let Err(e) = conn.auth(DEFAULT_MECHANISMS, &credentials).await {
+        if let Err(e) = conn.auth(connector.mechanisms(), &credentials).await {
             quit(&mut conn, deadlines).await;
-            return Err(refused(SubmitStage::Auth, &e));
+            return Err(
+                match (refused(SubmitStage::Auth, &e), connector.reauth_hint()) {
+                    (
+                        SubmitFailure::NotSubmitted {
+                            stage,
+                            reply_code,
+                            error,
+                            ..
+                        },
+                        Some(hint),
+                    ) => SubmitFailure::NotSubmitted {
+                        stage,
+                        reply_code,
+                        permanent: true,
+                        error: format!("{error}; {hint}"),
+                    },
+                    (failure, _) => failure,
+                },
+            );
         }
     }
 
@@ -616,8 +705,10 @@ pub mod testing {
                 .unwrap_or("")
                 .to_ascii_uppercase();
             let reply: String = match verb.as_str() {
-                "EHLO" => "250-scripted\r\n250-8BITMIME\r\n250-SMTPUTF8\r\n250 AUTH PLAIN LOGIN"
-                    .to_string(),
+                "EHLO" => {
+                    "250-scripted\r\n250-8BITMIME\r\n250-SMTPUTF8\r\n250 AUTH PLAIN LOGIN XOAUTH2"
+                        .to_string()
+                }
                 "AUTH" => script.auth.to_string(),
                 "MAIL" => "250 2.1.0 ok".to_string(),
                 "RCPT" => rcpt.next().copied().unwrap_or("250 2.1.5 ok").to_string(),
@@ -699,6 +790,43 @@ pub mod testing {
 
         fn credentials(&self) -> Option<Credentials> {
             Some(Credentials::new("user".into(), "pass".into()))
+        }
+    }
+
+    /// Connector that signs in with XOAUTH2, as an OAuth account would.
+    pub struct XoauthConnector {
+        pub addr: SocketAddr,
+    }
+
+    impl SmtpConnect for XoauthConnector {
+        fn connect(
+            &self,
+        ) -> impl Future<Output = Result<AsyncSmtpConnection, ConnectFailure>> + Send {
+            let addr = self.addr;
+            async move {
+                let stream = TcpStream::connect(addr).await.map_err(|e| ConnectFailure {
+                    reply_code: None,
+                    permanent: false,
+                    error: e.to_string(),
+                })?;
+                Ok(AsyncSmtpConnection::connect_with_transport(
+                    Box::new(stream),
+                    &ClientId::default(),
+                )
+                .await?)
+            }
+        }
+
+        fn credentials(&self) -> Option<Credentials> {
+            Some(Credentials::new("you@gmail.com".into(), "ya29.tok".into()))
+        }
+
+        fn mechanisms(&self) -> &'static [Mechanism] {
+            &[Mechanism::Xoauth2]
+        }
+
+        fn reauth_hint(&self) -> Option<String> {
+            Some("run `envelope accounts reauth you@gmail.com` to sign in again".into())
         }
     }
 
@@ -902,6 +1030,91 @@ mod tests {
             }
         ));
         assert!(!server.saw("MAIL"));
+    }
+
+    #[tokio::test]
+    async fn oauth_accounts_authenticate_with_xoauth2() {
+        use base64::Engine;
+        let server = ScriptedServer::start(Script::default()).await;
+        let result = submit_once(
+            &XoauthConnector { addr: server.addr },
+            &message(&["a@example.test"]),
+            fast(),
+        )
+        .await;
+        assert!(result.unwrap().starts_with("250"));
+        let commands = server.transcript.lock().unwrap().commands.clone();
+        let auth = commands
+            .iter()
+            .find(|c| c.starts_with("AUTH"))
+            .expect("AUTH sent");
+        let encoded = auth
+            .strip_prefix("AUTH XOAUTH2 ")
+            .expect("XOAUTH2 with initial response");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "user=you@gmail.com\x01auth=Bearer ya29.tok\x01\x01"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_oauth_token_is_permanent_and_names_the_fix() {
+        // Gmail answers a bad token with a 334 challenge carrying error JSON.
+        let script = Script {
+            auth: "334 eyJzdGF0dXMiOiI0MDAiLCJzY2hlbWVzIjoiQmVhcmVyIn0=",
+            ..Script::default()
+        };
+        let server = ScriptedServer::start(script).await;
+        let result = submit_once(
+            &XoauthConnector { addr: server.addr },
+            &message(&["a@example.test"]),
+            fast(),
+        )
+        .await;
+        match result.unwrap_err() {
+            SubmitFailure::NotSubmitted {
+                stage: SubmitStage::Auth,
+                permanent: true,
+                error,
+                ..
+            } => assert!(error.contains("envelope accounts reauth"), "{error}"),
+            other => panic!("expected a permanent AUTH refusal, got {other:?}"),
+        }
+        assert!(!server.saw("MAIL"));
+    }
+
+    #[tokio::test]
+    async fn an_oauth_placeholder_password_never_reaches_auth() {
+        use envelope_email_store::Account;
+        let creds = AccountWithCredentials {
+            account: Account {
+                id: "acc".into(),
+                name: "Gmail".into(),
+                username: "you@gmail.com".into(),
+                domain: "gmail.com".into(),
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 9,
+                imap_host: "imap.gmail.com".into(),
+                imap_port: 993,
+                smtp_username: None,
+                imap_username: None,
+                display_name: None,
+                signature_text: None,
+                signature_html: None,
+                created_at: "2026-10-03T00:00:00Z".into(),
+            },
+            password: "oauth2:grant".into(),
+            smtp_password: None,
+            imap_password: None,
+            sent_tracking: None,
+            oauth: None,
+        };
+        let failure = AccountConnector::new(&creds).connect().await.err().unwrap();
+        assert!(failure.permanent);
+        assert!(failure.error.contains("reauth"), "{}", failure.error);
     }
 
     #[tokio::test]

@@ -26,6 +26,8 @@ pub mod imap;
 pub mod ingress;
 pub mod managesieve;
 pub mod migrate;
+pub mod oauth;
+pub mod oauth_session;
 pub mod outbound;
 pub mod provider;
 pub mod reply;

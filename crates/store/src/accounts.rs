@@ -68,6 +68,17 @@ impl Database {
             .transpose()?;
 
         if let Some(existing) = self.find_account_by_email(username)? {
+            let current: String = self.conn().query_row(
+                "SELECT encrypted_password FROM accounts WHERE id = ?1",
+                params![existing.id],
+                |row| row.get(0),
+            )?;
+            if crate::oauth_grants::is_oauth_password(&crypto::decrypt(&current, passphrase)?) {
+                return Err(StoreError::OAuthAccount(
+                    username.to_string(),
+                    "importing a password would replace its sign-in; use `envelope accounts reauth` instead".into(),
+                ));
+            }
             self.conn().execute(
                 "UPDATE accounts SET name = ?1, domain = ?2, smtp_host = ?3, smtp_port = ?4,
                  imap_host = ?5, imap_port = ?6, encrypted_password = ?7,
@@ -228,6 +239,12 @@ impl Database {
             |row| row.get(0),
         )?;
         let password = crypto::decrypt(&encrypted_password, passphrase)?;
+        let oauth = self.resolve_oauth(id, &account.username, &password, passphrase)?;
+        let password = if oauth.is_some() {
+            String::new()
+        } else {
+            password
+        };
 
         let smtp_password: Option<String> = self.conn().query_row(
             "SELECT encrypted_smtp_password FROM accounts WHERE id = ?1",
@@ -254,6 +271,7 @@ impl Database {
             password,
             smtp_password,
             imap_password,
+            oauth,
         })
     }
 
@@ -278,6 +296,10 @@ impl Database {
         tx.execute("DELETE FROM contacts WHERE account_id = ?1", params![id])?;
         tx.execute(
             "DELETE FROM address_history_state WHERE account_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM oauth_grants WHERE account_id = ?1",
             params![id],
         )?;
         let rows = tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;

@@ -635,6 +635,42 @@ enum AccountsCmd {
         /// setup only: a wrong password is not caught until first use.
         #[arg(long)]
         skip_login_check: bool,
+        /// Sign in with the provider in a browser instead of a password.
+        /// `google` connects Gmail over IMAP and SMTP with OAuth (XOAUTH2).
+        #[arg(
+            long,
+            value_parser = ["google"],
+            conflicts_with_all = [
+                "password_stdin", "smtp_host", "smtp_port", "imap_host", "imap_port",
+                "skip_login_check",
+            ]
+        )]
+        provider: Option<String>,
+        /// With --provider: open the sign-in link on any device and paste the
+        /// address the browser ends on, instead of catching it locally.
+        #[arg(long, requires = "provider")]
+        paste: bool,
+        /// With --provider google: also allow reading Google contacts, so
+        /// `contacts source add carddav` can sync them with this sign-in.
+        #[arg(long, requires = "provider")]
+        contacts: bool,
+    },
+    /// Sign an account in again with its provider, or switch a password
+    /// account to provider sign-in with --provider
+    Reauth {
+        /// Account ID or email address
+        account: String,
+        /// Provider to sign in with; required to switch a password account
+        #[arg(long, value_parser = ["google"])]
+        provider: Option<String>,
+        /// Open the sign-in link on any device and paste the address the
+        /// browser ends on, instead of catching it locally
+        #[arg(long)]
+        paste: bool,
+        /// Also allow reading Google contacts. Kept on later sign-ins once
+        /// granted.
+        #[arg(long)]
+        contacts: bool,
     },
     /// Re-encrypt the file credential store under a new passphrase
     Rekey,

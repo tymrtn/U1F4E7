@@ -611,6 +611,12 @@ pub async fn publish_script(
     existing: &ExistingScript,
     timeout: Duration,
 ) -> PublishAttempt {
+    if account.oauth.is_some() {
+        return PublishAttempt::failed(ManageSieveError::Protocol(format!(
+            "{} signs in with OAuth; ManageSieve needs a password, so server-side rules can't be published for it",
+            account.account.username
+        )));
+    }
     if script.len() > MAX_SCRIPT_BYTES {
         return PublishAttempt::failed(ManageSieveError::Protocol(format!(
             "script is {} bytes; refusing to upload more than {} bytes",

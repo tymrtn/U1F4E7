@@ -1122,6 +1122,7 @@ mod tests {
             password: "fixture-password".to_string(),
             smtp_password: None,
             imap_password: None,
+            oauth: None,
         };
 
         build_manifest(

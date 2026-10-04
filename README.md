@@ -70,16 +70,18 @@ unsigned tarball you downloaded in a browser, clear the quarantine flag:
 
 ## Quick start
 
-Envelope signs in to IMAP and SMTP with a password or an app password. It has
-no OAuth sign-in yet, and that decides which mailboxes work today:
+Envelope signs in to IMAP and SMTP with a password or an app password, and to
+Gmail with Google sign-in. That decides which mailboxes work today:
 
 - **Fastmail and iCloud Mail:** create an app password in the provider's
   security settings.
-- **Gmail:** create an [app password](https://support.google.com/accounts/answer/185833).
-  Google only offers them once 2-Step Verification is on, and some Workspace
-  and Advanced Protection accounts cannot create one. If Google won't let you
-  create an app password for your account, Gmail can't connect to Envelope yet
-  (OAuth sign-in isn't supported).
+- **Gmail:** `envelope accounts add --provider google --email you@gmail.com`
+  signs in with Google in your browser; `envelope accounts reauth you@gmail.com
+  --provider google` switches an account added with a password. While
+  Envelope's Google app is in Google's testing stage, only addresses on its
+  test-user list can sign in, and Google asks again every 7 days. An
+  [app password](https://support.google.com/accounts/answer/185833) still works
+  for accounts that can create one.
 - **Migadu, self-hosted Dovecot, and most other IMAP hosts:** your normal
   mailbox password.
 - **Outlook.com, Hotmail, Live, and Microsoft 365:** not supported yet.
@@ -289,7 +291,7 @@ Envelope auto-discovers IMAP/SMTP from your email domain via DNS. Tested with:
 
 | Provider | Auth | Notes |
 |---|---|---|
-| **Gmail** | App password | `[Gmail]/` folder prefix handled automatically |
+| **Gmail** | Google sign-in or app password | `[Gmail]/` folder prefix handled automatically |
 | **Outlook.com / Microsoft 365** | Not supported yet | Microsoft requires OAuth sign-in for IMAP; Envelope has no OAuth yet |
 | **Migadu** | Password | Standard folders |
 | **Fastmail** | App password | Standard folders |

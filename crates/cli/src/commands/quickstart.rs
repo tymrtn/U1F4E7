@@ -487,13 +487,14 @@ pub fn auth_remediation(account: Option<&str>, server_text: &str) -> Vec<String>
         || domain == "googlemail.com"
         || text.contains("application-specific password required")
     {
+        let who = account
+            .filter(|a| a.contains('@'))
+            .unwrap_or("you@gmail.com");
         return vec![
-            "Envelope does not support Google sign-in (OAuth) yet, so Gmail needs an app password, not your Google account password.".to_string(),
-            "1. Turn on 2-Step Verification: https://myaccount.google.com/security".to_string(),
-            "2. Create an app password: https://myaccount.google.com/apppasswords".to_string(),
-            "3. Re-run: envelope accounts add --email you@gmail.com".to_string(),
-            "If Google won't let you create an app password for your account, Gmail can't connect to Envelope yet (OAuth sign-in isn't supported).".to_string(),
-            WORKING_PROVIDERS.to_string(),
+            "Gmail won't take your Google account password. Sign in with Google in your browser instead:".to_string(),
+            format!("  envelope accounts add --provider google --email {who}"),
+            format!("An account already added with a password switches over with: envelope accounts reauth {who} --provider google"),
+            "An app password still works too: turn on 2-Step Verification (https://myaccount.google.com/security), create one at https://myaccount.google.com/apppasswords, then re-run envelope accounts add.".to_string(),
         ];
     }
     match domain.as_str() {
@@ -750,9 +751,9 @@ mod tests {
     #[test]
     fn auth_remediation_gmail_domain_present() {
         let joined = auth_remediation(Some("you@gmail.com"), "Invalid credentials").join(" ");
+        assert!(joined.contains("envelope accounts add --provider google --email you@gmail.com"));
+        assert!(joined.contains("envelope accounts reauth you@gmail.com --provider google"));
         assert!(joined.contains("myaccount.google.com/apppasswords"));
-        assert!(joined.contains("OAuth"));
-        assert!(joined.contains("Gmail can't connect to Envelope yet"));
     }
 
     #[test]
@@ -763,6 +764,7 @@ mod tests {
         )
         .join(" ");
         assert!(joined.contains("myaccount.google.com/apppasswords"));
+        assert!(joined.contains("--provider google --email me@company.example"));
     }
 
     #[test]

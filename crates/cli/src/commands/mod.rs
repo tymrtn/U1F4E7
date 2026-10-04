@@ -31,6 +31,7 @@ pub mod keychain_import;
 pub mod license;
 pub mod messages;
 pub mod migrate;
+pub mod oauth_signin;
 pub mod paths;
 pub mod provenance;
 pub mod quickstart;
