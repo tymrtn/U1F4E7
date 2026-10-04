@@ -27,6 +27,41 @@ pub struct AccountWithCredentials {
     pub password: String,
     pub smtp_password: Option<String>,
     pub imap_password: Option<String>,
+    /// Set when the account signs in with OAuth (Gmail XOAUTH2). `password`
+    /// is then empty and must never be offered to a server.
+    pub oauth: Option<OAuthGrant>,
+}
+
+/// A decrypted OAuth sign-in. Clones share `cache`, so one refresh serves
+/// every connection the process opens for the account.
+#[derive(Clone)]
+pub struct OAuthGrant {
+    pub provider: String,
+    pub transport: String,
+    pub client_id: String,
+    pub authority: String,
+    pub scopes: String,
+    pub refresh_token: String,
+    pub cache: std::sync::Arc<std::sync::Mutex<CachedToken>>,
+}
+
+#[derive(Clone, Default)]
+pub struct CachedToken {
+    pub access_token: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl std::fmt::Debug for OAuthGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthGrant")
+            .field("provider", &self.provider)
+            .field("transport", &self.transport)
+            .field("client_id", &self.client_id)
+            .field("authority", &self.authority)
+            .field("scopes", &self.scopes)
+            .field("refresh_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AccountWithCredentials {

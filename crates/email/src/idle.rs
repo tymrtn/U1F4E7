@@ -22,7 +22,6 @@ pub async fn connect_session(account: &AccountWithCredentials) -> Result<ImapSes
     let host = &account.account.imap_host;
     let port = account.account.imap_port;
     let username = account.effective_imap_username();
-    let password = account.effective_imap_password();
 
     info!("idle: connecting to IMAP {host}:{port} as {username}");
 
@@ -51,10 +50,7 @@ pub async fn connect_session(account: &AccountWithCredentials) -> Result<ImapSes
     // Drain the untagged greeting before LOGIN — same race fix as `imap::connect`.
     crate::imap::read_imap_greeting(&mut client, host).await?;
 
-    let session = client
-        .login(username, password)
-        .await
-        .map_err(|(e, _)| ImapError::Auth(format!("login failed for {username}@{host}: {e}")))?;
+    let session = crate::imap::authenticate_client(client, account, host).await?;
 
     debug!("idle: IMAP session established for {username}@{host}");
     Ok(session)

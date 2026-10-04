@@ -16,6 +16,23 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
     match cmd {
         AccountsCmd::Add {
             email,
+            name,
+            insecure_machine_key,
+            provider: Some(_),
+            paste,
+            contacts,
+            ..
+        } => add_google(
+            &email,
+            name,
+            paste,
+            contacts,
+            insecure_machine_key,
+            json,
+            backend,
+        ),
+        AccountsCmd::Add {
+            email,
             password_stdin,
             name,
             smtp_host,
@@ -24,6 +41,8 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             imap_port,
             insecure_machine_key,
             skip_login_check,
+            provider: None,
+            ..
         } => add(
             &email,
             password_stdin,
@@ -37,6 +56,12 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             json,
             backend,
         ),
+        AccountsCmd::Reauth {
+            account,
+            provider,
+            paste,
+            contacts,
+        } => reauth(&account, provider, paste, contacts, json, backend),
         AccountsCmd::Rekey => rekey(json, backend),
         AccountsCmd::List => list(json),
         AccountsCmd::SetupInstructions {
@@ -49,7 +74,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
         AccountsCmd::CopyPassword { account, kind, ttl } => {
             copy_password(&account, &kind, ttl, json, backend)
         }
-        AccountsCmd::Remove { id } => remove(&id, json),
+        AccountsCmd::Remove { id } => remove(&id, json, backend),
         AccountsCmd::ImportKeychain {
             email,
             name,
@@ -410,6 +435,13 @@ fn handoff_password_to_clipboard(
     let creds = db
         .get_account_with_credentials(&account.id, &passphrase)
         .context("failed to decrypt account credentials")?;
+    if creds.oauth.is_some() {
+        bail!(
+            "{} signs in with {} and has no password to copy",
+            account.username,
+            provider_label(creds.oauth.as_ref().map(|g| g.provider.as_str()))
+        );
+    }
 
     // Distinct IMAP/SMTP passwords mean "multiple credentials exist", so an
     // explicit kind is required rather than guessing which one to copy.
@@ -632,7 +664,7 @@ fn setup_instructions(
     Ok(())
 }
 
-fn remove(id_or_email: &str, json: bool) -> Result<()> {
+fn remove(id_or_email: &str, json: bool, backend: CredentialBackend) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
 
     // Try as UUID first, then as email
@@ -646,9 +678,30 @@ fn remove(id_or_email: &str, json: bool) -> Result<()> {
         None => bail!("account not found: {id_or_email}"),
     };
 
+    let grant = if db.has_oauth_grant(&account.id).context("database error")? {
+        credential_store::get_passphrase(backend)
+            .ok()
+            .and_then(|passphrase| {
+                db.get_account_with_credentials(&account.id, &passphrase)
+                    .ok()
+            })
+            .and_then(|creds| creds.oauth)
+    } else {
+        None
+    };
+
     let deleted = db
         .delete_account(&account.id)
         .context("failed to delete account")?;
+    if let Some(grant) = grant {
+        match revoke_grant(grant) {
+            Ok(true) => eprintln!("Revoked Envelope's access at the provider."),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "Couldn't revoke Envelope's access at the provider ({e}). Remove it by hand: https://myaccount.google.com/permissions"
+            ),
+        }
+    }
 
     if !deleted {
         bail!("account not found: {}", account.id);
@@ -668,6 +721,212 @@ fn remove(id_or_email: &str, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn provider_label(provider: Option<&str>) -> &'static str {
+    match provider {
+        Some("google") => "Google",
+        Some("microsoft") => "Microsoft",
+        _ => "OAuth",
+    }
+}
+
+/// An in-memory account that signs in with a just-issued Google token, so
+/// IMAP can be checked before anything is saved.
+fn google_probe(
+    email: &str,
+    imap_host: &str,
+    imap_port: u16,
+    signed: &crate::commands::oauth_signin::GoogleSignIn,
+) -> envelope_email_store::AccountWithCredentials {
+    let mut probe = crate::commands::keychain_import::account_with_credentials(
+        email,
+        imap_host,
+        imap_port,
+        crate::commands::oauth_signin::GMAIL_SMTP_HOST,
+        crate::commands::oauth_signin::GMAIL_SMTP_PORT,
+        "",
+        "",
+    );
+    probe.oauth = Some(envelope_email_store::OAuthGrant {
+        provider: "google".into(),
+        transport: envelope_email_store::oauth_grants::TRANSPORT_IMAP_XOAUTH2.into(),
+        client_id: signed.client_id.clone(),
+        authority: envelope_email_transport::oauth::GOOGLE_AUTHORITY.into(),
+        scopes: signed.tokens.scope.clone(),
+        refresh_token: signed.refresh_token.clone(),
+        cache: std::sync::Arc::new(std::sync::Mutex::new(envelope_email_store::CachedToken {
+            access_token: Some(signed.tokens.access_token.clone()),
+            expires_at: Some(signed.tokens.expires_at),
+        })),
+    });
+    probe
+}
+
+async fn check_google_imap(
+    probe: &envelope_email_store::AccountWithCredentials,
+    imap_host: &str,
+) -> Result<()> {
+    eprintln!("Checking IMAP sign-in at {imap_host}...");
+    match tokio::time::timeout(
+        LOGIN_CHECK_TIMEOUT,
+        envelope_email_transport::imap::connect(probe),
+    )
+    .await
+    {
+        Ok(Ok(_client)) => {
+            eprintln!("IMAP sign-in ok.");
+            Ok(())
+        }
+        Ok(Err(e)) => bail!(
+            "IMAP rejected the Google sign-in for {}: {e}. Nothing was saved.",
+            probe.account.username
+        ),
+        Err(_) => bail!(
+            "IMAP sign-in check timed out after {}s at {imap_host}. Nothing was saved.",
+            LOGIN_CHECK_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+#[tokio::main]
+async fn add_google(
+    email: &str,
+    name: Option<String>,
+    paste: bool,
+    contacts: bool,
+    insecure_machine_key: bool,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    use crate::commands::oauth_signin::{
+        GMAIL_IMAP_HOST, GMAIL_IMAP_PORT, GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, google_sign_in,
+    };
+    let db = Database::open_default().context("failed to open database")?;
+    if db
+        .find_account_by_email(email)
+        .context("database error")?
+        .is_some()
+    {
+        bail!(
+            "{email} is already added. To switch it to Google sign-in, run `envelope accounts reauth {email} --provider google`."
+        );
+    }
+    let signed = google_sign_in(email, paste, contacts).await?;
+    check_google_imap(
+        &google_probe(email, GMAIL_IMAP_HOST, GMAIL_IMAP_PORT, &signed),
+        GMAIL_IMAP_HOST,
+    )
+    .await?;
+
+    let passphrase = if insecure_machine_key {
+        credential_store::get_or_create_passphrase_insecure_machine(backend)
+            .context("failed to access credential store for encryption")?
+    } else {
+        credential_store::get_or_create_passphrase_with(backend, &StdinPrompter)
+            .context("failed to access credential store for encryption")?
+    };
+    let account = db
+        .create_oauth_account(
+            &name.unwrap_or_else(|| email.to_string()),
+            email,
+            GMAIL_SMTP_HOST,
+            GMAIL_SMTP_PORT,
+            GMAIL_IMAP_HOST,
+            GMAIL_IMAP_PORT,
+            &signed.grant(),
+            &passphrase,
+        )
+        .context("failed to create account")?;
+
+    if json {
+        let value = ui::with_ui(&account, ui::account_ui(&account.id));
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "Account added: {} ({}), signs in with Google",
+            account.username, account.id
+        );
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn reauth(
+    account_arg: &str,
+    provider: Option<String>,
+    paste: bool,
+    contacts: bool,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    use envelope_email_transport::carddav::GOOGLE_CARDDAV_SCOPE;
+    let db = Database::open_default().context("failed to open database")?;
+    let account = resolve_account(&db, account_arg)?;
+    let passphrase = credential_store::get_passphrase(backend)
+        .context("failed to read credential store passphrase")?;
+    let current = match db.get_account_with_credentials(&account.id, &passphrase) {
+        Ok(creds) => creds.oauth,
+        Err(StoreError::OAuthReauthRequired(_)) => None,
+        Err(e) => return Err(e).context("failed to decrypt account credentials"),
+    };
+    // Signing in again must not quietly drop contacts access granted before.
+    let contacts = contacts
+        || current.as_ref().is_some_and(|g| {
+            g.scopes
+                .split_whitespace()
+                .any(|s| s == GOOGLE_CARDDAV_SCOPE)
+        });
+    let provider = provider.or(current.map(|g| g.provider)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} signs in with a password. To switch it to Google sign-in, run `envelope accounts reauth {} --provider google`.",
+            account.username,
+            account.username
+        )
+    })?;
+    if provider != "google" {
+        bail!(
+            "{} sign-in isn't supported yet",
+            provider_label(Some(&provider))
+        );
+    }
+
+    let signed =
+        crate::commands::oauth_signin::google_sign_in(&account.username, paste, contacts).await?;
+    check_google_imap(
+        &google_probe(
+            &account.username,
+            &account.imap_host,
+            account.imap_port,
+            &signed,
+        ),
+        &account.imap_host,
+    )
+    .await?;
+    db.set_oauth_grant(&account.id, &signed.grant(), &passphrase)
+        .context("failed to save the sign-in")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "reauthed": account.id, "email": account.username, "provider": provider })
+        );
+    } else {
+        println!("Signed in again: {} (Google)", account.username);
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn revoke_grant(
+    grant: envelope_email_store::OAuthGrant,
+) -> std::result::Result<bool, envelope_email_transport::oauth::OAuthError> {
+    let client = envelope_email_transport::oauth_session::client_for_grant(&grant)?;
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| envelope_email_transport::oauth::OAuthError::Http(e.to_string()))?;
+    client.revoke(&http, &grant.refresh_token).await
 }
 
 /// Read a single passphrase line from stdin with a stderr prompt.

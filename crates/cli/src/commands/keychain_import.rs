@@ -515,6 +515,7 @@ pub(crate) fn account_with_credentials(
         password: imap_password.to_string(),
         smtp_password: Some(smtp_password.to_string()),
         imap_password: None,
+        oauth: None,
     }
 }
 

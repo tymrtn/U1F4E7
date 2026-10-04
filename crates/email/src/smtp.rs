@@ -468,6 +468,7 @@ mod tests {
             password: "unused".to_string(),
             smtp_password: None,
             imap_password: None,
+            oauth: None,
         }
     }
 

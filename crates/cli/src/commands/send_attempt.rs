@@ -1003,6 +1003,7 @@ mod tests {
             password: "pw".into(),
             smtp_password: None,
             imap_password: None,
+            oauth: None,
         };
         Fixture {
             _dir: dir,
