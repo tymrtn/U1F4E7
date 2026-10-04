@@ -4,15 +4,6 @@
 //! Domain helpers shared by the analyzers: registrable domain, punycode, and
 //! look-alike comparison.
 
-/// Two-label public suffixes common enough to matter for mail. Not the full
-/// Public Suffix List; an unknown multi-label suffix degrades to "last two
-/// labels", which only ever makes look-alike checks stricter.
-const TWO_LABEL_SUFFIXES: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "ltd.uk", "plc.uk", "com.au", "net.au", "org.au",
-    "co.nz", "co.jp", "ne.jp", "co.za", "com.br", "com.mx", "com.ar", "com.tr", "com.cn", "com.hk",
-    "com.sg", "co.in", "co.kr", "com.es",
-];
-
 /// Lowercased domain part of an address.
 pub fn domain_of(addr: &str) -> Option<String> {
     let (_, domain) = addr.trim().rsplit_once('@')?;
@@ -24,20 +15,20 @@ pub fn domain_of(addr: &str) -> Option<String> {
     (!domain.is_empty()).then_some(domain)
 }
 
-/// eTLD+1 of `host` (see [`TWO_LABEL_SUFFIXES`]).
+/// eTLD+1 of `host` by the Public Suffix List, private domains included, so
+/// `victim.github.io` and `attacker.github.io` are different sites. A host
+/// that is itself a public suffix is returned whole. ASCII (IDNA) form.
 pub fn registrable(host: &str) -> String {
+    let host = ascii_host(host);
+    psl::domain_str(&host).map_or(host.clone(), str::to_string)
+}
+
+/// `host` lowercased, without a trailing dot, in its ASCII (IDNA) form, so
+/// `bänk.example` and `xn--bnk-qla.example` compare equal. Returned as
+/// written when it is not a valid domain name.
+pub fn ascii_host(host: &str) -> String {
     let host = host.trim().trim_end_matches('.').to_lowercase();
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() <= 2 {
-        return labels.join(".");
-    }
-    let last_two = labels[labels.len() - 2..].join(".");
-    let keep = if TWO_LABEL_SUFFIXES.contains(&last_two.as_str()) {
-        3
-    } else {
-        2
-    };
-    labels[labels.len().saturating_sub(keep)..].join(".")
+    idna::domain_to_ascii(&host).unwrap_or(host)
 }
 
 pub fn has_punycode(host: &str) -> bool {
@@ -137,6 +128,25 @@ mod tests {
 
     fn known(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn registrable_follows_the_public_suffix_list() {
+        assert_eq!(registrable("victim.github.io"), "victim.github.io");
+        assert_eq!(registrable("a.b.victim.github.io"), "victim.github.io");
+        assert_eq!(registrable("mail.bank.com.pl"), "bank.com.pl");
+        assert_eq!(registrable("www.bank.co.il"), "bank.co.il");
+        assert_eq!(registrable("bank.me.uk"), "bank.me.uk");
+        assert_eq!(registrable("x.bank.eu.org"), "bank.eu.org");
+        // A bare suffix or single label is its own registrable domain.
+        assert_eq!(registrable("co.uk"), "co.uk");
+        assert_eq!(registrable("localhost"), "localhost");
+        // IDNA: both spellings of a domain give its ASCII form.
+        assert_eq!(registrable("mail.b\u{e4}nk.example"), "xn--bnk-qla.example");
+        assert_eq!(
+            registrable("mail.xn--bnk-qla.example"),
+            "xn--bnk-qla.example"
+        );
     }
 
     #[test]

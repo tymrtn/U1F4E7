@@ -27,6 +27,7 @@ envelope-email-transport = { path = "../email" }
 envelope-email-dashboard = { path = "../dashboard" }
 
 mail-builder.workspace = true
+mail-parser.workspace = true
 clap.workspace = true
 tokio.workspace = true
 rustls.workspace = true

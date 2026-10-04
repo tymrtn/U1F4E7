@@ -141,6 +141,7 @@ pub async fn run_confirm(event_id: &str, json: bool, backend: CredentialBackend)
         client: &mut client,
         db: &db,
         account_id: &account_id,
+        agent_run: false,
     };
     let report = rule_exec::confirm_offer(
         &mut mbox,

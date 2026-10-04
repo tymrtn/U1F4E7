@@ -26,6 +26,12 @@ pub const ENV_DASHBOARD_TOKEN: &str = "ENVELOPE_DASHBOARD_TOKEN";
 pub const DASHBOARD_TAILSCALE_ALLOW_KEY: &str = "dashboard.tailscale_allow";
 pub const ENV_DASHBOARD_TAILSCALE_ALLOW: &str = "ENVELOPE_DASHBOARD_TAILSCALE_ALLOW";
 
+/// Accounts whose one-time codes may come from senders their mail provider
+/// did not authenticate. Operator-only: `envelope config set` never runs with
+/// an agent token, and no MCP tool writes it.
+pub const OTP_ALLOW_UNVERIFIED_KEY: &str = "otp.allow_unverified_senders";
+const OTP_ALLOW_UNVERIFIED_POINTER: &str = "/otp/allow_unverified_senders";
+
 const CONFIG_FILE_NAME: &str = "config.json";
 
 fn cmd_key(cmd: &ConfigCmd) -> &str {
@@ -43,6 +49,9 @@ pub fn run(cmd: ConfigCmd, json_output: bool) -> Result<()> {
     }
     if threat_config::is_threat_key(&key) {
         return run_threat_field(cmd, &key, json_output);
+    }
+    if key == OTP_ALLOW_UNVERIFIED_KEY {
+        return run_otp_unverified_field(cmd, json_output);
     }
     match cmd {
         ConfigCmd::Get { key } => {
@@ -169,9 +178,101 @@ fn require_supported_key(key: &str) -> Result<()> {
              {DASHBOARD_AUTH_TOKEN_KEY}, {DASHBOARD_TAILSCALE_ALLOW_KEY}, threat.enabled, \
              threat.quarantine, threat.on_read, threat.report_to, threat.analyzers.<name>, \
              threat.reputation.provider, threat.reputation.dqs_key, threat.clamd.address, \
-             threat.clamd.required, sync.poll_interval_secs"
+             threat.clamd.required, threat.receiver_domain, sync.poll_interval_secs, \
+             {OTP_ALLOW_UNVERIFIED_KEY}"
         ),
     }
+}
+
+/// get/set/unset for `otp.allow_unverified_senders`: a comma-separated list
+/// of account addresses or ids, stored as the accounts' addresses.
+fn run_otp_unverified_field(cmd: ConfigCmd, json_output: bool) -> Result<()> {
+    let key = OTP_ALLOW_UNVERIFIED_KEY;
+    let path = config_file_path();
+    let mut config = read_config_value(&path)?;
+    let written = match cmd {
+        ConfigCmd::Get { .. } => {
+            let accounts = otp_unverified_accounts(&config)?;
+            if json_output {
+                let obj = json!({
+                    "key": key,
+                    "value": accounts,
+                    "configured": !accounts.is_empty(),
+                    "config_path": display_config_path(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else if accounts.is_empty() {
+                println!("{key} is not set");
+            } else {
+                println!("{key}={}", accounts.join(","));
+            }
+            return Ok(());
+        }
+        ConfigCmd::Set { value, .. } => {
+            let db = envelope_email_store::Database::open_default()
+                .context("open the database to check the accounts")?;
+            let mut accounts = Vec::new();
+            for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                let account = super::common::resolve_account(&db, Some(entry))?;
+                let address = account.username.to_lowercase();
+                if !accounts.contains(&address) {
+                    accounts.push(address);
+                }
+            }
+            if accounts.is_empty() {
+                bail!(
+                    "{key} needs one or more account addresses; use `envelope config unset {key}`"
+                );
+            }
+            set_nested(&mut config, key, json!(accounts))?;
+            write_config_value(&path, &config)?;
+            json!(accounts)
+        }
+        ConfigCmd::Unset { .. } => {
+            unset_nested(&mut config, key)?;
+            write_config_value(&path, &config)?;
+            Value::Null
+        }
+    };
+    if json_output {
+        let obj = json!({
+            "status": if written.is_null() { "unset" } else { "set" },
+            "key": key,
+            "value": written,
+            "config_path": display_config_path(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else if written.is_null() {
+        println!("Unset {key}");
+    } else {
+        println!("Set {key}={}", display_value(&written));
+    }
+    Ok(())
+}
+
+fn otp_unverified_accounts(config: &Value) -> Result<Vec<String>> {
+    match config.pointer(OTP_ALLOW_UNVERIFIED_POINTER) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_lowercase).ok_or_else(|| {
+                    anyhow::anyhow!("{OTP_ALLOW_UNVERIFIED_KEY} must list account addresses")
+                })
+            })
+            .collect(),
+        Some(_) => bail!("{OTP_ALLOW_UNVERIFIED_KEY} must list account addresses"),
+    }
+}
+
+/// True when the operator lets `account` accept one-time codes from senders
+/// its provider did not authenticate.
+pub fn otp_unverified_senders_allowed(account: &envelope_email_store::Account) -> Result<bool> {
+    let config = read_config_value(&config_file_path())?;
+    let username = account.username.to_lowercase();
+    Ok(otp_unverified_accounts(&config)?
+        .iter()
+        .any(|entry| *entry == username || *entry == account.id))
 }
 
 /// True for keys whose stored value is a secret and must never be printed.
@@ -275,6 +376,7 @@ fn effective_threat_value(key: &str, config: &ThreatConfig) -> Value {
             .map(|a| json!(a.display()))
             .unwrap_or(json!("off")),
         "threat.clamd.required" => json!(config.clamd_required),
+        "threat.receiver_domain" => json!(config.receiver_domains),
         _ => key
             .strip_prefix("threat.analyzers.")
             .map(|name| json!(config.analyzer_enabled(name)))
@@ -739,6 +841,50 @@ mod tests {
         unset_nested(&mut config, "threat.analyzers.links").unwrap();
         unset_nested(&mut config, "sync.poll_interval_secs").unwrap();
         assert_eq!(config, json!({"dashboard": {"base_url": "https://x"}}));
+    }
+
+    #[test]
+    fn otp_opt_in_matches_listed_accounts_only() {
+        let path = test_config_path("otp-opt-in");
+        let _ = fs::remove_file(&path);
+        let _guard = isolated_dashboard_config(path.clone());
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let listed = db
+            .create_account(
+                "Listed",
+                "Listed@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let other = db
+            .create_account(
+                "Other",
+                "other@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        assert!(!otp_unverified_senders_allowed(&listed).unwrap());
+
+        write_config_value(
+            &path,
+            &json!({"otp": {"allow_unverified_senders": ["listed@example.test"]}}),
+        )
+        .unwrap();
+        assert!(otp_unverified_senders_allowed(&listed).unwrap());
+        assert!(!otp_unverified_senders_allowed(&other).unwrap());
+
+        write_config_value(&path, &json!({"otp": {"allow_unverified_senders": true}})).unwrap();
+        assert!(otp_unverified_senders_allowed(&listed).is_err());
     }
 
     #[test]

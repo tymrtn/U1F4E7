@@ -850,13 +850,12 @@ pub(crate) async fn create_reply_draft(
 /// sensitive/large files. The output uses the same draft attachment JSON shape as
 /// CLI `--attach`: metadata plus a base64 payload for later draft send.
 async fn snapshot_source_attachments(
+    db: &Database,
     creds: &AccountWithCredentials,
     uid: u32,
     folder: &str,
     source_attachments: &[AttachmentMeta],
 ) -> Result<Vec<serde_json::Value>> {
-    use base64::Engine as _;
-
     if source_attachments.is_empty() {
         return Ok(Vec::new());
     }
@@ -864,20 +863,61 @@ async fn snapshot_source_attachments(
     let mut client = imap::connect(creds)
         .await
         .context("failed to connect to IMAP for source attachments")?;
-    let mut snapshots = Vec::with_capacity(source_attachments.len());
+    let mut downloads = Vec::with_capacity(source_attachments.len());
     for meta in source_attachments {
         let downloaded = imap::download_attachment(&mut client, uid, &meta.filename, folder)
             .await
             .with_context(|| format!("failed to download source attachment: {}", meta.filename))?;
-        let data = downloaded.bytes;
-        snapshots.push(serde_json::json!({
-            "filename": downloaded.filename,
-            "content_type": meta.content_type,
-            "size": data.len(),
-            "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
-        }));
+        downloads.push((downloaded, meta.content_type.clone()));
     }
-    Ok(snapshots)
+    forwarded_attachment_snapshots(db, &creds.account.id, uid, downloads)
+}
+
+/// Draft snapshots of a forwarded message's attachments, each paired with the
+/// content type the message lists for it. Every attachment first passes the
+/// `attachment download` gate under the message's own identity, so a draft
+/// never holds bytes a download would refuse; one refused stops the forward
+/// before anything is stored.
+fn forwarded_attachment_snapshots(
+    db: &Database,
+    account_id: &str,
+    uid: u32,
+    downloads: Vec<(imap::DownloadedAttachment, String)>,
+) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+    for (downloaded, _) in &downloads {
+        let block = envelope_email_transport::threat::persist::attachment_block(
+            db,
+            account_id,
+            downloaded.message_id.as_deref(),
+            downloaded.content_fingerprint.as_deref(),
+            &downloaded.filename,
+            &downloaded.content_type,
+            &downloaded.bytes,
+        )
+        .context("threat check for a forwarded attachment failed")?;
+        if let Some(block) = block {
+            bail!(
+                "{}: {} ({:?} in UID {uid}). The forward was not created; forward without \
+                 its attachments, or `envelope threat mark-safe` if the message is legitimate.",
+                block.code,
+                block.reason,
+                downloaded.filename
+            );
+        }
+    }
+    Ok(downloads
+        .into_iter()
+        .map(|(downloaded, content_type)| {
+            let data = downloaded.bytes;
+            serde_json::json!({
+                "filename": downloaded.filename,
+                "content_type": content_type,
+                "size": data.len(),
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+            })
+        })
+        .collect())
 }
 
 /// Build a contextual forward draft. Shared by the CLI and MCP surfaces.
@@ -906,7 +946,7 @@ pub(crate) async fn create_forward_draft(
             .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?
     };
     let mut attachment_snapshots = if include_attachments {
-        snapshot_source_attachments(creds, uid, folder, &parent.attachments).await?
+        snapshot_source_attachments(db, creds, uid, folder, &parent.attachments).await?
     } else {
         Vec::new()
     };
@@ -2101,6 +2141,91 @@ pub async fn run_send(
     use envelope_email_transport::outbound::{
         IMMEDIATE_SEND_CONFIRM_CODE, SendDisposition, resolve_cooldown_seconds, resolve_disposition,
     };
+    use envelope_email_transport::{SendMode, SendPolicyDecision, SendPolicyInput, evaluate};
+
+    // ── Agent policy (with ENVELOPE_AGENT_TOKEN) ──
+    // The same evaluation MCP send_draft runs: the agent's send grant, its
+    // ceiling, its recipient allowlist, and a human approval of this revision.
+    // Without a token this is the operator and nothing here applies.
+    let (agent, admitted_revision) = {
+        let db = Database::open_default().context("failed to open database")?;
+        let agent = super::agent_context::cli_agent(&db, json)?;
+        let admitted_revision = match &agent {
+            None => None,
+            Some(ctx) => {
+                let draft = db
+                    .get_draft(id)
+                    .context("failed to load draft")?
+                    .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
+                super::agent_context::authorize_cli_action(
+                    &db,
+                    Some(ctx),
+                    "send",
+                    &draft.account_id,
+                    json,
+                )?;
+                let send_mode = ctx.clamp_send_mode(SendMode::AutonomousSend);
+                let authority =
+                    super::agent_context::agent_policy_input(Some(ctx), false, &[], Some(&draft));
+                let policy_input = SendPolicyInput {
+                    to: &draft.to_addr,
+                    cc: draft.cc_addr.as_deref(),
+                    bcc: draft.bcc_addr.as_deref(),
+                    confirm_send: authority.confirm_send,
+                    allow_recipients: authority.allow_recipients,
+                };
+                let decision = evaluate(send_mode, &policy_input);
+                super::send::record_send_policy_event(
+                    &db,
+                    &draft.account_id,
+                    send_mode,
+                    &decision,
+                    &policy_input,
+                    Some(&ctx.agent_id),
+                )?;
+                match decision {
+                    SendPolicyDecision::Allowed => Some(draft.revision),
+                    SendPolicyDecision::DraftOnly => {
+                        if json {
+                            println!(
+                                "{}",
+                                crate::commands::contract::send_body::mcp_drafted(
+                                    serde_json::json!(send_mode),
+                                    &draft.id,
+                                    ui::draft_ui(&draft.account_id, &draft.id),
+                                )
+                            );
+                        } else {
+                            println!(
+                                "Not sent: this agent may only draft ({send_mode}). Draft ID: {}",
+                                draft.id
+                            );
+                        }
+                        return Ok(());
+                    }
+                    SendPolicyDecision::Denied(denial) => {
+                        if json {
+                            let mut refusal = serde_json::json!({
+                                "status": "denied",
+                                "error": denial,
+                                "send_mode": send_mode,
+                                "draft_id": draft.id,
+                                "ui": ui::draft_ui(&draft.account_id, &draft.id),
+                            });
+                            if send_mode == SendMode::ConfirmSend {
+                                refusal["confirmation"] =
+                                    super::agent_context::human_approval_hint();
+                            }
+                            println!("{refusal}");
+                        }
+                        bail!("send denied by policy: {} ({})", denial.reason, denial.code);
+                    }
+                }
+            }
+        };
+        (agent, admitted_revision)
+    };
+    let agent_id = super::agent_context::agent_id_of(agent.as_ref());
 
     // ── Attribution precheck (before ANY side effect, incl. queueing) ──
     //
@@ -2111,7 +2236,7 @@ pub async fn run_send(
     let declared: Vec<String> = attr.to_vec();
     let precheck = {
         let db = Database::open_default().context("failed to open database")?;
-        let precheck = precheck_draft(&db, id, SendSurface::Cli, &declared, None)?;
+        let precheck = precheck_draft(&db, id, SendSurface::Cli, &declared, agent_id)?;
         if let Some(outcome) = &precheck.refusal {
             if json {
                 println!(
@@ -2127,6 +2252,16 @@ pub async fn run_send(
         }
         precheck
     };
+    if admitted_revision.is_some_and(|revision| revision != precheck.revision) {
+        let refusal = draft_changed_since_admitted(id);
+        if json {
+            println!("{refusal}");
+        }
+        bail!(
+            "{}",
+            refusal["error"]["reason"].as_str().unwrap_or_default()
+        );
+    }
 
     // ── Default actual-send cooldown (outbox queueing) ──
     // `draft send` queues by default: it sets send_after on the draft so the
@@ -2172,7 +2307,7 @@ pub async fn run_send(
                 &declared,
                 &envelope_email_store::QueueContext {
                     surface: "cli_draft_send",
-                    agent_id: None,
+                    agent_id,
                     cooldown_seconds: Some(cd),
                 },
             )?;
@@ -2208,8 +2343,9 @@ pub async fn run_send(
         SendDisposition::Immediate => {}
     }
 
-    // Catalog event: the operator approved this draft for immediate send. This
-    // is the human-confirmed transition (--send-now --confirm-send-now).
+    // Catalog event: the caller approved this draft for immediate send
+    // (--send-now --confirm-send-now), attributed to the agent when a token
+    // is set.
     {
         let db = Database::open_default().context("failed to open database")?;
         if let Some(draft) = db.get_draft(id).context("failed to load draft")? {
@@ -2217,35 +2353,44 @@ pub async fn run_send(
                 &draft.account_id,
                 envelope_email_store::event_catalog::DRAFT_APPROVED,
                 Some(serde_json::json!({ "draft_id": id })),
-                None,
+                agent_id,
             )
             .context("audit_unavailable: could not record the send approval; nothing was sent")?;
         }
     }
 
-    let outcome =
-        match send_existing_draft(id, account, backend, SendSurface::Cli, &declared, None).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // An unknown outcome is a result (exit 0): the caller reads
-                // `status` and must not treat the draft as sent.
-                if let Some(body) = super::send_attempt::uncertain_outcome(&e) {
-                    if json {
-                        println!("{body}");
-                    } else {
-                        super::send_attempt::print_uncertain(body);
-                    }
-                    return Ok(());
+    let outcome = match send_existing_draft(
+        id,
+        account,
+        backend,
+        SendSurface::Cli,
+        &declared,
+        agent_id,
+        admitted_revision,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // An unknown outcome is a result (exit 0): the caller reads
+            // `status` and must not treat the draft as sent.
+            if let Some(body) = super::send_attempt::uncertain_outcome(&e) {
+                if json {
+                    println!("{body}");
+                } else {
+                    super::send_attempt::print_uncertain(body);
                 }
-                if json
-                    && let Some(not_confirmed) =
-                        e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
-                {
-                    println!("{}", not_confirmed.body);
-                }
-                return Err(e);
+                return Ok(());
             }
-        };
+            if json
+                && let Some(not_confirmed) =
+                    e.downcast_ref::<super::send_attempt::SendNotConfirmed>()
+            {
+                println!("{}", not_confirmed.body);
+            }
+            return Err(e);
+        }
+    };
     if json {
         println!("{}", outcome.json);
     } else {
@@ -2497,12 +2642,29 @@ pub(crate) fn queue_bot_draft_for_send(
     .context("failed to atomically queue draft (declaration + schedule + due status)")
 }
 
+/// The refusal for a draft that changed after an agent's send policy admitted
+/// it: the decision covered the earlier revision only.
+pub(crate) fn draft_changed_since_admitted(draft_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "denied",
+        "draft_id": draft_id,
+        "retryable": true,
+        "error": {
+            "code": "draft_changed",
+            "reason": "the draft changed after the send policy admitted it; check it and send again",
+        },
+    })
+}
+
 /// Send an already-created draft (by local UUID or IMAP UID) without printing
 /// anything. The draft id is the operation key: the row is claimed for one
 /// attempt, transmitted through the shared attempt core, and left `sent`,
 /// released (nothing sent), or `delivery_uncertain`. Rerunning it on a `sent`
 /// draft answers from the record; on a `sending` row whose owner has exited,
 /// recovery resolves the row first.
+///
+/// `admitted_revision` is the revision an agent's send policy admitted; any
+/// other revision is refused before the claim.
 pub(crate) async fn send_existing_draft(
     id: &str,
     account: Option<&str>,
@@ -2510,6 +2672,7 @@ pub(crate) async fn send_existing_draft(
     surface: SendSurface,
     declared: &[String],
     agent_id: Option<&str>,
+    admitted_revision: Option<i64>,
 ) -> Result<SentDraftOutcome> {
     use super::send_attempt::{
         AttemptSurface, SendNotConfirmed, claim_row, state_report, transmit_claimed,
@@ -2583,6 +2746,12 @@ pub(crate) async fn send_existing_draft(
 
     // ── Bind credentials to the draft's account (before any network work) ──
     ensure_draft_account_binding(&draft.id, &draft.account_id, &acct.id, &acct.username)?;
+    if admitted_revision.is_some_and(|revision| revision != draft.revision) {
+        return Err(SendNotConfirmed {
+            body: draft_changed_since_admitted(&draft.id),
+        }
+        .into());
+    }
 
     // ── Exclusive durable send claim ──
     // An in-flight claim, a provider sync, a concurrent edit (stale revision),
@@ -2884,6 +3053,69 @@ pub async fn run_discard(
 mod tests {
     use super::*;
     use envelope_email_store::models::DraftStatus;
+
+    fn source_attachment(
+        filename: &str,
+        bytes: &[u8],
+        message_id: Option<&str>,
+    ) -> (imap::DownloadedAttachment, String) {
+        (
+            imap::DownloadedAttachment {
+                filename: filename.to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: bytes.to_vec(),
+                message_id: message_id.map(str::to_string),
+                content_fingerprint: None,
+            },
+            "application/octet-stream".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_forward_carries_no_attachment_the_download_gate_refuses() {
+        let db = Database::open_memory().unwrap();
+        let account_id = "acct-1";
+        db.add_tag(
+            account_id,
+            "flagged@example.test",
+            "threat:malware",
+            Some(9),
+            Some("INBOX"),
+        )
+        .unwrap();
+        for (downloads, refused) in [
+            (
+                vec![
+                    source_attachment("notes.txt", b"hi", None),
+                    source_attachment("invoice.pdf.exe", b"MZ\x90", None),
+                ],
+                "invoice.pdf.exe",
+            ),
+            (
+                vec![source_attachment(
+                    "notes.txt",
+                    b"hi",
+                    Some("flagged@example.test"),
+                )],
+                "notes.txt",
+            ),
+        ] {
+            let err = forwarded_attachment_snapshots(&db, account_id, 7, downloads)
+                .expect_err("a blocked attachment refuses the forward");
+            let err = format!("{err:#}");
+            assert!(err.contains("attachment_blocked"), "{err}");
+            assert!(err.contains(refused), "{err}");
+        }
+        let fine = forwarded_attachment_snapshots(
+            &db,
+            account_id,
+            7,
+            vec![source_attachment("notes.txt", b"hi", None)],
+        )
+        .unwrap();
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0]["filename"], "notes.txt");
+    }
 
     #[test]
     fn draft_dashboard_path_encodes_account_and_draft_segments() {

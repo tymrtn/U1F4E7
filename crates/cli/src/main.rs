@@ -3,6 +3,7 @@
 
 mod commands;
 mod mcp;
+mod token_mode;
 
 use clap::{ArgGroup, Parser, Subcommand};
 
@@ -484,14 +485,17 @@ enum Commands {
         attr: Vec<String>,
     },
 
-    /// Poll for a verification/OTP code from a recent email
+    /// Poll for a verification/OTP code from a recent email. A code counts only
+    /// when the mail provider authenticated the sender's From domain (DMARC or
+    /// aligned DKIM), unless an operator set otp.allow_unverified_senders for
+    /// the account.
     Code {
         /// Account ID or email. Required with --json so unattended retrieval is
         /// bound to the expected mailbox.
         #[arg(long)]
         account: Option<String>,
-        /// Exact sender address or full domain. With --json this is required;
-        /// fragments, display names, and wildcards are rejected.
+        /// Exact sender address or full domain (required). Fragments, display
+        /// names, and wildcards never match.
         #[arg(long)]
         from: Option<String>,
         /// Optional subject correlation filter (substring match)
@@ -1076,7 +1080,8 @@ enum AgentPolicyCmd {
         /// Allowed folders: '*' or comma-separated names
         #[arg(long)]
         allow_folders: Option<String>,
-        /// Allowed actions: '*' or comma-separated action names
+        /// Allowed actions: '*', comma-separated action names, or '*' plus
+        /// actions '*' does not include (e.g. '*,watch.webhook')
         #[arg(long)]
         allow_actions: Option<String>,
         /// Send-mode ceiling: draft-only|confirm-send|allowlisted-send|autonomous-send
@@ -1838,6 +1843,9 @@ pub enum EvidenceAttachmentCmd {
         /// Extract plain text from DOCX/text attachments alongside originals
         #[arg(long)]
         extract_text: bool,
+        /// Write the bytes even when the threat engine flags them as malware
+        #[arg(long = "unsafe")]
+        allow_unsafe: bool,
     },
 }
 
@@ -2135,7 +2143,12 @@ fn main() {
         .install_default()
         .ok();
 
-    let cli = Cli::parse();
+    // Parsed in two steps so token mode can read the raw arguments too.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| {
+        e.format(&mut <Cli as clap::CommandFactory>::command())
+            .exit()
+    });
 
     let backend: envelope_email_store::CredentialBackend = match cli.credential_store.parse() {
         Ok(b) => b,
@@ -2144,6 +2157,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // With ENVELOPE_AGENT_TOKEN set, the command must be one that agent may
+    // run, checked before anything else happens.
+    if let Err(e) = token_mode::enforce(&cli.command, &matches, cli.json) {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
 
     let result = match cli.command {
         Commands::Accounts { subcommand } => commands::accounts::run(subcommand, cli.json, backend),
@@ -3085,7 +3105,7 @@ mod tests {
         ));
 
         let contract = commands::contract::agent_contract();
-        assert_eq!(contract["schema"], "envelope.agent_contract.v3");
+        assert_eq!(contract["schema"], "envelope.agent_contract.v4");
         let surfaces = contract["surfaces"].as_array().expect("surfaces array");
         for required in [
             "inbox", "read", "search", "thread", "draft", "send", "watch", "otp", "rules",

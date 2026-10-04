@@ -8,6 +8,7 @@ use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::imap;
 use tracing::{info, warn};
 
+use super::agent_context;
 use super::common::{resolve_account, setup_credentials};
 use super::datetime::parse_until;
 
@@ -68,6 +69,19 @@ pub async fn run_snooze(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::refuse_held_cli(
+        &mut client,
+        &db,
+        ctx.as_ref(),
+        "snooze",
+        &creds.account.id,
+        folder,
+        uid,
+        json,
+    )
+    .await?;
 
     // Ensure the Snoozed folder exists
     if let Err(e) = imap::create_folder(&mut client, IMAP_SNOOZED_FOLDER).await {

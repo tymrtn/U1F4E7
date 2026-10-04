@@ -92,6 +92,7 @@ pub async fn run(
             filename_glob,
             out,
             extract_text,
+            allow_unsafe,
         }) => {
             run_attachment_export(
                 AttachmentExportArgs {
@@ -103,6 +104,7 @@ pub async fn run(
                     filename_glob,
                     out,
                     extract_text,
+                    allow_unsafe,
                 },
                 json_output,
                 backend,
@@ -121,6 +123,7 @@ struct AttachmentExportArgs {
     filename_glob: Option<String>,
     out: PathBuf,
     extract_text: bool,
+    allow_unsafe: bool,
 }
 
 async fn run_attachment_export(
@@ -130,10 +133,8 @@ async fn run_attachment_export(
 ) -> Result<()> {
     backup::validate_export_output_dir(&args.out)
         .map_err(|e| anyhow::anyhow!("{e} (at {})", args.out.display()))?;
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("create output dir {}", args.out.display()))?;
 
-    let (_db, src) = setup_credentials(Some(&args.account), backend)?;
+    let (db, src) = setup_credentials(Some(&args.account), backend)?;
     let account_email = format!("{}@{}", src.account.username, src.account.domain);
     let mut client = imap::connect(&src)
         .await
@@ -168,11 +169,89 @@ async fn run_attachment_export(
         .await
         .with_context(|| format!("fetch messages from {}", args.folder))?;
 
-    let exported_at = evidence_core::exported_at_now_utc();
-    let mut total_attachments = 0u32;
-    let mut messages_with_output = 0u32;
+    export_fetched_attachments(
+        &db,
+        &src.account.id,
+        &account_email,
+        uidvalidity,
+        &target_uids,
+        &raw_by_uid,
+        &args,
+        json_output,
+    )
+}
 
-    let mut sorted_uids = target_uids.clone();
+/// The attachments of one fetched message selected for export.
+struct PlannedExport {
+    uid: u32,
+    source: evidence_core::AttachmentSourceMessage,
+    attachments: Vec<evidence_core::ExtractedAttachment>,
+    /// The message's identity as `attachment download` reads it, for the
+    /// threat gate.
+    message_id: Option<String>,
+    fingerprint: Option<String>,
+}
+
+/// The `attachment download` gate over every selected attachment, run before
+/// any of them is written. A refused attachment is written only when the
+/// operator passed `--unsafe`.
+fn check_attachment_gate(
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    plans: &[PlannedExport],
+    allow_unsafe: bool,
+) -> Result<()> {
+    for plan in plans {
+        for att in &plan.attachments {
+            let content_type = ingress::normalize_content_type(
+                att.mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+            );
+            let block = envelope_email_transport::threat::persist::attachment_block(
+                db,
+                account_id,
+                plan.message_id.as_deref(),
+                plan.fingerprint.as_deref(),
+                &att.original_filename,
+                &content_type,
+                &att.bytes,
+            )
+            .context("threat check for the attachment failed")?;
+            let Some(block) = block else { continue };
+            if !allow_unsafe {
+                bail!(
+                    "{}: {} ({:?} in UID {}). Nothing was written. Pass --unsafe to save it \
+                     anyway, or `envelope threat mark-safe` if the message is legitimate.",
+                    block.code,
+                    block.reason,
+                    att.original_filename,
+                    plan.uid
+                );
+            }
+            eprintln!(
+                "warning: writing a blocked attachment because --unsafe was passed ({})",
+                block.reason
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Select, check and write the attachments of already-fetched messages.
+#[allow(clippy::too_many_arguments)]
+fn export_fetched_attachments(
+    db: &envelope_email_store::Database,
+    account_id: &str,
+    account_email: &str,
+    uidvalidity: u32,
+    target_uids: &[u32],
+    raw_by_uid: &HashMap<u32, imap::RawMessage>,
+    args: &AttachmentExportArgs,
+    json_output: bool,
+) -> Result<()> {
+    let mut plans = Vec::new();
+    let mut sorted_uids = target_uids.to_vec();
     sorted_uids.sort_unstable();
     for uid in sorted_uids {
         let Some(raw) = raw_by_uid.get(&uid) else {
@@ -187,7 +266,7 @@ async fn run_attachment_export(
         };
         let (source, attachments) = evidence_core::extract_message_attachments(
             &raw.rfc822,
-            &account_email,
+            account_email,
             &args.folder,
             uidvalidity,
             raw.uid,
@@ -195,7 +274,7 @@ async fn run_attachment_export(
 
         // Apply selection: exact --attachment name and/or --filename-glob.
         let selected: Vec<_> = attachments
-            .iter()
+            .into_iter()
             .filter(|att| {
                 if let Some(name) = args.attachment.as_deref()
                     && att.original_filename != name
@@ -231,9 +310,30 @@ async fn run_attachment_export(
                 args.folder
             );
         }
+        plans.push(PlannedExport {
+            uid,
+            source,
+            attachments: selected,
+            message_id: envelope_email_transport::threat::sole_message_id(&raw.rfc822),
+            fingerprint: envelope_email_transport::threat::content_fingerprint(&raw.rfc822),
+        });
+    }
 
+    check_attachment_gate(db, account_id, &plans, args.allow_unsafe)?;
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("create output dir {}", args.out.display()))?;
+    let exported_at = evidence_core::exported_at_now_utc();
+    let mut total_attachments = 0u32;
+    let mut messages_with_output = 0u32;
+    for PlannedExport {
+        uid,
+        source,
+        attachments,
+        ..
+    } in plans
+    {
         let mut written = Vec::new();
-        for att in selected {
+        for att in &attachments {
             let w = evidence_core::export_one_attachment(
                 &args.out,
                 &source,
@@ -253,7 +353,7 @@ async fn run_attachment_export(
                 json_output,
                 EvidenceEvent::AttachmentExported {
                     folder: args.folder.clone(),
-                    uid: raw.uid,
+                    uid,
                     original_filename: w.provenance.original_filename.clone(),
                     normalized_filename: w.provenance.normalized_filename.clone(),
                     sha256: w.provenance.sha256.clone(),
@@ -874,6 +974,122 @@ fn emit(json_output: bool, event: EvidenceEvent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// One fetched message, UID 7, carrying a single attachment.
+    fn fetched(message_id: &str, filename: &str, bytes: &[u8]) -> HashMap<u32, imap::RawMessage> {
+        fetched_with(
+            message_id,
+            &format!("filename=\"{filename}\""),
+            "application/pdf",
+            bytes,
+        )
+    }
+
+    /// As [`fetched`], with the Content-Disposition filename parameter as given.
+    fn fetched_with(
+        message_id: &str,
+        filename_param: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> HashMap<u32, imap::RawMessage> {
+        use base64::Engine;
+        let body = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let rfc822 = format!(
+            "From: a@sender.example\r\nTo: me@example.test\r\nSubject: s\r\n\
+             Message-ID: <{message_id}>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+             --b\r\nContent-Type: {content_type}\r\n\
+             Content-Disposition: attachment; {filename_param}\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n{body}\r\n--b--\r\n"
+        );
+        HashMap::from([(
+            7,
+            imap::RawMessage {
+                uid: 7,
+                message_id: None,
+                flags: Vec::new(),
+                internal_date: None,
+                size: rfc822.len() as u32,
+                rfc822: rfc822.into_bytes(),
+            },
+        )])
+    }
+
+    fn files_under(dir: &Path) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(std::fs::read(&path).unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn attachment_export_refuses_malware_before_writing() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().canonicalize().unwrap().join("out");
+        let export = |raw: &HashMap<u32, imap::RawMessage>, allow_unsafe: bool| {
+            let args = AttachmentExportArgs {
+                account: "acct".to_string(),
+                folder: "INBOX".to_string(),
+                uid: Some(7),
+                attachment: None,
+                query: None,
+                filename_glob: None,
+                out: out.clone(),
+                extract_text: false,
+                allow_unsafe,
+            };
+            export_fetched_attachments(&db, "acct", "me@example.test", 1, &[7], raw, &args, true)
+        };
+
+        let exe = fetched("a@x", "invoice.pdf.exe", b"MZ\x90");
+        let err = export(&exe, false).unwrap_err();
+        assert!(format!("{err:#}").contains("attachment_blocked"), "{err:#}");
+        assert!(!out.exists(), "no bytes may reach disk");
+
+        // A message tagged threat:malware blocks even a clean-looking file.
+        db.add_tag(
+            "acct",
+            "m@x",
+            envelope_email_transport::threat::TAG_MALWARE,
+            Some(7),
+            Some("INBOX"),
+        )
+        .unwrap();
+        let pdf = fetched("m@x", "r.pdf", b"%PDF-1.4");
+        let err = export(&pdf, false).unwrap_err();
+        assert!(format!("{err:#}").contains("attachment_blocked"), "{err:#}");
+        assert!(!out.exists(), "no bytes may reach disk");
+
+        // The gate checks the name the file is written under too.
+        for param in [
+            "filename*=utf-8''payload.js%01",
+            "filename*=utf-8''payload.js%00",
+        ] {
+            let js = fetched_with("b@x", param, "text/plain", b"alert(1)");
+            let err = export(&js, false).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("attachment_blocked"),
+                "{param}: {err:#}"
+            );
+            assert!(!out.exists(), "{param}: no bytes may reach disk");
+        }
+
+        // --unsafe is the only override.
+        export(&exe, true).unwrap();
+        assert!(
+            files_under(&out).iter().any(|f| f.as_slice() == b"MZ\x90"),
+            "--unsafe writes the bytes"
+        );
+    }
 
     fn manifest_for_account(
         username: &str,

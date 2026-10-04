@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use envelope_email_store::CredentialBackend;
 
+use super::agent_context;
 use super::common::setup_credentials;
 use super::ui;
 
@@ -16,11 +17,23 @@ pub async fn run_move(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    agent_context::refuse_held_cli(
+        &mut client,
+        &db,
+        ctx.as_ref(),
+        "move",
+        &creds.account.id,
+        folder,
+        uid,
+        json,
+    )
+    .await?;
 
     envelope_email_transport::imap::move_message(&mut client, uid, folder, to_folder).await?;
 
@@ -51,11 +64,23 @@ pub async fn run_copy(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    let (_db, creds) = setup_credentials(account, backend)?;
+    let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    agent_context::refuse_held_cli(
+        &mut client,
+        &db,
+        ctx.as_ref(),
+        "copy",
+        &creds.account.id,
+        folder,
+        uid,
+        json,
+    )
+    .await?;
 
     envelope_email_transport::imap::copy_message(&mut client, uid, folder, to_folder).await?;
 
@@ -127,6 +152,7 @@ pub async fn run_delete(
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -148,7 +174,21 @@ pub async fn run_delete(
         .unwrap_or(false)
         || looks_like_trash(folder);
 
-    match delete_plan(in_trash, permanent, confirm) {
+    let plan = delete_plan(in_trash, permanent, confirm);
+    if matches!(plan, DeletePlan::MoveToTrash | DeletePlan::Expunge) {
+        agent_context::refuse_held_cli(
+            &mut client,
+            &db,
+            ctx.as_ref(),
+            "delete",
+            &creds.account.id,
+            folder,
+            uid,
+            json,
+        )
+        .await?;
+    }
+    match plan {
         DeletePlan::MoveToTrash => {
             let Some(trash) = trash else {
                 anyhow::bail!(

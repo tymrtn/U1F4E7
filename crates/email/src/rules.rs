@@ -50,6 +50,27 @@ pub enum MatchExpr {
 }
 
 impl MatchExpr {
+    /// True when any condition selects by the threat verdict: a `threat:*`
+    /// tag, compared as [`crate::threat::is_threat_tag`] does, or the `threat`
+    /// score (trimmed, case-insensitive).
+    pub fn references_threat_verdict(&self) -> bool {
+        match self {
+            MatchExpr::HasTag(tag) | MatchExpr::ContactHasTag(tag) => {
+                crate::threat::is_threat_tag(tag)
+            }
+            MatchExpr::ScoreAbove { dimension, .. } | MatchExpr::ScoreBelow { dimension, .. } => {
+                dimension
+                    .trim()
+                    .eq_ignore_ascii_case(crate::threat::THREAT_DIMENSION)
+            }
+            MatchExpr::And(exprs) | MatchExpr::Or(exprs) => {
+                exprs.iter().any(MatchExpr::references_threat_verdict)
+            }
+            MatchExpr::Not(inner) => inner.references_threat_verdict(),
+            _ => false,
+        }
+    }
+
     /// True when any `and`/`or` in the tree has no children. `and []` is
     /// vacuously true and `not (or [])` is too, so such a rule can match
     /// every message; it is refused on save and skipped when rules run.
@@ -208,6 +229,19 @@ pub const SERVER_SIDE_ONLY_SKIP_REASON: &str = "server-side Sieve action; export
      not executed locally to avoid post-delivery fake bounces";
 
 impl Action {
+    /// True when running this action, or confirming its offer, would set a
+    /// `threat:*` tag. Tags compare as [`crate::threat::is_threat_tag`] does:
+    /// trimmed and case-insensitive.
+    pub fn sets_threat_tag(&self) -> bool {
+        match self {
+            Action::AddTag(tag) => crate::threat::is_threat_tag(tag),
+            Action::Confirm { then, .. } => then.iter().any(|step| {
+                matches!(step, ConfirmableAction::AddTag(tag) if crate::threat::is_threat_tag(tag))
+            }),
+            _ => false,
+        }
+    }
+
     /// Stable snake_case kind name (matches the serde tag), used as the
     /// `action_log.action_type` and in human-facing listings.
     pub fn kind(&self) -> &'static str {
@@ -565,6 +599,29 @@ pub fn build_match_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sets_threat_tag_reads_the_decoded_action() {
+        let parse = |json: &str| {
+            parse_authored_action(&serde_json::from_str(json).unwrap(), |_| None).unwrap()
+        };
+        for json in [
+            r#"{"add_tag":"threat\u003afalse_positive"}"#,
+            r#"{"add_tag":"THREAT:Malware"}"#,
+            r#"{"add_tag":"  threat:false_positive"}"#,
+            r#"{"confirm":{"prompt":"p","then":[{"flag":"seen"},{"add_tag":"threat\u003amalware"}]}}"#,
+        ] {
+            assert!(parse(json).sets_threat_tag(), "{json}");
+        }
+        for json in [
+            r#"{"add_tag":"newsletter"}"#,
+            r#"{"add_tag":"threats"}"#,
+            r#"{"move":"threat:folder"}"#,
+            r#"{"confirm":{"prompt":"p","then":[{"add_tag":"vip"}]}}"#,
+        ] {
+            assert!(!parse(json).sets_threat_tag(), "{json}");
+        }
+    }
 
     fn ctx(from: &str, to: &str, subject: &str) -> MessageContext {
         MessageContext {

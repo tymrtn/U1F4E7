@@ -21,7 +21,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-1.3.15-green.svg" alt="v1.3.15">
+  <img src="https://img.shields.io/badge/version-1.3.16-green.svg" alt="v1.3.16">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
@@ -574,7 +574,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope evidence collect/verify` | Query-scoped RFC822 evidence bundle with offline verification |
 | `envelope unsubscribe <uid> [--confirm]` | List-Unsubscribe (dry-run default) |
 | `envelope watch [--webhook] [--json]` | IMAP IDLE push — real-time new mail events |
-| `envelope code [--from] [--wait 120]` | Extract verification/OTP codes; `--json` automation requires `--account` plus an exact mailbox/full-domain `--from` binding and stabilizes before returning |
+| `envelope code --from <sender> [--wait 120]` | Extract verification/OTP codes from a sender whose From domain the mail provider authenticated (DMARC or aligned DKIM); `--json` automation also requires `--account` and stabilizes before returning. An operator can allow unverified senders per account with `envelope config set otp.allow_unverified_senders <account>` |
 | `envelope paths` | Show resolved database/credential paths and HOME drift warnings |
 | `envelope contract [--surface <name>]` | Export the versioned agent JSON/MCP contract |
 | `envelope mcp [--config]` | MCP server (stdio) for Claude Code, Cursor, Zed |

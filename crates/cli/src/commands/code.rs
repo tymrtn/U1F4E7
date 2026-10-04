@@ -4,9 +4,15 @@
 //! `envelope code` — poll IMAP for a verification code and extract it.
 
 use anyhow::{Context, Result, bail};
+use envelope_email_store::Account;
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_transport::code_extractor::extract_code;
 use envelope_email_transport::imap;
+use envelope_email_transport::threat::ThreatInput;
+use envelope_email_transport::threat::auth_results::{SenderAuth, sender_auth};
+use envelope_email_transport::threat::config::ThreatConfig;
+use envelope_email_transport::threat::domains::ascii_host;
+use serde_json::{Value, json};
 
 use super::common::setup_credentials;
 use super::provenance;
@@ -21,6 +27,65 @@ struct OtpCandidate {
     code: String,
     from: String,
     subject: String,
+    auth: SenderAuth,
+}
+
+/// One new message, judged as a one-time-code source.
+#[derive(Debug, PartialEq, Eq)]
+enum Classified {
+    /// Outside the --from/--subject filters, or carries no code.
+    NoMatch,
+    /// A code from a sender whose From domain is authenticated.
+    Candidate(OtpCandidate),
+    /// A code from a sender that is not authenticated. Its code is never
+    /// reported.
+    Rejected(OtpCandidate),
+}
+
+/// Judge one raw message. The From filter, subject, code and sender
+/// authentication all come from the same bytes. A candidate needs a pass
+/// for the very domain in its From header, from results written in the
+/// account's receiving mail domain (see [`ThreatConfig::receiver_domain`]).
+fn classify(
+    raw: &[u8],
+    account: &Account,
+    config: &ThreatConfig,
+    from_filter: Option<&str>,
+    subject_filter: Option<&str>,
+) -> Classified {
+    let Ok(mut input) = ThreatInput::from_raw(raw, &account.username) else {
+        return Classified::NoMatch;
+    };
+    input.receiver_domain = config.receiver_domain(&account.username, Some(&account.imap_host));
+    if from_filter.is_some_and(|filter| !sender_matches(&input.from_addr, filter)) {
+        return Classified::NoMatch;
+    }
+    let subject = mail_parser::MessageParser::default()
+        .parse(raw)
+        .and_then(|message| message.subject().map(str::to_string))
+        .unwrap_or_default();
+    if subject_filter.is_some_and(|filter| !subject.to_lowercase().contains(&filter.to_lowercase()))
+    {
+        return Classified::NoMatch;
+    }
+    let Some(code) = extract_code(input.text.as_deref().unwrap_or(""), input.html.as_deref())
+    else {
+        return Classified::NoMatch;
+    };
+    let auth = sender_auth(&input);
+    let authenticated = matches!(&auth, SenderAuth::Pass { domain, .. }
+        if input.from_domain().map(|d| ascii_host(&d)).as_deref() == Some(domain.as_str()));
+    let candidate = OtpCandidate {
+        code,
+        from: input.from_addr.clone(),
+        subject,
+        auth,
+    };
+    if authenticated {
+        Classified::Candidate(candidate)
+    } else {
+        Classified::Rejected(candidate)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,10 +98,32 @@ enum CollectionOutcome {
 #[derive(Default)]
 struct CandidateCollection {
     candidates: Vec<OtpCandidate>,
+    rejected: Vec<OtpCandidate>,
     first_seen_at: Option<std::time::Duration>,
 }
 
 impl CandidateCollection {
+    /// Keep the messages whose code may count and remember the rest. With the
+    /// operator opt-in, a sender that cannot be verified counts; a sender
+    /// that failed authentication never does.
+    fn admit(&mut self, classified: Vec<Classified>, allow_unverified: bool) -> Vec<OtpCandidate> {
+        let mut admitted = Vec::new();
+        for item in classified {
+            match item {
+                Classified::NoMatch => {}
+                Classified::Candidate(candidate) => admitted.push(candidate),
+                Classified::Rejected(candidate)
+                    if allow_unverified
+                        && matches!(candidate.auth, SenderAuth::Unverifiable(_)) =>
+                {
+                    admitted.push(candidate)
+                }
+                Classified::Rejected(candidate) => self.rejected.push(candidate),
+            }
+        }
+        admitted
+    }
+
     fn observe(
         &mut self,
         now: std::time::Duration,
@@ -57,14 +144,79 @@ impl CandidateCollection {
             CollectionOutcome::Continue
         }
     }
+
+    /// Codes that arrived from senders that were not authenticated. Their
+    /// codes are never included.
+    fn rejected_json(&self) -> Value {
+        Value::Array(
+            self.rejected
+                .iter()
+                .map(|c| json!({"from": c.from, "sender_auth": sender_auth_json(&c.auth)}))
+                .collect(),
+        )
+    }
+
+    /// The JSON error when the wait ends without a code.
+    fn timeout_report(&self, waited_seconds: u64) -> Value {
+        if !self.candidates.is_empty() || self.rejected.is_empty() {
+            return json!({"error": "timeout", "waited_seconds": waited_seconds});
+        }
+        let (error, reason) = if self
+            .rejected
+            .iter()
+            .any(|c| matches!(c.auth, SenderAuth::Unverifiable(_)))
+        {
+            (
+                "sender_unverifiable",
+                "a matching code arrived, but its sender could not be authenticated from what the mail provider recorded; an operator can allow unverified senders for this account (otp.allow_unverified_senders)",
+            )
+        } else {
+            (
+                "sender_unauthenticated",
+                "a matching code arrived, but its sender failed authentication for the From domain",
+            )
+        };
+        json!({
+            "error": error,
+            "reason": reason,
+            "waited_seconds": waited_seconds,
+            "rejected_candidates": self.rejected_json(),
+        })
+    }
+}
+
+fn sender_auth_json(auth: &SenderAuth) -> Value {
+    match auth {
+        SenderAuth::Pass {
+            via,
+            domain,
+            authserv_id,
+        } => json!({"result": "pass", "via": via, "domain": domain, "authserv_id": authserv_id}),
+        SenderAuth::Fail => json!({"result": "fail"}),
+        SenderAuth::Unverifiable(reason) => json!({"result": "unverifiable", "reason": reason}),
+    }
+}
+
+/// The JSON result for the code that was accepted.
+fn candidate_json(candidate: &OtpCandidate, collection: &CandidateCollection) -> Value {
+    provenance::annotate_inbound(json!({
+        "code": candidate.code,
+        "from": candidate.from,
+        "subject": candidate.subject,
+        "sender_auth": sender_auth_json(&candidate.auth),
+        "rejected_candidates": collection.rejected_json(),
+    }))
 }
 
 /// `envelope code` — poll IMAP for new messages and extract a verification code.
 ///
-/// The JSON surface is unattended/agent automation. It requires a caller-selected
-/// account and a narrow exact mailbox or full-domain sender filter, then collects
-/// candidates across a bounded stabilization window. The `From` header remains
-/// untrusted message content; Envelope does not claim it is authenticated.
+/// A code counts only when its sender's From domain is authenticated by the
+/// trusted Authentication-Results (DMARC, or aligned DKIM), unless the operator
+/// lets this account accept unverified senders. Other arrivals never end the
+/// wait. The JSON surface is unattended/agent automation: it requires a
+/// caller-selected account and a narrow exact mailbox or full-domain sender
+/// filter, then collects candidates across a bounded stabilization window.
+/// Plain-text mode requires the sender filter too.
 #[tokio::main]
 pub async fn run(
     account: Option<&str>,
@@ -74,23 +226,24 @@ pub async fn run(
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    if json {
-        if let Some(error) = automation_binding_error(account, from_filter) {
+    if let Some(error) = binding_error(json, account, from_filter) {
+        if json {
             println!(
                 "{}",
-                serde_json::json!({
+                json!({
                     "error": "automation_binding_required",
                     "reason": error,
                     "trust": provenance::inbound_trust(),
                 })
             );
-            bail!(
-                "OTP JSON automation requires an explicit --account and exact --from address or full domain"
-            );
         }
+        bail!("{error}");
     }
 
     let (_db, creds) = setup_credentials(account, backend)?;
+    let allow_unverified = super::config::otp_unverified_senders_allowed(&creds.account)?;
+    let threat_config = ThreatConfig::load()
+        .context("threat configuration is invalid; fix it with `envelope config`")?;
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
@@ -113,68 +266,59 @@ pub async fn run(
     loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
+            let mut report = collected.timeout_report(wait_secs);
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"error": "timeout", "waited_seconds": wait_secs, "trust": provenance::inbound_trust()})
-                );
-            } else {
+                report["trust"] = provenance::inbound_trust();
+                println!("{report}");
+            } else if report["error"] == "timeout" {
                 eprintln!("Timeout: no verification code found after {wait_secs}s");
+            } else {
+                eprintln!(
+                    "No verification code accepted after {wait_secs}s ({}): {}",
+                    report["error"].as_str().unwrap_or_default(),
+                    report["reason"].as_str().unwrap_or_default()
+                );
             }
             std::process::exit(1);
         }
 
         let new_uids = search_new_uids(&mut client, last_seen_uid).await?;
-        let mut matches = Vec::new();
+        let mut classified = Vec::new();
         for uid in new_uids {
             if uid <= last_seen_uid {
                 continue;
             }
             last_seen_uid = uid;
-            let msg = match imap::fetch_message(&mut client, "INBOX", uid).await? {
-                Some(m) => m,
-                None => continue,
-            };
-            if from_filter.is_some_and(|filter| !sender_matches(&msg.from_addr, filter)) {
+            // `BODY.PEEK[]`: reading never marks the message seen. A message
+            // too large to fetch whole has no bytes to authenticate and is
+            // skipped.
+            let Some((_, Some(raw))) =
+                imap::fetch_message_with_raw(&mut client, "INBOX", uid).await?
+            else {
                 continue;
-            }
-            if let Some(subject_filter) = subject_filter {
-                if !msg
-                    .subject
-                    .to_lowercase()
-                    .contains(&subject_filter.to_lowercase())
-                {
-                    continue;
-                }
-            }
-            if let Some(code) = extract_code(
-                msg.text_body.as_deref().unwrap_or(""),
-                msg.html_body.as_deref(),
-            ) {
-                matches.push(OtpCandidate {
-                    code,
-                    from: msg.from_addr,
-                    subject: msg.subject,
-                });
-            }
+            };
+            classified.push(classify(
+                &raw,
+                &creds.account,
+                &threat_config,
+                from_filter,
+                subject_filter,
+            ));
         }
+        let matches = collected.admit(classified, allow_unverified);
 
         if json {
             match collected.observe(elapsed, matches) {
                 CollectionOutcome::Continue => {}
                 CollectionOutcome::Ready(candidate) => {
-                    let output = provenance::annotate_inbound(serde_json::json!({
-                        "code": candidate.code,
-                        "from": candidate.from,
-                        "subject": candidate.subject,
-                    }));
+                    let output = candidate_json(&candidate, &collected);
                     println!("{}", serde_json::to_string_pretty(&output)?);
                     return Ok(());
                 }
                 CollectionOutcome::Ambiguous(candidate_count) => {
                     println!(
                         "{}",
-                        serde_json::json!({
+                        json!({
                             "error": "ambiguous_matches",
                             "candidate_count": candidate_count,
                             "trust": provenance::inbound_trust(),
@@ -186,8 +330,8 @@ pub async fn run(
                 }
             }
         } else {
-            // Interactive stdout use remains low-friction and intentionally does
-            // not imply the collection/authentication guarantees of --json.
+            // Interactive stdout use stays low-friction: no stabilization
+            // window, but the same sender authentication.
             match matches.as_slice() {
                 [] => {}
                 [candidate] => {
@@ -204,6 +348,23 @@ pub async fn run(
         let remaining = timeout.saturating_sub(start.elapsed());
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
+}
+
+/// Return the reason the request is not bound to a sender (and, for JSON
+/// automation, an account), if any. This runs before credentials are opened
+/// or any network connection is attempted.
+fn binding_error(
+    json: bool,
+    account: Option<&str>,
+    from_filter: Option<&str>,
+) -> Option<&'static str> {
+    if json {
+        return automation_binding_error(account, from_filter);
+    }
+    if from_filter.is_none_or(|value| value.trim().is_empty()) {
+        return Some("--from is required: the exact sender address or domain the code comes from");
+    }
+    None
 }
 
 /// Return the reason JSON automation is not safely bound, if any. This runs
@@ -236,9 +397,11 @@ fn is_narrow_sender_filter(raw_filter: &str) -> bool {
     }
 
     if let Some((local, domain)) = filter.rsplit_once('@') {
-        return !local.is_empty() && !local.contains('@') && is_fully_qualified_domain(domain);
+        return !local.is_empty()
+            && !local.contains('@')
+            && is_fully_qualified_domain(&ascii_host(domain));
     }
-    is_fully_qualified_domain(filter.trim_start_matches('@'))
+    is_fully_qualified_domain(&ascii_host(filter.trim_start_matches('@')))
 }
 
 fn is_fully_qualified_domain(domain: &str) -> bool {
@@ -253,7 +416,8 @@ fn is_fully_qualified_domain(domain: &str) -> bool {
 }
 
 /// Extract a mailbox from a header and compare exact case-insensitive mailbox
-/// identity or a whole domain. Display names are never candidates.
+/// identity or a whole domain, domains in ASCII (IDNA) form. Display names
+/// are never candidates.
 fn sender_matches(raw_sender: &str, raw_filter: &str) -> bool {
     let sender = mailbox_from_header(raw_sender);
     let filter = raw_filter
@@ -261,17 +425,17 @@ fn sender_matches(raw_sender: &str, raw_filter: &str) -> bool {
         .trim_matches('<')
         .trim_matches('>')
         .to_lowercase();
-    if sender.is_empty() || filter.is_empty() {
+    let Some((sender_local, sender_domain)) = sender.rsplit_once('@') else {
         return false;
-    }
+    };
+    let sender_domain = ascii_host(sender_domain);
     if filter.contains('@') && !filter.starts_with('@') {
-        return sender == filter;
+        return filter.rsplit_once('@').is_some_and(|(local, domain)| {
+            local == sender_local && ascii_host(domain) == sender_domain
+        });
     }
     let domain = filter.trim_start_matches('@');
-    !domain.is_empty()
-        && sender
-            .rsplit_once('@')
-            .is_some_and(|(_, value)| value == domain)
+    !domain.is_empty() && ascii_host(domain) == sender_domain
 }
 
 fn mailbox_from_header(raw: &str) -> String {
@@ -316,7 +480,293 @@ mod tests {
             code: code.to_string(),
             from: "otp@issuer.example".to_string(),
             subject: "Your verification code".to_string(),
+            auth: SenderAuth::Pass {
+                via: "dmarc".to_string(),
+                domain: "issuer.example".to_string(),
+                authserv_id: "mx1.example.org".to_string(),
+            },
         }
+    }
+
+    const RECEIVED_EDGE: &str = "Received: from mail.issuer.example (mail.issuer.example [203.0.113.5]) by mx1.example.org with ESMTPS id abc; Mon, 21 Sep 2026 10:00:00 +0000";
+
+    /// A one-time-code message with the given Authentication-Results and From.
+    fn otp_message(auth_results: Option<&str>, from: &str, code: &str) -> Vec<u8> {
+        let mut headers = Vec::new();
+        if let Some(ar) = auth_results {
+            headers.push(format!("Authentication-Results: {ar}"));
+        }
+        headers.push(RECEIVED_EDGE.to_string());
+        headers.push(format!("From: {from}"));
+        headers.push("To: me@example.org".to_string());
+        headers.push("Subject: Your verification code".to_string());
+        format!(
+            "{}\r\n\r\nYour verification code is {code}\r\n",
+            headers.join("\r\n")
+        )
+        .into_bytes()
+    }
+
+    const ISSUER_PASS: &str =
+        "mx1.example.org; dkim=pass header.d=issuer.example; dmarc=pass header.from=issuer.example";
+
+    /// The account `me@example.org`, whose mail `imap_host` serves.
+    fn mailbox(imap_host: &str) -> Account {
+        Account {
+            id: "acct-test".to_string(),
+            name: "Me".to_string(),
+            username: "me@example.org".to_string(),
+            domain: "example.org".to_string(),
+            smtp_host: "smtp.example.org".to_string(),
+            smtp_port: 587,
+            imap_host: imap_host.to_string(),
+            imap_port: 993,
+            smtp_username: None,
+            imap_username: None,
+            display_name: None,
+            signature_text: None,
+            signature_html: None,
+            created_at: "2026-10-03T00:00:00Z".to_string(),
+        }
+    }
+
+    fn classify_issuer(raw: &[u8]) -> Classified {
+        classify(
+            raw,
+            &mailbox("imap.example.org"),
+            &ThreatConfig::default(),
+            Some("issuer.example"),
+            None,
+        )
+    }
+
+    fn forged(code: &str) -> Classified {
+        classify_issuer(&otp_message(
+            Some(
+                "mx1.example.org; spf=fail smtp.mailfrom=issuer.example; dkim=none; dmarc=fail header.from=issuer.example",
+            ),
+            "Issuer <otp@issuer.example>",
+            code,
+        ))
+    }
+
+    fn authenticated(code: &str) -> Classified {
+        classify_issuer(&otp_message(
+            Some(ISSUER_PASS),
+            "Issuer <otp@issuer.example>",
+            code,
+        ))
+    }
+
+    fn unverifiable(code: &str) -> Classified {
+        classify_issuer(&otp_message(None, "Issuer <otp@issuer.example>", code))
+    }
+
+    #[test]
+    fn classify_drops_spoofed_from() {
+        match forged("111111") {
+            Classified::Rejected(c) => assert_eq!(c.auth, SenderAuth::Fail),
+            other => panic!("a failed sender must be rejected: {other:?}"),
+        }
+        // A pass for another domain does not cover this From.
+        let other_domain = classify_issuer(&otp_message(
+            Some(
+                "mx1.example.org; dkim=pass header.d=attacker.example; dmarc=pass header.from=attacker.example",
+            ),
+            "Issuer <otp@issuer.example>",
+            "222222",
+        ));
+        assert!(
+            matches!(other_domain, Classified::Rejected(_)),
+            "{other_domain:?}"
+        );
+        // A sender outside the --from filter is not a match at all.
+        let elsewhere = classify_issuer(&otp_message(
+            Some(ISSUER_PASS),
+            "otp@issuer.example.evil",
+            "333333",
+        ));
+        assert_eq!(elsewhere, Classified::NoMatch);
+        match authenticated("444444") {
+            Classified::Candidate(c) => {
+                assert_eq!(c.code, "444444");
+                assert_eq!(c.from, "otp@issuer.example");
+                assert!(matches!(c.auth, SenderAuth::Pass { .. }));
+            }
+            other => panic!("an authenticated sender is a candidate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_trusts_only_the_accounts_receiver() {
+        let raw = otp_message(Some(ISSUER_PASS), "Issuer <otp@issuer.example>", "555555");
+        let default = ThreatConfig::default();
+        let mut moved = ThreatConfig::default();
+        moved
+            .receiver_domains
+            .insert("me@example.org".to_string(), "attacker.example".to_string());
+        let mut pinned = ThreatConfig::default();
+        pinned
+            .receiver_domains
+            .insert("me@example.org".to_string(), "example.org".to_string());
+
+        // The IMAP host names the receiving domain, or the operator does.
+        for (imap_host, config) in [("imap.example.org", &default), ("127.0.0.1", &pinned)] {
+            let classified = classify(
+                &raw,
+                &mailbox(imap_host),
+                config,
+                Some("issuer.example"),
+                None,
+            );
+            assert!(
+                matches!(classified, Classified::Candidate(_)),
+                "{imap_host}: {classified:?}"
+            );
+        }
+        // Results from anywhere else prove nothing.
+        for (imap_host, config) in [
+            ("imap.attacker.example", &default),
+            ("127.0.0.1", &default),
+            ("imap.example.org", &moved),
+        ] {
+            match classify(
+                &raw,
+                &mailbox(imap_host),
+                config,
+                Some("issuer.example"),
+                None,
+            ) {
+                Classified::Rejected(c) => {
+                    assert!(matches!(c.auth, SenderAuth::Unverifiable(_)), "{imap_host}")
+                }
+                other => panic!("{imap_host}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_accepts_either_spelling_of_an_international_domain() {
+        let raw = otp_message(
+            Some("mx1.example.org; dmarc=pass header.from=xn--bnk-qla.example"),
+            "Bank <otp@b\u{e4}nk.example>",
+            "777777",
+        );
+        for filter in [
+            "xn--bnk-qla.example",
+            "b\u{e4}nk.example",
+            "otp@xn--bnk-qla.example",
+        ] {
+            match classify(
+                &raw,
+                &mailbox("imap.example.org"),
+                &ThreatConfig::default(),
+                Some(filter),
+                None,
+            ) {
+                Classified::Candidate(c) => assert_eq!(c.code, "777777", "{filter}"),
+                other => panic!("--from {filter}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_wins_over_forged_in_window() {
+        let mut collection = CandidateCollection::default();
+        let admitted = collection.admit(vec![forged("111111")], false);
+        assert_eq!(
+            collection.observe(std::time::Duration::ZERO, admitted),
+            CollectionOutcome::Continue
+        );
+        let admitted = collection.admit(vec![authenticated("222222")], false);
+        assert_eq!(
+            collection.observe(std::time::Duration::from_secs(5), admitted),
+            CollectionOutcome::Continue
+        );
+        let admitted = collection.admit(vec![forged("333333")], false);
+        match collection.observe(std::time::Duration::from_secs(10), admitted) {
+            CollectionOutcome::Ready(c) => assert_eq!(c.code, "222222"),
+            other => panic!("the authenticated code must win: {other:?}"),
+        }
+        let report = candidate_json(&collection.candidates[0], &collection);
+        assert_eq!(report["sender_auth"]["result"], "pass");
+        let rejected = report["rejected_candidates"].as_array().unwrap();
+        assert_eq!(rejected.len(), 2);
+        assert!(
+            !report.to_string().contains("111111") && !report.to_string().contains("333333"),
+            "a rejected code is never reported: {report}"
+        );
+    }
+
+    #[test]
+    fn two_authenticated_are_ambiguous() {
+        let mut collection = CandidateCollection::default();
+        let admitted = collection.admit(vec![authenticated("111111")], false);
+        assert_eq!(
+            collection.observe(std::time::Duration::ZERO, admitted),
+            CollectionOutcome::Continue
+        );
+        let admitted = collection.admit(vec![authenticated("222222")], false);
+        assert_eq!(
+            collection.observe(std::time::Duration::from_secs(5), admitted),
+            CollectionOutcome::Ambiguous(2)
+        );
+    }
+
+    #[test]
+    fn timeout_reports_sender_unverifiable() {
+        let mut collection = CandidateCollection::default();
+        let admitted = collection.admit(vec![unverifiable("111111")], false);
+        assert_eq!(
+            collection.observe(std::time::Duration::ZERO, admitted),
+            CollectionOutcome::Continue
+        );
+        let report = collection.timeout_report(30);
+        assert_eq!(report["error"], "sender_unverifiable", "{report}");
+        assert_eq!(report["waited_seconds"], 30);
+        let rejected = report["rejected_candidates"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["from"], "otp@issuer.example");
+        assert_eq!(rejected[0]["sender_auth"]["result"], "unverifiable");
+        assert!(!report.to_string().contains("111111"), "{report}");
+
+        let mut collection = CandidateCollection::default();
+        collection.admit(vec![forged("222222")], false);
+        assert_eq!(
+            collection.timeout_report(30)["error"],
+            "sender_unauthenticated"
+        );
+
+        let collection = CandidateCollection::default();
+        assert_eq!(collection.timeout_report(30)["error"], "timeout");
+    }
+
+    #[test]
+    fn plain_mode_requires_from() {
+        assert!(binding_error(false, None, None).is_some());
+        assert!(binding_error(false, None, Some("  ")).is_some());
+        assert!(binding_error(false, None, Some("issuer.example")).is_none());
+        assert!(binding_error(true, Some("account-1"), Some("issuer.example")).is_none());
+        assert!(binding_error(true, None, Some("issuer.example")).is_some());
+    }
+
+    #[test]
+    fn operator_opt_in_allows_unverifiable_and_reports_it() {
+        let mut collection = CandidateCollection::default();
+        let admitted = collection.admit(vec![unverifiable("555555"), forged("666666")], true);
+        assert_eq!(admitted.len(), 1, "a failed sender never counts");
+        assert_eq!(
+            collection.observe(std::time::Duration::ZERO, admitted),
+            CollectionOutcome::Continue
+        );
+        let ready = collection.observe(std::time::Duration::from_secs(5), Vec::new());
+        let CollectionOutcome::Ready(candidate) = ready else {
+            panic!("an opted-in unverifiable sender counts: {ready:?}");
+        };
+        assert_eq!(candidate.code, "555555");
+        let report = candidate_json(&candidate, &collection);
+        assert_eq!(report["sender_auth"]["result"], "unverifiable", "{report}");
+        assert!(report["sender_auth"]["reason"].is_string(), "{report}");
     }
 
     #[test]

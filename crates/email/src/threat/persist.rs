@@ -31,10 +31,40 @@ use crate::rule_exec::{
     self, ActionAttribution, ActionSource, ExecDb, ImapRuleMailbox, MessageTarget, RuleMailbox,
     RuleRunReport, RunAccount,
 };
-use crate::rules::{Action, MatchExpr, MessageContext, StoredRuleAction};
+use crate::rules::{Action, ConfirmableAction, MatchExpr, MessageContext, StoredRuleAction};
 
 pub const QUARANTINE_FOLDER: &str = "Envelope/Quarantine";
 pub const QUARANTINE_RULE_NAME: &str = "Envelope threat quarantine";
+
+/// Whether `folder` is the quarantine folder: compared trimmed and
+/// case-insensitive, with `.` or `/` as the separator, with or without an
+/// `INBOX` prefix.
+pub fn is_quarantine_folder(folder: &str) -> bool {
+    let normalized = folder.trim().to_ascii_lowercase().replace('.', "/");
+    let normalized = normalized.trim_matches('/');
+    let normalized = normalized.strip_prefix("inbox/").unwrap_or(normalized);
+    normalized.eq_ignore_ascii_case(QUARANTINE_FOLDER)
+}
+
+/// Whether `name` is the shipped quarantine rule's, compared trimmed and
+/// case-insensitive.
+pub fn is_quarantine_rule_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(QUARANTINE_RULE_NAME)
+}
+
+/// Whether a rule with this definition sets a threat verdict, selects mail
+/// by one, or moves mail into quarantine. Under an agent token only the
+/// operator writes or enables such a rule.
+pub fn rule_touches_threat_state(match_expr: &MatchExpr, action: &Action) -> bool {
+    let moves_to_quarantine = match action {
+        Action::Move(dest) => is_quarantine_folder(dest),
+        Action::Confirm { then, .. } => then.iter().any(
+            |step| matches!(step, ConfirmableAction::Move(dest) if is_quarantine_folder(dest)),
+        ),
+        _ => false,
+    };
+    moves_to_quarantine || action.sets_threat_tag() || match_expr.references_threat_verdict()
+}
 /// Agent id every engine-driven action and event is attributed to.
 pub const THREAT_AGENT_ID: &str = "envelope:threat";
 /// `score_above` is strict and scores are whole numbers, so `> 69.5` is
@@ -86,15 +116,21 @@ pub fn load_ledger(db: &Database, account_id: &str, input: &mut ThreatInput) {
         .map_err(|e| format!("correspondent ledger unreadable: {e}"));
 }
 
-/// Parse raw bytes and load the ledger: the part of a scan that needs the
-/// database.
+/// Parse raw bytes, set the account's receiving mail domain, and load the
+/// ledger: the part of a scan that needs the database.
 pub fn prepare_input(
     db: &Database,
     account_id: &str,
     account_address: &str,
     raw: &[u8],
+    config: &ThreatConfig,
 ) -> Result<ThreatInput, String> {
     let mut input = ThreatInput::from_raw(raw, account_address)?;
+    let imap_host = db
+        .get_account(account_id)
+        .map_err(|e| format!("account {account_id} unreadable: {e}"))?
+        .map(|account| account.imap_host);
+    input.receiver_domain = config.receiver_domain(account_address, imap_host.as_deref());
     load_ledger(db, account_id, &mut input);
     Ok(input)
 }
@@ -166,8 +202,10 @@ pub fn scan_raw(
     raw: &[u8],
     config: &ThreatConfig,
 ) -> (ThreatVerdict, ScannedMessage) {
-    let (verdict, mut scanned) =
-        evaluate_input(prepare_input(db, account_id, account_address, raw), config);
+    let (verdict, mut scanned) = evaluate_input(
+        prepare_input(db, account_id, account_address, raw, config),
+        config,
+    );
     scanned.content_fingerprint = super::content_fingerprint(raw);
     scanned.observed_message_ids = super::message_id_values(raw);
     (verdict, scanned)
@@ -619,7 +657,8 @@ pub struct AttachmentBlock {
 
 /// The attachment gate, for an attachment of the message with
 /// [`super::sole_message_id`] `message_id` and content `fingerprint`. Refuses
-/// bytes that look like malware; or whose message carries `threat:malware`
+/// bytes that look like malware, under their original name or the sanitized
+/// name they are written under; or whose message carries `threat:malware`
 /// under its threat key, or under its Message-ID when another message's
 /// content holds that (strictness may spread between messages sharing a
 /// Message-ID, leniency never does); or whose content has a malware verdict
@@ -641,7 +680,17 @@ pub fn attachment_block(
     {
         return Ok(None);
     }
-    let signals = super::attachments::gate(filename, content_type, bytes);
+    // Bytes reach disk under the sanitized name, so check it as well as the
+    // original; either one blocking refuses.
+    let mut signals = super::attachments::gate(filename, content_type, bytes);
+    let written = crate::ingress::normalize_attachment_filename(filename);
+    if written != filename {
+        for signal in super::attachments::gate(&written, content_type, bytes) {
+            if !signals.iter().any(|s| s.code == signal.code) {
+                signals.push(signal);
+            }
+        }
+    }
     let reason = if !signals.is_empty() {
         Some(format!(
             "attachment looks like malware ({})",
@@ -708,6 +757,119 @@ fn message_malware_reason(
     }
     Ok(window_full
         .then(|| "the message has more stored verdicts than the attachment gate reads".to_string()))
+}
+
+/// Why an agent may not move, copy or delete this message, if the threat
+/// engine holds it: its threat key or its Message-ID carries
+/// `threat:quarantined` or `threat:malware`, or a malware or dangerous
+/// verdict is stored for these bytes. The check reads content, not the
+/// folder, because a server can show one message in several folders (Gmail
+/// lists a quarantined message in `[Gmail]/All Mail` too). `raw` is `None`
+/// over the fetch cap; the header Message-ID then stands in and any verdict
+/// under it counts. A message with neither is held, and so is one whose
+/// verdict history is longer than the window read. Only a Mark safe bound to
+/// these bytes releases it.
+pub fn held_reason(
+    db: &Database,
+    account_id: &str,
+    raw: Option<&[u8]>,
+    header_message_id: Option<&str>,
+) -> Result<Option<String>> {
+    let (message_id, fingerprint) = match raw {
+        Some(raw) => (super::sole_message_id(raw), super::content_fingerprint(raw)),
+        None => (
+            header_message_id
+                .and_then(super::usable_message_id)
+                .map(str::to_string),
+            None,
+        ),
+    };
+    let (message_id, fingerprint) = (message_id.as_deref(), fingerprint.as_deref());
+    let Some(key) = threat_key(db, account_id, message_id, fingerprint)? else {
+        return Ok(Some(
+            "the message has no Message-ID or readable content to check".to_string(),
+        ));
+    };
+    if is_marked_safe(db, account_id, &key, fingerprint)? {
+        return Ok(None);
+    }
+    let holding_tag = |k: &str| -> Result<Option<String>> {
+        Ok(db
+            .get_tags(account_id, k)?
+            .into_iter()
+            .map(|t| t.tag)
+            .find(|t| t == TAG_QUARANTINED || t == TAG_MALWARE))
+    };
+    if let Some(tag) = holding_tag(&key)? {
+        return Ok(Some(format!("the message is tagged {tag}")));
+    }
+    if let Some(mid) = message_id
+        && mid != key
+        && let Some(tag) = holding_tag(mid)?
+    {
+        return Ok(Some(format!(
+            "a message with this Message-ID is tagged {tag}"
+        )));
+    }
+    let events =
+        db.events_for_message(account_id, THREAT_VERDICT, &key, FINGERPRINT_SEARCH_LIMIT)?;
+    let window_full = events.len() >= FINGERPRINT_SEARCH_LIMIT;
+    for event in events {
+        let stored = stored_verdict(event)?;
+        let same_content =
+            fingerprint.is_none_or(|fp| stored.content_fingerprint.as_deref() == Some(fp));
+        if !same_content {
+            continue;
+        }
+        if stored.verdict.is_malware() {
+            return Ok(Some(
+                "the message's stored threat verdict is malware".to_string(),
+            ));
+        }
+        if stored.verdict.level == Level::Dangerous {
+            return Ok(Some(
+                "the message's stored threat verdict is dangerous".to_string(),
+            ));
+        }
+    }
+    Ok(
+        window_full
+            .then(|| "the message has more stored verdicts than the check reads".to_string()),
+    )
+}
+
+/// [`held_reason`] for the message at `folder`/`uid`, read from the server
+/// without marking it seen. A message that is not there is an error.
+pub async fn held_at(
+    client: &mut ImapClient,
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Option<String>> {
+    let fetched = imap::fetch_message_with_raw(client, folder, uid)
+        .await
+        .with_context(|| format!("failed to read UID {uid} in {folder} for the threat check"))?;
+    held_of_fetch(db, account_id, folder, uid, fetched)
+}
+
+/// [`held_at`] for what [`imap::fetch_message_with_raw`] read at
+/// `folder`/`uid`.
+pub(crate) fn held_of_fetch(
+    db: &Database,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    fetched: Option<(envelope_email_store::models::Message, Option<Vec<u8>>)>,
+) -> Result<Option<String>> {
+    let (message, raw) =
+        fetched.ok_or_else(|| anyhow!("message UID {uid} not found in {folder}"))?;
+    held_reason(
+        db,
+        account_id,
+        raw.as_deref(),
+        message.message_id.as_deref(),
+    )
 }
 
 /// Every attachment of `raw` the download gate would refuse, by filename, in
@@ -1250,7 +1412,7 @@ async fn scan_one<M: RuleMailbox + RawFetch, D: ExecDb>(
         .await?
         .ok_or_else(|| anyhow!("UID {uid} vanished from {folder} before it was scanned"))?;
     let input = db
-        .with_db(|d| prepare_input(d, account.id, account.email, &raw))
+        .with_db(|d| prepare_input(d, account.id, account.email, &raw, config))
         .await;
     // Opt-in analyzers block on clamd and DNS: run them off the async
     // workers and without holding the database.
@@ -1423,6 +1585,7 @@ pub async fn scan_uid(
         client,
         db,
         account_id: account.id,
+        agent_run: false,
     };
     scan_one(&mut mbox, db, account, folder, uid, config).await
 }
@@ -1721,13 +1884,77 @@ mod tests {
     }
 
     #[test]
+    fn rules_touching_quarantine_or_verdicts_are_recognized() {
+        for folder in [
+            "Envelope/Quarantine",
+            " envelope.quarantine ",
+            "INBOX/Envelope/Quarantine",
+            "INBOX.Envelope.Quarantine/",
+        ] {
+            assert!(is_quarantine_folder(folder), "{folder}");
+        }
+        for folder in ["INBOX", "Envelope", "Quarantine", "Envelope/Quarantine/Old"] {
+            assert!(!is_quarantine_folder(folder), "{folder}");
+        }
+        assert!(is_quarantine_rule_name("  envelope THREAT quarantine "));
+        assert!(!is_quarantine_rule_name("Envelope threat quarantine 2"));
+
+        let any = MatchExpr::From("*".to_string());
+        let tagged = MatchExpr::And(vec![
+            any.clone(),
+            MatchExpr::Not(Box::new(MatchExpr::HasTag(
+                " Threat:Quarantined".to_string(),
+            ))),
+        ]);
+        let inbox = Action::Move("INBOX".to_string());
+        assert!(rule_touches_threat_state(&tagged, &inbox));
+        assert!(rule_touches_threat_state(
+            &any,
+            &Action::Move("envelope.quarantine".to_string())
+        ));
+        assert!(rule_touches_threat_state(
+            &any,
+            &Action::AddTag("threat:false_positive".to_string())
+        ));
+        assert!(!rule_touches_threat_state(&any, &inbox));
+        // The threat score is the verdict's, so selecting by it is too.
+        for score in [
+            MatchExpr::ScoreAbove {
+                dimension: "threat".to_string(),
+                threshold: 50.0,
+            },
+            MatchExpr::Or(vec![
+                any.clone(),
+                MatchExpr::ScoreBelow {
+                    dimension: " Threat ".to_string(),
+                    threshold: 10.0,
+                },
+            ]),
+        ] {
+            assert!(rule_touches_threat_state(&score, &inbox), "{score:?}");
+        }
+        let urgency = MatchExpr::ScoreAbove {
+            dimension: "urgent".to_string(),
+            threshold: 0.5,
+        };
+        assert!(!rule_touches_threat_state(&urgency, &inbox));
+        let (match_expr, action) = quarantine_rule_json();
+        let shipped = StoredRuleAction::parse(&action).unwrap().action;
+        let shipped_match: MatchExpr = serde_json::from_str(&match_expr).unwrap();
+        assert!(rule_touches_threat_state(&shipped_match, &shipped));
+    }
+
+    #[test]
     fn needs_scan_on_missing_or_old_engine() {
         assert!(needs_scan(None));
         let mut v = ThreatVerdict::unavailable("x");
         assert!(!needs_scan(Some(&v)));
         v.engine_version = "rshield-0".to_string();
         assert!(needs_scan(Some(&v)));
-        assert_eq!(ENGINE_VERSION, "rshield-1");
+        // 1.3.15's verdicts predate the account-set receiving domain.
+        v.engine_version = "rshield-1".to_string();
+        assert!(needs_scan(Some(&v)));
+        assert_eq!(ENGINE_VERSION, "rshield-2");
     }
 
     #[test]
@@ -1826,6 +2053,24 @@ mod tests {
             .unwrap()
             .remove(0);
         assert!(label.payload.unwrap().contains(TAG_FALSE_POSITIVE));
+    }
+
+    /// Bytes are written under the sanitized name, so the gate checks that
+    /// name as well as the original.
+    #[test]
+    fn attachment_gate_checks_the_name_written_to_disk() {
+        let db = Database::open_memory().unwrap();
+        for name in ["payload.js\u{1}", "payload.js\u{0}", "payload.js "] {
+            let block = attachment_block(&db, ACCT, None, None, name, "text/plain", b"alert(1)")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name:?} must be blocked"));
+            assert_eq!(block.code, ATTACHMENT_BLOCKED);
+        }
+        assert!(
+            attachment_block(&db, ACCT, None, None, "notes.txt\u{1}", "text/plain", b"hi")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The reader shows a blocked attachment as blocked, so it asks the same
@@ -3116,6 +3361,81 @@ Subject: s\r\n\r\nhi\r\n";
     }
 
     #[tokio::test]
+    async fn content_the_engine_holds_is_held_in_any_folder() {
+        let db = Database::open_memory().unwrap();
+        let config = ThreatConfig {
+            quarantine: Quarantine::Move,
+            ..ThreatConfig::default()
+        };
+        let quarantined = phish("q@x");
+        let mut mbox = FakeMailbox::default();
+        mbox.raw.insert(7, quarantined.clone());
+        let r = scan_new_mail(&mut mbox, &db, &account(), "INBOX", &[7], &config).await;
+        assert_eq!(
+            r[0].1.as_ref().unwrap().quarantine,
+            QuarantineOutcome::Moved
+        );
+
+        // Gmail also lists the message in [Gmail]/All Mail, under another
+        // UID: the same bytes, seen from another folder.
+        let held = held_reason(&db, ACCT, Some(&quarantined), Some("<q@x>")).unwrap();
+        assert!(
+            held.as_deref()
+                .is_some_and(|r| r.contains(TAG_QUARANTINED) || r.contains(TAG_MALWARE)),
+            "{held:?}"
+        );
+        // Over the fetch cap only the header Message-ID is known.
+        assert!(
+            held_reason(&db, ACCT, None, Some("<q@x>"))
+                .unwrap()
+                .is_some()
+        );
+        // Other content under the same Message-ID is held as well.
+        assert!(
+            held_reason(&db, ACCT, Some(&ordinary("q@x")), None)
+                .unwrap()
+                .is_some()
+        );
+        // Mail the engine does not hold, scanned or not, is not held.
+        assert_eq!(
+            held_reason(&db, ACCT, Some(&ordinary("o@x")), None).unwrap(),
+            None
+        );
+        // With neither bytes nor a usable Message-ID nothing can be checked.
+        assert!(held_reason(&db, ACCT, None, None).unwrap().is_some());
+
+        // The stored verdict on these bytes holds them without the tags.
+        for tag in [TAG_DANGEROUS, TAG_MALWARE, TAG_QUARANTINED] {
+            db.remove_tag(ACCT, "q@x", tag).unwrap();
+        }
+        let held = held_reason(&db, ACCT, Some(&quarantined), None).unwrap();
+        assert!(
+            held.as_deref().is_some_and(|r| r.contains("verdict")),
+            "{held:?}"
+        );
+
+        // Mark safe on these bytes releases them.
+        mark_safe(
+            &db,
+            &VerdictTarget {
+                account_id: ACCT,
+                folder: QUARANTINE_FOLDER,
+                uid: 7,
+                message_id: Some("q@x"),
+                content_fingerprint: Some(&content_fingerprint(&quarantined)),
+                observed_message_ids: &[],
+            },
+            "reader",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            held_reason(&db, ACCT, Some(&quarantined), None).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn suspicious_never_moves_and_tag_mode_never_moves() {
         let db = Database::open_memory().unwrap();
         let mut mbox = FakeMailbox::default();
@@ -3192,6 +3512,48 @@ Subject: s\r\n\r\nhi\r\n";
     }
 
     #[test]
+    fn prepare_input_takes_the_receiving_domain_from_the_account() {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "me",
+                EMAIL,
+                "pw",
+                "smtp.example.org",
+                587,
+                "imap.example.org",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let raw = "Authentication-Results: mx.example.org; dmarc=pass header.from=bank.example\r\n\
+                   Received: from out.bank.example (out.bank.example [192.0.2.1]) by mx.example.org with ESMTPS id q; Mon, 21 Sep 2026 10:00:00 +0000\r\n\
+                   Message-ID: <r1@x>\r\nFrom: Bank <alerts@bank.example>\r\nTo: me@example.org\r\n\
+                   Subject: s\r\n\r\nhi\r\n";
+        let prepared = |account_id: &str, config: &ThreatConfig| {
+            prepare_input(&db, account_id, EMAIL, raw.as_bytes(), config).unwrap()
+        };
+
+        let input = prepared(&account.id, &ThreatConfig::default());
+        assert_eq!(input.receiver_domain.as_deref(), Some("example.org"));
+        assert!(matches!(
+            super::super::auth_results::sender_auth(&input),
+            super::super::auth_results::SenderAuth::Pass { .. }
+        ));
+
+        let mut config = ThreatConfig::default();
+        config
+            .receiver_domains
+            .insert(EMAIL.to_string(), "relay.example".to_string());
+        let input = prepared(&account.id, &config);
+        assert_eq!(input.receiver_domain.as_deref(), Some("relay.example"));
+
+        // No account row: nothing to trust.
+        let input = prepared("missing", &ThreatConfig::default());
+        assert_eq!(input.receiver_domain, None);
+    }
+
+    #[test]
     fn reputation_lookups_become_domain_only_lookup_performed_events() {
         use super::super::reputation::{CACHE_FILE_NAME, ReputationAnalyzer, ReputationCache};
         let db = Database::open_memory().unwrap();
@@ -3205,7 +3567,7 @@ Subject: s\r\n\r\nhi\r\n";
         ))];
         let raw = "Message-ID: <l1@x>\r\nFrom: IT <it@examp1e.org>\r\nTo: me@example.org\r\n\
                    Subject: s\r\n\r\nReset at https://portal.partner.example/reset?t=SECRET\r\n";
-        let input = prepare_input(&db, ACCT, EMAIL, raw.as_bytes());
+        let input = prepare_input(&db, ACCT, EMAIL, raw.as_bytes(), &ThreatConfig::default());
         let (verdict, scanned) = evaluate_with(input, &ThreatConfig::default(), &analyzers, &log);
         assert_eq!(verdict.signals[0].code, "domain_blocklisted");
         assert_eq!(verdict.signals[0].weight, 60);

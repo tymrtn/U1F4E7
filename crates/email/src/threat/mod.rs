@@ -42,7 +42,7 @@ pub use envelope_email_store::correspondents::CorrespondentFacts;
 
 /// Bumped whenever an analyzer or weight changes; a stored verdict from an
 /// older engine is rescanned on open.
-pub const ENGINE_VERSION: &str = "rshield-1";
+pub const ENGINE_VERSION: &str = "rshield-2";
 
 /// `message_scores.dimension` holding the verdict score, so `score_above
 /// threat N` rules match without any new rule primitive.
@@ -53,6 +53,15 @@ pub const TAG_DANGEROUS: &str = "threat:dangerous";
 pub const TAG_MALWARE: &str = "threat:malware";
 pub const TAG_QUARANTINED: &str = "threat:quarantined";
 pub const TAG_FALSE_POSITIVE: &str = "threat:false_positive";
+
+/// A tag in the threat engine's namespace. These record verdicts
+/// (`threat:false_positive` lifts the attachment block), so only the
+/// operator may set or clear them by hand.
+pub fn is_threat_tag(tag: &str) -> bool {
+    tag.trim()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("threat:"))
+}
 
 pub const SUSPICIOUS_THRESHOLD: u32 = 30;
 pub const DANGEROUS_THRESHOLD: u32 = 70;
@@ -191,9 +200,11 @@ pub struct ThreatInput {
     pub attachments: Vec<AttachmentInput>,
     /// The mailbox this message was delivered to (lowercased).
     pub account_address: String,
-    /// The host that accepted the message: the first DNS-named `by` host in
-    /// the topmost `Received` headers.
-    pub receiving_host: Option<String>,
+    /// The registrable domain of the host that accepts this account's mail,
+    /// from the account (see [`config::ThreatConfig::receiver_domain`]) and
+    /// never from the message. `None`: unknown, so no Authentication-Results
+    /// can be trusted.
+    pub receiver_domain: Option<String>,
     /// Correspondent data. `Err` when the local ledger could not be read;
     /// the ledger analyzer then fails and the verdict is `unavailable`.
     pub ledger: Result<CorrespondentFacts, String>,
@@ -258,7 +269,6 @@ impl ThreatInput {
             .map(str::to_string)
             .collect();
 
-        let receiving_host = receiving_host(&headers);
         Ok(ThreatInput {
             headers,
             subjects,
@@ -269,7 +279,7 @@ impl ThreatInput {
             html: parsed.body_html(0).map(|h| h.to_string()),
             attachments,
             account_address: account_address.trim().to_lowercase(),
-            receiving_host,
+            receiver_domain: None,
             ledger: Err("correspondent ledger not loaded".to_string()),
         })
     }
@@ -437,20 +447,22 @@ pub fn message_id_values(raw: &[u8]) -> Vec<String> {
     message_id_values_in(&parse_header_block(raw))
 }
 
-/// The `by` host of a `Received` header, if it names one.
-pub fn received_by_host(value: &str) -> Option<String> {
+/// Every word that follows `by` in a `Received` header, in order. A sender's
+/// HELO can add words here; it cannot remove the receiver's own `by` host.
+pub fn received_by_hosts(value: &str) -> Vec<String> {
     let lower = value.to_lowercase();
-    let mut words = lower.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == "by" {
-            return words
-                .next()
-                .map(|h| h.trim_matches(|c: char| c == '(' || c == ')' || c == ';' || c == '['))
-                .map(|h| h.trim_end_matches('.').to_string())
-                .filter(|h| !h.is_empty());
-        }
-    }
-    None
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "by")
+        .map(|pair| {
+            pair[1]
+                .trim_matches(|c: char| matches!(c, '(' | ')' | ';' | '[' | ']'))
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 /// A `by` host that is a DNS name (not an IP literal or opaque id).
@@ -461,14 +473,6 @@ pub fn is_dns_name(host: &str) -> bool {
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-}
-
-fn receiving_host(headers: &[(String, String)]) -> Option<String> {
-    headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("received"))
-        .filter_map(|(_, value)| received_by_host(value))
-        .find(|host| is_dns_name(host))
 }
 
 /// A pluggable analyzer. Local analyzers are infallible pure functions; I/O
@@ -692,6 +696,8 @@ pub(crate) mod test_support {
         raw.push_str(body);
         let mut input = ThreatInput::from_raw(raw.as_bytes(), "me@example.org").unwrap();
         input.ledger = Ok(CorrespondentFacts::default());
+        // As if the account's IMAP host were imap.example.org.
+        input.receiver_domain = Some("example.org".to_string());
         input
     }
 
@@ -827,10 +833,7 @@ mod tests {
         );
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].1, "from a by mx.example.org; Mon");
-        assert_eq!(
-            received_by_host(&headers[0].1).as_deref(),
-            Some("mx.example.org")
-        );
+        assert_eq!(received_by_hosts(&headers[0].1), vec!["mx.example.org"]);
     }
 
     const LUNCH: &str = "From: Alice <alice@partner.example>\r\n\
@@ -887,16 +890,21 @@ mod tests {
     }
 
     #[test]
-    fn receiving_host_skips_opaque_by_ids() {
-        let input = input_from(
-            &[
-                "Received: by 2002:a05:6a10:1234 with SMTP id x; Mon, 1 Jan 2026",
-                "Received: from mail.sender.example by mx.google.com with ESMTPS id y",
-                "From: a@sender.example",
-            ],
-            "x",
+    fn received_by_hosts_lists_every_by_word() {
+        assert_eq!(
+            received_by_hosts("by 2002:a05:6a10:1234 with SMTP id x; Mon, 1 Jan 2026"),
+            vec!["2002:a05:6a10:1234"]
         );
-        assert_eq!(input.receiving_host.as_deref(), Some("mx.google.com"));
+        assert_eq!(
+            received_by_hosts(
+                "from x by 10.0.0.1 (h.example. [203.0.113.9]) By MX.Google.com. with ESMTPS id y"
+            ),
+            vec!["10.0.0.1", "mx.google.com"]
+        );
+        assert_eq!(
+            received_by_hosts("from a ([198.51.100.7]) by [10.0.0.5] with ESMTP"),
+            vec!["10.0.0.5"]
+        );
     }
 
     #[test]

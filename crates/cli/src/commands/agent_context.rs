@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-//! Per-agent identity context for the MCP transport.
+//! Per-agent identity context for the MCP transport and token-gated CLI commands.
 //!
 //! At MCP startup Envelope requires `ENVELOPE_AGENT_TOKEN` and resolves it to a
 //! stored [`AgentIdentity`] and its policy; every subsequent MCP tool call is
@@ -24,10 +24,14 @@
 //!    [`parse_allow_list`].
 
 use envelope_email_store::{
-    AgentIdentity, AgentPolicy as StoreAgentPolicy, Database,
+    AgentIdentity, AgentPolicy as StoreAgentPolicy, Database, Draft,
     SendModeCeiling as StoreSendModeCeiling,
 };
+use envelope_email_transport::bulk::{self, BulkOp, BulkRequest, BulkTarget};
+use envelope_email_transport::imap::ImapClient;
+use envelope_email_transport::threat::persist;
 use envelope_email_transport::{AgentPolicy as TransportPolicy, PolicyDenial, SendMode};
+use serde_json::{Value, json};
 
 /// Env var carrying the raw bearer token that selects an agent identity for the
 /// MCP session.
@@ -37,6 +41,124 @@ pub const AGENT_TOKEN_ENV: &str = "ENVELOPE_AGENT_TOKEN";
 /// sets it. Anonymous MCP is full-mailbox access, so operators must opt in
 /// conspicuously rather than receiving it as an unset-token default.
 pub const UNSAFE_ANONYMOUS_ENV: &str = "ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS";
+
+/// CLI actions an agent token may perform only when its policy names them.
+/// Each one sends mail data off the machine, contacts a sender, or changes
+/// what runs on mail without anyone asking, so a `"*"` policy does not
+/// include them.
+pub const EXPLICIT_GRANT_ACTIONS: &[&str] = &[
+    RULES_WRITE,
+    RULES_WEBHOOK,
+    RULES_BATCH_ACK,
+    SIEVE_PUBLISH,
+    WATCH_WEBHOOK,
+    UNSUBSCRIBE,
+];
+/// Create, enable, disable or delete a rule.
+pub const RULES_WRITE: &str = "rules.write";
+/// Create or enable a rule whose action posts message data to a webhook.
+pub const RULES_WEBHOOK: &str = "rules.webhook";
+/// `rule enable --acknowledge-batch-actions`: let snooze and unsubscribe
+/// rules act in batch runs.
+pub const RULES_BATCH_ACK: &str = "rules.batch_ack";
+/// `rule publish-sieve --confirm`: upload the rules to the mail server.
+pub const SIEVE_PUBLISH: &str = "sieve.publish";
+/// `watch --webhook <url>`: post each new message's event to a URL.
+pub const WATCH_WEBHOOK: &str = "watch.webhook";
+/// `unsubscribe --confirm`: contact a list's unsubscribe address.
+pub const UNSUBSCRIBE: &str = "unsubscribe";
+/// Stable code for a set `ENVELOPE_AGENT_TOKEN` that matches no active agent.
+pub const AGENT_TOKEN_INVALID_CODE: &str = "agent_token_invalid";
+/// Stable code for a command that never runs with an agent token.
+pub const OPERATOR_ONLY_CODE: &str = "operator_only_command";
+
+/// The refusal for something only the operator may do.
+pub fn operator_only_denial() -> PolicyDenial {
+    PolicyDenial {
+        code: OPERATOR_ONLY_CODE,
+        reason: "this changes credentials, agents, policy, configuration, authentication, \
+                 delivery routes or a threat verdict, so it runs only for the operator, \
+                 without an agent token"
+            .to_string(),
+    }
+}
+
+/// The refusal for an agent's move, copy, snooze or delete of a message the
+/// threat engine holds, `reason` from [`persist::held_reason`]. The check
+/// reads the message's content, so it applies in every folder that shows it.
+pub fn held_denial(folder: &str, uid: u32, reason: &str) -> PolicyDenial {
+    PolicyDenial {
+        code: OPERATOR_ONLY_CODE,
+        reason: format!(
+            "UID {uid} in {folder} is held by the threat engine ({reason}), so only the \
+             operator moves, copies, snoozes or deletes it, without an agent token"
+        ),
+    }
+}
+
+/// For an agent, the refusal to move, copy, snooze or delete the message at
+/// `folder`/`uid` when the threat engine holds it. The operator (`None`) is
+/// never checked.
+pub async fn held_message_denial(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> anyhow::Result<Option<PolicyDenial>> {
+    if ctx.is_none() {
+        return Ok(None);
+    }
+    Ok(persist::held_at(client, db, account_id, folder, uid)
+        .await?
+        .map(|reason| held_denial(folder, uid, &reason)))
+}
+
+/// For an agent, the refusal of a bulk move, copy or delete when any message
+/// it targets is held ([`held_message_denial`]). The request is pinned to the
+/// UIDs checked, so the run acts on exactly those. A dry run, another op, a
+/// target over the bulk limit (which the run refuses) and the operator are
+/// not checked.
+pub async fn held_bulk_denial(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    account_id: &str,
+    req: &mut BulkRequest,
+) -> anyhow::Result<Option<PolicyDenial>> {
+    let moves_mail = matches!(
+        req.op,
+        BulkOp::Move { .. } | BulkOp::Copy { .. } | BulkOp::Delete
+    );
+    if ctx.is_none() || req.dry_run || !moves_mail {
+        return Ok(None);
+    }
+    let uids = bulk::resolve_target(client, &req.folder, &req.target).await?;
+    if uids.len() <= bulk::BULK_UID_LIMIT {
+        for &uid in &uids {
+            if let Some(denial) =
+                held_message_denial(client, db, ctx, account_id, &req.folder, uid).await?
+            {
+                return Ok(Some(denial));
+            }
+        }
+    }
+    req.target = BulkTarget::Uids(uids);
+    Ok(None)
+}
+
+/// A CLI command refused for the acting agent, as a stable `{code, reason}`.
+#[derive(Debug)]
+pub struct CliDenial(pub PolicyDenial);
+
+impl std::fmt::Display for CliDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.0.reason, self.0.code)
+    }
+}
+
+impl std::error::Error for CliDenial {}
 
 /// A resolved agent identity plus its enforcement policy for one MCP session.
 #[derive(Debug, Clone)]
@@ -67,19 +189,89 @@ impl AgentContext {
     /// Authorize a bare policy action (already resolved, not a tool name)
     /// against `account`/`folder`. Used for the bulk two-action gate, where the
     /// coarse `bulk` action and the underlying operation action must both pass.
+    /// An [`EXPLICIT_GRANT_ACTIONS`] action must be named in the policy; a
+    /// `"*"` wildcard does not grant it.
     pub fn authorize_action(
         &self,
         action: &str,
         account: &str,
         folder: Option<&str>,
     ) -> Result<(), PolicyDenial> {
+        self.allows_action(action)?;
         self.policy.authorize(action, account, folder)
+    }
+
+    /// The action check alone, for a CLI command whose account is not known
+    /// yet. An [`EXPLICIT_GRANT_ACTIONS`] action must be named; any other is
+    /// granted by its name or by `"*"`.
+    pub fn allows_action(&self, action: &str) -> Result<(), PolicyDenial> {
+        let allowed = &self.policy.allowed_actions;
+        let granted = if EXPLICIT_GRANT_ACTIONS.contains(&action) {
+            allowed.iter().any(|a| a == action)
+        } else {
+            allowed.iter().any(|a| a == action || a == "*")
+        };
+        if granted {
+            return Ok(());
+        }
+        let reason = if EXPLICIT_GRANT_ACTIONS.contains(&action) {
+            format!("agent policy does not permit action '{action}'; it must be granted by name")
+        } else {
+            format!("agent policy does not permit action '{action}'")
+        };
+        Err(PolicyDenial {
+            code: "agent_policy_denied_action",
+            reason,
+        })
     }
 
     /// Clamp a requested send mode down to this agent's policy ceiling.
     pub fn clamp_send_mode(&self, requested: SendMode) -> SendMode {
         self.policy.clamp_send_mode(requested)
     }
+}
+
+/// The confirmation and recipient allowlist a send is evaluated with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendAuthority<'a> {
+    pub confirm_send: bool,
+    pub allow_recipients: &'a [String],
+}
+
+/// Where send authority comes from for one send-policy evaluation.
+///
+/// With an agent identity, the allowlist is the agent's stored policy and
+/// confirmation is a human approval of the draft's current revision (a message
+/// that is not a draft yet has none). The caller's own `confirm_send` and
+/// `allow_recipient` values are intent only. Without an identity (the operator
+/// CLI, or the unsafe anonymous MCP override) the caller's values apply.
+pub fn agent_policy_input<'a>(
+    ctx: Option<&'a AgentContext>,
+    tool_confirm: bool,
+    tool_allow: &'a [String],
+    draft: Option<&Draft>,
+) -> SendAuthority<'a> {
+    match ctx {
+        Some(ctx) => SendAuthority {
+            confirm_send: draft.is_some_and(Draft::human_approved),
+            allow_recipients: &ctx.policy.allow_recipients,
+        },
+        None => SendAuthority {
+            confirm_send: tool_confirm,
+            allow_recipients: tool_allow,
+        },
+    }
+}
+
+/// True when an agent's new message must wait for a human: under confirm-send
+/// it cannot carry an approval yet, so it is saved as a draft instead of sent.
+pub fn awaits_human_approval(ctx: Option<&AgentContext>, mode: SendMode) -> bool {
+    ctx.is_some() && mode == SendMode::ConfirmSend
+}
+
+/// Tells the agent that a human must approve the draft before it can be sent.
+pub fn human_approval_hint() -> Value {
+    json!({"required": "human_approval", "surface": "dashboard"})
 }
 
 /// Resolve the MCP agent context from the environment.
@@ -92,11 +284,33 @@ impl AgentContext {
 ///
 /// The raw token is never echoed into the error.
 pub fn resolve_from_env(db: &Database) -> anyhow::Result<Option<AgentContext>> {
-    let raw = std::env::var(AGENT_TOKEN_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let raw = agent_token_from_env()?;
     let unsafe_anonymous = std::env::var(UNSAFE_ANONYMOUS_ENV).ok().as_deref() == Some("1");
     resolve_from_values(db, raw, unsafe_anonymous)
+}
+
+/// The raw `ENVELOPE_AGENT_TOKEN`. Unset or blank is `None`, the operator. A
+/// value that is not valid UTF-8 can match no token, so it is refused rather
+/// than read as unset.
+pub fn agent_token_from_env() -> anyhow::Result<Option<String>> {
+    let Some(raw) = std::env::var_os(AGENT_TOKEN_ENV) else {
+        return Ok(None);
+    };
+    match raw.into_string() {
+        Ok(token) if token.trim().is_empty() => Ok(None),
+        Ok(token) => Ok(Some(token)),
+        Err(_) => Err(invalid_token().into()),
+    }
+}
+
+fn invalid_token() -> CliDenial {
+    CliDenial(PolicyDenial {
+        code: AGENT_TOKEN_INVALID_CODE,
+        reason: format!(
+            "{AGENT_TOKEN_ENV} is set but does not match any active agent identity \
+             (unknown or revoked token)"
+        ),
+    })
 }
 
 /// Pure startup-policy core, separated from process environment lookup so the
@@ -129,17 +343,167 @@ fn resolve_from_values(
              Create one with `envelope agent create <name>`."
         )
     })?;
+    context_for(db, &identity).map(Some)
+}
 
+fn context_for(db: &Database, identity: &AgentIdentity) -> anyhow::Result<AgentContext> {
     let store_policy = db
         .get_agent_policy(&identity.id)?
         .unwrap_or_else(|| StoreAgentPolicy::default_for(&identity.id));
     let policy = map_store_policy(&store_policy)?;
 
-    Ok(Some(AgentContext {
+    Ok(AgentContext {
         agent_id: identity.id.clone(),
         agent_name: identity.name.clone(),
         policy,
-    }))
+    })
+}
+
+/// Resolve who is running a CLI command.
+///
+/// - No (or a blank) `ENVELOPE_AGENT_TOKEN`: the operator, `Ok(None)`. The
+///   command behaves exactly as it does without agent identities.
+/// - A token for an active agent: `Ok(Some(ctx))`; token-gated commands then
+///   apply that agent's policy.
+/// - Any other token: a [`CliDenial`] with [`AGENT_TOKEN_INVALID_CODE`]. A bad
+///   token never falls back to the operator.
+///
+/// The raw token is never echoed into the error.
+pub fn resolve_cli_from_env(db: &Database) -> anyhow::Result<Option<AgentContext>> {
+    resolve_cli_from_values(db, agent_token_from_env()?)
+}
+
+fn resolve_cli_from_values(
+    db: &Database,
+    raw: Option<String>,
+) -> anyhow::Result<Option<AgentContext>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(identity) = db.get_agent_by_token(&raw)? else {
+        return Err(invalid_token().into());
+    };
+    context_for(db, &identity).map(Some)
+}
+
+/// [`resolve_cli_from_env`] without writing anything: the token is checked
+/// on a read-only connection to an existing database, and no database means
+/// no agent can match. Used before every CLI command, so commands that must
+/// not create or change files (`quickstart --skip-network`) stay that way.
+pub fn peek_cli_agent() -> anyhow::Result<Option<AgentContext>> {
+    let Some(raw) = agent_token_from_env()? else {
+        return Ok(None);
+    };
+    let Some(db) = Database::open_default_readonly_existing()? else {
+        return Err(invalid_token().into());
+    };
+    let Some(identity) = db.find_active_agent_by_token(&raw)? else {
+        return Err(invalid_token().into());
+    };
+    context_for(&db, &identity).map(Some)
+}
+
+/// The CLI's acting agent. An invalid token is refused and, in JSON mode,
+/// printed as `{"status":"denied","error":{code,reason}}`.
+pub fn cli_agent(db: &Database, json: bool) -> anyhow::Result<Option<AgentContext>> {
+    resolve_cli_from_env(db).map_err(|e| print_cli_denial(e, json))
+}
+
+/// Authorize `action` on `account_id` for the CLI's acting agent before any
+/// write or network call. The operator (`None`) is always allowed. A denial
+/// is recorded in the agent's action log, printed in JSON mode, and returned
+/// as the command's error so it exits nonzero.
+pub fn authorize_cli_action(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    ctx.authorize_action(action, account_id, None)
+        .map_err(|denial| refuse_cli(db, ctx, action, account_id, denial, json))
+}
+
+/// Refuse an operator-only change for the CLI's acting agent, whatever its
+/// policy grants. The operator (`None`) is always allowed. Recorded and
+/// printed as [`authorize_cli_action`] does.
+pub fn require_cli_operator(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    match ctx {
+        None => Ok(()),
+        Some(ctx) => Err(refuse_cli(
+            db,
+            ctx,
+            action,
+            account_id,
+            operator_only_denial(),
+            json,
+        )),
+    }
+}
+
+/// [`held_message_denial`] for the CLI: a held message refuses the command,
+/// recorded and printed as [`authorize_cli_action`] does.
+#[allow(clippy::too_many_arguments)]
+pub async fn refuse_held_cli(
+    client: &mut ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let denial = held_message_denial(client, db, ctx, account_id, folder, uid).await?;
+    refuse_cli_with(db, ctx, action, account_id, denial, json)
+}
+
+/// Refuse with `denial`, recorded and printed as [`authorize_cli_action`]
+/// does. The operator (`None`) is never refused.
+pub fn refuse_cli_with(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    denial: Option<PolicyDenial>,
+    json: bool,
+) -> anyhow::Result<()> {
+    match (ctx, denial) {
+        (Some(agent), Some(denial)) => Err(refuse_cli(db, agent, action, account_id, denial, json)),
+        _ => Ok(()),
+    }
+}
+
+fn refuse_cli(
+    db: &Database,
+    ctx: &AgentContext,
+    action: &str,
+    account_id: &str,
+    denial: PolicyDenial,
+    json: bool,
+) -> anyhow::Error {
+    if let Err(e) =
+        db.log_denied_action_with_agent(account_id, action, denial.code, Some(&ctx.agent_id))
+    {
+        tracing::warn!("could not record the refused {action} in the action log: {e}");
+    }
+    print_cli_denial(CliDenial(denial).into(), json)
+}
+
+pub(crate) fn print_cli_denial(error: anyhow::Error, json: bool) -> anyhow::Error {
+    if json && let Some(CliDenial(denial)) = error.downcast_ref::<CliDenial>() {
+        println!("{}", json!({"status": "denied", "error": denial.to_json()}));
+    }
+    error
 }
 
 /// Map a stored agent policy row into the pure transport policy the enforcement
@@ -281,6 +645,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_identity_is_the_operator_without_a_token_and_fails_closed_on_a_bad_one() {
+        let db = Database::open_memory().unwrap();
+        assert!(resolve_cli_from_values(&db, None).unwrap().is_none());
+
+        let err = resolve_cli_from_values(&db, Some("envtok_unknown".into())).unwrap_err();
+        let denial = err.downcast_ref::<CliDenial>().expect("a stable denial");
+        assert_eq!(denial.0.code, AGENT_TOKEN_INVALID_CODE);
+        assert!(!err.to_string().contains("envtok_unknown"));
+
+        let created = db.create_agent("skippy").unwrap();
+        let ctx = resolve_cli_from_values(&db, Some(created.token.clone()))
+            .unwrap()
+            .expect("an active agent");
+        assert_eq!(ctx.agent_id, created.identity.id);
+
+        db.revoke_agent(&created.identity.id).unwrap();
+        let err = resolve_cli_from_values(&db, Some(created.token)).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliDenial>().unwrap().0.code,
+            AGENT_TOKEN_INVALID_CODE
+        );
+    }
+
+    #[test]
+    fn a_wildcard_policy_does_not_grant_explicit_grant_actions() {
+        let mut ctx = allowlisted_ctx(SendMode::DraftOnly);
+        ctx.policy.allowed_actions = vec!["*".to_string()];
+        for action in EXPLICIT_GRANT_ACTIONS {
+            let denial = ctx.authorize_action(action, "acct", None).unwrap_err();
+            assert_eq!(denial.code, "agent_policy_denied_action");
+        }
+        assert!(ctx.authorize_action("rules.run", "acct", None).is_ok());
+
+        ctx.policy.allowed_actions = vec![RULES_WEBHOOK.to_string()];
+        assert!(ctx.authorize_action(RULES_WEBHOOK, "acct", None).is_ok());
+        assert!(ctx.authorize_action(SIEVE_PUBLISH, "acct", None).is_err());
+    }
+
+    #[test]
     fn send_mode_ceiling_maps_all_four_variants_exhaustively() {
         // Pins the store->transport bridge across all four stable names. If a
         // variant is added to either enum, this test (and the exhaustive match)
@@ -361,6 +764,84 @@ mod tests {
         assert_eq!(bulk_underlying_action("delete"), Some("delete"));
         assert_eq!(bulk_underlying_action("tag"), Some("tag"));
         assert_eq!(bulk_underlying_action("nope"), None);
+    }
+
+    fn allowlisted_ctx(ceiling: SendMode) -> AgentContext {
+        AgentContext {
+            agent_id: "id".to_string(),
+            agent_name: "skippy".to_string(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".to_string()],
+                allowed_folders: vec!["*".to_string()],
+                allowed_actions: vec!["send".to_string()],
+                send_mode_ceiling: ceiling,
+                allow_recipients: vec!["ok@example.test".to_string()],
+            },
+        }
+    }
+
+    fn draft_at_revision(revision: i64, approved_revision: Option<i64>) -> Draft {
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Test",
+                "me@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let mut draft = db
+            .create_draft(
+                &account.id,
+                "a@b.test",
+                Some("hi"),
+                Some("x"),
+                None,
+                None,
+                None,
+                None,
+                Some("mcp"),
+            )
+            .unwrap();
+        draft.revision = revision;
+        draft.metadata = approved_revision.map(|r| {
+            json!({"human_approval": {
+                "approved_by": "human:dashboard",
+                "approved_at": "2026-10-03T10:00:00Z",
+                "revision": r,
+            }})
+        });
+        draft
+    }
+
+    #[test]
+    fn agent_send_authority_ignores_the_call_and_reads_the_policy() {
+        let ctx = allowlisted_ctx(SendMode::AllowlistedSend);
+        let tool_allow = vec!["stranger@example.test".to_string()];
+        let authority = agent_policy_input(Some(&ctx), true, &tool_allow, None);
+        assert!(!authority.confirm_send, "a call cannot confirm itself");
+        assert_eq!(authority.allow_recipients, ["ok@example.test".to_string()]);
+
+        let approved = draft_at_revision(3, Some(3));
+        assert!(agent_policy_input(Some(&ctx), false, &[], Some(&approved)).confirm_send);
+        let stale = draft_at_revision(4, Some(3));
+        assert!(!agent_policy_input(Some(&ctx), true, &[], Some(&stale)).confirm_send);
+    }
+
+    #[test]
+    fn operator_send_authority_is_the_callers_own() {
+        let tool_allow = vec!["c@d.test".to_string()];
+        let authority = agent_policy_input(None, true, &tool_allow, None);
+        assert!(authority.confirm_send);
+        assert_eq!(authority.allow_recipients, tool_allow.as_slice());
+        assert!(!awaits_human_approval(None, SendMode::ConfirmSend));
+        let ctx = allowlisted_ctx(SendMode::ConfirmSend);
+        assert!(awaits_human_approval(Some(&ctx), SendMode::ConfirmSend));
+        assert!(!awaits_human_approval(Some(&ctx), SendMode::DraftOnly));
     }
 
     #[test]

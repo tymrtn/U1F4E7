@@ -143,8 +143,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | envelope mcp
 # Watch for new mail in real time (IMAP IDLE)
 envelope watch --json
 
-# Extract a verification code
-CODE=$(envelope code --wait 60)
+# Extract a verification code from an authenticated sender
+CODE=$(envelope code --from otp@issuer.example --wait 60)
 
 # Open the local dashboard
 envelope serve   # http://localhost:3141

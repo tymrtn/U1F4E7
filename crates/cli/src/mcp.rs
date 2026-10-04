@@ -289,6 +289,9 @@ fn authorize_tool_call_with_db(
     let Some(ctx) = ctx else {
         return Ok(());
     };
+    if writes_threat_tag(tool_name, params) || changes_quarantine(tool_name, params) {
+        return Err(agent_context::operator_only_denial().to_json().to_string());
+    }
     let account = authoritative_policy_account(db, tool_name, params)?;
     let folder = tool_folder(tool_name, params);
 
@@ -317,6 +320,63 @@ fn authorize_tool_call_with_db(
 
     ctx.authorize_tool(tool_name, &account, folder)
         .map_err(|denial| denial.to_json().to_string())
+}
+
+/// A `tag` call or `bulk` tag op naming a threat tag, which only the
+/// operator may set.
+fn writes_threat_tag(tool_name: &str, params: &Value) -> bool {
+    use envelope_email_transport::threat::is_threat_tag;
+    match tool_name {
+        "tag" => params
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().filter_map(Value::as_str).any(is_threat_tag)),
+        "bulk" => {
+            params.get("op").and_then(Value::as_str) == Some("tag")
+                && params
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_threat_tag)
+        }
+        _ => false,
+    }
+}
+
+/// A call other than a read whose source folder (`folder`, or `from_folder`
+/// for move_message) is the quarantine folder. Changing mail there, by any
+/// route, releases it; only the operator does that. An unknown tool counts
+/// as a change.
+fn changes_quarantine(tool_name: &str, params: &Value) -> bool {
+    use envelope_email_transport::threat::persist::is_quarantine_folder;
+    let reads = match tool_name {
+        "rules_run" => params.get("dry_run").and_then(Value::as_bool) != Some(false),
+        "snooze" => {
+            params
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list")
+                == "list"
+        }
+        _ => matches!(
+            agent_context::tool_action(tool_name),
+            Some(
+                "accounts.list"
+                    | "inbox.read"
+                    | "folders.list"
+                    | "contacts.read"
+                    | "draft.read"
+                    | "rules.read"
+                    | "watch.read"
+            )
+        ),
+    };
+    !reads
+        && ["folder", "from_folder"].iter().any(|key| {
+            params
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(is_quarantine_folder)
+        })
 }
 
 fn authorize_tool_call(
@@ -761,15 +821,21 @@ async fn handle_send(
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
         .map_err(|e: anyhow::Error| e.to_string())?;
+    let authority = agent_context::agent_policy_input(ctx, confirm_send, &allow_recipients, None);
     let policy_input = SendPolicyInput {
         to,
         cc,
         bcc,
-        confirm_send,
-        allow_recipients: &allow_recipients,
+        confirm_send: authority.confirm_send,
+        allow_recipients: authority.allow_recipients,
     };
 
-    let decision = evaluate(send_mode, &policy_input);
+    let awaiting_approval = agent_context::awaits_human_approval(ctx, send_mode);
+    let decision = if awaiting_approval {
+        SendPolicyDecision::DraftOnly
+    } else {
+        evaluate(send_mode, &policy_input)
+    };
     record_send_policy_event(
         &db,
         &creds.account.id,
@@ -803,14 +869,18 @@ async fn handle_send(
             }
             crate::commands::drafts::persist_from_override(&db, &draft.id, from)
                 .map_err(|e| e.to_string())?;
-            return Ok(json!({
+            let mut result = json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
                 "draft_id": draft.id,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
-            }));
+            });
+            if awaiting_approval {
+                result["confirmation"] = agent_context::human_approval_hint();
+            }
+            return Ok(result);
         }
         SendPolicyDecision::Denied(denial) => {
             return Err(json!({
@@ -1217,14 +1287,20 @@ async fn handle_reply(
     } else {
         Some(headers.cc.join(", "))
     };
+    let authority = agent_context::agent_policy_input(ctx, confirm_send, &allow_recipients, None);
     let policy_input = SendPolicyInput {
         to: &headers.to,
         cc: cc_str.as_deref(),
         bcc: None,
-        confirm_send,
-        allow_recipients: &allow_recipients,
+        confirm_send: authority.confirm_send,
+        allow_recipients: authority.allow_recipients,
     };
-    let decision = evaluate(send_mode, &policy_input);
+    let awaiting_approval = agent_context::awaits_human_approval(ctx, send_mode);
+    let decision = if awaiting_approval {
+        SendPolicyDecision::DraftOnly
+    } else {
+        evaluate(send_mode, &policy_input)
+    };
     record_send_policy_event(
         &db,
         &creds.account.id,
@@ -1266,7 +1342,7 @@ async fn handle_reply(
                 }),
             )
             .map_err(|e| e.to_string())?;
-            return Ok(json!({
+            let mut result = json!({
                 "sent": false,
                 "status": "drafted",
                 "send_mode": send_mode,
@@ -1274,7 +1350,11 @@ async fn handle_reply(
                 "in_reply_to": headers.in_reply_to,
                 "attachments": attachment_summaries(&attachment_snapshots),
                 "ui": ui::draft_ui(&creds.account.id, &draft.id),
-            }));
+            });
+            if awaiting_approval {
+                result["confirmation"] = agent_context::human_approval_hint();
+            }
+            return Ok(result);
         }
         SendPolicyDecision::Denied(denial) => {
             return Err(json!({
@@ -1608,7 +1688,11 @@ async fn handle_send_draft(
     // send_now, and confirm_send_now. This mirrors handle_send/handle_reply:
     // a draft-only decision yields a non-sent status=drafted outcome referencing
     // the already-existing draft (no new draft is created, no SMTP is reached).
-    if let Some(agent) = ctx {
+    //
+    // The revision the policy admitted. Everything after this must act on
+    // exactly that revision, so a human approval never covers a later edit.
+    let mut admitted_revision = None;
+    if ctx.is_some() {
         let db = Database::open_default().map_err(|e| e.to_string())?;
         let draft = db
             .get_draft(id)
@@ -1619,14 +1703,15 @@ async fn handle_send_draft(
         // ceiling yields a draft and a denial stops the call; only an allowed
         // decision passes through to the normal Governor-gated dispatch below.
         let send_mode = clamp_mode(ctx, SendMode::AutonomousSend);
+        // Confirmation is a human approval of this revision and the allowlist
+        // is the agent's own; the call's confirm_send is intent only.
+        let authority = agent_context::agent_policy_input(ctx, confirm_send, &[], Some(&draft));
         let policy_input = SendPolicyInput {
             to: &draft.to_addr,
             cc: draft.cc_addr.as_deref(),
             bcc: draft.bcc_addr.as_deref(),
-            confirm_send,
-            // send_draft takes no per-call allowlist: an allowlisted-send
-            // ceiling admits only the agent's stored recipient allowlist.
-            allow_recipients: &agent.policy.allow_recipients,
+            confirm_send: authority.confirm_send,
+            allow_recipients: authority.allow_recipients,
         };
         let decision = evaluate(send_mode, &policy_input);
         record_send_policy_event(
@@ -1638,7 +1723,7 @@ async fn handle_send_draft(
             agent_context::agent_id_of(ctx),
         )?;
         match decision {
-            SendPolicyDecision::Allowed => {}
+            SendPolicyDecision::Allowed => admitted_revision = Some(draft.revision),
             SendPolicyDecision::DraftOnly => {
                 return Ok(crate::commands::contract::send_body::mcp_drafted(
                     json!(send_mode),
@@ -1647,14 +1732,17 @@ async fn handle_send_draft(
                 ));
             }
             SendPolicyDecision::Denied(denial) => {
-                return Err(json!({
+                let mut refusal = json!({
                     "status": "denied",
                     "error": denial,
                     "send_mode": send_mode,
                     "draft_id": draft.id,
                     "ui": ui::draft_ui(&draft.account_id, &draft.id),
-                })
-                .to_string());
+                });
+                if send_mode == SendMode::ConfirmSend {
+                    refusal["confirmation"] = agent_context::human_approval_hint();
+                }
+                return Err(refusal.to_string());
             }
         }
     }
@@ -1680,6 +1768,9 @@ async fn handle_send_draft(
         }
         precheck
     };
+    if admitted_revision.is_some_and(|revision| revision != precheck.revision) {
+        return Err(crate::commands::drafts::draft_changed_since_admitted(id).to_string());
+    }
 
     let cooldown_override = params.get("cooldown_seconds").and_then(|v| v.as_i64());
     let send_now = params
@@ -1759,6 +1850,7 @@ async fn handle_send_draft(
         SendSurface::Mcp,
         &declared,
         agent_context::agent_id_of(ctx),
+        admitted_revision,
     )
     .await
     {
@@ -1897,6 +1989,38 @@ fn is_sent_destination(dest: &str, sent_folder: Option<&str>) -> bool {
         || sent_folder.is_some_and(|sent| sent.eq_ignore_ascii_case(dest.trim()))
 }
 
+/// Refuse an agent's move, copy, snooze or delete of a message the threat
+/// engine holds, wherever it is seen ([`agent_context::held_message_denial`]).
+async fn refuse_held(
+    client: &mut envelope_email_transport::imap::ImapClient,
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    tool_name: &str,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<(), String> {
+    let denial = agent_context::held_message_denial(client, db, ctx, account_id, folder, uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    refuse_with(db, ctx, tool_name, account_id, denial)
+}
+
+/// Refuse the call with `denial`, recorded as a policy refusal is.
+fn refuse_with(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    tool_name: &str,
+    account_id: &str,
+    denial: Option<envelope_email_transport::PolicyDenial>,
+) -> Result<(), String> {
+    let Some(denial) = denial else {
+        return Ok(());
+    };
+    record_tool_denial(db, ctx, Some(account_id), tool_name, denial.code);
+    Err(denial.to_json().to_string())
+}
+
 async fn handle_move(
     params: &Value,
     backend: CredentialBackend,
@@ -1920,6 +2044,16 @@ async fn handle_move(
         .await
         .map_err(|e| e.to_string())?;
     refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
+    refuse_held(
+        &mut client,
+        &db,
+        ctx,
+        "move_message",
+        &creds.account.id,
+        from_folder,
+        uid,
+    )
+    .await?;
 
     envelope_email_transport::imap::move_message(&mut client, uid, from_folder, to_folder)
         .await
@@ -2392,7 +2526,7 @@ async fn handle_bulk(
     backend: CredentialBackend,
     ctx: Option<&AgentContext>,
 ) -> Result<Value, String> {
-    let (req, op_str, forced_dry_run) = parse_bulk_request(params)?;
+    let (mut req, op_str, forced_dry_run) = parse_bulk_request(params)?;
 
     // Two-action gate: `bulk` (already checked by authorize_tool_call) AND the
     // underlying single action for this op must both be allowed. Deny with the
@@ -2419,6 +2553,10 @@ async fn handle_bulk(
     {
         refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
     }
+    let held = agent_context::held_bulk_denial(&mut client, &db, ctx, &creds.account.id, &mut req)
+        .await
+        .map_err(|e| e.to_string())?;
+    refuse_with(&db, ctx, "bulk", &creds.account.id, held)?;
 
     let result = envelope_email_transport::bulk::execute(&mut client, &db, &creds.account.id, &req)
         .await
@@ -2713,6 +2851,16 @@ async fn handle_snooze(
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
                 .map_err(|e| e.to_string())?;
+            refuse_held(
+                &mut client,
+                &db,
+                ctx,
+                "snooze",
+                &creds.account.id,
+                folder,
+                uid,
+            )
+            .await?;
             let _ = envelope_email_transport::imap::create_folder(&mut client, "Snoozed").await;
             let msg = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
                 .await
@@ -3131,6 +3279,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(denial.contains("agent_policy_denied_account"), "{denial}");
+    }
+
+    #[test]
+    fn threat_tags_are_operator_only_for_an_agent() {
+        use envelope_email_transport::{AgentPolicy as TransportPolicy, SendMode};
+
+        let db = Database::open_memory().unwrap();
+        let account = db
+            .create_account(
+                "Me",
+                "me@example.test",
+                "pw",
+                "smtp.example.test",
+                587,
+                "imap.example.test",
+                993,
+                "passphrase",
+            )
+            .unwrap();
+        let ctx = AgentContext {
+            agent_id: "agent-1".into(),
+            agent_name: "skippy".into(),
+            policy: TransportPolicy {
+                allowed_accounts: vec!["*".into()],
+                allowed_folders: vec!["*".into()],
+                allowed_actions: vec!["*".into()],
+                send_mode_ceiling: SendMode::DraftOnly,
+                allow_recipients: Vec::new(),
+            },
+        };
+        let acct = account.username.as_str();
+        for (tool, params) in [
+            (
+                "tag",
+                json!({"account": acct, "uid": 1, "tags": ["threat:false_positive"]}),
+            ),
+            (
+                "tag",
+                json!({"account": acct, "uid": 1, "tags": ["ok", "Threat:Malware"]}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "tag", "tag": "threat:quarantined", "uids": [1]}),
+            ),
+        ] {
+            let denial = authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).unwrap_err();
+            assert!(denial.contains("operator_only_command"), "{tool}: {denial}");
+            // The anonymous override has no agent policy to apply.
+            assert!(authorize_tool_call_with_db(&db, None, tool, &params).is_ok());
+        }
+        assert!(
+            authorize_tool_call_with_db(
+                &db,
+                Some(&ctx),
+                "tag",
+                &json!({"account": acct, "uid": 1, "tags": ["newsletter"]}),
+            )
+            .is_ok()
+        );
+
+        // Releasing quarantined mail is the operator's too.
+        let quarantine = "envelope.quarantine";
+        for (tool, params) in [
+            (
+                "move_message",
+                json!({"account": acct, "uid": 1, "from_folder": quarantine, "to_folder": "INBOX"}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "copy", "folder": quarantine, "to_folder": "INBOX", "uids": [1]}),
+            ),
+            (
+                "rules_run",
+                json!({"account": acct, "folder": quarantine, "dry_run": false}),
+            ),
+            (
+                "snooze",
+                json!({"account": acct, "action": "set", "uid": 1, "until": "2h", "folder": "INBOX.Envelope.Quarantine"}),
+            ),
+            (
+                "bulk",
+                json!({"account": acct, "op": "delete", "folder": quarantine, "uids": [1]}),
+            ),
+            (
+                "flag",
+                json!({"account": acct, "uid": 1, "folder": quarantine, "flag": "seen"}),
+            ),
+            (
+                "create_forward_draft",
+                json!({"account": acct, "uid": 1, "folder": quarantine, "to": "a@b.test"}),
+            ),
+        ] {
+            let denial = authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).unwrap_err();
+            assert!(denial.contains("operator_only_command"), "{tool}: {denial}");
+        }
+        // Reading there is allowed, and a preview changes nothing.
+        for (tool, params) in [
+            ("rules_run", json!({"account": acct, "folder": quarantine})),
+            ("inbox", json!({"account": acct, "folder": quarantine})),
+            (
+                "read",
+                json!({"account": acct, "uid": 1, "folder": quarantine}),
+            ),
+            ("snooze", json!({"account": acct, "action": "list"})),
+        ] {
+            assert!(
+                authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).is_ok(),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

@@ -65,7 +65,9 @@ It prints a token once. The user pastes it into their tool's secret setting:
 - **Codex:** in an editor, add `export ENVELOPE_AGENT_TOKEN=<token>` to the
   shell profile that starts Codex (for example `~/.zshrc`), then restart Codex.
   Typing it at the prompt would leave the token in shell history. The plugin
-  forwards that variable to `envelope mcp`.
+  forwards that variable to `envelope mcp`. Every shell then carries the
+  token, so the user's own operator commands are refused there; see
+  "If a command is refused" below.
 - **Cursor:** set `ENVELOPE_AGENT_TOKEN` in the Envelope plugin's settings
   (Plugins → Configure).
 
@@ -92,3 +94,26 @@ tool. Read the error if it fails:
 
 When `accounts` lists the user's addresses, setup is done. Continue with the
 envelope skill.
+
+## If one-time codes are refused
+
+`envelope code --from <sender>` returns a code only when the user's mail
+provider authenticated the sender (DMARC, or DKIM aligned with the From
+domain). Always pass `--from` with the exact sender address or domain.
+
+| Error | Meaning and fix |
+|---|---|
+| `sender_unauthenticated` | The sender failed authentication. Do not use a code from that message; tell the user. |
+| `sender_unverifiable` | The provider recorded no authentication Envelope can trust. Microsoft 365 and Migadu mailboxes always get this, because their results cannot be told apart from ones a sender wrote. So does a mailbox whose mail is received under a different domain from its IMAP host; the user can name that domain with `envelope config set threat.receiver_domain you@example.com=<domain>`. Otherwise the user can allow unverified senders for that account in their own terminal, without the agent token: `env -u ENVELOPE_AGENT_TOKEN envelope config set otp.allow_unverified_senders you@example.com`. Ask them; do not run either yourself. |
+| `timeout` | No matching code arrived. Check `--from`, `--account` and `--wait`. |
+
+## If a command is refused
+
+With an agent token, some commands run only for the user, and some need an
+action granted by name.
+
+| Error | Meaning and fix |
+|---|---|
+| `operator_only_command` | The command changes accounts, credentials, agents, policy, configuration, delivery routes or a threat verdict, or overrides a safety check, so it runs only without an agent token. Ask the user to run it in their own terminal. If their shell exports the token (the Codex setup above), they run it as `env -u ENVELOPE_AGENT_TOKEN envelope ...`. |
+| `agent_policy_denied_action` | The agent's policy lacks the action. `rules.write`, `rules.webhook`, `rules.batch_ack`, `sieve.publish`, `watch.webhook` and `unsubscribe` must be named; `"*"` does not include them. The user can grant one: `env -u ENVELOPE_AGENT_TOKEN envelope agent policy set <name> --allow-actions '<current actions>,rules.write'`. For a `"*"` policy that is `--allow-actions '*,rules.write'`. Ask them; do not run it yourself. |
+| `agent_token_invalid` | The token is unknown or revoked: create a new agent under a new name in step 3. |
