@@ -2136,6 +2136,17 @@ fn run_bulk(
 }
 
 fn main() {
+    // Log events go to stderr only: stdout carries MCP JSON-RPC and `--json`
+    // output. Warnings and errors show by default; RUST_LOG overrides.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
     // Install the rustls crypto provider before any TLS connections are made.
     // Without this, rustls panics with "Could not automatically determine
     // the process-level CryptoProvider" when async-imap or lettre open TLS.

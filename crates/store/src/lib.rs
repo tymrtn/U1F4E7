@@ -58,7 +58,7 @@ pub use paths::{app_data_dir, config_root_dir, credential_file_path, database_pa
 pub use relationship_facts::{RELATIONSHIP_FACT_RECIPIENT_LIMIT, RelationshipFacts};
 pub use send_attempts::{
     AttemptClaim, AttemptLock, AttemptOwner, AttemptPhase, AttemptStart, ClaimMode, IntentKey,
-    IntentLookup, Liveness, NewSendIntent, ReconcileReport, ReleaseBasis,
+    IntentLookup, Liveness, NewSendIntent, ProviderCleanupRetry, ReconcileReport, ReleaseBasis,
 };
 pub use sent_relationships::{SentRelationship, SentRelationshipPage, SentRelationshipSignal};
 pub use threads::ThreadContext;
