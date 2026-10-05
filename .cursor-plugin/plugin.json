@@ -1,6 +1,6 @@
 {
   "name": "envelope",
-  "version": "1.3.16",
+  "version": "1.3.17",
   "description": "All your email accounts in one inbox, shared with your agents. Envelope connects to the mailboxes you already have, so agents can read OTPs, search and reply across accounts, run rules, and draft for your approval.",
   "author": {
     "name": "Tyler Martin"
