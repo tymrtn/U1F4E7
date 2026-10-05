@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.17] — 2026-10-05
+
+A fix release. After a queued send, Envelope now removes the message's Drafts copy even when `envelope serve` stops in between. Warnings and errors also reach stderr.
+
 ### Fixed
 
 - A queued send no longer leaves its copy in Drafts when `envelope serve` stops right after sending it. The sweep marked the message sent first and removed the Drafts copy afterwards, from memory only, so a crash, sleep, restart or kill in between left a sendable copy of mail that had already gone out, and no later sweep tried again. Envelope now records which Drafts copy to remove in the same database write that marks the message sent. `envelope serve` retries pending removals once a minute, up to 20 failed attempts per message, and records the message's Sent copy first when that step never ran. The retry deletes only the message that carries the draft's exact Message-ID in the Drafts folder, and a copy that is already gone closes the record without an error. Retries run on their own timer, apart from scheduled sends, with 30 seconds to connect and 10 minutes per message. When an account's IMAP server stops answering, one connect attempt fails per pass and that account's other removals wait for the next pass, so scheduled sends on other accounts are not held up.
