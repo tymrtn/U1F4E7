@@ -554,3 +554,121 @@ fn an_explicit_idempotency_key_binds_one_payload() {
         .expect("count");
     assert_eq!(rows, 2);
 }
+
+// ── Provider Drafts cleanup after a send ──────────────────────────────────
+
+/// A local port with nothing listening: every IMAP connection is refused, the
+/// way an unreachable server fails, and no real mailbox is contacted.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("address").port()
+}
+
+/// A sent row as recording SMTP acceptance leaves it when the sender stops
+/// before removing the message's copy from the provider's Drafts folder
+/// (Mailroom trial D). No send lock is held, so its sender reads as gone.
+fn sent_before_drafts_cleanup(home: &Path, account_id: &str) -> String {
+    use envelope_email_store::{AttemptStart, ClaimMode};
+    let db = open_db(home);
+    db.set_detected_folder(account_id, "drafts", "Drafts")
+        .expect("cache the Drafts folder");
+    let draft = db
+        .create_draft(
+            account_id,
+            "alice@example.test",
+            Some("Already sent"),
+            Some("Body"),
+            None,
+            None,
+            None,
+            None,
+            Some("agent"),
+        )
+        .expect("create draft");
+    db.mark_draft_message_id(&draft.id, "<draft-copy@example.test>")
+        .expect("Drafts copy identity");
+    let draft = db.get_draft(&draft.id).expect("read").expect("draft");
+    let start = AttemptStart::new("<sent@example.test>", "sweep", None);
+    let claim = db
+        .claim_send_attempt(&draft.id, draft.revision, ClaimMode::Immediate, &start)
+        .expect("claim")
+        .expect("claimed");
+    db.finish_attempt_sent(
+        &draft.id,
+        &claim.token,
+        "<sent@example.test>",
+        serde_json::json!({"kind": "smtp_acceptance"}),
+    )
+    .expect("record sent");
+    draft.id
+}
+
+/// Mailroom trial D: `serve` stopped after recording a send and before
+/// deleting the message's Drafts copy, and no later sweep ever looked at it
+/// again, leaving a sendable copy of sent mail in Drafts. The first sweep
+/// after a restart must retry the cleanup, and with no `RUST_LOG` set its
+/// failure must still reach stderr.
+#[test]
+fn a_restarted_sweep_retries_the_drafts_cleanup_a_stopped_sender_left() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let account_id = seed_account(home);
+    open_db(home)
+        .conn()
+        .execute(
+            "UPDATE accounts SET imap_host = '127.0.0.1', imap_port = ?1",
+            [i64::from(closed_port())],
+        )
+        .expect("point IMAP at a closed port");
+    let draft_id = sent_before_drafts_cleanup(home, &account_id);
+
+    let mut serve = Command::new(envelope_bin())
+        .args(["serve", "--port", &closed_port().to_string()])
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let attempts = loop {
+        let attempts: Option<i64> = open_db(home)
+            .conn()
+            .query_row(
+                "SELECT json_extract(metadata, '$.provider_draft_cleanup.attempts')
+                 FROM drafts WHERE id = ?1",
+                [&draft_id],
+                |r| r.get(0),
+            )
+            .expect("read attempts");
+        let exited = serve.try_wait().expect("poll serve").is_some();
+        if attempts.unwrap_or(0) > 0 || exited || std::time::Instant::now() > deadline {
+            break attempts;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    serve.kill().ok();
+    let out = serve.wait_with_output().expect("wait serve");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        attempts,
+        Some(1),
+        "the first sweep after a restart must retry the cleanup\nserve stderr:\n{stderr}"
+    );
+    let row = open_db(home)
+        .get_draft(&draft_id)
+        .expect("read")
+        .expect("row");
+    let record = &row.metadata.expect("metadata")["provider_draft_cleanup"];
+    assert_eq!(
+        record["state"], "pending",
+        "a failed attempt is retried by a later sweep: {record}"
+    );
+    assert_eq!(record["message_id"], "<draft-copy@example.test>");
+    assert!(
+        stderr.contains(&format!("draft {draft_id}")) && stderr.contains("Drafts cleanup failed"),
+        "the failed cleanup must be logged on stderr by default:\n{stderr}"
+    );
+}

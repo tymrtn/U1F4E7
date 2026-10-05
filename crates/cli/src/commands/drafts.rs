@@ -2890,55 +2890,38 @@ async fn outgoing_for_draft(
 }
 
 /// Best-effort deletion of a sent draft's provider Drafts copy, only after its
-/// sent state is recorded. Identity is the exact detected folder plus the
-/// persisted pre-send Message-ID; only the single exact match is deleted.
-/// Skips and failures are logged, never claimed as done.
+/// sent state is recorded. The copy is the one named by the cleanup record
+/// written with that sent state; only the single exact Message-ID match in
+/// the detected Drafts folder is deleted. The outcome is settled on the
+/// record, so a failure here is retried by `envelope serve`'s next sweep.
 pub(crate) async fn cleanup_provider_draft_copy(
     db: &Database,
     creds: &AccountWithCredentials,
-    draft: &Draft,
+    draft_id: &str,
 ) -> bool {
     use envelope_email_transport::draft_cleanup::{
-        ProviderDraftCleanup, delete_provider_draft_exact, resolve_draft_cleanup_target,
+        delete_provider_draft_exact, resolve_sent_cleanup_target, settle_provider_draft_cleanup,
     };
-    let target = match resolve_draft_cleanup_target(db, draft) {
-        Ok(target) => target,
-        Err(reason) => {
-            if draft.imap_uid.is_some() {
-                warn!(
-                    "draft {}: provider draft cleanup skipped: {reason}",
-                    draft.id
-                );
-            }
+    let row = match db.get_draft(draft_id) {
+        Ok(Some(row)) if row.pending_provider_draft_cleanup().is_some() => row,
+        Ok(_) => return false,
+        Err(e) => {
+            warn!("draft {draft_id}: could not read its Drafts cleanup record: {e}");
             return false;
         }
     };
-    match imap::connect(creds).await {
-        Ok(mut client) => match delete_provider_draft_exact(&mut client, &target).await {
-            Ok(ProviderDraftCleanup::Deleted { uid }) => {
-                info!(
-                    "removed provider draft copy (UID {uid} in {})",
-                    target.folder
-                );
-                true
-            }
-            Ok(ProviderDraftCleanup::Skipped(reason)) => {
-                warn!(
-                    "provider draft cleanup skipped in {}: {reason}",
-                    target.folder
-                );
-                false
-            }
-            Err(e) => {
-                warn!("provider draft cleanup failed in {}: {e}", target.folder);
-                false
-            }
+    let target = resolve_sent_cleanup_target(db, &row);
+    let folder = target.as_ref().ok().map(|target| target.folder.clone());
+    let result = match target {
+        Err(reason) => Err(reason.to_string()),
+        Ok(target) => match imap::connect(creds).await {
+            Ok(mut client) => delete_provider_draft_exact(&mut client, &target)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(format!("IMAP connect failed: {e}")),
         },
-        Err(e) => {
-            warn!("failed to connect to IMAP to clean up sent draft: {e}");
-            false
-        }
-    }
+    };
+    settle_provider_draft_cleanup(db, draft_id, folder.as_deref(), result)
 }
 
 // ─── draft discard ───────────────────────────────────────────────────────

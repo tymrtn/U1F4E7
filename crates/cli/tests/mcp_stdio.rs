@@ -390,6 +390,87 @@ fn read_message(stdout: &mut BufReader<ChildStdout>) -> Value {
     serde_json::from_str(line.trim_end_matches(['\r', '\n'])).expect("parse response JSON")
 }
 
+/// Log events go to stderr. With every level enabled, stdout still carries
+/// the JSON-RPC stream and nothing else, and the log lines a tool's IMAP
+/// connection writes show up on stderr.
+#[test]
+fn mcp_stdio_logs_go_to_stderr_never_stdout() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let _probe = imap_connection_probe(home);
+    let mut child = Command::new(envelope_bin())
+        .arg("mcp")
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env("ENVELOPE_MCP_UNSAFE_ALLOW_ANONYMOUS", "1")
+        .env("RUST_LOG", "trace")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn envelope mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    write_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "inbox", "arguments": {} }
+        }),
+    );
+    let resp = read_message(&mut stdout);
+    assert_eq!(resp["id"], 1, "{resp}");
+    drop(stdin);
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut rest).expect("read stdout");
+    let out = child.wait_with_output().expect("wait mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    for line in rest.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            serde_json::from_str::<Value>(line).is_ok(),
+            "stdout must carry JSON-RPC only, got: {line:?}"
+        );
+    }
+    assert!(
+        stderr.contains("connecting to IMAP"),
+        "RUST_LOG=trace must put log lines on stderr:\n{stderr}"
+    );
+}
+
+/// The same split for `--json` commands: logs on stderr, stdout parseable.
+#[test]
+fn json_output_carries_no_log_lines() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let _probe = imap_connection_probe(home);
+    let out = Command::new(envelope_bin())
+        .args(["--json", "inbox"])
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env("RUST_LOG", "trace")
+        .output()
+        .expect("run envelope --json inbox");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            serde_json::from_str::<Value>(line).is_ok(),
+            "--json stdout must carry JSON only, got: {line:?}\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("connecting to IMAP"),
+        "RUST_LOG=trace must put log lines on stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn mcp_stdio_accepts_content_length_framed_initialize_and_tools_list() {
     let temp = tempfile::tempdir().expect("temp HOME");

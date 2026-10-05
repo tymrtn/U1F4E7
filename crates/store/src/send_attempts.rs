@@ -56,10 +56,22 @@ use crate::models::{Draft, DraftStatus};
 pub const SEND_INTENT_KEY: &str = "send_intent";
 pub const SEND_ATTEMPT_KEY: &str = "send_attempt";
 pub const SEND_ATTEMPT_HISTORY_KEY: &str = "send_attempt_history";
+/// The provider Drafts copy a sent row still has to remove: its Message-ID,
+/// recorded in the commit that marks the row `sent`, and how the removal is
+/// going (`pending`, `done`, or `abandoned` past the retry bound).
+pub const PROVIDER_DRAFT_CLEANUP_KEY: &str = "provider_draft_cleanup";
 /// Metadata keys only this module writes. Generic metadata writes carry the
 /// stored values forward and never accept a caller's.
-pub const SERVER_OWNED_METADATA_KEYS: &[&str] =
-    &[SEND_INTENT_KEY, SEND_ATTEMPT_KEY, SEND_ATTEMPT_HISTORY_KEY];
+pub const SERVER_OWNED_METADATA_KEYS: &[&str] = &[
+    SEND_INTENT_KEY,
+    SEND_ATTEMPT_KEY,
+    SEND_ATTEMPT_HISTORY_KEY,
+    PROVIDER_DRAFT_CLEANUP_KEY,
+];
+/// Failed attempts at removing a sent row's Drafts copy before the sweep
+/// stops trying. The sweep runs once a minute, so this is about twenty
+/// minutes of a mailbox that keeps failing.
+pub const MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS: u64 = 20;
 /// Format version of the intent and attempt blocks.
 pub const SEND_RECORD_FORMAT: u64 = 1;
 /// Receipt schema written into `action_log.action_taken`.
@@ -179,6 +191,15 @@ pub enum Liveness {
     Dead,
     /// Cannot be checked from here (another host, unreadable lock).
     Unknown,
+}
+
+/// Where a sent row's Drafts cleanup stands after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCleanupRetry {
+    /// A later sweep tries again.
+    Pending { attempts: u64 },
+    /// The retry bound was reached; the copy stays for a person to remove.
+    Abandoned { attempts: u64 },
 }
 
 /// Why a claim is being released for another attempt.
@@ -1083,6 +1104,23 @@ impl Database {
                 json!({"status": "sent", "at": now_rfc3339(), "evidence": evidence}),
             );
         }
+        // The UPDATE below replaces the row's Message-ID with the transmitted
+        // one and clears its Drafts UID, so the identity of the provider
+        // Drafts copy is recorded in the same commit. Whoever removes the copy
+        // settles the record; until then every scheduled-send sweep retries
+        // it (`pending_provider_draft_cleanups`).
+        metadata.remove(PROVIDER_DRAFT_CLEANUP_KEY);
+        if let Some(copy) = row
+            .draft
+            .message_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            metadata.insert(
+                PROVIDER_DRAFT_CLEANUP_KEY.into(),
+                json!({"state": "pending", "message_id": copy, "attempts": 0}),
+            );
+        }
         let rows = self.conn().execute(
             "UPDATE drafts SET status = 'sent', message_id = ?1, operation_token = NULL,
                 send_after = NULL, imap_uid = NULL, metadata = ?2,
@@ -1520,6 +1558,160 @@ impl Database {
             }
         }
         Ok(report)
+    }
+
+    // ── Provider Drafts cleanup after a send ────────────────────────────
+
+    /// Sent rows whose provider Drafts copy is still to be removed, oldest
+    /// send first, at most `limit`.
+    ///
+    /// A sender that is still alive (it holds its attempt's lock) removes the
+    /// copy itself, so its row is left alone. A sender that stopped, or whose
+    /// attempt failed, leaves the record pending for the sweep. When liveness
+    /// cannot be checked, the row waits out the send lease first.
+    pub fn pending_provider_draft_cleanups(
+        &self,
+        now: DateTime<Utc>,
+        liveness: &dyn Fn(&AttemptOwner, &str) -> Liveness,
+        limit: usize,
+    ) -> Result<Vec<Draft>> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT id FROM drafts
+                 WHERE status = 'sent'
+                   AND json_extract(metadata, '$.provider_draft_cleanup.state') = 'pending'
+                 ORDER BY sent_at",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let mut ready = Vec::new();
+        for id in ids {
+            if ready.len() >= limit {
+                break;
+            }
+            let Some(row) = self.lease_row(&id)? else {
+                continue;
+            };
+            let live = row
+                .attempt()
+                .and_then(|attempt| {
+                    let owner: AttemptOwner =
+                        serde_json::from_value(attempt.get("owner")?.clone()).ok()?;
+                    let attempt_id = attempt.get("attempt_id")?.as_str()?;
+                    Some(liveness(&owner, attempt_id))
+                })
+                .unwrap_or(Liveness::Unknown);
+            let lease_passed = || {
+                row.draft
+                    .sent_at
+                    .as_deref()
+                    .and_then(parse_sqlite_time)
+                    .is_none_or(|t| (now - t).num_seconds() >= SEND_LEASE_SECONDS)
+            };
+            let take = match live {
+                Liveness::Alive => false,
+                Liveness::Dead => true,
+                Liveness::Unknown => lease_passed(),
+            };
+            if take {
+                ready.push(row.draft);
+            }
+        }
+        Ok(ready)
+    }
+
+    /// [`Self::pending_provider_draft_cleanups`] with this database's owner
+    /// locks and the current time.
+    pub fn pending_provider_draft_cleanups_now(&self, limit: usize) -> Result<Vec<Draft>> {
+        let lock_dir = self.send_lock_dir();
+        self.pending_provider_draft_cleanups(
+            Utc::now(),
+            &|owner, attempt_id| owner_liveness(lock_dir.as_deref(), owner, attempt_id),
+            limit,
+        )
+    }
+
+    /// Close a sent row's pending Drafts cleanup. `outcome` says how it
+    /// ended: `deleted`, `absent` (already gone), or `ambiguous` (more than
+    /// one copy carries the Message-ID, so none was touched). Returns `false`
+    /// when nothing was pending.
+    pub fn finish_provider_draft_cleanup(&self, id: &str, outcome: &str) -> Result<bool> {
+        Ok(self
+            .update_pending_cleanup(id, |record| {
+                record.insert("state".into(), json!("done"));
+                record.insert("outcome".into(), json!(outcome));
+                record.insert("finished_at".into(), json!(now_rfc3339()));
+            })?
+            .is_some())
+    }
+
+    /// Count one failed attempt at a sent row's Drafts cleanup. At
+    /// [`MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS`] the record is abandoned and no
+    /// sweep tries again. Returns `None` when nothing was pending.
+    pub fn fail_provider_draft_cleanup(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<Option<ProviderCleanupRetry>> {
+        let updated = self.update_pending_cleanup(id, |record| {
+            let attempts = record.get("attempts").and_then(Value::as_u64).unwrap_or(0) + 1;
+            let state = if attempts >= MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS {
+                "abandoned"
+            } else {
+                "pending"
+            };
+            record.insert("attempts".into(), json!(attempts));
+            record.insert("state".into(), json!(state));
+            record.insert(
+                "last_error".into(),
+                json!(error.chars().take(300).collect::<String>()),
+            );
+            record.insert("last_attempt_at".into(), json!(now_rfc3339()));
+        })?;
+        Ok(updated.map(|record| {
+            let attempts = record.get("attempts").and_then(Value::as_u64).unwrap_or(0);
+            if record.get("state").and_then(Value::as_str) == Some("pending") {
+                ProviderCleanupRetry::Pending { attempts }
+            } else {
+                ProviderCleanupRetry::Abandoned { attempts }
+            }
+        }))
+    }
+
+    /// Apply `change` to a sent row's cleanup record while it is pending, and
+    /// return the record as written. `None` when the row is not `sent` or has
+    /// nothing pending.
+    fn update_pending_cleanup(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut Map<String, Value>),
+    ) -> Result<Option<Map<String, Value>>> {
+        let tx = ImmediateTx::begin(self)?;
+        let Some(draft) = self.get_draft(id)? else {
+            return Ok(None);
+        };
+        if draft.status != DraftStatus::Sent || draft.pending_provider_draft_cleanup().is_none() {
+            return Ok(None);
+        }
+        let Some(Value::Object(mut metadata)) = draft.metadata else {
+            return Ok(None);
+        };
+        let Some(Value::Object(record)) = metadata.get_mut(PROVIDER_DRAFT_CLEANUP_KEY) else {
+            return Ok(None);
+        };
+        change(record);
+        let written = record.clone();
+        let rows = self.conn().execute(
+            "UPDATE drafts SET metadata = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND status = 'sent'",
+            params![serde_json::to_string(&Value::Object(metadata))?, id],
+        )?;
+        if rows != 1 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(written))
     }
 
     // ── Receipts ────────────────────────────────────────────────────────
@@ -2416,6 +2608,164 @@ mod tests {
             Some(canonical)
         );
         assert_eq!(memory_db().send_lock_dir(), None);
+    }
+
+    // ── Provider Drafts cleanup after a send ────────────────────────────
+
+    /// A row whose provider Drafts copy carries `<draft-copy@example.test>`,
+    /// sent the way the sweep and the CLI record acceptance.
+    fn sent_with_drafts_copy(db: &Database, text: &str) -> Draft {
+        let draft = created(db, IntentKey::Fingerprint, text);
+        db.mark_draft_message_id(&draft.id, "<draft-copy@example.test>")
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 7).unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+        let c = claim(db, &draft);
+        db.finish_attempt_sent(&draft.id, &c.token, &c.message_id, json!({}))
+            .unwrap();
+        db.get_draft(&draft.id).unwrap().unwrap()
+    }
+
+    /// Mailroom trial D: recording `sent` replaced the row's Message-ID with
+    /// the transmitted one and cleared the Drafts UID, so once the sender
+    /// stopped nothing named the Drafts copy any more. The identity must be
+    /// recorded in the same commit as the send.
+    #[test]
+    fn recording_a_send_keeps_the_drafts_copy_to_remove() {
+        let db = memory_db();
+        let sent = sent_with_drafts_copy(&db, "hi");
+
+        assert_eq!(sent.status, DraftStatus::Sent);
+        assert_eq!(sent.message_id.as_deref(), Some("<m1@example.test>"));
+        assert_eq!(sent.imap_uid, None);
+        let record = &sent.metadata.as_ref().unwrap()["provider_draft_cleanup"];
+        assert_eq!(record["state"], "pending", "{record}");
+        assert_eq!(record["message_id"], "<draft-copy@example.test>");
+        assert_eq!(record["attempts"], 0);
+        assert_eq!(
+            sent.pending_provider_draft_cleanup(),
+            Some("<draft-copy@example.test>")
+        );
+    }
+
+    fn pending_ids(
+        db: &Database,
+        liveness: &dyn Fn(&AttemptOwner, &str) -> Liveness,
+    ) -> Vec<String> {
+        db.pending_provider_draft_cleanups(Utc::now(), liveness, 10)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect()
+    }
+
+    /// The sender removes its own copy while it lives; the sweep takes over
+    /// only once it is gone, or after the lease when that cannot be checked.
+    #[test]
+    fn a_pending_cleanup_waits_for_its_sender_to_stop() {
+        let db = memory_db();
+        let sent = sent_with_drafts_copy(&db, "hi");
+
+        assert_eq!(pending_ids(&db, &dead), vec![sent.id.clone()]);
+        assert!(pending_ids(&db, &alive).is_empty());
+        assert!(pending_ids(&db, &unknown).is_empty());
+        db.conn()
+            .execute(
+                "UPDATE drafts SET sent_at = datetime('now', '-16 minutes')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(pending_ids(&db, &unknown), vec![sent.id.clone()]);
+        assert!(pending_ids(&db, &alive).is_empty());
+    }
+
+    #[test]
+    fn a_closed_cleanup_is_never_retried() {
+        let db = memory_db();
+        let sent = sent_with_drafts_copy(&db, "hi");
+
+        assert!(
+            db.finish_provider_draft_cleanup(&sent.id, "deleted")
+                .unwrap()
+        );
+        assert!(pending_ids(&db, &dead).is_empty());
+        let row = db.get_draft(&sent.id).unwrap().unwrap();
+        assert_eq!(row.pending_provider_draft_cleanup(), None);
+        let record = &row.metadata.unwrap()["provider_draft_cleanup"];
+        assert_eq!(record["state"], "done");
+        assert_eq!(record["outcome"], "deleted");
+        assert!(
+            !db.finish_provider_draft_cleanup(&sent.id, "absent")
+                .unwrap(),
+            "settling twice changes nothing"
+        );
+        assert_eq!(
+            db.fail_provider_draft_cleanup(&sent.id, "late").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_cleanups_are_retried_up_to_the_bound() {
+        let db = memory_db();
+        let sent = sent_with_drafts_copy(&db, "hi");
+
+        for attempt in 1..MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS {
+            assert_eq!(
+                db.fail_provider_draft_cleanup(&sent.id, "connection reset")
+                    .unwrap(),
+                Some(ProviderCleanupRetry::Pending { attempts: attempt })
+            );
+            assert_eq!(pending_ids(&db, &dead), vec![sent.id.clone()]);
+        }
+        assert_eq!(
+            db.fail_provider_draft_cleanup(&sent.id, "connection reset")
+                .unwrap(),
+            Some(ProviderCleanupRetry::Abandoned {
+                attempts: MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS
+            })
+        );
+        assert!(
+            pending_ids(&db, &dead).is_empty(),
+            "the bound stops retries"
+        );
+        let row = db.get_draft(&sent.id).unwrap().unwrap();
+        let record = &row.metadata.unwrap()["provider_draft_cleanup"];
+        assert_eq!(record["state"], "abandoned");
+        assert_eq!(record["last_error"], "connection reset");
+        assert_eq!(record["message_id"], "<draft-copy@example.test>");
+    }
+
+    /// Only the send transition writes the record: a row with no Drafts copy
+    /// gets none, and a caller cannot plant one to aim the cleanup at another
+    /// message.
+    #[test]
+    fn only_a_drafts_copy_recorded_at_send_is_ever_cleaned_up() {
+        let db = memory_db();
+        let draft = created(&db, IntentKey::Fingerprint, "hi");
+        db.set_draft_metadata(
+            &draft.id,
+            &json!({"provider_draft_cleanup": {
+                "state": "pending", "message_id": "<someone-else@example.test>", "attempts": 0
+            }}),
+        )
+        .unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+        assert!(
+            draft
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("provider_draft_cleanup")
+                .is_none()
+        );
+        let c = claim(&db, &draft);
+        db.finish_attempt_sent(&draft.id, &c.token, &c.message_id, json!({}))
+            .unwrap();
+
+        let sent = db.get_draft(&draft.id).unwrap().unwrap();
+        assert_eq!(sent.pending_provider_draft_cleanup(), None);
+        assert!(pending_ids(&db, &dead).is_empty());
     }
 
     #[test]

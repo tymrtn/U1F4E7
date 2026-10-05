@@ -862,12 +862,11 @@ pub(crate) async fn transmit_claimed<C: SmtpConnect>(
             "record_status": if parked { "delivery_uncertain" } else { "sending" },
         }));
     }
-    drop(lock);
 
     // ── Provider draft cleanup: exact + unique, only after durable sent state ──
     let mut imap_draft_deleted = false;
     if recorded.is_ok() && !creds.account.imap_host.trim().is_empty() {
-        imap_draft_deleted = super::drafts::cleanup_provider_draft_copy(db, creds, draft).await;
+        imap_draft_deleted = super::drafts::cleanup_provider_draft_copy(db, creds, &draft.id).await;
     }
 
     // ── Sent-folder copy (pre-lookup before any client append) ──
@@ -906,6 +905,9 @@ pub(crate) async fn transmit_claimed<C: SmtpConnect>(
             Err(e) => warn!("draft {}: failed to record Sent-copy proof: {e}", draft.id),
         }
     }
+    // Held through the cleanup and the Sent copy: while it is held, `serve`
+    // leaves this row's pending Drafts cleanup to this process.
+    drop(lock);
 
     Ok(SentAttempt {
         draft_id: draft.id.clone(),
