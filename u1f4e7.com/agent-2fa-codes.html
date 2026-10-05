@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Can an AI agent safely read 2FA codes from your email? | Envelope</title>
+  <meta name="description" content="Only if it checks who sent the code. Envelope gives an agent a one-time code only when your own mail provider recorded that the sender passed DMARC or aligned DKIM.">
+  <link rel="canonical" href="https://u1f4e7.com/agent-2fa-codes.html">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
+  <meta name="theme-color" content="#0b1020">
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Envelope">
+  <meta property="og:url" content="https://u1f4e7.com/agent-2fa-codes.html">
+  <meta property="og:title" content="Can an AI agent safely read 2FA codes from your email?">
+  <meta property="og:description" content="Only if it checks who sent the code. Envelope gives an agent a one-time code only when your own mail provider recorded that the sender passed DMARC or aligned DKIM.">
+  <meta property="og:image" content="https://u1f4e7.com/og-card.png">
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Can an AI agent safely read 2FA codes from your email?">
+  <meta name="twitter:description" content="Only if it checks who sent the code. Envelope gives an agent a one-time code only when your own mail provider recorded that the sender passed DMARC or aligned DKIM.">
+  <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": "Can an AI agent safely read 2FA codes from your email?",
+    "description": "How Envelope decides whether a one-time code in an email came from the sender it claims, before an agent can use it.",
+    "datePublished": "2026-10-05",
+    "author": {"@type": "Person", "name": "Tyler Martin", "url": "https://github.com/tymrtn"},
+    "about": {"@type": "SoftwareApplication", "name": "Envelope", "applicationCategory": "CommunicationApplication", "operatingSystem": "macOS, Linux", "url": "https://u1f4e7.com/"},
+    "mainEntityOfPage": "https://u1f4e7.com/agent-2fa-codes.html"
+  }
+  </script>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="index.html#top">✉️ Envelope</a>
+      <nav>
+        <a href="index.html#use-cases">Use cases</a>
+        <a href="index.html#workflows">What it does</a>
+        <a href="index.html#control">Human control</a>
+        <a href="index.html#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=otp-nav" data-umami-event="github-nav">Repo</a>
+      </nav>
+    </div>
+  </header>
+  <main id="top">
+    <article id="otp-article" class="article wrap">
+      <p class="eyebrow">Agent questions</p>
+      <h1>Can an AI agent safely read 2FA codes from your email?</h1>
+      <p class="byline">By Tyler Martin, 5 October 2026. Describes Envelope 1.3.16.</p>
+      <p class="lede">It can if it checks who sent the code. Most ways of giving an agent email access hand it whatever message says "your code is 482913", and the line saying who sent that message is written by the sender.</p>
+
+      <section id="otp-risks" class="article-section">
+        <h2>Two ways a code goes wrong</h2>
+        <p><strong>A forged code comes in.</strong> Anyone can send you a message whose From line reads noreply@github.com. An agent that matches on the From address takes that message's code. Usually the login the agent is working on just fails. In a device-code sign-in, though, typing an attacker's code on the real site signs the attacker's device into your account. Microsoft <a href="https://www.microsoft.com/en-us/security/blog/2025/02/13/storm-2372-conducts-device-code-phishing-campaign/" data-umami-event="otp-source-microsoft">reported Storm-2372 using that technique</a> against people in February 2025, with the codes sent in fake Teams invitations.</p>
+        <p><strong>A real code goes out.</strong> In August 2026 Zenity showed hidden instructions in an email turning Claude in Chrome into a relay: the agent watched Gmail for verification codes and passed them to the attacker, who used them to take over Slack and X accounts (<a href="https://www.securityweek.com/zero-click-ai-browser-hacking-claude-and-chatgpt-atlas-hijacked-via-emails-x-posts/" data-umami-event="otp-source-securityweek">SecurityWeek's write-up</a>).</p>
+      </section>
+
+      <section id="otp-checks" class="article-section">
+        <h2>What Envelope checks before it hands over a code</h2>
+        <p><code>envelope code</code> waits for a message from the sender you name and returns the code in it. Before returning anything, it reads the authentication results your mail provider recorded when the message arrived. It needs DMARC to have passed for the domain in the From line, or DKIM to have passed with a signing domain that matches it while DMARC didn't fail. SPF alone isn't enough, because SPF checks the envelope sender, which can differ from the From line you see.</p>
+        <p>The harder part is knowing which results your provider wrote. Authentication-Results is an ordinary header, and a sender can include one that says <code>dmarc=pass</code>. <a href="https://datatracker.ietf.org/doc/html/rfc8601#section-5" data-umami-event="otp-source-rfc8601">RFC 8601</a> tells a receiving server to delete forged copies that carry its own name; copies carrying any other name pass through. Envelope counts results only when they carry your provider's domain and sit above the provider's own Received line, the point where the message entered its servers. Anything below that line arrived with the message, and Envelope treats it as unverifiable.</p>
+        <p>A message that fails these checks is skipped and the wait continues. If no authenticated code arrives before <code>--wait</code> runs out, the command ends with <code>sender_unauthenticated</code> or <code>sender_unverifiable</code> and lists the senders it skipped, without their codes. Every result includes a <code>sender_auth</code> field saying what Envelope found.</p>
+      </section>
+
+      <section id="otp-providers" class="article-section">
+        <h2>Which mailboxes pass today</h2>
+        <p>Gmail works with no setup. Microsoft 365 records its results without naming the server that wrote them, and Migadu records them below its own Received line. In both cases a real result looks the same as one a sender wrote, so codes come back <code>sender_unverifiable</code>. For any other provider, run <code>envelope code</code> once with <code>--json</code> and read <code>sender_auth</code>.</p>
+        <p>If your provider receives mail under a different domain from its IMAP server, you can name that domain. If you accept the risk for an account, you can let it take unverified senders, and codes accepted that way report <code>"unverifiable"</code>. Both settings are refused while an agent token is set, and no MCP tool changes them, so an agent can't switch the check off for itself.</p>
+        <div class="callout code-panel"><pre><code>envelope config set threat.receiver_domain you@example.com=&lt;domain&gt;
+envelope config set otp.allow_unverified_senders you@example.com</code></pre></div>
+      </section>
+
+      <section id="otp-setup" class="article-section">
+        <h2>Setup</h2>
+        <p>Run the first three commands in your own terminal, so your password and the agent's token never pass through the agent. The last one is what the agent runs.</p>
+        <div class="callout code-panel"><pre><code># Install on macOS or Linux
+curl -fsSL https://u1f4e7.com/install.sh | bash
+
+# Add the mailbox and create a token for the agent
+envelope accounts add --email you@gmail.com
+envelope agent create claude-code
+
+# The agent waits up to two minutes for an authenticated code
+envelope code --account you@gmail.com --from noreply@github.com --wait 120 --json</code></pre></div>
+        <p><code>--from</code> is required. Use the exact address the service sends codes from.</p>
+      </section>
+
+      <section id="otp-limits" class="article-section">
+        <h2>What Envelope doesn't cover</h2>
+        <p>Envelope controls what leaves through Envelope. With an agent token, the agent can't email a code anywhere beyond what its send policy allows, and new agents start at draft-only, so anything they write waits for you. It also can't add a rule that posts mail to a webhook unless you grant <code>rules.webhook</code> by name. An agent that also drives a browser or has your shell has other ways to pass a code along, and Envelope can't see those. Give that kind of agent the narrowest access you can, and have it read codes only for logins you expected.</p>
+      </section>
+
+      <div class="cta-row">
+        <a class="button" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=otp-cta" data-umami-event="github-cta-otp">Get Envelope on GitHub</a>
+        <a class="button button-secondary" href="approve-agent-emails.html" data-umami-event="otp-to-approve">How to make an agent ask before it sends</a>
+      </div>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope: one inbox for you and your agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=otp-footer" data-umami-event="github-footer">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing" data-umami-event="license-licensing-footer">Licensing</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
