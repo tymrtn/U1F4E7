@@ -298,8 +298,27 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The MCP Bundle (.mcpb) carries the four binaries from the tarballs
+      # above, checksum-verified and byte-for-byte unchanged, so any macOS
+      # signature survives.
+      - name: Build MCP Bundle
+        run: |
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          bash scripts/package-mcpb.sh "$VERSION" release-artifacts release-artifacts
+
       - name: List artifacts
-        run: find release-artifacts -type f | sort
+        run: |
+          find release-artifacts -type f | sort
+          count="$(find release-artifacts -type f | wc -l)"
+          if [[ "$count" -ne 10 ]]; then
+            echo "::error::Expected 10 release assets (4 tarballs, 4 checksums, the MCP Bundle and its checksum), found $count."
+            exit 1
+          fi
 
       - name: Create GitHub release and attach artifacts
         env:

@@ -2,7 +2,8 @@
 # ci/check-agent-plugins.sh — packaging checklist for the agent plugins this
 # repo ships from one root: Claude Code (.claude-plugin), Codex
 # (.codex-plugin + .agents/plugins), and Cursor (.cursor-plugin + mcp.json),
-# all sharing skills/. Every manifest version must equal the Cargo workspace
+# all sharing skills/, plus the MCP Bundle template (packaging/mcpb) that
+# release.yml packs. Every manifest version must equal the Cargo workspace
 # version, so plugins move with releases. Checks files only; publishes nothing.
 
 set -euo pipefail
@@ -226,6 +227,28 @@ if isinstance(codex_mkt, dict):
     ):
         err('.agents/plugins/marketplace.json must list envelope with source path "./"')
 
+# MCP Bundle template: release.yml packs it with the release binaries, and
+# the token reaches the server only through sensitive user_config.
+mcpb = load_json("packaging/mcpb/manifest.json")
+check_version("packaging/mcpb/manifest.json", mcpb)
+if isinstance(mcpb, dict):
+    if mcpb.get("name") != "envelope":
+        err('packaging/mcpb/manifest.json name must be "envelope"')
+    server = mcpb.get("server") or {}
+    config = server.get("mcp_config") or {}
+    if server.get("type") != "binary" or server.get("entry_point") != "server/envelope":
+        err('packaging/mcpb/manifest.json server must be type "binary" with entry_point "server/envelope"')
+    if config.get("command") != "${__dirname}/server/envelope" or config.get("args") != ["mcp"]:
+        err("packaging/mcpb/manifest.json must run `${__dirname}/server/envelope mcp`")
+    if (config.get("env") or {}).get("ENVELOPE_AGENT_TOKEN") != "${user_config.agent_token}":
+        err("packaging/mcpb/manifest.json must pass the token only as ${user_config.agent_token}")
+    token_cfg = ((mcpb.get("user_config") or {}).get("agent_token")) or {}
+    if token_cfg.get("sensitive") is not True or token_cfg.get("required") is not True:
+        err("packaging/mcpb/manifest.json user_config.agent_token must be sensitive and required")
+for rel in ("packaging/mcpb/launcher.sh", "packaging/mcpb/icon.png"):
+    if not (root / rel).is_file():
+        err(f"missing {rel}")
+
 token_scan = [
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
@@ -235,6 +258,7 @@ token_scan = [
     ".cursor-plugin/plugin.json",
     "mcp.json",
     "MARKETPLACE.md",
+    "packaging/mcpb/manifest.json",
 ] + [str(p.relative_to(root)) for p in sorted((root / "skills").glob("*/SKILL.md"))]
 for rel in token_scan:
     path = root / rel
@@ -246,5 +270,5 @@ if errors:
     print("\n".join(f"- {e}" for e in errors), file=sys.stderr)
     sys.exit(1)
 
-print("OK: agent plugin packaging checklist passed (Claude Code, Codex, Cursor).")
+print("OK: agent plugin packaging checklist passed (Claude Code, Codex, Cursor, MCP Bundle).")
 PY

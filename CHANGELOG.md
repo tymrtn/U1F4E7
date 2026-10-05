@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Releases include an MCP Bundle, `envelope-<version>.mcpb`, and its `.sha256`. Opening it in Claude Desktop, or another client that installs MCP Bundles, sets up Envelope's MCP server. The bundle holds the release binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and aarch64), unchanged from the tarballs, and a small launcher runs the one that matches the machine. It asks for the agent token and, optionally, the passphrase file, and shares accounts and data with the `envelope` CLI. Accounts and agent tokens are still created in a terminal.
+- `scripts/mcp-registry-server-json.sh <tag>` writes the `server.json` that lists a published release in the official MCP Registry, with the bundle's download URL and SHA-256.
+
 ## [1.3.16] — 2026-10-03
 
 Security fixes. Threat verdicts and Mark safe follow a message's content, agent tokens get only the authority their policy grants, and one-time codes need an authenticated sender. Agents that use the newly gated commands need the matching grants; see the agent contract v4.
