@@ -55,13 +55,17 @@ fn open_db(home: &Path) -> Database {
 }
 
 fn seed_account(home: &Path) -> String {
+    add_account(home, "sender@example.test")
+}
+
+fn add_account(home: &Path, email: &str) -> String {
     let mut child = Command::new(envelope_bin())
         .args([
             "accounts",
             "add",
             "--skip-login-check",
             "--email",
-            "sender@example.test",
+            email,
             "--password-stdin",
             "--smtp-host",
             "smtp.example.test",
@@ -91,7 +95,11 @@ fn seed_account(home: &Path) -> String {
     assert!(out.status.success(), "seed account failed");
     open_db(home)
         .conn()
-        .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM accounts WHERE username = ?1",
+            [email],
+            |r| r.get(0),
+        )
         .expect("account id")
 }
 
@@ -564,6 +572,57 @@ fn closed_port() -> u16 {
     listener.local_addr().expect("address").port()
 }
 
+/// A local IMAP server that accepts connections and never answers. The client
+/// then waits in the TLS handshake, which has no time limit of its own, the
+/// same way it waits on a host that silently drops packets. Accepted sockets
+/// stay open until the test process exits.
+fn silent_imap_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+fn point_imap_at(home: &Path, account_id: &str, port: u16) {
+    open_db(home)
+        .conn()
+        .execute(
+            "UPDATE accounts SET imap_host = '127.0.0.1', imap_port = ?1 WHERE id = ?2",
+            (i64::from(port), account_id),
+        )
+        .expect("point IMAP at a local port");
+}
+
+/// `serve` on a closed port, logging at the default level to a captured stderr.
+fn spawn_serve(home: &Path) -> std::process::Child {
+    Command::new(envelope_bin())
+        .args(["serve", "--port", &closed_port().to_string()])
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve")
+}
+
+fn cleanup_attempts(home: &Path, draft_id: &str) -> Option<i64> {
+    open_db(home)
+        .conn()
+        .query_row(
+            "SELECT json_extract(metadata, '$.provider_draft_cleanup.attempts')
+             FROM drafts WHERE id = ?1",
+            [draft_id],
+            |r| r.get(0),
+        )
+        .expect("read attempts")
+}
+
 /// A sent row as recording SMTP acceptance leaves it when the sender stops
 /// before removing the message's copy from the provider's Drafts folder
 /// (Mailroom trial D). No send lock is held, so its sender reads as gone.
@@ -613,35 +672,13 @@ fn a_restarted_sweep_retries_the_drafts_cleanup_a_stopped_sender_left() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     let account_id = seed_account(home);
-    open_db(home)
-        .conn()
-        .execute(
-            "UPDATE accounts SET imap_host = '127.0.0.1', imap_port = ?1",
-            [i64::from(closed_port())],
-        )
-        .expect("point IMAP at a closed port");
+    point_imap_at(home, &account_id, closed_port());
     let draft_id = sent_before_drafts_cleanup(home, &account_id);
 
-    let mut serve = Command::new(envelope_bin())
-        .args(["serve", "--port", &closed_port().to_string()])
-        .env("HOME", home)
-        .env("ENVELOPE_HOME", home)
-        .env_remove("RUST_LOG")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn serve");
+    let mut serve = spawn_serve(home);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let attempts = loop {
-        let attempts: Option<i64> = open_db(home)
-            .conn()
-            .query_row(
-                "SELECT json_extract(metadata, '$.provider_draft_cleanup.attempts')
-                 FROM drafts WHERE id = ?1",
-                [&draft_id],
-                |r| r.get(0),
-            )
-            .expect("read attempts");
+        let attempts = cleanup_attempts(home, &draft_id);
         let exited = serve.try_wait().expect("poll serve").is_some();
         if attempts.unwrap_or(0) > 0 || exited || std::time::Instant::now() > deadline {
             break attempts;
@@ -670,5 +707,102 @@ fn a_restarted_sweep_retries_the_drafts_cleanup_a_stopped_sender_left() {
     assert!(
         stderr.contains(&format!("draft {draft_id}")) && stderr.contains("Drafts cleanup failed"),
         "the failed cleanup must be logged on stderr by default:\n{stderr}"
+    );
+}
+
+/// The Drafts cleanup retry ran inside the scheduled-send sweep, before any
+/// due send, on IMAP connects with no time limit. One account whose server
+/// accepts connections and never answers stopped every scheduled send for
+/// every account, on every tick. A due send on another account must still be
+/// attempted on the first sweep, and the stuck retry must end at its connect
+/// limit as one failed attempt, leaving the same account's other pending
+/// cleanup for a later pass instead of spending a second connect limit on it.
+#[test]
+fn a_silent_imap_server_does_not_hold_up_scheduled_sends() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let silent = add_account(home, "silent@example.test");
+    let other = add_account(home, "other@example.test");
+    point_imap_at(home, &silent, silent_imap_port());
+    point_imap_at(home, &other, closed_port());
+    let stuck = [
+        sent_before_drafts_cleanup(home, &silent),
+        sent_before_drafts_cleanup(home, &silent),
+    ];
+    let due = {
+        let db = open_db(home);
+        let draft = db
+            .create_draft(
+                &other,
+                "bob@example.test",
+                Some("Due now"),
+                Some("Body"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .expect("create draft");
+        db.update_draft_send_after(&draft.id, "2026-01-01 00:00:00")
+            .expect("schedule in the past");
+        draft.id
+    };
+    let due_phase = || -> Option<String> {
+        open_db(home)
+            .conn()
+            .query_row(
+                "SELECT json_extract(metadata, '$.send_attempt.phase') FROM drafts WHERE id = ?1",
+                [&due],
+                |r| r.get(0),
+            )
+            .expect("read the due send's attempt")
+    };
+
+    let mut serve = spawn_serve(home);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let released = due_phase().as_deref() == Some("released");
+        let retried = stuck
+            .iter()
+            .any(|id| cleanup_attempts(home, id).unwrap_or(0) > 0);
+        let exited = serve.try_wait().expect("poll serve").is_some();
+        if (released && retried) || exited || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    serve.kill().ok();
+    let out = serve.wait_with_output().expect("wait serve");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The other account's server refuses connections, so its send is released
+    // for a later sweep. Reaching that point is what the stuck retry blocked.
+    assert_eq!(
+        due_phase().as_deref(),
+        Some("released"),
+        "a due send on another account must be attempted on the first sweep\n\
+         serve stderr:\n{stderr}"
+    );
+    let mut attempts: Vec<Option<i64>> =
+        stuck.iter().map(|id| cleanup_attempts(home, id)).collect();
+    attempts.sort();
+    assert_eq!(
+        attempts,
+        vec![Some(0), Some(1)],
+        "one row per unreachable account is tried each pass\nserve stderr:\n{stderr}"
+    );
+    let tried = stuck
+        .iter()
+        .find(|id| cleanup_attempts(home, id) == Some(1))
+        .expect("the tried row");
+    let row = open_db(home).get_draft(tried).expect("read").expect("row");
+    let record = &row.metadata.expect("metadata")["provider_draft_cleanup"];
+    assert_eq!(record["state"], "pending", "{record}");
+    assert!(
+        record["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("timed out")),
+        "the stuck attempt ends at its time limit: {record}"
     );
 }

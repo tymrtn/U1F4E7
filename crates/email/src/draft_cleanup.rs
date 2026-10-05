@@ -23,8 +23,8 @@
 //! `provider_draft_cleanup` record, written in the commit that marks it
 //! `sent`. Every attempt settles that record
 //! ([`settle_provider_draft_cleanup`]): a sender that stops before removing
-//! the copy, or whose attempt fails, leaves it pending and the next
-//! scheduled-send sweep retries it.
+//! the copy, or whose attempt fails, leaves it pending and `envelope serve`'s
+//! cleanup retry tries again.
 
 use std::future::Future;
 

@@ -217,6 +217,21 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             }
         });
 
+        // Drafts cleanup retries run on their own timer. One can wait on an
+        // IMAP server up to its time limits, which must never hold up a send.
+        println!("Background Drafts cleanup retry running every 60s");
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // A pass can outlast the period while a server is slow: wait a
+            // full period after it instead of running missed ticks back to back.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                retry_pending_provider_draft_cleanups(&cleanup_state).await;
+            }
+        });
+
         // Hourly Sent index sweep: keeps the cross-account Sent cache warm so
         // the Sent box reads locally instead of fanning IMAP from the browser.
         // First tick fires immediately, so the index populates on startup.
@@ -731,11 +746,6 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
             .map_err(|e| anyhow::anyhow!("db error: {e}"))?
     };
 
-    // Sent rows whose Drafts copy a stopped or failed sender left behind.
-    // Retried before this tick sends anything, so a row sent below is first
-    // retried by the next tick, never right behind its own attempt.
-    retry_pending_provider_draft_cleanups(state).await;
-
     if due.is_empty() {
         return Ok(());
     }
@@ -1110,7 +1120,7 @@ pub(crate) async fn run_scheduled_send_sweep(state: &AppState) -> anyhow::Result
                 // provider Drafts copy. If the sent state did not persist, the
                 // local draft is the only record and the provider copy stays.
                 // If this process stops before both finish, the cleanup record
-                // written with the sent state makes the next sweep do them.
+                // written with the sent state makes the cleanup retry do them.
                 if persistence == SentPersistence::Recorded {
                     resolve_and_record_sent_copy(
                         creds,
@@ -1765,14 +1775,27 @@ fn persist_sent_state(
     }
 }
 
-/// Sent rows per sweep whose provider Drafts cleanup is retried.
+/// Sent rows per pass whose provider Drafts cleanup is retried.
 const PROVIDER_CLEANUP_BATCH: usize = 10;
+
+/// Time to connect and log in for one cleanup retry. The IMAP client sets no
+/// limit of its own, so a host that drops packets, or a server that accepts
+/// the connection and never answers, would hold the pass for good.
+const PROVIDER_CLEANUP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Time for one row's whole retry: the connect, the Sent-copy check (which
+/// may APPEND the full message) and the Drafts delete. Ten minutes matches
+/// the SMTP body deadline the send itself had for the same bytes.
+const PROVIDER_CLEANUP_ATTEMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
 /// Retry the provider Drafts cleanup of sent rows whose sender stopped
 /// before finishing it (crash, sleep, restart, kill) or whose last attempt
-/// failed. A row whose Sent copy was never resolved gets that first, so the
-/// sent message has its Sent copy before its Drafts copy goes.
+/// failed. Runs on its own timer, so a slow or silent IMAP server delays
+/// only these retries and never a scheduled send.
 async fn retry_pending_provider_draft_cleanups(state: &AppState) {
+    use envelope_email_transport::draft_cleanup::settle_provider_draft_cleanup;
+
     let pending = {
         let db = state.db.lock().await;
         db.pending_provider_draft_cleanups_now(PROVIDER_CLEANUP_BATCH)
@@ -1780,16 +1803,89 @@ async fn retry_pending_provider_draft_cleanups(state: &AppState) {
     let pending = match pending {
         Ok(pending) => pending,
         Err(e) => {
-            tracing::warn!("scheduled send: could not list pending Drafts cleanups: {e}");
+            tracing::warn!("Drafts cleanup retry: could not list pending cleanups: {e}");
             return;
         }
     };
+    // Accounts whose server could not be reached in this pass. Their other
+    // rows wait for the next pass instead of each spending a time limit.
+    let mut unreachable = std::collections::HashSet::new();
     for draft in &pending {
-        if sent_copy_unresolved(draft) {
-            resolve_sent_copy_from_row(state, draft).await;
+        if unreachable.contains(&draft.account_id) {
+            continue;
         }
-        clean_up_provider_draft_copy(state, &draft.id).await;
+        let attempt = tokio::time::timeout(
+            PROVIDER_CLEANUP_ATTEMPT_TIMEOUT,
+            retry_provider_draft_cleanup(state, draft),
+        )
+        .await;
+        let reached = match attempt {
+            Ok(reached) => reached,
+            Err(_) => {
+                let error = format!(
+                    "cleanup timed out after {}s",
+                    PROVIDER_CLEANUP_ATTEMPT_TIMEOUT.as_secs()
+                );
+                let db = state.db.lock().await;
+                settle_provider_draft_cleanup(&db, &draft.id, None, Err(error));
+                false
+            }
+        };
+        if !reached {
+            unreachable.insert(draft.account_id.clone());
+        }
     }
+}
+
+/// One retry of a sent row's Drafts cleanup. It connects first, on a fresh
+/// connection under a time limit, so an unreachable server costs one bounded
+/// connect and no Sent-copy work. A row whose Sent copy was never resolved
+/// gets that next, so the sent message has its Sent copy before its Drafts
+/// copy goes. Returns false when the account's server could not be reached.
+async fn retry_provider_draft_cleanup(
+    state: &AppState,
+    draft: &envelope_email_store::Draft,
+) -> bool {
+    use envelope_email_transport::draft_cleanup::{
+        delete_provider_draft_exact, settle_provider_draft_cleanup,
+    };
+
+    let connected = match tokio::time::timeout(
+        PROVIDER_CLEANUP_CONNECT_TIMEOUT,
+        state.connect_imap_unpooled(&draft.account_id),
+    )
+    .await
+    {
+        Ok(connected) => connected.map_err(|e| e.to_string()),
+        Err(_) => Err(format!(
+            "IMAP connect timed out after {}s",
+            PROVIDER_CLEANUP_CONNECT_TIMEOUT.as_secs()
+        )),
+    };
+    let (mut client, creds) = match connected {
+        Ok(connected) => connected,
+        Err(e) => {
+            let db = state.db.lock().await;
+            settle_provider_draft_cleanup(&db, &draft.id, None, Err(e));
+            return false;
+        }
+    };
+    if sent_copy_unresolved(draft) {
+        resolve_sent_copy_from_row(creds, draft).await;
+    }
+    let Some((_, target)) = pending_cleanup_target(state, &draft.id).await else {
+        return true;
+    };
+    let folder = target.as_ref().ok().map(|target| target.folder.clone());
+    let result = match target {
+        Err(reason) => Err(reason.to_string()),
+        Ok(target) => delete_provider_draft_exact(&mut client, &target)
+            .await
+            .map_err(|e| e.to_string()),
+    };
+    let db = state.db.lock().await;
+    settle_provider_draft_cleanup(&db, &draft.id, folder.as_deref(), result);
+    true
 }
 
 /// No Sent-copy proof was recorded, or the lookup that recorded it was
@@ -1806,20 +1902,12 @@ fn sent_copy_unresolved(draft: &envelope_email_store::Draft) -> bool {
 /// Resolve and record the Sent copy of a row an earlier run transmitted,
 /// rebuilt from the row the way the sweep built the message, under the
 /// transmitted Message-ID.
-async fn resolve_sent_copy_from_row(state: &AppState, draft: &envelope_email_store::Draft) {
+async fn resolve_sent_copy_from_row(
+    creds: envelope_email_store::models::AccountWithCredentials,
+    draft: &envelope_email_store::Draft,
+) {
     let Some(message_id) = draft.message_id.as_deref() else {
         return;
-    };
-    let creds = match state.get_or_create_imap(&draft.account_id).await {
-        Ok((_client, creds)) => creds,
-        Err(e) => {
-            tracing::warn!(
-                "scheduled send: draft {} sent, but its Sent copy is unresolved and IMAP is \
-                 unreachable: {e}",
-                draft.id
-            );
-            return;
-        }
     };
     let attachments = match decode_scheduled_attachments(&draft.attachments) {
         Ok(attachments) => attachments,
@@ -1851,33 +1939,15 @@ async fn resolve_sent_copy_from_row(state: &AppState, draft: &envelope_email_sto
 /// (`envelope_email_transport::draft_cleanup`): the folder comes only from
 /// the detected-folder cache, and only the single exact Message-ID match is
 /// deleted. The outcome is settled on the record, so a failure stays pending
-/// for the next sweep, up to the retry bound. Send success stays
+/// for the cleanup retry, up to the retry bound. Send success stays
 /// authoritative regardless.
 async fn clean_up_provider_draft_copy(state: &AppState, draft_id: &str) {
     use envelope_email_transport::draft_cleanup::{
-        delete_provider_draft_exact, resolve_sent_cleanup_target, settle_provider_draft_cleanup,
+        delete_provider_draft_exact, settle_provider_draft_cleanup,
     };
 
-    let found = {
-        let db = state.db.lock().await;
-        db.get_draft(draft_id).map(|row| {
-            row.filter(|row| row.pending_provider_draft_cleanup().is_some())
-                .map(|row| {
-                    let target = resolve_sent_cleanup_target(&db, &row);
-                    (row.account_id, target)
-                })
-        })
-    };
-    let (account_id, target) = match found {
-        Ok(Some(found)) => found,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(
-                "scheduled send: draft {draft_id} sent, but its Drafts cleanup record could not \
-                 be read: {e}"
-            );
-            return;
-        }
+    let Some((account_id, target)) = pending_cleanup_target(state, draft_id).await else {
+        return;
     };
     let folder = target.as_ref().ok().map(|target| target.folder.clone());
     let result = match target {
@@ -1897,6 +1967,33 @@ async fn clean_up_provider_draft_copy(state: &AppState, draft_id: &str) {
     };
     let db = state.db.lock().await;
     settle_provider_draft_cleanup(&db, draft_id, folder.as_deref(), result);
+}
+
+/// A sent row's account and the Drafts copy its pending cleanup record names,
+/// or why that copy cannot be identified. `None` when nothing is pending or
+/// the row could not be read.
+async fn pending_cleanup_target(
+    state: &AppState,
+    draft_id: &str,
+) -> Option<(
+    String,
+    Result<envelope_email_transport::draft_cleanup::DraftCleanupTarget, &'static str>,
+)> {
+    let db = state.db.lock().await;
+    let found = db.get_draft(draft_id).map(|row| {
+        row.filter(|row| row.pending_provider_draft_cleanup().is_some())
+            .map(|row| {
+                let target =
+                    envelope_email_transport::draft_cleanup::resolve_sent_cleanup_target(&db, &row);
+                (row.account_id, target)
+            })
+    });
+    found.unwrap_or_else(|e| {
+        tracing::warn!(
+            "draft {draft_id} sent, but its Drafts cleanup record could not be read: {e}"
+        );
+        None
+    })
 }
 
 /// Decide whether a blocked scheduled draft should be durably paused into

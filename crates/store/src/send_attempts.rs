@@ -1107,8 +1107,8 @@ impl Database {
         // The UPDATE below replaces the row's Message-ID with the transmitted
         // one and clears its Drafts UID, so the identity of the provider
         // Drafts copy is recorded in the same commit. Whoever removes the copy
-        // settles the record; until then every scheduled-send sweep retries
-        // it (`pending_provider_draft_cleanups`).
+        // settles the record; until then `envelope serve`'s cleanup retry
+        // tries again (`pending_provider_draft_cleanups`).
         metadata.remove(PROVIDER_DRAFT_CLEANUP_KEY);
         if let Some(copy) = row
             .draft
