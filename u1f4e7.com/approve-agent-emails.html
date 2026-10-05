@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How do I make an AI agent ask before it sends email? | Envelope</title>
+  <meta name="description" content="Give the agent a mailbox token whose send policy stops at a draft. Envelope saves the agent's message to your Drafts folder and sends it only after you approve that exact version.">
+  <link rel="canonical" href="https://u1f4e7.com/approve-agent-emails.html">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
+  <meta name="theme-color" content="#0b1020">
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Envelope">
+  <meta property="og:url" content="https://u1f4e7.com/approve-agent-emails.html">
+  <meta property="og:title" content="How do I make an AI agent ask before it sends email?">
+  <meta property="og:description" content="Give the agent a mailbox token whose send policy stops at a draft. Envelope saves the agent's message to your Drafts folder and sends it only after you approve that exact version.">
+  <meta property="og:image" content="https://u1f4e7.com/og-card.png">
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="How do I make an AI agent ask before it sends email?">
+  <meta name="twitter:description" content="Give the agent a mailbox token whose send policy stops at a draft. Envelope saves the agent's message to your Drafts folder and sends it only after you approve that exact version.">
+  <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": "How do I make an AI agent ask before it sends email?",
+    "description": "Send modes, human approval and the dashboard setup that keep an AI agent's email in draft until a person approves it.",
+    "datePublished": "2026-10-05",
+    "author": {"@type": "Person", "name": "Tyler Martin", "url": "https://github.com/tymrtn"},
+    "about": {"@type": "SoftwareApplication", "name": "Envelope", "applicationCategory": "CommunicationApplication", "operatingSystem": "macOS, Linux", "url": "https://u1f4e7.com/"},
+    "mainEntityOfPage": "https://u1f4e7.com/approve-agent-emails.html"
+  }
+  </script>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="index.html#top">✉️ Envelope</a>
+      <nav>
+        <a href="index.html#use-cases">Use cases</a>
+        <a href="index.html#workflows">What it does</a>
+        <a href="index.html#control">Human control</a>
+        <a href="index.html#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=approve-nav" data-umami-event="github-nav">Repo</a>
+      </nav>
+    </div>
+  </header>
+  <main id="top">
+    <article id="approve-article" class="article wrap">
+      <p class="eyebrow">Agent questions</p>
+      <h1>How do I make an AI agent ask before it sends email?</h1>
+      <p class="byline">By Tyler Martin, 5 October 2026. Describes Envelope 1.3.16.</p>
+      <p class="lede">Give the agent its own mailbox token with a send limit, and approve its drafts yourself. In Envelope a new agent can write drafts and can't send them. Each draft is saved to your Drafts folder and shows up on the dashboard's Review page, where you read it and decide.</p>
+
+      <section id="approve-setup" class="article-section">
+        <h2>Setup</h2>
+        <p>Run these in your own terminal, so your password and the agent's token never pass through the agent.</p>
+        <div class="callout code-panel"><pre><code># Install on macOS or Linux
+curl -fsSL https://u1f4e7.com/install.sh | bash
+
+# Add your mailbox and create a token for the agent
+envelope accounts add --email you@example.com
+envelope agent create claude-code
+
+# Print the MCP config to paste into your agent
+envelope mcp --config
+
+# Open the dashboard at http://localhost:3141; drafts wait on the Review page
+envelope serve</code></pre></div>
+        <p>Claude Code, Codex and Cursor can install Envelope as a plugin instead of a pasted config. The <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=approve-plugins#use-envelope-from-your-agent" data-umami-event="approve-plugins">README has the plugin commands</a>.</p>
+      </section>
+
+      <section id="approve-modes" class="article-section">
+        <h2>The four send modes</h2>
+        <p>Each agent has a send-mode ceiling that only you can change, with <code>envelope agent policy set &lt;name&gt; --send-mode-ceiling &lt;mode&gt;</code>.</p>
+        <ul class="checklist">
+          <li><code>draft-only</code> is where every new agent starts. The agent saves drafts, and you send them.</li>
+          <li><code>confirm-send</code> lets the agent send after you approve. Its send and reply calls save a draft and tell it to wait for you. Once you approve on the dashboard, its <code>send_draft</code> call goes through. If the draft changes after you approve it, it needs a new approval.</li>
+          <li><code>allowlisted-send</code> lets the agent send without asking, only to the addresses and domains in its policy, such as <code>--allow-recipients 'ops@example.com,@example.com'</code>.</li>
+          <li><code>autonomous-send</code> lets the agent send on its own. I'd keep it for mail you would already let a cron job send.</li>
+        </ul>
+        <p>Under <code>confirm-send</code>, the agent's reply call comes back like this (trimmed), so a well-behaved agent tells you there is a draft to approve:</p>
+        <div class="callout code-panel"><pre><code>{"status": "drafted",
+ "confirmation": {"required": "human_approval", "surface": "dashboard"}}</code></pre></div>
+      </section>
+
+      <section id="approve-weak-points" class="article-section">
+        <h2>Where approval can be bypassed</h2>
+        <p><strong>An unauthenticated dashboard.</strong> On 127.0.0.1 with no auth configured, any program on your machine can call the dashboard, and that includes the agent. If agents run on the same machine, give the dashboard a token: <code>envelope config set dashboard.auth_token "$(openssl rand -hex 32)"</code>.</p>
+        <p><strong>An agent with your shell.</strong> It can run <code>envelope</code> without its token, which makes it you. Connect agents over MCP with their token where you can, and avoid handing them a terminal that has your Envelope access.</p>
+        <p><strong>Tool parameters.</strong> MCP send tools take <code>confirm_send</code> and <code>allow_recipient</code> inputs. With an agent token those inputs only state what the agent intends; the recipient list comes from the agent's policy and the confirmation comes from your approval. Before 1.3.16 an agent could pass them itself, so update if you're on an older version.</p>
+      </section>
+
+      <div class="cta-row">
+        <a class="button" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=approve-cta" data-umami-event="github-cta-approve">Get Envelope on GitHub</a>
+        <a class="button button-secondary" href="agent-2fa-codes.html" data-umami-event="approve-to-otp">Can an agent safely read 2FA codes?</a>
+      </div>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope: one inbox for you and your agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=questions&amp;utm_content=approve-footer" data-umami-event="github-footer">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing" data-umami-event="license-licensing-footer">Licensing</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
