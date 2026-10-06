@@ -69,6 +69,9 @@ pub async fn run_snooze(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder)
+        .await
+        .context("failed to resolve folder")?;
 
     let ctx = agent_context::cli_agent(&db, json)?;
     agent_context::refuse_held_cli(

@@ -36,7 +36,7 @@ pub async fn run(
     // --folder; with --role we map each requested role to every matching folder
     // for this account's provider layout. Search is read-only either way.
     let folders = if roles.is_empty() {
-        vec![folder.to_string()]
+        vec![envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?]
     } else {
         resolve_role_folders(&mut client, &db, &account_id, roles).await?
     };

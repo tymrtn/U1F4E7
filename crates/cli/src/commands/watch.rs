@@ -47,13 +47,6 @@ pub async fn run(
             .with_context(|| format!("--webhook {url} refused"))?;
     }
 
-    if !json {
-        eprintln!(
-            "Watching {} on {}... (Ctrl-C to stop)",
-            folder, creds.account.username
-        );
-    }
-
     // Threat scanning (threat.enabled, default on) runs on every new UID
     // before --run-rules, so `score_above threat` rules see the verdict. An
     // invalid threat config stops watch rather than silently not scanning.
@@ -66,10 +59,24 @@ pub async fn run(
     // keeps its SELECTed state. Log in once up front so bad credentials fail
     // loudly; each batch then opens a fresh connection, because an idle side
     // connection is dropped by the server long before the next new mail.
-    if run_rules || threat_config.is_some() {
-        envelope_email_transport::imap::connect(&creds)
+    // The same login resolves a typed name such as `Sent` to the real folder.
+    let folder = &if run_rules
+        || threat_config.is_some()
+        || envelope_email_transport::provider::folder_alias(folder).is_some()
+    {
+        let mut client = envelope_email_transport::imap::connect(&creds)
             .await
             .context("IMAP connection for the new-mail pass failed")?;
+        envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?
+    } else {
+        folder.to_string()
+    };
+
+    if !json {
+        eprintln!(
+            "Watching {} on {}... (Ctrl-C to stop)",
+            folder, creds.account.username
+        );
     }
 
     // Graceful shutdown via Ctrl-C

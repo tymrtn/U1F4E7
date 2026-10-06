@@ -7,11 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.18] — 2026-10-06
+
+A fix release. CLI folder names such as `Sent` now open the account's real folder on Gmail and other providers, and releases now include an MCP Bundle.
+
 ### Added
 
 - Releases include an MCP Bundle, `envelope-<version>.mcpb`, and its `.sha256`. Opening it in Claude Desktop, or another client that installs MCP Bundles, sets up Envelope's MCP server. The bundle holds the release binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and aarch64), unchanged from the tarballs, and a small launcher runs the one that matches the machine. It asks for the agent token and, optionally, the passphrase file, and shares accounts and data with the `envelope` CLI. Accounts and agent tokens are still created in a terminal.
 - `scripts/mcp-registry-server-json.sh <tag>` writes the `server.json` that lists a published release in the official MCP Registry, with the bundle's download URL and SHA-256.
 - A `Dockerfile` that runs `envelope mcp` in a container. With `ENVELOPE_AGENT_TOKEN` set, it serves the data directory mounted at `/home/envelope/data`. Without a token, it starts only when the container has no database yet, and then creates a throwaway agent in that empty store, so MCP directories such as Glama can start the server and list its tools. An existing database without a token is refused.
+
+### Fixed
+
+- CLI folder names such as `Sent`, `Drafts`, `Junk`, `Trash`, `Archive` and `Starred` (any capitalization) now open the account's own folder of that kind. Before this, `envelope inbox --folder Sent` on Gmail failed with `[NONEXISTENT] Unknown Mailbox: Sent`, because Gmail keeps sent mail in `[Gmail]/Sent Mail` and the CLI passed the typed name to the server unchanged. A folder the server lists under exactly the typed name still wins. Otherwise Envelope uses the folder the server flags for that role (RFC 6154 SPECIAL-USE), which also finds localized Gmail folders such as `[Gmail]/Gesendet`, and falls back to the provider's usual name, the same choice the dashboard makes. Any other name is used as typed, with no extra round trip. This covers inbox, read, search, move, copy, delete, flag, tag, snooze, unsubscribe, attachments, bulk, rules, threat, evidence, watch, quickstart, and reply/forward drafts. MCP tools still take folder names exactly as given, because an agent's folder policy authorizes the name the agent typed.
 
 ## [1.3.17] — 2026-10-05
 

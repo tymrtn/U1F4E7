@@ -428,6 +428,57 @@ where
     Ok(name)
 }
 
+/// The real folder for a name a user or agent typed. The common names
+/// (`Sent`, `drafts`, `Junk`, `Trash`, `Archive`, `Starred`, any case) mean
+/// the account's folder of that kind: see [`crate::provider::resolve_alias`].
+/// Any other name passes through untouched, with no extra round trip.
+pub async fn resolve_mailbox(client: &mut ImapClient, typed: &str) -> Result<String, ImapError> {
+    resolve_mailbox_in(&mut client.session, typed).await
+}
+
+async fn resolve_mailbox_in<T>(session: &mut Session<T>, typed: &str) -> Result<String, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    use crate::provider::{canonical, folder_alias, resolve_alias};
+    use async_imap::types::{Name, NameAttribute};
+
+    let Some(alias) = folder_alias(typed) else {
+        return Ok(typed.to_string());
+    };
+    if alias == canonical::INBOX {
+        return Ok("INBOX".to_string());
+    }
+    let mailboxes: Vec<Name> = session
+        .list(Some(""), Some("*"))
+        .await
+        .map_err(|e| ImapError::Protocol(format!("LIST command failed: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| ImapError::Protocol(format!("LIST parse error: {e}")))?;
+    let roles: &[NameAttribute<'static>] = match alias {
+        canonical::SENT => &[NameAttribute::Sent],
+        canonical::DRAFTS => &[NameAttribute::Drafts],
+        canonical::TRASH => &[NameAttribute::Trash],
+        canonical::SPAM => &[NameAttribute::Junk],
+        canonical::ARCHIVE => &[NameAttribute::Archive, NameAttribute::All],
+        canonical::STARRED => &[NameAttribute::Flagged],
+        _ => &[],
+    };
+    let special_use = roles.iter().find_map(|role| {
+        mailboxes
+            .iter()
+            .find(|m| m.attributes().contains(role))
+            .map(|m| m.name().to_string())
+    });
+    let names: Vec<String> = mailboxes.iter().map(|m| m.name().to_string()).collect();
+    resolve_alias(typed, alias, &names, special_use.as_deref()).ok_or_else(|| {
+        ImapError::Protocol(format!(
+            "this account has no {typed} folder; `envelope folders` lists the folders it has"
+        ))
+    })
+}
+
 /// Fetch stats for a single folder via IMAP `STATUS (MESSAGES RECENT UNSEEN)`.
 ///
 /// Unlike `fetch_inbox`, this does NOT `SELECT` the folder (which would cause
@@ -3670,6 +3721,61 @@ Subject: hi\r\n\r\nbody\r\n";
                 });
             server.await.unwrap();
         }
+    }
+
+    /// `envelope inbox --folder Sent` on Gmail sent `SELECT Sent` and failed
+    /// with `[NONEXISTENT] Unknown Mailbox`. The typed name now resolves to
+    /// the folder the server flags `\Sent`, ahead of a user label that merely
+    /// looks like a sent folder.
+    #[tokio::test]
+    async fn typed_sent_resolves_to_the_flagged_gmail_folder() {
+        let reply = vec![
+            r#"* LIST (\HasNoChildren) "/" "INBOX""#.to_string(),
+            r#"* LIST (\HasNoChildren) "/" "Sent Messages""#.to_string(),
+            r#"* LIST (\HasChildren \Noselect) "/" "[Gmail]""#.to_string(),
+            r#"* LIST (\All \HasNoChildren) "/" "[Gmail]/All Mail""#.to_string(),
+            r#"* LIST (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail""#.to_string(),
+            "{tag} OK Success".to_string(),
+        ];
+        let (mut session, server) = scripted_session(vec![Turn {
+            verb: "LIST",
+            reply,
+        }])
+        .await;
+        let resolved = resolve_mailbox_in(&mut session, "Sent").await.unwrap();
+        assert_eq!(resolved, "[Gmail]/Sent Mail");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_folder_names_resolve_without_a_round_trip() {
+        let (mut session, server) = scripted_session(vec![]).await;
+        for typed in ["Projects", "[Gmail]/Sent Mail", "INBOX.Sent"] {
+            assert_eq!(
+                resolve_mailbox_in(&mut session, typed).await.unwrap(),
+                typed
+            );
+        }
+        assert_eq!(
+            resolve_mailbox_in(&mut session, "inbox").await.unwrap(),
+            "INBOX"
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_alias_with_no_folder_says_so() {
+        let (mut session, server) = scripted_session(vec![Turn {
+            verb: "LIST",
+            reply: vec![
+                r#"* LIST (\HasNoChildren) "/" "INBOX""#.to_string(),
+                "{tag} OK Success".to_string(),
+            ],
+        }])
+        .await;
+        let err = resolve_mailbox_in(&mut session, "Trash").await.unwrap_err();
+        assert!(err.to_string().contains("no Trash folder"), "{err}");
+        server.await.unwrap();
     }
 
     /// Same hazard for single-UID FETCH readers: taking the one FETCH item and

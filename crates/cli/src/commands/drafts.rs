@@ -784,12 +784,16 @@ async fn create_contextual_draft(
 }
 
 /// Build a contextual reply draft. Shared by the CLI and MCP surfaces.
+/// `resolve_alias` maps a typed name such as `Sent` to the account's real
+/// folder; MCP passes false because its agent policy authorized the folder
+/// exactly as typed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_reply_draft(
     db: &Database,
     creds: &AccountWithCredentials,
     uid: u32,
     folder: &str,
+    resolve_alias: bool,
     reply_all: bool,
     authored: &AuthoredBody,
     signature: bool,
@@ -798,14 +802,20 @@ pub(crate) async fn create_reply_draft(
     if creds.account.imap_host.is_empty() {
         bail!("reply requires an IMAP account to fetch the parent message");
     }
-    let parent = {
+    let (folder, parent) = {
         let mut client = imap::connect(creds)
             .await
             .context("failed to connect to IMAP")?;
-        imap::fetch_message(&mut client, folder, uid)
+        let folder = if resolve_alias {
+            imap::resolve_mailbox(&mut client, folder).await?
+        } else {
+            folder.to_string()
+        };
+        let parent = imap::fetch_message(&mut client, &folder, uid)
             .await
             .context("failed to fetch parent message")?
-            .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?
+            .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
+        (folder, parent)
     };
 
     let headers = if reply_all {
@@ -823,7 +833,7 @@ pub(crate) async fn create_reply_draft(
 
     let spec = ContextualDraftSpec {
         kind: DraftKind::Reply,
-        source_folder: folder.to_string(),
+        source_folder: folder,
         source_uid: uid,
         source_message_id: parent.message_id.clone(),
         to: headers.to,
@@ -920,13 +930,15 @@ fn forwarded_attachment_snapshots(
         .collect())
 }
 
-/// Build a contextual forward draft. Shared by the CLI and MCP surfaces.
+/// Build a contextual forward draft. Shared by the CLI and MCP surfaces;
+/// `resolve_alias` as in [`create_reply_draft`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_forward_draft(
     db: &Database,
     creds: &AccountWithCredentials,
     uid: u32,
     folder: &str,
+    resolve_alias: bool,
     to: Option<&str>,
     authored: &AuthoredBody,
     signature: bool,
@@ -936,17 +948,23 @@ pub(crate) async fn create_forward_draft(
     if creds.account.imap_host.is_empty() {
         bail!("forward requires an IMAP account to fetch the source message");
     }
-    let parent = {
+    let (folder, parent) = {
         let mut client = imap::connect(creds)
             .await
             .context("failed to connect to IMAP")?;
-        imap::fetch_message(&mut client, folder, uid)
+        let folder = if resolve_alias {
+            imap::resolve_mailbox(&mut client, folder).await?
+        } else {
+            folder.to_string()
+        };
+        let parent = imap::fetch_message(&mut client, &folder, uid)
             .await
             .context("failed to fetch source message")?
-            .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?
+            .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found in {folder}"))?;
+        (folder, parent)
     };
     let mut attachment_snapshots = if include_attachments {
-        snapshot_source_attachments(db, creds, uid, folder, &parent.attachments).await?
+        snapshot_source_attachments(db, creds, uid, &folder, &parent.attachments).await?
     } else {
         Vec::new()
     };
@@ -955,7 +973,7 @@ pub(crate) async fn create_forward_draft(
 
     let spec = ContextualDraftSpec {
         kind: DraftKind::Forward,
-        source_folder: folder.to_string(),
+        source_folder: folder,
         source_uid: uid,
         source_message_id: parent.message_id.clone(),
         to: to.unwrap_or("").to_string(),
@@ -1516,6 +1534,7 @@ pub async fn run_reply(
         &creds,
         uid,
         folder,
+        true,
         reply_all,
         &authored,
         signature,
@@ -1552,6 +1571,7 @@ pub async fn run_forward(
         &creds,
         uid,
         folder,
+        true,
         to,
         &authored,
         signature,

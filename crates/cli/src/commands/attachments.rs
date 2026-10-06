@@ -221,6 +221,7 @@ pub async fn run_list(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     let message = envelope_email_transport::imap::fetch_message(&mut client, folder, uid).await?;
 
@@ -322,6 +323,7 @@ pub async fn run_download(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     let attachment =
         envelope_email_transport::imap::download_attachment(&mut client, uid, filename, folder)

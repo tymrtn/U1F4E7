@@ -277,6 +277,65 @@ pub fn all_candidates_for(canonical_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// The folder of `canonical_type` on a server listing `folders`: the
+/// provider's own name when it exists, else the first known variant that
+/// exists, else `None`. Never returns a folder the server did not list.
+pub fn pick_canonical_folder(
+    provider: ProviderType,
+    canonical_type: &str,
+    folders: &[String],
+) -> Option<String> {
+    if provider != ProviderType::Unknown {
+        let resolved = resolve_folder(provider, canonical_type);
+        if folders.iter().any(|f| f == resolved) {
+            return Some(resolved.to_string());
+        }
+    }
+    all_candidates_for(canonical_type)
+        .iter()
+        .find(|candidate| folders.iter().any(|f| f == *candidate))
+        .map(|c| c.to_string())
+}
+
+/// The canonical type a typed folder name stands for (`Sent`, `drafts`,
+/// `JUNK`, ...), or `None` for any other name.
+pub fn folder_alias(typed: &str) -> Option<&'static str> {
+    match typed.to_ascii_lowercase().as_str() {
+        "inbox" => Some(canonical::INBOX),
+        "sent" => Some(canonical::SENT),
+        "drafts" => Some(canonical::DRAFTS),
+        "trash" => Some(canonical::TRASH),
+        "spam" | "junk" => Some(canonical::SPAM),
+        "archive" => Some(canonical::ARCHIVE),
+        "starred" => Some(canonical::STARRED),
+        _ => None,
+    }
+}
+
+/// The real folder a typed alias names on a server listing `folders`. A
+/// folder listed under exactly the typed name wins. Next comes the folder the
+/// server flags for that role with SPECIAL-USE (`special_use`), which also
+/// covers localized names such as `[Gmail]/Gesendet`. Last is the provider's
+/// usual name, as the dashboard picks it (on Gmail, `Sent` is
+/// `[Gmail]/Sent Mail`). `None` when the server has none of them.
+pub fn resolve_alias(
+    typed: &str,
+    alias: &str,
+    folders: &[String],
+    special_use: Option<&str>,
+) -> Option<String> {
+    if alias == canonical::INBOX {
+        return Some("INBOX".to_string());
+    }
+    if folders.iter().any(|f| f == typed) {
+        return Some(typed.to_string());
+    }
+    if let Some(flagged) = special_use {
+        return Some(flagged.to_string());
+    }
+    pick_canonical_folder(detect_provider(folders), alias, folders)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +631,94 @@ mod tests {
             ProviderType::Dovecot,
             "INBOX/x (slash) folders must not be mistaken for Dovecot INBOX.x (dot)"
         );
+    }
+
+    // ── Typed folder aliases ─────────────────────────────────────
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn typed_sent_on_gmail_is_the_sent_mail_folder() {
+        // Shape of a real Gmail account: an empty user label "Sent Messages"
+        // also classifies as sent, and must not win over Gmail's own folder.
+        let folders = names(&[
+            "INBOX",
+            "Sent Messages",
+            "[Gmail]",
+            "[Gmail]/All Mail",
+            "[Gmail]/Drafts",
+            "[Gmail]/Sent Mail",
+            "[Gmail]/Spam",
+            "[Gmail]/Trash",
+        ]);
+        for typed in ["Sent", "sent", "SENT"] {
+            let alias = folder_alias(typed).unwrap();
+            assert_eq!(
+                resolve_alias(typed, alias, &folders, None).as_deref(),
+                Some("[Gmail]/Sent Mail"),
+                "{typed}"
+            );
+        }
+        assert_eq!(
+            resolve_alias("Junk", folder_alias("Junk").unwrap(), &folders, None).as_deref(),
+            Some("[Gmail]/Spam")
+        );
+        assert_eq!(
+            resolve_alias("archive", folder_alias("archive").unwrap(), &folders, None).as_deref(),
+            Some("[Gmail]/All Mail")
+        );
+    }
+
+    #[test]
+    fn a_folder_the_server_lists_by_that_name_wins() {
+        let folders = names(&["INBOX", "Sent", "Sent Items", "Deleted Items"]);
+        assert_eq!(
+            resolve_alias("Sent", "sent", &folders, None).as_deref(),
+            Some("Sent")
+        );
+        // Lowercase isn't listed, so it means Exchange's sent folder.
+        assert_eq!(
+            resolve_alias("sent", "sent", &folders, None).as_deref(),
+            Some("Sent Items")
+        );
+    }
+
+    #[test]
+    fn the_special_use_folder_covers_localized_names() {
+        let folders = names(&["INBOX", "[Gmail]/Gesendet", "[Gmail]/Papierkorb"]);
+        assert_eq!(
+            resolve_alias("Sent", "sent", &folders, Some("[Gmail]/Gesendet")).as_deref(),
+            Some("[Gmail]/Gesendet")
+        );
+        // Without the flag, a localized name can't be guessed.
+        assert_eq!(resolve_alias("Sent", "sent", &folders, None), None);
+    }
+
+    #[test]
+    fn inbox_is_case_insensitive_and_needs_no_listing() {
+        assert_eq!(
+            resolve_alias("inbox", "inbox", &[], None).as_deref(),
+            Some("INBOX")
+        );
+    }
+
+    #[test]
+    fn an_alias_with_no_matching_folder_resolves_to_nothing() {
+        let folders = names(&["INBOX", "Projects"]);
+        assert_eq!(resolve_alias("Trash", "trash", &folders, None), None);
+    }
+
+    #[test]
+    fn other_names_are_not_aliases() {
+        for typed in [
+            "Projects",
+            "[Gmail]/Sent Mail",
+            "Sent Messages",
+            "INBOX.Sent",
+        ] {
+            assert_eq!(folder_alias(typed), None, "{typed}");
+        }
     }
 }

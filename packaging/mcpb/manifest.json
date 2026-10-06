@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "envelope",
   "display_name": "Envelope",
-  "version": "1.3.17",
+  "version": "1.3.18",
   "description": "All your email accounts in one inbox, shared with your agents. Envelope runs locally on the IMAP/SMTP mailboxes you already have.",
   "long_description": "Envelope gives Claude your own IMAP and SMTP mailboxes as tools: read, search, draft, reply, file and watch mail. It runs on your machine. The extension starts the `envelope` binary bundled inside it, and that binary uses the same local data as the `envelope` command-line tool.\n\nSet Envelope up in a terminal before you turn this extension on. It has no setup screens of its own, and your password and token never pass through Claude.\n\n1. Install the CLI: `brew install tymrtn/u1f4e7/envelope`, or `curl -fsSL https://u1f4e7.com/install.sh | bash`.\n2. Add each account: `envelope accounts add --email you@example.com`.\n3. Create a token for Claude: `envelope agent create claude-desktop`. It prints the token once. Paste it into **Agent token**.\n\nIf you keep Envelope's passphrase in a file (`ENVELOPE_MASTER_PASSPHRASE_FILE` in your shell profile), choose that file under **Passphrase file**. Claude starts the server without your shell profile, so it never sees that export.\n\nEvery tool call runs under the agent's policy, and drafts the agent writes wait for your approval before they send.\n\nFull setup guide: [Use Envelope from your agent](https://github.com/tymrtn/U1F4E7#use-envelope-from-your-agent).",
   "author": {

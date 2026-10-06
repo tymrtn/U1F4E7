@@ -29,6 +29,9 @@ pub async fn run(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder)
+        .await
+        .context("failed to resolve folder")?;
 
     // Fetch message summary for display
     let msg = imap::fetch_message(&mut client, folder, uid)

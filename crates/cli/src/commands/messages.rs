@@ -23,6 +23,9 @@ pub async fn run_move(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
+    let to_folder =
+        &envelope_email_transport::imap::resolve_mailbox(&mut client, to_folder).await?;
     agent_context::refuse_held_cli(
         &mut client,
         &db,
@@ -70,6 +73,9 @@ pub async fn run_copy(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
+    let to_folder =
+        &envelope_email_transport::imap::resolve_mailbox(&mut client, to_folder).await?;
     agent_context::refuse_held_cli(
         &mut client,
         &db,
@@ -157,6 +163,7 @@ pub async fn run_delete(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     // Resolve the account's real Trash once: it is both the default destination
     // and the way we know whether `folder` already IS Trash.
