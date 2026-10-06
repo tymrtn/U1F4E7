@@ -81,7 +81,7 @@ pub fn delete_effective_dry_run(dry_run: bool, confirm: bool) -> bool {
 #[allow(clippy::too_many_arguments)]
 #[tokio::main]
 pub async fn run(
-    op: BulkOp,
+    mut op: BulkOp,
     target: BulkTarget,
     folder: &str,
     dry_run: bool,
@@ -95,6 +95,11 @@ pub async fn run(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
+    if let BulkOp::Move { to_folder } | BulkOp::Copy { to_folder } = &mut op {
+        *to_folder =
+            envelope_email_transport::imap::resolve_mailbox(&mut client, to_folder).await?;
+    }
 
     let action_type = op.action_type();
     let mut req = BulkRequest {

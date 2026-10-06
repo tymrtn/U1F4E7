@@ -66,23 +66,25 @@ async fn current_verdict(
     folder: &str,
     uid: u32,
     config: &ThreatConfig,
-) -> Result<StoredVerdict> {
+) -> Result<(String, StoredVerdict)> {
     let account_id = creds.account.id.as_str();
     let mut client = imap::connect(creds)
         .await
         .context("IMAP connection failed")?;
-    let raw = fetch_raw(&mut client, folder, uid).await?;
-    if let Some(stored) = current_stored(db, account_id, folder, uid, &raw)? {
-        return Ok(stored);
+    let folder = imap::resolve_mailbox(&mut client, folder).await?;
+    let raw = fetch_raw(&mut client, &folder, uid).await?;
+    if let Some(stored) = current_stored(db, account_id, &folder, uid, &raw)? {
+        return Ok((folder, stored));
     }
     require_enabled(config)?;
     let account = RunAccount {
         id: account_id,
         email: &creds.account.username,
     };
-    persist::scan_uid(&mut client, db, &account, folder, uid, config).await?;
-    persist::stored_verdict_for_uid(db, account_id, folder, uid)?
-        .ok_or_else(|| anyhow!("scan of UID {uid} recorded no verdict"))
+    persist::scan_uid(&mut client, db, &account, &folder, uid, config).await?;
+    let stored = persist::stored_verdict_for_uid(db, account_id, &folder, uid)?
+        .ok_or_else(|| anyhow!("scan of UID {uid} recorded no verdict"))?;
+    Ok((folder, stored))
 }
 
 /// The `threat:*` tags stored under a message's threat key.
@@ -174,6 +176,7 @@ pub async fn run_scan(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder).await?;
     imap::examine_folder_info(&mut client, folder).await?;
     let mut uids = imap::list_selected_uids(&mut client).await?;
     uids.sort_unstable();
@@ -241,7 +244,7 @@ pub async fn run_show(
 ) -> Result<()> {
     let config = load_config()?;
     let (db, creds) = setup_credentials(account, backend)?;
-    let stored = current_verdict(&db, &creds, folder, uid, &config).await?;
+    let (folder, stored) = current_verdict(&db, &creds, folder, uid, &config).await?;
     let value = verdict_json(&db, &creds.account.id, &stored)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -275,7 +278,7 @@ pub async fn run_explain(
 ) -> Result<()> {
     let config = load_config()?;
     let (db, creds) = setup_credentials(account, backend)?;
-    let stored = current_verdict(&db, &creds, folder, uid, &config).await?;
+    let (folder, stored) = current_verdict(&db, &creds, folder, uid, &config).await?;
     let lines = threat::explain(&stored.verdict);
     if json {
         println!(
@@ -354,11 +357,13 @@ pub async fn run_mark_safe(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     // A message that cannot be read whole (over the size cap) is not marked.
-    let raw = async {
+    let (folder, raw) = async {
         let mut client = imap::connect(&creds)
             .await
             .context("IMAP connection failed")?;
-        fetch_raw(&mut client, folder, uid).await
+        let folder = imap::resolve_mailbox(&mut client, folder).await?;
+        let raw = fetch_raw(&mut client, &folder, uid).await?;
+        Ok::<_, anyhow::Error>((folder, raw))
     }
     .await
     .with_context(|| {
@@ -367,7 +372,7 @@ pub async fn run_mark_safe(
             persist::RESCAN_REQUIRED
         )
     })?;
-    let message_id = mark_safe_bytes(&db, &creds.account.id, folder, uid, &raw)?;
+    let message_id = mark_safe_bytes(&db, &creds.account.id, &folder, uid, &raw)?;
     if json {
         println!(
             "{}",
@@ -402,6 +407,8 @@ pub async fn run_release(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder).await?;
+    let to = &imap::resolve_mailbox(&mut client, to).await?;
     let raw = fetch_raw(&mut client, folder, uid).await?;
     let message_id = threat::sole_message_id(&raw);
     let key = persist::threat_key(
@@ -477,6 +484,7 @@ pub async fn run_report(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder).await?;
     let raw = fetch_raw(&mut client, folder, uid).await?;
     drop(client);
 

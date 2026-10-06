@@ -369,6 +369,9 @@ pub async fn run_test(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder)
+        .await
+        .context("failed to resolve folder")?;
 
     let msg = imap::fetch_message(&mut client, folder, uid)
         .await
@@ -595,6 +598,9 @@ pub async fn run_preview(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder)
+        .await
+        .context("failed to resolve folder")?;
     let result = preview_core(&mut client, &db, &account_id, folder, limit).await?;
     let matches = result["matches"].as_array().cloned().unwrap_or_default();
     let total = result["processed"].as_u64().unwrap_or(0) as usize;
@@ -669,6 +675,9 @@ pub async fn run_apply(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &imap::resolve_mailbox(&mut client, folder)
+        .await
+        .context("failed to resolve folder")?;
 
     let agent = agent_context::cli_agent(&db, json)?;
     let attribution = ActionAttribution::new(rule_exec::ActionSource::Cli)

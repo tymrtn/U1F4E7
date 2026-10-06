@@ -1394,26 +1394,7 @@ pub(crate) async fn resolve_canonical_folder(
     Ok(picked)
 }
 
-/// Pure folder choice for a canonical type against a real folder inventory:
-/// the provider's own name when it exists, else the first known variant that
-/// exists, else `None`. Never returns a folder the server did not list.
-pub(crate) fn pick_canonical_folder(
-    provider: envelope_email_transport::provider::ProviderType,
-    canonical_type: &str,
-    folders: &[String],
-) -> Option<String> {
-    use envelope_email_transport::provider::{self, ProviderType};
-    if provider != ProviderType::Unknown {
-        let resolved = provider::resolve_folder(provider, canonical_type);
-        if folders.iter().any(|f| f == resolved) {
-            return Some(resolved.to_string());
-        }
-    }
-    provider::all_candidates_for(canonical_type)
-        .iter()
-        .find(|candidate| folders.iter().any(|f| f == *candidate))
-        .map(|c| c.to_string())
-}
+pub(crate) use envelope_email_transport::provider::pick_canonical_folder;
 
 /// Stable JSON failure for a canonical move target that resolved to no real
 /// provider folder. Returned BEFORE any mutation; carries only the requested

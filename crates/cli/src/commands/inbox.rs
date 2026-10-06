@@ -21,6 +21,7 @@ pub async fn run(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     let messages = envelope_email_transport::imap::fetch_inbox(&mut client, folder, limit).await?;
 

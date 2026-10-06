@@ -20,6 +20,7 @@ pub async fn run_add(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     envelope_email_transport::imap::set_flag(&mut client, folder, uid, flag).await?;
     envelope_email_transport::imap::record_own_flag_change(
@@ -63,6 +64,7 @@ pub async fn run_remove(
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
+    let folder = &envelope_email_transport::imap::resolve_mailbox(&mut client, folder).await?;
 
     envelope_email_transport::imap::remove_flag(&mut client, folder, uid, flag).await?;
     envelope_email_transport::imap::record_own_flag_change(

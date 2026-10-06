@@ -365,13 +365,15 @@ fn run_network_phases(options: &QuickstartOptions<'_>, account: &Account) -> Vec
         );
 
         let peek_started = Instant::now();
-        let peek = tokio::time::timeout(
-            timeout,
-            envelope_email_transport::imap::peek_folder_headers_read_only(&mut client, &folder, peek_limit),
-        )
+        let peek = tokio::time::timeout(timeout, async {
+            let folder = envelope_email_transport::imap::resolve_mailbox(&mut client, &folder).await?;
+            envelope_email_transport::imap::peek_folder_headers_read_only(&mut client, &folder, peek_limit)
+                .await
+                .map(|messages| (folder, messages))
+        })
         .await;
         let peek_phase = match peek {
-            Ok(Ok(messages)) => {
+            Ok(Ok((folder, messages))) => {
                 let newest = messages.first();
                 ok_phase(
                     PhaseName::InboxPeek,

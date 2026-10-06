@@ -127,7 +127,7 @@ struct AttachmentExportArgs {
 }
 
 async fn run_attachment_export(
-    args: AttachmentExportArgs,
+    mut args: AttachmentExportArgs,
     json_output: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -139,6 +139,9 @@ async fn run_attachment_export(
     let mut client = imap::connect(&src)
         .await
         .context("source IMAP connection failed")?;
+    args.folder = imap::resolve_mailbox(&mut client, &args.folder)
+        .await
+        .context("failed to resolve folder")?;
 
     let selected = imap::examine_folder_for_evidence(&mut client, &args.folder)
         .await
@@ -386,7 +389,7 @@ fn export_fetched_attachments(
 }
 
 async fn run_collect(
-    args: CollectArgs,
+    mut args: CollectArgs,
     json_output: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -403,6 +406,9 @@ async fn run_collect(
     let mut client = imap::connect(&src)
         .await
         .context("source IMAP connection failed")?;
+    args.folder = imap::resolve_mailbox(&mut client, &args.folder)
+        .await
+        .context("failed to resolve folder")?;
 
     let selected = imap::examine_folder_for_evidence(&mut client, &args.folder)
         .await
