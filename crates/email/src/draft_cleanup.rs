@@ -18,11 +18,53 @@
 //! 3. Callers run this strictly AFTER SMTP acceptance and durable sent-state
 //!    persistence (send paths), or while holding the exclusive `syncing`
 //!    claim (modify replace). A skip is reported, never claimed as done.
+//!
+//! After a send, the copy to remove is named by the row's durable
+//! `provider_draft_cleanup` record, written in the commit that marks it
+//! `sent`. Every attempt settles that record
+//! ([`settle_provider_draft_cleanup`]): a sender that stops before removing
+//! the copy, or whose attempt fails, leaves it pending and `envelope serve`'s
+//! cleanup retry tries again.
 
-use envelope_email_store::{Database, Draft};
+use std::future::Future;
+
+use envelope_email_store::{Database, Draft, ProviderCleanupRetry};
+use tracing::{error, info, warn};
 
 use crate::errors::ImapError;
 use crate::imap::{self, ImapClient};
+
+/// The two mailbox operations post-send cleanup performs.
+pub trait DraftsMailbox {
+    /// Every UID in `folder` whose Message-ID header exactly equals
+    /// `message_id` after normalization.
+    fn exact_message_id_uids(
+        &mut self,
+        folder: &str,
+        message_id: &str,
+    ) -> impl Future<Output = Result<Vec<u32>, ImapError>> + Send;
+
+    /// Delete one message by UID (mark `\Deleted`, expunge that UID).
+    fn delete_uid(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> impl Future<Output = Result<(), ImapError>> + Send;
+}
+
+impl DraftsMailbox for ImapClient {
+    async fn exact_message_id_uids(
+        &mut self,
+        folder: &str,
+        message_id: &str,
+    ) -> Result<Vec<u32>, ImapError> {
+        imap::find_uids_by_exact_message_id(self, folder, message_id).await
+    }
+
+    async fn delete_uid(&mut self, folder: &str, uid: u32) -> Result<(), ImapError> {
+        imap::delete_message(self, folder, uid).await
+    }
+}
 
 /// Identity facts required before a provider draft copy may be deleted.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,16 +92,33 @@ pub fn resolve_draft_cleanup_target(
     db: &Database,
     draft: &Draft,
 ) -> Result<DraftCleanupTarget, &'static str> {
+    cleanup_target(db, draft, draft.message_id.as_deref())
+}
+
+/// [`resolve_draft_cleanup_target`] for a `sent` row: its Message-ID column
+/// now holds the transmitted message, so the Drafts copy's identity comes
+/// from the pending cleanup record written with the send.
+pub fn resolve_sent_cleanup_target(
+    db: &Database,
+    draft: &Draft,
+) -> Result<DraftCleanupTarget, &'static str> {
+    let Some(copy) = draft.pending_provider_draft_cleanup() else {
+        return Err("no provider Drafts cleanup pending");
+    };
+    cleanup_target(db, draft, Some(copy))
+}
+
+fn cleanup_target(
+    db: &Database,
+    draft: &Draft,
+    identity: Option<&str>,
+) -> Result<DraftCleanupTarget, &'static str> {
     let folder = match db.get_drafts_folder(&draft.account_id) {
         Ok(Some(folder)) => folder,
         Ok(None) => return Err("no detected drafts folder cached; refusing to guess one"),
         Err(_) => return Err("detected-folder cache read failed"),
     };
-    let message_id = draft
-        .message_id
-        .as_deref()
-        .and_then(imap::normalize_message_id);
-    let Some(message_id) = message_id else {
+    let Some(message_id) = identity.and_then(imap::normalize_message_id) else {
         return Err("no persisted Message-ID to verify draft identity");
     };
     let superseded = draft
@@ -80,8 +139,11 @@ pub fn resolve_draft_cleanup_target(
 pub enum ProviderDraftCleanup {
     /// The uniquely-verified copy was deleted (server-reported UID).
     Deleted { uid: u32 },
-    /// Identity could not be established unambiguously (zero or multiple
-    /// exact Message-ID matches) — nothing was deleted.
+    /// No message in the folder carries the copy's Message-ID: it is already
+    /// gone. Nothing was deleted.
+    Absent,
+    /// Identity could not be established unambiguously (more than one exact
+    /// Message-ID match) — nothing was deleted.
     Skipped(&'static str),
 }
 
@@ -98,10 +160,12 @@ pub enum ProviderDraftReplaceCleanup {
 /// Delete the provider draft copy identified by `target`, verifying identity
 /// on the server first: the deleted UID is the **single** message in the
 /// exact detected folder whose Message-ID header exactly equals the
-/// persisted one. Zero or multiple exact matches skip (fail closed). The
-/// caller supplies a connected client and owns retry/eviction policy.
-pub async fn delete_provider_draft_exact(
-    client: &mut ImapClient,
+/// persisted one. No match is [`ProviderDraftCleanup::Absent`]; several skip
+/// (fail closed). A message at the draft's old UID that carries another
+/// Message-ID is never touched. The caller supplies a connected client and
+/// owns retry/eviction policy.
+pub async fn delete_provider_draft_exact<M: DraftsMailbox>(
+    client: &mut M,
     target: &DraftCleanupTarget,
 ) -> Result<ProviderDraftCleanup, ImapError> {
     // Sweep the identities this draft has previously worn first. Each edit
@@ -115,13 +179,13 @@ pub async fn delete_provider_draft_exact(
     // that is ambiguous or absent is simply skipped.
     let mut superseded_uids = Vec::new();
     for stale in &target.superseded_message_ids {
-        match imap::find_unique_uid_by_exact_message_id(client, &target.folder, stale).await {
-            Ok(Some(uid)) => {
-                imap::delete_message(client, &target.folder, uid).await?;
-                superseded_uids.push(uid);
+        match client.exact_message_id_uids(&target.folder, stale).await {
+            Ok(uids) if uids.len() == 1 => {
+                client.delete_uid(&target.folder, uids[0]).await?;
+                superseded_uids.push(uids[0]);
             }
             // Absent or ambiguous: nothing safely identifiable to remove.
-            Ok(None) => {}
+            Ok(_) => {}
             // A lookup failure on a stale identity must not abort cleanup of
             // the current copy, which is the one that definitely exists.
             Err(e) => {
@@ -133,24 +197,83 @@ pub async fn delete_provider_draft_exact(
         }
     }
 
-    match imap::find_unique_uid_by_exact_message_id(client, &target.folder, &target.message_id)
+    match client
+        .exact_message_id_uids(&target.folder, &target.message_id)
         .await?
+        .as_slice()
     {
-        Some(uid) => {
-            imap::delete_message(client, &target.folder, uid).await?;
-            Ok(ProviderDraftCleanup::Deleted { uid })
+        [uid] => {
+            client.delete_uid(&target.folder, *uid).await?;
+            Ok(ProviderDraftCleanup::Deleted { uid: *uid })
         }
-        None if !superseded_uids.is_empty() => {
+        [] if !superseded_uids.is_empty() => {
             // The current identity is gone but stale copies were removed. That
             // is a real cleanup, not a skip.
             Ok(ProviderDraftCleanup::Deleted {
                 uid: superseded_uids[superseded_uids.len() - 1],
             })
         }
-        None => Ok(ProviderDraftCleanup::Skipped(
+        [] => Ok(ProviderDraftCleanup::Absent),
+        _ => Ok(ProviderDraftCleanup::Skipped(
             "provider draft copy not uniquely identified by exact Message-ID",
         )),
     }
+}
+
+/// Record one post-send cleanup attempt on the sent row's pending record,
+/// and log it (draft id, folder and UID only). A deletion, an absent copy or
+/// an ambiguous one closes the record; an error counts against the retry
+/// bound, so a later sweep tries again. Returns true when a copy was
+/// deleted.
+pub fn settle_provider_draft_cleanup(
+    db: &Database,
+    draft_id: &str,
+    folder: Option<&str>,
+    result: Result<ProviderDraftCleanup, String>,
+) -> bool {
+    let folder = folder.unwrap_or("the Drafts folder");
+    let (closed, deleted) = match &result {
+        Ok(ProviderDraftCleanup::Deleted { uid }) => {
+            info!("draft {draft_id}: removed its provider Drafts copy (UID {uid} in {folder})");
+            (db.finish_provider_draft_cleanup(draft_id, "deleted"), true)
+        }
+        Ok(ProviderDraftCleanup::Absent) => {
+            info!("draft {draft_id}: its provider Drafts copy is already gone from {folder}");
+            (db.finish_provider_draft_cleanup(draft_id, "absent"), false)
+        }
+        Ok(ProviderDraftCleanup::Skipped(reason)) => {
+            warn!("draft {draft_id}: provider Drafts copy left in {folder}: {reason}");
+            (
+                db.finish_provider_draft_cleanup(draft_id, "ambiguous"),
+                false,
+            )
+        }
+        Err(e) => {
+            match db.fail_provider_draft_cleanup(draft_id, e) {
+                Ok(Some(ProviderCleanupRetry::Pending { attempts })) => warn!(
+                    "draft {draft_id}: provider Drafts cleanup failed in {folder} (attempt \
+                     {attempts} of {}); the next sweep retries: {e}",
+                    envelope_email_store::send_attempts::MAX_PROVIDER_DRAFT_CLEANUP_ATTEMPTS
+                ),
+                Ok(Some(ProviderCleanupRetry::Abandoned { attempts })) => error!(
+                    "draft {draft_id}: provider Drafts cleanup failed {attempts} times; \
+                     giving up, so the sent message's copy stays in {folder}: {e}"
+                ),
+                Ok(None) => {
+                    warn!("draft {draft_id}: provider Drafts cleanup failed in {folder}: {e}")
+                }
+                Err(store) => error!(
+                    "draft {draft_id}: provider Drafts cleanup failed in {folder} ({e}), and \
+                     the failure could not be recorded: {store}"
+                ),
+            }
+            return false;
+        }
+    };
+    if let Err(e) = closed {
+        error!("draft {draft_id}: could not record the provider Drafts cleanup: {e}");
+    }
+    deleted
 }
 
 /// Clear every exact provider copy before APPENDing an edited replacement.
@@ -235,6 +358,232 @@ mod tests {
             target.superseded_message_ids,
             vec!["older@mac.lan".to_string()],
             "normalized, and the current identity is not swept twice"
+        );
+    }
+
+    // ── Post-send cleanup against a scripted Drafts folder ──────────────
+
+    /// A Drafts folder of `(uid, Message-ID)` pairs. `failing_deletes`
+    /// deletes fail the way a dropped connection does before any succeeds.
+    #[derive(Default)]
+    struct ScriptedDrafts {
+        messages: Vec<(u32, String)>,
+        deleted: Vec<u32>,
+        failing_deletes: usize,
+    }
+
+    impl DraftsMailbox for ScriptedDrafts {
+        async fn exact_message_id_uids(
+            &mut self,
+            _folder: &str,
+            message_id: &str,
+        ) -> Result<Vec<u32>, ImapError> {
+            let wanted = imap::normalize_message_id(message_id);
+            Ok(self
+                .messages
+                .iter()
+                .filter(|(_, id)| imap::normalize_message_id(id) == wanted)
+                .map(|(uid, _)| *uid)
+                .collect())
+        }
+
+        async fn delete_uid(&mut self, _folder: &str, uid: u32) -> Result<(), ImapError> {
+            if self.failing_deletes > 0 {
+                self.failing_deletes -= 1;
+                return Err(ImapError::Connection("connection reset by peer".into()));
+            }
+            self.messages.retain(|(u, _)| *u != uid);
+            self.deleted.push(uid);
+            Ok(())
+        }
+    }
+
+    fn dead(_: &envelope_email_store::AttemptOwner, _: &str) -> envelope_email_store::Liveness {
+        envelope_email_store::Liveness::Dead
+    }
+
+    /// A row sent from Drafts UID 41 (`<draft-copy@mac.lan>`) whose sender
+    /// stopped after recording acceptance: nothing removed the copy.
+    fn sent_and_stopped(db: &Database) -> String {
+        use envelope_email_store::{AttemptStart, ClaimMode};
+        db.set_detected_folder("gmail1", "drafts", "[Gmail]/Drafts")
+            .unwrap();
+        let draft = db
+            .create_draft(
+                "gmail1",
+                "to@test.com",
+                Some("S"),
+                Some("B"),
+                None,
+                None,
+                None,
+                None,
+                Some("agent"),
+            )
+            .unwrap();
+        db.mark_draft_message_id(&draft.id, "<draft-copy@mac.lan>")
+            .unwrap();
+        db.update_draft_imap_uid(&draft.id, 41).unwrap();
+        let draft = db.get_draft(&draft.id).unwrap().unwrap();
+        let start = AttemptStart::new("<sent@mac.lan>", "sweep", None);
+        let claim = db
+            .claim_send_attempt(&draft.id, draft.revision, ClaimMode::Immediate, &start)
+            .unwrap()
+            .expect("claim");
+        db.finish_attempt_sent(
+            &draft.id,
+            &claim.token,
+            "<sent@mac.lan>",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        draft.id
+    }
+
+    /// One sweep pass over the pending cleanups, as the dashboard runs it.
+    async fn sweep_pass(db: &Database, mailbox: &mut ScriptedDrafts) -> Vec<bool> {
+        let pending = db
+            .pending_provider_draft_cleanups(chrono::Utc::now(), &dead, 10)
+            .unwrap();
+        let mut deleted = Vec::new();
+        for row in pending {
+            let target = resolve_sent_cleanup_target(db, &row).unwrap();
+            let result = delete_provider_draft_exact(mailbox, &target)
+                .await
+                .map_err(|e| e.to_string());
+            deleted.push(settle_provider_draft_cleanup(
+                db,
+                &row.id,
+                Some(&target.folder),
+                result,
+            ));
+        }
+        deleted
+    }
+
+    fn cleanup_record(db: &Database, id: &str) -> serde_json::Value {
+        db.get_draft(id).unwrap().unwrap().metadata.unwrap()["provider_draft_cleanup"].clone()
+    }
+
+    /// Mailroom trial D: the sender stopped between transmitting and removing
+    /// the Drafts copy. The next pass removes exactly that copy.
+    #[tokio::test]
+    async fn the_next_pass_removes_the_copy_a_stopped_sender_left() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let mut drafts = ScriptedDrafts {
+            messages: vec![
+                (41, "<draft-copy@mac.lan>".into()),
+                (42, "<other@mac.lan>".into()),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![true]);
+        assert_eq!(drafts.deleted, vec![41]);
+        assert_eq!(drafts.messages, vec![(42, "<other@mac.lan>".to_string())]);
+        assert_eq!(cleanup_record(&db, &id)["state"], "done");
+        assert_eq!(cleanup_record(&db, &id)["outcome"], "deleted");
+        assert!(
+            sweep_pass(&db, &mut drafts).await.is_empty(),
+            "a settled cleanup is not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_is_retried_by_the_next_pass() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let mut drafts = ScriptedDrafts {
+            messages: vec![(41, "<draft-copy@mac.lan>".into())],
+            failing_deletes: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![false]);
+        let record = cleanup_record(&db, &id);
+        assert_eq!(record["state"], "pending");
+        assert_eq!(record["attempts"], 1);
+        assert!(
+            record["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("connection reset")
+        );
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![true]);
+        assert!(drafts.messages.is_empty());
+        assert_eq!(cleanup_record(&db, &id)["state"], "done");
+    }
+
+    #[tokio::test]
+    async fn a_copy_already_gone_closes_the_cleanup_without_an_error() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let mut drafts = ScriptedDrafts::default();
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![false]);
+        let record = cleanup_record(&db, &id);
+        assert_eq!(record["state"], "done");
+        assert_eq!(record["outcome"], "absent");
+        assert_eq!(record["attempts"], 0, "an absent copy is not a failure");
+        assert!(record.get("last_error").is_none());
+    }
+
+    /// The copy left UID 41 and a person's message now sits there (or the
+    /// person edited the draft, which re-saves it under another Message-ID).
+    /// Only the exact Message-ID is ever deleted, never "whatever is at 41".
+    #[tokio::test]
+    async fn a_different_message_at_the_drafts_uid_is_never_deleted() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let mut drafts = ScriptedDrafts {
+            messages: vec![(41, "<human-edit@mac.lan>".into())],
+            ..Default::default()
+        };
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![false]);
+        assert!(drafts.deleted.is_empty());
+        assert_eq!(
+            drafts.messages,
+            vec![(41, "<human-edit@mac.lan>".to_string())]
+        );
+        assert_eq!(cleanup_record(&db, &id)["outcome"], "absent");
+    }
+
+    #[tokio::test]
+    async fn duplicate_copies_are_left_alone() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let mut drafts = ScriptedDrafts {
+            messages: vec![
+                (41, "<draft-copy@mac.lan>".into()),
+                (43, "<draft-copy@mac.lan>".into()),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(sweep_pass(&db, &mut drafts).await, vec![false]);
+        assert!(drafts.deleted.is_empty());
+        assert_eq!(cleanup_record(&db, &id)["outcome"], "ambiguous");
+    }
+
+    #[test]
+    fn the_sent_target_names_the_drafts_copy_never_the_sent_message() {
+        let db = seeded_db();
+        let id = sent_and_stopped(&db);
+        let row = db.get_draft(&id).unwrap().unwrap();
+        assert_eq!(row.message_id.as_deref(), Some("<sent@mac.lan>"));
+
+        let target = resolve_sent_cleanup_target(&db, &row).unwrap();
+        assert_eq!(target.folder, "[Gmail]/Drafts");
+        assert_eq!(target.message_id, "draft-copy@mac.lan");
+
+        db.finish_provider_draft_cleanup(&id, "deleted").unwrap();
+        let row = db.get_draft(&id).unwrap().unwrap();
+        assert_eq!(
+            resolve_sent_cleanup_target(&db, &row).unwrap_err(),
+            "no provider Drafts cleanup pending"
         );
     }
 

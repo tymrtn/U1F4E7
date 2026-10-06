@@ -119,6 +119,20 @@ impl Draft {
             .unwrap_or_default()
     }
 
+    /// Message-ID of this sent row's provider Drafts copy while removing it
+    /// is still pending. Recorded in the commit that marks the row `sent`
+    /// and settled by whoever removes the copy.
+    pub fn pending_provider_draft_cleanup(&self) -> Option<&str> {
+        let record = self
+            .metadata
+            .as_ref()?
+            .get(crate::send_attempts::PROVIDER_DRAFT_CLEANUP_KEY)?;
+        if record.get("state")?.as_str()? != "pending" {
+            return None;
+        }
+        record.get("message_id")?.as_str()
+    }
+
     pub fn human_approved(&self) -> bool {
         let Some(attestation) = self.metadata.as_ref().and_then(|m| m.get("human_approval")) else {
             return false;

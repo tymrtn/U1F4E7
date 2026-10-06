@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Releases include an MCP Bundle, `envelope-<version>.mcpb`, and its `.sha256`. Opening it in Claude Desktop, or another client that installs MCP Bundles, sets up Envelope's MCP server. The bundle holds the release binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and aarch64), unchanged from the tarballs, and a small launcher runs the one that matches the machine. It asks for the agent token and, optionally, the passphrase file, and shares accounts and data with the `envelope` CLI. Accounts and agent tokens are still created in a terminal.
 - `scripts/mcp-registry-server-json.sh <tag>` writes the `server.json` that lists a published release in the official MCP Registry, with the bundle's download URL and SHA-256.
 
+## [1.3.17] — 2026-10-05
+
+A fix release. After a queued send, Envelope now removes the message's Drafts copy even when `envelope serve` stops in between. Warnings and errors also reach stderr.
+
+### Fixed
+
+- A queued send no longer leaves its copy in Drafts when `envelope serve` stops right after sending it. The sweep marked the message sent first and removed the Drafts copy afterwards, from memory only, so a crash, sleep, restart or kill in between left a sendable copy of mail that had already gone out, and no later sweep tried again. Envelope now records which Drafts copy to remove in the same database write that marks the message sent. `envelope serve` retries pending removals once a minute, up to 20 failed attempts per message, and records the message's Sent copy first when that step never ran. The retry deletes only the message that carries the draft's exact Message-ID in the Drafts folder, and a copy that is already gone closes the record without an error. Retries run on their own timer, apart from scheduled sends, with 30 seconds to connect and 10 minutes per message. When an account's IMAP server stops answering, one connect attempt fails per pass and that account's other removals wait for the next pass, so scheduled sends on other accounts are not held up.
+- `envelope draft send` and the MCP `send_draft` tool record the same removal, so a CLI process that stops before deleting the Drafts copy leaves the job to `envelope serve`.
+- Warnings and errors now reach stderr. Earlier versions never set up log output, so messages such as a failed Drafts cleanup were dropped. Set `RUST_LOG` to change the level, for example `RUST_LOG=info`. Logs never go to stdout, which carries only MCP and `--json` output.
+
 ## [1.3.16] — 2026-10-03
 
 Security fixes. Threat verdicts and Mark safe follow a message's content, agent tokens get only the authority their policy grants, and one-time codes need an authenticated sender. Agents that use the newly gated commands need the matching grants; see the agent contract v4.

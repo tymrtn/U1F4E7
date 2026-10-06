@@ -21,7 +21,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-blue.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/version-1.3.16-green.svg" alt="v1.3.16">
+  <img src="https://img.shields.io/badge/version-1.3.17-green.svg" alt="v1.3.17">
   <img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-green.svg" alt="License: FSL-1.1-ALv2">
 </p>
 
