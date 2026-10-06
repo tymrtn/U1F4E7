@@ -1,0 +1,11 @@
+.git
+target
+**/target
+**/node_modules
+dist
+u1f4e7.com
+.worktrees
+*.db
+*.db-shm
+*.db-wal
+.env
