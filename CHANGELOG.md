@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `Dockerfile` that runs `envelope mcp` in a container. With `ENVELOPE_AGENT_TOKEN` set, it serves the data directory mounted at `/home/envelope/data`. Without a token, it starts only when the container has no database yet, and then creates a throwaway agent in that empty store, so MCP directories such as Glama can start the server and list its tools. An existing database without a token is refused.
+
 ## [1.3.17] — 2026-10-05
 
 A fix release. After a queued send, Envelope now removes the message's Drafts copy even when `envelope serve` stops in between. Warnings and errors also reach stderr.
