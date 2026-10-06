@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.18] — 2026-10-06
+
+A fix release. CLI folder names such as `Sent` now open the account's real folder on Gmail and other providers, and releases now include an MCP Bundle.
+
 ### Added
 
 - Releases include an MCP Bundle, `envelope-<version>.mcpb`, and its `.sha256`. Opening it in Claude Desktop, or another client that installs MCP Bundles, sets up Envelope's MCP server. The bundle holds the release binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and aarch64), unchanged from the tarballs, and a small launcher runs the one that matches the machine. It asks for the agent token and, optionally, the passphrase file, and shares accounts and data with the `envelope` CLI. Accounts and agent tokens are still created in a terminal.
