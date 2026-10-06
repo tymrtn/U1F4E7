@@ -324,6 +324,8 @@ For a single, distribution-ready operating guide to hand a fresh agent, see [the
 
 For a walkthrough of running multiple agents from one shared inbox with scoped policies, see [Agents at a glance](docs/agent-fleet-shared-inbox.md).
 
+The `Dockerfile` runs the MCP server in a container (`docker build -t envelope .`, then `docker run -i --rm envelope`). Mount a data directory at `/home/envelope/data` and pass `ENVELOPE_AGENT_TOKEN` for an agent created in it. Without a token, the container starts only when it has no database yet. It then creates a throwaway agent in that empty store, which has no mail accounts, so MCP directories can start the server and list its tools.
+
 ## Use Envelope from your agent
 
 Envelope ships as a plugin for Claude Code, Codex and Cursor, and as skills on
