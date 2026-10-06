@@ -381,6 +381,12 @@ export ENVELOPE_AGENT_TOKEN=<token>
 `ENVELOPE_AGENT_TOKEN` under Plugins → Configure. Listing copy is
 in [MARKETPLACE.md](MARKETPLACE.md).
 
+**Claude Desktop** (MCP Bundle): download `envelope-<version>.mcpb` from the
+[latest release](https://github.com/tymrtn/U1F4E7/releases/latest) and open it.
+Claude asks for the token, and for your passphrase file if you set
+`ENVELOPE_MASTER_PASSPHRASE_FILE`. The bundle carries its own `envelope` binary
+for macOS and Linux and uses the same accounts and data as the CLI.
+
 **Skills only** (any agent that skills.sh supports):
 
 ```bash
@@ -393,6 +399,7 @@ npx skills add https://github.com/tymrtn/U1F4E7/tree/main/skills
 | `.claude-plugin/` | Claude Code manifest and marketplace |
 | `.codex-plugin/`, `.agents/plugins/marketplace.json` | Codex manifest, MCP config and marketplace |
 | `.cursor-plugin/plugin.json`, `mcp.json` | Cursor manifest and MCP config |
+| `packaging/mcpb/` | MCP Bundle manifest, launcher and icon; `scripts/package-mcpb.sh` packs them at release |
 
 Plugin versions follow Envelope releases; `ci/check-agent-plugins.sh` enforces it.
 

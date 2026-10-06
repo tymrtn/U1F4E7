@@ -1,0 +1,53 @@
+{
+  "manifest_version": "0.3",
+  "name": "envelope",
+  "display_name": "Envelope",
+  "version": "1.3.17",
+  "description": "All your email accounts in one inbox, shared with your agents. Envelope runs locally on the IMAP/SMTP mailboxes you already have.",
+  "long_description": "Envelope gives Claude your own IMAP and SMTP mailboxes as tools: read, search, draft, reply, file and watch mail. It runs on your machine. The extension starts the `envelope` binary bundled inside it, and that binary uses the same local data as the `envelope` command-line tool.\n\nSet Envelope up in a terminal before you turn this extension on. It has no setup screens of its own, and your password and token never pass through Claude.\n\n1. Install the CLI: `brew install tymrtn/u1f4e7/envelope`, or `curl -fsSL https://u1f4e7.com/install.sh | bash`.\n2. Add each account: `envelope accounts add --email you@example.com`.\n3. Create a token for Claude: `envelope agent create claude-desktop`. It prints the token once. Paste it into **Agent token**.\n\nIf you keep Envelope's passphrase in a file (`ENVELOPE_MASTER_PASSPHRASE_FILE` in your shell profile), choose that file under **Passphrase file**. Claude starts the server without your shell profile, so it never sees that export.\n\nEvery tool call runs under the agent's policy, and drafts the agent writes wait for your approval before they send.\n\nFull setup guide: [Use Envelope from your agent](https://github.com/tymrtn/U1F4E7#use-envelope-from-your-agent).",
+  "author": {
+    "name": "Tyler Martin",
+    "url": "https://u1f4e7.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tymrtn/U1F4E7.git"
+  },
+  "homepage": "https://u1f4e7.com",
+  "documentation": "https://github.com/tymrtn/U1F4E7#use-envelope-from-your-agent",
+  "support": "https://github.com/tymrtn/U1F4E7/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/envelope",
+    "mcp_config": {
+      "command": "${__dirname}/server/envelope",
+      "args": ["mcp"],
+      "env": {
+        "ENVELOPE_AGENT_TOKEN": "${user_config.agent_token}",
+        "ENVELOPE_MASTER_PASSPHRASE_FILE": "${user_config.passphrase_file}"
+      }
+    }
+  },
+  "keywords": ["email", "imap", "smtp", "inbox", "mcp", "otp", "byo", "multi-account"],
+  "license": "FSL-1.1-ALv2",
+  "compatibility": {
+    "platforms": ["darwin", "linux"]
+  },
+  "user_config": {
+    "agent_token": {
+      "type": "string",
+      "title": "Agent token",
+      "description": "Run `envelope agent create claude-desktop` in your own terminal and paste the token it prints. Envelope enforces that agent's policy on every tool call.",
+      "sensitive": true,
+      "required": true
+    },
+    "passphrase_file": {
+      "type": "file",
+      "title": "Passphrase file",
+      "description": "The file your shell profile names in ENVELOPE_MASTER_PASSPHRASE_FILE, such as ~/.envelope-passphrase (press Cmd-Shift-. in the picker to show hidden files). Leave it empty if you never set one.",
+      "required": false,
+      "default": ""
+    }
+  }
+}
