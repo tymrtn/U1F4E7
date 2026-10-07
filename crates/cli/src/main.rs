@@ -1615,7 +1615,7 @@ enum RuleCmd {
         /// Script name on the ManageSieve server
         #[arg(long, default_value = commands::rule::DEFAULT_SIEVE_SCRIPT_NAME)]
         script_name: String,
-        /// ManageSieve host override (defaults: sieve.migadu.com for Migadu, else IMAP host)
+        /// ManageSieve host override (defaults: imap.migadu.com for Migadu, else IMAP host)
         #[arg(long)]
         host: Option<String>,
         /// ManageSieve port override (default: 4190)
@@ -1647,7 +1647,7 @@ enum RuleCmd {
         #[arg(long)]
         account: Option<String>,
         /// ManageSieve host override (defaults: the last publish's host, else
-        /// sieve.migadu.com for Migadu, else the IMAP host)
+        /// imap.migadu.com for Migadu, else the IMAP host)
         #[arg(long)]
         host: Option<String>,
         /// ManageSieve port override (defaults: the last publish's port, else 4190)
