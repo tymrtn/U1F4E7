@@ -182,7 +182,8 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Linux x86_64: native build on ubuntu-latest.
+  # Linux x86_64: built with cargo-zigbuild like aarch64 below. A native build
+  # links against ubuntu-latest's glibc, which older distros don't have.
   # The keychain feature resolves to async-secret-service+crypto-rust+tokio
   # (pure-Rust D-Bus via zbus, no libdbus link required) per
   # crates/store/Cargo.toml [target.'cfg(target_os = "linux")'].
@@ -208,8 +209,16 @@ jobs:
           restore-keys: |
             ubuntu-x86_64-cargo-
 
+      - name: Install cargo-zigbuild and Zig
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --locked
+
       - name: Build release binary
-        run: cargo build --release --bin envelope
+        run: cargo zigbuild --release --bin envelope --target x86_64-unknown-linux-gnu
+
+      - name: Check glibc floor
+        run: ./ci/check-glibc-floor.sh target/x86_64-unknown-linux-gnu/release/envelope
 
       - name: Package release
         run: bash scripts/package-release.sh --target x86_64-unknown-linux-gnu
@@ -228,7 +237,7 @@ jobs:
   #   - cross uses Docker-in-Docker (requires privileged runners or DIND setup).
   #   - cargo-zigbuild uses Zig as a drop-in C cross-linker; no Docker needed.
   #   - Zig ships a hermetic musl+glibc sysroot, so the binary links against
-  #     a known glibc floor (2.17) without needing a matching OS image.
+  #     an older glibc than the runner's; ci/check-glibc-floor.sh enforces it.
   #   - The keychain crate's async-secret-service feature is pure Rust (zbus),
   #     so no native D-Bus headers are needed for the cross build.
   # ---------------------------------------------------------------------------
@@ -262,6 +271,9 @@ jobs:
 
       - name: Build release binary (cross)
         run: cargo zigbuild --release --bin envelope --target aarch64-unknown-linux-gnu
+
+      - name: Check glibc floor
+        run: ./ci/check-glibc-floor.sh target/aarch64-unknown-linux-gnu/release/envelope
 
       - name: Package release
         run: bash scripts/package-release.sh --target aarch64-unknown-linux-gnu

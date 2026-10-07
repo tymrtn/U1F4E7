@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Linux x86_64 release binary runs on glibc 2.31 and later (Debian 11, Ubuntu 20.04). It was built natively on `ubuntu-latest`, so v1.3.18 needed glibc 2.34 to start and printed a `GLIBC_2.39` loader warning on every run under Debian 12. It is now cross-built with cargo-zigbuild like the aarch64 binary, and `ci/check-glibc-floor.sh` fails the release if either Linux binary needs a newer glibc.
+
 ## [1.3.18] — 2026-10-06
 
 A fix release. CLI folder names such as `Sent` now open the account's real folder on Gmail and other providers, and releases now include an MCP Bundle.
