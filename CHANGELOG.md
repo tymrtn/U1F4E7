@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The Linux x86_64 release binary runs on glibc 2.31 and later (Debian 11, Ubuntu 20.04). It was built natively on `ubuntu-latest`, so v1.3.18 needed glibc 2.34 to start and printed a `GLIBC_2.39` loader warning on every run under Debian 12. It is now cross-built with cargo-zigbuild like the aarch64 binary, and `ci/check-glibc-floor.sh` fails the release if either Linux binary needs a newer glibc.
+- Publishing keeps your existing server filters. A mail server runs one Sieve script at a time, and `envelope rule publish-sieve --confirm` used to make Envelope's script the active one without looking, which switched off any filters set up in your mail provider's settings. Publishing now lists the scripts on the server first. If another script is active, publishing stops before uploading anything and tells you which script it is. Two options let it go ahead:
+  - `--keep-existing` keeps your script running. Envelope uploads its own script without activating it, adds a small wrapper named `<script-name>-wrapper` that runs your script first and then Envelope's rules, and makes the wrapper active. If your script stops processing a message, Envelope's rules don't run on it. This needs Sieve include (RFC 6609) on the server.
+  - `--replace-active <name>` switches off the named script and activates Envelope's. The script stays on the server.
+
+  Envelope never deletes a script on the server. A dry run shows what a publish would do in each case without connecting. With an agent token, `--confirm --replace-active` is operator-only.
+- Rules published to the mail server no longer run twice. The server already acts on new mail with the published script, and Envelope used to run the same rules again locally. After a publish, Envelope records which rules the server runs for that account, and `rule run`, `watch --run-rules`, the dashboard and the MCP `rules_run` tool skip them with the reason `server_managed`. Republishing updates the list. To change what a published rule does, edit it and republish. When Envelope's script is no longer the active one, as seen by the next publish or `rule sieve-status`, those rules run locally again.
+
+### Added
+
+- `envelope rule sieve-status` lists the scripts on the account's ManageSieve server and marks the active one. It also reports whether the server supports Sieve include and whether it still runs the rules Envelope last published. It only reads from the server. With an agent token, `--host` is operator-only.
 
 ## [1.3.18] — 2026-10-06
 

@@ -21,7 +21,7 @@
         "rules.batch_ack": "also needed by `envelope rule enable --acknowledge-batch-actions`",
         "rules.webhook": "also needed by `envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
         "rules.write": "`envelope rule create`, `rule enable`, `rule disable` and `rule delete`",
-        "sieve.publish": "`envelope rule publish-sieve --confirm` to the account's own ManageSieve endpoint; naming another with --host is operator-only",
+        "sieve.publish": "`envelope rule publish-sieve --confirm` to the account's own ManageSieve endpoint; naming another with --host, or switching off the active script with --replace-active, is operator-only",
         "unsubscribe": "`envelope unsubscribe --confirm`",
         "watch.webhook": "`envelope watch --webhook <url>` and `envelope watch --deliver`"
       },
@@ -185,6 +185,8 @@
         "evidence attachment export --unsafe",
         "rule publish-sieve --host",
         "rule publish-sieve --confirm --host",
+        "rule publish-sieve --confirm --replace-active",
+        "rule sieve-status --host",
         "any command that is not read-only, with --folder set to the quarantine folder",
         "doctor --repair",
         "serve",

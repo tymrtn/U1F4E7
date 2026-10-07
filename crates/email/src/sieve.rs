@@ -19,14 +19,25 @@ use envelope_email_store::models::Rule;
 
 use crate::rules::{Action, MatchExpr, StoredRuleAction};
 
+/// A Sieve script rendered from rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SieveExport {
+    pub script: String,
+    /// Names of enabled rules left out of the script.
+    pub skipped: Vec<String>,
+    /// Ids of the rules the script contains.
+    pub exported_rule_ids: Vec<String>,
+}
+
 /// Export a set of rules as a Sieve script string.
 ///
-/// Rules whose `sieve_exportable` flag is false are skipped. Returns
-/// the script text and a list of skipped rule names.
-pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
+/// Rules whose `sieve_exportable` flag is false are skipped, as is any rule
+/// that cannot be written as Sieve.
+pub fn export_sieve(rules: &[Rule]) -> SieveExport {
     let mut requires: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut rule_blocks: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut exported_rule_ids: Vec<String> = Vec::new();
 
     for rule in rules {
         if !rule.enabled {
@@ -95,6 +106,7 @@ pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
             condition = condition,
             action_str = action_str,
         ));
+        exported_rule_ids.push(rule.id.clone());
     }
 
     // Build the script
@@ -118,7 +130,11 @@ pub fn export_sieve(rules: &[Rule]) -> (String, Vec<String>) {
         script.push('\n');
     }
 
-    (script, skipped)
+    SieveExport {
+        script,
+        skipped,
+        exported_rule_ids,
+    }
 }
 
 fn expr_to_sieve(expr: &MatchExpr) -> Option<String> {
@@ -282,7 +298,9 @@ mod tests {
             r#"{"move":"Archive"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty());
         assert!(script.contains("require [\"fileinto\"]"));
         assert!(script.contains("address :matches \"from\" \"*@notifications.github.com\""));
@@ -301,7 +319,9 @@ mod tests {
                 true,
             ),
         ];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert_eq!(skipped, vec!["empty-and", "not-empty-or", "nested-or"]);
         assert!(!script.contains("discard"), "{script}");
     }
@@ -314,7 +334,9 @@ mod tests {
             r#"{"move":"Archive"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty());
         // `:is` — not `:matches` — so the literal `*` is never treated as a glob.
         assert!(script.contains("address :is \"from\" \"*@example.com\""));
@@ -329,7 +351,7 @@ mod tests {
             r#"{"flag":"flagged"}"#,
             true,
         )];
-        let (script, _) = export_sieve(&rules);
+        let SieveExport { script, .. } = export_sieve(&rules);
         assert!(script.contains("imap4flags"));
         assert!(script.contains("addflag \"\\\\Flagged\""));
     }
@@ -342,7 +364,9 @@ mod tests {
             r#"{"move":"Junk"}"#,
             false,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert_eq!(skipped, vec!["Tag-based"]);
         assert!(script.is_empty() || !script.contains("Tag-based"));
     }
@@ -355,7 +379,7 @@ mod tests {
             r#""delete""#,
             true,
         )];
-        let (script, _) = export_sieve(&rules);
+        let SieveExport { script, .. } = export_sieve(&rules);
         assert!(script.contains("allof"));
         assert!(script.contains("discard;"));
     }
@@ -366,7 +390,9 @@ mod tests {
             make_rule("Rule 1", r#"{"from":"*@a.com"}"#, r#"{"move":"A"}"#, true),
             make_rule("Rule 2", r#"{"from":"*@b.com"}"#, r#"{"move":"B"}"#, true),
         ];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty());
         assert!(script.contains("# Rule 1"));
         assert!(script.contains("# Rule 2"));
@@ -380,7 +406,9 @@ mod tests {
             r#"{"move":"Archive"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert_eq!(skipped, vec!["Newsletter guard"]);
         assert!(!script.contains("news.example"));
     }
@@ -393,7 +421,9 @@ mod tests {
             r#"{"reject":"This mailbox is closed."}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty(), "expected no skipped rules: {skipped:?}");
         assert!(
             script.contains("require [\"reject\"]"),
@@ -417,7 +447,9 @@ mod tests {
             r#"{"ereject":"Mailbox unreachable."}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty(), "expected no skipped rules: {skipped:?}");
         assert!(
             script.contains("require [\"ereject\"]"),
@@ -443,7 +475,9 @@ mod tests {
             r#"{"reject":"Say \"no\" \\stop"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty(), "expected no skipped rules: {skipped:?}");
         // Sieve quoted strings escape \ as \\ and " as \".
         assert!(
@@ -462,7 +496,9 @@ mod tests {
             r#"{"reject":"Line one\nLine two"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty(), "expected no skipped rules: {skipped:?}");
         // The reject string itself must be on a single line.
         let action_line = script
@@ -490,7 +526,9 @@ mod tests {
             r#"{"move":"\\Junk"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert_eq!(skipped, vec!["Legacy junk rule"]);
         assert!(!script.contains("fileinto"));
         assert!(!script.contains("Junk"));
@@ -507,7 +545,9 @@ mod tests {
             r#"{"move":"Receipts"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty());
         assert!(script.contains(r#"fileinto "Receipts";"#));
     }
@@ -520,7 +560,9 @@ mod tests {
             r#"{"move":"Archive\"; discard; #"}"#,
             true,
         )];
-        let (script, skipped) = export_sieve(&rules);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&rules);
         assert!(skipped.is_empty());
         assert!(script.contains("# Bad # injected"));
         assert!(script.contains(r#"fileinto "Archive\"; discard; #";"#));
@@ -528,6 +570,35 @@ mod tests {
             "
 # injected"
         ));
+    }
+
+    /// `publish-sieve` records these ids as the rules the server runs, so a
+    /// rule flagged exportable but left out of the script must not be listed.
+    #[test]
+    fn export_lists_the_ids_of_the_rules_it_wrote() {
+        let mut archive = make_rule(
+            "archive",
+            r#"{"from":"*@notifications.github.com"}"#,
+            r#"{"move":"Archive"}"#,
+            true,
+        );
+        archive.id = "r-archive".to_string();
+        let mut sentinel = make_rule(
+            "junk-sentinel",
+            r#"{"from":"*@spam.example"}"#,
+            r#"{"move":"\\Junk"}"#,
+            true,
+        );
+        sentinel.id = "r-sentinel".to_string();
+        let mut tagged = make_rule("tagged", r#"{"has_tag":"x"}"#, r#""delete""#, false);
+        tagged.id = "r-tagged".to_string();
+
+        let export = export_sieve(&[archive, sentinel, tagged]);
+        assert_eq!(export.exported_rule_ids, vec!["r-archive".to_string()]);
+        assert_eq!(
+            export.skipped,
+            vec!["junk-sentinel".to_string(), "tagged".to_string()]
+        );
     }
 
     #[test]
@@ -539,7 +610,9 @@ mod tests {
             r#"{"confirm":{"prompt":"Trip?","then":[{"flag":"flagged"}]}}"#,
             true,
         );
-        let (script, skipped) = export_sieve(&[rule]);
+        let SieveExport {
+            script, skipped, ..
+        } = export_sieve(&[rule]);
         assert_eq!(skipped, vec!["Trip offer".to_string()]);
         assert!(!script.contains("addflag"), "{script}");
     }

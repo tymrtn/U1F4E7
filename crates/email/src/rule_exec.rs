@@ -331,6 +331,29 @@ pub fn load_rules(rules: Vec<Rule>) -> (Vec<LoadedRule>, Vec<SkippedRule>) {
     (loaded, skipped)
 }
 
+/// Split off the rules the mail server runs from the script
+/// `envelope rule publish-sieve` left active, reported as `server_managed`.
+/// Returns the rules Envelope runs itself, and the skips.
+pub fn split_server_managed(
+    db: &Database,
+    account_id: &str,
+    rules: Vec<Rule>,
+) -> Result<(Vec<Rule>, Vec<SkippedRule>)> {
+    let server_managed = db
+        .server_managed_rule_ids(account_id)
+        .context("failed to read which rules the mail server runs")?;
+    let (managed, local): (Vec<Rule>, Vec<Rule>) = rules
+        .into_iter()
+        .partition(|r| server_managed.contains(&r.id));
+    let skipped = managed
+        .iter()
+        .map(|r| skip(r, rules::SERVER_MANAGED_SKIP_REASON.to_string()))
+        .collect();
+    Ok((local, skipped))
+}
+
+/// The account's enabled rules, gated as [`load_rules`] does, minus the ones
+/// the mail server runs ([`split_server_managed`]).
 pub fn load_enabled_rules(
     db: &Database,
     account_id: &str,
@@ -338,7 +361,10 @@ pub fn load_enabled_rules(
     let rules = db
         .list_enabled_rules(account_id)
         .context("failed to list enabled rules")?;
-    Ok(load_rules(rules))
+    let (local, server_managed) = split_server_managed(db, account_id, rules)?;
+    let (loaded, mut skipped) = load_rules(local);
+    skipped.extend(server_managed);
+    Ok((loaded, skipped))
 }
 
 /// Enabled rules whose action did nothing in batch runs before the unified
@@ -1301,6 +1327,124 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Record a publish whose script the server now runs.
+    fn publish_to_server(db: &Database, rules: &[&Rule]) {
+        let rule_ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
+        db.record_sieve_publication(
+            &envelope_email_store::sieve_publications::NewSievePublication {
+                account_id: ACCT,
+                host: "sieve.example.test",
+                port: 4190,
+                script_name: "envelope-rules",
+                script_sha256: "0000",
+                rule_ids: &rule_ids,
+                activation: "activated",
+                active_script: "envelope-rules",
+                previous_active_script: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn server_managed(rule: &Rule) -> SkippedRule {
+        SkippedRule {
+            rule_id: rule.id.clone(),
+            rule_name: rule.name.clone(),
+            reason: rules::SERVER_MANAGED_SKIP_REASON.to_string(),
+        }
+    }
+
+    /// The server already filed the message with the published script, so
+    /// running the same rule locally would act on it a second time.
+    #[tokio::test]
+    async fn published_rules_are_left_to_the_server_and_unpublished_ones_still_run() {
+        let db = Database::open_memory().unwrap();
+        let archive = rule(&db, "archive", r#"{"move":"Archive"}"#);
+        db.create_rule(
+            ACCT,
+            "flag-boss",
+            r#"{"from":"boss@corp.example"}"#,
+            r#"{"flag":"flagged"}"#,
+            50,
+            false,
+        )
+        .unwrap();
+        publish_to_server(&db, &[&archive]);
+        let mut mbox = FakeMailbox::default();
+
+        let report = run(
+            &db,
+            &mut mbox,
+            &[
+                summary(1, "a@airline.example", "x@airline.example"),
+                summary(2, "b@corp.example", "boss@corp.example"),
+            ],
+        )
+        .await;
+
+        assert_eq!(mbox.calls, vec!["flag INBOX/2 flagged".to_string()]);
+        assert_eq!(report.skipped_rules, vec![server_managed(&archive)]);
+        assert!(
+            report.skipped_rules[0].reason.starts_with("server_managed"),
+            "{report:?}"
+        );
+        assert!(db.list_actions(ACCT, 10).unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn republishing_updates_the_set_and_an_inactive_script_hands_rules_back() {
+        let db = Database::open_memory().unwrap();
+        let flagger = db
+            .create_rule(
+                ACCT,
+                "flagger",
+                r#"{"from":"*@airline.example"}"#,
+                r#"{"flag":"flagged"}"#,
+                10,
+                false,
+            )
+            .unwrap();
+        let archive = rule(&db, "archive", r#"{"move":"Archive"}"#);
+        let mut mbox = FakeMailbox::default();
+
+        publish_to_server(&db, &[&archive]);
+        let first = run(
+            &db,
+            &mut mbox,
+            &[summary(1, "m1@airline.example", "x@airline.example")],
+        )
+        .await;
+        assert_eq!(first.skipped_rules, vec![server_managed(&archive)]);
+        assert_eq!(mbox.calls, vec!["flag INBOX/1 flagged".to_string()]);
+
+        publish_to_server(&db, &[&flagger]);
+        let second = run(
+            &db,
+            &mut mbox,
+            &[summary(2, "m2@airline.example", "x@airline.example")],
+        )
+        .await;
+        assert_eq!(second.skipped_rules, vec![server_managed(&flagger)]);
+        assert_eq!(mbox.calls[1..], ["move INBOX/2 -> Archive".to_string()]);
+
+        // Another script became active on the server: run everything locally.
+        db.set_sieve_publication_server_active(ACCT, false).unwrap();
+        let third = run(
+            &db,
+            &mut mbox,
+            &[summary(3, "m3@airline.example", "x@airline.example")],
+        )
+        .await;
+        assert!(third.skipped_rules.is_empty(), "{third:?}");
+        assert_eq!(
+            mbox.calls[2..],
+            [
+                "flag INBOX/3 flagged".to_string(),
+                "move INBOX/3 -> Archive".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ pub mod relationship_facts;
 pub mod rule_store;
 pub mod send_attempts;
 pub mod sent_relationships;
+pub mod sieve_publications;
 pub mod snoozed;
 pub mod tag_store;
 pub mod threads;

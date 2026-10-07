@@ -264,13 +264,27 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                     ReadOnly
                 }
             }
-            // --host sends the mailbox password to the named server. Without
-            // --confirm, publish-sieve is a dry run.
-            RuleCmd::PublishSieve { host, confirm, .. } => {
-                if host.is_some() {
+            // --host sends the mailbox password to the named server, and
+            // --replace-active switches off the person's own server filters.
+            // Without --confirm, publish-sieve is a dry run.
+            RuleCmd::PublishSieve {
+                host,
+                confirm,
+                replace_active,
+                ..
+            } => {
+                if host.is_some() || (*confirm && replace_active.is_some()) {
                     OperatorOnly
                 } else if *confirm {
                     Gated(SIEVE)
+                } else {
+                    ReadOnly
+                }
+            }
+            // Lists the server's scripts and changes nothing there.
+            RuleCmd::SieveStatus { host, .. } => {
+                if host.is_some() {
+                    OperatorOnly
                 } else {
                     ReadOnly
                 }
@@ -600,6 +614,15 @@ mod tests {
             "rule publish-sieve --confirm --host h.example",
             OperatorOnly,
         ),
+        ("rule publish-sieve --keep-existing", ReadOnly),
+        ("rule publish-sieve --confirm --keep-existing", Gated(SIEVE)),
+        ("rule publish-sieve --replace-active roundcube", ReadOnly),
+        (
+            "rule publish-sieve --confirm --replace-active roundcube",
+            OperatorOnly,
+        ),
+        ("rule sieve-status", ReadOnly),
+        ("rule sieve-status --host h.example", OperatorOnly),
         ("contacts add --email a@b.test", OperatorOnly),
         ("contacts list", ReadOnly),
         ("contacts show a@b.test", ReadOnly),
@@ -751,6 +774,7 @@ mod tests {
             "--unsafe",
             "--confirm",
             "--host",
+            "--replace-active",
             "--repair",
             "--webhook",
             "--deliver",
