@@ -94,7 +94,7 @@ pub struct NewAgentToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPolicy {
     pub agent_id: String,
-    /// `"*"` or a JSON array of account ids.
+    /// `"*"` or a JSON array of account ids or emails.
     pub allowed_accounts: String,
     /// `"*"` or a JSON array of folder names.
     pub allowed_folders: String,
