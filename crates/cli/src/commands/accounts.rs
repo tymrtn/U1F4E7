@@ -20,17 +20,8 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             insecure_machine_key,
             provider: Some(_),
             paste,
-            contacts,
             ..
-        } => add_google(
-            &email,
-            name,
-            paste,
-            contacts,
-            insecure_machine_key,
-            json,
-            backend,
-        ),
+        } => add_google(&email, name, paste, insecure_machine_key, json, backend),
         AccountsCmd::Add {
             email,
             password_stdin,
@@ -60,8 +51,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             account,
             provider,
             paste,
-            contacts,
-        } => reauth(&account, provider, paste, contacts, json, backend),
+        } => reauth(&account, provider, paste, json, backend),
         AccountsCmd::Rekey => rekey(json, backend),
         AccountsCmd::List => list(json),
         AccountsCmd::SetupInstructions {
@@ -678,17 +668,15 @@ fn remove(id_or_email: &str, json: bool, backend: CredentialBackend) -> Result<(
         None => bail!("account not found: {id_or_email}"),
     };
 
-    let grant = if db.has_oauth_grant(&account.id).context("database error")? {
-        credential_store::get_passphrase(backend)
-            .ok()
-            .and_then(|passphrase| {
-                db.get_account_with_credentials(&account.id, &passphrase)
-                    .ok()
-            })
-            .and_then(|creds| creds.oauth)
-    } else {
-        None
-    };
+    // The grant is inside the encrypted password, so finding it means
+    // decrypting. Best effort: a missing passphrase only skips the revoke.
+    let grant = credential_store::get_passphrase(backend)
+        .ok()
+        .and_then(|passphrase| {
+            db.get_account_with_credentials(&account.id, &passphrase)
+                .ok()
+        })
+        .and_then(|creds| creds.oauth);
 
     let deleted = db
         .delete_account(&account.id)
@@ -794,7 +782,6 @@ async fn add_google(
     email: &str,
     name: Option<String>,
     paste: bool,
-    contacts: bool,
     insecure_machine_key: bool,
     json: bool,
     backend: CredentialBackend,
@@ -812,7 +799,7 @@ async fn add_google(
             "{email} is already added. To switch it to Google sign-in, run `envelope accounts reauth {email} --provider google`."
         );
     }
-    let signed = google_sign_in(email, paste, contacts).await?;
+    let signed = google_sign_in(email, paste, false).await?;
     check_google_imap(
         &google_probe(email, GMAIL_IMAP_HOST, GMAIL_IMAP_PORT, &signed),
         GMAIL_IMAP_HOST,
@@ -856,11 +843,10 @@ async fn reauth(
     account_arg: &str,
     provider: Option<String>,
     paste: bool,
-    contacts: bool,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    use envelope_email_transport::carddav::GOOGLE_CARDDAV_SCOPE;
+    use crate::commands::oauth_signin::GOOGLE_CARDDAV_SCOPE;
     let db = Database::open_default().context("failed to open database")?;
     let account = resolve_account(&db, account_arg)?;
     let passphrase = credential_store::get_passphrase(backend)
@@ -870,13 +856,13 @@ async fn reauth(
         Err(StoreError::OAuthReauthRequired(_)) => None,
         Err(e) => return Err(e).context("failed to decrypt account credentials"),
     };
-    // Signing in again must not quietly drop contacts access granted before.
-    let contacts = contacts
-        || current.as_ref().is_some_and(|g| {
-            g.scopes
-                .split_whitespace()
-                .any(|s| s == GOOGLE_CARDDAV_SCOPE)
-        });
+    // Signing in again must not quietly drop contacts access that Envelope
+    // v2, which can share this database, was granted before.
+    let keep_contacts = current.as_ref().is_some_and(|g| {
+        g.scopes
+            .split_whitespace()
+            .any(|s| s == GOOGLE_CARDDAV_SCOPE)
+    });
     let provider = provider.or(current.map(|g| g.provider)).ok_or_else(|| {
         anyhow::anyhow!(
             "{} signs in with a password. To switch it to Google sign-in, run `envelope accounts reauth {} --provider google`.",
@@ -892,7 +878,8 @@ async fn reauth(
     }
 
     let signed =
-        crate::commands::oauth_signin::google_sign_in(&account.username, paste, contacts).await?;
+        crate::commands::oauth_signin::google_sign_in(&account.username, paste, keep_contacts)
+            .await?;
     check_google_imap(
         &google_probe(
             &account.username,

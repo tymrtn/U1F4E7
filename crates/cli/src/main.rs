@@ -650,10 +650,6 @@ enum AccountsCmd {
         /// address the browser ends on, instead of catching it locally.
         #[arg(long, requires = "provider")]
         paste: bool,
-        /// With --provider google: also allow reading Google contacts, so
-        /// `contacts source add carddav` can sync them with this sign-in.
-        #[arg(long, requires = "provider")]
-        contacts: bool,
     },
     /// Sign an account in again with its provider, or switch a password
     /// account to provider sign-in with --provider
@@ -667,10 +663,6 @@ enum AccountsCmd {
         /// browser ends on, instead of catching it locally
         #[arg(long)]
         paste: bool,
-        /// Also allow reading Google contacts. Kept on later sign-ins once
-        /// granted.
-        #[arg(long)]
-        contacts: bool,
     },
     /// Re-encrypt the file credential store under a new passphrase
     Rekey,

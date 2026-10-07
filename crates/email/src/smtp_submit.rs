@@ -1106,7 +1106,6 @@ mod tests {
             password: "oauth2:grant".into(),
             smtp_password: None,
             imap_password: None,
-            sent_tracking: None,
             oauth: None,
         };
         let failure = AccountConnector::new(&creds).connect().await.err().unwrap();

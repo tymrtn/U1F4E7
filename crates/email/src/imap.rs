@@ -3723,7 +3723,6 @@ Subject: hi\r\n\r\nbody\r\n";
             password: password.into(),
             smtp_password: None,
             imap_password: None,
-            sent_tracking: None,
             oauth: token.map(|t| OAuthGrant {
                 provider: "google".into(),
                 transport: "imap_xoauth2".into(),

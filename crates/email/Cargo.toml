@@ -46,6 +46,9 @@ base64.workspace = true
 # Backup archive checksums
 sha2.workspace = true
 
+# OAuth PKCE verifier and state
+rand.workspace = true
+
 # DOCX (ZIP container) attachment text extraction for evidence export
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
