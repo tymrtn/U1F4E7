@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::handlers::message_target::{TargetExpectation, has_flag, verify_target};
-use crate::mailbox_sync::{AccountSyncOutcome, SyncReport, SyncTarget, sync_accounts};
+use crate::mailbox_sync::{AccountSyncOutcome, SyncFailure, SyncReport, SyncTarget, sync_accounts};
 use crate::state::AppState;
 
 pub(crate) const UNIFIED_INBOX_FOLDER: &str = "INBOX";
@@ -315,14 +315,14 @@ pub async fn unified_inbox(
 }
 
 /// One account's index refresh: connect, EXAMINE, fetch summaries read-only,
-/// upsert into the local index. Returns the failure string on any step; the
-/// sync flight persists errors and callers build the response uniformly.
+/// upsert into the local index. Returns the failure on any step; the sync
+/// flight persists errors and callers build the response uniformly.
 pub(crate) async fn refresh_one_account(
     state: AppState,
     account: Account,
     folder: String,
     limit: u32,
-) -> Result<(), String> {
+) -> Result<(), SyncFailure> {
     let (client_arc, _creds) = state
         .get_or_create_imap(&account.id)
         .await
@@ -333,7 +333,7 @@ pub(crate) async fn refresh_one_account(
             Ok(info) => info.uid_validity.unwrap_or(0) as u64,
             Err(e) => {
                 state.evict_imap(&account.id).await;
-                return Err(format!("EXAMINE {folder}: {e}"));
+                return Err(SyncFailure::imap(&format!("EXAMINE {folder}"), &e));
             }
         };
     match envelope_email_transport::imap::fetch_folder_summaries_read_only(
@@ -368,12 +368,12 @@ pub(crate) async fn refresh_one_account(
                     crate::handlers::address_book::catch_up_account(&state, &account.id).await;
                     Ok(())
                 }
-                Err(e) => Err(format!("index {folder}: {e}")),
+                Err(e) => Err(format!("index {folder}: {e}").into()),
             }
         }
         Err(e) => {
             state.evict_imap(&account.id).await;
-            Err(format!("fetch {folder}: {e}"))
+            Err(SyncFailure::imap(&format!("fetch {folder}"), &e))
         }
     }
 }
@@ -386,7 +386,7 @@ pub(crate) async fn refresh_one_account_sent(
     state: AppState,
     account: Account,
     limit: u32,
-) -> Result<(), String> {
+) -> Result<(), SyncFailure> {
     let (client_arc, _creds) = state
         .get_or_create_imap(&account.id)
         .await
@@ -397,12 +397,12 @@ pub(crate) async fn refresh_one_account_sent(
             Ok(folder) => folder,
             Err(e) => {
                 state.evict_imap(&account.id).await;
-                return Err(format!("resolve sent folder: {e}"));
+                return Err(SyncFailure::imap("resolve sent folder", &e));
             }
         }
     };
     let Some(folder) = folder else {
-        return Err("no Sent folder detected on this account".to_string());
+        return Err("no Sent folder detected on this account".to_string().into());
     };
     refresh_one_account(state, account, folder, limit).await
 }
@@ -557,6 +557,43 @@ pub async fn run_sent_index_sweep(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Background pass that keeps the Inbox index current while `serve` runs, so
+/// the Inbox and Digest stay fresh with no browser open. It is the same
+/// read-only sync, limit and time budget as POST /api/messages/unified/refresh
+/// and shares its sync flights: an account the web UI is already syncing is
+/// joined, not fetched twice, and a UI request that joins this pass waits no
+/// longer than it would for its own.
+pub async fn run_inbox_index_sweep(state: &AppState) -> anyhow::Result<()> {
+    let accounts = {
+        let db = state.db.lock().await;
+        db.list_accounts()?
+    };
+    if accounts.is_empty() {
+        return Ok(());
+    }
+
+    let limit = default_limit();
+    let outcomes = sync_accounts(
+        state,
+        accounts.clone(),
+        SyncTarget::Inbox,
+        limit,
+        state.sync_limits,
+    )
+    .await;
+    for outcome in &outcomes {
+        if let Err(error) = &outcome.result {
+            tracing::warn!("inbox index sweep [{}]: {error}", outcome.account.username);
+        }
+    }
+    let (_, account_results) =
+        load_indexed_unified_inbox(state, &accounts, UNIFIED_INBOX_FOLDER, limit, None)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    publish_new_mail(state, &outcomes, &account_results);
+    Ok(())
+}
+
 async fn load_indexed_sent(
     state: &AppState,
     accounts: &[Account],
@@ -642,12 +679,24 @@ pub async fn refresh_unified_inbox(
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     apply_sync_failures(&mut messages, &mut account_results, &report);
+    publish_new_mail(&state, &outcomes, &account_results);
 
-    // Publish a metadata-level `new_mail` event for each account THIS request
-    // synced (a joined run was announced by the request that started it; an
-    // account outside the scope was not synced at all). It carries only
-    // post-sync counts — no bodies, subjects or recipients. Clients treat it
-    // as "this account's index may have changed — reload the cached view".
+    let mut response =
+        build_inbox_response("unified_inbox", folder, q.limit, messages, account_results);
+    response.sync = Some(report);
+    Json(response).into_response()
+}
+
+/// Publish a metadata-level `new_mail` event for each account THIS caller
+/// synced (a joined run was announced by the caller that started it; an
+/// account outside the scope was not synced at all). It carries only
+/// post-sync counts — no bodies, subjects or recipients. Clients treat it as
+/// "this account's index may have changed — reload the cached view".
+fn publish_new_mail(
+    state: &AppState,
+    outcomes: &[AccountSyncOutcome],
+    account_results: &[UnifiedInboxAccountResult],
+) {
     for outcome in outcomes
         .iter()
         .filter(|outcome| outcome.result.is_ok() && !outcome.joined)
@@ -665,11 +714,6 @@ pub async fn refresh_unified_inbox(
                 });
         }
     }
-
-    let mut response =
-        build_inbox_response("unified_inbox", folder, q.limit, messages, account_results);
-    response.sync = Some(report);
-    Json(response).into_response()
 }
 
 /// Apply this sync's failures to the response in memory, independent of

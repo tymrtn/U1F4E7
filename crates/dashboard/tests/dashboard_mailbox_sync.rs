@@ -15,7 +15,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use envelope_email_dashboard::dashboard_router;
 use envelope_email_dashboard::events::DashboardEvent;
-use envelope_email_dashboard::mailbox_sync::{AccountSyncer, SyncLimits, SyncTarget};
+use envelope_email_dashboard::handlers::messages::run_inbox_index_sweep;
+use envelope_email_dashboard::mailbox_sync::{AccountSyncer, SyncFailure, SyncLimits, SyncTarget};
 use envelope_email_dashboard::state::AppState;
 use envelope_email_store::models::IndexedMessageInput;
 use envelope_email_store::{CredentialBackend, Database};
@@ -48,6 +49,11 @@ fn insert_account(db: &Database, id: &str, username: &str) {
         .unwrap();
 }
 
+/// How the read-only IMAP syncer reports the first command on a pooled
+/// connection the server dropped while it sat idle.
+const BROKEN_PIPE: &str =
+    "EXAMINE INBOX: IMAP connection failed: EXAMINE INBOX: io: Broken pipe (os error 32)";
+
 /// What the fake provider does for one account's sync.
 #[derive(Clone)]
 enum Provider {
@@ -55,6 +61,9 @@ enum Provider {
     Rows(u64, Vec<IndexedMessageInput>),
     Fail(&'static str),
     Hang,
+    /// The pooled connection is dead: the first attempt fails with a broken
+    /// pipe, and every later one (on a fresh connection) returns these rows.
+    DeadPooledConnection(u64, Vec<IndexedMessageInput>),
 }
 
 #[derive(Clone, Default)]
@@ -95,13 +104,18 @@ impl FakeProvider {
                     .unwrap()
                     .push((account.id.clone(), target));
                 tokio::time::sleep(fake.delay).await;
-                let behavior = fake
-                    .behavior
-                    .lock()
-                    .unwrap()
-                    .get(&(account.id.clone(), target))
-                    .cloned()
-                    .unwrap_or(Provider::Rows(1, vec![]));
+                let behavior = {
+                    let mut behavior = fake.behavior.lock().unwrap();
+                    let key = (account.id.clone(), target);
+                    let current = behavior
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or(Provider::Rows(1, vec![]));
+                    if let Provider::DeadPooledConnection(uidvalidity, rows) = &current {
+                        behavior.insert(key, Provider::Rows(*uidvalidity, rows.clone()));
+                    }
+                    current
+                };
                 match behavior {
                     Provider::Rows(uidvalidity, rows) => {
                         let folder = match target {
@@ -115,12 +129,15 @@ impl FakeProvider {
                             uidvalidity,
                             &rows,
                         )
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| e.to_string().into())
                     }
-                    Provider::Fail(error) => Err(error.to_string()),
+                    Provider::Fail(error) => Err(error.to_string().into()),
                     Provider::Hang => {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         Ok(())
+                    }
+                    Provider::DeadPooledConnection(..) => {
+                        Err(SyncFailure::ConnectionLost(BROKEN_PIPE.to_string()))
                     }
                 }
             }
@@ -356,6 +373,123 @@ async fn scoped_sync_touches_only_that_account_and_announces_only_it() {
         }
     }
     assert_eq!(announced, vec!["acct-b".to_string()]);
+}
+
+/// After two idle days the server had dropped half the pooled connections;
+/// each one failed its account's next sync and only the sync after that
+/// worked. The run must reconnect and finish the account itself.
+#[tokio::test]
+async fn dead_pooled_connection_reconnects_and_syncs_in_the_same_run() {
+    let fake = FakeProvider::default();
+    fake.set(
+        "acct-b",
+        SyncTarget::Inbox,
+        Provider::DeadPooledConnection(1, vec![msg(1, "b-cached", false), msg(4, "b-new", false)]),
+    );
+    let state = seeded(&fake);
+
+    let (status, json) = call(&state, "POST", "/api/messages/unified/refresh").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let b = account(&json, "acct-b");
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["freshness"], "fresh");
+    assert_eq!(json["sync"]["status"], "ok");
+    assert!(subjects(&json).contains(&"b-new".to_string()));
+    let b_calls = fake
+        .calls()
+        .iter()
+        .filter(|(account, _)| account == "acct-b")
+        .count();
+    assert_eq!(
+        b_calls, 2,
+        "the broken attempt plus one on a fresh connection"
+    );
+}
+
+/// `serve` keeps the Inbox index current on its own timer: no browser, no
+/// HTTP request, and the Inbox and Digest still show new mail.
+#[tokio::test]
+async fn background_inbox_sweep_refreshes_the_index_with_no_http_request() {
+    let fake = FakeProvider::default();
+    fake.set(
+        "acct-a",
+        SyncTarget::Inbox,
+        Provider::Rows(1, vec![msg(1, "a-cached", false), msg(3, "a-new", false)]),
+    );
+    let state = seeded(&fake);
+    let mut events = state.events.subscribe();
+    let (_, before) = call(&state, "GET", "/api/messages/unified").await;
+    let indexed_before = account(&before, "acct-a")["indexed_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    run_inbox_index_sweep(&state).await.unwrap();
+
+    let mut calls = fake.calls();
+    calls.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        calls,
+        vec![
+            ("acct-a".to_string(), SyncTarget::Inbox),
+            ("acct-b".to_string(), SyncTarget::Inbox),
+        ]
+    );
+    let (_, cached) = call(&state, "GET", "/api/messages/unified").await;
+    assert_eq!(subjects(&cached), vec!["a-cached", "a-new", "b-cached"]);
+    let a = account(&cached, "acct-a");
+    assert_eq!(a["freshness"], "fresh");
+    assert!(a["indexed_at"].as_str().unwrap() > indexed_before.as_str());
+
+    // Open tabs hear about it the same way a manual refresh announces it.
+    let mut announced = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let DashboardEvent::NewMail {
+            account_id,
+            message_count,
+            ..
+        } = event
+        {
+            announced.push((account_id, message_count));
+        }
+    }
+    announced.sort();
+    assert_eq!(
+        announced,
+        vec![("acct-a".to_string(), 2), ("acct-b".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn background_inbox_sweep_joins_a_running_ui_sync_instead_of_a_second_pass() {
+    let fake = FakeProvider {
+        delay: Duration::from_millis(150),
+        ..FakeProvider::default()
+    };
+    let state = seeded(&fake);
+    let mut events = state.events.subscribe();
+
+    let (ui, sweep) = tokio::join!(
+        call(&state, "POST", "/api/messages/unified/refresh"),
+        async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            run_inbox_index_sweep(&state).await
+        },
+    );
+
+    assert_eq!(ui.0, StatusCode::OK);
+    sweep.unwrap();
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 2, "one provider run per account: {calls:?}");
+    // Each run is announced once, by the caller that started it.
+    let mut new_mail = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, DashboardEvent::NewMail { .. }) {
+            new_mail += 1;
+        }
+    }
+    assert_eq!(new_mail, 2);
 }
 
 #[tokio::test]

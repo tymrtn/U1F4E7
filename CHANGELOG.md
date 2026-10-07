@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `envelope serve` keeps every account's Inbox current on its own. A background pass refreshes the Inbox index on the `sync.poll_interval_secs` timer (default 300 seconds). Until now the index refreshed only when the web UI opened the Mail view, so a `serve` left running with no browser open showed an Inbox and Digest days behind. The pass runs the same read-only sync as the Mail view (EXAMINE and BODY.PEEK, so nothing is marked read), joins a sync the web UI has already started, and is off under `--no-background-sweeps`.
+- A pooled IMAP connection the server dropped while idle no longer fails the next sync. When a command fails with a broken pipe, a connection reset or an unexpected end of stream, Envelope reconnects and retries that account once in the same run. After two idle days the first refresh used to fail about half the accounts with `EXAMINE INBOX: ... Broken pipe (os error 32)`, and each dead connection cost one failed refresh. Login failures and errors the server returns are still reported without a retry.
 - The Linux x86_64 release binary runs on glibc 2.31 and later (Debian 11, Ubuntu 20.04). It was built natively on `ubuntu-latest`, so v1.3.18 needed glibc 2.34 to start and printed a `GLIBC_2.39` loader warning on every run under Debian 12. It is now cross-built with cargo-zigbuild like the aarch64 binary, and `ci/check-glibc-floor.sh` fails the release if either Linux binary needs a newer glibc.
 
 ## [1.3.18] — 2026-10-06
