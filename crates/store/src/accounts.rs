@@ -298,10 +298,12 @@ impl Database {
             "DELETE FROM address_history_state WHERE account_id = ?1",
             params![id],
         )?;
-        tx.execute(
-            "DELETE FROM oauth_grants WHERE account_id = ?1",
-            params![id],
-        )?;
+        if self.has_v2_grant_table()? {
+            tx.execute(
+                "DELETE FROM oauth_grants WHERE account_id = ?1",
+                params![id],
+            )?;
+        }
         let rows = tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(rows > 0)

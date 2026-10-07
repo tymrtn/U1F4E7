@@ -1,29 +1,30 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
-//! OAuth sign-ins (migration 24's `oauth_grants`).
+//! OAuth sign-ins, stored inline in the password column.
 //!
-//! An OAuth account's `encrypted_password` holds [`OAUTH_PASSWORD_SENTINEL`]
-//! and its grant lives here. A public V1 build stores its grant inline in the
-//! password column behind [`V1_GRANT_MARKER`] instead, because V1 cannot add
-//! tables; this build reads both so a database shared between the two lines
-//! never offers either value to a server as a password.
+//! This line cannot add tables, so an OAuth account's `encrypted_password`
+//! holds its whole grant, encrypted like any password, behind
+//! [`V1_GRANT_MARKER`]: `oauth2:v1:<json>`. A V2 build that shares the
+//! database reads this form, and writes [`OAUTH_PASSWORD_SENTINEL`] with the
+//! grant in its own `oauth_grants` table (schema 24) instead; this build reads
+//! that table when it exists. Neither value is ever offered to a server as a
+//! password.
 
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::crypto;
 use crate::db::Database;
 use crate::errors::{Result, StoreError};
 use crate::models::{Account, CachedToken, OAuthGrant};
 
-/// Stored (encrypted) as the password of an account whose grant is in
-/// `oauth_grants`. Never a real password, never sent anywhere.
+/// The password of a V2 account whose grant is in V2's `oauth_grants`.
 pub const OAUTH_PASSWORD_SENTINEL: &str = "oauth2:grant";
-/// Prefix of a public V1 build's inline grant: `oauth2:v1:<json>`.
+/// Prefix of this line's inline grant: `oauth2:v1:<json>`.
 pub const V1_GRANT_MARKER: &str = "oauth2:v1:";
 /// IMAP and SMTP with SASL XOAUTH2 (Gmail).
 pub const TRANSPORT_IMAP_XOAUTH2: &str = "imap_xoauth2";
@@ -44,7 +45,9 @@ pub struct NewOAuthGrant<'a> {
     pub access_expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Deserialize)]
+/// The inline JSON. V2 parses these field names, so they are a contract
+/// between the two lines.
+#[derive(Serialize, Deserialize)]
 struct V1Grant {
     provider: String,
     transport: String,
@@ -56,6 +59,20 @@ struct V1Grant {
     refresh_token: String,
     access_token: Option<String>,
     expires_at: Option<DateTime<Utc>>,
+}
+
+fn marker(g: &NewOAuthGrant<'_>) -> Result<String> {
+    let json = serde_json::to_string(&V1Grant {
+        provider: g.provider.into(),
+        transport: g.transport.into(),
+        client_id: g.client_id.into(),
+        authority: g.authority.into(),
+        scopes: g.scopes.into(),
+        refresh_token: g.refresh_token.into(),
+        access_token: g.access_token.map(Into::into),
+        expires_at: g.access_expires_at,
+    })?;
+    Ok(format!("{V1_GRANT_MARKER}{json}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -84,7 +101,7 @@ fn grant(
 }
 
 impl Database {
-    /// Creates an OAuth account and its grant in one transaction.
+    /// Creates an OAuth account with its grant inline.
     #[allow(clippy::too_many_arguments)]
     pub fn create_oauth_account(
         &self,
@@ -97,104 +114,57 @@ impl Database {
         new_grant: &NewOAuthGrant<'_>,
         passphrase: &str,
     ) -> Result<Account> {
-        let tx = self.conn().unchecked_transaction()?;
-        let account = self.create_account(
+        self.create_account(
             name,
             username,
-            OAUTH_PASSWORD_SENTINEL,
+            &marker(new_grant)?,
             smtp_host,
             smtp_port,
             imap_host,
             imap_port,
             passphrase,
-        )?;
-        self.upsert_grant_row(&account.id, new_grant, passphrase)?;
-        tx.commit()?;
-        Ok(account)
+        )
     }
 
     /// Signs an existing account in with OAuth: converts a password account,
-    /// or replaces the grant of an OAuth account (reauth). One transaction.
+    /// or replaces the grant of an OAuth account (reauth).
     pub fn set_oauth_grant(
         &self,
         account_id: &str,
         new_grant: &NewOAuthGrant<'_>,
         passphrase: &str,
     ) -> Result<()> {
-        let tx = self.conn().unchecked_transaction()?;
         let updated = self.conn().execute(
             "UPDATE accounts SET encrypted_password = ?1,
              encrypted_smtp_password = NULL, encrypted_imap_password = NULL
              WHERE id = ?2",
             params![
-                crypto::encrypt(OAUTH_PASSWORD_SENTINEL, passphrase)?,
+                crypto::encrypt(&marker(new_grant)?, passphrase)?,
                 account_id
             ],
         )?;
         if updated == 0 {
             return Err(StoreError::AccountNotFound(account_id.to_string()));
         }
-        self.upsert_grant_row(account_id, new_grant, passphrase)?;
-        tx.commit()?;
         Ok(())
     }
 
-    fn upsert_grant_row(
-        &self,
-        account_id: &str,
-        g: &NewOAuthGrant<'_>,
-        passphrase: &str,
-    ) -> Result<()> {
-        let refresh = crypto::encrypt(g.refresh_token, passphrase)?;
-        let access = g
-            .access_token
-            .map(|t| crypto::encrypt(t, passphrase))
-            .transpose()?;
-        self.conn().execute(
-            "INSERT INTO oauth_grants (account_id, provider, transport, client_id, authority,
-                 scopes, encrypted_refresh_token, encrypted_access_token, access_expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(account_id) DO UPDATE SET
-                 provider = excluded.provider,
-                 transport = excluded.transport,
-                 client_id = excluded.client_id,
-                 authority = excluded.authority,
-                 scopes = excluded.scopes,
-                 encrypted_refresh_token = excluded.encrypted_refresh_token,
-                 encrypted_access_token = excluded.encrypted_access_token,
-                 access_expires_at = excluded.access_expires_at,
-                 grant_version = grant_version + 1,
-                 needs_reauth = 0,
-                 last_error = NULL,
-                 updated_at = datetime('now')",
-            params![
-                account_id,
-                g.provider,
-                g.transport,
-                g.client_id,
-                g.authority,
-                g.scopes,
-                refresh,
-                access,
-                g.access_expires_at.map(|t| t.to_rfc3339()),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Whether the account has a grant row, without decrypting anything.
-    pub fn has_oauth_grant(&self, account_id: &str) -> Result<bool> {
-        let n: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM oauth_grants WHERE account_id = ?1",
-            params![account_id],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+    /// Whether V2's `oauth_grants` table exists in this database.
+    pub(crate) fn has_v2_grant_table(&self) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_grants'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The grant behind a decrypted password, if that password is an OAuth
-    /// placeholder. A sentinel with no grant row fails loud: falling back to
-    /// the sentinel as a password would send it to the server.
+    /// placeholder. A V2 sentinel with no grant row fails loud: falling back
+    /// to the sentinel as a password would send it to the server.
     pub(crate) fn resolve_oauth(
         &self,
         account_id: &str,
@@ -217,6 +187,9 @@ impl Database {
         }
         if password != OAUTH_PASSWORD_SENTINEL {
             return Ok(None);
+        }
+        if !self.has_v2_grant_table()? {
+            return Err(StoreError::OAuthReauthRequired(username.to_string()));
         }
         let row = self
             .conn()
@@ -268,6 +241,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     const PASS: &str = "test-passphrase";
 
@@ -298,13 +272,66 @@ mod tests {
         .unwrap()
     }
 
+    fn stored_password(db: &Database, id: &str) -> String {
+        let enc: String = db
+            .conn()
+            .query_row(
+                "SELECT encrypted_password FROM accounts WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crypto::decrypt(&enc, PASS).unwrap()
+    }
+
+    /// Adds V2's schema-24 `oauth_grants` table, as a shared database has it.
+    fn add_v2_grant_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE oauth_grants (
+                account_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                authority TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                encrypted_refresh_token TEXT NOT NULL,
+                encrypted_access_token TEXT,
+                access_expires_at TEXT,
+                grant_version INTEGER NOT NULL DEFAULT 0,
+                needs_reauth INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+    }
+
+    fn v2_sentinel_account(db: &Database) -> Account {
+        db.create_account(
+            "Gmail",
+            "v2@gmail.com",
+            OAUTH_PASSWORD_SENTINEL,
+            "smtp.gmail.com",
+            465,
+            "imap.gmail.com",
+            993,
+            PASS,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn an_oauth_account_resolves_to_its_grant_and_no_password() {
         let db = Database::open_memory().unwrap();
         let account = oauth_account(&db);
         let creds = db.get_account_with_credentials(&account.id, PASS).unwrap();
-        assert_eq!(creds.password, "", "the sentinel never leaves the store");
+        assert_eq!(
+            creds.password, "",
+            "the inline grant never leaves the store"
+        );
         assert_eq!(creds.effective_imap_password(), "");
+        assert_eq!(creds.effective_smtp_password(), "");
         let grant = creds.oauth.expect("grant resolved");
         assert_eq!(grant.refresh_token, "rt-1");
         assert_eq!(grant.transport, TRANSPORT_IMAP_XOAUTH2);
@@ -314,8 +341,42 @@ mod tests {
         );
     }
 
+    /// V2 parses these exact field names; renaming one locks V2 out of
+    /// accounts this line signs in.
     #[test]
-    fn a_v1_inline_grant_is_read_and_never_returned_as_a_password() {
+    fn the_inline_grant_keeps_the_field_names_v2_reads() {
+        let db = Database::open_memory().unwrap();
+        let account = oauth_account(&db);
+        let stored = stored_password(&db, &account.id);
+        let json = stored
+            .strip_prefix(V1_GRANT_MARKER)
+            .expect("stored behind the marker");
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "access_token",
+                "authority",
+                "client_id",
+                "expires_at",
+                "provider",
+                "refresh_token",
+                "scopes",
+                "transport"
+            ]
+        );
+    }
+
+    /// The minimal form V2's own test writes still parses here.
+    #[test]
+    fn a_minimal_inline_grant_is_read_and_never_returned_as_a_password() {
         let db = Database::open_memory().unwrap();
         let marker = format!(
             r#"{V1_GRANT_MARKER}{{"provider":"google","transport":"imap_xoauth2","client_id":"cid","refresh_token":"rt-v1"}}"#
@@ -338,22 +399,61 @@ mod tests {
     }
 
     #[test]
-    fn a_sentinel_without_a_grant_asks_for_reauth() {
+    fn a_v2_sentinel_without_its_table_asks_for_reauth() {
         let db = Database::open_memory().unwrap();
-        let account = oauth_account(&db);
-        db.conn().execute("DELETE FROM oauth_grants", []).unwrap();
+        let account = v2_sentinel_account(&db);
         let err = db
             .get_account_with_credentials(&account.id, PASS)
             .err()
             .expect("must not fall back to the sentinel as a password");
         assert!(
-            matches!(err, StoreError::OAuthReauthRequired(ref u) if u == "you@gmail.com"),
+            matches!(err, StoreError::OAuthReauthRequired(ref u) if u == "v2@gmail.com"),
             "{err}"
         );
     }
 
     #[test]
-    fn a_password_account_converts_and_reauth_bumps_the_version() {
+    fn a_v2_sentinel_without_its_row_asks_for_reauth() {
+        let db = Database::open_memory().unwrap();
+        add_v2_grant_table(db.conn());
+        let account = v2_sentinel_account(&db);
+        let err = db
+            .get_account_with_credentials(&account.id, PASS)
+            .err()
+            .expect("must not fall back to the sentinel as a password");
+        assert!(matches!(err, StoreError::OAuthReauthRequired(_)), "{err}");
+    }
+
+    #[test]
+    fn a_v2_grant_row_is_read() {
+        let db = Database::open_memory().unwrap();
+        add_v2_grant_table(db.conn());
+        let account = v2_sentinel_account(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO oauth_grants (account_id, provider, transport, client_id,
+                     authority, scopes, encrypted_refresh_token, encrypted_access_token,
+                     access_expires_at)
+                 VALUES (?1, 'google', 'imap_xoauth2', 'cid', 'https://accounts.google.com',
+                     'https://mail.google.com/', ?2, ?3, '2026-10-07T10:00:00+00:00')",
+                params![
+                    account.id,
+                    crypto::encrypt("rt-v2", PASS).unwrap(),
+                    crypto::encrypt("at-v2", PASS).unwrap()
+                ],
+            )
+            .unwrap();
+        let creds = db.get_account_with_credentials(&account.id, PASS).unwrap();
+        assert_eq!(creds.password, "");
+        let grant = creds.oauth.unwrap();
+        assert_eq!(grant.refresh_token, "rt-v2");
+        let cache = grant.cache.lock().unwrap();
+        assert_eq!(cache.access_token.as_deref(), Some("at-v2"));
+        assert!(cache.expires_at.is_some());
+    }
+
+    #[test]
+    fn a_password_account_converts_and_reauth_replaces_the_grant() {
         let db = Database::open_memory().unwrap();
         let account = db
             .create_account(
@@ -367,6 +467,12 @@ mod tests {
                 PASS,
             )
             .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE accounts SET encrypted_smtp_password = ?1 WHERE id = ?2",
+                params![crypto::encrypt("smtp-pw", PASS).unwrap(), account.id],
+            )
+            .unwrap();
         db.set_oauth_grant(&account.id, &new_grant("rt-a"), PASS)
             .unwrap();
         db.set_oauth_grant(&account.id, &new_grant("rt-b"), PASS)
@@ -375,23 +481,44 @@ mod tests {
         assert_eq!(creds.password, "");
         assert!(creds.smtp_password.is_none() && creds.imap_password.is_none());
         assert_eq!(creds.oauth.unwrap().refresh_token, "rt-b");
-        let version: i64 = db
-            .conn()
-            .query_row("SELECT grant_version FROM oauth_grants", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, 1);
     }
 
     #[test]
-    fn deleting_the_account_deletes_its_grant() {
+    fn signing_in_a_missing_account_fails() {
         let db = Database::open_memory().unwrap();
-        let account = oauth_account(&db);
+        let err = db
+            .set_oauth_grant("nope", &new_grant("rt"), PASS)
+            .expect_err("no such account");
+        assert!(matches!(err, StoreError::AccountNotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn deleting_the_account_deletes_a_v2_grant_row() {
+        let db = Database::open_memory().unwrap();
+        add_v2_grant_table(db.conn());
+        let account = v2_sentinel_account(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO oauth_grants (account_id, provider, transport, client_id,
+                     authority, scopes, encrypted_refresh_token)
+                 VALUES (?1, 'google', 'imap_xoauth2', 'cid', 'a', 's', 'enc')",
+                params![account.id],
+            )
+            .unwrap();
         assert!(db.delete_account(&account.id).unwrap());
         let left: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM oauth_grants", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn deleting_an_oauth_account_works_without_the_v2_table() {
+        let db = Database::open_memory().unwrap();
+        let account = oauth_account(&db);
+        assert!(db.delete_account(&account.id).unwrap());
+        assert!(db.find_account_by_email("you@gmail.com").unwrap().is_none());
     }
 
     #[test]

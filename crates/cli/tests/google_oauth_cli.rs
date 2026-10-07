@@ -166,6 +166,5 @@ fn google_accounts_are_guarded_offline() {
     ok(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Couldn't revoke"), "{stderr}");
-    assert!(!db.has_oauth_grant(&gmail.id).unwrap());
     assert!(db.find_account_by_email(GMAIL).unwrap().is_none());
 }

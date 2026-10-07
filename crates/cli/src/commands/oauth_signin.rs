@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use envelope_email_store::oauth_grants::{NewOAuthGrant, TRANSPORT_IMAP_XOAUTH2};
-use envelope_email_transport::carddav::GOOGLE_CARDDAV_SCOPE;
 use envelope_email_transport::oauth::{
     GMAIL_SCOPE, GOOGLE_AUTHORITY, GOOGLE_LOOPBACK_PATH, LoopbackListener, OAuthClient, Pkce,
     ProviderConfig, TokenSet, new_state, parse_redirect,
@@ -21,6 +20,10 @@ pub const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
 pub const GMAIL_IMAP_PORT: u16 = 993;
 pub const GMAIL_SMTP_HOST: &str = "smtp.gmail.com";
 pub const GMAIL_SMTP_PORT: u16 = 465;
+/// Google's CardDAV scope. This line has no contacts sync, but Envelope v2
+/// does and can share the database, so reauth keeps the scope when the old
+/// grant had it.
+pub const GOOGLE_CARDDAV_SCOPE: &str = "https://www.googleapis.com/auth/carddav";
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -48,16 +51,16 @@ impl GoogleSignIn {
 
 /// Signs `email` in with Google in the browser. With `paste`, nothing
 /// listens locally: the user opens the link on any device and pastes back
-/// the address of the page it ends on. `contacts` also asks for the CardDAV
-/// scope, so a Google contact source can sync with the same grant.
-pub async fn google_sign_in(email: &str, paste: bool, contacts: bool) -> Result<GoogleSignIn> {
+/// the address of the page it ends on. `keep_contacts` asks again for the
+/// CardDAV scope an earlier grant had.
+pub async fn google_sign_in(email: &str, paste: bool, keep_contacts: bool) -> Result<GoogleSignIn> {
     let (client_id, secret) = google_client_credentials().ok_or_else(|| {
         anyhow!(
             "Google sign-in isn't configured in this build: set ENVELOPE_GOOGLE_CLIENT_ID and ENVELOPE_GOOGLE_CLIENT_SECRET"
         )
     })?;
     let mut config = ProviderConfig::google(&client_id, &secret);
-    if contacts {
+    if keep_contacts {
         config.scopes.push(GOOGLE_CARDDAV_SCOPE.to_string());
     }
     let client = OAuthClient::new(config)?;
@@ -104,9 +107,9 @@ pub async fn google_sign_in(email: &str, paste: bool, contacts: bool) -> Result<
         .exchange_code(&http, &code, &redirect_uri, &pkce.verifier)
         .await?;
     check_google_tokens(email, &tokens)?;
-    if contacts && !tokens.has_scope(GOOGLE_CARDDAV_SCOPE) {
+    if keep_contacts && !tokens.has_scope(GOOGLE_CARDDAV_SCOPE) {
         eprintln!(
-            "Google didn't grant contacts access (the box was unticked), so Google contacts won't sync. Mail works; run `envelope accounts reauth {email} --contacts` to try again."
+            "Google didn't grant contacts access this time (the box was unticked), so Envelope v2 can no longer sync this account's Google contacts. Mail works."
         );
     }
     let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
