@@ -40,8 +40,9 @@ use tokio_rustls::TlsConnector;
 pub const MIGADU_IMAP_HOST: &str = "imap.migadu.com";
 
 /// Migadu's ManageSieve host. Default for accounts whose IMAP host matches
-/// [`MIGADU_IMAP_HOST`].
-pub const MIGADU_SIEVE_HOST: &str = "sieve.migadu.com";
+/// [`MIGADU_IMAP_HOST`]. Migadu serves ManageSieve on its IMAP host (port
+/// 4190); a separate `sieve.` subdomain has no DNS record.
+pub const MIGADU_SIEVE_HOST: &str = "imap.migadu.com";
 
 /// Standard ManageSieve port from RFC 5804.
 pub const DEFAULT_SIEVE_PORT: u16 = 4190;
@@ -1063,14 +1064,14 @@ mod tests {
     #[test]
     fn migadu_defaults_match_canonical_host() {
         let got = migadu_defaults("imap.migadu.com").expect("migadu host should resolve");
-        assert_eq!(got.0, "sieve.migadu.com");
+        assert_eq!(got.0, "imap.migadu.com");
         assert_eq!(got.1, 4190);
     }
 
     #[test]
     fn migadu_defaults_case_insensitive() {
         let got = migadu_defaults("Imap.Migadu.Com").expect("migadu host should resolve");
-        assert_eq!(got.0, "sieve.migadu.com");
+        assert_eq!(got.0, "imap.migadu.com");
         assert_eq!(got.1, 4190);
     }
 
@@ -1084,7 +1085,7 @@ mod tests {
     #[test]
     fn resolve_endpoint_uses_migadu_defaults_when_no_override() {
         let (host, port) = resolve_sieve_endpoint("imap.migadu.com", None, None);
-        assert_eq!(host, "sieve.migadu.com");
+        assert_eq!(host, "imap.migadu.com");
         assert_eq!(port, 4190);
     }
 
@@ -1106,7 +1107,7 @@ mod tests {
     #[test]
     fn resolve_endpoint_port_override_keeps_default_host() {
         let (host, port) = resolve_sieve_endpoint("imap.migadu.com", None, Some(4191));
-        assert_eq!(host, "sieve.migadu.com");
+        assert_eq!(host, "imap.migadu.com");
         assert_eq!(port, 4191);
     }
 
@@ -1223,7 +1224,7 @@ mod tests {
     fn build_plan_marks_dry_run_and_confirm_required() {
         let plan = build_plan(
             "acct-1",
-            "sieve.migadu.com",
+            "imap.migadu.com",
             4190,
             "envelope-rules",
             "require [\"fileinto\"];\n".to_string(),
@@ -1234,7 +1235,7 @@ mod tests {
         assert_eq!(plan.status, "dry_run");
         assert_eq!(plan.mode, "dry-run");
         assert_eq!(plan.account_id, "acct-1");
-        assert_eq!(plan.host, "sieve.migadu.com");
+        assert_eq!(plan.host, "imap.migadu.com");
         assert_eq!(plan.port, 4190);
         assert_eq!(plan.script_name, "envelope-rules");
         assert!(plan.would_upload);
@@ -1248,7 +1249,7 @@ mod tests {
     fn build_plan_serializes_to_stable_json_keys() {
         let plan = build_plan(
             "acct-1",
-            "sieve.migadu.com",
+            "imap.migadu.com",
             4190,
             "envelope-rules",
             "stop;\n".to_string(),
