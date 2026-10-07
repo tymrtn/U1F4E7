@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Envelope never deletes a script on the server. A dry run shows what a publish would do in each case without connecting. With an agent token, `--confirm --replace-active` is operator-only.
 - Rules published to the mail server no longer run twice. The server already acts on new mail with the published script, and Envelope used to run the same rules again locally. After a publish, Envelope records which rules the server runs for that account, and `rule run`, `watch --run-rules`, the dashboard and the MCP `rules_run` tool skip them with the reason `server_managed`. Republishing updates the list. To change what a published rule does, edit it and republish. When Envelope's script is no longer the active one, as seen by the next publish or `rule sieve-status`, those rules run locally again.
 - Sieve publishing on Migadu now connects to `imap.migadu.com`, which serves ManageSieve; the old default host does not exist.
+- An agent policy that names accounts by email now works for every command and MCP tool; before, only account ids matched. Emails match in any case.
 
 ### Added
 

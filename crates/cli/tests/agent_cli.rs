@@ -376,13 +376,18 @@ fn run_as(home: &Path, token: &str, args: &[&str]) -> std::process::Output {
 
 /// Seed one offline account. Uses the insecure machine key (test-only).
 fn seed_account(home: &Path) {
+    add_account(home, "test@example.test");
+}
+
+/// Add an offline account for `email`. Uses the insecure machine key (test-only).
+fn add_account(home: &Path, email: &str) {
     let mut child = Command::new(envelope_bin())
         .args([
             "accounts",
             "add",
             "--skip-login-check",
             "--email",
-            "test@example.test",
+            email,
             "--password-stdin",
             "--smtp-host",
             "smtp.example.test",
@@ -952,24 +957,29 @@ fn send_args<'a>(to: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
 
 /// Insert a draft row directly; `draft create` would need a live IMAP APPEND.
 fn local_draft(home: &Path, to: &str) -> String {
-    let db = open_db(home);
-    let account_id: String = db
+    let account_id: String = open_db(home)
         .conn()
         .query_row("SELECT id FROM accounts LIMIT 1", [], |r| r.get(0))
         .expect("seed account id");
-    db.create_draft(
-        &account_id,
-        to,
-        Some("hi"),
-        Some("x"),
-        None,
-        None,
-        None,
-        None,
-        Some("cli"),
-    )
-    .expect("create draft")
-    .id
+    local_draft_on(home, &account_id, to)
+}
+
+/// [`local_draft`] on the account `account_id`.
+fn local_draft_on(home: &Path, account_id: &str, to: &str) -> String {
+    open_db(home)
+        .create_draft(
+            account_id,
+            to,
+            Some("hi"),
+            Some("x"),
+            None,
+            None,
+            None,
+            None,
+            Some("cli"),
+        )
+        .expect("create draft")
+        .id
 }
 
 fn send_after(home: &Path, draft_id: &str) -> Option<String> {
@@ -1108,6 +1118,158 @@ fn cli_draft_send_with_confirm_token_requires_human_approval() {
     let payload = json_stdout(&out);
     assert_eq!(payload["status"], "scheduled", "{payload}");
     assert!(send_after(home, &draft_id).is_some());
+}
+
+// ── Accounts a policy names ─────────────────────────────────────────
+
+const ALPHA: &str = "alpha@example.test";
+const BETA: &str = "beta@example.test";
+
+fn account_id(home: &Path, email: &str) -> String {
+    open_db(home)
+        .conn()
+        .query_row(
+            "SELECT id FROM accounts WHERE username = ?1",
+            [email],
+            |r| r.get(0),
+        )
+        .expect("account id")
+}
+
+/// Accounts ALPHA and BETA with a draft on each, and an agent `skippy`.
+/// Returns the agent's token and the ALPHA and BETA draft ids.
+fn two_accounts_and_an_agent(home: &Path) -> (String, String, String) {
+    add_account(home, ALPHA);
+    add_account(home, BETA);
+    let token = create_agent_token(home, "skippy");
+    let alpha_draft = local_draft_on(home, &account_id(home, ALPHA), "a@b.test");
+    let beta_draft = local_draft_on(home, &account_id(home, BETA), "a@b.test");
+    (token, alpha_draft, beta_draft)
+}
+
+/// Let `name` act only on `accounts`, with `send` up to draft-only and
+/// `contacts.read`.
+fn allow_accounts(home: &Path, name: &str, accounts: &str) {
+    let out = run(
+        home,
+        &[
+            "agent",
+            "policy",
+            "set",
+            name,
+            "--allow-accounts",
+            accounts,
+            "--allow-actions",
+            "send,contacts.read",
+            "--send-mode-ceiling",
+            "draft-only",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "policy set failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `draft send` under a draft-only ceiling checks the draft's account, then
+/// only reports the draft: nothing is queued and no server is contacted.
+fn draft_send_as(home: &Path, token: &str, draft_id: &str) -> std::process::Output {
+    run_as(
+        home,
+        token,
+        &[
+            "--json",
+            "draft",
+            "send",
+            draft_id,
+            "--attr",
+            "informational",
+        ],
+    )
+}
+
+fn assert_drafted(out: &std::process::Output) {
+    let payload = json_stdout(out);
+    assert_eq!(payload["status"], "drafted", "{payload}");
+}
+
+/// The refusal never names the account it refused.
+fn assert_account_denied(out: &std::process::Output, home: &Path, email: &str) {
+    assert_denied(out, "agent_policy_denied_account");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(email) && !stdout.contains(&account_id(home, email)),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn cli_policy_naming_an_account_by_email_allows_it_and_denies_another() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (token, alpha_draft, beta_draft) = two_accounts_and_an_agent(home);
+    allow_accounts(home, "skippy", ALPHA);
+
+    assert_drafted(&draft_send_as(home, &token, &alpha_draft));
+    assert_account_denied(&draft_send_as(home, &token, &beta_draft), home, BETA);
+}
+
+#[test]
+fn cli_policy_naming_an_account_by_id_still_allows_it() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (token, alpha_draft, beta_draft) = two_accounts_and_an_agent(home);
+    allow_accounts(home, "skippy", &account_id(home, ALPHA));
+
+    assert_drafted(&draft_send_as(home, &token, &alpha_draft));
+    assert_account_denied(&draft_send_as(home, &token, &beta_draft), home, BETA);
+}
+
+#[test]
+fn cli_policy_account_email_matches_in_any_case() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (token, alpha_draft, beta_draft) = two_accounts_and_an_agent(home);
+    allow_accounts(home, "skippy", "ALPHA@Example.TEST");
+
+    assert_drafted(&draft_send_as(home, &token, &alpha_draft));
+    assert_account_denied(&draft_send_as(home, &token, &beta_draft), home, BETA);
+}
+
+#[test]
+fn mcp_policy_account_matches_whether_the_tool_names_it_by_id_or_email() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (token, _, _) = two_accounts_and_an_agent(home);
+    let (alpha, beta) = (account_id(home, ALPHA), account_id(home, BETA));
+    let contacts = |account: &str| {
+        mcp_tool_call(
+            home,
+            &token,
+            "contacts",
+            json!({ "action": "list", "account": account }),
+        )
+    };
+    let assert_denied_unnamed = |account: &str, email: &str, id: &str| {
+        let (denied, is_error) = contacts(account);
+        assert!(is_error, "{denied}");
+        assert_eq!(denied["code"], "agent_policy_denied_account", "{denied}");
+        let text = denied.to_string();
+        assert!(!text.contains(email) && !text.contains(id), "{text}");
+    };
+
+    // Listed by id, named by email.
+    allow_accounts(home, "skippy", &alpha);
+    let (allowed, is_error) = contacts(ALPHA);
+    assert!(!is_error, "{allowed}");
+    assert_denied_unnamed(BETA, BETA, &beta);
+
+    // Listed by email, named by id.
+    allow_accounts(home, "skippy", ALPHA);
+    let (allowed, is_error) = contacts(&alpha);
+    assert!(!is_error, "{allowed}");
+    assert_denied_unnamed(&beta, BETA, &beta);
 }
 
 // ── One-time-code operator opt-in ───────────────────────────────────

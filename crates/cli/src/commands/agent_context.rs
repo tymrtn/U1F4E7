@@ -350,13 +350,36 @@ fn context_for(db: &Database, identity: &AgentIdentity) -> anyhow::Result<AgentC
     let store_policy = db
         .get_agent_policy(&identity.id)?
         .unwrap_or_else(|| StoreAgentPolicy::default_for(&identity.id));
-    let policy = map_store_policy(&store_policy)?;
+    let mut policy = map_store_policy(&store_policy)?;
+    policy.allowed_accounts = named_accounts(db, &policy.allowed_accounts)?;
 
     Ok(AgentContext {
         agent_id: identity.id.clone(),
         agent_name: identity.name.clone(),
         policy,
     })
+}
+
+/// The id and email of every account the policy's account entries name. An
+/// entry names an account when it equals the account's id exactly or its
+/// email in any case; an entry that names no account matches nothing. Every
+/// check passes the account id, so an account listed by email must be known
+/// by its id too. A `*` list is kept as it is.
+fn named_accounts(db: &Database, entries: &[String]) -> anyhow::Result<Vec<String>> {
+    if entries.is_empty() || entries.iter().any(|entry| entry == "*") {
+        return Ok(entries.to_vec());
+    }
+    let mut named = Vec::new();
+    for account in db.list_accounts()? {
+        if entries
+            .iter()
+            .any(|entry| *entry == account.id || entry.eq_ignore_ascii_case(&account.username))
+        {
+            named.push(account.id);
+            named.push(account.username);
+        }
+    }
+    Ok(named)
 }
 
 /// Resolve who is running a CLI command.
@@ -861,5 +884,52 @@ mod tests {
             .authorize_tool("totally_unknown", "a@b.test", None)
             .unwrap_err();
         assert_eq!(denial.code, "agent_policy_denied_action");
+    }
+
+    #[test]
+    fn a_policy_names_an_account_by_its_id_or_its_email_in_any_case() {
+        let db = Database::open_memory().unwrap();
+        for (id, email) in [
+            ("acct-alpha", "alpha@example.test"),
+            ("acct-beta", "beta@example.test"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                                           imap_host, imap_port, encrypted_password)
+                     VALUES (?1, 'Test', ?2, 'example.test', 'smtp.example.test', 587,
+                             'imap.example.test', 993, 'x')",
+                    rusqlite::params![id, email],
+                )
+                .unwrap();
+        }
+        let agent = db.create_agent("skippy").unwrap();
+        // Every check passes the account id, as the CLI and MCP callers do.
+        let allows = |entries: &[&str], account_id: &str| {
+            let mut policy = StoreAgentPolicy::default_for(&agent.identity.id);
+            policy.allowed_accounts = serde_json::to_string(entries).unwrap();
+            db.set_agent_policy(&policy).unwrap();
+            let ctx = resolve_cli_from_values(&db, Some(agent.token.clone()))
+                .unwrap()
+                .expect("an active agent");
+            ctx.authorize_action("send", account_id, None).is_ok()
+        };
+
+        for entry in ["acct-alpha", "alpha@example.test", "ALPHA@Example.TEST"] {
+            assert!(allows(&[entry], "acct-alpha"), "{entry} names alpha");
+            assert!(!allows(&[entry], "acct-beta"), "{entry} does not name beta");
+        }
+        for entry in [
+            "ACCT-ALPHA",
+            "acct",
+            "ghost@example.test",
+            "@example.test",
+            "example.test",
+            "alpha",
+            "alpha@example.test.evil",
+        ] {
+            assert!(!allows(&[entry], "acct-alpha"), "{entry} names no account");
+        }
+        assert!(allows(&["*"], "acct-beta"));
     }
 }
