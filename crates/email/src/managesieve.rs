@@ -15,8 +15,12 @@
 //!   [`build_plan`] helper for that dry-run JSON path.
 //! - Passwords and SASL credentials are never logged. The protocol
 //!   transcript is not captured anywhere by default.
-//! - We only emit `PUTSCRIPT` and `SETACTIVE` for the script the operator
-//!   asked for. We never `DELETESCRIPT` other scripts on the server.
+//! - Before changing anything, a publish lists the server's scripts. When a
+//!   script other than Envelope's is active, it refuses unless the operator
+//!   chose `--keep-existing` (a wrapper that includes that script first,
+//!   RFC 6609) or `--replace-active <name>`. See [`decide_activation`].
+//! - We only `PUTSCRIPT` the script the operator named and its wrapper, and
+//!   `SETACTIVE` one of them. We never `DELETESCRIPT` or `RENAMESCRIPT`.
 //! - The first capability exchange is plaintext (per RFC 5804). We always
 //!   `STARTTLS` before issuing `AUTHENTICATE` — credentials never leave
 //!   the client unencrypted.
@@ -67,6 +71,11 @@ pub enum ManageSieveError {
     /// hosts/ports rather than re-try.
     #[error("ManageSieve capability unavailable: {0}")]
     CapabilityUnavailable(String),
+
+    /// Publishing would switch off a script the operator did not name.
+    /// Nothing was uploaded.
+    #[error("{}", .0.message)]
+    ActiveScriptConflict(ActiveScriptConflict),
 }
 
 /// Resolve the ManageSieve endpoint to publish to.
@@ -163,6 +172,12 @@ impl Capabilities {
             .iter()
             .any(|m| m.eq_ignore_ascii_case(mechanism))
     }
+
+    pub fn supports_extension(&self, extension: &str) -> bool {
+        self.sieve_extensions
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(extension))
+    }
 }
 
 /// Status of a single ManageSieve response.
@@ -221,21 +236,21 @@ impl<'a> SieveTokenizer<'a> {
         if bytes.first()? != &b'"' {
             return None;
         }
-        let mut out = String::new();
+        let mut out = Vec::new();
         let mut i = 1;
         while i < bytes.len() {
             let b = bytes[i];
             if b == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
             if b == b'"' {
                 self.rest = &rest[i + 1..];
                 self.rest = self.rest.trim_start();
-                return Some(out);
+                return String::from_utf8(out).ok();
             }
-            out.push(b as char);
+            out.push(b);
             i += 1;
         }
         None
@@ -268,6 +283,217 @@ pub fn apply_capability(caps: &mut Capabilities, name: &str, value: Option<&str>
     }
 }
 
+/// One script on the server, as `LISTSCRIPTS` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServerScript {
+    pub name: String,
+    pub active: bool,
+}
+
+/// What a publish does when a script other than Envelope's is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExistingScript {
+    /// Refuse and name the active script. The default.
+    Refuse,
+    /// `--keep-existing`: keep it running through a wrapper that includes it
+    /// first and then Envelope's script. Needs the server's `include`
+    /// extension (RFC 6609).
+    Keep,
+    /// `--replace-active <name>`: switch off exactly this script. It stays
+    /// on the server.
+    Replace(String),
+}
+
+/// How a publish leaves Envelope's script running on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    /// No script was active, or Envelope's own script was.
+    Activate,
+    /// Envelope's wrapper was already active and includes the script.
+    KeepWrapper,
+    /// The new wrapper runs `previous` first and then Envelope's script.
+    WrapExisting { previous: String },
+    /// `previous` was switched off. It stays on the server.
+    ReplaceActive { previous: String },
+}
+
+impl Activation {
+    /// Stable name, used in JSON output and the local publish record.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Activation::Activate => "activated",
+            Activation::KeepWrapper => "kept_wrapper",
+            Activation::WrapExisting { .. } => "wrapped_existing",
+            Activation::ReplaceActive { .. } => "replaced_active",
+        }
+    }
+
+    /// The user's script this publish wrapped or switched off.
+    pub fn previous(&self) -> Option<&str> {
+        match self {
+            Activation::WrapExisting { previous } | Activation::ReplaceActive { previous } => {
+                Some(previous)
+            }
+            Activation::Activate | Activation::KeepWrapper => None,
+        }
+    }
+
+    /// The script left active: Envelope's script, or its wrapper.
+    pub fn active_script(&self, script_name: &str) -> String {
+        match self {
+            Activation::KeepWrapper | Activation::WrapExisting { .. } => {
+                wrapper_script_name(script_name)
+            }
+            Activation::Activate | Activation::ReplaceActive { .. } => script_name.to_string(),
+        }
+    }
+}
+
+/// Name of the wrapper `--keep-existing` uploads for `script_name`.
+pub fn wrapper_script_name(script_name: &str) -> String {
+    format!("{script_name}-wrapper")
+}
+
+/// The wrapper: the script that was active first, then Envelope's.
+/// `:optional` keeps Envelope's rules running if that script is deleted
+/// later.
+pub fn wrapper_script(previous: &str, script_name: &str) -> String {
+    format!(
+        "# Written by Envelope: envelope rule publish-sieve --keep-existing\n\
+         # Runs the script that was active before, then Envelope's rules.\n\
+         require [\"include\"];\n\
+         include :personal :optional \"{previous}\";\n\
+         include :personal \"{script_name}\";\n",
+        previous = escape_quoted_inner(previous),
+        script_name = escape_quoted_inner(script_name),
+    )
+}
+
+/// A publish refused because it would switch off a script the operator did
+/// not name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ActiveScriptConflict {
+    /// The script active on the server.
+    pub active_script: String,
+    /// Whether the server supports `include`, which `--keep-existing` needs.
+    pub include_supported: bool,
+    pub message: String,
+}
+
+/// Decide how publishing `script_name` activates it, given the server's
+/// scripts. Network-free. It never switches off a script the operator did
+/// not name with `--replace-active`.
+pub fn decide_activation(
+    scripts: &[ServerScript],
+    include_supported: bool,
+    script_name: &str,
+    existing: &ExistingScript,
+) -> Result<Activation, ActiveScriptConflict> {
+    let Some(active) = scripts.iter().find(|s| s.active).map(|s| s.name.as_str()) else {
+        return Ok(Activation::Activate);
+    };
+    if active == script_name {
+        return Ok(Activation::Activate);
+    }
+    if active == wrapper_script_name(script_name) {
+        return Ok(Activation::KeepWrapper);
+    }
+    let options = if include_supported {
+        format!(
+            "Use --keep-existing to run \"{active}\" first and then Envelope's rules, \
+             or --replace-active \"{active}\" to switch it off (it stays on the server)."
+        )
+    } else {
+        format!(
+            "This server does not support Sieve include, so both cannot run. \
+             Use --replace-active \"{active}\" to switch it off (it stays on the server)."
+        )
+    };
+    let message = match existing {
+        ExistingScript::Keep if include_supported => {
+            return Ok(Activation::WrapExisting {
+                previous: active.to_string(),
+            });
+        }
+        ExistingScript::Replace(named) if named == active => {
+            return Ok(Activation::ReplaceActive {
+                previous: active.to_string(),
+            });
+        }
+        ExistingScript::Refuse => format!(
+            "\"{active}\" is the active Sieve script on the server and may hold filters set up \
+             in your mail provider's settings. Publishing would switch it off. {options}"
+        ),
+        ExistingScript::Keep => format!(
+            "--keep-existing needs Sieve include, which this server does not support, so \
+             \"{active}\" cannot keep running alongside Envelope's rules. Use --replace-active \
+             \"{active}\" to switch it off (it stays on the server)."
+        ),
+        ExistingScript::Replace(named) => format!(
+            "--replace-active names \"{named}\", but the active Sieve script on the server is \
+             \"{active}\". Publishing would switch \"{active}\" off. {options}"
+        ),
+    };
+    Err(ActiveScriptConflict {
+        active_script: active.to_string(),
+        include_supported,
+        message,
+    })
+}
+
+/// What a confirmed publish does in each state the server can be in. A dry
+/// run never connects, so it shows every branch.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivationPlan {
+    /// `refuse`, `keep_existing` or `replace_active`.
+    pub on_another_active_script: &'static str,
+    pub if_no_script_or_envelope_script_active: String,
+    pub if_envelope_wrapper_active: String,
+    pub if_another_script_active: String,
+    /// Always false: Envelope never deletes a script on the server.
+    pub deletes_scripts: bool,
+}
+
+pub fn activation_plan(script_name: &str, existing: &ExistingScript) -> ActivationPlan {
+    let wrapper = wrapper_script_name(script_name);
+    let (choice, other) = match existing {
+        ExistingScript::Refuse => (
+            "refuse",
+            "refuse and name that script; nothing is uploaded. Pass --keep-existing to keep it \
+             running, or --replace-active <name> to switch it off"
+                .to_string(),
+        ),
+        ExistingScript::Keep => (
+            "keep_existing",
+            format!(
+                "if the server supports Sieve include: upload \"{script_name}\" without \
+                 activating it, upload \"{wrapper}\", which runs that script first and then \
+                 \"{script_name}\", and make \"{wrapper}\" active. Without include support: \
+                 refuse; nothing is uploaded"
+            ),
+        ),
+        ExistingScript::Replace(named) => (
+            "replace_active",
+            format!(
+                "if it is \"{named}\": switch \"{named}\" off (it stays on the server) and make \
+                 \"{script_name}\" active. Any other script: refuse; nothing is uploaded"
+            ),
+        ),
+    };
+    ActivationPlan {
+        on_another_active_script: choice,
+        if_no_script_or_envelope_script_active: format!(
+            "upload \"{script_name}\" and make it the active script"
+        ),
+        if_envelope_wrapper_active: format!(
+            "upload \"{script_name}\"; \"{wrapper}\" stays active and still runs the earlier \
+             script first"
+        ),
+        if_another_script_active: other,
+        deletes_scripts: false,
+    }
+}
+
 /// Pure dry-run plan: describes what `publish_script` would do against the
 /// resolved endpoint, without opening a socket.
 ///
@@ -286,6 +512,7 @@ pub struct PublishPlan {
     pub would_upload: bool,
     pub confirm_required: bool,
     pub network_used: bool,
+    pub activation: ActivationPlan,
 }
 
 /// Build a dry-run plan from already-resolved inputs. Network-free.
@@ -298,6 +525,7 @@ pub fn build_plan(
     script: String,
     skipped: Vec<String>,
     exported_count: usize,
+    existing: &ExistingScript,
 ) -> PublishPlan {
     PublishPlan {
         status: "dry_run",
@@ -312,24 +540,44 @@ pub fn build_plan(
         would_upload: true,
         confirm_required: true,
         network_used: false,
+        activation: activation_plan(script_name, existing),
     }
 }
 
-/// Result of a successful confirmed `publish_script`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PublishResult {
-    pub status: &'static str,
-    pub mode: &'static str,
-    pub account_id: String,
-    pub host: String,
-    pub port: u16,
-    pub script_name: String,
-    pub exported_count: usize,
-    pub skipped: Vec<String>,
-    pub server_implementation: Option<String>,
+/// What a confirmed publish did on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishOutcome {
+    pub activation: Activation,
+    /// The script now active: Envelope's script or its wrapper.
     pub active_script: String,
-    pub starttls_used: bool,
-    pub sasl_mechanism: &'static str,
+    pub include_supported: bool,
+    pub server_implementation: Option<String>,
+}
+
+/// A publish attempt: the server's scripts as listed before anything
+/// changed, and the result. `scripts_before` is `None` when the session
+/// failed before `LISTSCRIPTS` answered.
+#[derive(Debug)]
+pub struct PublishAttempt {
+    pub scripts_before: Option<Vec<ServerScript>>,
+    pub result: Result<PublishOutcome, ManageSieveError>,
+}
+
+impl PublishAttempt {
+    fn failed(error: ManageSieveError) -> Self {
+        PublishAttempt {
+            scripts_before: None,
+            result: Err(error),
+        }
+    }
+}
+
+/// What `LISTSCRIPTS` and the capability banner report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub scripts: Vec<ServerScript>,
+    pub include_supported: bool,
+    pub server_implementation: Option<String>,
 }
 
 /// Hard upper bound on a single script the CLI will publish. Migadu's
@@ -338,43 +586,237 @@ pub struct PublishResult {
 /// not a Sieve script.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 
+/// Longest script name read from a `LISTSCRIPTS` literal.
+const MAX_SCRIPT_NAME_BYTES: usize = 1024;
+
 /// Publish a Sieve script to ManageSieve at `host:port` for the given
 /// account. Performs:
 ///
-/// 1. TCP connect
-/// 2. Read plaintext capability banner
-/// 3. `STARTTLS` (mandatory — refuses to send credentials otherwise)
-/// 4. TLS handshake using the system root store
-/// 5. Re-read capability banner
-/// 6. `AUTHENTICATE "PLAIN" "<base64>"`
-/// 7. `PUTSCRIPT "<name>" {N+}\r\n<bytes>`
-/// 8. `SETACTIVE "<name>"`
-/// 9. `LOGOUT`
+/// 1. TCP connect and read the plaintext capability banner
+/// 2. `STARTTLS` (mandatory — refuses to send credentials otherwise), the
+///    TLS handshake using the system root store, and the re-issued banner
+/// 3. `AUTHENTICATE "PLAIN" "<base64>"`
+/// 4. [`publish_on_session`]: `LISTSCRIPTS`, then `PUTSCRIPT` and
+///    `SETACTIVE` as [`decide_activation`] allows
+/// 5. `LOGOUT`
 ///
-/// The protocol transcript is never logged. Returns a [`PublishResult`]
-/// with stable fields safe for JSON output.
-#[allow(clippy::too_many_arguments)]
+/// The protocol transcript is never logged.
 pub async fn publish_script(
     account: &AccountWithCredentials,
     host: &str,
     port: u16,
     script_name: &str,
     script: &str,
-    exported_count: usize,
-    skipped: Vec<String>,
+    existing: &ExistingScript,
     timeout: Duration,
-) -> Result<PublishResult, ManageSieveError> {
+) -> PublishAttempt {
     if script.len() > MAX_SCRIPT_BYTES {
-        return Err(ManageSieveError::Protocol(format!(
+        return PublishAttempt::failed(ManageSieveError::Protocol(format!(
             "script is {} bytes; refusing to upload more than {} bytes",
             script.len(),
             MAX_SCRIPT_BYTES
         )));
     }
-    let _quoted_name = sieve_quoted(script_name).ok_or_else(|| {
-        ManageSieveError::Protocol("script name must not contain CR or LF".to_string())
-    })?;
+    if sieve_quoted(script_name).is_none() {
+        return PublishAttempt::failed(ManageSieveError::Protocol(
+            "script name must not contain CR or LF".to_string(),
+        ));
+    }
+    let (mut session, caps) = match connect_authenticated(account, host, port, timeout).await {
+        Ok(connected) => connected,
+        Err(e) => return PublishAttempt::failed(e),
+    };
+    let attempt =
+        publish_on_session(&mut session, &caps, script_name, script, existing, timeout).await;
+    logout(&mut session, timeout).await;
+    attempt
+}
 
+/// Publish on an authenticated session. Lists the server's scripts first
+/// and uploads nothing when [`decide_activation`] refuses. Writes only
+/// `script_name` and its wrapper; never deletes or renames a script.
+pub async fn publish_on_session<S>(
+    stream: &mut BufStream<S>,
+    caps: &Capabilities,
+    script_name: &str,
+    script: &str,
+    existing: &ExistingScript,
+    timeout: Duration,
+) -> PublishAttempt
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let scripts = match list_scripts(stream, timeout).await {
+        Ok(scripts) => scripts,
+        Err(e) => return PublishAttempt::failed(e),
+    };
+    let include_supported = caps.supports_extension("include");
+    let result = apply_activation(
+        stream,
+        &scripts,
+        include_supported,
+        script_name,
+        script,
+        existing,
+        timeout,
+    )
+    .await
+    .map(|activation| PublishOutcome {
+        active_script: activation.active_script(script_name),
+        activation,
+        include_supported,
+        server_implementation: caps.implementation.clone(),
+    });
+    PublishAttempt {
+        scripts_before: Some(scripts),
+        result,
+    }
+}
+
+async fn apply_activation<S>(
+    stream: &mut BufStream<S>,
+    scripts: &[ServerScript],
+    include_supported: bool,
+    script_name: &str,
+    script: &str,
+    existing: &ExistingScript,
+    timeout: Duration,
+) -> Result<Activation, ManageSieveError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let activation = decide_activation(scripts, include_supported, script_name, existing)
+        .map_err(ManageSieveError::ActiveScriptConflict)?;
+    put_script(stream, script_name, script, timeout).await?;
+    match &activation {
+        Activation::Activate | Activation::ReplaceActive { .. } => {
+            set_active(stream, script_name, timeout).await?;
+        }
+        Activation::KeepWrapper => {}
+        Activation::WrapExisting { previous } => {
+            let wrapper = wrapper_script_name(script_name);
+            put_script(
+                stream,
+                &wrapper,
+                &wrapper_script(previous, script_name),
+                timeout,
+            )
+            .await?;
+            set_active(stream, &wrapper, timeout).await?;
+        }
+    }
+    Ok(activation)
+}
+
+/// Read the server's scripts. After authenticating, this sends only
+/// `LISTSCRIPTS` and `LOGOUT`; nothing on the server changes.
+pub async fn read_status(
+    account: &AccountWithCredentials,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<ServerStatus, ManageSieveError> {
+    let (mut session, caps) = connect_authenticated(account, host, port, timeout).await?;
+    let scripts = list_scripts(&mut session, timeout).await;
+    logout(&mut session, timeout).await;
+    Ok(ServerStatus {
+        scripts: scripts?,
+        include_supported: caps.supports_extension("include"),
+        server_implementation: caps.implementation,
+    })
+}
+
+/// `LISTSCRIPTS` on an authenticated session. Each name arrives as a quoted
+/// string or a literal (RFC 5804 §2.7); the active one carries `ACTIVE`.
+pub async fn list_scripts<S>(
+    stream: &mut BufStream<S>,
+    timeout: Duration,
+) -> Result<Vec<ServerScript>, ManageSieveError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    write_line(stream, b"LISTSCRIPTS\r\n", timeout).await?;
+    let mut scripts = Vec::new();
+    loop {
+        let line = read_line(stream, timeout).await?;
+        if let Some((status, reason)) = classify_response(&line) {
+            return match status {
+                ResponseStatus::Ok => Ok(scripts),
+                ResponseStatus::No => {
+                    Err(ManageSieveError::Refused(format!("LISTSCRIPTS: {reason}")))
+                }
+                ResponseStatus::Bye => Err(ManageSieveError::Refused(format!(
+                    "LISTSCRIPTS BYE: {reason}"
+                ))),
+            };
+        }
+        let (name, rest) = match literal_length(&line) {
+            Some(len) if len > MAX_SCRIPT_NAME_BYTES => {
+                return Err(ManageSieveError::Protocol(format!(
+                    "LISTSCRIPTS sent a {len}-byte script name"
+                )));
+            }
+            Some(len) => {
+                let bytes = read_exact_bytes(stream, len, timeout).await?;
+                let name = String::from_utf8(bytes).map_err(|_| {
+                    ManageSieveError::Protocol("LISTSCRIPTS sent a name that is not UTF-8".into())
+                })?;
+                (name, read_line(stream, timeout).await?)
+            }
+            None => {
+                let mut tokens = SieveTokenizer::new(line.trim_end_matches(['\r', '\n']));
+                let name = tokens.next_quoted().ok_or_else(|| {
+                    ManageSieveError::Protocol(format!(
+                        "unexpected LISTSCRIPTS line: {}",
+                        line.trim_end()
+                    ))
+                })?;
+                (name, tokens.rest.to_string())
+            }
+        };
+        // `read_line` decodes lossily; a replaced byte means the name we
+        // hold is not the server's, and the wrapper must include the real one.
+        if name.contains(char::REPLACEMENT_CHARACTER) {
+            return Err(ManageSieveError::Protocol(
+                "LISTSCRIPTS sent a name that is not UTF-8".into(),
+            ));
+        }
+        let active = match rest.trim() {
+            "" => false,
+            word if word.eq_ignore_ascii_case("ACTIVE") => true,
+            other => {
+                return Err(ManageSieveError::Protocol(format!(
+                    "unexpected LISTSCRIPTS suffix: {other}"
+                )));
+            }
+        };
+        scripts.push(ServerScript { name, active });
+    }
+}
+
+/// `{N}` or `{N+}` on its own line: a literal of N bytes follows.
+fn literal_length(line: &str) -> Option<usize> {
+    let inner = line
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix('{')?
+        .strip_suffix('}')?;
+    inner.strip_suffix('+').unwrap_or(inner).parse().ok()
+}
+
+/// Connect, `STARTTLS`, and authenticate with SASL PLAIN. Returns the
+/// session and the capabilities advertised after `STARTTLS`.
+async fn connect_authenticated(
+    account: &AccountWithCredentials,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<
+    (
+        BufStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        Capabilities,
+    ),
+    ManageSieveError,
+> {
     let tcp = time::timeout(timeout, TcpStream::connect((host, port)))
         .await
         .map_err(|_| ManageSieveError::Connection(format!("timeout connecting to {host}:{port}")))?
@@ -409,45 +851,53 @@ pub async fn publish_script(
     let auth_cmd = format!("AUTHENTICATE \"PLAIN\" \"{initial}\"\r\n");
     write_line(&mut tls, auth_cmd.as_bytes(), timeout).await?;
     match read_final(&mut tls, timeout).await? {
-        (ResponseStatus::Ok, _) => {}
-        (ResponseStatus::No, _) => return Err(ManageSieveError::Auth),
-        (ResponseStatus::Bye, reason) => {
-            return Err(ManageSieveError::Refused(format!(
-                "BYE after AUTH: {reason}"
-            )));
-        }
+        (ResponseStatus::Ok, _) => Ok((tls, tls_caps)),
+        (ResponseStatus::No, _) => Err(ManageSieveError::Auth),
+        (ResponseStatus::Bye, reason) => Err(ManageSieveError::Refused(format!(
+            "BYE after AUTH: {reason}"
+        ))),
     }
+}
 
-    let putscript_header = format!("PUTSCRIPT \"{}\" ", escape_quoted_inner(script_name));
-    let mut framed = Vec::with_capacity(putscript_header.len() + script.len() + 16);
-    framed.extend_from_slice(putscript_header.as_bytes());
+async fn put_script<S>(
+    stream: &mut BufStream<S>,
+    name: &str,
+    script: &str,
+    timeout: Duration,
+) -> Result<(), ManageSieveError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let header = format!("PUTSCRIPT \"{}\" ", escape_quoted_inner(name));
+    let mut framed = Vec::with_capacity(header.len() + script.len() + 16);
+    framed.extend_from_slice(header.as_bytes());
     framed.extend_from_slice(&sieve_literal(script.as_bytes()));
     framed.extend_from_slice(b"\r\n");
-    write_line(&mut tls, &framed, timeout).await?;
-    expect_ok(&mut tls, "PUTSCRIPT", timeout).await?;
+    write_line(stream, &framed, timeout).await?;
+    expect_ok(stream, "PUTSCRIPT", timeout).await
+}
 
-    let setactive = format!("SETACTIVE \"{}\"\r\n", escape_quoted_inner(script_name));
-    write_line(&mut tls, setactive.as_bytes(), timeout).await?;
-    expect_ok(&mut tls, "SETACTIVE", timeout).await?;
+async fn set_active<S>(
+    stream: &mut BufStream<S>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), ManageSieveError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let command = format!("SETACTIVE \"{}\"\r\n", escape_quoted_inner(name));
+    write_line(stream, command.as_bytes(), timeout).await?;
+    expect_ok(stream, "SETACTIVE", timeout).await
+}
 
-    write_line(&mut tls, b"LOGOUT\r\n", timeout).await?;
-    // LOGOUT is best-effort; ignore parse errors after we sent the bytes.
-    let _ = time::timeout(timeout, read_final(&mut tls, timeout)).await;
-
-    Ok(PublishResult {
-        status: "published",
-        mode: "confirmed",
-        account_id: account.account.id.clone(),
-        host: host.to_string(),
-        port,
-        script_name: script_name.to_string(),
-        exported_count,
-        skipped,
-        server_implementation: tls_caps.implementation,
-        active_script: script_name.to_string(),
-        starttls_used: true,
-        sasl_mechanism: "PLAIN",
-    })
+/// Best effort: by now the work is done or has already failed.
+async fn logout<S>(stream: &mut BufStream<S>, timeout: Duration)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if write_line(stream, b"LOGOUT\r\n", timeout).await.is_ok() {
+        let _ = read_final(stream, timeout).await;
+    }
 }
 
 fn escape_quoted_inner(value: &str) -> String {
@@ -508,6 +958,22 @@ where
     .map_err(|_| ManageSieveError::Connection("timeout reading from ManageSieve".to_string()))?
     .map_err(|e| ManageSieveError::Connection(format!("read: {e}")))
     .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+}
+
+async fn read_exact_bytes<S>(
+    stream: &mut BufStream<S>,
+    len: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, ManageSieveError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; len];
+    time::timeout(timeout, stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| ManageSieveError::Connection("timeout reading from ManageSieve".to_string()))?
+        .map_err(|e| ManageSieveError::Connection(format!("read: {e}")))?;
+    Ok(buf)
 }
 
 async fn read_capabilities<S>(
@@ -763,6 +1229,7 @@ mod tests {
             "require [\"fileinto\"];\n".to_string(),
             vec!["TagOnly".to_string()],
             2,
+            &ExistingScript::Refuse,
         );
         assert_eq!(plan.status, "dry_run");
         assert_eq!(plan.mode, "dry-run");
@@ -787,6 +1254,7 @@ mod tests {
             "stop;\n".to_string(),
             vec![],
             0,
+            &ExistingScript::Refuse,
         );
         let value = serde_json::to_value(&plan).unwrap();
         for key in [
@@ -802,6 +1270,7 @@ mod tests {
             "would_upload",
             "confirm_required",
             "network_used",
+            "activation",
         ] {
             assert!(
                 value.get(key).is_some(),
@@ -818,5 +1287,453 @@ mod tests {
         assert_eq!(escape_quoted_inner(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape_quoted_inner(r"a\b"), r"a\\b");
         assert_eq!(escape_quoted_inner(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
+    // ── Publishing against a fake ManageSieve server ──────────────────
+
+    use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
+
+    const T: Duration = Duration::from_secs(5);
+    const SCRIPT: &str = "require [\"fileinto\"];\n\nif address :is \"from\" \"a@b.example\" {\n    fileinto \"Archive\";\n    stop;\n}\n";
+
+    /// What the fake server received, and the scripts it holds at the end.
+    #[derive(Debug, Default)]
+    struct ServerLog {
+        /// Each command's verb and its first quoted argument, in order.
+        commands: Vec<String>,
+        /// Uploaded script bodies, by name.
+        uploads: Vec<(String, String)>,
+        scripts: Vec<ServerScript>,
+    }
+
+    /// A ManageSieve server past STARTTLS and AUTHENTICATE, at the far end
+    /// of an in-memory pipe. It answers LISTSCRIPTS, PUTSCRIPT and SETACTIVE
+    /// and refuses everything else.
+    async fn fake_server(stream: DuplexStream, scripts: Vec<ServerScript>) -> ServerLog {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let mut log = ServerLog {
+            scripts,
+            ..ServerLog::default()
+        };
+        loop {
+            let mut line = String::new();
+            if read.read_line(&mut line).await.unwrap() == 0 {
+                return log;
+            }
+            let line = line.trim_end().to_string();
+            let (verb, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let name = rest.split('"').nth(1).unwrap_or("").to_string();
+            log.commands
+                .push(format!("{verb} {name}").trim_end().to_string());
+            let reply = match verb {
+                "LISTSCRIPTS" => {
+                    let mut out = String::new();
+                    for s in &log.scripts {
+                        let active = if s.active { " ACTIVE" } else { "" };
+                        out.push_str(&format!("\"{}\"{active}\r\n", s.name));
+                    }
+                    out + "OK \"Listscripts completed.\"\r\n"
+                }
+                "PUTSCRIPT" => {
+                    let len: usize = rest
+                        .rsplit('{')
+                        .next()
+                        .unwrap()
+                        .trim_end_matches("+}")
+                        .parse()
+                        .unwrap();
+                    let mut body = vec![0u8; len];
+                    read.read_exact(&mut body).await.unwrap();
+                    let mut crlf = String::new();
+                    read.read_line(&mut crlf).await.unwrap();
+                    if !log.scripts.iter().any(|s| s.name == name) {
+                        log.scripts.push(ServerScript {
+                            name: name.clone(),
+                            active: false,
+                        });
+                    }
+                    log.uploads.push((name, String::from_utf8(body).unwrap()));
+                    "OK\r\n".to_string()
+                }
+                "SETACTIVE" => {
+                    for s in &mut log.scripts {
+                        s.active = s.name == name;
+                    }
+                    "OK\r\n".to_string()
+                }
+                _ => "NO \"not supported here\"\r\n".to_string(),
+            };
+            write.write_all(reply.as_bytes()).await.unwrap();
+        }
+    }
+
+    fn server_scripts(list: &[(&str, bool)]) -> Vec<ServerScript> {
+        list.iter()
+            .map(|(name, active)| ServerScript {
+                name: name.to_string(),
+                active: *active,
+            })
+            .collect()
+    }
+
+    fn caps(include: bool) -> Capabilities {
+        let mut sieve_extensions = vec!["fileinto".to_string(), "reject".to_string()];
+        if include {
+            sieve_extensions.push("include".to_string());
+        }
+        Capabilities {
+            implementation: Some("Fake Pigeonhole".to_string()),
+            sieve_extensions,
+            ..Capabilities::default()
+        }
+    }
+
+    async fn publish_against(
+        scripts: Vec<ServerScript>,
+        include: bool,
+        existing: ExistingScript,
+    ) -> (PublishAttempt, ServerLog) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(fake_server(server, scripts));
+        let mut stream = BufStream::new(client);
+        let attempt = publish_on_session(
+            &mut stream,
+            &caps(include),
+            "envelope-rules",
+            SCRIPT,
+            &existing,
+            T,
+        )
+        .await;
+        drop(stream);
+        (attempt, server.await.unwrap())
+    }
+
+    /// Envelope only lists, uploads and activates. It never deletes or
+    /// renames a script, and the user's script is still on the server.
+    fn assert_kept(log: &ServerLog, user_script: &str) {
+        for command in &log.commands {
+            let verb = command.split(' ').next().unwrap();
+            assert!(
+                matches!(verb, "LISTSCRIPTS" | "PUTSCRIPT" | "SETACTIVE"),
+                "unexpected {command}: {:?}",
+                log.commands
+            );
+        }
+        assert!(
+            log.scripts.iter().any(|s| s.name == user_script),
+            "{user_script} must stay on the server: {:?}",
+            log.scripts
+        );
+    }
+
+    fn conflict(attempt: PublishAttempt) -> ActiveScriptConflict {
+        match attempt.result {
+            Err(ManageSieveError::ActiveScriptConflict(c)) => c,
+            other => panic!("expected an active-script refusal, got {other:?}"),
+        }
+    }
+
+    fn active(log: &ServerLog) -> Option<&str> {
+        log.scripts
+            .iter()
+            .find(|s| s.active)
+            .map(|s| s.name.as_str())
+    }
+
+    #[tokio::test]
+    async fn another_active_script_is_refused_before_anything_is_uploaded() {
+        let scripts = server_scripts(&[("roundcube", true), ("vacation", false)]);
+        let (attempt, log) = publish_against(scripts.clone(), true, ExistingScript::Refuse).await;
+
+        assert_eq!(attempt.scripts_before.as_ref(), Some(&scripts));
+        let c = conflict(attempt);
+        assert_eq!(c.active_script, "roundcube");
+        assert!(c.include_supported);
+        assert!(
+            c.message
+                .contains("\"roundcube\" is the active Sieve script")
+                && c.message.contains("would switch it off")
+                && c.message.contains("--keep-existing")
+                && c.message.contains("--replace-active \"roundcube\""),
+            "{}",
+            c.message
+        );
+        assert_eq!(log.commands, ["LISTSCRIPTS"]);
+        assert_eq!(active(&log), Some("roundcube"));
+        assert_kept(&log, "roundcube");
+    }
+
+    #[tokio::test]
+    async fn keep_existing_wraps_the_active_script_when_the_server_supports_include() {
+        let (attempt, log) = publish_against(
+            server_scripts(&[("roundcube", true), ("vacation", false)]),
+            true,
+            ExistingScript::Keep,
+        )
+        .await;
+
+        let outcome = attempt.result.expect("publish");
+        assert_eq!(
+            outcome.activation,
+            Activation::WrapExisting {
+                previous: "roundcube".to_string()
+            }
+        );
+        assert_eq!(outcome.active_script, "envelope-rules-wrapper");
+        assert_eq!(
+            log.commands,
+            [
+                "LISTSCRIPTS",
+                "PUTSCRIPT envelope-rules",
+                "PUTSCRIPT envelope-rules-wrapper",
+                "SETACTIVE envelope-rules-wrapper",
+            ]
+        );
+        assert_eq!(
+            log.uploads[0],
+            ("envelope-rules".to_string(), SCRIPT.to_string())
+        );
+        let wrapper = &log.uploads[1].1;
+        assert_eq!(wrapper, &wrapper_script("roundcube", "envelope-rules"));
+        let theirs = wrapper
+            .find("include :personal :optional \"roundcube\";")
+            .expect("wrapper includes the user's script");
+        let ours = wrapper
+            .find("include :personal \"envelope-rules\";")
+            .expect("wrapper includes Envelope's script");
+        assert!(theirs < ours, "the user's script runs first:\n{wrapper}");
+        assert!(wrapper.contains("require [\"include\"];"));
+        assert_eq!(active(&log), Some("envelope-rules-wrapper"));
+        assert_kept(&log, "roundcube");
+        assert_kept(&log, "vacation");
+    }
+
+    #[tokio::test]
+    async fn without_include_keep_existing_is_refused() {
+        let (attempt, log) = publish_against(
+            server_scripts(&[("roundcube", true)]),
+            false,
+            ExistingScript::Keep,
+        )
+        .await;
+
+        let c = conflict(attempt);
+        assert_eq!(c.active_script, "roundcube");
+        assert!(!c.include_supported);
+        assert!(
+            c.message.contains("does not support")
+                && c.message.contains("--replace-active \"roundcube\""),
+            "{}",
+            c.message
+        );
+        assert_eq!(log.commands, ["LISTSCRIPTS"]);
+        assert_eq!(active(&log), Some("roundcube"));
+    }
+
+    #[tokio::test]
+    async fn without_include_the_default_refusal_offers_only_replace_active() {
+        let (attempt, _log) = publish_against(
+            server_scripts(&[("roundcube", true)]),
+            false,
+            ExistingScript::Refuse,
+        )
+        .await;
+        let c = conflict(attempt);
+        assert!(!c.message.contains("--keep-existing"), "{}", c.message);
+        assert!(c.message.contains("--replace-active \"roundcube\""));
+    }
+
+    #[tokio::test]
+    async fn replace_active_switches_off_only_the_named_script_and_keeps_it() {
+        let (attempt, log) = publish_against(
+            server_scripts(&[("roundcube", true)]),
+            false,
+            ExistingScript::Replace("roundcube".to_string()),
+        )
+        .await;
+
+        let outcome = attempt.result.expect("publish");
+        assert_eq!(
+            outcome.activation,
+            Activation::ReplaceActive {
+                previous: "roundcube".to_string()
+            }
+        );
+        assert_eq!(outcome.active_script, "envelope-rules");
+        assert_eq!(
+            log.commands,
+            [
+                "LISTSCRIPTS",
+                "PUTSCRIPT envelope-rules",
+                "SETACTIVE envelope-rules"
+            ]
+        );
+        assert_eq!(active(&log), Some("envelope-rules"));
+        assert_kept(&log, "roundcube");
+    }
+
+    #[tokio::test]
+    async fn replace_active_naming_a_different_script_is_refused() {
+        let (attempt, log) = publish_against(
+            server_scripts(&[("roundcube", true)]),
+            true,
+            ExistingScript::Replace("old-filters".to_string()),
+        )
+        .await;
+
+        let c = conflict(attempt);
+        assert!(
+            c.message.contains("\"old-filters\"") && c.message.contains("\"roundcube\""),
+            "{}",
+            c.message
+        );
+        assert_eq!(log.commands, ["LISTSCRIPTS"]);
+        assert_eq!(active(&log), Some("roundcube"));
+    }
+
+    #[tokio::test]
+    async fn republishing_under_the_wrapper_only_updates_envelopes_script() {
+        let (attempt, log) = publish_against(
+            server_scripts(&[
+                ("roundcube", false),
+                ("envelope-rules", false),
+                ("envelope-rules-wrapper", true),
+            ]),
+            true,
+            ExistingScript::Refuse,
+        )
+        .await;
+
+        let outcome = attempt.result.expect("publish");
+        assert_eq!(outcome.activation, Activation::KeepWrapper);
+        assert_eq!(outcome.active_script, "envelope-rules-wrapper");
+        assert_eq!(log.commands, ["LISTSCRIPTS", "PUTSCRIPT envelope-rules"]);
+        assert_eq!(active(&log), Some("envelope-rules-wrapper"));
+        assert_kept(&log, "roundcube");
+    }
+
+    #[tokio::test]
+    async fn no_active_script_or_envelopes_own_is_simply_activated() {
+        for (scripts, existing) in [
+            (server_scripts(&[]), ExistingScript::Refuse),
+            (
+                server_scripts(&[("roundcube", false)]),
+                ExistingScript::Refuse,
+            ),
+            (
+                server_scripts(&[("envelope-rules", true)]),
+                ExistingScript::Refuse,
+            ),
+            (
+                server_scripts(&[("envelope-rules", true)]),
+                ExistingScript::Replace("roundcube".to_string()),
+            ),
+        ] {
+            let (attempt, log) = publish_against(scripts.clone(), true, existing).await;
+            let outcome = attempt.result.expect("publish");
+            assert_eq!(outcome.activation, Activation::Activate, "{scripts:?}");
+            assert_eq!(
+                log.commands,
+                [
+                    "LISTSCRIPTS",
+                    "PUTSCRIPT envelope-rules",
+                    "SETACTIVE envelope-rules"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_scripts_reads_quoted_literal_and_utf8_names() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = BufReader::new(read);
+            let mut command = String::new();
+            read.read_line(&mut command).await.unwrap();
+            write
+                .write_all(
+                    "\"summer_script\"\r\n{13}\r\nclever\"script\r\n\"R\u{e8}gles \\\"perso\\\"\" ACTIVE\r\n{6+}\r\nwinter\r\nOK \"Listscripts completed.\"\r\n"
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            command
+        });
+        let mut stream = BufStream::new(client);
+
+        let scripts = list_scripts(&mut stream, T).await.unwrap();
+
+        assert_eq!(server.await.unwrap(), "LISTSCRIPTS\r\n");
+        assert_eq!(
+            scripts,
+            server_scripts(&[
+                ("summer_script", false),
+                ("clever\"script", false),
+                ("R\u{e8}gles \"perso\"", true),
+                ("winter", false),
+            ])
+        );
+    }
+
+    #[test]
+    fn wrapper_escapes_quotes_in_script_names() {
+        let wrapper = wrapper_script("my \"old\" rules", "envelope-rules");
+        assert!(
+            wrapper.contains(r#"include :personal :optional "my \"old\" rules";"#),
+            "{wrapper}"
+        );
+    }
+
+    #[test]
+    fn dry_run_plan_shows_what_happens_in_each_server_state() {
+        let refuse = activation_plan("envelope-rules", &ExistingScript::Refuse);
+        assert_eq!(refuse.on_another_active_script, "refuse");
+        assert!(refuse.if_another_script_active.starts_with("refuse"));
+        assert!(
+            refuse
+                .if_no_script_or_envelope_script_active
+                .contains("make it the active script")
+        );
+        assert!(
+            refuse
+                .if_envelope_wrapper_active
+                .contains("envelope-rules-wrapper")
+        );
+
+        let keep = activation_plan("envelope-rules", &ExistingScript::Keep);
+        assert_eq!(keep.on_another_active_script, "keep_existing");
+        assert!(
+            keep.if_another_script_active.contains("Sieve include")
+                && keep
+                    .if_another_script_active
+                    .contains("\"envelope-rules-wrapper\"")
+                && keep
+                    .if_another_script_active
+                    .contains("Without include support: refuse"),
+            "{}",
+            keep.if_another_script_active
+        );
+
+        let replace = activation_plan(
+            "envelope-rules",
+            &ExistingScript::Replace("roundcube".to_string()),
+        );
+        assert_eq!(replace.on_another_active_script, "replace_active");
+        assert!(
+            replace
+                .if_another_script_active
+                .contains("switch \"roundcube\" off (it stays on the server)")
+                && replace
+                    .if_another_script_active
+                    .contains("Any other script: refuse"),
+            "{}",
+            replace.if_another_script_active
+        );
+
+        for plan in [refuse, keep, replace] {
+            assert!(!plan.deletes_scripts);
+        }
     }
 }

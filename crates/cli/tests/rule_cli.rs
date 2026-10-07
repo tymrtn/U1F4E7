@@ -107,3 +107,101 @@ fn rule_create_without_match_flags_is_refused_and_stores_nothing() {
     );
     assert_eq!(stored_rule_count(home), 1);
 }
+
+/// A dry run never connects, so it shows what a confirmed publish does in
+/// each state the server can be in, for the option the operator chose.
+#[test]
+fn publish_sieve_dry_run_shows_what_happens_to_an_active_script() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let created = run_cli(
+        home,
+        &[
+            "rule",
+            "create",
+            "--name",
+            "archive",
+            "--match-from",
+            "*@sender.example",
+            "--action",
+            "move=Archive",
+        ],
+    );
+    assert!(created.status.success());
+
+    let plan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec!["--json", "rule", "publish-sieve"];
+        args.extend_from_slice(extra);
+        let out = run_cli(home, &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan: serde_json::Value = serde_json::from_slice(&out.stdout).expect("plan JSON");
+        assert_eq!(plan["status"], "dry_run");
+        assert_eq!(plan["network_used"], false);
+        assert_eq!(plan["exported_count"], 1);
+        assert_eq!(plan["activation"]["deletes_scripts"], false);
+        plan["activation"].clone()
+    };
+
+    let refuse = plan(&[]);
+    assert_eq!(refuse["on_another_active_script"], "refuse");
+    assert!(
+        refuse["if_another_script_active"]
+            .as_str()
+            .unwrap()
+            .starts_with("refuse and name that script; nothing is uploaded")
+    );
+
+    let keep = plan(&["--keep-existing"]);
+    assert_eq!(keep["on_another_active_script"], "keep_existing");
+    let keep_text = keep["if_another_script_active"].as_str().unwrap();
+    assert!(
+        keep_text.contains("upload \"envelope-rules-wrapper\", which runs that script first")
+            && keep_text.contains("Without include support: refuse"),
+        "{keep_text}"
+    );
+
+    let replace = plan(&["--replace-active", "roundcube"]);
+    assert_eq!(replace["on_another_active_script"], "replace_active");
+    assert!(
+        replace["if_another_script_active"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "if it is \"roundcube\": switch \"roundcube\" off (it stays on the server)"
+            )
+    );
+
+    let text = run_cli(
+        home,
+        &["rule", "publish-sieve", "--replace-active", "roundcube"],
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(text.status.success());
+    assert!(
+        stdout.contains("another script active: if it is \"roundcube\"")
+            && stdout.contains("Envelope never deletes a script on the server."),
+        "{stdout}"
+    );
+
+    let both = run_cli(
+        home,
+        &[
+            "rule",
+            "publish-sieve",
+            "--keep-existing",
+            "--replace-active",
+            "roundcube",
+        ],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+}

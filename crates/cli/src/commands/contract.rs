@@ -110,6 +110,8 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "evidence attachment export --unsafe",
     "rule publish-sieve --host",
     "rule publish-sieve --confirm --host",
+    "rule publish-sieve --confirm --replace-active",
+    "rule sieve-status --host",
     QUARANTINE_SOURCE_COMMANDS,
     "doctor --repair",
     "serve",
@@ -274,7 +276,7 @@ pub fn agent_contract() -> Value {
                     "rules.write": "`envelope rule create`, `rule enable`, `rule disable` and `rule delete`",
                     "rules.webhook": "also needed by `envelope rule create` with a webhook action, and `envelope rule enable` of a rule whose action is a webhook",
                     "rules.batch_ack": "also needed by `envelope rule enable --acknowledge-batch-actions`",
-                    "sieve.publish": "`envelope rule publish-sieve --confirm` to the account's own ManageSieve endpoint; naming another with --host is operator-only",
+                    "sieve.publish": "`envelope rule publish-sieve --confirm` to the account's own ManageSieve endpoint; naming another with --host, or switching off the active script with --replace-active, is operator-only",
                     "watch.webhook": "`envelope watch --webhook <url>` and `envelope watch --deliver`",
                     "unsubscribe": "`envelope unsubscribe --confirm`"
                 },

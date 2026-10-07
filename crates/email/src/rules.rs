@@ -299,6 +299,12 @@ impl Action {
 pub const BATCH_ACTIONS_UNACKNOWLEDGED_REASON: &str = "needs_review: snooze/unsubscribe rule predates unified execution; \
      re-enable with 'envelope rule enable <name> --acknowledge-batch-actions' to let it run";
 
+/// Stable skip reason for a rule the mail server runs from the script
+/// `envelope rule publish-sieve` left active. Running it locally as well
+/// would act on the message twice. Part of the JSON contract: do not reword.
+pub const SERVER_MANAGED_SKIP_REASON: &str = "server_managed: the mail server runs this rule from the published Sieve script, \
+     so Envelope does not run it again; republish after editing it";
+
 /// A rule's action as stored in `rules.action`.
 ///
 /// Legacy and ordinary rows are a bare [`Action`] JSON value. Acknowledging a

@@ -1613,7 +1613,7 @@ enum RuleCmd {
         #[arg(long)]
         account: Option<String>,
         /// Script name on the ManageSieve server
-        #[arg(long, default_value = "envelope-rules")]
+        #[arg(long, default_value = commands::rule::DEFAULT_SIEVE_SCRIPT_NAME)]
         script_name: String,
         /// ManageSieve host override (defaults: sieve.migadu.com for Migadu, else IMAP host)
         #[arg(long)]
@@ -1627,9 +1627,35 @@ enum RuleCmd {
         /// Plan only; render the script and ManageSieve endpoint without uploading
         #[arg(long)]
         dry_run: bool,
-        /// Confirm the mutating upload (PUTSCRIPT + SETACTIVE against the live server)
+        /// Upload to the live server. Lists its scripts first and stops if a script other than Envelope's is active, unless --keep-existing or --replace-active says how to handle it
         #[arg(long)]
         confirm: bool,
+        /// If another script is active on the server, keep it running: upload a
+        /// wrapper that runs it first and then Envelope's rules, and activate the
+        /// wrapper. Needs the server's Sieve include extension
+        #[arg(long, conflicts_with = "replace_active")]
+        keep_existing: bool,
+        /// If SCRIPT is the active script on the server, switch it off and
+        /// activate Envelope's script instead. SCRIPT stays on the server
+        #[arg(long, value_name = "SCRIPT")]
+        replace_active: Option<String>,
+    },
+    /// Show the scripts on the ManageSieve server, which one is active, and
+    /// whether the mail server runs the rules Envelope last published
+    SieveStatus {
+        /// Account ID or email
+        #[arg(long)]
+        account: Option<String>,
+        /// ManageSieve host override (defaults: the last publish's host, else
+        /// sieve.migadu.com for Migadu, else the IMAP host)
+        #[arg(long)]
+        host: Option<String>,
+        /// ManageSieve port override (defaults: the last publish's port, else 4190)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Per-network-phase timeout in seconds (capped at 60)
+        #[arg(long, default_value = "20")]
+        timeout_secs: u64,
     },
 }
 
@@ -2885,6 +2911,8 @@ fn main() {
                 timeout_secs,
                 dry_run,
                 confirm,
+                keep_existing,
+                replace_active,
             } => commands::rule::run_publish_sieve(
                 account.as_deref(),
                 &script_name,
@@ -2893,6 +2921,21 @@ fn main() {
                 timeout_secs,
                 dry_run,
                 confirm,
+                keep_existing,
+                replace_active.as_deref(),
+                cli.json,
+                backend,
+            ),
+            RuleCmd::SieveStatus {
+                account,
+                host,
+                port,
+                timeout_secs,
+            } => commands::rule::run_sieve_status(
+                account.as_deref(),
+                host.as_deref(),
+                port,
+                timeout_secs,
                 cli.json,
                 backend,
             ),
@@ -3498,6 +3541,45 @@ mod tests {
             }
             _ => panic!("expected rule publish-sieve command"),
         }
+    }
+
+    #[test]
+    fn rule_publish_sieve_takes_one_way_to_handle_an_active_script() {
+        let cli = Cli::try_parse_from([
+            "envelope",
+            "rule",
+            "publish-sieve",
+            "--replace-active",
+            "roundcube",
+        ])
+        .expect("--replace-active takes the script name");
+        match cli.command {
+            Commands::Rule {
+                subcommand:
+                    RuleCmd::PublishSieve {
+                        keep_existing,
+                        replace_active,
+                        ..
+                    },
+            } => {
+                assert!(!keep_existing);
+                assert_eq!(replace_active.as_deref(), Some("roundcube"));
+            }
+            _ => panic!("expected rule publish-sieve command"),
+        }
+
+        let both = Cli::try_parse_from([
+            "envelope",
+            "rule",
+            "publish-sieve",
+            "--keep-existing",
+            "--replace-active",
+            "roundcube",
+        ]);
+        assert!(
+            both.is_err(),
+            "--keep-existing and --replace-active conflict"
+        );
     }
 
     #[test]

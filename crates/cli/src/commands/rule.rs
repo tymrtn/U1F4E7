@@ -5,7 +5,11 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use envelope_email_store::credential_store::CredentialBackend;
+use envelope_email_store::sieve_publications::{NewSievePublication, SievePublication};
 use envelope_email_transport::imap;
+use envelope_email_transport::managesieve::{
+    self, Activation, ExistingScript, ManageSieveError, ServerScript,
+};
 use envelope_email_transport::rule_exec::{self, ActionAttribution, ImapRuleMailbox, RunAccount};
 use envelope_email_transport::rules::{self, Action, MessageContext};
 use envelope_email_transport::threat::persist::rule_touches_threat_state;
@@ -484,9 +488,13 @@ pub async fn preview_core(
     let summaries = imap::fetch_inbox(client, folder, limit)
         .await
         .context("failed to fetch messages")?;
-    let (preview_rules, skipped_rules) = rule_exec::split_evaluable_rules(
+    let (local_rules, server_managed) = rule_exec::split_server_managed(
+        db,
+        account_id,
         db.list_rules(account_id).context("failed to list rules")?,
-    );
+    )?;
+    let (preview_rules, mut skipped_rules) = rule_exec::split_evaluable_rules(local_rules);
+    skipped_rules.extend(server_managed);
 
     let total = summaries.len();
     let mut matches: Vec<serde_json::Value> = Vec::new();
@@ -893,6 +901,63 @@ pub fn run_delete(
 mod tests {
     use super::*;
 
+    /// Publish and `sieve-status` both feed what they listed on the server
+    /// through this check.
+    #[test]
+    fn a_listed_server_decides_whether_published_rules_stay_on_the_server() {
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        let rule_ids = vec!["r1".to_string()];
+        db.record_sieve_publication(&NewSievePublication {
+            account_id: "acct",
+            host: "sieve.example.test",
+            port: 4190,
+            script_name: "envelope-rules",
+            script_sha256: "abc",
+            rule_ids: &rule_ids,
+            activation: "wrapped_existing",
+            active_script: "envelope-rules-wrapper",
+            previous_active_script: Some("roundcube"),
+        })
+        .unwrap();
+        let listed = |active: &str| -> Vec<ServerScript> {
+            ["roundcube", "envelope-rules", "envelope-rules-wrapper"]
+                .iter()
+                .map(|name| ServerScript {
+                    name: name.to_string(),
+                    active: *name == active,
+                })
+                .collect()
+        };
+        let sync = |host: &str, active: &str| {
+            let record = db.get_sieve_publication("acct").unwrap();
+            sync_server_active(&db, record.as_ref(), host, 4190, &listed(active)).unwrap()
+        };
+
+        assert_eq!(
+            sync("sieve.example.test", "envelope-rules-wrapper"),
+            Some(true)
+        );
+        assert_eq!(db.server_managed_rule_ids("acct").unwrap().len(), 1);
+
+        // Someone made their own script active again in the provider's UI.
+        assert_eq!(sync("sieve.example.test", "roundcube"), Some(false));
+        assert!(db.server_managed_rule_ids("acct").unwrap().is_empty());
+        let record = db.get_sieve_publication("acct").unwrap().unwrap();
+        assert!(
+            handed_back_note(&record).contains("runs the 1 rule(s) it published locally again")
+        );
+
+        // Another server's listing says nothing about this one.
+        assert_eq!(sync("other.example.test", "envelope-rules-wrapper"), None);
+        assert!(db.server_managed_rule_ids("acct").unwrap().is_empty());
+
+        assert_eq!(
+            sync("sieve.example.test", "envelope-rules-wrapper"),
+            Some(true)
+        );
+        assert_eq!(db.server_managed_rule_ids("acct").unwrap().len(), 1);
+    }
+
     #[test]
     fn parse_action_move() {
         let a = parse_action("move=Archive").unwrap();
@@ -1145,22 +1210,57 @@ mod tests {
 const MAX_MANAGESIEVE_TIMEOUT_SECS: u64 = 60;
 const MIN_MANAGESIEVE_TIMEOUT_SECS: u64 = 1;
 
+/// The script name `rule publish-sieve` uses unless `--script-name` says
+/// otherwise.
+pub const DEFAULT_SIEVE_SCRIPT_NAME: &str = "envelope-rules";
+
 /// Validate a user-supplied script name. ManageSieve allows quoted strings
 /// containing arbitrary bytes, but Envelope refuses anything that would
 /// require the literal form here — CR/LF/NUL are rejected outright, and
 /// empty names are rejected because Pigeonhole maps them to "the default
 /// script" which is not what an operator passing `--script-name` expects.
-fn validate_script_name(name: &str) -> Result<()> {
+fn validate_script_name(flag: &str, name: &str) -> Result<()> {
     if name.is_empty() {
-        bail!("--script-name must not be empty");
+        bail!("{flag} must not be empty");
     }
     if name.contains(['\r', '\n', '\0']) {
-        bail!("--script-name must not contain control characters");
+        bail!("{flag} must not contain control characters");
     }
     if name.len() > 128 {
-        bail!("--script-name must be 128 characters or fewer");
+        bail!("{flag} must be 128 characters or fewer");
     }
     Ok(())
+}
+
+/// Record whether the script the account's last publish left active still
+/// is, given the scripts just listed on `host:port`. While it is not,
+/// Envelope runs those rules locally again. Returns the recorded state, or
+/// `None` when no publish to this server is on record.
+fn sync_server_active(
+    db: &envelope_email_store::Database,
+    record: Option<&SievePublication>,
+    host: &str,
+    port: u16,
+    scripts: &[ServerScript],
+) -> Result<Option<bool>> {
+    let Some(record) = record.filter(|r| r.host == host && r.port == port) else {
+        return Ok(None);
+    };
+    let active = scripts
+        .iter()
+        .any(|s| s.active && s.name == record.active_script);
+    db.set_sieve_publication_server_active(&record.account_id, active)
+        .context("failed to record whether the published Sieve script is still active")?;
+    Ok(Some(active))
+}
+
+/// Text for a script the last publish left active that is no longer active.
+fn handed_back_note(record: &SievePublication) -> String {
+    format!(
+        "\"{}\" is no longer the active Sieve script, so Envelope runs the {} rule(s) it published locally again.",
+        record.active_script,
+        record.rule_ids.len()
+    )
 }
 
 /// `envelope rule publish-sieve` — render the export and (optionally)
@@ -1168,11 +1268,14 @@ fn validate_script_name(name: &str) -> Result<()> {
 ///
 /// Safety contract:
 /// - When neither `--dry-run` nor `--confirm` is provided, runs in
-///   dry-run mode so the default surface is non-mutating.
+///   dry-run mode so the default surface is non-mutating. A dry run never
+///   connects; it shows what a publish does in each state the server can be in.
 /// - `--confirm` is mandatory before any network upload happens.
-/// - Dry-run JSON includes the resolved endpoint and the generated script
-///   so an operator can diff it against the server's current `envelope-rules`
-///   without exposing credentials.
+/// - A confirmed publish lists the server's scripts first. It refuses to
+///   switch off a script other than Envelope's unless `--keep-existing` or
+///   `--replace-active <name>` says how, and it never deletes a script.
+/// - After a publish the server runs the published rules, and Envelope's
+///   local executor skips them (`server_managed`).
 #[allow(clippy::too_many_arguments)]
 #[tokio::main]
 pub async fn run_publish_sieve(
@@ -1183,14 +1286,25 @@ pub async fn run_publish_sieve(
     timeout_secs: u64,
     dry_run: bool,
     confirm: bool,
+    keep_existing: bool,
+    replace_active: Option<&str>,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
-    validate_script_name(script_name)?;
+    validate_script_name("--script-name", script_name)?;
+    if let Some(name) = replace_active {
+        validate_script_name("--replace-active", name)?;
+    }
 
     if dry_run && confirm {
         bail!("--dry-run and --confirm are mutually exclusive");
     }
+    let existing = match (keep_existing, replace_active) {
+        (true, Some(_)) => bail!("--keep-existing and --replace-active are mutually exclusive"),
+        (true, None) => ExistingScript::Keep,
+        (false, Some(name)) => ExistingScript::Replace(name.to_string()),
+        (false, None) => ExistingScript::Refuse,
+    };
 
     let timeout_secs =
         timeout_secs.clamp(MIN_MANAGESIEVE_TIMEOUT_SECS, MAX_MANAGESIEVE_TIMEOUT_SECS);
@@ -1213,34 +1327,50 @@ pub async fn run_publish_sieve(
     let rules = db
         .list_enabled_rules(&account_id)
         .context("failed to list rules")?;
-    let (script, skipped) = envelope_email_transport::sieve::export_sieve(&rules);
-    let exported_count = rules.len() - skipped.len();
+    let export = envelope_email_transport::sieve::export_sieve(&rules);
+    let exported_count = export.exported_rule_ids.len();
 
     let (resolved_host, resolved_port) =
-        envelope_email_transport::managesieve::resolve_sieve_endpoint(&imap_host, host, port);
+        managesieve::resolve_sieve_endpoint(&imap_host, host, port);
 
     if !confirm {
-        let plan = envelope_email_transport::managesieve::build_plan(
+        let plan = managesieve::build_plan(
             &account_id,
             &resolved_host,
             resolved_port,
             script_name,
-            script,
-            skipped,
+            export.script,
+            export.skipped,
             exported_count,
+            &existing,
         );
         if json {
             let value = ui::with_ui(&plan, ui::rules_ui(&account_id));
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!(
-                "ManageSieve dry-run for {account_id}: would PUTSCRIPT \"{name}\" + SETACTIVE on {host}:{port} ({count} rule(s), {sk} skipped). Rerun with --confirm to upload.",
+                "ManageSieve dry-run for {account_id}: would upload {count} rule(s) as \"{name}\" to {host}:{port} ({sk} skipped). Rerun with --confirm to upload.",
                 name = script_name,
                 host = resolved_host,
                 port = resolved_port,
                 count = exported_count,
                 sk = plan.skipped.len(),
             );
+            println!("Before activating anything, publish lists the scripts on the server. Then:");
+            println!(
+                "  - no script active, or \"{script_name}\" active: {}",
+                plan.activation.if_no_script_or_envelope_script_active
+            );
+            println!(
+                "  - \"{}\" active: {}",
+                managesieve::wrapper_script_name(script_name),
+                plan.activation.if_envelope_wrapper_active
+            );
+            println!(
+                "  - another script active: {}",
+                plan.activation.if_another_script_active
+            );
+            println!("Envelope never deletes a script on the server.");
             if !plan.skipped.is_empty() {
                 eprintln!("Skipped local-only rules: {}", plan.skipped.join(", "));
             }
@@ -1248,7 +1378,14 @@ pub async fn run_publish_sieve(
         return Ok(());
     }
 
-    if exported_count == 0 {
+    // With no exportable rules, upload only to replace a script the server
+    // still runs from an earlier publish. Otherwise those rules keep running
+    // there and stay skipped here.
+    let server_runs_earlier_rules = !db
+        .server_managed_rule_ids(&account_id)
+        .context("failed to read which rules the mail server runs")?
+        .is_empty();
+    if exported_count == 0 && !server_runs_earlier_rules {
         if json {
             println!(
                 "{}",
@@ -1259,15 +1396,15 @@ pub async fn run_publish_sieve(
                     "port": resolved_port,
                     "script_name": script_name,
                     "exported_count": 0,
-                    "skipped": skipped,
+                    "skipped": export.skipped,
                     "network_used": false,
                     "ui": ui::rules_ui(&account_id),
                 })
             );
         } else {
             println!("No exportable rules — nothing to upload to {resolved_host}:{resolved_port}");
-            if !skipped.is_empty() {
-                eprintln!("Skipped local-only rules: {}", skipped.join(", "));
+            if !export.skipped.is_empty() {
+                eprintln!("Skipped local-only rules: {}", export.skipped.join(", "));
             }
         }
         return Ok(());
@@ -1281,37 +1418,331 @@ pub async fn run_publish_sieve(
     };
 
     let timeout = std::time::Duration::from_secs(timeout_secs);
-    let result = envelope_email_transport::managesieve::publish_script(
+    let attempt = managesieve::publish_script(
         &creds,
         &resolved_host,
         resolved_port,
         script_name,
-        &script,
-        exported_count,
-        skipped,
+        &export.script,
+        &existing,
         timeout,
+    )
+    .await;
+
+    let previous = db
+        .get_sieve_publication(&account_id)
+        .context("failed to read the last Sieve publish")?;
+    let still_active = match &attempt.scripts_before {
+        Some(scripts) => sync_server_active(
+            &db,
+            previous.as_ref(),
+            &resolved_host,
+            resolved_port,
+            scripts,
+        )?,
+        None => None,
+    };
+    let handed_back = match (&previous, still_active) {
+        (Some(record), Some(false)) if record.server_active => Some(handed_back_note(record)),
+        _ => None,
+    };
+
+    let outcome = match attempt.result {
+        Ok(outcome) => outcome,
+        Err(ManageSieveError::ActiveScriptConflict(conflict)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "refused",
+                        "error": {
+                            "code": "active_script_conflict",
+                            "reason": conflict.message,
+                        },
+                        "account_id": account_id,
+                        "host": resolved_host,
+                        "port": resolved_port,
+                        "script_name": script_name,
+                        "active_script": conflict.active_script,
+                        "include_supported": conflict.include_supported,
+                        "uploaded": false,
+                        "envelope_script_active": still_active,
+                        "network_used": true,
+                    })
+                );
+            }
+            if let Some(note) = &handed_back {
+                eprintln!("{note}");
+            }
+            bail!("{} Nothing was uploaded.", conflict.message);
+        }
+        Err(e) => {
+            if let Some(note) = &handed_back {
+                eprintln!("{note}");
+            }
+            bail!("{e}");
+        }
+    };
+
+    let script_sha256 = envelope_email_transport::backup::sha256_hex(export.script.as_bytes());
+    // A republish that keeps the same arrangement keeps the name of the
+    // user's script that the wrapper runs, or that was switched off.
+    let previous_active_script = outcome
+        .activation
+        .previous()
+        .map(str::to_string)
+        .or_else(|| {
+            previous
+                .as_ref()
+                .filter(|r| {
+                    r.host == resolved_host
+                        && r.port == resolved_port
+                        && r.active_script == outcome.active_script
+                })
+                .and_then(|r| r.previous_active_script.clone())
+        });
+    db.record_sieve_publication(&NewSievePublication {
+        account_id: &account_id,
+        host: &resolved_host,
+        port: resolved_port,
+        script_name,
+        script_sha256: &script_sha256,
+        rule_ids: &export.exported_rule_ids,
+        activation: outcome.activation.kind(),
+        active_script: &outcome.active_script,
+        previous_active_script: previous_active_script.as_deref(),
+    })
+    .context(
+        "the mail server now runs the published rules, but Envelope could not record which ones, \
+         so its local rule runs may repeat or miss them; rerun `envelope rule publish-sieve --confirm`",
+    )?;
+
+    if json {
+        let value = serde_json::json!({
+            "status": "published",
+            "mode": "confirmed",
+            "account_id": account_id,
+            "host": resolved_host,
+            "port": resolved_port,
+            "script_name": script_name,
+            "exported_count": exported_count,
+            "skipped": export.skipped,
+            "server_implementation": outcome.server_implementation,
+            "active_script": outcome.active_script,
+            "activation": outcome.activation.kind(),
+            "previous_active_script": previous_active_script,
+            "include_supported": outcome.include_supported,
+            "script_sha256": script_sha256,
+            "server_managed_rule_ids": export.exported_rule_ids,
+            "starttls_used": true,
+            "sasl_mechanism": "PLAIN",
+            "ui": ui::rules_ui(&account_id),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "Uploaded {exported_count} rule(s) as \"{script_name}\" to {resolved_host}:{resolved_port} ({} skipped).",
+            export.skipped.len(),
+        );
+        let earlier = previous_active_script
+            .as_deref()
+            .map_or("the earlier script".to_string(), |p| format!("\"{p}\""));
+        match &outcome.activation {
+            Activation::Activate => println!("\"{script_name}\" is the active script."),
+            Activation::KeepWrapper => println!(
+                "\"{}\" stays active and runs {earlier} first, then \"{script_name}\".",
+                outcome.active_script
+            ),
+            Activation::WrapExisting { previous } => println!(
+                "\"{}\" is now active. It runs \"{previous}\" first, then \"{script_name}\". \"{previous}\" itself was not changed.",
+                outcome.active_script
+            ),
+            Activation::ReplaceActive { previous } => println!(
+                "\"{script_name}\" is now active. \"{previous}\" was switched off and is still on the server."
+            ),
+        }
+        println!(
+            "The mail server now runs these {exported_count} rule(s), so Envelope no longer runs them locally."
+        );
+        if !export.skipped.is_empty() {
+            eprintln!("Skipped local-only rules: {}", export.skipped.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+/// `envelope rule sieve-status` — list the ManageSieve server's scripts and
+/// check that the script the last publish left active still is. Nothing on
+/// the server changes. Locally it records the answer, so the published rules
+/// run locally again once the server no longer runs them.
+#[tokio::main]
+pub async fn run_sieve_status(
+    account: Option<&str>,
+    host: Option<&str>,
+    port: Option<u16>,
+    timeout_secs: u64,
+    json: bool,
+    backend: CredentialBackend,
+) -> Result<()> {
+    let timeout_secs =
+        timeout_secs.clamp(MIN_MANAGESIEVE_TIMEOUT_SECS, MAX_MANAGESIEVE_TIMEOUT_SECS);
+    let db = envelope_email_store::Database::open_default().context("failed to open database")?;
+    let acct = super::common::resolve_account(&db, account)?;
+    let account_id = acct.id.clone();
+    let previous = db
+        .get_sieve_publication(&account_id)
+        .context("failed to read the last Sieve publish")?;
+    let (resolved_host, resolved_port) = match &previous {
+        Some(r) => (
+            host.map_or_else(|| r.host.clone(), str::to_string),
+            port.unwrap_or(r.port),
+        ),
+        None => managesieve::resolve_sieve_endpoint(&acct.imap_host, host, port),
+    };
+
+    let creds = {
+        let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(backend)
+            .context("credential store error")?;
+        db.get_account_with_credentials(&account_id, &passphrase)
+            .context("failed to decrypt credentials")?
+    };
+    let status = managesieve::read_status(
+        &creds,
+        &resolved_host,
+        resolved_port,
+        std::time::Duration::from_secs(timeout_secs),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if json {
-        let value = ui::with_ui(&result, ui::rules_ui(&account_id));
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        println!(
-            "Uploaded {count} rule(s) as \"{name}\" to {host}:{port} ({sk} skipped, active script set to \"{active}\")",
-            count = result.exported_count,
-            name = result.script_name,
-            host = result.host,
-            port = result.port,
-            sk = result.skipped.len(),
-            active = result.active_script,
-        );
-        if !result.skipped.is_empty() {
-            eprintln!("Skipped local-only rules: {}", result.skipped.join(", "));
+    let envelope_active = sync_server_active(
+        &db,
+        previous.as_ref(),
+        &resolved_host,
+        resolved_port,
+        &status.scripts,
+    )?;
+    let record = db
+        .get_sieve_publication(&account_id)
+        .context("failed to read the last Sieve publish")?;
+    let mut server_managed: Vec<String> = db
+        .server_managed_rule_ids(&account_id)
+        .context("failed to read which rules the mail server runs")?
+        .into_iter()
+        .collect();
+    server_managed.sort();
+    let local_rules_changed = match &record {
+        Some(r) => {
+            let rules = db
+                .list_enabled_rules(&account_id)
+                .context("failed to list rules")?;
+            let script = envelope_email_transport::sieve::export_sieve(&rules).script;
+            Some(envelope_email_transport::backup::sha256_hex(script.as_bytes()) != r.script_sha256)
         }
+        None => None,
+    };
+    let script_name = record
+        .as_ref()
+        .map_or(DEFAULT_SIEVE_SCRIPT_NAME, |r| r.script_name.as_str());
+    let (next_outcome, next_message) = match managesieve::decide_activation(
+        &status.scripts,
+        status.include_supported,
+        script_name,
+        &ExistingScript::Refuse,
+    ) {
+        Ok(Activation::KeepWrapper) => (
+            "kept_wrapper",
+            format!(
+                "publish-sieve --confirm updates \"{script_name}\"; \"{}\" stays active",
+                managesieve::wrapper_script_name(script_name)
+            ),
+        ),
+        Ok(_) => (
+            "activated",
+            format!(
+                "publish-sieve --confirm updates \"{script_name}\" and makes it the active script"
+            ),
+        ),
+        Err(conflict) => ("refused", conflict.message),
+    };
+    let active_script = status
+        .scripts
+        .iter()
+        .find(|s| s.active)
+        .map(|s| s.name.clone());
+
+    if json {
+        let value = serde_json::json!({
+            "status": "ok",
+            "account_id": account_id,
+            "host": resolved_host,
+            "port": resolved_port,
+            "server_implementation": status.server_implementation,
+            "include_supported": status.include_supported,
+            "scripts": status.scripts,
+            "active_script": active_script,
+            "published": record,
+            "envelope_script_active": envelope_active,
+            "server_managed_rule_ids": server_managed,
+            "local_rules_changed_since_publish": local_rules_changed,
+            "next_publish": {"outcome": next_outcome, "message": next_message},
+            "network_used": true,
+            "ui": ui::rules_ui(&account_id),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
+    println!(
+        "ManageSieve on {resolved_host}:{resolved_port}{} for {account_id}:",
+        status
+            .server_implementation
+            .as_deref()
+            .map_or(String::new(), |i| format!(" ({i})"))
+    );
+    if status.scripts.is_empty() {
+        println!("  Scripts: none");
+    } else {
+        let names: Vec<String> = status
+            .scripts
+            .iter()
+            .map(|s| {
+                if s.active {
+                    format!("\"{}\" (active)", s.name)
+                } else {
+                    format!("\"{}\"", s.name)
+                }
+            })
+            .collect();
+        println!("  Scripts: {}", names.join(", "));
+    }
+    println!(
+        "  Sieve include: {}",
+        if status.include_supported {
+            "supported"
+        } else {
+            "not supported"
+        }
+    );
+    match (&record, envelope_active) {
+        (Some(r), Some(true)) => println!(
+            "  Last publish ({} UTC) left \"{}\" active. The mail server runs its {} rule(s), so Envelope skips them locally.",
+            r.published_at,
+            r.active_script,
+            r.rule_ids.len()
+        ),
+        (Some(r), Some(false)) => println!("  {}", handed_back_note(r)),
+        (Some(r), None) => println!(
+            "  Last publish went to {}:{}, not this server.",
+            r.host, r.port
+        ),
+        (None, _) => println!("  Last publish: none on record."),
+    }
+    if local_rules_changed == Some(true) {
+        println!("  Rules changed since that publish. Republish to update the server.");
+    }
+    println!("  Next publish: {next_message}");
     Ok(())
 }
 
@@ -1325,27 +1756,27 @@ pub fn run_export(account: Option<&str>, json: bool, _backend: CredentialBackend
         .list_enabled_rules(&account_id)
         .context("failed to list rules")?;
 
-    let (script, skipped) = envelope_email_transport::sieve::export_sieve(&rules);
+    let export = envelope_email_transport::sieve::export_sieve(&rules);
 
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "script": script,
-                "skipped": skipped,
-                "exported_count": rules.len() - skipped.len(),
+                "script": export.script,
+                "skipped": export.skipped,
+                "exported_count": export.exported_rule_ids.len(),
                 "ui": ui::rules_ui(&account_id),
             })
         );
     } else {
-        if !skipped.is_empty() {
+        if !export.skipped.is_empty() {
             eprintln!(
                 "Skipped {} rule(s) (local-only, not Sieve-exportable): {}",
-                skipped.len(),
-                skipped.join(", ")
+                export.skipped.len(),
+                export.skipped.join(", ")
             );
         }
-        print!("{script}");
+        print!("{}", export.script);
     }
 
     Ok(())

@@ -42,6 +42,7 @@ impl Database {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
         )?;
         crate::migrations::run(&mut conn)?;
+        crate::sieve_publications::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -64,6 +65,7 @@ impl Database {
     pub fn open_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         crate::migrations::run(&mut conn)?;
+        crate::sieve_publications::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
 
