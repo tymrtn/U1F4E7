@@ -870,10 +870,13 @@ async fn highest_uid(
 }
 
 /// Fetch messages with UID > last_uid from the already-selected folder.
-async fn fetch_new_messages(
-    session: &mut envelope_email_transport::imap::ImapSession,
+async fn fetch_new_messages<T>(
+    session: &mut async_imap::Session<T>,
     last_uid: u32,
-) -> Result<Vec<NewMessage>> {
+) -> Result<Vec<NewMessage>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let start = last_uid + 1;
     let range = format!("{start}:*");
 
@@ -921,7 +924,7 @@ async fn fetch_new_messages(
                     let subj = env
                         .subject
                         .as_ref()
-                        .map(|s| String::from_utf8_lossy(s).to_string());
+                        .map(|s| envelope_email_transport::imap::decode_rfc2047(s));
                     (mid, from, to, subj)
                 } else {
                     (None, None, None, None)
@@ -1367,6 +1370,84 @@ mod tests {
                 .unwrap();
         assert_eq!(again.actions, 0);
         assert_eq!(session.calls.len(), 1);
+    }
+
+    /// An IMAP server on an in-memory pipe: it greets, accepts LOGIN, then
+    /// answers the next command with `reply` (`{tag}` is that command's tag).
+    async fn scripted_session(reply: Vec<String>) -> async_imap::Session<tokio::io::DuplexStream> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(server_io);
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"* OK fake\r\n").await.unwrap();
+            for lines in [vec!["{tag} OK LOGIN completed".to_string()], reply] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                let tag = command.split_whitespace().next().unwrap_or_default();
+                let out: String = lines
+                    .iter()
+                    .map(|line| format!("{}\r\n", line.replace("{tag}", tag)))
+                    .collect();
+                write_half.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let mut client = async_imap::Client::new(client_io);
+        client.read_response().await.unwrap().unwrap();
+        client.login("me", "pw").await.map_err(|(e, _)| e).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_rules_match_the_decoded_subject_of_new_mail() {
+        let envelope = |uid: u32, subject: &str| {
+            format!(
+                "* {uid} FETCH (UID {uid} ENVELOPE (NIL \"{subject}\" \
+                 ((NIL NIL \"ana\" \"example.com\")) NIL NIL \
+                 ((NIL NIL \"me\" \"example.com\")) NIL NIL NIL \"<m{uid}@example.com>\"))"
+            )
+        };
+        let mut server = scripted_session(vec![
+            // "Résumé de la réunion", Q-encoded.
+            envelope(1, "=?UTF-8?Q?R=C3=A9sum=C3=A9_de_la_r=C3=A9union?="),
+            // "Счёт на оплату", B-encoded.
+            envelope(2, "=?UTF-8?B?0KHRh9GR0YIg0L3QsCDQvtC/0LvQsNGC0YM=?="),
+            "{tag} OK UID FETCH completed".to_string(),
+        ])
+        .await;
+        let new_msgs = fetch_new_messages(&mut server, 0).await.unwrap();
+
+        let db = envelope_email_store::Database::open_memory().unwrap();
+        for (name, subject) in [("meetings", "*réunion*"), ("invoices", "счёт*")] {
+            db.create_rule(
+                "acc-1",
+                name,
+                &serde_json::json!({ "subject": subject }).to_string(),
+                r#"{"flag":"flagged"}"#,
+                10,
+                false,
+            )
+            .unwrap();
+        }
+        let account = RunAccount {
+            id: "acc-1",
+            email: "me@example.com",
+        };
+        let mut session = FakeSession::default();
+        run_rules_on_new_messages(&mut session, &db, &account, "INBOX", &new_msgs)
+            .await
+            .unwrap();
+
+        let subjects: Vec<_> = new_msgs.iter().map(|m| m.subject.as_deref()).collect();
+        assert_eq!(
+            session.calls,
+            vec!["flag INBOX/1 flagged", "flag INBOX/2 flagged"],
+            "the rules saw these subjects: {subjects:?}"
+        );
+        assert_eq!(
+            subjects,
+            vec![Some("Résumé de la réunion"), Some("Счёт на оплату")]
+        );
     }
 
     impl RawFetch for FakeSession {

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Agent tokens on the command line now respect the agent's account and folder limits for moving, copying, deleting, flagging, snoozing and bulk actions, as MCP already did. Every other gated command checks them too: tags, drafts and scheduled messages, rules, `threat report`, `unsubscribe --confirm` and `watch` with `--webhook`, `--deliver` or `--run-rules`. A refusal comes before any connection to the mail server, with `agent_policy_denied_account` or `agent_policy_denied_folder`.
+- `watch --run-rules` matches rules against decoded subjects, so rules on non-English subjects work live.
 
 ## [1.3.19] — 2026-10-08
 
