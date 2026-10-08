@@ -981,6 +981,7 @@ dependencies = [
  "envelope-email-transport",
  "futures-util",
  "hickory-resolver",
+ "hostname",
  "lettre",
  "mail-builder",
  "mail-parser",

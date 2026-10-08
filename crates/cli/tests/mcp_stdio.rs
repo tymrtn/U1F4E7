@@ -2658,3 +2658,344 @@ fn mcp_tool_result_text_is_compact_json() {
     let parsed: Value = serde_json::from_str(text).expect("result text is JSON");
     assert_eq!(text, serde_json::to_string(&parsed).unwrap());
 }
+
+// ── Attachments and draft accounts over MCP ─────────────────────────
+
+fn server_hostname() -> String {
+    hostname::get()
+        .expect("hostname")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn draft_only_send(subject: &str) -> Value {
+    json!({
+        "to": "a@b.test",
+        "subject": subject,
+        "body": "x",
+        "attributes": ["informational"]
+    })
+}
+
+fn stored_attachments(home: &std::path::Path, draft_id: &str) -> Vec<Value> {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.get_draft(draft_id)
+        .expect("read draft")
+        .expect("draft exists")
+        .attachments
+}
+
+fn draft_count(home: &std::path::Path) -> i64 {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+        .expect("count drafts")
+}
+
+/// The raw tool-result text of an error (`tool_call` keeps non-JSON text
+/// under `_raw`).
+fn error_text(payload: &Value) -> String {
+    payload["_raw"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| payload.to_string())
+}
+
+#[test]
+fn mcp_attach_content_stores_the_same_attachment_as_a_path() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let file = home.join("report.pdf");
+    std::fs::write(&file, b"%PDF-1.4 hello").expect("write attachment");
+
+    let mut by_path = draft_only_send("by path");
+    by_path["attach"] = json!([file.to_str().unwrap()]);
+    let (path_result, is_error) = tool_call(home, None, "send", by_path);
+    assert!(!is_error, "{path_result}");
+
+    let mut by_content = draft_only_send("by content");
+    by_content["attach_content"] =
+        json!([{"filename": "report.pdf", "data_base64": b64(b"%PDF-1.4 hello")}]);
+    let (content_result, is_error) = tool_call(home, None, "send", by_content);
+    assert!(!is_error, "{content_result}");
+
+    assert_eq!(content_result["attachments"], path_result["attachments"]);
+    let from_path = stored_attachments(home, path_result["draft_id"].as_str().unwrap());
+    let from_content = stored_attachments(home, content_result["draft_id"].as_str().unwrap());
+    assert_eq!(from_path.len(), 1);
+    assert_eq!(from_content, from_path);
+}
+
+#[test]
+fn mcp_attach_content_refuses_bad_input_before_creating_anything() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+
+    let mut bad_base64 = draft_only_send("bad base64");
+    bad_base64["attach_content"] =
+        json!([{"filename": "report.pdf", "data_base64": "not base64!"}]);
+    let (payload, is_error) = tool_call(home, None, "send", bad_base64);
+    assert!(is_error, "invalid base64 must be refused: {payload}");
+    assert!(error_text(&payload).contains("base64"), "{payload}");
+
+    let mut traversal = draft_only_send("traversal");
+    traversal["attach_content"] =
+        json!([{"filename": "../../etc/passwd", "data_base64": b64(b"x")}]);
+    let (payload, is_error) = tool_call(home, None, "send", traversal);
+    assert!(is_error, "a path in filename must be refused: {payload}");
+    assert!(error_text(&payload).contains("bare file name"), "{payload}");
+
+    assert_eq!(draft_count(home), 0, "no draft for a refused attachment");
+}
+
+#[test]
+fn mcp_attachment_read_error_names_the_os_cause_and_the_server() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let missing = home.join("no-such-report.pdf");
+
+    let mut args = draft_only_send("missing file");
+    args["attach"] = json!([missing.to_str().unwrap()]);
+    let (payload, is_error) = tool_call(home, None, "send", args);
+    assert!(is_error, "{payload}");
+    let text = error_text(&payload);
+    assert!(text.contains(missing.to_str().unwrap()), "{text}");
+    assert!(text.contains("No such file or directory"), "{text}");
+    assert!(text.contains(&server_hostname()), "{text}");
+}
+
+/// Kills the MCP child if a test fails while the server is stuck.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A FIFO blocks inside `open()` until a writer appears, the same way macOS
+/// privacy protection holds a read of ~/Downloads while it waits for consent.
+#[cfg(unix)]
+#[test]
+fn mcp_blocked_attachment_read_times_out_and_the_server_keeps_answering() {
+    use wait_timeout::ChildExt as _;
+
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let fifo = home.join("blocked-report.pdf");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo failed");
+
+    let mut child = KillOnDrop(spawn_mcp(home));
+    let mut stdin = child.0.stdin.take().expect("stdin");
+    let stdout = child.0.stdout.take().expect("stdout");
+    let (lines_tx, lines) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if lines_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut args = draft_only_send("blocked");
+    args["attach"] = json!([fifo.to_str().unwrap()]);
+    write_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "send", "arguments": args}
+        }),
+    );
+    write_line(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+
+    let first: Value = serde_json::from_str(
+        &lines
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the server stopped answering while the attachment read was blocked"),
+    )
+    .expect("first response JSON");
+    assert_eq!(first["id"], 1);
+    assert_eq!(first["result"]["isError"], true, "{first}");
+    let text = first["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(fifo.to_str().unwrap()), "{text}");
+    assert!(text.contains(&server_hostname()), "{text}");
+    assert!(text.contains("did not complete"), "{text}");
+
+    let second: Value = serde_json::from_str(
+        &lines
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the next request was not answered"),
+    )
+    .expect("second response JSON");
+    assert_eq!(second["id"], 2);
+    assert!(second["result"]["tools"].is_array(), "{second}");
+
+    // The read thread is still stuck in open(); the server must exit anyway.
+    drop(stdin);
+    let status = child
+        .0
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait for mcp");
+    assert!(
+        status.is_some(),
+        "the server did not exit after stdin closed"
+    );
+    assert_eq!(draft_count(home), 0);
+}
+
+/// Two accounts, both send-only so a draft edit stays local. The second one
+/// is the non-default account. Returns (default_id, other_id).
+fn seed_two_send_only_accounts(home: &std::path::Path) -> (String, String) {
+    seed_account(home);
+    let out = run_cli_with_stdin(
+        home,
+        &[
+            "accounts",
+            "add",
+            "--skip-login-check",
+            "--email",
+            "other@example.test",
+            "--password-stdin",
+            "--smtp-host",
+            "smtp.example.test",
+            "--smtp-port",
+            "587",
+            "--imap-host",
+            "imap.example.test",
+            "--imap-port",
+            "993",
+            "--insecure-machine-key",
+            "--json",
+        ],
+        None,
+        "pw",
+    );
+    assert!(out.status.success(), "seed second account failed");
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .execute("UPDATE accounts SET imap_host = ''", [])
+        .expect("make accounts send-only");
+    db.conn()
+        .execute(
+            "UPDATE accounts SET created_at = '2999-01-01T00:00:00Z' WHERE username = 'other@example.test'",
+            [],
+        )
+        .expect("make the second account non-default");
+    let id_of = |email: &str| -> String {
+        db.conn()
+            .query_row(
+                "SELECT id FROM accounts WHERE username = ?1",
+                [email],
+                |r| r.get(0),
+            )
+            .expect("account id")
+    };
+    let default_id = db
+        .default_account()
+        .expect("default account")
+        .expect("one exists")
+        .id;
+    assert_eq!(default_id, id_of("test@example.test"));
+    (default_id, id_of("other@example.test"))
+}
+
+fn draft_on(home: &std::path::Path, account_id: &str) -> String {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.create_draft(
+        account_id,
+        "to@b.test",
+        Some("before"),
+        Some("x"),
+        None,
+        None,
+        None,
+        None,
+        Some("cli"),
+    )
+    .expect("create draft")
+    .id
+}
+
+fn draft_subject(home: &std::path::Path, draft_id: &str) -> Option<String> {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.get_draft(draft_id)
+        .expect("read draft")
+        .expect("draft exists")
+        .subject
+}
+
+#[test]
+fn mcp_modify_draft_without_account_uses_the_drafts_own_account() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (_default_id, other_id) = seed_two_send_only_accounts(home);
+    let draft_id = draft_on(home, &other_id);
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "modify_draft",
+        json!({"draft_id": draft_id, "subject": "after"}),
+    );
+    assert!(!is_error, "{payload}");
+    assert_eq!(draft_subject(home, &draft_id).as_deref(), Some("after"));
+}
+
+#[test]
+fn mcp_draft_tools_refuse_another_account_in_mcp_terms() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    let (_default_id, other_id) = seed_two_send_only_accounts(home);
+    let draft_id = draft_on(home, &other_id);
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "modify_draft",
+        json!({"draft_id": draft_id, "subject": "after", "account": "test@example.test"}),
+    );
+    assert!(is_error, "{payload}");
+    let text = error_text(&payload);
+    assert!(text.contains("`account` parameter"), "{text}");
+    assert!(!text.contains("--account"), "{text}");
+    assert_eq!(draft_subject(home, &draft_id).as_deref(), Some("before"));
+
+    let mut send = confirmed_send_draft(&draft_id);
+    send["account"] = json!("test@example.test");
+    let (payload, is_error) = tool_call(home, None, "send_draft", send);
+    assert!(is_error, "{payload}");
+    let text = error_text(&payload);
+    assert!(text.contains("`account` parameter"), "{text}");
+    assert!(!text.contains("--account"), "{text}");
+    assert_eq!(
+        draft_schedule(home, &draft_id).0,
+        None,
+        "nothing was queued"
+    );
+}

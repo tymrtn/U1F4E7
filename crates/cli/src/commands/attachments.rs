@@ -4,6 +4,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use envelope_email_store::CredentialBackend;
@@ -12,37 +13,201 @@ use envelope_email_transport::smtp::Attachment;
 
 use super::common::setup_credentials;
 
+/// How long an MCP call waits for one `attach` path to be read before it
+/// fails the call.
+pub(crate) const ATTACHMENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One stored draft attachment entry: `filename`, `content_type`, `size`, and
+/// a base64 `data_base64` payload. Every way of attaching a file builds this
+/// same shape, so drafts, sends and their checks never see where it came from.
+fn snapshot_entry(filename: &str, content_type: &str, data: &[u8]) -> serde_json::Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "filename": filename,
+        "content_type": content_type,
+        "size": data.len(),
+        "data_base64": base64::engine::general_purpose::STANDARD.encode(data),
+    })
+}
+
+fn path_snapshot(path_str: &str, data: &[u8]) -> serde_json::Value {
+    let path = Path::new(path_str);
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let content_type = mime_guess::from_path(path).first_or_octet_stream();
+    snapshot_entry(filename, content_type.as_ref(), data)
+}
+
 /// Read each `--attach` file and snapshot its bytes into a JSON attachment
 /// entry suitable for persisting on a draft.
 ///
-/// Each entry carries `filename`, `content_type`, `size`, and a base64
-/// `data_base64` payload. Returns an explicit error if any file cannot be read
-/// so a draft is never created with a silently-missing attachment. This is the
-/// same snapshot convention used by scheduled sends.
+/// Returns an explicit error if any file cannot be read so a draft is never
+/// created with a silently-missing attachment. This is the same snapshot
+/// convention used by scheduled sends.
 pub(crate) fn snapshot_attachments(attach_paths: &[String]) -> Result<Vec<serde_json::Value>> {
-    use base64::Engine as _;
+    attach_paths
+        .iter()
+        .map(|path_str| {
+            let data = std::fs::read(path_str)
+                .with_context(|| format!("failed to read attachment: {path_str}"))?;
+            Ok(path_snapshot(path_str, &data))
+        })
+        .collect()
+}
+
+/// [`snapshot_attachments`] for the long-lived MCP server, where one stuck
+/// read must not stop every later request.
+///
+/// A read can block inside `open()` with no end: macOS privacy protection
+/// holds a read of Downloads, Desktop or Documents while it waits for a
+/// consent nobody will give, and FIFOs and dead network mounts do the same.
+/// Each path is read on its own thread and the caller waits at most `timeout`;
+/// a read that never finishes is left behind. The thread is a plain one
+/// because dropping the runtime waits for `spawn_blocking` tasks, so a stuck
+/// read there would keep the server from ever exiting.
+pub(crate) async fn snapshot_attachments_bounded(
+    attach_paths: &[String],
+    read: fn(&Path) -> std::io::Result<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Vec<serde_json::Value>> {
     let mut out = Vec::with_capacity(attach_paths.len());
     for path_str in attach_paths {
-        let path = std::path::Path::new(path_str);
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("attachment")
-            .to_string();
-        let data = std::fs::read(path)
-            .with_context(|| format!("failed to read attachment: {path_str}"))?;
-        let content_type = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&data);
-        out.push(serde_json::json!({
-            "filename": filename,
-            "content_type": content_type,
-            "size": data.len(),
-            "data_base64": data_base64,
-        }));
+        let (done, result) = tokio::sync::oneshot::channel();
+        let path = PathBuf::from(path_str);
+        std::thread::Builder::new()
+            .name("attachment-read".to_string())
+            .spawn(move || {
+                let _ = done.send(read(&path));
+            })
+            .context("failed to start an attachment read")?;
+        let data = match tokio::time::timeout(timeout, result).await {
+            Ok(Ok(read)) => read.with_context(|| {
+                format!(
+                    "failed to read attachment {path_str} on {}",
+                    server_hostname()
+                )
+            })?,
+            Ok(Err(_)) => bail!(
+                "reading attachment {path_str} on {} stopped without a result",
+                server_hostname()
+            ),
+            Err(_) => bail!(
+                "reading attachment {path_str} on {} did not complete within {timeout:?}. \
+                 Attachment paths are read on the machine running the Envelope server. On \
+                 macOS a read that never finishes is usually privacy protection: this \
+                 process has no access to Downloads, Desktop or Documents. Grant it access, \
+                 move the file, or send its bytes in attach_content.",
+                server_hostname()
+            ),
+        };
+        out.push(path_snapshot(path_str, &data));
     }
     Ok(out)
+}
+
+/// Snapshot MCP `attach_content` entries, `[{filename, data_base64,
+/// content_type?}]`: files a client sends as bytes because the server cannot
+/// read paths on the client's machine.
+///
+/// Each entry becomes exactly the entry a path holding the same bytes under
+/// the same name would. Bad input fails the call: invalid base64, a name that
+/// is not a bare file name, unknown fields, or more bytes in one call than the
+/// per-message limit the dashboard enforces on uploads.
+pub(crate) fn inline_attachment_snapshots(
+    raw: Option<&serde_json::Value>,
+) -> Result<Vec<serde_json::Value>> {
+    use base64::Engine as _;
+    use envelope_email_dashboard::handlers::draft_attachments::MAX_DRAFT_ATTACHMENT_BYTES;
+
+    let entries = match raw {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(raw) => raw.as_array().context(
+            "attach_content must be an array of {filename, data_base64, content_type} objects",
+        )?,
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    let mut total = 0usize;
+    for (i, entry) in entries.iter().enumerate() {
+        let fields = entry
+            .as_object()
+            .with_context(|| format!("attach_content[{i}] must be an object"))?;
+        if let Some(unknown) = fields
+            .keys()
+            .find(|k| !matches!(k.as_str(), "filename" | "data_base64" | "content_type"))
+        {
+            bail!(
+                "attach_content[{i}] has unknown field `{unknown}`; the fields are filename, \
+                 data_base64 and optional content_type"
+            );
+        }
+        let raw_name = fields
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("attach_content[{i}].filename is required"))?;
+        let filename = bare_filename(raw_name)
+            .with_context(|| format!("attach_content[{i}].filename {raw_name:?}"))?;
+        let encoded = fields
+            .get("data_base64")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("attach_content[{i}].data_base64 is required"))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| {
+                format!(
+                    "attach_content[{i}] ({filename}): data_base64 is not standard base64 \
+                     (padded, no line breaks)"
+                )
+            })?;
+        total += data.len();
+        if total > MAX_DRAFT_ATTACHMENT_BYTES {
+            bail!(
+                "attach_content would total {total} bytes, over the \
+                 {MAX_DRAFT_ATTACHMENT_BYTES} byte limit for one message"
+            );
+        }
+        let content_type = match fields.get("content_type") {
+            None | Some(serde_json::Value::Null) => mime_guess::from_path(&filename)
+                .first_or_octet_stream()
+                .to_string(),
+            Some(serde_json::Value::String(given))
+                if !given.trim().is_empty() && !given.chars().any(char::is_control) =>
+            {
+                given.trim().to_string()
+            }
+            Some(_) => bail!(
+                "attach_content[{i}].content_type must be a MIME type such as \
+                 application/pdf, or left out"
+            ),
+        };
+        out.push(snapshot_entry(&filename, &content_type, &data));
+    }
+    Ok(out)
+}
+
+/// A client-supplied attachment name, accepted only as a bare file name. A
+/// name with a directory part is refused, so the stored file always carries
+/// exactly the name the caller gave.
+fn bare_filename(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        bail!("must be a bare file name: not empty, no directory part, no control characters");
+    }
+    Ok(name.to_string())
+}
+
+/// The machine `attach` paths are read on, named in errors because the
+/// client reading them may be somewhere else.
+fn server_hostname() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_else(|e| format!("this server (hostname unavailable: {e})"))
 }
 
 /// Build a non-secret summary (filename, content_type, size) of stored draft
@@ -559,6 +724,164 @@ mod tests {
     fn snapshot_attachments_errors_on_missing_file() {
         let err = snapshot_attachments(&["/no/such/path/at/all.txt".to_string()]).unwrap_err();
         assert!(err.to_string().contains("failed to read attachment"));
+    }
+
+    fn inline(entries: serde_json::Value) -> Result<Vec<serde_json::Value>> {
+        inline_attachment_snapshots(Some(&entries))
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn inline_content_snapshot_matches_the_path_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        fs::write(&path, b"%PDF-1.4 hello").unwrap();
+        let from_path = snapshot_attachments(&[path.to_str().unwrap().to_string()]).unwrap();
+
+        let from_content = inline(serde_json::json!([
+            {"filename": "report.pdf", "data_base64": b64(b"%PDF-1.4 hello")}
+        ]))
+        .unwrap();
+
+        assert_eq!(from_content, from_path);
+        assert_eq!(from_content[0]["content_type"], "application/pdf");
+    }
+
+    #[test]
+    fn inline_content_keeps_a_given_content_type() {
+        let snap = inline(serde_json::json!([
+            {"filename": "rows.bin", "data_base64": b64(b"a,b"), "content_type": "text/csv"}
+        ]))
+        .unwrap();
+        assert_eq!(snap[0]["content_type"], "text/csv");
+        assert_eq!(snap[0]["filename"], "rows.bin");
+        assert_eq!(snap[0]["size"], 3);
+    }
+
+    #[test]
+    fn inline_content_rejects_invalid_base64() {
+        for bad in ["not base64!", "aGVsbG8", "aGVs\nbG8="] {
+            let err = inline(serde_json::json!([{"filename": "a.txt", "data_base64": bad}]))
+                .expect_err(bad);
+            assert!(format!("{err:#}").contains("base64"), "{bad:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn inline_content_rejects_names_that_are_not_bare_file_names() {
+        for name in [
+            "../../etc/passwd",
+            "dir/report.pdf",
+            "..\\evil.exe",
+            "/abs.txt",
+            "..",
+            ".",
+            "",
+            "   ",
+            "bad\u{0}.txt",
+            "line\r\nX-Injected: y",
+        ] {
+            let err = inline(serde_json::json!([{"filename": name, "data_base64": b64(b"x")}]))
+                .expect_err(name);
+            assert!(
+                format!("{err:#}").contains("bare file name"),
+                "{name:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_content_rejects_unknown_fields_and_wrong_shapes() {
+        let err = inline(serde_json::json!([{"filename": "a.txt", "content_base64": b64(b"x")}]))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("content_base64"), "{err:#}");
+
+        let err =
+            inline(serde_json::json!({"filename": "a.txt", "data_base64": b64(b"x")})).unwrap_err();
+        assert!(format!("{err:#}").contains("array"), "{err:#}");
+
+        let err = inline(serde_json::json!([
+            {"filename": "a.txt", "data_base64": b64(b"x"), "content_type": "text/plain\r\nBcc: x@y.test"}
+        ]))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("content_type"), "{err:#}");
+    }
+
+    #[test]
+    fn inline_content_applies_the_per_message_attachment_limit() {
+        use envelope_email_dashboard::handlers::draft_attachments::MAX_DRAFT_ATTACHMENT_BYTES;
+        let half = b64(&vec![0u8; MAX_DRAFT_ATTACHMENT_BYTES / 2 + 1]);
+        let err = inline(serde_json::json!([
+            {"filename": "a.bin", "data_base64": half},
+            {"filename": "b.bin", "data_base64": half},
+        ]))
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&MAX_DRAFT_ATTACHMENT_BYTES.to_string()),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_snapshot_times_out_a_blocked_read_and_serves_the_next_call() {
+        fn blocked(_: &Path) -> std::io::Result<Vec<u8>> {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(b"late".to_vec())
+        }
+        fn quick(_: &Path) -> std::io::Result<Vec<u8>> {
+            Ok(b"hello".to_vec())
+        }
+
+        let started = std::time::Instant::now();
+        let err = snapshot_attachments_bounded(
+            &["/Users/someone/Downloads/report.pdf".to_string()],
+            blocked,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the caller waited {:?} on a blocked read",
+            started.elapsed()
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("/Users/someone/Downloads/report.pdf"),
+            "{text}"
+        );
+        assert!(text.contains("did not complete"), "{text}");
+        assert!(text.contains(&server_hostname()), "{text}");
+
+        // The blocked read is still sleeping on its own thread; the next
+        // call is answered anyway.
+        let snap = snapshot_attachments_bounded(
+            &["/srv/notes.txt".to_string()],
+            quick,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snap[0]["filename"], "notes.txt");
+        assert_eq!(snap[0]["data_base64"], "aGVsbG8=");
+    }
+
+    #[tokio::test]
+    async fn bounded_snapshot_error_keeps_the_os_cause_and_names_the_host() {
+        let err = snapshot_attachments_bounded(
+            &["/no/such/path/report.pdf".to_string()],
+            |path| fs::read(path),
+            ATTACHMENT_READ_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("No such file or directory"), "{text}");
+        assert!(text.contains(&server_hostname()), "{text}");
     }
 
     #[test]

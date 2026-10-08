@@ -7,7 +7,10 @@
 //! dispatches to existing command functions, writes JSON-RPC responses to stdout.
 
 use crate::commands::agent_context::{self, AgentContext};
-use crate::commands::attachments::{attachment_summaries, snapshot_attachments};
+use crate::commands::attachments::{
+    ATTACHMENT_READ_TIMEOUT, attachment_summaries, inline_attachment_snapshots,
+    snapshot_attachments_bounded,
+};
 use crate::commands::authored_body::AuthoredBody;
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
 use crate::commands::governor_gate::{account_domain, governor_request, precheck_attribution};
@@ -237,7 +240,7 @@ fn authoritative_policy_account(
         let draft_id = required_str(params, "draft_id")?;
         let draft = db
             .get_draft(draft_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| "draft not found".to_string())?;
         if let Some(requested) = optional_str(params, "account") {
             let requested = crate::commands::common::resolve_account(db, Some(requested))
@@ -387,7 +390,7 @@ fn authorize_tool_call(
     if ctx.is_none() || is_always_allowed_readonly(tool_name) {
         return Ok(());
     }
-    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
     authorize_tool_call_with_db(&db, ctx, tool_name, params)
 }
 
@@ -511,7 +514,7 @@ async fn handle_tool_call(
     crate::commands::authored_body::attach_tool_notice(tool_name, params, &mut result);
     if agent_context::agent_id_of(ctx).is_some() && DISPATCH_LOGGED_TOOLS.contains(&tool_name) {
         let audit = Database::open_default()
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("{e:#}"))
             .and_then(|db| match audit_account_id(&db, tool_name, params) {
                 Some(acct) => record_tool_outcome(&db, ctx, &acct, tool_name, &result),
                 None => Err("no account to file the audit row under".to_string()),
@@ -608,8 +611,8 @@ fn message_row<T: Serialize>(
 }
 
 async fn handle_accounts(_backend: CredentialBackend) -> Result<Value, String> {
-    let db = Database::open_default().map_err(|e| e.to_string())?;
-    let accounts = db.list_accounts().map_err(|e| e.to_string())?;
+    let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
+    let accounts = db.list_accounts().map_err(|e| format!("{e:#}"))?;
     Ok(Value::Array(
         accounts
             .iter()
@@ -627,15 +630,15 @@ async fn handle_inbox(params: &Value, backend: CredentialBackend) -> Result<Valu
         .unwrap_or("INBOX");
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let messages = envelope_email_transport::imap::fetch_inbox(&mut client, folder, limit)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(wrap_untrusted(Value::Array(
         messages
@@ -657,16 +660,16 @@ async fn handle_read(params: &Value, backend: CredentialBackend) -> Result<Value
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let (message, raw) =
         envelope_email_transport::imap::fetch_message_with_raw(&mut client, folder, uid)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
     let verdict = crate::commands::threat::verdict_for_read(
         &db,
@@ -692,7 +695,7 @@ fn handle_threat_show(params: &Value) -> Result<Value, String> {
         .and_then(|v| v.as_u64())
         .ok_or("uid is required")? as u32;
     let folder = optional_str(params, "folder").unwrap_or("INBOX");
-    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
     let account = crate::commands::common::resolve_account(&db, optional_str(params, "account"))
         .map_err(|e| format!("{e:#}"))?;
     let stored = envelope_email_transport::threat::persist::stored_verdict_for_uid(
@@ -731,15 +734,15 @@ async fn handle_search(params: &Value, backend: CredentialBackend) -> Result<Val
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let messages = envelope_email_transport::imap::search(&mut client, folder, query, limit)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(wrap_untrusted(Value::Array(
         messages
@@ -771,18 +774,20 @@ async fn handle_send(
     let body = authored.text();
     let html = authored.html();
     let from = params.get("from").and_then(|v| v.as_str());
-    let from = crate::commands::drafts::validate_from_override(from).map_err(|e| e.to_string())?;
+    let from =
+        crate::commands::drafts::validate_from_override(from).map_err(|e| format!("{e:#}"))?;
     let cc = params.get("cc").and_then(|v| v.as_str());
     let bcc = params.get("bcc").and_then(|v| v.as_str());
     let reply_to = params.get("reply_to").and_then(|v| v.as_str());
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let inline_attachments = inline_attachments(params)?;
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let send_mode = params
         .get("send_mode")
         .and_then(|v| v.as_str())
         .map(SendMode::from_str)
         .transpose()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?
         .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
     // Clamp the requested mode to the agent policy ceiling (never widens).
     let send_mode = clamp_mode(ctx, send_mode);
@@ -820,7 +825,7 @@ async fn handle_send(
     let idempotency_key = idempotency_key(params)?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
     let authority = agent_context::agent_policy_input(ctx, confirm_send, &allow_recipients, None);
     let policy_input = SendPolicyInput {
         to,
@@ -849,7 +854,7 @@ async fn handle_send(
         SendPolicyDecision::Allowed => {}
         SendPolicyDecision::DraftOnly => {
             let attachment_snapshots =
-                snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+                new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
             let draft = db
                 .create_draft(
                     &creds.account.id,
@@ -862,13 +867,13 @@ async fn handle_send(
                     bcc,
                     Some("mcp"),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             if !attachment_snapshots.is_empty() {
                 db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("{e:#}"))?;
             }
             crate::commands::drafts::persist_from_override(&db, &draft.id, from)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             let mut result = json!({
                 "sent": false,
                 "status": "drafted",
@@ -893,7 +898,7 @@ async fn handle_send(
         }
     }
 
-    let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+    let attachment_snapshots = new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
 
     // ── Attribution precheck (before ANY side effect: no draft, no SMTP, no
     // Governor spawn on an unattributed/invalid request) ──
@@ -1061,7 +1066,7 @@ fn record_send_policy_event(
     };
     db.insert_event_with_agent(&event, agent_id).map_err(|e| {
         format!(
-            "audit_unavailable: could not record the send-policy decision; nothing was sent: {e}"
+            "audit_unavailable: could not record the send-policy decision; nothing was sent: {e:#}"
         )
     })
 }
@@ -1125,6 +1130,58 @@ fn optional_string_array(params: &Value, names: &[&str]) -> Result<Vec<String>, 
         }
     }
     Ok(Vec::new())
+}
+
+/// The `attach_content` files of an MCP call, decoded and checked before any
+/// side effect.
+fn inline_attachments(params: &Value) -> Result<Vec<Value>, String> {
+    inline_attachment_snapshots(params.get("attach_content")).map_err(|e| format!("{e:#}"))
+}
+
+/// Every attachment an MCP call adds: its `attach` paths, read on this machine
+/// off the request thread, then its `attach_content` files.
+async fn new_attachment_snapshots(
+    paths: &[String],
+    inline: &[Value],
+) -> Result<Vec<Value>, String> {
+    let mut snapshots =
+        snapshot_attachments_bounded(paths, |path| std::fs::read(path), ATTACHMENT_READ_TIMEOUT)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+    snapshots.extend_from_slice(inline);
+    Ok(snapshots)
+}
+
+/// The account a draft-id tool acts as: the draft's own, never the default
+/// account. An `account` the caller passes must name that same account.
+fn draft_tool_account(draft_id: &str, requested: Option<&str>) -> Result<String, String> {
+    let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
+    let draft = db
+        .get_draft(draft_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("draft not found: {draft_id}"))?;
+    let owner = db
+        .get_account(&draft.account_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| {
+            format!(
+                "account {} of draft {draft_id} no longer exists",
+                draft.account_id
+            )
+        })?;
+    if let Some(requested) = requested {
+        let named = crate::commands::common::resolve_account(&db, Some(requested))
+            .map_err(|e| format!("{e:#}"))?;
+        if named.id != owner.id {
+            return Err(format!(
+                "draft {draft_id} belongs to {}, not {} named by the `account` parameter. \
+                 Nothing was changed. Leave out `account` to use the draft's own account, \
+                 or pass that account.",
+                owner.username, named.username
+            ));
+        }
+    }
+    Ok(owner.id)
 }
 
 /// Whether the parsed `attributes` declaration is empty (missing, `[]`, or all
@@ -1224,12 +1281,13 @@ async fn handle_reply(
         .unwrap_or("INBOX");
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let inline_attachments = inline_attachments(params)?;
     let send_mode = params
         .get("send_mode")
         .and_then(|v| v.as_str())
         .map(SendMode::from_str)
         .transpose()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?
         .unwrap_or_else(|| default_mode_for_runtime(SendRuntime::AgentMcp));
     // Clamp the requested mode to the agent policy ceiling (never widens).
     let send_mode = clamp_mode(ctx, send_mode);
@@ -1265,15 +1323,15 @@ async fn handle_reply(
     let idempotency_key = idempotency_key(params)?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let parent = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
 
     let headers = if reply_all {
@@ -1314,7 +1372,7 @@ async fn handle_reply(
         SendPolicyDecision::Allowed => {}
         SendPolicyDecision::DraftOnly => {
             let attachment_snapshots =
-                snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+                new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
             let draft = db
                 .create_draft(
                     &creds.account.id,
@@ -1327,10 +1385,10 @@ async fn handle_reply(
                     None,
                     Some("mcp"),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             if !attachment_snapshots.is_empty() {
                 db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("{e:#}"))?;
             }
             db.set_draft_metadata(
                 &draft.id,
@@ -1341,7 +1399,7 @@ async fn handle_reply(
                     "source": {"folder": folder, "uid": uid},
                 }),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
             let mut result = json!({
                 "sent": false,
                 "status": "drafted",
@@ -1367,7 +1425,7 @@ async fn handle_reply(
         }
     }
 
-    let attachment_snapshots = snapshot_attachments(&attach_paths).map_err(|e| e.to_string())?;
+    let attachment_snapshots = new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
 
     // ── Attribution precheck (before ANY side effect) ──
     let precheck_req = reply_governor_request(
@@ -1546,9 +1604,11 @@ async fn handle_create_reply_draft(
         .unwrap_or(false);
     let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let inline_attachments = inline_attachments(params)?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
+    let new_attachments = new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
     let draft = crate::commands::drafts::create_reply_draft(
         &db,
         &creds,
@@ -1558,10 +1618,10 @@ async fn handle_create_reply_draft(
         reply_all,
         &authored,
         add_signature,
-        &attach_paths,
+        &new_attachments,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("{e:#}"))?;
 
     Ok(crate::commands::drafts::draft_envelope_json(&draft))
 }
@@ -1580,13 +1640,15 @@ async fn handle_create_forward_draft(
         .unwrap_or(false);
     let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let inline_attachments = inline_attachments(params)?;
     let include_attachments = params
         .get("include_attachments")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
+    let new_attachments = new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
     let draft = crate::commands::drafts::create_forward_draft(
         &db,
         &creds,
@@ -1596,20 +1658,20 @@ async fn handle_create_forward_draft(
         to,
         &authored,
         add_signature,
-        &attach_paths,
+        &new_attachments,
         include_attachments,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("{e:#}"))?;
 
     Ok(crate::commands::drafts::draft_envelope_json(&draft))
 }
 
 async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
     let id = required_str(params, "draft_id")?;
-    let account_arg = optional_str(params, "account");
     let add_signature = params.get("add_signature").and_then(|v| v.as_bool());
     let attach_paths = optional_string_array(params, &["attach", "attachments"])?;
+    let inline_attachments = inline_attachments(params)?;
     let remove_attachments =
         optional_string_array(params, &["remove_attach", "remove_attachments"])?;
     let clear_attachments = params
@@ -1619,8 +1681,10 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
 
     let authored = AuthoredBody::new(optional_str(params, "body"), optional_str(params, "html"));
 
-    let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+    let account = draft_tool_account(id, optional_str(params, "account"))?;
+    let (db, creds) = crate::commands::common::setup_credentials(Some(&account), backend)
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
+    let new_attachments = new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
     let draft = crate::commands::drafts::modify_draft(
         &db,
         &creds,
@@ -1632,22 +1696,22 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
         optional_str(params, "bcc"),
         optional_str(params, "subject"),
         add_signature,
-        &attach_paths,
+        &new_attachments,
         &remove_attachments,
         clear_attachments,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("{e:#}"))?;
 
     Ok(crate::commands::drafts::draft_envelope_json(&draft))
 }
 
 async fn handle_get_draft(params: &Value, _backend: CredentialBackend) -> Result<Value, String> {
     let id = required_str(params, "draft_id")?;
-    let db = Database::open_default().map_err(|e| e.to_string())?;
+    let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
     let draft = db
         .get_draft(id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| format!("draft not found: {id}"))?;
     Ok(crate::commands::drafts::draft_envelope_json(&draft))
 }
@@ -1695,10 +1759,10 @@ async fn handle_send_draft(
     // exactly that revision, so a human approval never covers a later edit.
     let mut admitted_revision = None;
     if ctx.is_some() {
-        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
         let draft = db
             .get_draft(id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| format!("draft not found: {id}"))?;
         // send_draft's confirm flags express full send intent, so the requested
         // mode is the maximal one; the ceiling clamps it down. A draft-only
@@ -1755,8 +1819,9 @@ async fn handle_send_draft(
     // Capture the EXACT validated revision + resolution so the queue CAS binds
     // to the revision the declaration was validated against — never a reloaded,
     // possibly concurrently-edited newer revision.
+    let account = draft_tool_account(id, account_arg)?;
     let precheck = {
-        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
         let precheck = crate::commands::drafts::precheck_draft(
             &db,
             id,
@@ -1804,7 +1869,7 @@ async fn handle_send_draft(
         SendDisposition::Queue {
             cooldown_seconds: cd,
         } => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
             let send_at = (chrono::Utc::now() + chrono::Duration::seconds(cd))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
@@ -1824,7 +1889,7 @@ async fn handle_send_draft(
                     cooldown_seconds: Some(cd),
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
             // The additive success block is built from the SAME validated
             // resolution — no re-resolve that could observe edited content.
             let queued_attribution =
@@ -1847,7 +1912,7 @@ async fn handle_send_draft(
     // a successful send can never leave the local DB at status=draft.
     match crate::commands::drafts::send_existing_draft(
         id,
-        account_arg,
+        Some(&account),
         backend,
         SendSurface::Mcp,
         &declared,
@@ -1891,7 +1956,7 @@ fn log_agent_mutation(
         draft_id,
         Some(agent_id),
     )
-    .map_err(|e| format!("could not record the agent action: {e}"))?;
+    .map_err(|e| format!("could not record the agent action: {e:#}"))?;
     let payload = json!({
         "action_type": action_type,
         "action": action_taken,
@@ -1903,7 +1968,7 @@ fn log_agent_mutation(
         Some(payload),
         Some(agent_id),
     )
-    .map_err(|e| format!("could not record the agent_action event: {e}"))?;
+    .map_err(|e| format!("could not record the agent_action event: {e:#}"))?;
     Ok(())
 }
 
@@ -1956,7 +2021,7 @@ fn idempotency_key(params: &Value) -> Result<Option<&str>, String> {
     let key = optional_str(params, "idempotency_key");
     if let Some(key) = key {
         envelope_email_store::send_attempts::validate_idempotency_key(key)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
     }
     Ok(key)
 }
@@ -1973,7 +2038,7 @@ async fn refuse_move_into_sent(
 ) -> Result<(), String> {
     let sent = envelope_email_transport::folders::detect_sent_folder(client, db, account_id)
         .await
-        .map_err(|e| format!("could not resolve the Sent folder to check `{dest}`: {e}"))?;
+        .map_err(|e| format!("could not resolve the Sent folder to check `{dest}`: {e:#}"))?;
     if is_sent_destination(dest, sent.as_deref()) {
         return Err(format!(
             "agents cannot move or copy messages into the Sent folder (`{dest}`): it is the \
@@ -2004,7 +2069,7 @@ async fn refuse_held(
 ) -> Result<(), String> {
     let denial = agent_context::held_message_denial(client, db, ctx, account_id, folder, uid)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     refuse_with(db, ctx, tool_name, account_id, denial)
 }
 
@@ -2040,11 +2105,11 @@ async fn handle_move(
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     refuse_move_into_sent(&mut client, &db, &creds.account.id, to_folder).await?;
     refuse_held(
         &mut client,
@@ -2059,7 +2124,7 @@ async fn handle_move(
 
     envelope_email_transport::imap::move_message(&mut client, uid, from_folder, to_folder)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let audit = log_agent_mutation(
         &db,
@@ -2106,17 +2171,17 @@ async fn handle_flag(
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     match action {
         "add" => {
             envelope_email_transport::imap::set_flag(&mut client, folder, uid, flag)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             envelope_email_transport::imap::record_own_flag_change(
                 &db,
                 &creds.account.id,
@@ -2127,14 +2192,14 @@ async fn handle_flag(
             )
             .map_err(|e| {
                 format!(
-                    "flag changed on the server, but updating the local message index failed: {e}"
+                    "flag changed on the server, but updating the local message index failed: {e:#}"
                 )
             })?;
         }
         "remove" => {
             envelope_email_transport::imap::remove_flag(&mut client, folder, uid, flag)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             envelope_email_transport::imap::record_own_flag_change(
                 &db,
                 &creds.account.id,
@@ -2145,7 +2210,7 @@ async fn handle_flag(
             )
             .map_err(|e| {
                 format!(
-                    "flag changed on the server, but updating the local message index failed: {e}"
+                    "flag changed on the server, but updating the local message index failed: {e:#}"
                 )
             })?;
         }
@@ -2177,15 +2242,15 @@ async fn handle_folders(params: &Value, backend: CredentialBackend) -> Result<Va
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (_db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let stats = envelope_email_transport::imap::list_folder_stats(&mut client)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(json!({
         "folders": stats,
@@ -2209,16 +2274,16 @@ async fn handle_tag(
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     // Fetch message to get Message-ID
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let (message, raw) =
         envelope_email_transport::imap::fetch_message_with_raw(&mut client, folder, uid)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| format!("message {uid} not found in {folder}"))?;
     tag_message(
         &db,
@@ -2257,7 +2322,7 @@ fn tag_message(
         for tag_val in tags {
             if let Some(tag) = tag_val.as_str() {
                 db.add_tag(account_id, message_id, tag, Some(uid as i64), Some(folder))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("{e:#}"))?;
             }
         }
     }
@@ -2274,7 +2339,7 @@ fn tag_message(
                     Some(uid as i64),
                     Some(folder),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             }
         }
     }
@@ -2283,7 +2348,7 @@ fn tag_message(
         envelope_email_transport::threat::persist::shown_tags_and_scores(
             db, account_id, folder, uid, message_id, raw,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     let audit = log_agent_mutation(
         db,
@@ -2314,7 +2379,7 @@ async fn handle_contacts(params: &Value, backend: CredentialBackend) -> Result<V
     let account_arg = params.get("account").and_then(|v| v.as_str());
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
     contacts_action(&db, &creds.account.id, action, params)
 }
 
@@ -2329,7 +2394,7 @@ fn contacts_action(
             let tag_filter = params.get("tag").and_then(|v| v.as_str());
             let contacts = db
                 .list_contacts(account_id, tag_filter)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             Ok(Value::Array(
                 contacts
                     .iter()
@@ -2344,7 +2409,7 @@ fn contacts_action(
                 .ok_or("email is required for show")?;
             let contact = db
                 .get_contact(account_id, email)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             Ok(ui::with_ui(&contact, ui::account_ui(account_id)))
         }
         "add" => {
@@ -2378,7 +2443,7 @@ fn contacts_action(
             // An agent-written contact never vouches for the address to the
             // Governor gate; see `envelope_email_store::Curator`.
             db.upsert_contact_by(&contact, envelope_email_store::Curator::Agent)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             Ok(ui::with_ui(&contact, ui::account_ui(account_id)))
         }
         "tag" => {
@@ -2391,7 +2456,7 @@ fn contacts_action(
                 .and_then(|v| v.as_str())
                 .ok_or("tag is required")?;
             db.add_contact_tag(account_id, email, tag, envelope_email_store::Curator::Agent)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             Ok(json!({
                 "tagged": true,
                 "email": email,
@@ -2409,7 +2474,7 @@ fn contacts_action(
                 .and_then(|v| v.as_str())
                 .ok_or("tag is required")?;
             db.remove_contact_tag(account_id, email, tag, envelope_email_store::Curator::Agent)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             Ok(json!({
                 "untagged": true,
                 "email": email,
@@ -2536,7 +2601,7 @@ async fn handle_bulk(
     if let Some(ctx) = ctx {
         let underlying = agent_context::bulk_underlying_action(&op_str)
             .ok_or_else(|| format!("unknown bulk op '{op_str}'"))?;
-        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let db = Database::open_default().map_err(|e| format!("{e:#}"))?;
         let account = authoritative_policy_account(&db, "bulk", params)?;
         let folder = params.get("folder").and_then(|v| v.as_str());
         ctx.authorize_action(underlying, &account, folder)
@@ -2545,11 +2610,11 @@ async fn handle_bulk(
 
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     if let envelope_email_transport::bulk::BulkOp::Move { to_folder }
     | envelope_email_transport::bulk::BulkOp::Copy { to_folder } = &req.op
     {
@@ -2557,7 +2622,7 @@ async fn handle_bulk(
     }
     let held = agent_context::held_bulk_denial(&mut client, &db, ctx, &creds.account.id, &mut req)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     refuse_with(&db, ctx, "bulk", &creds.account.id, held)?;
 
     let result = envelope_email_transport::bulk::execute(&mut client, &db, &creds.account.id, &req)
@@ -2585,7 +2650,7 @@ async fn handle_bulk(
         )
     };
 
-    let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+    let mut out = serde_json::to_value(&result).map_err(|e| format!("{e:#}"))?;
     attach_audit_warning(&mut out, audit);
     if let (true, Some(obj)) = (forced_dry_run, out.as_object_mut()) {
         obj.insert(
@@ -2601,7 +2666,7 @@ async fn handle_bulk(
 async fn handle_thread(params: &Value, backend: CredentialBackend) -> Result<Value, String> {
     let account_arg = params.get("account").and_then(|v| v.as_str());
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
 
     // thread show: a uid selects a single conversation. Otherwise list recent
     // threads (bounded by the same agent list-limit cap the CLI uses).
@@ -2613,20 +2678,20 @@ async fn handle_thread(params: &Value, backend: CredentialBackend) -> Result<Val
             .unwrap_or("INBOX");
         let thread_id = db
             .find_thread_by_uid(uid, folder, &creds.account.id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| {
                 format!("message UID {uid} in {folder} not found in any thread (run thread build)")
             })?;
         let thread = db
             .get_thread(&thread_id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?
             .ok_or("thread not found in database")?;
         if thread.account_id != creds.account.id {
             return Err("thread belongs to a different account".to_string());
         }
         let messages = db
             .get_thread_messages(&thread_id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         return Ok(wrap_untrusted(json!({
             "thread_id": thread.thread_id,
             "subject": thread.subject_normalized,
@@ -2645,7 +2710,7 @@ async fn handle_thread(params: &Value, backend: CredentialBackend) -> Result<Val
     let limit = validate_agent_list_limit(params.get("limit"))?;
     let threads = db
         .list_threads(Some(&creds.account.id), limit)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     Ok(wrap_untrusted(Value::Array(
         threads
             .iter()
@@ -2673,15 +2738,15 @@ async fn handle_rules_preview(params: &Value, backend: CredentialBackend) -> Res
     let limit = validate_agent_list_limit(params.get("limit"))?;
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     crate::commands::rule::preview_core(&mut client, &db, &creds.account.id, folder, limit)
         .await
         .map(wrap_untrusted)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 async fn handle_rules_run(
@@ -2703,16 +2768,16 @@ async fn handle_rules_run(
         .unwrap_or(true);
 
     let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-        .map_err(|e: anyhow::Error| e.to_string())?;
+        .map_err(|e: anyhow::Error| format!("{e:#}"))?;
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     if dry_run {
         let mut preview =
             crate::commands::rule::preview_core(&mut client, &db, &creds.account.id, folder, limit)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
         if let Some(obj) = preview.as_object_mut() {
             obj.insert("dry_run".to_string(), json!(true));
             obj.insert(
@@ -2736,7 +2801,7 @@ async fn handle_rules_run(
         &attribution,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("{e:#}"))?;
     if let Some(obj) = result.as_object_mut() {
         obj.insert("dry_run".to_string(), json!(false));
     }
@@ -2751,22 +2816,25 @@ async fn handle_watch_status(params: &Value, backend: CredentialBackend) -> Resu
     let (db, account_id) = match account_arg {
         Some(_) => {
             let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-                .map_err(|e: anyhow::Error| e.to_string())?;
+                .map_err(|e: anyhow::Error| format!("{e:#}"))?;
             (db, Some(creds.account.id))
         }
-        None => (Database::open_default().map_err(|e| e.to_string())?, None),
+        None => (
+            Database::open_default().map_err(|e| format!("{e:#}"))?,
+            None,
+        ),
     };
 
     let watches = db
         .list_watches(account_id.as_deref(), 100)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     // Delivery counts by high-level status (bounded reads).
     let cap = 1000usize;
     let count = |filter: DeliveryStatusFilter| -> Result<usize, String> {
         db.list_deliveries(filter, cap)
             .map(|v| v.len())
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("{e:#}"))
     };
     let delivered = count(DeliveryStatusFilter::Delivered)?;
     let dead = count(DeliveryStatusFilter::Dead)?;
@@ -2775,7 +2843,7 @@ async fn handle_watch_status(params: &Value, backend: CredentialBackend) -> Resu
     // Most recent successful delivery timestamp across the recent window.
     let recent = db
         .list_deliveries(DeliveryStatusFilter::Delivered, cap)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let last_delivery = recent.iter().filter_map(|d| d.delivered_at.clone()).max();
 
     Ok(json!({
@@ -2815,15 +2883,18 @@ async fn handle_snooze(
                 Some(_) => {
                     let (db, creds) =
                         crate::commands::common::setup_credentials(account_arg, backend)
-                            .map_err(|e: anyhow::Error| e.to_string())?;
+                            .map_err(|e: anyhow::Error| format!("{e:#}"))?;
                     (db, Some(creds.account.username))
                 }
-                None => (Database::open_default().map_err(|e| e.to_string())?, None),
+                None => (
+                    Database::open_default().map_err(|e| format!("{e:#}"))?,
+                    None,
+                ),
             };
             let snoozed = db
                 .list_snoozed(filter.as_deref())
-                .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_value(&snoozed).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok(serde_json::to_value(&snoozed).map_err(|e| format!("{e:#}"))?)
         }
         "set" => {
             let uid = required_uid(params)?;
@@ -2836,15 +2907,15 @@ async fn handle_snooze(
             let note = params.get("note").and_then(|v| v.as_str());
             let recipient = params.get("recipient").and_then(|v| v.as_str());
             let return_at = crate::commands::datetime::parse_until(until)
-                .map_err(|e| format!("failed to parse until: {e}"))?;
+                .map_err(|e| format!("failed to parse until: {e:#}"))?;
 
             let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-                .map_err(|e: anyhow::Error| e.to_string())?;
+                .map_err(|e: anyhow::Error| format!("{e:#}"))?;
             let account_email = creds.account.username.clone();
 
             if db
                 .find_snoozed_by_uid(&account_email, uid)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:#}"))?
                 .is_some()
             {
                 return Err(format!("UID {uid} is already snoozed; cancel it first"));
@@ -2852,7 +2923,7 @@ async fn handle_snooze(
 
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             refuse_held(
                 &mut client,
                 &db,
@@ -2866,14 +2937,14 @@ async fn handle_snooze(
             let _ = envelope_email_transport::imap::create_folder(&mut client, "Snoozed").await;
             let msg = envelope_email_transport::imap::fetch_message(&mut client, folder, uid)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             let (subject, message_id) = match &msg {
                 Some(m) => (Some(m.subject.as_str()), m.message_id.as_deref()),
                 None => (None, None),
             };
             envelope_email_transport::imap::move_message(&mut client, uid, folder, "Snoozed")
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             let snoozed = db
                 .create_snoozed(
                     &account_email,
@@ -2887,7 +2958,7 @@ async fn handle_snooze(
                     note,
                     recipient,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
 
             let audit = log_agent_mutation(
                 &db,
@@ -2898,23 +2969,23 @@ async fn handle_snooze(
                 message_id,
                 None,
             );
-            let mut result = serde_json::to_value(&snoozed).map_err(|e| e.to_string())?;
+            let mut result = serde_json::to_value(&snoozed).map_err(|e| format!("{e:#}"))?;
             attach_audit_warning(&mut result, audit);
             Ok(result)
         }
         "cancel" => {
             let uid = required_uid(params)?;
             let (db, creds) = crate::commands::common::setup_credentials(account_arg, backend)
-                .map_err(|e: anyhow::Error| e.to_string())?;
+                .map_err(|e: anyhow::Error| format!("{e:#}"))?;
             let account_email = creds.account.username.clone();
             let snoozed = db
                 .find_snoozed_by_uid(&account_email, uid)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:#}"))?
                 .ok_or_else(|| format!("no snoozed message found for UID {uid}"))?;
 
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{e:#}"))?;
             envelope_email_transport::imap::move_message(
                 &mut client,
                 snoozed.uid,
@@ -2922,8 +2993,9 @@ async fn handle_snooze(
                 &snoozed.original_folder,
             )
             .await
-            .map_err(|e| e.to_string())?;
-            db.delete_snoozed(&snoozed.id).map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
+            db.delete_snoozed(&snoozed.id)
+                .map_err(|e| format!("{e:#}"))?;
 
             let audit = log_agent_mutation(
                 &db,

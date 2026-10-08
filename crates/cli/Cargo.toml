@@ -46,6 +46,7 @@ hickory-resolver.workspace = true
 lettre.workspace = true
 mime_guess = "2"
 base64.workspace = true
+hostname.workspace = true
 rpassword.workspace = true
 wait-timeout.workspace = true
 
