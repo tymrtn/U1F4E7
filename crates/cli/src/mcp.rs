@@ -13,11 +13,13 @@ use crate::commands::attachments::{
 };
 use crate::commands::authored_body::AuthoredBody;
 use crate::commands::contract::{DEFAULT_AGENT_LIST_LIMIT, MAX_AGENT_LIST_LIMIT};
+use crate::commands::drafts::HeldDraft;
 use crate::commands::governor_gate::{account_domain, governor_request, precheck_attribution};
 use crate::commands::send_attempt::{
     GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request, uncertain_outcome,
 };
 use crate::commands::ui;
+use envelope_email_store::models::{AccountWithCredentials, Draft};
 use envelope_email_store::{CredentialBackend, Database, Event};
 use envelope_email_transport::attribution_persist::success_attribution_block;
 use envelope_email_transport::outbound::{
@@ -855,25 +857,20 @@ async fn handle_send(
         SendPolicyDecision::DraftOnly => {
             let attachment_snapshots =
                 new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
-            let draft = db
-                .create_draft(
-                    &creds.account.id,
-                    to,
-                    Some(subject),
-                    body,
-                    html,
-                    None,
-                    cc,
-                    bcc,
-                    Some("mcp"),
-                )
-                .map_err(|e| format!("{e:#}"))?;
-            if !attachment_snapshots.is_empty() {
-                db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| format!("{e:#}"))?;
-            }
-            crate::commands::drafts::persist_from_override(&db, &draft.id, from)
-                .map_err(|e| format!("{e:#}"))?;
+            let held = HeldDraft {
+                to,
+                cc,
+                bcc,
+                subject,
+                text: body,
+                html,
+                from,
+                in_reply_to: None,
+                references: &[],
+                attachments: &attachment_snapshots,
+                metadata: json!({}),
+            };
+            let draft = saved_in_mailbox(&db, &creds, held).await?;
             let mut result = json!({
                 "sent": false,
                 "status": "drafted",
@@ -1373,33 +1370,25 @@ async fn handle_reply(
         SendPolicyDecision::DraftOnly => {
             let attachment_snapshots =
                 new_attachment_snapshots(&attach_paths, &inline_attachments).await?;
-            let draft = db
-                .create_draft(
-                    &creds.account.id,
-                    &headers.to,
-                    Some(&headers.subject),
-                    Some(body),
-                    html,
-                    headers.in_reply_to.as_deref(),
-                    cc_str.as_deref(),
-                    None,
-                    Some("mcp"),
-                )
-                .map_err(|e| format!("{e:#}"))?;
-            if !attachment_snapshots.is_empty() {
-                db.update_draft_attachments(&draft.id, &attachment_snapshots)
-                    .map_err(|e| format!("{e:#}"))?;
-            }
-            db.set_draft_metadata(
-                &draft.id,
-                &json!({
+            let held = HeldDraft {
+                to: &headers.to,
+                cc: cc_str.as_deref(),
+                bcc: None,
+                subject: &headers.subject,
+                text: Some(body),
+                html,
+                from: None,
+                in_reply_to: headers.in_reply_to.as_deref(),
+                references: &headers.references,
+                attachments: &attachment_snapshots,
+                metadata: json!({
                     "draft_kind": "reply",
                     "in_reply_to": headers.in_reply_to.clone(),
                     "references": headers.references.clone(),
                     "source": {"folder": folder, "uid": uid},
                 }),
-            )
-            .map_err(|e| format!("{e:#}"))?;
+            };
+            let draft = saved_in_mailbox(&db, &creds, held).await?;
             let mut result = json!({
                 "sent": false,
                 "status": "drafted",
@@ -1703,7 +1692,53 @@ async fn handle_modify_draft(params: &Value, backend: CredentialBackend) -> Resu
     .await
     .map_err(|e| format!("{e:#}"))?;
 
-    Ok(crate::commands::drafts::draft_envelope_json(&draft))
+    let envelope = crate::commands::drafts::draft_envelope_json(&draft);
+    if !creds.account.imap_host.is_empty() && envelope["storage"]["local_only"] == true {
+        let reason = envelope["storage"]["sync_status_reason"]
+            .as_str()
+            .unwrap_or("mailbox_append_failed");
+        return Err(draft_not_in_mailbox(
+            &draft,
+            &format!("The edit did not reach the Drafts folder ({reason})."),
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Save a held draft in the mailbox's Drafts folder and return it. A draft
+/// the mailbox did not get is an error, though Envelope keeps its copy.
+async fn saved_in_mailbox(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    held: HeldDraft<'_>,
+) -> Result<Draft, String> {
+    let saved = crate::commands::drafts::save_held_draft(db, creds, held)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    match saved.not_in_mailbox {
+        None => Ok(saved.draft),
+        Some(cause) => Err(draft_not_in_mailbox(
+            &saved.draft,
+            &format!("Saving it to the Drafts folder failed: {cause:#}"),
+        )),
+    }
+}
+
+/// The error for a draft Envelope saved that the mailbox's Drafts folder did
+/// not get, so the user's other mail clients cannot show it.
+fn draft_not_in_mailbox(draft: &Draft, cause: &str) -> String {
+    json!({
+        "status": "saved_locally",
+        "error": {
+            "code": "draft_not_in_mailbox",
+            "reason": format!(
+                "The draft was saved locally but not in the mailbox, so other mail clients will not show it. {cause}"
+            ),
+        },
+        "draft_id": draft.id,
+        "draft": crate::commands::drafts::draft_envelope_json(draft),
+    })
+    .to_string()
 }
 
 async fn handle_get_draft(params: &Value, _backend: CredentialBackend) -> Result<Value, String> {
