@@ -818,6 +818,46 @@ const UI_LINK_TOOLS: &[&str] = &[
     "rules_run",
 ];
 
+/// MCP tools that take `attach` paths and `attach_content` files.
+const ATTACHMENT_TOOLS: &[&str] = &[
+    "send",
+    "reply",
+    "create_reply_draft",
+    "create_forward_draft",
+    "modify_draft",
+];
+
+/// The server may run on another machine than its client, so every
+/// attachment tool says where an `attach` path is read.
+const MCP_ATTACH_TOOL_NOTE: &str = "Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.";
+
+fn mcp_attach_paths(purpose: &str) -> Value {
+    array_of(string(&format!(
+        "{purpose}, read on the machine running this server; a remote client uses attach_content"
+    )))
+}
+
+/// MCP `attach_content`: files sent as bytes. Runtime checks live in
+/// `attachments::inline_attachment_snapshots`.
+fn attach_content_schema() -> Value {
+    use envelope_email_dashboard::handlers::draft_attachments::MAX_DRAFT_ATTACHMENT_BYTES;
+    json!({
+        "type": "array",
+        "description": format!(
+            "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most {} MiB in all per call",
+            MAX_DRAFT_ATTACHMENT_BYTES / (1024 * 1024)
+        ),
+        "items": object(
+            json!({
+                "filename": string("Bare file name, no directory part"),
+                "data_base64": string("File bytes as standard padded base64, no line breaks"),
+                "content_type": string("MIME type; guessed from filename when omitted")
+            }),
+            json!(["filename", "data_base64"]),
+        ),
+    })
+}
+
 /// The `include_ui_links` input every tool in [`UI_LINK_TOOLS`] shares. Kept to
 /// one short line because tools/list rides along with every model request.
 fn include_ui_links_schema() -> Value {
@@ -929,6 +969,9 @@ fn mcp_tool_entries() -> Value {
                     input_schema["properties"]["include_ui_links"] = include_ui_links_schema();
                 }
                 if *name == "send" {
+                    input_schema["properties"]["attach"] =
+                        mcp_attach_paths("File attachment path to snapshot or send");
+                    input_schema["properties"]["attach_content"] = attach_content_schema();
                     if let Some(send_mode) = input_schema
                         .get_mut("properties")
                         .and_then(|props| props.get_mut("send_mode"))
@@ -939,6 +982,11 @@ fn mcp_tool_entries() -> Value {
                         );
                     }
                 }
+                let description = if ATTACHMENT_TOOLS.contains(name) {
+                    format!("{description} {MCP_ATTACH_TOOL_NOTE}")
+                } else {
+                    description.to_string()
+                };
                 json!({
                     "name": name,
                     "description": description,
@@ -1007,8 +1055,9 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "send_now": json!({"type": "boolean", "default": false, "description": "Emergency bypass: transmit immediately instead of queueing into the outbox cooldown. Requires confirm_send_now"}),
                     "confirm_send_now": json!({"type": "boolean", "default": false, "description": "Explicit confirmation required to use send_now or cooldown_seconds=0"}),
                     "allow_recipient": array_of(json!({"type": "string", "description": "Allowed recipient email or domain for allowlisted-send. With an agent identity this is intent only: the agent policy's allow_recipients decide"})),
-                    "attach": array_of(string("File attachment path to snapshot or send")),
+                    "attach": mcp_attach_paths("File attachment path to snapshot or send"),
                     "attachments": array_of(string("File attachment path alias for attach")),
+                    "attach_content": attach_content_schema(),
                     "folder": string_default("IMAP folder of original message", "INBOX"),
                     "idempotency_key": idempotency_key_schema(),
                     "account": string("Account ID or email address")
@@ -1027,8 +1076,9 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "body": string("Initial agent-authored plain-text body"),
                     "html": string("Initial agent-authored HTML body"),
                     "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
-                    "attach": array_of(string("File attachment path to snapshot into the draft")),
+                    "attach": mcp_attach_paths("File attachment path to snapshot into the draft"),
                     "attachments": array_of(string("File attachment path alias for attach")),
+                    "attach_content": attach_content_schema(),
                     "account": string("Account ID or email address")
                 }),
                 json!(["uid"]),
@@ -1045,8 +1095,9 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "body": string("Initial agent-authored plain-text body"),
                     "html": string("Initial agent-authored HTML body"),
                     "add_signature": json!({"type": "boolean", "description": "Append the account signature when available", "default": false}),
-                    "attach": array_of(string("File attachment path to snapshot into the draft")),
+                    "attach": mcp_attach_paths("File attachment path to snapshot into the draft"),
                     "attachments": array_of(string("File attachment path alias for attach")),
+                    "attach_content": attach_content_schema(),
                     "include_attachments": json!({"type": "boolean", "description": "Forward original source-message attachments into the new draft", "default": false}),
                     "account": string("Account ID or email address")
                 }),
@@ -1066,8 +1117,9 @@ fn mcp_only_inputs() -> Vec<(&'static str, Value, Value)> {
                     "bcc": string("BCC override"),
                     "subject": string("Subject override"),
                     "add_signature": json!({"type": "boolean", "description": "Override signature application for this edit"}),
-                    "attach": array_of(string("File attachment path to add to the draft")),
+                    "attach": mcp_attach_paths("File attachment path to add to the draft"),
                     "attachments": array_of(string("File attachment path alias for attach")),
+                    "attach_content": attach_content_schema(),
                     "remove_attach": array_of(string("Stored attachment filename to remove")),
                     "remove_attachments": array_of(string("Stored attachment filename alias for remove_attach")),
                     "clear_attachments": json!({"type": "boolean", "description": "Remove all stored attachments before adding new files", "default": false}),

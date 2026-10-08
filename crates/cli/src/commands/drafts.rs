@@ -797,7 +797,7 @@ pub(crate) async fn create_reply_draft(
     reply_all: bool,
     authored: &AuthoredBody,
     signature: bool,
-    attach_paths: &[String],
+    new_attachments: &[serde_json::Value],
 ) -> Result<Draft> {
     if creds.account.imap_host.is_empty() {
         bail!("reply requires an IMAP account to fetch the parent message");
@@ -828,7 +828,7 @@ pub(crate) async fn create_reply_draft(
     } else {
         Some(headers.cc.join(", "))
     };
-    let attachment_snapshots = snapshot_attachments(attach_paths)?;
+    let attachment_snapshots = new_attachments.to_vec();
     let attachments = decode_attachments(&attachment_snapshots)?;
 
     let spec = ContextualDraftSpec {
@@ -942,7 +942,7 @@ pub(crate) async fn create_forward_draft(
     to: Option<&str>,
     authored: &AuthoredBody,
     signature: bool,
-    attach_paths: &[String],
+    new_attachments: &[serde_json::Value],
     include_attachments: bool,
 ) -> Result<Draft> {
     if creds.account.imap_host.is_empty() {
@@ -968,7 +968,7 @@ pub(crate) async fn create_forward_draft(
     } else {
         Vec::new()
     };
-    attachment_snapshots.extend(snapshot_attachments(attach_paths)?);
+    attachment_snapshots.extend_from_slice(new_attachments);
     let attachments = decode_attachments(&attachment_snapshots)?;
 
     let spec = ContextualDraftSpec {
@@ -1009,7 +1009,7 @@ pub(crate) async fn modify_draft(
     bcc: Option<&str>,
     subject: Option<&str>,
     add_signature: Option<bool>,
-    attach_paths: &[String],
+    new_attachments: &[serde_json::Value],
     remove_attachments: &[String],
     clear_attachments: bool,
 ) -> Result<Draft> {
@@ -1114,9 +1114,7 @@ pub(crate) async fn modify_draft(
             !remove_attachments.iter().any(|name| name == filename)
         });
     }
-    if !attach_paths.is_empty() {
-        attachment_snapshots.extend(snapshot_attachments(attach_paths)?);
-    }
+    attachment_snapshots.extend_from_slice(new_attachments);
     let attachments =
         decode_attachments(&attachment_snapshots).context("failed to decode draft attachments")?;
 
@@ -1538,7 +1536,7 @@ pub async fn run_reply(
         reply_all,
         &authored,
         signature,
-        attach_paths,
+        &snapshot_attachments(attach_paths)?,
     )
     .await?;
     emit_draft_envelope(&draft, json, Some(&authored));
@@ -1575,7 +1573,7 @@ pub async fn run_forward(
         to,
         &authored,
         signature,
-        attach_paths,
+        &snapshot_attachments(attach_paths)?,
         include_attachments,
     )
     .await?;
@@ -1754,7 +1752,7 @@ pub async fn run_edit(
         bcc,
         subject,
         add_signature,
-        attach_paths,
+        &snapshot_attachments(attach_paths)?,
         remove_attachments,
         clear_attachments,
     )

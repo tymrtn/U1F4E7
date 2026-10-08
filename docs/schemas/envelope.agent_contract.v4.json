@@ -420,7 +420,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now.",
+      "description": "Send an email. Supports text and HTML bodies, CC, BCC, reply-to, and file attachments. `attributes` are required factual labels describing this message (declare every catalog key honestly true of it); the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help (definition, syntax, examples, catalog pointers) and a compact error.recovery — no draft is created. By default an allowed send QUEUES into the outbox with a cooldown (default 60s) and only transmits later via the scheduled-send sweep, after the Governor gate permits it (when built with the `governor` feature); immediate transmission requires send_now + confirm_send_now. Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -437,8 +437,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot or send",
+              "description": "File attachment path to snapshot or send, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -576,7 +602,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery.",
+      "description": "Reply to a message. Automatically sets In-Reply-To, References, and subject prefix. `attributes` are required factual labels for this message; the attributes parameter lists them. A missing/invalid declaration returns attributes_required/attributes_invalid with a self-contained error.help plus a compact error.recovery. Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -593,8 +619,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot or send",
+              "description": "File attachment path to snapshot or send, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -744,7 +796,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Create a Mail.app-style contextual reply draft with populated threading headers, preserved quoted context, and abridged preview.",
+      "description": "Create a Mail.app-style contextual reply draft with populated threading headers, preserved quoted context, and abridged preview. Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -759,8 +811,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot into the draft",
+              "description": "File attachment path to snapshot into the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -808,7 +886,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Create a Mail.app-style contextual forward draft with forwarded-message context and abridged preview.",
+      "description": "Create a Mail.app-style contextual forward draft with forwarded-message context and abridged preview. Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -823,8 +901,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot into the draft",
+              "description": "File attachment path to snapshot into the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -876,7 +980,7 @@
     },
     {
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Modify the agent-authored portion of a contextual draft while preserving quote/forward context and threading metadata.",
+      "description": "Modify the agent-authored portion of a contextual draft while preserving quote/forward context and threading metadata. Attachment paths are read on the machine running this server; a client on another machine sends file bytes in attach_content.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -890,8 +994,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to add to the draft",
+              "description": "File attachment path to add to the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -3167,8 +3297,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot or send",
+              "description": "File attachment path to snapshot or send, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -3485,8 +3641,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot into the draft",
+              "description": "File attachment path to snapshot into the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -3555,8 +3737,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to snapshot into the draft",
+              "description": "File attachment path to snapshot into the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
@@ -3628,8 +3836,34 @@
           },
           "attach": {
             "items": {
-              "description": "File attachment path to add to the draft",
+              "description": "File attachment path to add to the draft, read on the machine running this server; a remote client uses attach_content",
               "type": "string"
+            },
+            "type": "array"
+          },
+          "attach_content": {
+            "description": "Files sent as base64, for a client on another machine than the server. Each is stored exactly as an attach path with the same bytes would be; at most 25 MiB in all per call",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "description": "MIME type; guessed from filename when omitted",
+                  "type": "string"
+                },
+                "data_base64": {
+                  "description": "File bytes as standard padded base64, no line breaks",
+                  "type": "string"
+                },
+                "filename": {
+                  "description": "Bare file name, no directory part",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename",
+                "data_base64"
+              ],
+              "type": "object"
             },
             "type": "array"
           },
