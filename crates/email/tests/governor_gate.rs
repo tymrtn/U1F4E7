@@ -7,24 +7,27 @@
 //! binary; they point the gate at a tiny shell-script stub so we can assert the
 //! allow/deny/review wiring deterministically.
 
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-
 use envelope_email_transport::outbound::{
     GovernorConfig, GovernorMode, GovernorRequest, SendSurface, gate,
 };
 
-/// Write an executable shell-script stub that prints `body` on stdout and exits 0.
+const STUB_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/governor-stub.sh"
+);
+
+/// Create a Governor stub at `dir/name` that prints `body` on stdout, exits 0,
+/// and records its arguments to `dir/name.argv`.
+///
+/// The stub is a symlink to a checked-in script, so no test ever writes the
+/// file it executes. Writing a script and then running it races with sibling
+/// tests: a process they fork in that window inherits the open write handle,
+/// and running the script fails with ETXTBSY ("Text file busy"), which the gate
+/// correctly reports as `governor_unavailable`.
 fn stub_governor(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "#!/bin/sh").unwrap();
-    // Emit the canned JSON regardless of arguments.
-    writeln!(f, "cat <<'EOF'\n{body}\nEOF").unwrap();
-    drop(f);
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    std::fs::write(dir.join(format!("{name}.verdict")), body).unwrap();
+    std::os::unix::fs::symlink(STUB_SCRIPT, &path).unwrap();
     path
 }
 
@@ -120,35 +123,17 @@ fn warn_mode_allows_even_on_deny() {
     assert_eq!(outcome.decision, "deny");
 }
 
-/// Write a stub that records the exact argv it was invoked with to `argv_out`,
-/// then emits an allow verdict. Lets us assert the blind-attribution invocation
-/// shape without invoking the real Governor.
-fn stub_governor_recording(
-    dir: &std::path::Path,
-    name: &str,
-    argv_out: &std::path::Path,
-) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "#!/bin/sh").unwrap();
-    writeln!(f, "echo \"$@\" > \"{}\"", argv_out.display()).unwrap();
-    writeln!(
-        f,
-        "cat <<'EOF'\n{{\"decision\":\"allow\",\"state\":\"allowed\",\"score\":0.2}}\nEOF"
-    )
-    .unwrap();
-    drop(f);
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
+/// The stub records the exact argv it was invoked with, which lets us assert
+/// the blind-attribution invocation shape without invoking the real Governor.
 #[test]
 fn gate_invocation_passes_attribute_keys_and_never_pii() {
     let dir = tempfile::tempdir().unwrap();
-    let argv_out = dir.path().join("argv.txt");
-    let bin = stub_governor_recording(dir.path(), "governor-record", &argv_out);
+    let bin = stub_governor(
+        dir.path(),
+        "governor-record",
+        r#"{"decision":"allow","state":"allowed","score":0.2}"#,
+    );
+    let argv_out = dir.path().join("governor-record.argv");
     let config = GovernorConfig {
         mode: GovernorMode::Required,
         bin: bin.to_string_lossy().to_string(),
