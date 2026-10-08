@@ -27,7 +27,7 @@
       },
       "actor": "Under a token, `envelope actions exec --actor` must name the agent itself (its name or id); any other actor is refused with operator_only_command.",
       "classes": {
-        "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. Some gated commands then apply more of the policy (see send and actions).",
+        "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. It then checks the policy's account and folder lists (see scope), and some gated commands apply more of the policy (see send and actions).",
         "operator_only": "Changes credentials, agent identities or policy, configuration, authentication, delivery routes, or a decision that belongs to a person, or runs the dashboard server. Refused under any agent token with operator_only_command, whatever the policy grants. The operator runs it without the token, for example `env -u ENVELOPE_AGENT_TOKEN envelope config set ...`.",
         "read_only": "Reads mail or local state. Runs under any active agent's token as it does for the operator. Every command not listed in gated_commands or operator_only_commands is read-only."
       },
@@ -35,7 +35,8 @@
         "agent_token_invalid",
         "operator_only_command",
         "agent_policy_denied_action",
-        "agent_policy_denied_account"
+        "agent_policy_denied_account",
+        "agent_policy_denied_folder"
       ],
       "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. `send` and `draft send` can also return the send-policy codes (outbound_safety.send_authority.denial_codes).",
       "env": "ENVELOPE_AGENT_TOKEN",
@@ -214,7 +215,7 @@
       ],
       "quarantine": "Under a token, quarantine is operator-only. Refused with operator_only_command: any CLI command that is not read-only whose --folder is the quarantine folder (Envelope/Quarantine, compared case-insensitively with `.` or `/` as the separator, a trailing separator, and with or without an INBOX prefix), such as move, copy, delete, flag, tag, snooze, bulk, draft reply or forward, `rule run --confirm` and `watch --run-rules` (`threat report` runs there, since it only reads the message and drafts a report); any MCP tool call other than a read whose folder or from_folder is the quarantine folder (rules_run counts as a read with dry_run left true, snooze with action list); `rule create` or `rule enable` of a rule whose match selects by a threat:* tag or the threat score, or whose action moves mail into quarantine; and `rule create`, `enable`, `disable` or `delete` naming the shipped rule \"Envelope threat quarantine\". The check also reads each message: move, copy, delete and snooze set, bulk move, copy and delete (CLI and MCP), and the moves and deletes of an agent's rule run are refused with operator_only_command for a message whose threat key or Message-ID carries threat:quarantined or threat:malware, or whose stored verdict for the same bytes is malware or dangerous, in any folder that shows it (Gmail also lists it in [Gmail]/All Mail). A Mark safe on those bytes lifts this.",
       "resolution": "With no token, or a blank one, the CLI runs as the operator and behaves as before. Any other value must be the token of an active agent: an unknown or revoked token, or one that is not valid UTF-8, fails every command closed with error.code=agent_token_invalid before it runs and never falls back to the operator. The token is never echoed. `envelope mcp` checks the token at startup instead (see semantics).",
-      "scope": "Before dispatch only actions are checked. `send`, `draft send`, and the rule commands that need rules.webhook, rules.batch_ack or sieve.publish also check the account. Other commands do not apply the policy's account or folder lists.",
+      "scope": "Before dispatch only actions are checked. Every gated command then checks the account it acts on, and each folder it reads or changes as the command line names it, before any write or network call, and refuses with agent_policy_denied_account or agent_policy_denied_folder. move, copy, bulk move and bulk copy check their source and destination; other commands check their --folder. Drafts and scheduled messages are checked under their own account. `snooze cancel` and `unsnooze` check the folder each message returns to, in its own account, and `snooze check-replies` searches every account's INBOX, so it needs all of them. Read-only commands do not apply the policy's account or folder lists.",
       "send": "`envelope send` and `envelope draft send` also check the `send` action for the resolved account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
       "threat_tags": "Under a token, setting a threat:* tag is operator-only: `tag set` and `bulk tag` with one, and `rule create` with an action that sets one (read after JSON decoding, trimmed and case-insensitive, including actions a confirm offer takes from another rule) or `rule enable` of such a rule, are refused with operator_only_command."
     },

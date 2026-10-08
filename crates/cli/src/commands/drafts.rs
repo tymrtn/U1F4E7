@@ -25,6 +25,7 @@ use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
 use tracing::{info, warn};
 
+use super::agent_context;
 use super::attachments::{attachment_summaries, decode_attachments, snapshot_attachments};
 use super::authored_body::{AuthoredBody, attach_notice};
 use super::common::{resolve_account, setup_credentials};
@@ -1526,6 +1527,15 @@ pub async fn run_reply(
     attach_paths: &[String],
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "draft.create",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
     let authored = AuthoredBody::new(body, html);
     let draft = create_reply_draft(
         &db,
@@ -1563,6 +1573,15 @@ pub async fn run_forward(
     include_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "draft.create",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
     let authored = AuthoredBody::new(body, html);
     let draft = create_forward_draft(
         &db,
@@ -1739,7 +1758,24 @@ pub async fn run_edit(
     clear_attachments: bool,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        ctx.as_ref(),
+        "draft.modify",
+        &creds.account.id,
+        json,
+    )?;
     let resolved_id = resolve_edit_draft_id(&db, &creds, id).await?;
+    if let Some(draft) = db.get_draft(&resolved_id).context("failed to get draft")? {
+        agent_context::authorize_cli_action(
+            &db,
+            ctx.as_ref(),
+            "draft.modify",
+            &draft.account_id,
+            json,
+        )?;
+    }
     let authored = AuthoredBody::new(body, html);
     let draft = modify_draft(
         &db,
@@ -1991,6 +2027,14 @@ pub async fn run_create(
     let authored = AuthoredBody::new(body, None);
 
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        ctx.as_ref(),
+        "draft.create",
+        &creds.account.id,
+        json,
+    )?;
 
     // Snapshot attachment bytes now so review/send preserve them even if the
     // source files later change. Fail explicitly if a file is unreadable rather
@@ -2952,9 +2996,19 @@ pub async fn run_discard(
     backend: CredentialBackend,
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     let is_imap_uid = id.parse::<u32>().is_ok();
     let local_draft = db.get_draft(id).context("failed to get draft")?;
+    if let Some(draft) = &local_draft {
+        agent_context::authorize_cli_action(
+            &db,
+            ctx.as_ref(),
+            "draft.modify",
+            &draft.account_id,
+            json,
+        )?;
+    }
 
     let imap_uid: Option<u32> = if let Some(ref d) = local_draft {
         d.imap_uid
@@ -2966,9 +3020,6 @@ pub async fn run_discard(
 
     // ── Delete from IMAP Drafts folder (primary) ──
     if let Some(uid) = imap_uid {
-        let passphrase = credential_store::get_or_create_passphrase(backend)
-            .context("credential store error")?;
-
         let acct = match account {
             Some(a) => resolve_account(&db, Some(a))?,
             None => {
@@ -2988,6 +3039,9 @@ pub async fn run_discard(
                 }
             }
         };
+        agent_context::authorize_cli_action(&db, ctx.as_ref(), "draft.modify", &acct.id, json)?;
+        let passphrase = credential_store::get_or_create_passphrase(backend)
+            .context("credential store error")?;
 
         if !acct.imap_host.is_empty() {
             let creds = db

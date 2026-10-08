@@ -263,7 +263,7 @@ pub fn agent_contract() -> Value {
                 "resolution": "With no token, or a blank one, the CLI runs as the operator and behaves as before. Any other value must be the token of an active agent: an unknown or revoked token, or one that is not valid UTF-8, fails every command closed with error.code=agent_token_invalid before it runs and never falls back to the operator. The token is never echoed. `envelope mcp` checks the token at startup instead (see semantics).",
                 "classes": {
                     "read_only": "Reads mail or local state. Runs under any active agent's token as it does for the operator. Every command not listed in gated_commands or operator_only_commands is read-only.",
-                    "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. Some gated commands then apply more of the policy (see send and actions).",
+                    "gated": "Runs only when the agent's allowed actions grant every action listed for it in gated_commands; otherwise it is refused with agent_policy_denied_action before any write or network call. It then checks the policy's account and folder lists (see scope), and some gated commands apply more of the policy (see send and actions).",
                     "operator_only": "Changes credentials, agent identities or policy, configuration, authentication, delivery routes, or a decision that belongs to a person, or runs the dashboard server. Refused under any agent token with operator_only_command, whatever the policy grants. The operator runs it without the token, for example `env -u ENVELOPE_AGENT_TOKEN envelope config set ...`."
                 },
                 "gated_commands": cli_gated_commands(),
@@ -282,12 +282,13 @@ pub fn agent_contract() -> Value {
                 },
                 "explicit_grant_actions": crate::commands::agent_context::EXPLICIT_GRANT_ACTIONS,
                 "explicit_grant": "Each explicit_grant_actions entry must be named in the agent's allowed actions; a \"*\" policy does not include them. \"*\" can be listed with them, stored as [\"*\", \"watch.webhook\"]: `envelope agent policy set <name> --allow-actions '*,watch.webhook'`. \"*\" listed with any other action is refused.",
-                "scope": "Before dispatch only actions are checked. `send`, `draft send`, and the rule commands that need rules.webhook, rules.batch_ack or sieve.publish also check the account. Other commands do not apply the policy's account or folder lists.",
+                "scope": "Before dispatch only actions are checked. Every gated command then checks the account it acts on, and each folder it reads or changes as the command line names it, before any write or network call, and refuses with agent_policy_denied_account or agent_policy_denied_folder. move, copy, bulk move and bulk copy check their source and destination; other commands check their --folder. Drafts and scheduled messages are checked under their own account. `snooze cancel` and `unsnooze` check the folder each message returns to, in its own account, and `snooze check-replies` searches every account's INBOX, so it needs all of them. Read-only commands do not apply the policy's account or folder lists.",
                 "denial_codes": [
                     "agent_token_invalid",
                     "operator_only_command",
                     "agent_policy_denied_action",
-                    "agent_policy_denied_account"
+                    "agent_policy_denied_account",
+                    "agent_policy_denied_folder"
                 ],
                 "denial_shape": "A refusal prints {\"status\":\"denied\",\"error\":{code, reason}} with --json, is recorded in the agent's action log, and exits nonzero. `send` and `draft send` can also return the send-policy codes (outbound_safety.send_authority.denial_codes).",
                 "isolation": "These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator."

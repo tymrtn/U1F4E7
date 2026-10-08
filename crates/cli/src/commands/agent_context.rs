@@ -443,11 +443,31 @@ pub fn authorize_cli_action(
     account_id: &str,
     json: bool,
 ) -> anyhow::Result<()> {
+    authorize_cli_folders(db, ctx, action, account_id, &[], json)
+}
+
+/// [`authorize_cli_action`] for a command that reads or changes mail in
+/// `folders`, each checked as the command line names it, before IMAP
+/// resolves an alias. A move or copy passes its source and its destination,
+/// as MCP checks `move_message`.
+pub fn authorize_cli_folders(
+    db: &Database,
+    ctx: Option<&AgentContext>,
+    action: &str,
+    account_id: &str,
+    folders: &[&str],
+    json: bool,
+) -> anyhow::Result<()> {
     let Some(ctx) = ctx else {
         return Ok(());
     };
-    ctx.authorize_action(action, account_id, None)
-        .map_err(|denial| refuse_cli(db, ctx, action, account_id, denial, json))
+    let decision = match folders {
+        [] => ctx.authorize_action(action, account_id, None),
+        _ => folders
+            .iter()
+            .try_for_each(|folder| ctx.authorize_action(action, account_id, Some(folder))),
+    };
+    decision.map_err(|denial| refuse_cli(db, ctx, action, account_id, denial, json))
 }
 
 /// Refuse an operator-only change for the CLI's acting agent, whatever its

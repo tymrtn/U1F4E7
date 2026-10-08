@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent tokens on the command line now respect the agent's account and folder limits for moving, copying, deleting, flagging, snoozing and bulk actions, as MCP already did. Every other gated command checks them too: tags, drafts and scheduled messages, rules, `threat report`, `unsubscribe --confirm` and `watch` with `--webhook`, `--deliver` or `--run-rules`. A refusal comes before any connection to the mail server, with `agent_policy_denied_account` or `agent_policy_denied_folder`.
+
 ## [1.3.19] — 2026-10-08
 
 A fix release. `envelope serve` keeps every account's Inbox current with no browser open and reconnects an IMAP connection the server dropped, MCP clients can pass attachments as file contents, and one stuck attachment read can no longer hang the MCP server. Publishing rules to your mail server keeps the filters already running there, published rules no longer run twice, an agent policy that names accounts by email works for every command and MCP tool, and the Linux x86_64 binary runs on glibc 2.31 and later.

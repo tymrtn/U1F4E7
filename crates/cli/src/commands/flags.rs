@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use envelope_email_store::CredentialBackend;
 
+use super::agent_context;
 use super::common::setup_credentials;
 
 #[tokio::main]
@@ -16,6 +17,15 @@ pub async fn run_add(
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "flag",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -60,6 +70,15 @@ pub async fn run_remove(
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "flag",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await

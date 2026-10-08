@@ -53,6 +53,15 @@ pub async fn run_snooze(
 
     let (db, creds) = setup_credentials(account, backend)?;
     let account_email = &creds.account.username;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "snooze",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
 
     // Check if already snoozed
     if let Some(existing) = db
@@ -73,7 +82,6 @@ pub async fn run_snooze(
         .await
         .context("failed to resolve folder")?;
 
-    let ctx = agent_context::cli_agent(&db, json)?;
     agent_context::refuse_held_cli(
         &mut client,
         &db,
@@ -217,6 +225,8 @@ pub async fn run_unsnooze(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_email = &creds.account.username;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(&db, ctx.as_ref(), "snooze", &creds.account.id, json)?;
 
     // Find the snoozed record
     let snoozed = db
@@ -225,6 +235,14 @@ pub async fn run_unsnooze(
         .ok_or_else(|| {
             anyhow::anyhow!("no snoozed message found for UID {uid} on account {account_email}")
         })?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "snooze",
+        &creds.account.id,
+        &[&snoozed.original_folder],
+        json,
+    )?;
 
     // Connect to IMAP and move back
     let mut client = imap::connect(&creds)
@@ -295,11 +313,13 @@ pub async fn run_check(
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
     let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     // Resolve account filter
     let account_filter = match account {
         Some(a) => {
             let acct = resolve_account(&db, Some(a))?;
+            agent_context::authorize_cli_action(&db, ctx.as_ref(), "snooze", &acct.id, json)?;
             Some(acct.username.clone())
         }
         None => None,
@@ -318,21 +338,41 @@ pub async fn run_check(
         return Ok(());
     }
 
-    // We need credentials per account to connect to IMAP.
-    // Group by account and process each.
-    let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(backend)
-        .context("credential store error")?;
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut success_count = 0u32;
-    let mut fail_count = 0u32;
-
     // Group messages by account
     let mut by_account: std::collections::HashMap<String, Vec<_>> =
         std::collections::HashMap::new();
     for msg in &due {
         by_account.entry(msg.account.clone()).or_default().push(msg);
     }
+
+    // An agent's sweep returns mail only within its policy: an account or
+    // folder outside it refuses the whole sweep before any mailbox is touched.
+    for (account_email, messages) in &by_account {
+        let Some(acct) = db
+            .find_account_by_email(account_email)
+            .context("database error")?
+        else {
+            continue;
+        };
+        for msg in messages {
+            agent_context::authorize_cli_folders(
+                &db,
+                ctx.as_ref(),
+                "snooze",
+                &acct.id,
+                &[&msg.original_folder],
+                json,
+            )?;
+        }
+    }
+
+    // We need credentials per account to connect to IMAP.
+    let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(backend)
+        .context("credential store error")?;
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut success_count = 0u32;
+    let mut fail_count = 0u32;
 
     for (account_email, messages) in &by_account {
         // Resolve account and get credentials
@@ -467,11 +507,13 @@ pub async fn run_check_replies(
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
     let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     // Resolve account filter
     let account_filter = match account {
         Some(a) => {
             let acct = resolve_account(&db, Some(a))?;
+            agent_context::authorize_cli_action(&db, ctx.as_ref(), "snooze", &acct.id, json)?;
             Some(acct.username.clone())
         }
         None => None,
@@ -507,6 +549,19 @@ pub async fn run_check_replies(
 
     // Get all configured accounts for cross-account search
     let all_accounts = db.list_accounts().context("failed to list accounts")?;
+    // The search reads every account's INBOX, so an agent needs them all: a
+    // search limited to its own accounts would escalate snoozes whose reply
+    // sits in one it cannot see.
+    for acct in &all_accounts {
+        agent_context::authorize_cli_folders(
+            &db,
+            ctx.as_ref(),
+            "snooze",
+            &acct.id,
+            &["INBOX"],
+            json,
+        )?;
+    }
     let passphrase = envelope_email_store::credential_store::get_or_create_passphrase(backend)
         .context("credential store error")?;
 

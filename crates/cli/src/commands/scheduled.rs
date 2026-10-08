@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use envelope_email_store::Database;
 use envelope_email_store::credential_store::CredentialBackend;
 
+use super::agent_context;
 use super::common::resolve_account;
 
 /// Build a non-secret summary (filename, content_type, size) of stored draft
@@ -348,6 +349,16 @@ fn hold_scheduled(db: &Database, id: &str, account: Option<&str>) -> Result<serd
 /// CLI entry point for `envelope scheduled hold <id>`.
 pub fn run_hold(id: &str, account: Option<&str>, json: bool) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    if let Some(draft) = db.get_draft(id).context("failed to get draft")? {
+        agent_context::authorize_cli_action(
+            &db,
+            ctx.as_ref(),
+            "draft.modify",
+            &draft.account_id,
+            json,
+        )?;
+    }
     let result = hold_scheduled(&db, id, account)?;
 
     if json {
@@ -373,12 +384,20 @@ pub fn run_hold(id: &str, account: Option<&str>, json: bool) -> Result<()> {
 /// stopping the clock while keeping the message.
 pub fn run_cancel(id: &str, _account: Option<&str>, json: bool) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
+    let ctx = agent_context::cli_agent(&db, json)?;
 
     // Verify the draft exists and has send_after
     let draft = db
         .get_draft(id)
         .context("failed to get draft")?
         .ok_or_else(|| anyhow::anyhow!("draft not found: {id}"))?;
+    agent_context::authorize_cli_action(
+        &db,
+        ctx.as_ref(),
+        "draft.modify",
+        &draft.account_id,
+        json,
+    )?;
 
     if draft.send_after.is_none() {
         bail!("draft {id} is not a scheduled message (no send_after set)");

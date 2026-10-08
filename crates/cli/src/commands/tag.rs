@@ -8,6 +8,7 @@ use envelope_email_store::models::{MessageScore, MessageTag};
 use envelope_email_transport::imap;
 use envelope_email_transport::threat::{self, persist};
 
+use super::agent_context;
 use super::common::setup_credentials;
 
 /// Parse a `key=value` score pair (e.g. `urgent=0.9`).
@@ -44,6 +45,8 @@ pub async fn run_set(
 
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = &creds.account.id;
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(&db, ctx.as_ref(), "tag", account_id, &[folder], json)?;
 
     // Fetch message to resolve UID -> Message-ID (stable key for tagging)
     let mut client = imap::connect(&creds)

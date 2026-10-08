@@ -22,6 +22,7 @@ use envelope_email_transport::threat::persist::{self, QuarantineOutcome, RawFetc
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
+use super::agent_context;
 use super::common::setup_credentials;
 use super::provenance;
 
@@ -37,7 +38,25 @@ pub async fn run(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
-    let agent_run = super::agent_context::cli_agent(&db, json)?.is_some();
+    let agent = agent_context::cli_agent(&db, json)?;
+    let mut actions = Vec::new();
+    if webhook.is_some() || deliver {
+        actions.push(agent_context::WATCH_WEBHOOK);
+    }
+    if run_rules {
+        actions.push("rules.run");
+    }
+    for action in actions {
+        agent_context::authorize_cli_folders(
+            &db,
+            agent.as_ref(),
+            action,
+            &account_id,
+            &[folder],
+            json,
+        )?;
+    }
+    let agent_run = agent.is_some();
 
     // Refuse a private or unresolvable --webhook up front. Each POST re-checks
     // the host, since DNS can change over a long-running watch.

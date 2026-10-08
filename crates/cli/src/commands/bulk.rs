@@ -78,6 +78,17 @@ pub fn delete_effective_dry_run(dry_run: bool, confirm: bool) -> bool {
     dry_run || !confirm
 }
 
+/// The single-message action a bulk op needs besides `bulk`, as
+/// `token_mode` gates the command.
+fn single_message_action(op: &BulkOp) -> &'static str {
+    match op {
+        BulkOp::Move { .. } | BulkOp::Copy { .. } => "move",
+        BulkOp::FlagAdd { .. } | BulkOp::FlagRemove { .. } => "flag",
+        BulkOp::Delete => "delete",
+        BulkOp::Tag { .. } => "tag",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tokio::main]
 pub async fn run(
@@ -91,6 +102,21 @@ pub async fn run(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
+    let ctx = agent_context::cli_agent(&db, json)?;
+    let mut folders = vec![folder];
+    if let BulkOp::Move { to_folder } | BulkOp::Copy { to_folder } = &op {
+        folders.push(to_folder);
+    }
+    for action in ["bulk", single_message_action(&op)] {
+        agent_context::authorize_cli_folders(
+            &db,
+            ctx.as_ref(),
+            action,
+            &account_id,
+            &folders,
+            json,
+        )?;
+    }
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -108,7 +134,6 @@ pub async fn run(
         folder: folder.to_string(),
         dry_run,
     };
-    let ctx = agent_context::cli_agent(&db, json)?;
     let held =
         agent_context::held_bulk_denial(&mut client, &db, ctx.as_ref(), &account_id, &mut req)
             .await?;
