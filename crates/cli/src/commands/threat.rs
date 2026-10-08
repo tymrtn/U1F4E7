@@ -21,6 +21,7 @@ use envelope_email_transport::threat::report::{self, AbuseOutcome};
 use envelope_email_transport::threat::{self, TAG_QUARANTINED, ThreatConfig};
 use serde_json::json;
 
+use super::agent_context;
 use super::common::setup_credentials;
 
 fn load_config() -> Result<ThreatConfig> {
@@ -481,6 +482,15 @@ pub async fn run_report(
     let config = load_config()?;
     let (db, creds) = setup_credentials(account, backend)?;
     let account_id = creds.account.id.clone();
+    let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "draft.create",
+        &account_id,
+        &[folder],
+        json,
+    )?;
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;

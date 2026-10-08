@@ -213,6 +213,13 @@ pub fn run_create(
     let acct = super::common::resolve_account(&db, account)?;
     let account_id = &acct.id;
     let agent = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        agent.as_ref(),
+        agent_context::RULES_WRITE,
+        account_id,
+        json,
+    )?;
 
     let match_expr_json =
         serde_json::to_string(&match_expr).context("failed to serialize match expression")?;
@@ -673,6 +680,15 @@ pub async fn run_apply(
         );
     }
     let (db, creds) = setup_credentials(account, backend)?;
+    let agent = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        agent.as_ref(),
+        "rules.run",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
     if !json {
         let rules = db
             .list_enabled_rules(&creds.account.id)
@@ -687,7 +703,6 @@ pub async fn run_apply(
         .await
         .context("failed to resolve folder")?;
 
-    let agent = agent_context::cli_agent(&db, json)?;
     let attribution = ActionAttribution::new(rule_exec::ActionSource::Cli)
         .with_agent(agent_context::agent_id_of(agent.as_ref()));
     let result = apply_core(
@@ -757,6 +772,13 @@ pub fn run_enable(
     let acct = super::common::resolve_account(&db, account)?;
 
     let agent = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        agent.as_ref(),
+        agent_context::RULES_WRITE,
+        &acct.id,
+        json,
+    )?;
 
     let rule = db
         .find_rule_by_name(&acct.id, name)
@@ -837,6 +859,14 @@ pub fn run_disable(
 ) -> Result<()> {
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
+    let agent = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        agent.as_ref(),
+        agent_context::RULES_WRITE,
+        &acct.id,
+        json,
+    )?;
 
     let rule = db
         .find_rule_by_name(&acct.id, name)
@@ -872,6 +902,14 @@ pub fn run_delete(
 ) -> Result<()> {
     let db = envelope_email_store::Database::open_default().context("failed to open database")?;
     let acct = super::common::resolve_account(&db, account)?;
+    let agent = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_action(
+        &db,
+        agent.as_ref(),
+        agent_context::RULES_WRITE,
+        &acct.id,
+        json,
+    )?;
 
     let rule = db
         .find_rule_by_name(&acct.id, name)

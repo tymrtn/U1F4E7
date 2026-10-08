@@ -673,7 +673,7 @@ fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummar
 /// For non-UTF-8 charsets (iso-8859-1, windows-1252, etc.), returns the
 /// raw decoded bytes as lossy UTF-8 — imperfect but better than showing
 /// `=?iso-8859-1?q?...?=` to the user.
-fn decode_rfc2047(raw: &[u8]) -> String {
+pub fn decode_rfc2047(raw: &[u8]) -> String {
     let input = String::from_utf8_lossy(raw);
 
     // Fast path: no encoded words

@@ -7,6 +7,7 @@ use envelope_email_transport::imap;
 use envelope_email_transport::smtp::SmtpSender;
 use envelope_email_transport::unsubscribe;
 
+use super::agent_context;
 use super::common::setup_credentials;
 
 /// `envelope unsubscribe <uid>` — parse List-Unsubscribe and optionally execute.
@@ -25,6 +26,18 @@ pub async fn run(
     backend: CredentialBackend,
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
+    // Without --confirm this is a dry run, which reads like any other read.
+    if confirm {
+        let ctx = agent_context::cli_agent(&db, json)?;
+        agent_context::authorize_cli_folders(
+            &db,
+            ctx.as_ref(),
+            agent_context::UNSUBSCRIBE,
+            &creds.account.id,
+            &[folder],
+            json,
+        )?;
+    }
 
     let mut client = imap::connect(&creds)
         .await

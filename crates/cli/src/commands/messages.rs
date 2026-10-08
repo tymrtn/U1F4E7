@@ -19,6 +19,14 @@ pub async fn run_move(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "move",
+        &creds.account.id,
+        &[folder, to_folder],
+        json,
+    )?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -69,6 +77,14 @@ pub async fn run_copy(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "move",
+        &creds.account.id,
+        &[folder, to_folder],
+        json,
+    )?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
@@ -159,6 +175,14 @@ pub async fn run_delete(
 ) -> Result<()> {
     let (db, creds) = setup_credentials(account, backend)?;
     let ctx = agent_context::cli_agent(&db, json)?;
+    agent_context::authorize_cli_folders(
+        &db,
+        ctx.as_ref(),
+        "delete",
+        &creds.account.id,
+        &[folder],
+        json,
+    )?;
 
     let mut client = envelope_email_transport::imap::connect(&creds)
         .await
