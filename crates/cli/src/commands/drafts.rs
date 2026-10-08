@@ -640,6 +640,148 @@ pub(crate) async fn create_threat_report_draft(
     Ok((draft, folder, uid))
 }
 
+/// A draft an agent asked to send that the send policy kept as a draft: MCP
+/// `send` and `reply` in draft-only mode, or waiting for a person's approval.
+pub(crate) struct HeldDraft<'a> {
+    pub to: &'a str,
+    pub cc: Option<&'a str>,
+    pub bcc: Option<&'a str>,
+    pub subject: &'a str,
+    pub text: Option<&'a str>,
+    pub html: Option<&'a str>,
+    /// Validated send-as identity, when the caller overrides the account's.
+    pub from: Option<&'a str>,
+    pub in_reply_to: Option<&'a str>,
+    pub references: &'a [String],
+    /// Attachment snapshots, from `attach` paths and `attach_content` alike.
+    pub attachments: &'a [serde_json::Value],
+    /// Metadata the caller adds, such as a reply's `draft_kind` and `source`.
+    pub metadata: serde_json::Value,
+}
+
+/// A saved [`HeldDraft`]. `not_in_mailbox` holds the APPEND failure when the
+/// draft exists only in Envelope; the caller must report it as a failure.
+pub(crate) struct SavedDraft {
+    pub draft: Draft,
+    pub not_in_mailbox: Option<anyhow::Error>,
+}
+
+/// Save a held draft where `draft create` saves one: APPENDed to the account's
+/// Drafts folder by [`append_draft_required`], then recorded locally with the
+/// UID and Message-ID the mailbox holds. A send-only account has no mailbox,
+/// so its draft stays local. When the APPEND fails the local draft is kept,
+/// marked `mailbox_append_failed`, and the failure comes back in
+/// `not_in_mailbox`.
+pub(crate) async fn save_held_draft(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    held: HeldDraft<'_>,
+) -> Result<SavedDraft> {
+    save_held_draft_with(db, creds, held, async |rfc822: &[u8], message_id: &str| {
+        append_draft_required(db, creds, rfc822, message_id).await
+    })
+    .await
+}
+
+/// [`save_held_draft`] with the APPEND passed in, so tests can stand in for
+/// the mailbox.
+async fn save_held_draft_with(
+    db: &Database,
+    creds: &AccountWithCredentials,
+    held: HeldDraft<'_>,
+    append: impl AsyncFnOnce(&[u8], &str) -> Result<(String, Option<u32>)>,
+) -> Result<SavedDraft> {
+    let attachments = decode_attachments(held.attachments)?;
+    let from = held
+        .from
+        .map(str::to_string)
+        .unwrap_or_else(|| account_from_header(creds));
+    let (rfc822, message_id) = build_rfc822_full(
+        &from,
+        held.to,
+        held.subject,
+        held.text,
+        held.html,
+        held.cc,
+        held.bcc,
+        held.in_reply_to,
+        held.references,
+        None,
+        &attachments,
+    )?;
+    let appended = if creds.account.imap_host.is_empty() {
+        None
+    } else {
+        Some(append(&rfc822, &message_id).await)
+    };
+
+    let draft = db
+        .create_draft(
+            &creds.account.id,
+            held.to,
+            Some(held.subject),
+            held.text,
+            held.html,
+            held.in_reply_to,
+            held.cc,
+            held.bcc,
+            Some("mcp"),
+        )
+        .context("failed to create local draft record")?;
+    if !held.attachments.is_empty() {
+        db.update_draft_attachments(&draft.id, held.attachments)
+            .context("failed to persist draft attachments")?;
+    }
+    let storage = match &appended {
+        None => serde_json::json!({
+            "imap_synced": false,
+            "imap_folder": null,
+            "local_only": true,
+        }),
+        Some(Ok((folder, uid))) => {
+            if let Some(uid) = uid {
+                db.update_draft_imap_uid(&draft.id, *uid)
+                    .context("failed to record the draft's IMAP UID")?;
+            }
+            db.mark_draft_message_id(&draft.id, &strip_brackets(&message_id))
+                .context("failed to record the draft's Message-ID")?;
+            serde_json::json!({
+                "imap_synced": true,
+                "imap_folder": folder,
+                "local_only": false,
+            })
+        }
+        Some(Err(_)) => serde_json::json!({
+            "imap_synced": false,
+            "imap_folder": null,
+            "local_only": true,
+            "sync_status_reason": "mailbox_append_failed",
+        }),
+    };
+    let mut metadata = held.metadata;
+    let fields = metadata
+        .as_object_mut()
+        .context("draft metadata must be a JSON object")?;
+    fields.insert("agent_body_text".into(), serde_json::json!(held.text));
+    fields.insert("agent_body_html".into(), serde_json::json!(held.html));
+    fields.insert("signature_applied".into(), serde_json::json!(false));
+    fields.insert("storage".into(), storage);
+    if let Some(from) = held.from {
+        fields.insert("from".into(), serde_json::json!(from));
+    }
+    db.set_draft_metadata(&draft.id, &metadata)
+        .context("failed to persist draft metadata")?;
+
+    let draft = db
+        .get_draft(&draft.id)
+        .context("failed to reload draft")?
+        .ok_or_else(|| anyhow::anyhow!("draft vanished after creation: {}", draft.id))?;
+    Ok(SavedDraft {
+        draft,
+        not_in_mailbox: appended.and_then(Result::err),
+    })
+}
+
 /// All the resolved fields needed to instantiate a contextual draft.
 ///
 /// Built once by [`run_reply`]/[`run_forward`] and consumed by
@@ -1324,11 +1466,15 @@ async fn modify_claimed_draft(
     };
 
     let storage = if old_copy_cleared {
-        serde_json::json!({
+        let mut storage = serde_json::json!({
             "imap_synced": imap_synced,
             "imap_folder": if imap_synced { Some(imap_folder.clone()) } else { None },
             "local_only": !imap_synced,
-        })
+        });
+        if !imap_synced {
+            storage["sync_status_reason"] = serde_json::json!("mailbox_append_failed");
+        }
+        storage
     } else {
         serde_json::json!({
             "imap_synced": false,
@@ -4765,5 +4911,201 @@ mod tests {
         )
         .unwrap();
         assert_strict_crlf(&rfc822);
+    }
+
+    // ─── drafts the send policy held back (MCP draft-only) ───────────────
+
+    /// The account row behind `make_creds("desk@example.com", ..)`.
+    fn held_draft_account(db: &Database) -> AccountWithCredentials {
+        db.conn()
+            .execute(
+                "INSERT INTO accounts (id, name, username, domain, smtp_host, smtp_port,
+                 imap_host, imap_port, encrypted_password)
+                 VALUES ('acct-test', 'Desk', 'desk@example.com', 'example.com',
+                         'smtp.example.com', 587, 'imap.example.com', 993, 'enc')",
+                [],
+            )
+            .unwrap();
+        make_creds("desk@example.com", None, "Desk")
+    }
+
+    /// One `attach` path and one `attach_content` file, snapshotted the way
+    /// the MCP server snapshots them.
+    async fn path_and_inline_attachments(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        use base64::Engine as _;
+        let path = dir.join("report.pdf");
+        std::fs::write(&path, b"%PDF-1.4 by path").unwrap();
+        let mut snapshots = super::super::attachments::snapshot_attachments_bounded(
+            &[path.to_string_lossy().into_owned()],
+            |p| std::fs::read(p),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        snapshots.extend(
+            super::super::attachments::inline_attachment_snapshots(Some(&serde_json::json!([{
+                "filename": "notes.txt",
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(b"inline bytes"),
+            }])))
+            .unwrap(),
+        );
+        snapshots
+    }
+
+    fn held_reply<'a>(
+        attachments: &'a [serde_json::Value],
+        references: &'a [String],
+    ) -> HeldDraft<'a> {
+        HeldDraft {
+            to: "client@example.org",
+            cc: None,
+            bcc: None,
+            subject: "Re: Quote",
+            text: Some("Here is the quote."),
+            html: None,
+            from: None,
+            in_reply_to: Some("<parent@example.org>"),
+            references,
+            attachments,
+            metadata: serde_json::json!({"draft_kind": "reply"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn held_draft_lands_in_drafts_with_its_uid_attachments_and_threading() {
+        use mail_parser::MimeHeaders as _;
+        let db = Database::open_memory().unwrap();
+        let creds = held_draft_account(&db);
+        let dir = tempfile::tempdir().unwrap();
+        let attachments = path_and_inline_attachments(dir.path()).await;
+        let references = vec![
+            "<root@example.org>".to_string(),
+            "<parent@example.org>".to_string(),
+        ];
+        let mut appended: Vec<(Vec<u8>, String)> = Vec::new();
+
+        let saved = save_held_draft_with(
+            &db,
+            &creds,
+            held_reply(&attachments, &references),
+            async |rfc822: &[u8], message_id: &str| {
+                appended.push((rfc822.to_vec(), message_id.to_string()));
+                Ok(("Drafts".to_string(), Some(42)))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(saved.not_in_mailbox.is_none());
+        assert_eq!(appended.len(), 1, "one APPEND to the Drafts folder");
+        let (rfc822, message_id) = &appended[0];
+        let parsed = mail_parser::MessageParser::default()
+            .parse(rfc822.as_slice())
+            .expect("appended draft parses");
+        assert_eq!(
+            parsed.in_reply_to().as_text(),
+            Some("parent@example.org"),
+            "the mailbox copy keeps In-Reply-To"
+        );
+        assert_eq!(
+            parsed.references().as_text_list(),
+            Some(vec!["root@example.org", "parent@example.org"]),
+            "the mailbox copy keeps References"
+        );
+        let files: Vec<(String, Vec<u8>)> = parsed
+            .attachments()
+            .map(|a| {
+                (
+                    a.attachment_name().unwrap_or_default().to_string(),
+                    a.contents().to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("report.pdf".to_string(), b"%PDF-1.4 by path".to_vec()),
+                ("notes.txt".to_string(), b"inline bytes".to_vec()),
+            ],
+            "the mailbox copy carries both attachments"
+        );
+
+        let draft = saved.draft;
+        assert_eq!(draft.imap_uid, Some(42));
+        assert_eq!(
+            draft.message_id.as_deref(),
+            Some(strip_brackets(message_id).as_str()),
+            "the local record names the copy in the mailbox"
+        );
+        assert_eq!(draft.attachments, attachments);
+        let envelope = draft_envelope_json(&draft);
+        assert_eq!(envelope["storage"]["imap_synced"], true, "{envelope}");
+        assert_eq!(envelope["storage"]["imap_folder"], "Drafts", "{envelope}");
+        assert_eq!(envelope["storage"]["imap_uid"], 42, "{envelope}");
+        assert_eq!(envelope["storage"]["local_only"], false, "{envelope}");
+        assert_eq!(envelope["draft_kind"], "reply", "{envelope}");
+        assert_eq!(
+            envelope["fields"]["in_reply_to"], "<parent@example.org>",
+            "{envelope}"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_draft_the_mailbox_refused_is_kept_locally_and_reported() {
+        let db = Database::open_memory().unwrap();
+        let creds = held_draft_account(&db);
+        let dir = tempfile::tempdir().unwrap();
+        let attachments = path_and_inline_attachments(dir.path()).await;
+
+        let saved = save_held_draft_with(
+            &db,
+            &creds,
+            held_reply(&attachments, &[]),
+            async |_: &[u8], _: &str| Err(anyhow::anyhow!("NO [OVERQUOTA] mailbox full")),
+        )
+        .await
+        .unwrap();
+
+        let cause = format!(
+            "{:#}",
+            saved.not_in_mailbox.expect("APPEND failure reported")
+        );
+        assert!(cause.contains("OVERQUOTA"), "{cause}");
+        let draft = saved.draft;
+        assert_eq!(draft.imap_uid, None);
+        assert_eq!(draft.attachments, attachments, "attachments kept locally");
+        let envelope = draft_envelope_json(&draft);
+        assert_eq!(envelope["storage"]["local_only"], true, "{envelope}");
+        assert_eq!(
+            envelope["storage"]["sync_status_reason"], "mailbox_append_failed",
+            "{envelope}"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_draft_on_a_send_only_account_stays_local_without_an_append() {
+        let db = Database::open_memory().unwrap();
+        let mut creds = held_draft_account(&db);
+        creds.account.imap_host = String::new();
+
+        let saved = save_held_draft_with(
+            &db,
+            &creds,
+            held_reply(&[], &[]),
+            async |_: &[u8], _: &str| -> Result<(String, Option<u32>)> {
+                panic!("a send-only account has no mailbox to APPEND to")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(saved.not_in_mailbox.is_none(), "nothing failed");
+        let envelope = draft_envelope_json(&saved.draft);
+        assert_eq!(envelope["storage"]["local_only"], true, "{envelope}");
+        assert_eq!(
+            envelope["storage"]["sync_status_reason"],
+            serde_json::Value::Null,
+            "{envelope}"
+        );
     }
 }

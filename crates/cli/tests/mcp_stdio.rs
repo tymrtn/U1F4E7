@@ -1022,6 +1022,7 @@ fn mcp_allowed_send_clamps_to_ceiling_and_attributes_agent() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
+    make_send_only(home);
     let (token, agent_id) = create_agent(home, "skippy");
     // send allowed, but ceiling is draft-only: an autonomous request must clamp.
     set_policy(home, "skippy", "send", "draft-only");
@@ -1068,6 +1069,7 @@ fn mcp_anonymous_send_default_mode_is_draft_only() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
+    make_send_only(home);
 
     let (payload, is_error) = tool_call(
         home,
@@ -1437,6 +1439,7 @@ fn tool_confirm_send_does_not_confirm() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
+    make_send_only(home);
     let (token, _agent_id) = create_agent(home, "skippy");
     set_policy(home, "skippy", "send", "confirm-send");
 
@@ -1465,6 +1468,7 @@ fn confirm_ceiling_drafts_with_approval_hint() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
+    make_send_only(home);
     let (token, _agent_id) = create_agent(home, "skippy");
     set_policy(home, "skippy", "send", "confirm-send");
 
@@ -2711,6 +2715,7 @@ fn mcp_attach_content_stores_the_same_attachment_as_a_path() {
     let temp = tempfile::tempdir().expect("temp HOME");
     let home = temp.path();
     seed_account(home);
+    make_send_only(home);
     let file = home.join("report.pdf");
     std::fs::write(&file, b"%PDF-1.4 hello").expect("write attachment");
 
@@ -2997,5 +3002,133 @@ fn mcp_draft_tools_refuse_another_account_in_mcp_terms() {
         draft_schedule(home, &draft_id).0,
         None,
         "nothing was queued"
+    );
+}
+
+// ── Agent drafts land in the mailbox's Drafts folder ────────────────
+
+/// Drop the account's mailbox. Draft-only sends then stay local, for tests of
+/// send policy that must not depend on reaching IMAP.
+fn make_send_only(home: &std::path::Path) {
+    let db = envelope_email_store::Database::open(&db_path(home)).expect("open db");
+    db.conn()
+        .execute("UPDATE accounts SET imap_host = ''", [])
+        .expect("make account send-only");
+}
+
+/// The local copy behind a draft id, as `get_draft` reports it.
+fn draft_envelope(home: &std::path::Path, draft_id: &str) -> Value {
+    let (draft, is_error) = tool_call(home, None, "get_draft", json!({"draft_id": draft_id}));
+    assert!(!is_error, "{draft}");
+    draft
+}
+
+/// A draft-only `send` saves its draft to the mailbox's Drafts folder, the way
+/// `envelope draft create` does. When the mailbox cannot be reached the call
+/// fails and says the draft exists only in Envelope.
+#[test]
+fn mcp_draft_only_send_reports_a_draft_the_mailbox_did_not_get() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let probe = imap_connection_probe(home);
+
+    let mut args = draft_only_send("unreachable mailbox");
+    args["attach_content"] = json!([{"filename": "notes.txt", "data_base64": b64(b"hello")}]);
+    let (payload, is_error) = tool_call(home, None, "send", args);
+
+    assert_eq!(
+        probe.connected.recv_timeout(Duration::from_secs(5)),
+        Ok(true),
+        "a draft-only send must try to save the draft in the mailbox: {payload}"
+    );
+    assert!(
+        is_error,
+        "a draft the mailbox never got must not read as success: {payload}"
+    );
+    assert_eq!(payload["status"], "saved_locally", "{payload}");
+    assert_eq!(
+        payload["error"]["code"], "draft_not_in_mailbox",
+        "{payload}"
+    );
+    let reason = payload["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("saved locally but not in the mailbox"),
+        "{payload}"
+    );
+
+    let draft_id = payload["draft_id"].as_str().expect("draft_id");
+    let draft = draft_envelope(home, draft_id);
+    assert_eq!(draft["storage"]["local_only"], true, "{draft}");
+    assert_eq!(
+        draft["storage"]["sync_status_reason"], "mailbox_append_failed",
+        "{draft}"
+    );
+    assert_eq!(stored_attachments(home, draft_id).len(), 1);
+}
+
+/// A send-only account has no mailbox, so its draft stays in Envelope and the
+/// call succeeds.
+#[test]
+fn mcp_draft_only_send_on_a_send_only_account_stays_local() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    make_send_only(home);
+
+    let (payload, is_error) = tool_call(home, None, "send", draft_only_send("send-only"));
+    assert!(!is_error, "{payload}");
+    assert_eq!(payload["status"], "drafted", "{payload}");
+
+    let draft = draft_envelope(home, payload["draft_id"].as_str().expect("draft_id"));
+    assert_eq!(draft["storage"]["local_only"], true, "{draft}");
+    assert_eq!(draft["storage"]["imap_uid"], Value::Null, "{draft}");
+    assert_eq!(
+        draft["storage"]["sync_status_reason"],
+        Value::Null,
+        "{draft}"
+    );
+}
+
+/// An edit the mailbox did not take is reported the same way: the local edit
+/// stands and the call fails.
+#[test]
+fn mcp_modify_draft_reports_an_edit_the_mailbox_did_not_get() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let draft_id = create_local_draft(home, "a@b.test");
+    let probe = imap_connection_probe(home);
+
+    let (payload, is_error) = tool_call(
+        home,
+        None,
+        "modify_draft",
+        json!({"draft_id": draft_id, "subject": "edited"}),
+    );
+
+    assert_eq!(
+        probe.connected.recv_timeout(Duration::from_secs(5)),
+        Ok(true),
+        "the edit must try to reach the mailbox: {payload}"
+    );
+    assert!(
+        is_error,
+        "an edit the mailbox never got must not read as success: {payload}"
+    );
+    assert_eq!(
+        payload["error"]["code"], "draft_not_in_mailbox",
+        "{payload}"
+    );
+    let reason = payload["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("saved locally but not in the mailbox"),
+        "{payload}"
+    );
+    assert_eq!(draft_subject(home, &draft_id).as_deref(), Some("edited"));
+    let draft = draft_envelope(home, &draft_id);
+    assert_eq!(
+        draft["storage"]["sync_status_reason"], "mailbox_append_failed",
+        "{draft}"
     );
 }
