@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.19] — 2026-10-08
+
+A fix release. `envelope serve` keeps every account's Inbox current with no browser open and reconnects an IMAP connection the server dropped, MCP clients can pass attachments as file contents, and one stuck attachment read can no longer hang the MCP server. Publishing rules to your mail server keeps the filters already running there, published rules no longer run twice, an agent policy that names accounts by email works for every command and MCP tool, and the Linux x86_64 binary runs on glibc 2.31 and later.
+
+### Added
+
+- MCP `send`, `reply`, `create_reply_draft`, `create_forward_draft` and `modify_draft` accept file contents in `attach_content`, `[{filename, data_base64, content_type?}]`, for a client that reaches the server over a network bridge and cannot hand it a path. Each file is stored exactly as an `attach` path with the same bytes and name would be, so attribution, the Governor gate, send policy and idempotency treat both the same. Invalid base64, a `filename` with a directory part, unknown fields, or more than 25 MiB in one call fail the call before anything is created. The tool descriptions now say that `attach` paths are read on the machine running the server. This is a new optional field, so the contract stays `envelope.agent_contract.v4`.
+- `envelope rule sieve-status` lists the scripts on the account's ManageSieve server and marks the active one. It also reports whether the server supports Sieve include and whether it still runs the rules Envelope last published. It only reads from the server. With an agent token, `--host` is operator-only.
+
 ### Fixed
 
 - `envelope serve` keeps every account's Inbox current on its own. A background pass refreshes the Inbox index on the `sync.poll_interval_secs` timer (default 300 seconds). Until now the index refreshed only when the web UI opened the Mail view, so a `serve` left running with no browser open showed an Inbox and Digest days behind. The pass runs the same read-only sync as the Mail view (EXAMINE and BODY.PEEK, so nothing is marked read), joins a sync the web UI has already started, and is off under `--no-background-sweeps`.
@@ -23,12 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - One attachment read can no longer hang the whole MCP server. `envelope mcp` read `attach` paths on its main thread, so a path inside a macOS privacy-protected folder (Downloads, Desktop, Documents) blocked inside `open()` while macOS waited for a consent nobody would give, and every later request from every client timed out until the process was killed. Each path is now read on its own thread. After 10 seconds the call fails with an error that names the path and the server's hostname and explains the likely cause, and the server goes on answering.
 - MCP tool errors keep their cause. A failed attachment read used to reach the client as just `failed to read attachment: <path>`; it now ends with the operating system's reason, such as `No such file or directory (os error 2)` or `Operation not permitted (os error 1)`, and names the machine that looked for the file. Every other MCP tool error now carries its full cause chain the same way.
 - MCP `modify_draft` without `account` now edits the draft as the account it belongs to. It used to pick the default account and then refuse a draft from any other account with "Drop --account or pass the draft's own account", even though the caller had passed no account. A mismatched `account` is still refused on `modify_draft` and `send_draft`, before anything changes, and the message now names the `account` parameter. `send_draft` now refuses a mismatched `account` on the queued path too, where it used to be ignored.
-
-### Added
-
-- MCP `send`, `reply`, `create_reply_draft`, `create_forward_draft` and `modify_draft` accept file contents in `attach_content`, `[{filename, data_base64, content_type?}]`, for a client that reaches the server over a network bridge and cannot hand it a path. Each file is stored exactly as an `attach` path with the same bytes and name would be, so attribution, the Governor gate, send policy and idempotency treat both the same. Invalid base64, a `filename` with a directory part, unknown fields, or more than 25 MiB in one call fail the call before anything is created. The tool descriptions now say that `attach` paths are read on the machine running the server. This is a new optional field, so the contract stays `envelope.agent_contract.v4`.
-
-- `envelope rule sieve-status` lists the scripts on the account's ManageSieve server and marks the active one. It also reports whether the server supports Sieve include and whether it still runs the rules Envelope last published. It only reads from the server. With an agent token, `--host` is operator-only.
 
 ## [1.3.18] — 2026-10-06
 
