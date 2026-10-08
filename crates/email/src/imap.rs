@@ -600,14 +600,14 @@ pub async fn fetch_folder_summaries_read_only(
         .session
         .fetch(&range, FETCH_SUMMARY_DESCRIPTOR)
         .await
-        .map_err(|e| ImapError::Protocol(format!("FETCH {range}: {e}")))?;
+        .map_err(|e| command_error(format!("FETCH {range}"), e))?;
 
     let mut summaries = Vec::new();
     let mut stream = messages;
     while let Some(item) = stream.next().await {
         match item {
             Ok(fetch) => summaries.push(message_summary_from_fetch(&fetch)),
-            Err(e) => return Err(ImapError::Protocol(format!("FETCH parse error: {e}"))),
+            Err(e) => return Err(command_error("FETCH parse error".to_string(), e)),
         }
     }
 
@@ -1601,13 +1601,25 @@ pub async fn examine_folder_info(
         .session
         .examine(folder)
         .await
-        .map_err(|e| ImapError::Protocol(format!("EXAMINE {folder}: {e}")))?;
+        .map_err(|e| command_error(format!("EXAMINE {folder}"), e))?;
 
     Ok(SelectedMailbox {
         exists: mailbox.exists,
         uid_validity: mailbox.uid_validity,
         uid_next: mailbox.uid_next,
     })
+}
+
+/// Map a failed IMAP command. A dead connection (an I/O error, or the stream
+/// ending) is `Connection` so a caller can reconnect; anything the server
+/// answered stays `Protocol`.
+fn command_error(context: String, e: async_imap::error::Error) -> ImapError {
+    match e {
+        async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost => {
+            ImapError::Connection(format!("{context}: {e}"))
+        }
+        _ => ImapError::Protocol(format!("{context}: {e}")),
+    }
 }
 
 /// Evidence-specific wrapper around EXAMINE for readability at call sites.
@@ -3445,6 +3457,33 @@ Subject: hi\r\n\r\nbody\r\n";
     fn evidence_header_search_query_rejects_subject_fallback_and_crlf() {
         assert!(evidence_header_search_query("Subject", "Contract").is_err());
         assert!(evidence_header_search_query("Message-ID", "<a@example.com>\r\nALL").is_err());
+    }
+
+    /// The dashboard reconnects and retries only a dead connection, so it
+    /// must stay distinguishable from a server's answer.
+    #[test]
+    fn command_error_separates_a_dead_connection_from_a_server_answer() {
+        use async_imap::error::Error;
+        use std::io::{Error as IoError, ErrorKind};
+        let context = || "EXAMINE INBOX".to_string();
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let err = command_error(context(), Error::Io(IoError::from(kind)));
+            assert!(matches!(err, ImapError::Connection(_)), "{kind:?}: {err}");
+        }
+        assert!(matches!(
+            command_error(context(), Error::ConnectionLost),
+            ImapError::Connection(_)
+        ));
+        for answer in [Error::No("try later".into()), Error::Bad("syntax".into())] {
+            let err = command_error(context(), answer);
+            assert!(matches!(err, ImapError::Protocol(_)), "{err}");
+        }
+        let text = command_error(context(), Error::Io(IoError::from(ErrorKind::BrokenPipe)));
+        assert!(text.to_string().contains("EXAMINE INBOX: io: "), "{text}");
     }
 
     #[test]

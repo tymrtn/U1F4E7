@@ -247,6 +247,37 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
             }
         });
 
+        // Inbox index refresh on the `sync.poll_interval_secs` timer (default
+        // 300s), so the Inbox and Digest stay current with no browser open.
+        // The first pass runs at startup; the interval is re-read after each.
+        println!(
+            "Background Inbox index refresh running every sync.poll_interval_secs (default 300s)"
+        );
+        let inbox_sweep_state = state.clone();
+        tokio::spawn(async move {
+            use envelope_email_transport::threat::ThreatConfig;
+            use envelope_email_transport::threat::config::DEFAULT_POLL_INTERVAL_SECS;
+            loop {
+                if let Err(e) = handlers::messages::run_inbox_index_sweep(&inbox_sweep_state).await
+                {
+                    tracing::warn!("inbox index sweep error: {e}");
+                }
+                // An invalid config.json must not stop Inbox refresh: say so
+                // on every pass and keep the default period until it is fixed.
+                let secs = match ThreatConfig::load() {
+                    Ok(config) => config.poll_interval_secs,
+                    Err(e) => {
+                        tracing::warn!(
+                            "inbox index sweep: invalid config ({e:#}); refreshing every \
+                             {DEFAULT_POLL_INTERVAL_SECS}s until it is fixed"
+                        );
+                        DEFAULT_POLL_INTERVAL_SECS
+                    }
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+        });
+
         // Threat scan of new INBOX mail on each account's
         // `sync.poll_interval_secs` timer (default 300s), checked every tick.
         println!("Background threat scan: per-account timer (sync.poll_interval_secs)");

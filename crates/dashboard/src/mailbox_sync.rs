@@ -9,12 +9,15 @@
 //!
 //! - **Single flight per account and mailbox.** A second request for an
 //!   account whose sync is already running (another tab, an SSE-driven reload,
-//!   the hourly sweep, a double click) joins that run instead of opening a
+//!   a background sweep, a double click) joins that run instead of opening a
 //!   second IMAP pass. The run is a spawned task, so a caller that disconnects
 //!   does not cancel it for the others.
 //! - **Bounded.** A fixed number of accounts at once, each under its own time
 //!   budget; a timed-out account's pooled connection is evicted because the
 //!   dropped future may have left it mid-command.
+//! - **One reconnect.** A pooled connection the server dropped while idle
+//!   fails its first command; the account is retried once on a fresh
+//!   connection inside its budget. No other failure is retried.
 //! - **Truthful failure.** A failed or timed-out account gets an error marker
 //!   on its index row, which reports its cached rows as stale. The rows are
 //!   never deleted by a failure.
@@ -29,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use envelope_email_store::models::Account;
+use envelope_email_transport::errors::ImapError;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::Serialize;
@@ -46,12 +50,47 @@ pub enum SyncTarget {
 }
 
 /// Provider work for one account: fetch the target mailbox read-only and write
-/// the local index. Returns the failure text on any step.
+/// the local index. Returns what failed on any step.
 pub type AccountSyncer = Arc<
-    dyn Fn(AppState, Account, SyncTarget, u32) -> BoxFuture<'static, Result<(), String>>
+    dyn Fn(AppState, Account, SyncTarget, u32) -> BoxFuture<'static, Result<(), SyncFailure>>
         + Send
         + Sync,
 >;
+
+/// Why one account's provider work failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncFailure {
+    /// The IMAP connection died under a command (broken pipe, reset, EOF).
+    ConnectionLost(String),
+    /// Anything else: credentials, login, a server's NO/BAD, the index write.
+    Failed(String),
+}
+
+impl SyncFailure {
+    /// Classify a command that failed on an open connection. Only a dead
+    /// connection is `ConnectionLost`; a server's answer never is.
+    pub fn imap(context: &str, error: &ImapError) -> Self {
+        let message = format!("{context}: {error}");
+        match error {
+            ImapError::Connection(_) => Self::ConnectionLost(message),
+            _ => Self::Failed(message),
+        }
+    }
+}
+
+impl From<String> for SyncFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionLost(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
 
 /// The production syncer: read-only IMAP into the local index.
 pub fn imap_syncer() -> AccountSyncer {
@@ -170,13 +209,22 @@ async fn run_flight(
     id: u64,
 ) -> Result<(), String> {
     let syncer = state.syncer.clone();
-    let result = match tokio::time::timeout(
-        budget,
-        syncer(state.clone(), account.clone(), target, limit),
-    )
-    .await
-    {
-        Ok(result) => result,
+    let attempt = || syncer(state.clone(), account.clone(), target, limit);
+    let attempts = async {
+        match attempt().await {
+            Err(SyncFailure::ConnectionLost(error)) => {
+                tracing::warn!(
+                    "mailbox sync [{}]: {error}; retrying once on a fresh connection",
+                    account.username
+                );
+                state.evict_imap(&account.id).await;
+                attempt().await
+            }
+            result => result,
+        }
+    };
+    let result = match tokio::time::timeout(budget, attempts).await {
+        Ok(result) => result.map_err(|failure| failure.to_string()),
         Err(_) => {
             // The dropped future may have left the pooled client mid-command.
             state.evict_imap(&account.id).await;
@@ -421,7 +469,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async {
                     tokio::time::sleep(Duration::from_millis(150)).await;
-                    Err("IMAP: auth failed".to_string())
+                    Err("IMAP: auth failed".to_string().into())
                 }
                 .boxed()
             })
@@ -451,6 +499,74 @@ mod tests {
         sync_account(&state, account("a"), SyncTarget::Inbox, 50, budget).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(state.sync_flights.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn only_a_lost_connection_is_retried_and_only_once() {
+        let calls: Arc<StdMutex<HashMap<String, usize>>> = Arc::default();
+        let syncer: AccountSyncer = {
+            let calls = calls.clone();
+            Arc::new(move |_, account, _, _| {
+                let attempt = {
+                    let mut calls = calls.lock().unwrap();
+                    let n = calls.entry(account.id.clone()).or_default();
+                    *n += 1;
+                    *n
+                };
+                let dead =
+                    ImapError::Connection("EXAMINE INBOX: io: Broken pipe (os error 32)".into());
+                let answer = ImapError::Protocol("EXAMINE INBOX: no response: try later".into());
+                async move {
+                    match (account.id.as_str(), attempt) {
+                        ("drops-once", 1) | ("drops-every-time", _) => {
+                            Err(SyncFailure::imap("EXAMINE INBOX", &dead))
+                        }
+                        ("server-says-no", _) => Err(SyncFailure::imap("EXAMINE INBOX", &answer)),
+                        ("bad-login", _) => Err("IMAP: login failed".to_string().into()),
+                        _ => Ok(()),
+                    }
+                }
+                .boxed()
+            })
+        };
+        let state = state_with(syncer, SyncLimits::default());
+        let ids = [
+            "drops-once",
+            "drops-every-time",
+            "server-says-no",
+            "bad-login",
+        ];
+
+        let outcomes = sync_accounts(
+            &state,
+            ids.iter().map(|id| account(id)).collect(),
+            SyncTarget::Inbox,
+            50,
+            state.sync_limits,
+        )
+        .await;
+
+        let result = |id: &str| {
+            outcomes
+                .iter()
+                .find(|o| o.account.id == id)
+                .unwrap()
+                .result
+                .clone()
+        };
+        assert_eq!(result("drops-once"), Ok(()));
+        let still_dead = result("drops-every-time").unwrap_err();
+        assert!(still_dead.contains("Broken pipe"), "got: {still_dead}");
+        assert!(result("server-says-no").is_err());
+        assert!(result("bad-login").is_err());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls["drops-once"], 2);
+        assert_eq!(calls["drops-every-time"], 2, "one retry, never a loop");
+        assert_eq!(
+            calls["server-says-no"], 1,
+            "a server's answer is not retried"
+        );
+        assert_eq!(calls["bad-login"], 1, "a login failure is not retried");
     }
 
     #[tokio::test]
