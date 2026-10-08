@@ -1312,31 +1312,22 @@ mod tests {
         assert_eq!(outcome.decision, "unparseable");
     }
 
-    /// End-to-end fixture: a local throwaway executable that prints a valid
-    /// `allow` verdict but exits nonzero must be refused by the real gate in
-    /// required mode. No secrets, no network — the fixture is a two-line shell
-    /// script in the test temp dir.
+    /// End-to-end fixture: a local executable that prints a valid `allow`
+    /// verdict but exits nonzero must be refused by the real gate in required
+    /// mode. No secrets, no network. The fixture is checked in because writing
+    /// a script and then running it can fail with ETXTBSY when a sibling test
+    /// forks in between, and that spawn error would also read as
+    /// `governor_unavailable` without the script ever running.
     #[cfg(unix)]
     #[test]
     fn gate_refuses_allow_stdout_from_failing_governor_process() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = std::env::temp_dir().join(format!(
-            "envelope-governor-exit-fixture-{}.sh",
-            std::process::id()
-        ));
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, "echo '{{\"decision\": \"allow\"}}'").unwrap();
-            writeln!(f, "exit 3").unwrap();
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
         let config = GovernorConfig {
             mode: GovernorMode::Required,
-            bin: path.to_string_lossy().into_owned(),
+            bin: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/governor-allow-exit-3.sh"
+            )
+            .to_string(),
         };
         let req = GovernorRequest::build(
             "acc1",
@@ -1351,7 +1342,6 @@ mod tests {
             false,
         );
         let outcome = gate(&config, &req);
-        let _ = std::fs::remove_file(&path);
 
         assert!(
             !outcome.allowed,
