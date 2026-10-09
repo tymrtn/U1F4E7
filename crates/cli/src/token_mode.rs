@@ -78,6 +78,7 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                 SignatureCmd::Set { .. } | SignatureCmd::Clear { .. } => OperatorOnly,
             },
             AccountsCmd::Add { .. }
+            | AccountsCmd::Reauth { .. }
             | AccountsCmd::Rekey
             | AccountsCmd::ImportKeychain { .. }
             | AccountsCmd::CopyPassword { .. }
@@ -448,6 +449,12 @@ mod tests {
     /// its class. Positional values are placeholders; nothing runs.
     const MATRIX: &[(&str, Permission)] = &[
         ("accounts add --email a@b.test", OperatorOnly),
+        (
+            "accounts add --email a@b.test --provider google --paste",
+            OperatorOnly,
+        ),
+        ("accounts reauth a", OperatorOnly),
+        ("accounts reauth a --provider google --paste", OperatorOnly),
         ("accounts rekey", OperatorOnly),
         ("accounts import-keychain --email a@b.test", OperatorOnly),
         ("accounts list", ReadOnly),

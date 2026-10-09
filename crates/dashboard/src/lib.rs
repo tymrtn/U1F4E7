@@ -3177,6 +3177,7 @@ mod tests {
             password: "unused".to_string(),
             smtp_password: None,
             imap_password: None,
+            oauth: None,
         }
     }
 
@@ -4624,6 +4625,7 @@ mod tests {
             password: "unused".to_string(),
             smtp_password: None,
             imap_password: None,
+            oauth: None,
         };
         // Same body arguments the sweep passes to `SmtpSender::send`.
         let (message, _) = envelope_email_transport::smtp::build_message(

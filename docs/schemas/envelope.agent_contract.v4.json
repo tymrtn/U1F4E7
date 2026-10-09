@@ -172,6 +172,7 @@
       "isolation": "These gates apply to commands run with an agent token. Run a shell agent as its own operating-system user, without access to the operator's Envelope data, to keep it from acting as the operator.",
       "operator_only_commands": [
         "accounts add",
+        "accounts reauth",
         "accounts rekey",
         "accounts import-keychain",
         "accounts setup-instructions --copy-password",

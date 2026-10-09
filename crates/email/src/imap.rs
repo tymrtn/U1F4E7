@@ -292,7 +292,6 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
     let host = &account.account.imap_host;
     let port = account.account.imap_port;
     let username = account.effective_imap_username();
-    let password = account.effective_imap_password();
 
     info!("connecting to IMAP {host}:{port} as {username}");
 
@@ -325,10 +324,7 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
     // greeting first — see the crate's lib.rs docs.
     read_imap_greeting(&mut client, host).await?;
 
-    let session = client
-        .login(username, password)
-        .await
-        .map_err(|(e, _)| ImapError::Auth(format!("login failed for {username}@{host}: {e}")))?;
+    let session = authenticate_client(client, account, host).await?;
 
     debug!("IMAP session established for {username}@{host}");
     Ok(ImapClient {
@@ -342,6 +338,68 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
 /// the stream without a greeting or returns an I/O error mid-greeting.
 ///
 /// `host` is used only for error context and never logged with credentials.
+/// SASL XOAUTH2 for async-imap. Gmail answers `AUTHENTICATE XOAUTH2` with an
+/// empty continuation, which gets the bearer string; on failure it sends a
+/// second continuation carrying error JSON, which must get an empty reply so
+/// the server can finish with a tagged NO.
+struct Xoauth2Authenticator {
+    initial: Option<String>,
+}
+
+impl async_imap::Authenticator for Xoauth2Authenticator {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        self.initial.take().unwrap_or_default()
+    }
+}
+
+/// Signs a greeted client in: SASL XOAUTH2 for an OAuth account, LOGIN
+/// otherwise. An OAuth placeholder is never offered as a password.
+pub(crate) async fn authenticate_client<T>(
+    client: async_imap::Client<T>,
+    account: &AccountWithCredentials,
+    host: &str,
+) -> Result<Session<T>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let username = account.effective_imap_username();
+    if let Some(grant) = &account.oauth {
+        let token = crate::oauth_session::access_token(grant)
+            .await
+            .map_err(|e| {
+                ImapError::Auth(crate::oauth_session::token_failure(
+                    &account.account.username,
+                    &e,
+                ))
+            })?;
+        let authenticator = Xoauth2Authenticator {
+            initial: Some(crate::oauth::xoauth2_initial_response(username, &token)),
+        };
+        return client
+            .authenticate("XOAUTH2", authenticator)
+            .await
+            .map_err(|(e, _)| {
+                ImapError::Auth(format!(
+                    "XOAUTH2 rejected for {username}@{host}: {e}; {}",
+                    crate::oauth_session::reauth_hint(&account.account.username)
+                ))
+            });
+    }
+    let password = account.effective_imap_password();
+    if envelope_email_store::oauth_grants::is_oauth_password(password) {
+        return Err(ImapError::Auth(format!(
+            "{username} signs in with OAuth but no sign-in was loaded; {}",
+            crate::oauth_session::reauth_hint(&account.account.username)
+        )));
+    }
+    client
+        .login(username, password)
+        .await
+        .map_err(|(e, _)| ImapError::Auth(format!("login failed for {username}@{host}: {e}")))
+}
+
 pub(crate) async fn read_imap_greeting<T>(
     client: &mut async_imap::Client<T>,
     host: &str,
@@ -3641,6 +3699,164 @@ Subject: hi\r\n\r\nbody\r\n";
     struct Turn {
         verb: &'static str,
         reply: Vec<String>,
+    }
+
+    fn sasl_creds(password: &str, token: Option<&str>) -> AccountWithCredentials {
+        use envelope_email_store::{Account, CachedToken, OAuthGrant};
+        AccountWithCredentials {
+            account: Account {
+                id: "acc".into(),
+                name: "Gmail".into(),
+                username: "you@gmail.com".into(),
+                domain: "gmail.com".into(),
+                smtp_host: "smtp.gmail.com".into(),
+                smtp_port: 465,
+                imap_host: "imap.gmail.com".into(),
+                imap_port: 993,
+                smtp_username: None,
+                imap_username: None,
+                display_name: None,
+                signature_text: None,
+                signature_html: None,
+                created_at: "2026-10-03T00:00:00Z".into(),
+            },
+            password: password.into(),
+            smtp_password: None,
+            imap_password: None,
+            oauth: token.map(|t| OAuthGrant {
+                provider: "google".into(),
+                transport: "imap_xoauth2".into(),
+                client_id: "cid".into(),
+                authority: "https://accounts.google.com".into(),
+                scopes: "https://mail.google.com/".into(),
+                refresh_token: "r".into(),
+                cache: Arc::new(std::sync::Mutex::new(CachedToken {
+                    access_token: Some(t.into()),
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                })),
+            }),
+        }
+    }
+
+    /// A server that greets, then plays Gmail's side of AUTHENTICATE XOAUTH2
+    /// (`accept`) or LOGIN, and returns every line the client sent.
+    async fn sasl_server(
+        server_io: tokio::io::DuplexStream,
+        accept: bool,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(server_io);
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"* OK scripted\r\n").await.unwrap();
+            let mut lines = Vec::new();
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                return lines;
+            }
+            let tag = line.split_whitespace().next().unwrap().to_string();
+            lines.push(line.trim_end().to_string());
+            if line.contains("LOGIN") {
+                write_half
+                    .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                return lines;
+            }
+            write_half.write_all(b"+ \r\n").await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            lines.push(line.trim_end().to_string());
+            if accept {
+                write_half
+                    .write_all(format!("{tag} OK user authenticated\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                write_half
+                    .write_all(b"+ eyJzdGF0dXMiOiI0MDAiLCJzY2hlbWVzIjoiQmVhcmVyIn0=\r\n")
+                    .await
+                    .unwrap();
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                lines.push(line.trim_end().to_string());
+                write_half
+                    .write_all(
+                        format!(
+                            "{tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            lines
+        })
+    }
+
+    async fn sign_in(
+        creds: &AccountWithCredentials,
+        accept: bool,
+    ) -> (Result<(), ImapError>, Vec<String>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = sasl_server(server_io, accept).await;
+        let mut client = async_imap::Client::new(client_io);
+        read_imap_greeting(&mut client, "scripted.test")
+            .await
+            .unwrap();
+        let result = authenticate_client(client, creds, "scripted.test")
+            .await
+            .map(|_| ());
+        (result, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn oauth_accounts_sign_in_with_xoauth2() {
+        use base64::Engine;
+        let (result, lines) = sign_in(&sasl_creds("", Some("ya29.tok")), true).await;
+        result.unwrap();
+        assert!(lines[0].ends_with("AUTHENTICATE XOAUTH2"), "{lines:?}");
+        let sent = base64::engine::general_purpose::STANDARD
+            .decode(&lines[1])
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(sent).unwrap(),
+            "user=you@gmail.com\x01auth=Bearer ya29.tok\x01\x01"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_gets_an_empty_reply_and_a_reauth_error() {
+        let (result, lines) = sign_in(&sasl_creds("", Some("stale")), false).await;
+        assert_eq!(
+            lines[2], "",
+            "the error challenge is answered with an empty line"
+        );
+        match result {
+            Err(ImapError::Auth(message)) => {
+                assert!(
+                    message.contains("envelope accounts reauth you@gmail.com"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn password_accounts_still_log_in() {
+        let (result, lines) = sign_in(&sasl_creds("app-password", None), true).await;
+        result.unwrap();
+        assert!(lines[0].contains("LOGIN"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn an_oauth_placeholder_is_never_sent_as_a_password() {
+        for placeholder in ["oauth2:grant", r#"oauth2:v1:{"provider":"google"}"#] {
+            let (result, lines) = sign_in(&sasl_creds(placeholder, None), true).await;
+            assert!(matches!(result, Err(ImapError::Auth(_))), "{placeholder}");
+            assert!(lines.is_empty(), "nothing reached the server: {lines:?}");
+        }
     }
 
     /// Log in over an in-memory duplex against a server that plays `turns` in

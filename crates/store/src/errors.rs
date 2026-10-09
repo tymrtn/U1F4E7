@@ -51,6 +51,14 @@ pub enum StoreError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error(
+        "{0} signs in with OAuth but its sign-in is missing; run `envelope accounts reauth {0}`"
+    )]
+    OAuthReauthRequired(String),
+
+    #[error("{0} signs in with OAuth: {1}")]
+    OAuthAccount(String, String),
+
     #[error("migration error: {0}")]
     Migration(String),
 }

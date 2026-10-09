@@ -25,6 +25,7 @@ pub mod message_index;
 pub mod migration;
 pub mod migrations;
 pub mod models;
+pub mod oauth_grants;
 pub mod ops_primitives;
 pub mod paths;
 pub mod relationship_facts;

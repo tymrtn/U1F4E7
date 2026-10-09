@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gmail sign-in with Google. `envelope accounts add --provider google --email you@gmail.com` signs in through your browser (`--paste` finishes on another device), and `envelope accounts reauth` signs in again or switches an account added with an app password. IMAP and SMTP then use XOAUTH2. The sign-in is stored encrypted in the account's existing password field, so the database schema doesn't change, and it is never offered to a server as a password. Under an agent token, `accounts reauth` is operator-only. While Envelope's Google app is in Google's testing stage, only addresses on its test-user list can sign in, and Google asks again every 7 days.
+
 ### Fixed
 
 - Agent tokens on the command line now respect the agent's account and folder limits for moving, copying, deleting, flagging, snoozing and bulk actions, as MCP already did. Every other gated command checks them too: tags, drafts and scheduled messages, rules, `threat report`, `unsubscribe --confirm` and `watch` with `--webhook`, `--deliver` or `--run-rules`. A refusal comes before any connection to the mail server, with `agent_policy_denied_account` or `agent_policy_denied_folder`.

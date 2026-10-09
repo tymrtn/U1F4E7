@@ -96,6 +96,7 @@ const CLI_GATED_COMMANDS: &[(&str, &[&str])] = &[
 /// Commands refused under `ENVELOPE_AGENT_TOKEN`.
 const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "accounts add",
+    "accounts reauth",
     "accounts rekey",
     "accounts import-keychain",
     "accounts setup-instructions --copy-password",
