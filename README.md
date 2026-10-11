@@ -45,8 +45,7 @@ envelope inbox --account you@work.example --json   # the same mail, for your age
 # against the release's SHA-256 file, and installs it to ~/.local/bin (no sudo).
 curl -fsSL https://u1f4e7.com/install.sh | bash
 
-# Homebrew (macOS). The formula builds from source, so Homebrew installs Rust
-# as a build dependency and the first install takes a few minutes.
+# Homebrew (macOS or Linux) installs the same release binary.
 brew install tymrtn/u1f4e7/envelope
 # `tymrtn/u1f4e7/u1f4e7` is a live compat alias for the same formula.
 ```
