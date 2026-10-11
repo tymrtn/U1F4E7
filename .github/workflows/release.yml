@@ -46,7 +46,17 @@ jobs:
             macos-${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --bin envelope --target ${{ matrix.target }}
+        run: |
+          if [ -z "$ENVELOPE_GOOGLE_CLIENT_ID" ] || [ -z "$ENVELOPE_GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::Repo secrets ENVELOPE_GOOGLE_CLIENT_ID/SECRET are not set; this release would ship without Google sign-in."
+            exit 1
+          fi
+          cargo build --release --bin envelope --target ${{ matrix.target }}
+        env:
+          # Compiled in with option_env! so Google sign-in works in releases.
+          # A desktop OAuth client's secret can't stay secret once shipped.
+          ENVELOPE_GOOGLE_CLIENT_ID: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_ID }}
+          ENVELOPE_GOOGLE_CLIENT_SECRET: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_SECRET }}
 
       # Signing + notarization run only when every secret is present. With
       # none set the release still ships (unsigned, with a warning); a partial
@@ -215,7 +225,17 @@ jobs:
           cargo install cargo-zigbuild --locked
 
       - name: Build release binary
-        run: cargo zigbuild --release --bin envelope --target x86_64-unknown-linux-gnu
+        run: |
+          if [ -z "$ENVELOPE_GOOGLE_CLIENT_ID" ] || [ -z "$ENVELOPE_GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::Repo secrets ENVELOPE_GOOGLE_CLIENT_ID/SECRET are not set; this release would ship without Google sign-in."
+            exit 1
+          fi
+          cargo zigbuild --release --bin envelope --target x86_64-unknown-linux-gnu
+        env:
+          # Compiled in with option_env! so Google sign-in works in releases.
+          # A desktop OAuth client's secret can't stay secret once shipped.
+          ENVELOPE_GOOGLE_CLIENT_ID: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_ID }}
+          ENVELOPE_GOOGLE_CLIENT_SECRET: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_SECRET }}
 
       - name: Check glibc floor
         run: ./ci/check-glibc-floor.sh target/x86_64-unknown-linux-gnu/release/envelope
@@ -270,7 +290,17 @@ jobs:
           cargo install cargo-zigbuild --locked
 
       - name: Build release binary (cross)
-        run: cargo zigbuild --release --bin envelope --target aarch64-unknown-linux-gnu
+        run: |
+          if [ -z "$ENVELOPE_GOOGLE_CLIENT_ID" ] || [ -z "$ENVELOPE_GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::Repo secrets ENVELOPE_GOOGLE_CLIENT_ID/SECRET are not set; this release would ship without Google sign-in."
+            exit 1
+          fi
+          cargo zigbuild --release --bin envelope --target aarch64-unknown-linux-gnu
+        env:
+          # Compiled in with option_env! so Google sign-in works in releases.
+          # A desktop OAuth client's secret can't stay secret once shipped.
+          ENVELOPE_GOOGLE_CLIENT_ID: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_ID }}
+          ENVELOPE_GOOGLE_CLIENT_SECRET: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_SECRET }}
 
       - name: Check glibc floor
         run: ./ci/check-glibc-floor.sh target/aarch64-unknown-linux-gnu/release/envelope

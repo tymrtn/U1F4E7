@@ -23,20 +23,28 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Google client credentials: the run-time environment wins over the pair
 /// compiled in at release-build time. Neither is ever in the repository.
 pub fn google_client_credentials() -> Option<(String, String)> {
-    let runtime = (
-        std::env::var("ENVELOPE_GOOGLE_CLIENT_ID").ok(),
-        std::env::var("ENVELOPE_GOOGLE_CLIENT_SECRET").ok(),
-    );
-    if let (Some(id), Some(secret)) = runtime {
-        return Some((id, secret));
-    }
-    match (
-        option_env!("ENVELOPE_GOOGLE_CLIENT_ID"),
-        option_env!("ENVELOPE_GOOGLE_CLIENT_SECRET"),
-    ) {
-        (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
+    pick_credentials(
+        (
+            std::env::var("ENVELOPE_GOOGLE_CLIENT_ID").ok(),
+            std::env::var("ENVELOPE_GOOGLE_CLIENT_SECRET").ok(),
+        ),
+        (
+            option_env!("ENVELOPE_GOOGLE_CLIENT_ID").map(String::from),
+            option_env!("ENVELOPE_GOOGLE_CLIENT_SECRET").map(String::from),
+        ),
+    )
+}
+
+type MaybePair = (Option<String>, Option<String>);
+
+/// An empty value counts as unset: a release built without its secrets gets
+/// "" from GitHub Actions, and Google would only reject an empty client ID.
+fn pick_credentials(runtime: MaybePair, built: MaybePair) -> Option<(String, String)> {
+    let set = |pair: MaybePair| match pair {
+        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
         _ => None,
-    }
+    };
+    set(runtime).or_else(|| set(built))
 }
 
 /// The provider client for a stored grant. A Google refresh must use the
@@ -150,5 +158,28 @@ mod tests {
 
         let offline = OAuthError::Http("connection refused".into());
         assert!(!token_failure("me@gmail.com", &offline).contains("accounts reauth"));
+    }
+
+    fn pair(id: &str, secret: &str) -> (Option<String>, Option<String>) {
+        (Some(id.into()), Some(secret.into()))
+    }
+
+    /// GitHub Actions passes "" for a secret that isn't set, so a release
+    /// built without one must report "not configured", not send Google an
+    /// empty client ID.
+    #[test]
+    fn empty_client_credentials_count_as_unset() {
+        let none = (None, None);
+        assert_eq!(pick_credentials(none.clone(), pair("", "")), None);
+        assert_eq!(pick_credentials(pair("id", ""), pair("", "s")), None);
+        assert_eq!(
+            pick_credentials(pair("", ""), pair("built", "s")),
+            Some(("built".into(), "s".into()))
+        );
+        assert_eq!(
+            pick_credentials(pair("run", "r"), pair("built", "s")),
+            Some(("run".into(), "r".into()))
+        );
+        assert_eq!(pick_credentials(none.clone(), none), None);
     }
 }
