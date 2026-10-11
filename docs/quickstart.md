@@ -33,15 +33,14 @@ release's `.sha256` file, installs `envelope` to `~/.local/bin` without sudo,
 and tells you if that directory is missing from your `PATH`. Pin a version with
 `bash -s -- --version v1.3.2`.
 
-### macOS (Homebrew)
+### Homebrew (macOS or Linux)
 
 ```bash
 brew install tymrtn/u1f4e7/envelope
 which envelope   # verify it's on PATH
 ```
 
-The formula builds from source, so Homebrew installs Rust as a build
-dependency and the first install takes a few minutes.
+The formula installs the same release binary as the install script.
 
 ### Build from source
 
