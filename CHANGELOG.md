@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.3.20] — 2026-10-08
+## [1.3.20] — 2026-10-11
 
 A fix release. Agent tokens on the command line now respect the agent's account and folder limits, `watch --run-rules` matches rules against decoded subjects, and drafts an agent writes over MCP are saved to the mailbox's Drafts folder, where your other mail clients show them.
 
