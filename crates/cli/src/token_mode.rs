@@ -453,8 +453,18 @@ mod tests {
             "accounts add --email a@b.test --provider google --paste",
             OperatorOnly,
         ),
+        (
+            "accounts add --email a@b.test --provider google --paste --no-wait",
+            OperatorOnly,
+        ),
+        (
+            "accounts add --email a@b.test --provider google --finish -",
+            OperatorOnly,
+        ),
         ("accounts reauth a", OperatorOnly),
         ("accounts reauth a --provider google --paste", OperatorOnly),
+        ("accounts reauth a --paste --no-wait", OperatorOnly),
+        ("accounts reauth a --finish -", OperatorOnly),
         ("accounts rekey", OperatorOnly),
         ("accounts import-keychain --email a@b.test", OperatorOnly),
         ("accounts list", ReadOnly),

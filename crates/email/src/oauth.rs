@@ -525,6 +525,39 @@ pub fn parse_redirect(redirect: &str, expected_state: &str) -> Result<String, OA
     }
 }
 
+/// Finds the sign-in's redirect address in pasted text: the bare address or
+/// the whole "can't connect" page the browser stopped on. Links without a
+/// `state` are someone else's and skipped; an address from another sign-in
+/// attempt is reported, not skipped. `Ok(None)` means no address was found.
+pub fn find_redirect(text: &str, expected_state: &str) -> Result<Option<String>, OAuthError> {
+    let mut other_attempt = false;
+    for token in text.split_whitespace() {
+        let start = [token.find("http://"), token.find("https://")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(start) = start else { continue };
+        let candidate = token[start..].trim_end_matches(|c: char| {
+            matches!(c, '.' | ',' | ';' | ')' | ']' | '>' | '"' | '\'' | '`')
+                || matches!(c, '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}')
+        });
+        let Ok(url) = Url::parse(candidate) else {
+            continue;
+        };
+        if !url.query_pairs().any(|(k, _)| k == "state") {
+            continue;
+        }
+        match parse_redirect(candidate, expected_state) {
+            Err(OAuthError::StateMismatch) => other_attempt = true,
+            other => return other.map(Some),
+        }
+    }
+    if other_attempt {
+        return Err(OAuthError::StateMismatch);
+    }
+    Ok(None)
+}
+
 const PAGE_DONE: &str = "<!doctype html><title>Envelope</title><p>Signed in. You can close this tab and go back to Envelope.</p>";
 const PAGE_FAILED: &str = "<!doctype html><title>Envelope</title><p>Sign-in did not complete. Go back to Envelope for the reason.</p>";
 
@@ -775,6 +808,58 @@ mod tests {
         let pasted =
             "  http://127.0.0.1:53817/oauth/google/callback?state=S1&code=4/0Abc&scope=email\n";
         assert_eq!(parse_redirect(pasted, "S1").unwrap(), "4/0Abc");
+    }
+
+    /// Chrome's error page as it was pasted in a live sign-in, code redacted.
+    const PASTED_PAGE: &str = "This site can\u{2019}t be reached\nThe webpage at http://127.0.0.1:1/oauth/google/callback?state=S1&iss=https://accounts.google.com&code=4/0Abc&scope=email%20https://www.googleapis.com/auth/userinfo.email%20openid%20https://mail.google.com/&authuser=1&prompt=consent might be temporarily down or it may have moved permanently to a new web address.\nERR_UNSAFE_PORT\n";
+
+    #[test]
+    fn find_redirect_takes_the_address_out_of_a_pasted_page() {
+        assert_eq!(
+            find_redirect(PASTED_PAGE, "S1").unwrap().as_deref(),
+            Some("4/0Abc")
+        );
+        let safari = "Safari Can\u{2019}t Open the Page\n\u{201c}http://127.0.0.1:1/oauth/google/callback?state=S1&code=4/0Abc\u{201d}. Not allowed to use restricted network port.";
+        assert_eq!(
+            find_redirect(safari, "S1").unwrap().as_deref(),
+            Some("4/0Abc")
+        );
+        let quoted = "\"http://127.0.0.1:1/oauth/google/callback?state=S1&code=4/0Abc\".";
+        assert_eq!(
+            find_redirect(quoted, "S1").unwrap().as_deref(),
+            Some("4/0Abc")
+        );
+    }
+
+    #[test]
+    fn find_redirect_reports_another_sign_ins_address() {
+        let stale = "http://127.0.0.1:1/oauth/google/callback?state=OLD&code=4/0Old";
+        assert!(matches!(
+            find_redirect(stale, "S1"),
+            Err(OAuthError::StateMismatch)
+        ));
+        let both =
+            format!("{stale}\nhttp://127.0.0.1:1/oauth/google/callback?state=S1&code=4/0New");
+        assert_eq!(
+            find_redirect(&both, "S1").unwrap().as_deref(),
+            Some("4/0New")
+        );
+    }
+
+    #[test]
+    fn find_redirect_ignores_unrelated_links_and_plain_text() {
+        assert_eq!(find_redirect("ERR_UNSAFE_PORT", "S1").unwrap(), None);
+        assert_eq!(
+            find_redirect("see https://support.google.com/chrome/answer/1", "S1").unwrap(),
+            None
+        );
+        assert!(matches!(
+            find_redirect(
+                "http://127.0.0.1:1/oauth/google/callback?state=S1&error=access_denied",
+                "S1"
+            ),
+            Err(OAuthError::Provider { .. })
+        ));
     }
 
     #[test]

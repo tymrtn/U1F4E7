@@ -2,6 +2,7 @@
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
 use crate::commands::clipboard;
+use crate::commands::oauth_signin::{SignInMode, SignInOutcome};
 use crate::commands::ui;
 use crate::{AccountsCmd, SignatureCmd};
 use anyhow::{Context, Result, bail};
@@ -20,8 +21,17 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             insecure_machine_key,
             provider: Some(_),
             paste,
+            no_wait,
+            finish,
             ..
-        } => add_google(&email, name, paste, insecure_machine_key, json, backend),
+        } => add_google(
+            &email,
+            name,
+            sign_in_mode(paste, no_wait, finish),
+            insecure_machine_key,
+            json,
+            backend,
+        ),
         AccountsCmd::Add {
             email,
             password_stdin,
@@ -51,7 +61,15 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             account,
             provider,
             paste,
-        } => reauth(&account, provider, paste, json, backend),
+            no_wait,
+            finish,
+        } => reauth(
+            &account,
+            provider,
+            sign_in_mode(paste, no_wait, finish),
+            json,
+            backend,
+        ),
         AccountsCmd::Rekey => rekey(json, backend),
         AccountsCmd::List => list(json),
         AccountsCmd::SetupInstructions {
@@ -777,11 +795,44 @@ async fn check_google_imap(
     }
 }
 
+fn sign_in_mode(paste: bool, no_wait: bool, finish: Option<String>) -> SignInMode {
+    match finish {
+        Some(pasted) => SignInMode::Finish(pasted),
+        None if no_wait => SignInMode::Start,
+        None => SignInMode::Interactive { paste },
+    }
+}
+
+/// Output for `--paste --no-wait`: the link, and the command that finishes it.
+fn print_started(
+    email: &str,
+    url: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    finish: &str,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "email": email,
+            "sign_in_url": url,
+            "expires_at": expires_at.to_rfc3339(),
+            "finish": finish,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Open this link on any device and sign in to Google as {email}:\n\n{url}\n");
+        println!(
+            "After you approve, the browser stops on a \"can't connect\" page. Within 10 minutes, run\n\n  {finish}\n\nand paste that page's address (or the whole page)."
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn add_google(
     email: &str,
     name: Option<String>,
-    paste: bool,
+    mode: SignInMode,
     insecure_machine_key: bool,
     json: bool,
     backend: CredentialBackend,
@@ -799,7 +850,14 @@ async fn add_google(
             "{email} is already added. To switch it to Google sign-in, run `envelope accounts reauth {email} --provider google`."
         );
     }
-    let signed = google_sign_in(email, paste, false).await?;
+    let signed = match google_sign_in(email, mode, false).await? {
+        SignInOutcome::Done(signed) => signed,
+        SignInOutcome::Started { url, expires_at } => {
+            let finish =
+                format!("envelope accounts add --provider google --email {email} --finish -");
+            return print_started(email, &url, expires_at, &finish, json);
+        }
+    };
     check_google_imap(
         &google_probe(email, GMAIL_IMAP_HOST, GMAIL_IMAP_PORT, &signed),
         GMAIL_IMAP_HOST,
@@ -842,7 +900,7 @@ async fn add_google(
 async fn reauth(
     account_arg: &str,
     provider: Option<String>,
-    paste: bool,
+    mode: SignInMode,
     json: bool,
     backend: CredentialBackend,
 ) -> Result<()> {
@@ -878,8 +936,18 @@ async fn reauth(
     }
 
     let signed =
-        crate::commands::oauth_signin::google_sign_in(&account.username, paste, keep_contacts)
-            .await?;
+        match crate::commands::oauth_signin::google_sign_in(&account.username, mode, keep_contacts)
+            .await?
+        {
+            SignInOutcome::Done(signed) => signed,
+            SignInOutcome::Started { url, expires_at } => {
+                let finish = format!(
+                    "envelope accounts reauth {} --provider google --finish -",
+                    account.username
+                );
+                return print_started(&account.username, &url, expires_at, &finish, json);
+            }
+        };
     check_google_imap(
         &google_probe(
             &account.username,
