@@ -336,45 +336,58 @@ pub(crate) async fn refresh_one_account(
                 return Err(SyncFailure::imap(&format!("EXAMINE {folder}"), &e));
             }
         };
-    match envelope_email_transport::imap::fetch_folder_summaries_read_only(
+    let fetched = envelope_email_transport::imap::fetch_folder_summaries_read_only(
         &mut client,
         &folder,
         limit,
     )
-    .await
-    {
-        Ok(summaries) => {
-            let inputs: Vec<IndexedMessageInput> = summaries
-                .iter()
-                .map(|summary| IndexedMessageInput {
-                    uid: summary.uid,
-                    message_id: summary.message_id.clone(),
-                    from_addr: summary.from_addr.clone(),
-                    to_addr: summary.to_addr.clone(),
-                    subject: summary.subject.clone(),
-                    date: summary.date.clone(),
-                    flags: summary.flags.clone(),
-                    size: summary.size,
-                    snippet: None,
-                    thread_id: None,
-                })
-                .collect();
-            let write_result = {
-                let db = state.db.lock().await;
-                db.upsert_indexed_message_summaries(&account.id, &folder, uidvalidity, &inputs)
-            };
-            match write_result {
-                Ok(()) => {
-                    crate::handlers::address_book::catch_up_account(&state, &account.id).await;
-                    Ok(())
-                }
-                Err(e) => Err(format!("index {folder}: {e}").into()),
-            }
-        }
+    .await;
+    index_fetched_summaries(&state, &account.id, &folder, uidvalidity, fetched).await
+}
+
+/// Replace `folder`'s rows in the local index with the summaries a refresh
+/// fetched. The write replaces the folder's rows, so an empty answer empties
+/// it; a fetch that failed, a refusal by the server included, writes nothing
+/// and fails the refresh with the server's words.
+async fn index_fetched_summaries(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uidvalidity: u64,
+    fetched: Result<Vec<MessageSummary>, envelope_email_transport::errors::ImapError>,
+) -> Result<(), SyncFailure> {
+    let summaries = match fetched {
+        Ok(summaries) => summaries,
         Err(e) => {
-            state.evict_imap(&account.id).await;
-            Err(SyncFailure::imap(&format!("fetch {folder}"), &e))
+            state.evict_imap(account_id).await;
+            return Err(SyncFailure::imap(&format!("fetch {folder}"), &e));
         }
+    };
+    let inputs: Vec<IndexedMessageInput> = summaries
+        .iter()
+        .map(|summary| IndexedMessageInput {
+            uid: summary.uid,
+            message_id: summary.message_id.clone(),
+            from_addr: summary.from_addr.clone(),
+            to_addr: summary.to_addr.clone(),
+            subject: summary.subject.clone(),
+            date: summary.date.clone(),
+            flags: summary.flags.clone(),
+            size: summary.size,
+            snippet: None,
+            thread_id: None,
+        })
+        .collect();
+    let write_result = {
+        let db = state.db.lock().await;
+        db.upsert_indexed_message_summaries(account_id, folder, uidvalidity, &inputs)
+    };
+    match write_result {
+        Ok(()) => {
+            crate::handlers::address_book::catch_up_account(state, account_id).await;
+            Ok(())
+        }
+        Err(e) => Err(format!("index {folder}: {e}").into()),
     }
 }
 
@@ -1824,6 +1837,59 @@ mod tests {
     use chrono::NaiveDateTime;
     use envelope_email_store::{CredentialBackend, Database};
     use serde_json::json;
+
+    /// The refresh replaces a folder's indexed rows with the summaries it
+    /// fetched, so a refused FETCH that read as an empty answer wiped the
+    /// inbox list. Given the refusal as the error it now is, the rows stay as
+    /// they were and the refresh fails with the server's words.
+    #[tokio::test]
+    async fn the_index_survives_a_refused_refresh() {
+        let db = Database::open_memory().unwrap();
+        let row = IndexedMessageInput {
+            uid: 42,
+            message_id: Some("<kept@example.test>".to_string()),
+            from_addr: "sender@example.test".to_string(),
+            to_addr: "me@example.test".to_string(),
+            subject: "kept".to_string(),
+            date: Some("Tue, 12 May 2026 12:00:00 +0000".to_string()),
+            flags: Vec::new(),
+            size: 123,
+            snippet: None,
+            thread_id: None,
+        };
+        db.upsert_indexed_message_summaries("acct-a", "INBOX", 88, &[row])
+            .unwrap();
+        let state = AppState::new(db, CredentialBackend::File);
+        let refused = envelope_email_transport::errors::ImapError::Protocol(
+            "FETCH INBOX 1:3: the server refused it: NO [UNAVAILABLE] Fetch backend down".into(),
+        );
+
+        let failure = index_fetched_summaries(&state, "acct-a", "INBOX", 88, Err(refused))
+            .await
+            .expect_err("a refused fetch fails the refresh")
+            .to_string();
+
+        assert!(
+            failure.contains("fetch INBOX")
+                && failure.contains("NO [UNAVAILABLE] Fetch backend down"),
+            "{failure}"
+        );
+        let subjects: Vec<String> = {
+            let db = state.db.lock().await;
+            let mut rows = db
+                .conn()
+                .prepare(
+                    "SELECT subject FROM indexed_message_summaries
+                     WHERE account_id = 'acct-a' AND folder = 'INBOX'",
+                )
+                .unwrap();
+            rows.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(subjects, ["kept"], "the indexed rows are left as they were");
+    }
 
     fn at(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()

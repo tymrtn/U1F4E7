@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Tyler Martin
 // Licensed under FSL-1.1-ALv2 (see LICENSE)
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use chrono::Local;
-use envelope_email_store::Database;
 use envelope_email_store::credential_store::CredentialBackend;
+use envelope_email_store::{Database, SnoozedMessage};
+use envelope_email_transport::errors::ImapError;
 use envelope_email_transport::imap;
 use tracing::{info, warn};
 
@@ -99,10 +102,13 @@ pub async fn run_snooze(
         warn!("could not create Snoozed folder (may already exist): {e}");
     }
 
-    // Fetch message summary to store subject and message-id
+    // Fetch message summary to store subject and message-id. A read the
+    // server refused stops here, before the move.
     let msg = imap::fetch_message(&mut client, folder, uid)
         .await
-        .context("failed to fetch message")?;
+        .with_context(|| {
+            format!("could not read UID {uid} in {folder} on {account_email}; nothing was moved")
+        })?;
 
     let (subject, message_id) = match &msg {
         Some(m) => (Some(m.subject.as_str()), m.message_id.as_deref()),
@@ -253,17 +259,16 @@ pub async fn run_unsnooze(
     // Search by message-id if available, otherwise try the stored UID
     let snoozed_uid = if let Some(ref mid) = snoozed.message_id {
         let mid_clean = mid.trim_matches(|c| c == '<' || c == '>');
-        match imap::find_uid_by_message_id(&mut client, &snoozed.snoozed_folder, mid_clean).await {
-            Ok(Some(uid)) => uid,
-            Ok(None) => {
-                warn!("message-id search returned no results, trying stored UID");
-                snoozed.uid
-            }
-            Err(e) => {
-                warn!("message-id search failed: {e}, trying stored UID");
-                snoozed.uid
-            }
-        }
+        uid_to_return(
+            imap::find_uid_by_message_id(&mut client, &snoozed.snoozed_folder, mid_clean).await,
+            snoozed.uid,
+        )
+        .with_context(|| {
+            format!(
+                "could not search {} on {account_email} for the snoozed message; nothing was moved",
+                snoozed.snoozed_folder
+            )
+        })?
     } else {
         snoozed.uid
     };
@@ -410,24 +415,26 @@ pub async fn run_check(
             // Find the actual UID in the snoozed folder
             let snoozed_uid = if let Some(ref mid) = msg.message_id {
                 let mid_clean = mid.trim_matches(|c| c == '<' || c == '>');
-                match imap::find_uid_by_message_id(&mut client, &msg.snoozed_folder, mid_clean)
-                    .await
-                {
-                    Ok(Some(uid)) => uid,
-                    _ => msg.uid,
-                }
+                uid_to_return(
+                    imap::find_uid_by_message_id(&mut client, &msg.snoozed_folder, mid_clean).await,
+                    msg.uid,
+                )
             } else {
-                msg.uid
+                Ok(msg.uid)
+            };
+            let moved = match snoozed_uid {
+                Ok(uid) => {
+                    imap::move_message(&mut client, uid, &msg.snoozed_folder, &msg.original_folder)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                Err(e) => Err(format!(
+                    "could not search {} for the snoozed message; nothing was moved: {e}",
+                    msg.snoozed_folder
+                )),
             };
 
-            match imap::move_message(
-                &mut client,
-                snoozed_uid,
-                &msg.snoozed_folder,
-                &msg.original_folder,
-            )
-            .await
-            {
+            match moved {
                 Ok(()) => {
                     if let Err(e) = db.delete_snoozed(&msg.id) {
                         warn!("failed to delete snooze record {}: {e}", msg.id);
@@ -569,12 +576,23 @@ pub async fn run_check_replies(
     let mut reply_found_for: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut reply_details: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
+    // Recipients whose reply was not looked for in some mailbox, and why. A
+    // reply may be there, so they are not escalated.
+    let mut unchecked: HashMap<String, String> = HashMap::new();
+    let not_searched = |unchecked: &mut HashMap<String, String>, why: String| {
+        for (recipient, _) in &recipients_to_check {
+            unchecked
+                .entry(recipient.clone())
+                .or_insert_with(|| why.clone());
+        }
+    };
 
     for acct in &all_accounts {
         let creds = match db.get_account_with_credentials(&acct.id, &passphrase) {
             Ok(c) => c,
             Err(e) => {
                 warn!("failed to decrypt credentials for {}: {e}", acct.username);
+                not_searched(&mut unchecked, format!("{}: {e}", acct.username));
                 continue;
             }
         };
@@ -583,6 +601,7 @@ pub async fn run_check_replies(
             Ok(c) => c,
             Err(e) => {
                 warn!("IMAP connection failed for {}: {e}", acct.username);
+                not_searched(&mut unchecked, format!("{}: {e}", acct.username));
                 continue;
             }
         };
@@ -619,15 +638,50 @@ pub async fn run_check_replies(
                         "search failed for FROM {} in {}: {e}",
                         recipient, acct.username
                     );
+                    unchecked
+                        .entry(recipient.clone())
+                        .or_insert_with(|| format!("INBOX on {}: {e}", acct.username));
                 }
             }
         }
     }
 
     // Now process results: update DB and build output
-    let mut results: Vec<serde_json::Value> = Vec::new();
+    let results = settle_awaiting(&db, &awaiting, &reply_details, &unchecked, &now, json);
 
-    for msg in &awaiting {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "results": results,
+                "checked": awaiting.len(),
+            }))?
+        );
+    } else {
+        println!(
+            "\nChecked {} snoozed message(s) awaiting replies",
+            awaiting.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Record what one `check-replies` found for each snoozed message awaiting a
+/// reply, and build its result rows. `reply_details` holds the replies found,
+/// by recipient; `unchecked` the recipients whose reply could not be looked
+/// for in some mailbox, with why. A message with no reply found is escalated
+/// once it is overdue.
+fn settle_awaiting(
+    db: &Database,
+    awaiting: &[SnoozedMessage],
+    reply_details: &HashMap<String, serde_json::Value>,
+    unchecked: &HashMap<String, String>,
+    now: &str,
+    json: bool,
+) -> Vec<serde_json::Value> {
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for msg in awaiting {
         let recipient = msg.recipient.as_deref().unwrap_or("(unknown)");
 
         if let Some(reply_info) = msg.recipient.as_ref().and_then(|r| reply_details.get(r)) {
@@ -677,9 +731,29 @@ pub async fn run_check_replies(
                 "status": "no_recipient",
                 "escalation_tier": msg.escalation_tier,
             }));
+        } else if let Some(why) = msg.recipient.as_ref().and_then(|r| unchecked.get(r)) {
+            // No reply found, but a mailbox it could be in was not searched:
+            // nothing is escalated, and the next check looks again.
+            if !json {
+                println!(
+                    "  ! UID {} — could not check for a reply from {recipient}: {why}",
+                    msg.uid
+                );
+            }
+            results.push(serde_json::json!({
+                "uid": msg.uid,
+                "account": msg.account,
+                "subject": msg.subject,
+                "reason": msg.reason,
+                "note": msg.note,
+                "recipient": recipient,
+                "status": "check_failed",
+                "error": why,
+                "escalation_tier": msg.escalation_tier,
+            }));
         } else {
             // No reply found
-            let is_overdue = msg.return_at <= now;
+            let is_overdue = msg.return_at.as_str() <= now;
             let new_tier = if is_overdue {
                 // Past due — escalate
                 match db.increment_escalation(&msg.id) {
@@ -721,23 +795,21 @@ pub async fn run_check_replies(
             }));
         }
     }
+    results
+}
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "results": results,
-                "checked": awaiting.len(),
-            }))?
-        );
-    } else {
-        println!(
-            "\nChecked {} snoozed message(s) awaiting replies",
-            awaiting.len()
-        );
+/// The UID to move a snoozed message back from: where its Message-ID search
+/// found it, else the stored UID. A search that failed stops the move: the
+/// stored UID names the message in its original folder, so in the Snoozed
+/// folder it may be another message by now.
+fn uid_to_return(found: Result<Option<u32>, ImapError>, stored: u32) -> Result<u32, ImapError> {
+    match found? {
+        Some(uid) => Ok(uid),
+        None => {
+            warn!("message-id search returned no results, trying stored UID");
+            Ok(stored)
+        }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -757,5 +829,69 @@ mod tests {
     fn validate_reason_invalid() {
         assert!(validate_reason("banana").is_err());
         assert!(validate_reason("").is_err());
+    }
+
+    /// A Message-ID search the server refused says nothing about where the
+    /// snoozed message is. The stored UID names it in its original folder,
+    /// so in the Snoozed folder it may be another message: unsnooze, cancel
+    /// and the due sweep stop with the server's words and move nothing.
+    #[test]
+    fn a_refused_search_never_moves_the_stored_uid() {
+        let refused = ImapError::Protocol(
+            "UID SEARCH HEADER Message-ID \"a@example.test\": the server refused it: \
+             NO [UNAVAILABLE] backend down"
+                .into(),
+        );
+        let err = uid_to_return(Err(refused), 7).expect_err("a refused search moves nothing");
+        assert!(
+            err.to_string().contains("NO [UNAVAILABLE] backend down"),
+            "{err}"
+        );
+        assert_eq!(uid_to_return(Ok(Some(12)), 7).unwrap(), 12);
+    }
+
+    /// A reply search the server refused, or a mailbox that could not be
+    /// opened, found no reply because it never looked. The follow-up is
+    /// reported as not checked, with the reason, and is not escalated; the
+    /// next check looks again.
+    #[test]
+    fn a_follow_up_whose_reply_could_not_be_looked_for_is_not_escalated() {
+        let db = Database::open_memory().unwrap();
+        db.create_snoozed(
+            "me@example.test",
+            7,
+            "INBOX",
+            "Snoozed",
+            "2026-01-01T09:00:00",
+            Some("<sent-1@example.test>"),
+            Some("Quote"),
+            Some("waiting-reply"),
+            None,
+            Some("them@example.test"),
+        )
+        .unwrap();
+        let awaiting = db.list_snoozed_awaiting_reply(None).unwrap();
+        let why = "me@example.test: UID SEARCH FROM \"them@example.test\" SINCE 1-Jan-2026: \
+                   the server refused it: NO [UNAVAILABLE] backend down";
+        let unchecked = HashMap::from([("them@example.test".to_string(), why.to_string())]);
+
+        let results = settle_awaiting(
+            &db,
+            &awaiting,
+            &HashMap::new(),
+            &unchecked,
+            "2026-10-12T09:00:00",
+            true,
+        );
+
+        assert_eq!(results[0]["status"], "check_failed", "{results:?}");
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("NO [UNAVAILABLE] backend down")),
+            "{results:?}"
+        );
+        let row = db.get_snoozed(&awaiting[0].id).unwrap().unwrap();
+        assert_eq!(row.escalation_tier, 0, "nothing is escalated");
     }
 }

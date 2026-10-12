@@ -162,7 +162,12 @@ async fn run_attachment_export(
         }
         let mut uids = imap::evidence_search_selected_uids(&mut client, trimmed)
             .await
-            .with_context(|| format!("UID SEARCH {trimmed}"))?;
+            .with_context(|| {
+                format!(
+                    "UID SEARCH {trimmed} in {} on {}",
+                    args.folder, args.account
+                )
+            })?;
         uids.sort_unstable();
         uids.dedup();
         uids
@@ -170,7 +175,7 @@ async fn run_attachment_export(
 
     let raw_by_uid = fetch_raw_uids(&mut client, &args.folder, &target_uids)
         .await
-        .with_context(|| format!("fetch messages from {}", args.folder))?;
+        .with_context(|| format!("fetch messages from {} on {}", args.folder, args.account))?;
 
     export_fetched_attachments(
         &db,
@@ -425,11 +430,16 @@ async fn run_collect(
 
     let matched_uids = imap::evidence_search_selected_uids(&mut client, &query)
         .await
-        .with_context(|| format!("UID SEARCH {query}"))?;
+        .with_context(|| format!("UID SEARCH {query} in {} on {}", args.folder, args.account))?;
     let matched_set: HashSet<u32> = matched_uids.iter().copied().collect();
     let mut raw_by_uid = fetch_raw_uids(&mut client, &args.folder, &matched_uids)
         .await
-        .with_context(|| format!("fetch matched messages from {}", args.folder))?;
+        .with_context(|| {
+            format!(
+                "fetch matched messages from {} on {}",
+                args.folder, args.account
+            )
+        })?;
     let fetched_uids: HashSet<u32> = raw_by_uid.keys().copied().collect();
     let mut warnings = evidence_core::missing_uid_fetch_warnings(
         &matched_uids,
@@ -447,7 +457,12 @@ async fn run_collect(
                 args.max_thread_messages,
             )
             .await
-            .with_context(|| format!("expand header thread in {}", args.folder))?,
+            .with_context(|| {
+                format!(
+                    "expand header thread in {} on {}",
+                    args.folder, args.account
+                )
+            })?,
         );
     }
 
