@@ -687,6 +687,122 @@ fn mcp_content_tools_advertise_untrusted_trust_boundary() {
     child.wait().expect("wait for mcp process");
 }
 
+/// Policy actions that only read. A tool authorized under one of these is
+/// labeled read-only and a tool under any other action is not, so a tool with
+/// a new action counts as a writer until someone classifies the action here.
+const READ_ACTIONS: [&str; 7] = [
+    "accounts.list",
+    "inbox.read",
+    "folders.list",
+    "contacts.read",
+    "draft.read",
+    "rules.read",
+    "watch.read",
+];
+
+/// Tools authorized under a read action although some of their operations
+/// write. `contacts` runs add, tag and untag under `contacts.read`.
+const READ_ACTION_WRITERS: [&str; 1] = ["contacts"];
+
+#[test]
+fn mcp_tools_list_labels_every_tool_by_its_policy_action() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let mut child = spawn_mcp(temp.path());
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    write_line(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+    );
+    let _ = read_message(&mut stdout);
+    write_line(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    );
+    let listed = read_message(&mut stdout);
+    drop(stdin);
+    child.wait().expect("wait mcp");
+    let tools = listed["result"]["tools"].as_array().expect("tools array");
+
+    // The contract export prints the binary's own tool-to-action map.
+    let output = Command::new(envelope_bin())
+        .arg("contract")
+        .env("HOME", temp.path())
+        .env("ENVELOPE_HOME", temp.path())
+        .output()
+        .expect("run contract");
+    assert!(output.status.success());
+    let contract: Value = serde_json::from_slice(&output.stdout).expect("contract JSON");
+    let identity = &contract["agent_identity"];
+    let action_map = identity["tool_action_map"].as_object().expect("action map");
+    let always_allowed = identity["always_allowed_readonly_tools"]
+        .as_array()
+        .expect("always-allowed tools");
+
+    let mut send_tools = Vec::new();
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let hints = &tool["annotations"];
+        assert!(
+            hints["title"].as_str().is_some_and(|t| !t.is_empty()),
+            "{name} has no annotations.title: {hints}"
+        );
+        for hint in [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ] {
+            assert!(
+                hints[hint].is_boolean(),
+                "{name} must set {hint} explicitly: {hints}"
+            );
+        }
+
+        let read_only = match action_map.get(name).and_then(Value::as_str) {
+            Some(action) => {
+                if action == "send" {
+                    send_tools.push(name);
+                }
+                READ_ACTIONS.contains(&action) && !READ_ACTION_WRITERS.contains(&name)
+            }
+            None => {
+                assert!(
+                    always_allowed.iter().any(|t| t == name),
+                    "{name} has no policy action and is not an always-allowed read"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            hints["readOnlyHint"],
+            read_only,
+            "{name} (action {:?}) is labeled readOnlyHint={}",
+            action_map.get(name),
+            hints["readOnlyHint"]
+        );
+        if send_tools.contains(&name) {
+            assert_eq!(hints["destructiveHint"], true, "{name} sends mail");
+            assert_eq!(hints["openWorldHint"], true, "{name} sends mail");
+        }
+    }
+    send_tools.sort_unstable();
+    assert_eq!(send_tools, ["reply", "send", "send_draft"]);
+    for name in action_map.keys() {
+        assert!(
+            tools.iter().any(|t| t["name"] == name.as_str()),
+            "tool_action_map names {name}, which tools/list does not list"
+        );
+    }
+    for name in READ_ACTION_WRITERS {
+        let action = action_map[name].as_str().expect("writer action");
+        assert!(
+            READ_ACTIONS.contains(&action),
+            "{name} now authorizes under {action}; drop it from READ_ACTION_WRITERS"
+        );
+    }
+}
+
 #[test]
 fn contract_export_declares_untrusted_trust_model() {
     // The additive trust_model block must describe the wrapper for MCP consumers.

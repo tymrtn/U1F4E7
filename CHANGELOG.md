@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every MCP tool now says whether it is read-only, destructive, idempotent and open-world. `tools/list` gives each of the 24 tools an `annotations` object with a `title` and all four MCP hints set, so Claude and other clients can decide when to ask you before a call. The hints describe a tool's full capability, whatever the send mode: `send`, `reply` and `send_draft` count as destructive even under `draft-only`, because they can send mail that can't be recalled. `move_message`, `snooze`, `flag`, `bulk` and `rules_run` are marked destructive too: a move expunges the source copy, a flag can set `\Deleted`, and bulk and rule runs can delete. The same annotations appear under `mcp_tools` in `envelope contract`, whose `tool_action_map` is now generated from the policy code and keeps the same values. No tool behaves differently.
+
 ## [1.3.23] — 2026-10-12
 
 A fix release. Gmail interleaves its own updates for other messages (a flag change on a new arrival) into the reply to a read, and Envelope took one of those for a refusal: `envelope read` and `envelope attachment download` on an old message intermittently failed with "server omitted RFC822.SIZE" naming a different, newer UID. Reads now keep only the UID they asked for. A missing size on the requested message itself still stops the read.
