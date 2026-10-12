@@ -914,9 +914,9 @@ pub async fn fetch_message_with_raw(
     fetch_message_with_raw_in(&mut client.session, folder, uid).await
 }
 
-/// [`fetch_message_with_raw`] over any transport, so the scripted-server
-/// tests can drive it without TLS.
-async fn fetch_message_with_raw_in<T>(
+/// [`fetch_message_with_raw`] over any transport: `envelope code` holds a
+/// bare session, and the scripted-server tests drive it without TLS.
+pub async fn fetch_message_with_raw_in<T>(
     session: &mut Session<T>,
     folder: &str,
     uid: u32,
@@ -2032,6 +2032,22 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
     uid_search_checked(session, "ALL").await
+}
+
+/// The UIDs above `after` in the selected mailbox, ascending, read as
+/// [`list_selected_uids_in`] reads them: a refused search is an error, never
+/// "nothing new". `n:*` matches the highest message even when `n` is past
+/// it, so UIDs at or below `after` are dropped.
+pub async fn list_selected_uids_after_in<T>(
+    session: &mut Session<T>,
+    after: u32,
+) -> Result<Vec<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let criterion = format!("UID {}:*", after.saturating_add(1));
+    let uids = uid_search_checked(session, &criterion).await?;
+    Ok(uids.into_iter().filter(|uid| *uid > after).collect())
 }
 
 /// Fetch a batch of raw messages from the currently selected folder.
