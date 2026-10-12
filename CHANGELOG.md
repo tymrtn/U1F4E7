@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.22] — 2026-10-12
+
+A fix release. When the mail server refuses a read, Envelope stops with the server's error and changes nothing. A refused read used to look like an empty answer, which could wipe the dashboard's inbox list, move the wrong snoozed message, append duplicate drafts, or hand `envelope code` an old one-time code.
+
 ### Fixed
 
 - If the mail server refuses a read, Envelope no longer wipes the inbox list, moves snoozed mail, or reports a backup as complete; it stops with the server's error. A SEARCH or FETCH the server answered with NO or BAD, or a connection that dropped partway through one, used to come back as an empty answer. The dashboard then emptied that folder's message list, `unsnooze` and `snooze check` moved whatever message held the stored UID, `snooze check-replies` escalated follow-ups as `no_reply_overdue` without having looked for a reply, and `watch` treated every message in the folder as new. Draft edits, restores, migrations and the Sent copy after a send could append a second copy of a message they had failed to look up, the dashboard could discard a draft whose mailbox copy it could not read, and `backup`, `evidence` and `migrate` could finish with exit code 0 after a refused read. Each of these now fails with an error that names the account or folder and quotes the server's reply, and nothing is moved, appended or overwritten. A follow-up whose reply could not be looked for is reported as `check_failed` and checked again next time.
