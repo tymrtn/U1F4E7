@@ -20,8 +20,9 @@ use crate::commands::send_attempt::{
 };
 use crate::commands::ui;
 use envelope_email_store::models::{AccountWithCredentials, Draft};
-use envelope_email_store::{CredentialBackend, Database, Event};
+use envelope_email_store::{CredentialBackend, Database, Event, SnoozedMessage};
 use envelope_email_transport::attribution_persist::success_attribution_block;
+use envelope_email_transport::errors::ImapError;
 use envelope_email_transport::outbound::{
     IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
     SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
@@ -3021,14 +3022,7 @@ async fn handle_snooze(
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
-            envelope_email_transport::imap::move_message(
-                &mut client,
-                snoozed.uid,
-                &snoozed.snoozed_folder,
-                &snoozed.original_folder,
-            )
-            .await
-            .map_err(|e| format!("{e:#}"))?;
+            return_snoozed(&mut client, &snoozed, &account_email).await?;
             db.delete_snoozed(&snoozed.id)
                 .map_err(|e| format!("{e:#}"))?;
 
@@ -3053,6 +3047,66 @@ async fn handle_snooze(
             "unknown snooze action '{other}' (expected set, list, or cancel)"
         )),
     }
+}
+
+/// The mailbox calls a snooze cancel makes: the live IMAP client, or a fake
+/// in tests.
+trait SnoozeMailbox {
+    async fn find_uid_by_message_id(
+        &mut self,
+        folder: &str,
+        message_id: &str,
+    ) -> Result<Option<u32>, ImapError>;
+    async fn move_message(&mut self, uid: u32, from: &str, to: &str) -> Result<(), ImapError>;
+}
+
+impl SnoozeMailbox for envelope_email_transport::imap::ImapClient {
+    async fn find_uid_by_message_id(
+        &mut self,
+        folder: &str,
+        message_id: &str,
+    ) -> Result<Option<u32>, ImapError> {
+        envelope_email_transport::imap::find_uid_by_message_id(self, folder, message_id).await
+    }
+
+    async fn move_message(&mut self, uid: u32, from: &str, to: &str) -> Result<(), ImapError> {
+        envelope_email_transport::imap::move_message(self, uid, from, to).await
+    }
+}
+
+/// Move a snoozed message back to the folder it came from. Its stored UID
+/// names it in that folder, so in the snooze folder it may be another
+/// message, or none: the message is found there by its Message-ID first, and
+/// a search that is refused or finds nothing moves nothing.
+async fn return_snoozed(
+    mailbox: &mut impl SnoozeMailbox,
+    snoozed: &SnoozedMessage,
+    account_email: &str,
+) -> Result<(), String> {
+    let folder = &snoozed.snoozed_folder;
+    let Some(message_id) = snoozed.message_id.as_deref() else {
+        return Err(format!(
+            "the snooze of UID {} has no Message-ID to find it by in {folder} on {account_email}; nothing was moved",
+            snoozed.uid
+        ));
+    };
+    let uid = mailbox
+        .find_uid_by_message_id(folder, message_id.trim_matches(|c| c == '<' || c == '>'))
+        .await
+        .map_err(|e| {
+            format!(
+                "could not search {folder} on {account_email} for the snoozed message; nothing was moved: {e:#}"
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "the snoozed message {message_id} is no longer in {folder} on {account_email}; nothing was moved"
+            )
+        })?;
+    mailbox
+        .move_message(uid, folder, &snoozed.original_folder)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 // ── Config output ───────────────────────────────────────────────────
@@ -3229,6 +3283,138 @@ fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyho
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A Snoozed folder whose Message-ID search answers `found`. It records
+    /// each search and each move.
+    struct FakeSnoozeMailbox {
+        found: Option<Result<Option<u32>, ImapError>>,
+        searches: Vec<(String, String)>,
+        moves: Vec<(u32, String, String)>,
+    }
+
+    impl FakeSnoozeMailbox {
+        fn answering(found: Result<Option<u32>, ImapError>) -> Self {
+            Self {
+                found: Some(found),
+                searches: Vec::new(),
+                moves: Vec::new(),
+            }
+        }
+    }
+
+    impl SnoozeMailbox for FakeSnoozeMailbox {
+        async fn find_uid_by_message_id(
+            &mut self,
+            folder: &str,
+            message_id: &str,
+        ) -> Result<Option<u32>, ImapError> {
+            self.searches
+                .push((folder.to_string(), message_id.to_string()));
+            self.found.take().expect("one search per cancel")
+        }
+
+        async fn move_message(&mut self, uid: u32, from: &str, to: &str) -> Result<(), ImapError> {
+            self.moves.push((uid, from.to_string(), to.to_string()));
+            Ok(())
+        }
+    }
+
+    /// A message snoozed from INBOX, where it was UID 42.
+    fn snoozed_from_inbox() -> SnoozedMessage {
+        let db = Database::open_memory().unwrap();
+        db.create_snoozed(
+            "me@example.test",
+            42,
+            "INBOX",
+            "Snoozed",
+            "2026-10-13T09:00:00",
+            Some("<later@example.test>"),
+            Some("Later"),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The stored UID names the message in INBOX. In Snoozed it has another
+    /// UID, so cancel finds it there by Message-ID and moves that one.
+    #[tokio::test]
+    async fn snooze_cancel_moves_the_message_found_in_snoozed() {
+        let mut mailbox = FakeSnoozeMailbox::answering(Ok(Some(3)));
+
+        return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+            .await
+            .expect("the message is found and returned");
+
+        assert_eq!(
+            mailbox.searches,
+            [("Snoozed".to_string(), "later@example.test".to_string())]
+        );
+        assert_eq!(
+            mailbox.moves,
+            [(3, "Snoozed".to_string(), "INBOX".to_string())]
+        );
+    }
+
+    /// When the snoozed message is no longer in Snoozed, UID 42 there is
+    /// another message or none: cancel moves nothing and says so.
+    #[tokio::test]
+    async fn snooze_cancel_moves_nothing_when_the_message_is_gone() {
+        let mut mailbox = FakeSnoozeMailbox::answering(Ok(None));
+
+        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+            .await
+            .expect_err("a message that is gone is not returned");
+
+        assert!(mailbox.moves.is_empty(), "moved {:?}", mailbox.moves);
+        for expected in ["Snoozed", "me@example.test", "nothing was moved"] {
+            assert!(err.contains(expected), "missing {expected:?}: {err}");
+        }
+    }
+
+    /// A snooze recorded without a Message-ID cannot be found in Snoozed:
+    /// cancel moves nothing rather than guess with the INBOX UID.
+    #[tokio::test]
+    async fn snooze_cancel_moves_nothing_without_a_message_id() {
+        let mut mailbox = FakeSnoozeMailbox::answering(Ok(Some(3)));
+        let snoozed = SnoozedMessage {
+            message_id: None,
+            ..snoozed_from_inbox()
+        };
+
+        let err = return_snoozed(&mut mailbox, &snoozed, "me@example.test")
+            .await
+            .expect_err("nothing to find it by");
+
+        assert!(mailbox.searches.is_empty() && mailbox.moves.is_empty());
+        assert!(err.contains("nothing was moved"), "{err}");
+    }
+
+    /// A search the server refused says nothing about where the message is:
+    /// cancel moves nothing and reports the server's words.
+    #[tokio::test]
+    async fn snooze_cancel_moves_nothing_when_the_search_is_refused() {
+        let mut mailbox = FakeSnoozeMailbox::answering(Err(ImapError::Protocol(
+            "UID SEARCH HEADER Message-ID \"later@example.test\": the server refused it: \
+             NO [UNAVAILABLE] backend down"
+                .into(),
+        )));
+
+        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+            .await
+            .expect_err("a refused search returns nothing");
+
+        assert!(mailbox.moves.is_empty(), "moved {:?}", mailbox.moves);
+        for expected in [
+            "Snoozed",
+            "me@example.test",
+            "nothing was moved",
+            "NO [UNAVAILABLE] backend down",
+        ] {
+            assert!(err.contains(expected), "missing {expected:?}: {err}");
+        }
+    }
 
     #[test]
     fn tag_tool_does_not_give_a_twin_the_marked_original_s_threat_tags() {

@@ -247,25 +247,48 @@ pub async fn run(
     let mut client = imap::connect(&creds)
         .await
         .context("IMAP connection failed")?;
-    client
-        .session_mut()
+    let session = client.session_mut();
+    session
         .select("INBOX")
         .await
         .map_err(|e| anyhow::anyhow!("SELECT INBOX: {e}"))?;
-    let initial_max_uid = get_max_uid(&mut client).await?;
-    if !json {
-        eprintln!(
-            "Watching for verification codes (timeout: {wait_secs}s, starting after UID {initial_max_uid})..."
-        );
-    }
-
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(wait_secs);
-    let mut last_seen_uid = initial_max_uid;
+    let wait = CodeWait {
+        account: &creds.account,
+        threat_config: &threat_config,
+        from_filter,
+        subject_filter,
+        allow_unverified,
+        json,
+        timeout: std::time::Duration::from_secs(wait_secs),
+    };
     let mut collected = CandidateCollection::default();
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
+    match wait_for_code(session, &wait, &mut collected).await? {
+        WaitOutcome::Code(candidate) if json => {
+            let output = candidate_json(&candidate, &collected);
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        WaitOutcome::Code(candidate) => {
+            println!("{}", candidate.code);
+            Ok(())
+        }
+        WaitOutcome::Ambiguous(candidate_count) if json => {
+            println!(
+                "{}",
+                json!({
+                    "error": "ambiguous_matches",
+                    "candidate_count": candidate_count,
+                    "trust": provenance::inbound_trust(),
+                })
+            );
+            bail!(
+                "ambiguous OTP matches: {candidate_count} messages matched; refine --from or --subject"
+            );
+        }
+        WaitOutcome::Ambiguous(candidate_count) => bail!(
+            "ambiguous OTP matches: {candidate_count} messages matched this poll; refine --from or --subject"
+        ),
+        WaitOutcome::TimedOut => {
             let mut report = collected.timeout_report(wait_secs);
             if json {
                 report["trust"] = provenance::inbound_trust();
@@ -281,71 +304,112 @@ pub async fn run(
             }
             std::process::exit(1);
         }
+    }
+}
 
-        let new_uids = search_new_uids(&mut client, last_seen_uid).await?;
+/// What one `envelope code` wait looks for, and for how long.
+struct CodeWait<'a> {
+    account: &'a Account,
+    threat_config: &'a ThreatConfig,
+    from_filter: Option<&'a str>,
+    subject_filter: Option<&'a str>,
+    allow_unverified: bool,
+    /// JSON automation: candidates are collected across the stabilization
+    /// window instead of returned on the first poll.
+    json: bool,
+    timeout: std::time::Duration,
+}
+
+/// How a wait for a code ended.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Code(OtpCandidate),
+    /// More than one accepted code: across the wait (JSON) or in one poll.
+    Ambiguous(usize),
+    TimedOut,
+}
+
+/// Poll INBOX, open on `session`, for a code in mail that arrives after the
+/// wait starts. `collected` keeps what the polls found, for the result.
+async fn wait_for_code<T>(
+    session: &mut async_imap::Session<T>,
+    wait: &CodeWait<'_>,
+    collected: &mut CandidateCollection,
+) -> Result<WaitOutcome>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    // A read the server refused ends the wait. Taken for an empty answer, it
+    // would start the wait at UID 0, or release the first code before the
+    // stabilization window saw a second, and return an old code.
+    let account = &wait.account.username;
+    let initial_max_uid = imap::list_selected_uids_in(session)
+        .await
+        .with_context(|| format!("could not search INBOX on {account}; no code was returned"))?
+        .last()
+        .copied()
+        .unwrap_or(0);
+    if !wait.json {
+        eprintln!(
+            "Watching for verification codes (timeout: {}s, starting after UID {initial_max_uid})...",
+            wait.timeout.as_secs()
+        );
+    }
+
+    let start = tokio::time::Instant::now();
+    let mut last_seen_uid = initial_max_uid;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= wait.timeout {
+            return Ok(WaitOutcome::TimedOut);
+        }
+
+        let new_uids = imap::list_selected_uids_after_in(session, last_seen_uid)
+            .await
+            .with_context(|| {
+                format!("could not search INBOX on {account} for new mail; no code was returned")
+            })?;
         let mut classified = Vec::new();
         for uid in new_uids {
-            if uid <= last_seen_uid {
-                continue;
-            }
             last_seen_uid = uid;
             // `BODY.PEEK[]`: reading never marks the message seen. A message
             // too large to fetch whole has no bytes to authenticate and is
             // skipped.
-            let Some((_, Some(raw))) =
-                imap::fetch_message_with_raw(&mut client, "INBOX", uid).await?
+            let Some((_, Some(raw))) = imap::fetch_message_with_raw_in(session, "INBOX", uid)
+                .await
+                .with_context(|| {
+                    format!("could not read UID {uid} in INBOX on {account}; no code was returned")
+                })?
             else {
                 continue;
             };
             classified.push(classify(
                 &raw,
-                &creds.account,
-                &threat_config,
-                from_filter,
-                subject_filter,
+                wait.account,
+                wait.threat_config,
+                wait.from_filter,
+                wait.subject_filter,
             ));
         }
-        let matches = collected.admit(classified, allow_unverified);
+        let matches = collected.admit(classified, wait.allow_unverified);
 
-        if json {
+        if wait.json {
             match collected.observe(elapsed, matches) {
                 CollectionOutcome::Continue => {}
-                CollectionOutcome::Ready(candidate) => {
-                    let output = candidate_json(&candidate, &collected);
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                    return Ok(());
-                }
-                CollectionOutcome::Ambiguous(candidate_count) => {
-                    println!(
-                        "{}",
-                        json!({
-                            "error": "ambiguous_matches",
-                            "candidate_count": candidate_count,
-                            "trust": provenance::inbound_trust(),
-                        })
-                    );
-                    bail!(
-                        "ambiguous OTP matches: {candidate_count} messages matched; refine --from or --subject"
-                    );
-                }
+                CollectionOutcome::Ready(candidate) => return Ok(WaitOutcome::Code(candidate)),
+                CollectionOutcome::Ambiguous(count) => return Ok(WaitOutcome::Ambiguous(count)),
             }
         } else {
             // Interactive stdout use stays low-friction: no stabilization
             // window, but the same sender authentication.
             match matches.as_slice() {
                 [] => {}
-                [candidate] => {
-                    println!("{}", candidate.code);
-                    return Ok(());
-                }
-                _ => bail!(
-                    "ambiguous OTP matches: {} messages matched this poll; refine --from or --subject",
-                    matches.len()
-                ),
+                [candidate] => return Ok(WaitOutcome::Code(candidate.clone())),
+                _ => return Ok(WaitOutcome::Ambiguous(matches.len())),
             }
         }
 
-        let remaining = timeout.saturating_sub(start.elapsed());
+        let remaining = wait.timeout.saturating_sub(start.elapsed());
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 }
@@ -448,27 +512,6 @@ fn mailbox_from_header(raw: &str) -> String {
     (candidate.matches('@').count() == 1 && !candidate.contains(char::is_whitespace))
         .then_some(candidate)
         .unwrap_or_default()
-}
-
-async fn get_max_uid(client: &mut imap::ImapClient) -> Result<u32> {
-    let uid_set = client
-        .session_mut()
-        .uid_search("ALL")
-        .await
-        .map_err(|e| anyhow::anyhow!("UID SEARCH ALL: {e}"))?;
-    Ok(uid_set.into_iter().max().unwrap_or(0))
-}
-
-async fn search_new_uids(client: &mut imap::ImapClient, since_uid: u32) -> Result<Vec<u32>> {
-    let query = format!("UID {}:*", since_uid + 1);
-    let uid_set = client
-        .session_mut()
-        .uid_search(&query)
-        .await
-        .map_err(|e| anyhow::anyhow!("UID SEARCH {query}: {e}"))?;
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-    uids.sort_unstable();
-    Ok(uids)
 }
 
 #[cfg(test)]
@@ -842,6 +885,220 @@ mod tests {
                 [candidate("111111"), candidate("222222")]
             ),
             CollectionOutcome::Ambiguous(2)
+        );
+    }
+
+    /// One command the scripted server expects, by how it starts after the
+    /// tag, and the lines it answers with (`{tag}` is the command's tag).
+    struct Turn {
+        command: String,
+        reply: Vec<String>,
+    }
+
+    fn turn(command: &str, reply: &[&str]) -> Turn {
+        Turn {
+            command: command.to_string(),
+            reply: reply.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    const SEARCH_OK: &str = "{tag} OK Search completed";
+    const REFUSED: &str = "{tag} NO [UNAVAILABLE] backend down";
+
+    /// The turns `fetch_message_with_raw_in` takes to read message `uid`.
+    fn read_turns(uid: u32, raw: &[u8]) -> Vec<Turn> {
+        let raw = String::from_utf8(raw.to_vec()).unwrap();
+        vec![
+            turn("SELECT", &["{tag} OK [READ-WRITE] Select completed"]),
+            turn(
+                &format!("UID FETCH {uid} (UID RFC822.SIZE)"),
+                &[
+                    &format!("* 1 FETCH (UID {uid} RFC822.SIZE {})", raw.len()),
+                    "{tag} OK Fetch completed",
+                ],
+            ),
+            turn(
+                &format!("UID FETCH {uid} (UID FLAGS BODY.PEEK[])"),
+                &[
+                    &format!(
+                        "* 1 FETCH (UID {uid} FLAGS () BODY[] {{{}}}\r\n{raw})",
+                        raw.len()
+                    ),
+                    "{tag} OK Fetch completed",
+                ],
+            ),
+        ]
+    }
+
+    fn issuer_code(code: &str) -> Vec<u8> {
+        otp_message(Some(ISSUER_PASS), "Issuer <otp@issuer.example>", code)
+    }
+
+    /// A logged-in session over an in-memory pipe whose server plays `turns`
+    /// in order and answers anything else BAD. The server returns every
+    /// command it was sent after LOGIN.
+    async fn scripted_session(
+        turns: Vec<Turn>,
+    ) -> (
+        async_imap::Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(server_io);
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"* OK scripted\r\n").await.unwrap();
+            let mut turns = turns.into_iter();
+            let mut received = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap_or_default();
+                let reply = if command.starts_with("LOGIN") {
+                    vec!["{tag} OK LOGIN completed".to_string()]
+                } else {
+                    received.push(command.to_string());
+                    match turns.next() {
+                        Some(turn) if command.starts_with(&turn.command) => turn.reply,
+                        _ => vec!["{tag} BAD unscripted command".to_string()],
+                    }
+                };
+                let out: String = reply
+                    .iter()
+                    .map(|line| format!("{}\r\n", line.replace("{tag}", tag)))
+                    .collect();
+                if write_half.write_all(out.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            received
+        });
+        let mut client = async_imap::Client::new(client_io);
+        client.read_response().await.unwrap().unwrap();
+        let session = client.login("me", "pw").await.map_err(|(e, _)| e).unwrap();
+        (session, server)
+    }
+
+    /// Wait up to `timeout_secs` for a code from issuer.example to
+    /// me@example.org, over the scripted `turns`. Returns how the wait ended
+    /// and the commands the server was sent.
+    async fn wait_scripted(
+        turns: Vec<Turn>,
+        json: bool,
+        timeout_secs: u64,
+    ) -> (Result<WaitOutcome>, Vec<String>) {
+        let account = mailbox("imap.example.org");
+        let config = ThreatConfig::default();
+        let wait = CodeWait {
+            account: &account,
+            threat_config: &config,
+            from_filter: Some("issuer.example"),
+            subject_filter: None,
+            allow_unverified: false,
+            json,
+            timeout: std::time::Duration::from_secs(timeout_secs),
+        };
+        let (mut session, server) = scripted_session(turns).await;
+        let outcome = wait_for_code(&mut session, &wait, &mut CandidateCollection::default()).await;
+        drop(session);
+        (outcome, server.await.unwrap())
+    }
+
+    /// The error a refused read ends the wait with, as the CLI prints it. It
+    /// names the account, the folder and the server's words.
+    fn assert_refusal_reported(outcome: Result<WaitOutcome>) {
+        let err = format!(
+            "{:#}",
+            outcome.expect_err("a refused read ends the wait with an error, never a code")
+        );
+        for expected in ["me@example.org", "INBOX", "NO [UNAVAILABLE] backend down"] {
+            assert!(err.contains(expected), "missing {expected:?}: {err}");
+        }
+    }
+
+    /// A refused `UID SEARCH ALL` read as an empty INBOX, so the wait started
+    /// after UID 0 and took a code already in the mailbox for a new one: the
+    /// agent got an old code. The refusal now ends the wait, and nothing more
+    /// is read.
+    #[tokio::test]
+    async fn a_refused_search_never_returns_an_old_code() {
+        let mut turns = vec![
+            turn("UID SEARCH ALL", &[REFUSED]),
+            // What a wait that started after UID 0 went on to read.
+            turn("UID SEARCH UID 1:*", &["* SEARCH 3", SEARCH_OK]),
+        ];
+        turns.extend(read_turns(3, &issuer_code("111111")));
+
+        let (outcome, commands) = wait_scripted(turns, false, 60).await;
+
+        assert_refusal_reported(outcome);
+        assert_eq!(
+            commands,
+            ["UID SEARCH ALL"],
+            "nothing is read after the refusal"
+        );
+    }
+
+    /// JSON automation waits out the stabilization window so that a second
+    /// code arriving in it fails closed as ambiguous. A search refused in the
+    /// window read as nothing new, and the first code was released though
+    /// another had come. The refusal now ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_search_in_the_stabilization_window_never_releases_the_first_code() {
+        let mut turns = vec![
+            turn("UID SEARCH ALL", &["* SEARCH 5", SEARCH_OK]),
+            turn("UID SEARCH UID 6:*", &["* SEARCH 6", SEARCH_OK]),
+        ];
+        turns.extend(read_turns(6, &issuer_code("111111")));
+        // A second code has arrived as UID 7; the search that would find it
+        // is refused.
+        turns.push(turn("UID SEARCH UID 7:*", &[REFUSED]));
+
+        let (outcome, _) = wait_scripted(turns, true, 60).await;
+
+        assert_refusal_reported(outcome);
+    }
+
+    /// A FETCH the server refused is an error, never a message that is gone:
+    /// skipping it would return the older code that arrived beside it.
+    #[tokio::test]
+    async fn a_refused_fetch_never_returns_an_old_code() {
+        let mut turns = vec![
+            turn("UID SEARCH ALL", &["* SEARCH 5", SEARCH_OK]),
+            turn("UID SEARCH UID 6:*", &["* SEARCH 6 7", SEARCH_OK]),
+        ];
+        turns.extend(read_turns(6, &issuer_code("111111")));
+        turns.push(turn("SELECT", &["{tag} OK [READ-WRITE] Select completed"]));
+        turns.push(turn("UID FETCH 7 (UID RFC822.SIZE)", &[REFUSED]));
+
+        let (outcome, _) = wait_scripted(turns, false, 60).await;
+
+        assert_refusal_reported(outcome);
+    }
+
+    /// No new mail yet is still a wait: a poll every five seconds until the
+    /// wait runs out, then a timeout. An empty SEARCH, and `n:*` answering
+    /// with the highest UID already seen, both mean nothing new.
+    #[tokio::test(start_paused = true)]
+    async fn no_new_mail_still_waits_and_times_out() {
+        let turns = vec![
+            turn("UID SEARCH ALL", &["* SEARCH 5", SEARCH_OK]),
+            turn("UID SEARCH UID 6:*", &["* SEARCH", SEARCH_OK]),
+            turn("UID SEARCH UID 6:*", &["* SEARCH 5", SEARCH_OK]),
+        ];
+        let started = tokio::time::Instant::now();
+
+        let (outcome, commands) = wait_scripted(turns, false, 10).await;
+
+        assert_eq!(outcome.unwrap(), WaitOutcome::TimedOut);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(
+            commands,
+            ["UID SEARCH ALL", "UID SEARCH UID 6:*", "UID SEARCH UID 6:*"]
         );
     }
 
