@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `envelope unsnooze` and `envelope snooze check-replies` no longer return or flag snoozed mail early (or late) by your time-zone offset. Return times are stored in UTC, but both commands compared them with your local clock: two hours ahead of UTC, a snooze came back two hours early, and behind UTC it came back late. They now compare in UTC, as `envelope serve` already did.
+
 ## [1.3.24] — 2026-10-12
 
 Finishing a Gmail sign-in from another device now takes whatever you paste, the address or the whole "can't connect" page, and an agent can hand you the link and finish the sign-in later. Every MCP tool also says whether it only reads, can change or delete mail, or reaches beyond your machine, so Claude and other clients know when to ask you first.

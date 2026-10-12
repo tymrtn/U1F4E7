@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use chrono::Local;
+use chrono::{DateTime, Utc};
 use envelope_email_store::credential_store::CredentialBackend;
 use envelope_email_store::{Database, SnoozedMessage};
 use envelope_email_transport::errors::ImapError;
@@ -17,6 +17,10 @@ use super::datetime::parse_until;
 
 /// The default IMAP folder name for snoozed messages.
 const IMAP_SNOOZED_FOLDER: &str = "Snoozed";
+
+/// Format of a stored `return_at`: naive UTC, as `parse_until` writes it, so
+/// due checks are plain string comparisons.
+const RETURN_AT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 /// Valid snooze reasons.
 const VALID_REASONS: &[&str] = &["follow-up", "waiting-reply", "defer", "reminder", "review"];
@@ -317,7 +321,7 @@ pub async fn run_check(
     backend: CredentialBackend,
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
-    let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = Utc::now().format(RETURN_AT_FORMAT).to_string();
     let ctx = agent_context::cli_agent(&db, json)?;
 
     // Resolve account filter
@@ -513,7 +517,6 @@ pub async fn run_check_replies(
     backend: CredentialBackend,
 ) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
-    let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let ctx = agent_context::cli_agent(&db, json)?;
 
     // Resolve account filter
@@ -647,7 +650,7 @@ pub async fn run_check_replies(
     }
 
     // Now process results: update DB and build output
-    let results = settle_awaiting(&db, &awaiting, &reply_details, &unchecked, &now, json);
+    let results = settle_awaiting(&db, &awaiting, &reply_details, &unchecked, Utc::now(), json);
 
     if json {
         println!(
@@ -671,15 +674,16 @@ pub async fn run_check_replies(
 /// reply, and build its result rows. `reply_details` holds the replies found,
 /// by recipient; `unchecked` the recipients whose reply could not be looked
 /// for in some mailbox, with why. A message with no reply found is escalated
-/// once it is overdue.
+/// once it is overdue: its naive UTC `return_at` is at or before `now`.
 fn settle_awaiting(
     db: &Database,
     awaiting: &[SnoozedMessage],
     reply_details: &HashMap<String, serde_json::Value>,
     unchecked: &HashMap<String, String>,
-    now: &str,
+    now: DateTime<Utc>,
     json: bool,
 ) -> Vec<serde_json::Value> {
+    let now = now.format(RETURN_AT_FORMAT).to_string();
     let mut results: Vec<serde_json::Value> = Vec::new();
     for msg in awaiting {
         let recipient = msg.recipient.as_deref().unwrap_or("(unknown)");
@@ -753,7 +757,7 @@ fn settle_awaiting(
             }));
         } else {
             // No reply found
-            let is_overdue = msg.return_at.as_str() <= now;
+            let is_overdue = msg.return_at <= now;
             let new_tier = if is_overdue {
                 // Past due — escalate
                 match db.increment_escalation(&msg.id) {
@@ -815,6 +819,10 @@ fn uid_to_return(found: Result<Option<u32>, ImapError>, stored: u32) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
 
     #[test]
     fn validate_reason_valid() {
@@ -880,7 +888,7 @@ mod tests {
             &awaiting,
             &HashMap::new(),
             &unchecked,
-            "2026-10-12T09:00:00",
+            utc("2026-10-12T09:00:00Z"),
             true,
         );
 
@@ -893,5 +901,37 @@ mod tests {
         );
         let row = db.get_snoozed(&awaiting[0].id).unwrap().unwrap();
         assert_eq!(row.escalation_tier, 0, "nothing is escalated");
+    }
+
+    /// A follow-up with no reply is overdue from its naive UTC `return_at`
+    /// on, and not a second before.
+    #[test]
+    fn a_follow_up_is_overdue_from_its_utc_return_time() {
+        let db = Database::open_memory().unwrap();
+        db.create_snoozed(
+            "me@example.test",
+            7,
+            "INBOX",
+            "Snoozed",
+            "2026-10-12T09:00:00",
+            Some("<sent-1@example.test>"),
+            Some("Quote"),
+            Some("waiting-reply"),
+            None,
+            Some("them@example.test"),
+        )
+        .unwrap();
+        let awaiting = db.list_snoozed_awaiting_reply(None).unwrap();
+        let no_replies = HashMap::new();
+        let all_searched = HashMap::new();
+        let settle = |now| settle_awaiting(&db, &awaiting, &no_replies, &all_searched, now, true);
+
+        let before = settle(utc("2026-10-12T08:59:59Z"));
+        assert_eq!(before[0]["status"], "no_reply_waiting", "{before:?}");
+        assert_eq!(before[0]["escalation_tier"], 0, "{before:?}");
+
+        let at = settle(utc("2026-10-12T09:00:00Z"));
+        assert_eq!(at[0]["status"], "no_reply_overdue", "{at:?}");
+        assert_eq!(at[0]["escalation_tier"], 1, "{at:?}");
     }
 }
