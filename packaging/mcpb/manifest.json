@@ -31,6 +31,7 @@
   },
   "keywords": ["email", "imap", "smtp", "inbox", "mcp", "otp", "byo", "multi-account"],
   "license": "FSL-1.1-ALv2",
+  "privacy_policies": ["https://u1f4e7.com/privacy"],
   "compatibility": {
     "platforms": ["darwin", "linux"]
   },
