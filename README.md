@@ -80,7 +80,9 @@ Gmail with Google sign-in. That decides which mailboxes work today:
   Envelope's Google app is in Google's testing stage, only addresses on its
   test-user list can sign in, and Google asks again every 7 days. An
   [app password](https://support.google.com/accounts/answer/185833) still works
-  for accounts that can create one.
+  for accounts that can create one. From another device, add `--paste`
+  (automatic over SSH), or run `--paste --no-wait` now and `--finish -`
+  within 24 hours.
 - **Migadu, self-hosted Dovecot, and most other IMAP hosts:** your normal
   mailbox password.
 - **Outlook.com, Hotmail, Live, and Microsoft 365:** not supported yet.

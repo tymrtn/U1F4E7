@@ -14,9 +14,23 @@ can also use Google sign-in in your browser.
 |---|---|
 | **Fastmail** | App password: [app.fastmail.com/settings/security/devicekeys](https://app.fastmail.com/settings/security/devicekeys) |
 | **iCloud Mail** | App-specific password: [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords |
-| **Gmail** | Google sign-in: `envelope accounts add --provider google --email you@gmail.com` opens Google in your browser (add `--paste` to finish on another device). An account added earlier with a password switches with `envelope accounts reauth you@gmail.com --provider google`. While Envelope's Google app is in Google's testing stage, only addresses on its test-user list can sign in, and Google asks again every 7 days. An app password ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)) still works if your account can create one. |
+| **Gmail** | Google sign-in: `envelope accounts add --provider google --email you@gmail.com` opens Google in your browser (from another device, see [below](#gmail-from-another-device-or-through-an-agent)). An account added earlier with a password switches with `envelope accounts reauth you@gmail.com --provider google`. While Envelope's Google app is in Google's testing stage, only addresses on its test-user list can sign in, and Google asks again every 7 days. An app password ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)) still works if your account can create one. |
 | **Migadu / self-hosted** | Your regular mailbox password |
 | **Outlook.com, Hotmail, Live, Microsoft 365** | Not supported yet. Microsoft turned off password sign-in for IMAP on [Outlook.com](https://support.microsoft.com/en-us/office/modern-authentication-methods-now-needed-to-continue-syncing-outlook-email-in-non-microsoft-email-apps-c5d65390-9676-4763-b41f-d7986499a90d) and [Exchange Online](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online), and Envelope cannot do the OAuth sign-in Microsoft requires. |
+
+### Gmail from another device or through an agent
+
+Over SSH, or with `--paste`, Envelope prints the sign-in link instead of opening a browser. Open it on any device, approve, and paste back the address of the "can't connect" page the browser ends on. Pasting the whole page works too.
+
+To split that across two commands, for example when an agent hands you the link:
+
+```bash
+envelope accounts add --provider google --email you@gmail.com --paste --no-wait
+# open the link, approve, copy the page's address, then within 24 hours:
+envelope accounts add --provider google --email you@gmail.com --finish -
+```
+
+`accounts reauth` takes the same flags.
 
 ---
 

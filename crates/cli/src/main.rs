@@ -650,6 +650,19 @@ enum AccountsCmd {
         /// address the browser ends on, instead of catching it locally.
         #[arg(long, requires = "provider")]
         paste: bool,
+        /// With --paste: print the sign-in link and exit; finish within 24
+        /// hours with --finish
+        #[arg(long, requires = "paste")]
+        no_wait: bool,
+        /// Finish a sign-in started with --paste --no-wait: the address the
+        /// browser ended on, or the whole page; `-` reads it from stdin
+        #[arg(
+            long,
+            value_name = "ADDRESS",
+            requires = "provider",
+            conflicts_with = "paste"
+        )]
+        finish: Option<String>,
     },
     /// Sign an account in again with its provider, or switch a password
     /// account to provider sign-in with --provider
@@ -663,6 +676,14 @@ enum AccountsCmd {
         /// browser ends on, instead of catching it locally
         #[arg(long)]
         paste: bool,
+        /// With --paste: print the sign-in link and exit; finish within 24
+        /// hours with --finish
+        #[arg(long, requires = "paste")]
+        no_wait: bool,
+        /// Finish a sign-in started with --paste --no-wait: the address the
+        /// browser ended on, or the whole page; `-` reads it from stdin
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "paste")]
+        finish: Option<String>,
     },
     /// Re-encrypt the file credential store under a new passphrase
     Rekey,
