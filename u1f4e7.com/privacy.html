@@ -81,6 +81,7 @@
       <section id="privacy-google" class="article-section">
         <h2>Signing in with Google</h2>
         <p>A Gmail account can sign in through Google instead of using an app password. The sign-in opens accounts.google.com in your browser, and Envelope exchanges the result for tokens at oauth2.googleapis.com. Envelope asks for Gmail access (the <code>https://mail.google.com/</code> scope, the only one that allows IMAP and SMTP) and for your email address. It uses the tokens to log in to Gmail's IMAP and SMTP servers and calls no other Google API. When the access token expires, Envelope renews it at oauth2.googleapis.com. When you remove the account with <code>envelope accounts remove</code>, Envelope asks Google to revoke its access.</p>
+        <p>Envelope uses the mail it reads from a Google account only to show it to you and to the agents you connect, and to carry out what you or those agents ask. It doesn't sell that data, use it for advertising, or use it to train AI models. Envelope's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy#additional_requirements_for_specific_api_scopes">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
       </section>
 
       <section id="privacy-on-request" class="article-section">
