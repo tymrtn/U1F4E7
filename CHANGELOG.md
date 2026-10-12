@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.24] — 2026-10-12
+
+Finishing a Gmail sign-in from another device now takes whatever you paste, the address or the whole "can't connect" page, and an agent can hand you the link and finish the sign-in later. Every MCP tool also says whether it only reads, can change or delete mail, or reaches beyond your machine, so Claude and other clients know when to ask you first.
+
 ### Added
 
 - Every MCP tool now says whether it is read-only, destructive, idempotent and open-world. `tools/list` gives each of the 24 tools an `annotations` object with a `title` and all four MCP hints set, so Claude and other clients can decide when to ask you before a call. The hints describe a tool's full capability, whatever the send mode: `send`, `reply` and `send_draft` count as destructive even under `draft-only`, because they can send mail that can't be recalled. `move_message`, `snooze`, `flag`, `bulk` and `rules_run` are marked destructive too: a move expunges the source copy, a flag can set `\Deleted`, and bulk and rule runs can delete. The same annotations appear under `mcp_tools` in `envelope contract`, whose `tool_action_map` is now generated from the policy code and keeps the same values. No tool behaves differently.
