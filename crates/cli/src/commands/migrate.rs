@@ -168,7 +168,9 @@ pub async fn run(
                         src_folder: Some(&folder.folder),
                         src_uidvalidity: Some(src_uidvalidity),
                     };
-                    let source_uids = imap::list_selected_uids(&mut src_client).await?;
+                    let source_uids = imap::list_selected_uids(&mut src_client)
+                        .await
+                        .with_context(|| format!("listing {} on {from}", folder.folder))?;
                     let migrated_uids: HashSet<u32> =
                         db.list_migrated_uids(scope)?.into_iter().collect();
                     let destination_exists = imap::folder_exists(&mut dst_client, &folder.folder)
@@ -192,7 +194,8 @@ pub async fn run(
                             &folder.folder,
                             &uid_set,
                         )
-                        .await?;
+                        .await
+                        .with_context(|| format!("reading {} on {from}", folder.folder))?;
                         for header in headers {
                             if migrated_uids.contains(&header.uid) {
                                 already_migrated += 1;
@@ -205,7 +208,10 @@ pub async fn run(
                                         &folder.folder,
                                         message_id,
                                     )
-                                    .await?
+                                    .await
+                                    .with_context(|| {
+                                        format!("searching {} on {to}", folder.folder)
+                                    })?
                                     .is_some()
                                     {
                                         already_in_destination += 1;
@@ -247,7 +253,9 @@ pub async fn run(
                 let mut skipped = 0u32;
                 let mut failed = 0u32;
 
-                let source_uids = imap::list_selected_uids(&mut src_client).await?;
+                let source_uids = imap::list_selected_uids(&mut src_client)
+                    .await
+                    .with_context(|| format!("listing {} on {from}", folder.folder))?;
                 let uid_sets = migrate::uid_sequence_set_batches(&source_uids, batch_size);
 
                 for uid_set in uid_sets {
@@ -256,7 +264,8 @@ pub async fn run(
                         &folder.folder,
                         &uid_set,
                     )
-                    .await?;
+                    .await
+                    .with_context(|| format!("reading {} on {from}", folder.folder))?;
                     for msg in messages {
                         let key = MigrationKey {
                             src_account_id: &src.account.id,
@@ -278,12 +287,20 @@ pub async fn run(
                             continue;
                         }
                         if let Some(message_id) = msg.message_id.as_deref() {
+                            // A refused search stops the migration: read as
+                            // "not there", it would append a second copy.
                             let already_in_destination = imap::find_uid_by_message_id(
                                 dst_client,
                                 &folder.folder,
                                 message_id,
                             )
-                            .await?
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "searching {} on {to}; UID {} was not copied",
+                                    folder.folder, msg.uid
+                                )
+                            })?
                             .is_some();
                             if already_in_destination {
                                 db.record_migration(MigrationRecord {

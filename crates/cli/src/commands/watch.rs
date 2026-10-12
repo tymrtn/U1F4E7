@@ -112,8 +112,11 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("SELECT {folder}: {e}"))?;
     let mut current_uid_validity = selected_mailbox.uid_validity;
 
-    // Track highest UID we've seen so we only fetch genuinely new messages
-    let mut last_uid: u32 = highest_uid(&mut session, folder).await.unwrap_or(0);
+    // Track highest UID we've seen so we only fetch genuinely new messages.
+    // Without it every message in the folder would read as new.
+    let mut last_uid: u32 = highest_uid(&mut session, folder)
+        .await
+        .with_context(|| format!("watch did not start on {}", creds.account.username))?;
 
     let condstore = match session.capabilities().await {
         Ok(caps) => caps.has_str("CONDSTORE"),
@@ -856,17 +859,16 @@ fn snippet_preview(bytes: &[u8], max_chars: usize) -> String {
     }
 }
 
-/// Return the highest UID currently in the selected folder.
-async fn highest_uid(
-    session: &mut envelope_email_transport::imap::ImapSession,
-    _folder: &str,
-) -> Result<u32> {
-    // SEARCH for all messages to find max UID
-    let uids = session
-        .uid_search("ALL")
+/// Return the highest UID currently in the selected folder. A search the
+/// server refuses or never finishes is an error, never an empty folder.
+async fn highest_uid<T>(session: &mut async_imap::Session<T>, folder: &str) -> Result<u32>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let uids = envelope_email_transport::imap::list_selected_uids_in(session)
         .await
-        .map_err(|e| anyhow::anyhow!("UID SEARCH ALL: {e}"))?;
-    Ok(uids.into_iter().max().unwrap_or(0))
+        .with_context(|| format!("could not read the highest UID in {folder}"))?;
+    Ok(uids.last().copied().unwrap_or(0))
 }
 
 /// Fetch messages with UID > last_uid from the already-selected folder.
@@ -1396,6 +1398,30 @@ mod tests {
         let mut client = async_imap::Client::new(client_io);
         client.read_response().await.unwrap().unwrap();
         client.login("me", "pw").await.map_err(|(e, _)| e).unwrap()
+    }
+
+    /// The watch's starting watermark came from a search whose refusal read
+    /// as an empty folder, so the first wake took every message in the folder
+    /// for new mail: an event and a webhook for each, and `--run-rules` on
+    /// all of them. A refused or cut-off search stops the watch instead.
+    #[tokio::test]
+    async fn a_refused_search_never_starts_the_watermark_at_zero() {
+        for (reply, expected) in [
+            (
+                "{tag} NO [UNAVAILABLE] backend down",
+                "NO [UNAVAILABLE] backend down",
+            ),
+            ("* SEARCH 7 9", "connection lost"),
+        ] {
+            let mut session = scripted_session(vec![reply.to_string()]).await;
+            // The whole chain, as the CLI prints it.
+            let err = format!(
+                "{:#}",
+                highest_uid(&mut session, "INBOX").await.expect_err(reply)
+            );
+            assert!(err.contains("INBOX"), "{err}");
+            assert!(err.contains(expected), "{err}");
+        }
     }
 
     #[tokio::test]

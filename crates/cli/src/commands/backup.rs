@@ -299,7 +299,9 @@ async fn run_export(args: ExportArgs, json_output: bool, backend: CredentialBack
             },
         )?;
 
-        let uids = imap::list_selected_uids(&mut client).await?;
+        let uids = imap::list_selected_uids(&mut client)
+            .await
+            .with_context(|| format!("backup of {} on {account}", folder.folder))?;
         let mut written = 0u32;
         // Issue #20: each `uid_set` materializes `batch_size` full RFC822
         // bodies in memory (the FETCH response Vec). We bound `batch_size` to
@@ -309,7 +311,8 @@ async fn run_export(args: ExportArgs, json_output: bool, backend: CredentialBack
         for uid_set in migrate::uid_sequence_set_batches(&uids, batch_size) {
             let messages =
                 imap::fetch_raw_messages_selected_uid_set(&mut client, &folder.folder, &uid_set)
-                    .await?;
+                    .await
+                    .with_context(|| format!("backup of {} on {account}", folder.folder))?;
             for msg in messages {
                 let rel_path = backup::relative_message_path(&folder.folder, uidvalidity, msg.uid);
                 let abs_path = out.join(&rel_path);
@@ -760,8 +763,20 @@ async fn run_restore(
                 }
                 // Destination Message-ID dedup, mirroring migrate.
                 if let Some(message_id) = record.message_id.as_deref() {
-                    let already =
-                        imap::find_uid_by_message_id(&mut client, &destination, message_id).await?;
+                    // A refused search stops the restore: read as "not
+                    // there", it would append a second copy.
+                    let already = imap::find_uid_by_message_id(
+                        &mut client,
+                        &destination,
+                        message_id,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "restore to {destination} on {account}; UID {} was not appended",
+                            action.uid()
+                        )
+                    })?;
                     if already.is_some() {
                         if let Err(e) = persist_state(&state_path, record, &mut state) {
                             return Err(e.context(format!(

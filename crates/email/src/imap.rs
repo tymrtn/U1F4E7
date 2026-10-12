@@ -590,13 +590,25 @@ pub async fn fetch_inbox(
     folder: &str,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, ImapError> {
+    fetch_inbox_in(&mut client.session, folder, limit).await
+}
+
+/// [`fetch_inbox`] over any transport, so the scripted-server tests can drive
+/// it without TLS.
+async fn fetch_inbox_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let mailbox = client
-        .session
+    let mailbox = session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
@@ -612,23 +624,15 @@ pub async fn fetch_inbox(
         1
     };
     let range = format!("{start}:{exists}");
-
-    let messages = client
-        .session
-        .fetch(&range, FETCH_SUMMARY_DESCRIPTOR)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("FETCH {range}: {e}")))?;
-
-    let mut summaries = Vec::new();
-    let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(fetch) => summaries.push(message_summary_from_fetch(&fetch)),
-            Err(e) => return Err(ImapError::Protocol(format!("FETCH parse error: {e}"))),
-        }
-    }
-
-    Ok(summaries)
+    // A refused FETCH is an error, never an empty folder: `rule apply` and
+    // `contacts import` would report the folder processed.
+    Ok(
+        seq_fetch_checked(session, folder, &range, FETCH_SUMMARY_DESCRIPTOR)
+            .await?
+            .into_iter()
+            .filter_map(|fetch| fetch.summary)
+            .collect(),
+    )
 }
 
 /// Fetch message summaries after opening the folder read-only with IMAP
@@ -642,7 +646,20 @@ pub async fn fetch_folder_summaries_read_only(
     folder: &str,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, ImapError> {
-    let selected = examine_folder_info(client, folder).await?;
+    fetch_folder_summaries_read_only_in(&mut client.session, folder, limit).await
+}
+
+/// [`fetch_folder_summaries_read_only`] over any transport, so the
+/// scripted-server tests can drive it without TLS.
+async fn fetch_folder_summaries_read_only_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let selected = examine_folder_info_in(session, folder).await?;
     if selected.exists == 0 || limit == 0 {
         return Ok(Vec::new());
     }
@@ -653,66 +670,47 @@ pub async fn fetch_folder_summaries_read_only(
         1
     };
     let range = format!("{start}:{}", selected.exists);
-
-    let messages = client
-        .session
-        .fetch(&range, FETCH_SUMMARY_DESCRIPTOR)
-        .await
-        .map_err(|e| command_error(format!("FETCH {range}"), e))?;
-
-    let mut summaries = Vec::new();
-    let mut stream = messages;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(fetch) => summaries.push(message_summary_from_fetch(&fetch)),
-            Err(e) => return Err(command_error("FETCH parse error".to_string(), e)),
-        }
-    }
-
-    Ok(summaries)
+    // A refused FETCH is an error, never an empty folder: the dashboard
+    // rewrites the folder's index from what this returns.
+    Ok(
+        seq_fetch_checked(session, folder, &range, FETCH_SUMMARY_DESCRIPTOR)
+            .await?
+            .into_iter()
+            .filter_map(|fetch| fetch.summary)
+            .collect(),
+    )
 }
 
-fn message_summary_from_fetch(fetch: &async_imap::types::Fetch) -> MessageSummary {
-    let uid = fetch.uid.unwrap_or(0);
-    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-    let size = fetch.size.unwrap_or(0);
-
-    let (from_addr, to_addr, subject, date, message_id) = if let Some(env) = fetch.envelope() {
-        let from = imap_envelope_addresses(&env.from);
-        let to = imap_envelope_addresses(&env.to);
-        let subj = env
+/// A [`MessageSummary`] from one FETCH response's items. The provider spam
+/// score comes from the peeked header fields `FETCH_SUMMARY_DESCRIPTOR`
+/// requests, when the FETCH asked for them.
+fn message_summary(
+    uid: Option<u32>,
+    flags: Vec<String>,
+    size: Option<u32>,
+    env: &imap_proto::types::Envelope<'_>,
+    header: Option<&[u8]>,
+) -> MessageSummary {
+    MessageSummary {
+        uid: uid.unwrap_or(0),
+        message_id: env
+            .message_id
+            .as_ref()
+            .map(|m| String::from_utf8_lossy(m).to_string()),
+        from_addr: imap_envelope_addresses(&env.from),
+        to_addr: imap_envelope_addresses(&env.to),
+        subject: env
             .subject
             .as_ref()
             .map(|s| decode_rfc2047(s))
-            .unwrap_or_default();
-        let dt = env
+            .unwrap_or_default(),
+        date: env
             .date
             .as_ref()
-            .map(|d| String::from_utf8_lossy(d).to_string());
-        let mid = env
-            .message_id
-            .as_ref()
-            .map(|m| String::from_utf8_lossy(m).to_string());
-        (from, to, subj, dt, mid)
-    } else {
-        (String::new(), String::new(), String::new(), None, None)
-    };
-
-    // Derive the provider spam score from the peeked header fields requested by
-    // `FETCH_SUMMARY_DESCRIPTOR`. `Fetch::header()` carries the
-    // `BODY[HEADER.FIELDS (...)]` section bytes.
-    let provider_spam = fetch.header().and_then(provider_spam_from_header_bytes);
-
-    MessageSummary {
-        uid,
-        message_id,
-        from_addr,
-        to_addr,
-        subject,
-        date,
+            .map(|d| String::from_utf8_lossy(d).to_string()),
         flags,
-        size,
-        provider_spam,
+        size: size.unwrap_or(0),
+        provider_spam: header.and_then(provider_spam_from_header_bytes),
     }
 }
 
@@ -942,18 +940,12 @@ where
     for size in &expected_sizes {
         refuse_oversize_message(size)?;
     }
-    // Read through the tagged completion before using the reply; see
-    // drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = session
-        .uid_fetch(&uid_range, FETCH_MESSAGE_DESCRIPTOR)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid}: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    // Read through the tagged completion before using the reply; a refused
+    // FETCH is an error, never a message that is gone.
+    let fetched = uid_fetch_checked(session, folder, &uid_range, FETCH_MESSAGE_DESCRIPTOR).await?;
 
     // fetch_message expects exactly one message for the UID — take the first item.
-    let Some(fetch) = fetches.first() else {
+    let Some(fetch) = fetched.into_iter().next() else {
         return Ok(None);
     };
     let fetched_uid = fetch
@@ -966,16 +958,15 @@ where
     }
     let expected_size = expected_raw_message_size(&expected_sizes, fetched_uid)?;
     let body = fetch
-        .body()
+        .body
         .ok_or_else(|| missing_body_protocol_error(folder, &uid_range, Some(fetched_uid)))?;
-    validate_raw_message_body_size(fetched_uid, expected_size, body)?;
-    let Some(parsed) = mail_parser::MessageParser::default().parse(body) else {
+    validate_raw_message_body_size(fetched_uid, expected_size, &body)?;
+    let Some(parsed) = mail_parser::MessageParser::default().parse(&body) else {
         return Ok(None);
     };
 
-    let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-    let message = message_from_parsed(uid, flags, &parsed, body, &parsed);
-    Ok(Some((message, Some(body.to_vec()))))
+    let message = message_from_parsed(uid, fetch.flags, &parsed, &body, &parsed);
+    Ok(Some((message, Some(body))))
 }
 
 /// Build a [`Message`] from its parsed header (`header`, whose raw bytes are
@@ -1058,6 +1049,7 @@ fn oversize_declared(sizes: &[RawMessageSize], uid: u32) -> Option<u32> {
 
 /// A message's MIME tree, owned from its BODYSTRUCTURE. A `message/rfc822`
 /// part stays one leaf: mail_parser treats it as one attachment.
+#[derive(Debug)]
 enum MimeNode {
     Multipart {
         subtype: String,
@@ -1066,7 +1058,7 @@ enum MimeNode {
     Leaf(MimeLeaf),
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 struct MimeLeaf {
     /// IMAP section path: `[1, 2]` is `BODY[1.2]`.
     section: Vec<u32>,
@@ -1282,25 +1274,18 @@ fn refuse_oversize_part(uid: u32, leaf: &MimeLeaf, what: &str) -> Result<(), Ima
 }
 
 /// UID FETCH one message and return its response, `None` if the UID is gone.
+/// A FETCH the server refuses or never finishes is an error.
 async fn uid_fetch_one_in<T>(
     session: &mut Session<T>,
     folder: &str,
     uid: u32,
     query: &str,
-) -> Result<Option<async_imap::types::Fetch>, ImapError>
+) -> Result<Option<FetchedItems>, ImapError>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
-    // Read through the tagged completion before using the reply; see
-    // drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = session
-        .uid_fetch(uid.to_string(), query)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid}: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
-    let Some(fetch) = fetches.into_iter().next() else {
+    let fetched = uid_fetch_checked(session, folder, &uid.to_string(), query).await?;
+    let Some(fetch) = fetched.into_iter().next() else {
         return Ok(None);
     };
     match fetch.uid {
@@ -1322,7 +1307,7 @@ fn peek_item(spec: &str, limit: u32) -> String {
 
 /// The bytes of one `BODY[<spec>]` item, refused when over `limit`.
 fn section_bytes<'a>(
-    fetch: &'a async_imap::types::Fetch,
+    fetch: &'a FetchedItems,
     uid: u32,
     spec: &str,
     path: &SectionPath,
@@ -1391,12 +1376,13 @@ where
         "(UID FLAGS BODYSTRUCTURE {})",
         peek_item("HEADER", ingress::MAX_RFC822_MESSAGE_BYTES)
     );
-    let Some(fetch) = uid_fetch_one_in(session, folder, uid, &query).await? else {
+    let Some(mut fetch) = uid_fetch_one_in(session, folder, uid, &query).await? else {
         return Ok(None);
     };
-    let tree = MimeNode::from_bodystructure(fetch.bodystructure().ok_or_else(|| {
-        ImapError::Protocol(format!("UID FETCH {uid} returned no BODYSTRUCTURE"))
-    })?);
+    let tree = fetch
+        .structure
+        .take()
+        .ok_or_else(|| ImapError::Protocol(format!("UID FETCH {uid} returned no BODYSTRUCTURE")))?;
     let header = section_bytes(
         &fetch,
         uid,
@@ -1405,7 +1391,7 @@ where
         ingress::MAX_RFC822_MESSAGE_BYTES,
     )?
     .to_vec();
-    let flags = fetch.flags().map(|f| format!("{f:?}")).collect();
+    let flags = fetch.flags;
 
     let part_headers = match &tree {
         // A single-part message's MIME header is the message header.
@@ -1628,9 +1614,18 @@ pub async fn select_folder_info(
     client: &mut ImapClient,
     folder: &str,
 ) -> Result<SelectedMailbox, ImapError> {
+    select_folder_info_in(&mut client.session, folder).await
+}
+
+async fn select_folder_info_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+) -> Result<SelectedMailbox, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
-    let mailbox = client
-        .session
+    let mailbox = session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
@@ -1654,9 +1649,18 @@ pub async fn examine_folder_info(
     client: &mut ImapClient,
     folder: &str,
 ) -> Result<SelectedMailbox, ImapError> {
+    examine_folder_info_in(&mut client.session, folder).await
+}
+
+async fn examine_folder_info_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+) -> Result<SelectedMailbox, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
-    let mailbox = client
-        .session
+    let mailbox = session
         .examine(folder)
         .await
         .map_err(|e| command_error(format!("EXAMINE {folder}"), e))?;
@@ -1677,6 +1681,285 @@ fn command_error(context: String, e: async_imap::error::Error) -> ImapError {
             ImapError::Connection(format!("{context}: {e}"))
         }
         _ => ImapError::Protocol(format!("{context}: {e}")),
+    }
+}
+
+/// `UID SEARCH <criterion>` in the folder the session has open, read to its
+/// tagged reply; the UIDs come back ascending, each once.
+///
+/// async-imap's `uid_search` stops at the tagged reply whatever its status,
+/// and at a dropped connection, so a NO, a BAD or a cut-off search came back
+/// as no match, or a short one. This sends the command itself and fails
+/// unless the server completes it OK with the SEARCH response RFC 3501
+/// requires.
+async fn uid_search_checked<T>(
+    session: &mut Session<T>,
+    criterion: &str,
+) -> Result<Vec<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let label = format!("UID SEARCH {criterion}");
+    let tag = session
+        .run_command(&label)
+        .await
+        .map_err(|e| command_error(label.clone(), e))?;
+    let mut found: Option<Vec<u32>> = None;
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .ok_or_else(|| {
+                ImapError::Connection(format!("{label}: connection lost before the tagged reply"))
+            })?
+            .map_err(|e| ImapError::Connection(format!("{label}: {e}")))?;
+        match response.parsed() {
+            imap_proto::Response::MailboxData(imap_proto::MailboxDatum::Search(uids)) => {
+                found.get_or_insert_with(Vec::new).extend(uids);
+            }
+            imap_proto::Response::Done {
+                tag: done_tag,
+                status,
+                code,
+                information,
+            } if *done_tag == tag => {
+                if *status != imap_proto::Status::Ok {
+                    return Err(refused(
+                        &label,
+                        status,
+                        code.as_ref(),
+                        information.as_deref(),
+                    ));
+                }
+                let mut uids = found.ok_or_else(|| {
+                    ImapError::Protocol(format!(
+                        "{label}: the server said OK but sent no SEARCH response"
+                    ))
+                })?;
+                uids.sort_unstable();
+                uids.dedup();
+                return Ok(uids);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `UID FETCH <uid_set> <items>` in `folder`, which the session has open,
+/// read to its tagged reply.
+///
+/// async-imap's `uid_fetch` stream ends at the tagged reply whatever its
+/// status, and at a dropped connection, so a NO, a BAD or a cut-off fetch
+/// came back as an empty or short answer. This sends the command itself, as
+/// [`uid_search_checked`] does, and fails unless the server completes it OK.
+/// Every FETCH response comes back, unsolicited ones (another client's flag
+/// change) included; callers keep the UIDs they asked for.
+async fn uid_fetch_checked<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid_set: &str,
+    items: &str,
+) -> Result<Vec<FetchedItems>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    fetch_checked(
+        session,
+        &format!("UID FETCH {folder} {uid_set}"),
+        &format!("UID FETCH {uid_set} {items}"),
+    )
+    .await
+}
+
+/// `FETCH <range> <items>` by sequence number in `folder`, which the session
+/// has open, read to its tagged reply as [`uid_fetch_checked`] reads it.
+async fn seq_fetch_checked<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    range: &str,
+    items: &str,
+) -> Result<Vec<FetchedItems>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    fetch_checked(
+        session,
+        &format!("FETCH {folder} {range}"),
+        &format!("FETCH {range} {items}"),
+    )
+    .await
+}
+
+/// Send `command`, a FETCH, and read every response to its tagged reply;
+/// anything but a tagged OK fails as `label`.
+async fn fetch_checked<T>(
+    session: &mut Session<T>,
+    label: &str,
+    command: &str,
+) -> Result<Vec<FetchedItems>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let tag = session
+        .run_command(command)
+        .await
+        .map_err(|e| command_error(label.to_string(), e))?;
+    let mut fetched = Vec::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .ok_or_else(|| {
+                ImapError::Connection(format!("{label}: connection lost before the tagged reply"))
+            })?
+            .map_err(|e| ImapError::Connection(format!("{label}: {e}")))?;
+        match response.parsed() {
+            imap_proto::Response::Fetch(_, items) => {
+                fetched.push(FetchedItems::from_items(items));
+            }
+            imap_proto::Response::Done {
+                tag: done_tag,
+                status,
+                code,
+                information,
+            } if *done_tag == tag => {
+                if *status != imap_proto::Status::Ok {
+                    return Err(refused(
+                        label,
+                        status,
+                        code.as_ref(),
+                        information.as_deref(),
+                    ));
+                }
+                return Ok(fetched);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The error for a command the server ended with a tagged status other than
+/// OK, carrying the server's own words.
+fn refused(
+    label: &str,
+    status: &imap_proto::Status,
+    code: Option<&imap_proto::ResponseCode<'_>>,
+    information: Option<&str>,
+) -> ImapError {
+    let status = match status {
+        imap_proto::Status::Ok => "OK",
+        imap_proto::Status::No => "NO",
+        imap_proto::Status::Bad => "BAD",
+        imap_proto::Status::PreAuth => "PREAUTH",
+        imap_proto::Status::Bye => "BYE",
+    };
+    let code = code.map(|c| format!("[{c:?}] ")).unwrap_or_default();
+    ImapError::Protocol(format!(
+        "{label}: the server refused it: {status} {code}{}",
+        information.unwrap_or_default()
+    ))
+}
+
+/// One FETCH response read by [`fetch_checked`], copied out of the reply as
+/// async-imap's `Fetch` accessors read it. That type can only be built by
+/// async-imap's own stream, the one that drops the tagged status.
+#[derive(Debug, Default)]
+struct FetchedItems {
+    uid: Option<u32>,
+    size: Option<u32>,
+    /// In the index spelling (`Seen`, `Custom("$Label")`).
+    flags: Vec<String>,
+    internal_date: Option<DateTime<FixedOffset>>,
+    /// From ENVELOPE and the header section; `None` without ENVELOPE, as in
+    /// an unsolicited flag update.
+    summary: Option<MessageSummary>,
+    /// `BODY[HEADER]` or `BODY[HEADER.FIELDS (…)]`, which imap-proto parses
+    /// to the same section.
+    header: Option<Vec<u8>>,
+    /// `BODY[]`, whole or partial.
+    body: Option<Vec<u8>>,
+    /// The BODYSTRUCTURE, as a part-by-part read walks it.
+    structure: Option<MimeNode>,
+    /// `BODY[<part>]` and `BODY[<part>.MIME]` items: the part's section
+    /// path, whether the item is its MIME header, and the bytes.
+    parts: Vec<(Vec<u32>, bool, Vec<u8>)>,
+}
+
+impl FetchedItems {
+    fn from_items(items: &[imap_proto::types::AttributeValue<'_>]) -> Self {
+        use imap_proto::types::AttributeValue;
+        let mut fetched = FetchedItems::default();
+        let mut envelope = None;
+        for item in items {
+            match item {
+                AttributeValue::Uid(uid) => fetched.uid = Some(*uid),
+                AttributeValue::Rfc822Size(size) => fetched.size = Some(*size),
+                AttributeValue::Flags(flags) => fetched.flags.extend(
+                    flags
+                        .iter()
+                        .map(|f| format!("{:?}", async_imap::types::Flag::from(f.as_ref()))),
+                ),
+                AttributeValue::InternalDate(date) => {
+                    fetched.internal_date =
+                        DateTime::parse_from_str(date, "%d-%b-%Y %H:%M:%S %z").ok();
+                }
+                AttributeValue::Envelope(found) => envelope = Some(&**found),
+                AttributeValue::BodySection {
+                    section: Some(SectionPath::Full(MessageSection::Header)),
+                    data: Some(header),
+                    ..
+                }
+                | AttributeValue::Rfc822Header(Some(header)) => {
+                    fetched.header = Some(header.to_vec());
+                }
+                AttributeValue::BodySection {
+                    section: None,
+                    data: Some(body),
+                    ..
+                }
+                | AttributeValue::Rfc822(Some(body)) => fetched.body = Some(body.to_vec()),
+                AttributeValue::BodySection {
+                    section: Some(SectionPath::Part(part, kind)),
+                    data: Some(data),
+                    ..
+                } => match kind {
+                    None => fetched.parts.push((part.clone(), false, data.to_vec())),
+                    Some(MessageSection::Mime) => {
+                        fetched.parts.push((part.clone(), true, data.to_vec()))
+                    }
+                    Some(_) => {}
+                },
+                AttributeValue::BodyStructure(structure) => {
+                    fetched.structure = Some(MimeNode::from_bodystructure(structure));
+                }
+                _ => {}
+            }
+        }
+        fetched.summary = envelope.map(|envelope| {
+            message_summary(
+                fetched.uid,
+                fetched.flags.clone(),
+                fetched.size,
+                envelope,
+                fetched.header.as_deref(),
+            )
+        });
+        fetched
+    }
+
+    /// The `BODY[<section>]` item, as async-imap's `Fetch::section` finds it,
+    /// for the sections the part-by-part read asks for.
+    fn section(&self, section: &SectionPath) -> Option<&[u8]> {
+        let (part, mime) = match section {
+            SectionPath::Full(MessageSection::Header) => return self.header.as_deref(),
+            SectionPath::Part(part, None) => (part, false),
+            SectionPath::Part(part, Some(MessageSection::Mime)) => (part, true),
+            _ => return None,
+        };
+        self.parts
+            .iter()
+            .find(|(p, m, _)| p == part && *m == mime)
+            .map(|(_, _, data)| data.as_slice())
     }
 }
 
@@ -1739,14 +2022,16 @@ pub async fn fetch_raw_messages(
 
 /// Return all UIDs in the currently selected mailbox.
 pub async fn list_selected_uids(client: &mut ImapClient) -> Result<Vec<u32>, ImapError> {
-    let uid_set = client
-        .session
-        .uid_search("ALL")
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH ALL: {e}")))?;
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-    uids.sort_unstable();
-    Ok(uids)
+    list_selected_uids_in(&mut client.session).await
+}
+
+/// [`list_selected_uids`] over any transport: `watch` holds a bare session,
+/// and the scripted-server tests drive it without TLS.
+pub async fn list_selected_uids_in<T>(session: &mut Session<T>) -> Result<Vec<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    uid_search_checked(session, "ALL").await
 }
 
 /// Fetch a batch of raw messages from the currently selected folder.
@@ -1787,17 +2072,12 @@ async fn declared_raw_message_sizes_in<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
-    // Read the whole reply before validating it, so a refusal below does not
-    // leave the rest of it on the connection; see drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = session
-        .uid_fetch(uid_set, "(UID RFC822.SIZE)")
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH size {folder} {uid_set}: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH size parse error: {e}")))?;
+    // Read the whole reply, to its tagged OK, before validating it: a refused
+    // FETCH is an error, never a set of messages that are gone, and a refusal
+    // below does not leave the rest of the reply on the connection.
+    let fetched = uid_fetch_checked(session, folder, uid_set, "(UID RFC822.SIZE)").await?;
     let mut sizes = Vec::new();
-    for fetch in fetches {
+    for fetch in fetched {
         let uid = fetch.uid.ok_or_else(|| {
             ImapError::Protocol("UID FETCH size response without UID".to_string())
         })?;
@@ -1836,31 +2116,39 @@ pub async fn fetch_raw_messages_selected_uid_set_preflighted(
     uid_set: &str,
     expected_sizes: &[RawMessageSize],
 ) -> Result<Vec<RawMessage>, ImapError> {
+    fetch_raw_messages_preflighted_in(&mut client.session, folder, uid_set, expected_sizes).await
+}
+
+/// [`fetch_raw_messages_selected_uid_set_preflighted`] over any transport, so
+/// the scripted-server tests can drive it without TLS.
+async fn fetch_raw_messages_preflighted_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid_set: &str,
+    expected_sizes: &[RawMessageSize],
+) -> Result<Vec<RawMessage>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
 
-    // Read the whole reply before validating it, so a refusal below does not
-    // leave the rest of it on the connection; see drafts_special_use_folder_in.
-    // Consuming `fetches` by value frees each response as its copy is made, so
-    // peak memory stays at one batch of bodies.
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
-        .uid_fetch(uid_set, EVIDENCE_RAW_FETCH_DESCRIPTOR)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set}: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    // Read the whole reply, to its tagged OK, before validating it: a refused
+    // FETCH is an error, never an empty batch, and a refusal below does not
+    // leave the rest of the reply on the connection. Consuming `fetched` by
+    // value moves each body out, so peak memory stays at one batch of bodies.
+    let fetched =
+        uid_fetch_checked(session, folder, uid_set, EVIDENCE_RAW_FETCH_DESCRIPTOR).await?;
     let mut out = Vec::new();
-    for fetch in fetches {
+    for fetch in fetched {
         let uid = fetch
             .uid
             .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
         let body = fetch
-            .body()
+            .body
             .ok_or_else(|| missing_body_protocol_error(folder, uid_set, Some(uid)))?;
         let expected_size = expected_raw_message_size(expected_sizes, uid)?;
-        validate_raw_message_body_size(uid, expected_size, body)?;
+        validate_raw_message_body_size(uid, expected_size, &body)?;
         if let Some(response_size) = fetch.size
             && response_size != expected_size
         {
@@ -1868,14 +2156,16 @@ pub async fn fetch_raw_messages_selected_uid_set_preflighted(
                 "UID FETCH size changed for UID {uid}: preflight {expected_size}, body response {response_size}"
             )));
         }
-        let parsed = mail_parser::MessageParser::default().parse(body);
+        let message_id = mail_parser::MessageParser::default()
+            .parse(&body)
+            .and_then(|m| m.message_id().map(|s| s.to_string()));
         out.push(RawMessage {
             uid,
-            message_id: parsed.and_then(|m| m.message_id().map(|s| s.to_string())),
-            flags: fetch.flags().map(|f| format!("{f:?}")).collect(),
-            internal_date: fetch.internal_date(),
+            message_id,
+            flags: fetch.flags,
+            internal_date: fetch.internal_date,
             size: expected_size,
-            rfc822: body.to_vec(),
+            rfc822: body,
         });
     }
     Ok(out)
@@ -1997,33 +2287,43 @@ pub async fn fetch_message_headers_selected_uid_set(
     folder: &str,
     uid_set: &str,
 ) -> Result<Vec<MessageHeader>, ImapError> {
+    fetch_message_headers_in(&mut client.session, folder, uid_set).await
+}
+
+/// [`fetch_message_headers_selected_uid_set`] over any transport, so the
+/// scripted-server tests can drive it without TLS.
+async fn fetch_message_headers_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<MessageHeader>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
     validate_uid_set(uid_set)?;
 
-    // Read the whole reply before validating it, so a refusal below does not
-    // leave the rest of it on the connection; see drafts_special_use_folder_in.
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
-        .uid_fetch(
-            uid_set,
-            "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid_set} HEADER: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
+    // Read the whole reply, to its tagged OK, before validating it: a refused
+    // FETCH is an error, never "no such message" (the draft and migrate
+    // lookups append a copy when they find none), and a refusal below does
+    // not leave the rest of the reply on the connection.
+    let fetched = uid_fetch_checked(
+        session,
+        folder,
+        uid_set,
+        "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+    )
+    .await?;
     let mut out = Vec::new();
-    for fetch in fetches {
+    for fetch in fetched {
         let uid = fetch
             .uid
             .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
         // `BODY.PEEK[HEADER.FIELDS (…)]` responses parse to
-        // `SectionPath::Full(MessageSection::Header)`, which async-imap
-        // surfaces via `Fetch::header()` — `Fetch::body()` only matches the
-        // section-less `BODY[]`/`RFC822` and returns None for these fetches.
+        // `SectionPath::Full(MessageSection::Header)`, the `header` item.
         let message_id = fetch
-            .header()
+            .header
+            .as_deref()
             .and_then(parse_message_id_from_header_section);
         out.push(MessageHeader {
             uid,
@@ -2117,23 +2417,33 @@ pub async fn find_uid_by_message_id(
     folder: &str,
     message_id: &str,
 ) -> Result<Option<u32>, ImapError> {
+    find_uid_by_message_id_in(&mut client.session, folder, message_id).await
+}
+
+/// [`find_uid_by_message_id`] over any transport, so the scripted-server tests
+/// can drive it without TLS.
+async fn find_uid_by_message_id_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    message_id: &str,
+) -> Result<Option<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
+    // A refused search is an error, never "not there": restore and migrate
+    // append a copy, and unsnooze moves the stored UID, on that answer.
     let search_query = message_id_search_query(message_id)?;
-    let uid_set = client
-        .session
-        .uid_search(&search_query)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {search_query}: {e}")))?;
-
-    let uid = uid_set.into_iter().next();
-    Ok(uid)
+    Ok(uid_search_checked(session, &search_query)
+        .await?
+        .first()
+        .copied())
 }
 
 /// Find the single message whose Message-ID header equals `message_id`
@@ -2212,33 +2522,40 @@ pub async fn find_uids_by_exact_message_id(
     folder: &str,
     message_id: &str,
 ) -> Result<Vec<u32>, ImapError> {
+    find_uids_by_exact_message_id_in(&mut client.session, folder, message_id).await
+}
+
+/// [`find_uids_by_exact_message_id`] over any transport, so the
+/// scripted-server tests can drive it without TLS.
+async fn find_uids_by_exact_message_id_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    message_id: &str,
+) -> Result<Vec<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
+    // A refused search is an error, never "no such message": a draft edit
+    // appends its replacement, and a send appends a Sent copy, on that answer.
     let search_query = message_id_search_query(message_id)?;
-    let uid_set = client
-        .session
-        .uid_search(&search_query)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {search_query}: {e}")))?;
-
-    let mut candidate_uids: Vec<u32> = uid_set.into_iter().collect();
+    let candidate_uids = uid_search_checked(session, &search_query).await?;
     if candidate_uids.is_empty() {
         return Ok(Vec::new());
     }
-    candidate_uids.sort_unstable();
     let uid_set_arg = candidate_uids
         .iter()
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
 
-    let headers = fetch_message_headers_selected_uid_set(client, folder, &uid_set_arg).await?;
+    let headers = fetch_message_headers_in(session, folder, &uid_set_arg).await?;
     let Some(wanted) = normalize_message_id(message_id) else {
         return Ok(Vec::new());
     };
@@ -2313,15 +2630,20 @@ pub async fn evidence_search_selected_uids(
     client: &mut ImapClient,
     query: &str,
 ) -> Result<Vec<u32>, ImapError> {
+    evidence_search_selected_uids_in(&mut client.session, query).await
+}
+
+/// [`evidence_search_selected_uids`] over any transport, so the
+/// scripted-server tests can drive it without TLS.
+async fn evidence_search_selected_uids_in<T>(
+    session: &mut Session<T>,
+    query: &str,
+) -> Result<Vec<u32>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(query)?;
-    let uid_set = client
-        .session
-        .uid_search(query)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {query}: {e}")))?;
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-    uids.sort_unstable();
-    Ok(uids)
+    uid_search_checked(session, query).await
 }
 
 /// Search the currently selected/examined mailbox by one of the RFC5322
@@ -2485,6 +2807,20 @@ pub async fn search(
     query: &str,
     limit: u32,
 ) -> Result<Vec<MessageSummary>, ImapError> {
+    search_in(&mut client.session, folder, query, limit).await
+}
+
+/// [`search`] over any transport, so the scripted-server tests can drive it
+/// without TLS.
+async fn search_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     validate_imap_input(folder)?;
     validate_imap_input(query)?;
 
@@ -2492,22 +2828,14 @@ pub async fn search(
     // field-qualified queries agents expect (issue #63).
     let search_criteria = normalize_search_query(query);
 
-    client
-        .session
+    session
         .select(folder)
         .await
         .map_err(|e| ImapError::Protocol(format!("SELECT {folder}: {e}")))?;
 
-    let uid_set = client
-        .session
-        .uid_search(&search_criteria)
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID SEARCH {search_criteria}: {e}")))?;
+    let mut uids = uid_search_checked(session, &search_criteria).await?;
 
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-
-    // Sort ascending then reverse for newest first
-    uids.sort_unstable();
+    // Newest first
     uids.reverse();
     uids.truncate(limit as usize);
 
@@ -2521,62 +2849,19 @@ pub async fn search(
         .collect::<Vec<_>>()
         .join(",");
 
-    let messages = client
-        .session
-        .uid_fetch(&uid_range, "(UID FLAGS ENVELOPE RFC822.SIZE)")
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {uid_range}: {e}")))?;
-
-    let mut summaries = Vec::new();
-    let mut msg_stream = messages;
-    while let Some(item) = msg_stream.next().await {
-        match item {
-            Ok(fetch) => {
-                let uid = fetch.uid.unwrap_or(0);
-                let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-                let size = fetch.size.unwrap_or(0);
-
-                let (from_addr, to_addr, subject, date, message_id) =
-                    if let Some(env) = fetch.envelope() {
-                        let from = imap_envelope_addresses(&env.from);
-                        let to = imap_envelope_addresses(&env.to);
-                        let subj = env
-                            .subject
-                            .as_ref()
-                            .map(|s| decode_rfc2047(s))
-                            .unwrap_or_default();
-                        let dt = env
-                            .date
-                            .as_ref()
-                            .map(|d| String::from_utf8_lossy(d).to_string());
-                        let mid = env
-                            .message_id
-                            .as_ref()
-                            .map(|m| String::from_utf8_lossy(m).to_string());
-                        (from, to, subj, dt, mid)
-                    } else {
-                        (String::new(), String::new(), String::new(), None, None)
-                    };
-
-                summaries.push(MessageSummary {
-                    uid,
-                    message_id,
-                    from_addr,
-                    to_addr,
-                    subject,
-                    date,
-                    flags,
-                    size,
-                    // Search does not fetch spam-score headers; rules never run
-                    // against search results, so leave the signal absent.
-                    provider_spam: None,
-                });
-            }
-            Err(e) => return Err(ImapError::Protocol(format!("UID FETCH parse error: {e}"))),
-        }
-    }
-
-    Ok(summaries)
+    // A refused FETCH is an error, never "no matches": snooze escalates a
+    // follow-up whose search finds no reply. Search does not fetch the
+    // spam-score headers, so `provider_spam` stays absent.
+    Ok(uid_fetch_checked(
+        session,
+        folder,
+        &uid_range,
+        "(UID FLAGS ENVELOPE RFC822.SIZE)",
+    )
+    .await?
+    .into_iter()
+    .filter_map(|fetch| fetch.summary)
+    .collect())
 }
 
 /// Move a message from one folder to another by UID (copy + delete).
@@ -2717,25 +3002,37 @@ pub async fn probe_uid(
     folder: &str,
     uid: u32,
 ) -> Result<UidProbe, ImapError> {
-    let selected = select_folder_info(client, folder).await?;
-    let fetches: Vec<async_imap::types::Fetch> = client
-        .session
-        .uid_fetch(
-            uid.to_string(),
-            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH {folder} {uid} FLAGS: {e}")))?
-        .try_collect()
-        .await
-        .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
-    let found = fetches.iter().find(|fetch| fetch.uid == Some(uid));
+    probe_uid_in(&mut client.session, folder, uid).await
+}
+
+/// [`probe_uid`] over any transport, so the scripted-server tests can drive it
+/// without TLS.
+async fn probe_uid_in<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    uid: u32,
+) -> Result<UidProbe, ImapError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let selected = select_folder_info_in(session, folder).await?;
+    // A refused FETCH is an error, never a UID that is gone: a draft discard
+    // drops its local draft when the probe says the mailbox copy is gone.
+    let fetched = uid_fetch_checked(
+        session,
+        folder,
+        &uid.to_string(),
+        "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+    )
+    .await?;
+    let found = fetched.into_iter().find(|fetch| fetch.uid == Some(uid));
     Ok(UidProbe {
         uid_validity: selected.uid_validity,
-        flags: found.map(|fetch| fetch.flags().map(|f| format!("{f:?}")).collect()),
         message_id: found
-            .and_then(|fetch| fetch.header())
+            .as_ref()
+            .and_then(|fetch| fetch.header.as_deref())
             .and_then(parse_message_id_from_header_section),
+        flags: found.map(|fetch| fetch.flags),
     })
 }
 
@@ -4751,5 +5048,246 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
         assert_eq!(unique_uid_from(&moved, "<m@x>", 41), Some(42));
         let dup = [h(41, Some("m@x")), h(42, Some("m@x"))];
         assert_eq!(unique_uid_from(&dup, "m@x", 1), None);
+    }
+
+    // ── A refused read is an error, never an empty answer ───────────────
+    //
+    // async-imap 0.10.4 ends a SEARCH or FETCH at the tagged reply whatever
+    // its status, and quietly at a dropped connection, so a refused read used
+    // to come back empty and callers wrote from it.
+
+    fn reply_turn(verb: &'static str, reply: &[&str]) -> Turn {
+        Turn {
+            verb,
+            reply: reply.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    /// SELECT or EXAMINE of a folder holding three messages.
+    fn opened_turn(verb: &'static str) -> Turn {
+        Turn {
+            verb,
+            reply: vec![
+                "* 3 EXISTS".into(),
+                "* OK [UIDVALIDITY 9] UIDs valid".into(),
+                format!("{{tag}} OK {verb} completed"),
+            ],
+        }
+    }
+
+    /// How a server can end a FETCH without completing it, and what the
+    /// error must then say.
+    const REFUSED_FETCHES: [(&str, &[&str], &str); 3] = [
+        (
+            "NO",
+            &["{tag} NO [UNAVAILABLE] Fetch backend down"],
+            "the server refused it: NO [UNAVAILABLE] Fetch backend down",
+        ),
+        (
+            "BAD",
+            &["{tag} BAD Invalid fetch arguments"],
+            "the server refused it: BAD Invalid fetch arguments",
+        ),
+        (
+            "cut off",
+            &["* 1 FETCH (UID 7 FLAGS ())"],
+            "connection lost before the tagged reply",
+        ),
+    ];
+
+    /// One read whose empty answer Envelope used to write from, against a
+    /// server that answers its FETCH with `reply`. Each reads UID 7 of INBOX,
+    /// or the folder's three messages by sequence number.
+    async fn refused_fetch(which: &str, reply: &[&str]) -> Result<(), ImapError> {
+        let uid_fetch = || reply_turn("UID FETCH", reply);
+        let sized = |size: u32| fetch_turn(format!("* 1 FETCH (UID 7 RFC822.SIZE {size})"));
+        let found = || reply_turn("UID SEARCH", &["* SEARCH 7", "{tag} OK Search completed"]);
+        let turns = match which {
+            "summaries" => vec![opened_turn("EXAMINE"), reply_turn("FETCH", reply)],
+            "inbox" => vec![opened_turn("SELECT"), reply_turn("FETCH", reply)],
+            "message size" => vec![opened_turn("SELECT"), uid_fetch()],
+            "message" => vec![opened_turn("SELECT"), sized(20), uid_fetch()],
+            "large message" => vec![
+                opened_turn("SELECT"),
+                sized(ingress::MAX_RFC822_MESSAGE_BYTES + 1),
+                uid_fetch(),
+            ],
+            "raw sizes" | "raw bodies" | "message ids" => vec![uid_fetch()],
+            "probe" => vec![opened_turn("SELECT"), uid_fetch()],
+            "exact message id" | "search" => vec![opened_turn("SELECT"), found(), uid_fetch()],
+            _ => unreachable!("{which}"),
+        };
+        let (mut session, server) = scripted_session(turns).await;
+        let s = &mut session;
+        let result = match which {
+            "summaries" => fetch_folder_summaries_read_only_in(s, "INBOX", 50)
+                .await
+                .map(drop),
+            "inbox" => fetch_inbox_in(s, "INBOX", 50).await.map(drop),
+            "message size" | "message" | "large message" => {
+                fetch_message_with_raw_in(s, "INBOX", 7).await.map(drop)
+            }
+            "raw sizes" => declared_raw_message_sizes_in(s, "INBOX", "7")
+                .await
+                .map(drop),
+            "raw bodies" => {
+                let sizes = [RawMessageSize { uid: 7, size: 20 }];
+                fetch_raw_messages_preflighted_in(s, "INBOX", "7", &sizes)
+                    .await
+                    .map(drop)
+            }
+            "message ids" => fetch_message_headers_in(s, "INBOX", "7").await.map(drop),
+            "probe" => probe_uid_in(s, "INBOX", 7).await.map(drop),
+            "exact message id" => find_uids_by_exact_message_id_in(s, "INBOX", "a@b.test")
+                .await
+                .map(drop),
+            "search" => search_in(s, "INBOX", "FROM a@b.test", 5).await.map(drop),
+            _ => unreachable!("{which}"),
+        };
+        drop(session);
+        server.await.unwrap();
+        result
+    }
+
+    /// What each read became: the inbox refresh rewrote the index from an
+    /// empty answer, snooze moved a message it could not read, backup and
+    /// evidence archived folders without their mail, migrate reported
+    /// nothing to copy, the draft and Sent-copy lookups found nothing and
+    /// appended again, and a draft discard took a refused probe for a draft
+    /// already gone. Each read now fails with the command, the folder and
+    /// the server's words.
+    #[tokio::test]
+    async fn a_refused_fetch_is_an_error_never_an_empty_answer() {
+        let mut wrong = Vec::new();
+        for (which, label) in [
+            ("summaries", "FETCH INBOX 1:3"),
+            ("inbox", "FETCH INBOX 1:3"),
+            ("message size", "UID FETCH INBOX 7"),
+            ("message", "UID FETCH INBOX 7"),
+            ("large message", "UID FETCH INBOX 7"),
+            ("raw sizes", "UID FETCH INBOX 7"),
+            ("raw bodies", "UID FETCH INBOX 7"),
+            ("message ids", "UID FETCH INBOX 7"),
+            ("probe", "UID FETCH INBOX 7"),
+            ("exact message id", "UID FETCH INBOX 7"),
+            ("search", "UID FETCH INBOX 7"),
+        ] {
+            for (name, reply, expected) in REFUSED_FETCHES {
+                match refused_fetch(which, reply).await {
+                    Err(e) if e.to_string().contains(label) && e.to_string().contains(expected) => {
+                    }
+                    other => wrong.push(format!("{which}: {name}: {other:?}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// One read that starts with a `UID SEARCH`, against a server that
+    /// answers that search with `reply`.
+    async fn refused_search(which: &str, reply: &[&str]) -> Result<(), ImapError> {
+        let mut turns = Vec::new();
+        if !matches!(which, "uid list" | "evidence") {
+            turns.push(opened_turn("SELECT"));
+        }
+        turns.push(reply_turn("UID SEARCH", reply));
+        let (mut session, server) = scripted_session(turns).await;
+        let s = &mut session;
+        let result = match which {
+            "uid list" => list_selected_uids_in(s).await.map(drop),
+            "find uid" => find_uid_by_message_id_in(s, "INBOX", "a@b.test")
+                .await
+                .map(drop),
+            "exact message id" => find_uids_by_exact_message_id_in(s, "INBOX", "a@b.test")
+                .await
+                .map(drop),
+            "evidence" => evidence_search_selected_uids_in(s, "FROM a@b.test")
+                .await
+                .map(drop),
+            "search" => search_in(s, "INBOX", "FROM a@b.test", 5).await.map(drop),
+            _ => unreachable!("{which}"),
+        };
+        drop(session);
+        server.await.unwrap();
+        result
+    }
+
+    /// The same for SEARCH, where a refusal read as "no match": backup and
+    /// migrate listed an empty folder, unsnooze moved the stored UID, a
+    /// restore or migrate found no copy in the destination and appended a
+    /// second one, and evidence bundled nothing. A cut-off search is a short
+    /// answer, and an OK with no SEARCH response breaks RFC 3501; both fail.
+    #[tokio::test]
+    async fn a_refused_search_is_an_error_never_no_match() {
+        let cases: [(&str, &[&str], &str); 4] = [
+            (
+                "NO",
+                &["{tag} NO [UNAVAILABLE] backend down"],
+                "the server refused it: NO [UNAVAILABLE] backend down",
+            ),
+            (
+                "BAD",
+                &["{tag} BAD Unknown criteria"],
+                "the server refused it: BAD Unknown criteria",
+            ),
+            (
+                "cut off",
+                &["* SEARCH 7"],
+                "connection lost before the tagged reply",
+            ),
+            (
+                "no answer",
+                &["{tag} OK Search completed"],
+                "the server said OK but sent no SEARCH response",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (which, label) in [
+            ("uid list", "UID SEARCH ALL"),
+            ("find uid", "UID SEARCH HEADER Message-ID"),
+            ("exact message id", "UID SEARCH HEADER Message-ID"),
+            ("evidence", "UID SEARCH FROM a@b.test"),
+            ("search", "UID SEARCH FROM a@b.test"),
+        ] {
+            for (name, reply, expected) in cases {
+                match refused_search(which, reply).await {
+                    Err(e) if e.to_string().contains(label) && e.to_string().contains(expected) => {
+                    }
+                    other => wrong.push(format!("{which}: {name}: {other:?}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A completed read still answers as before, and an unsolicited FETCH
+    /// for another message (a flag change from another client) never
+    /// becomes a summary of its own.
+    #[tokio::test]
+    async fn a_completed_search_still_answers_and_ignores_unsolicited_fetches() {
+        let envelope = "(NIL \"Hello\" ((NIL NIL \"ana\" \"example.com\")) NIL NIL \
+            ((NIL NIL \"me\" \"example.com\")) NIL NIL NIL \"<m7@example.com>\")";
+        let (mut session, server) = scripted_session(vec![
+            opened_turn("SELECT"),
+            reply_turn("UID SEARCH", &["* SEARCH 7", "{tag} OK Search completed"]),
+            Turn {
+                verb: "UID FETCH",
+                reply: vec![
+                    "* 2 FETCH (UID 5 FLAGS (\\Seen))".into(),
+                    format!("* 3 FETCH (UID 7 FLAGS () RFC822.SIZE 20 ENVELOPE {envelope})"),
+                    "{tag} OK Fetch completed".into(),
+                ],
+            },
+        ])
+        .await;
+        let found = search_in(&mut session, "INBOX", "FROM ana@example.com", 5)
+            .await
+            .unwrap();
+        drop(session);
+        server.await.unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].uid, 7);
+        assert_eq!(found[0].subject, "Hello");
+        assert_eq!(found[0].from_addr, "ana@example.com");
     }
 }
