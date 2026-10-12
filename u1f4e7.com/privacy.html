@@ -52,7 +52,7 @@
     <article id="privacy-article" class="article wrap">
       <p class="eyebrow">Privacy</p>
       <h1>Privacy</h1>
-      <p class="byline">Effective 12 October 2026. Describes Envelope 1.3.22 and this website.</p>
+      <p class="byline">Effective 12 October 2026, for Envelope 1.3.22 and this website.</p>
       <p class="lede">Envelope is an email client that runs on your own computer and connects to the mail accounts you add. Tyler Martin publishes it and runs no server that your mail, passwords or usage pass through. This page lists what Envelope keeps on your machine, each outside service it can contact and what makes it do so, and what u1f4e7.com collects when you visit.</p>
 
       <section id="privacy-local" class="article-section">
@@ -81,11 +81,10 @@
       <section id="privacy-google" class="article-section">
         <h2>Signing in with Google</h2>
         <p>A Gmail account can sign in through Google instead of using an app password. The sign-in opens accounts.google.com in your browser, and Envelope exchanges the result for tokens at oauth2.googleapis.com. Envelope asks for Gmail access (the <code>https://mail.google.com/</code> scope, the only one that allows IMAP and SMTP) and for your email address. It uses the tokens to log in to Gmail's IMAP and SMTP servers and calls no other Google API. When the access token expires, Envelope renews it at oauth2.googleapis.com. When you remove the account with <code>envelope accounts remove</code>, Envelope asks Google to revoke its access.</p>
-        <p>If an account was first signed in by Envelope 2 with access to Google contacts, signing in again asks to keep that access. This version doesn't use it.</p>
       </section>
 
       <section id="privacy-on-request" class="article-section">
-        <h2>Contacts that happen only when you ask</h2>
+        <h2>Connections Envelope makes only when you ask</h2>
         <ul class="checklist">
           <li><strong>Unsubscribing.</strong> <code>envelope unsubscribe --confirm</code>, or a rule you write with the unsubscribe action, sends a one-click unsubscribe request (an HTTPS POST) to the URL in the message's List-Unsubscribe header when the sender supports one-click. If the sender lists only an email address, Envelope sends the unsubscribe email through your own mail server. Envelope never opens an unsubscribe link with a GET request and doesn't follow redirects.</li>
           <li><strong>Webhooks.</strong> If you give <code>envelope watch</code> a <code>--webhook</code> URL, add an event route, or write a rule with a webhook action, Envelope posts to that URL. The post can include the sender and recipient addresses, the subject, and a short snippet with one-time codes removed.</li>
@@ -128,7 +127,7 @@
 
       <section id="privacy-contact" class="article-section">
         <h2>Questions and changes</h2>
-        <p>Send questions about this page to Tyler Martin at <a href="mailto:ty@tmrtn.com?subject=Envelope%20privacy" data-umami-event="privacy-contact">ty@tmrtn.com</a>. When Envelope's network behavior changes, this page will be updated and the effective date at the top will change.</p>
+        <p>Send questions about this page to Tyler Martin at <a href="mailto:ty@tmrtn.com?subject=Envelope%20privacy" data-umami-event="privacy-contact">ty@tmrtn.com</a>. When Envelope's network behavior changes, Tyler updates this page and its effective date.</p>
       </section>
     </article>
   </main>
