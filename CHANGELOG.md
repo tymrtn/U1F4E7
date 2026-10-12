@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Every MCP tool now says whether it is read-only, destructive, idempotent and open-world. `tools/list` gives each of the 24 tools an `annotations` object with a `title` and all four MCP hints set, so Claude and other clients can decide when to ask you before a call. The hints describe a tool's full capability, whatever the send mode: `send`, `reply` and `send_draft` count as destructive even under `draft-only`, because they can send mail that can't be recalled. `move_message`, `snooze`, `flag`, `bulk` and `rules_run` are marked destructive too: a move expunges the source copy, a flag can set `\Deleted`, and bulk and rule runs can delete. The same annotations appear under `mcp_tools` in `envelope contract`, whose `tool_action_map` is now generated from the policy code and keeps the same values. No tool behaves differently.
-- `--paste --no-wait` prints the Gmail sign-in link and exits, and `--finish` completes it within 10 minutes, so an agent or a second terminal can carry the pasted address. `accounts add` and `accounts reauth` both take them.
+- `--paste --no-wait` prints the Gmail sign-in link and exits, and `--finish` completes it within 24 hours, so an agent or a second terminal can carry the pasted address. `accounts add` and `accounts reauth` both take them.
 - Over SSH, or on Linux with no display, Google sign-in switches to pasting and says so, because a browser opened on that computer can't finish it.
 
 ### Fixed

@@ -26,7 +26,7 @@ To split that across two commands, for example when an agent hands you the link:
 
 ```bash
 envelope accounts add --provider google --email you@gmail.com --paste --no-wait
-# open the link, approve, copy the page's address, then within 10 minutes:
+# open the link, approve, copy the page's address, then within 24 hours:
 envelope accounts add --provider google --email you@gmail.com --finish -
 ```
 

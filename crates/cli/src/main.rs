@@ -650,8 +650,8 @@ enum AccountsCmd {
         /// address the browser ends on, instead of catching it locally.
         #[arg(long, requires = "provider")]
         paste: bool,
-        /// With --paste: print the sign-in link and exit; finish within 10
-        /// minutes with --finish
+        /// With --paste: print the sign-in link and exit; finish within 24
+        /// hours with --finish
         #[arg(long, requires = "paste")]
         no_wait: bool,
         /// Finish a sign-in started with --paste --no-wait: the address the
@@ -676,8 +676,8 @@ enum AccountsCmd {
         /// browser ends on, instead of catching it locally
         #[arg(long)]
         paste: bool,
-        /// With --paste: print the sign-in link and exit; finish within 10
-        /// minutes with --finish
+        /// With --paste: print the sign-in link and exit; finish within 24
+        /// hours with --finish
         #[arg(long, requires = "paste")]
         no_wait: bool,
         /// Finish a sign-in started with --paste --no-wait: the address the

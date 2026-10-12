@@ -32,9 +32,12 @@ pub const GMAIL_SMTP_PORT: u16 = 465;
 pub const GOOGLE_CARDDAV_SCOPE: &str = "https://www.googleapis.com/auth/carddav";
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long a pasted sign-in stays usable, at the prompt or saved by
-/// `--no-wait`. Google's authorization codes don't last longer.
+/// How long the paste prompt waits for someone at the terminal.
 const PASTE_WINDOW: Duration = Duration::from_secs(600);
+/// How long a sign-in saved by `--no-wait` can be finished. A relayed link
+/// can sit for hours before anyone approves it, and the saved verifier is
+/// useless without Google's code, which expires minutes after it is issued.
+const SAVED_SIGN_IN_HOURS: i64 = 24;
 
 const PASTE_PROMPT: &str = "After you approve, the browser stops on a \"can't connect\" page. Copy its address (on a phone: tap the address bar, Select All, Copy) and paste it here; pasting the whole page works too:";
 const NO_ADDRESS: &str = "No sign-in address in what was pasted. Copy the full address of the page the sign-in ended on; it starts with http://127.0.0.1:1/";
@@ -73,7 +76,7 @@ struct PendingSignIn {
 
 impl PendingSignIn {
     fn expires_at(&self) -> DateTime<Utc> {
-        self.created_at + chrono::Duration::from_std(PASTE_WINDOW).expect("ten minutes fits")
+        self.created_at + chrono::Duration::hours(SAVED_SIGN_IN_HOURS)
     }
 }
 
@@ -117,7 +120,8 @@ pub async fn google_sign_in(
                 eprintln!("Paste the address the sign-in ended on (or the whole page):");
                 let left = (pending.expires_at() - Utc::now())
                     .to_std()
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .min(PASTE_WINDOW);
                 wait_for_paste(io::BufReader::new(io::stdin()), &pending.state, left).await?
             } else {
                 read_pasted(&pasted, &pending.state)?.ok_or_else(|| anyhow!(NO_ADDRESS))?
@@ -399,8 +403,7 @@ fn load_pending(dir: &Path, email: &str, now: DateTime<Utc>) -> Result<PendingSi
     if now > pending.expires_at() {
         delete_pending(dir, email)?;
         bail!(
-            "The sign-in for {email} started more than {} minutes ago and has expired. Start it again for a fresh link.",
-            PASTE_WINDOW.as_secs() / 60
+            "The sign-in for {email} started more than {SAVED_SIGN_IN_HOURS} hours ago and has expired. Start it again for a fresh link."
         );
     }
     Ok(pending)
@@ -585,9 +588,19 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_sign_in_outlasts_a_slow_relay() {
+        // Live test, 2026-10-12: the link went through an agent and was
+        // approved almost three hours after it was printed.
+        let dir = tempfile::tempdir().unwrap();
+        let started = Utc::now() - chrono::Duration::hours(3);
+        save_pending(dir.path(), &pending("you@gmail.com", started)).unwrap();
+        load_pending(dir.path(), "you@gmail.com", Utc::now()).unwrap();
+    }
+
+    #[test]
     fn an_expired_sign_in_is_refused_and_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let started = Utc::now() - chrono::Duration::minutes(11);
+        let started = Utc::now() - chrono::Duration::hours(25);
         save_pending(dir.path(), &pending("you@gmail.com", started)).unwrap();
         let err = load_pending(dir.path(), "you@gmail.com", Utc::now())
             .err()

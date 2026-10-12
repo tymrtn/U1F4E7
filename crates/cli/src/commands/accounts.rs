@@ -822,7 +822,7 @@ fn print_started(
     } else {
         println!("Open this link on any device and sign in to Google as {email}:\n\n{url}\n");
         println!(
-            "After you approve, the browser stops on a \"can't connect\" page. Within 10 minutes, run\n\n  {finish}\n\nand paste that page's address (or the whole page)."
+            "After you approve, the browser stops on a \"can't connect\" page. Within 24 hours, run\n\n  {finish}\n\nand paste that page's address (or the whole page)."
         );
     }
     Ok(())
