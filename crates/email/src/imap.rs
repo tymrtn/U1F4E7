@@ -944,18 +944,11 @@ where
     // FETCH is an error, never a message that is gone.
     let fetched = uid_fetch_checked(session, folder, &uid_range, FETCH_MESSAGE_DESCRIPTOR).await?;
 
-    // fetch_message expects exactly one message for the UID — take the first item.
-    let Some(fetch) = fetched.into_iter().next() else {
+    // Unsolicited FETCH updates for other messages share the reply; keep ours.
+    let Some(fetch) = fetched.into_iter().find(|f| f.uid == Some(uid)) else {
         return Ok(None);
     };
-    let fetched_uid = fetch
-        .uid
-        .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
-    if fetched_uid != uid {
-        return Err(ImapError::Protocol(format!(
-            "UID FETCH {uid} returned unexpected UID {fetched_uid}"
-        )));
-    }
+    let fetched_uid = uid;
     let expected_size = expected_raw_message_size(&expected_sizes, fetched_uid)?;
     let body = fetch
         .body
@@ -2097,6 +2090,11 @@ where
         let uid = fetch.uid.ok_or_else(|| {
             ImapError::Protocol("UID FETCH size response without UID".to_string())
         })?;
+        // Servers (Gmail) interleave unsolicited FETCH updates for other
+        // messages, which carry no RFC822.SIZE; only the UIDs asked for count.
+        if !uid_set_contains(uid_set, uid) {
+            continue;
+        }
         let size = fetch.size.ok_or_else(|| {
             ImapError::Protocol(format!(
                 "attachment/message fetch refused for UID {uid}: server omitted RFC822.SIZE"
@@ -2412,6 +2410,28 @@ pub fn provider_spam_from_header_bytes(section: &[u8]) -> Option<f64> {
     let migadu = header_value_from_bytes(section, "X-Migadu-Spam-Score");
     let generic = header_value_from_bytes(section, "X-Spam-Score");
     crate::rules::provider_spam_from_headers(migadu.as_deref(), generic.as_deref())
+}
+
+/// Whether `uid` is a member of a validated UID set (`7`, `3:9`, `5:*`,
+/// `1,4:6`). `*` is open-ended, so a set using it admits every UID above its
+/// other bound: a stray response is then judged, never silently dropped.
+fn uid_set_contains(uid_set: &str, uid: u32) -> bool {
+    uid_set.split(',').any(|part| {
+        let bound = |s: &str| {
+            if s == "*" {
+                u32::MAX
+            } else {
+                s.parse().unwrap_or(0)
+            }
+        };
+        match part.split_once(':') {
+            Some((a, b)) => {
+                let (a, b) = (bound(a), bound(b));
+                (a.min(b)..=a.max(b)).contains(&uid) || (part.contains('*') && uid >= a.min(b))
+            }
+            None => bound(part) == uid,
+        }
+    })
 }
 
 fn validate_uid_set(uid_set: &str) -> Result<(), ImapError> {
@@ -3249,17 +3269,11 @@ where
         .await
         .map_err(|e| ImapError::Protocol(format!("UID FETCH parse error: {e}")))?;
 
-    let Some(fetch) = fetches.first() else {
+    // Unsolicited FETCH updates for other messages share the reply; keep ours.
+    let Some(fetch) = fetches.iter().find(|f| f.uid == Some(uid)) else {
         return Err(ImapError::NotFound(uid));
     };
-    let fetched_uid = fetch
-        .uid
-        .ok_or_else(|| ImapError::Protocol("UID FETCH returned message without UID".into()))?;
-    if fetched_uid != uid {
-        return Err(ImapError::Protocol(format!(
-            "UID FETCH {uid} returned unexpected UID {fetched_uid}"
-        )));
-    }
+    let fetched_uid = uid;
     let expected_size = expected_raw_message_size(&expected_sizes, fetched_uid)?;
     let body = fetch
         .body()
@@ -5274,6 +5288,53 @@ Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Gmail interleaves unsolicited FETCH updates (no RFC822.SIZE) for its
+    /// newest messages into a size query for an old UID. They are ignored;
+    /// the requested UID's own response still has to carry the size.
+    #[tokio::test]
+    async fn unsolicited_fetch_for_another_uid_does_not_trip_the_size_guard() {
+        let unsolicited = "* 9 FETCH (UID 359054 FLAGS (\\Seen))";
+        let (mut session, server) = scripted_session(vec![reply_turn(
+            "UID FETCH",
+            &[
+                unsolicited,
+                "* 1 FETCH (UID 7 RFC822.SIZE 20)",
+                "{tag} OK Fetch completed",
+            ],
+        )])
+        .await;
+        let sizes = declared_raw_message_sizes_in(&mut session, "INBOX", "7")
+            .await
+            .unwrap();
+        drop(session);
+        server.await.unwrap();
+        assert_eq!(sizes, vec![RawMessageSize { uid: 7, size: 20 }]);
+
+        let (mut session, server) = scripted_session(vec![reply_turn(
+            "UID FETCH",
+            &[
+                unsolicited,
+                "* 1 FETCH (UID 7 FLAGS ())",
+                "{tag} OK Fetch completed",
+            ],
+        )])
+        .await;
+        let err = declared_raw_message_sizes_in(&mut session, "INBOX", "7")
+            .await
+            .unwrap_err();
+        drop(session);
+        server.await.unwrap();
+        assert!(err.to_string().contains("refused for UID 7"), "{err}");
+    }
+
+    #[test]
+    fn uid_set_membership() {
+        assert!(uid_set_contains("7", 7) && !uid_set_contains("7", 8));
+        assert!(uid_set_contains("1,4:6", 5) && !uid_set_contains("1,4:6", 7));
+        assert!(uid_set_contains("6:4", 5));
+        assert!(uid_set_contains("5:*", 359054) && !uid_set_contains("5:*", 4));
     }
 
     /// A completed read still answers as before, and an unsolicited FETCH
