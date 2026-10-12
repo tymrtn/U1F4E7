@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.23] — 2026-10-12
+
+A fix release. Gmail interleaves its own updates for other messages (a flag change on a new arrival) into the reply to a read, and Envelope took one of those for a refusal: `envelope read` and `envelope attachment download` on an old message intermittently failed with "server omitted RFC822.SIZE" naming a different, newer UID. Reads now keep only the UID they asked for. A missing size on the requested message itself still stops the read.
+
 ## [1.3.22] — 2026-10-12
 
 A fix release. When the mail server refuses a read, Envelope stops with the server's error and changes nothing. A refused read used to look like an empty answer, which could wipe the dashboard's inbox list, move the wrong snoozed message, append duplicate drafts, or hand `envelope code` an old one-time code.

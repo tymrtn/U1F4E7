@@ -4610,6 +4610,83 @@ Subject: hi\r\n\r\nbody\r\n";
         downloaded
     }
 
+    /// Gmail slips flag updates for its newest messages into a FETCH reply
+    /// for an old UID. Reads and downloads keep the UID they asked for.
+    const UNSOLICITED: &str = "* 9 FETCH (UID 359054 FLAGS (\\Seen))";
+    const WITH_ATTACHMENT: &str = "From: a@example.org\r\nTo: me@example.org\r\n\
+Message-ID: <one@x>\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"notes.pdf\"\r\n\r\n%PDF-1.4\r\n\
+--b--\r\n";
+
+    fn reply_with_unsolicited_before(body_line: Option<String>) -> Vec<Turn> {
+        let mut reply = vec![UNSOLICITED.to_string()];
+        reply.extend(body_line);
+        reply.push("{tag} OK Fetch completed".into());
+        vec![
+            select_turn(),
+            size_turn(WITH_ATTACHMENT.len()),
+            Turn {
+                verb: "UID FETCH",
+                reply,
+            },
+        ]
+    }
+
+    fn body_line(flags: &str) -> String {
+        format!(
+            "* 1 FETCH (UID {BIG_UID} {flags}BODY[] {{{}}}\r\n{WITH_ATTACHMENT})",
+            WITH_ATTACHMENT.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_message_read_ignores_an_unsolicited_fetch_for_another_uid() {
+        let (mut session, server) = scripted_session(reply_with_unsolicited_before(Some(
+            body_line("FLAGS (\\Seen) "),
+        )))
+        .await;
+        let (message, raw) = fetch_message_with_raw_in(&mut session, "INBOX", BIG_UID)
+            .await
+            .expect("the requested UID's own response answers the read")
+            .expect("message");
+        server.await.unwrap();
+        assert_eq!(message.uid, BIG_UID);
+        assert_eq!(raw.as_deref(), Some(WITH_ATTACHMENT.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn a_message_read_with_only_unsolicited_responses_finds_nothing() {
+        let (mut session, server) = scripted_session(reply_with_unsolicited_before(None)).await;
+        let found = fetch_message_with_raw_in(&mut session, "INBOX", BIG_UID)
+            .await
+            .expect("a completed FETCH without our UID is not an error");
+        server.await.unwrap();
+        assert!(found.is_none(), "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn an_attachment_download_ignores_an_unsolicited_fetch_for_another_uid() {
+        let (mut session, server) =
+            scripted_session(reply_with_unsolicited_before(Some(body_line("")))).await;
+        let downloaded = download_attachment_in(&mut session, BIG_UID, "notes.pdf", "INBOX")
+            .await
+            .expect("the requested UID's own response answers the download");
+        server.await.unwrap();
+        assert_eq!(downloaded.filename, "notes.pdf");
+    }
+
+    #[tokio::test]
+    async fn an_attachment_download_with_only_unsolicited_responses_is_not_found() {
+        let (mut session, server) = scripted_session(reply_with_unsolicited_before(None)).await;
+        let err = download_attachment_in(&mut session, BIG_UID, "notes.pdf", "INBOX")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(err, ImapError::NotFound(BIG_UID)), "{err:?}");
+    }
+
     /// Regression: `envelope read` on UID 2379 (RFC822.SIZE 27289641) failed
     /// with "declared RFC822.SIZE 27289641 exceeds 26214400 bytes", so the
     /// text body and attachment names of a large message could not be seen.
