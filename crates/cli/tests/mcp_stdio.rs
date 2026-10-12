@@ -700,10 +700,6 @@ const READ_ACTIONS: [&str; 7] = [
     "watch.read",
 ];
 
-/// Tools authorized under a read action although some of their operations
-/// write. `contacts` runs add, tag and untag under `contacts.read`.
-const READ_ACTION_WRITERS: [&str; 1] = ["contacts"];
-
 #[test]
 fn mcp_tools_list_labels_every_tool_by_its_policy_action() {
     let temp = tempfile::tempdir().expect("temp HOME");
@@ -764,7 +760,7 @@ fn mcp_tools_list_labels_every_tool_by_its_policy_action() {
                 if action == "send" {
                     send_tools.push(name);
                 }
-                READ_ACTIONS.contains(&action) && !READ_ACTION_WRITERS.contains(&name)
+                READ_ACTIONS.contains(&action)
             }
             None => {
                 assert!(
@@ -792,13 +788,6 @@ fn mcp_tools_list_labels_every_tool_by_its_policy_action() {
         assert!(
             tools.iter().any(|t| t["name"] == name.as_str()),
             "tool_action_map names {name}, which tools/list does not list"
-        );
-    }
-    for name in READ_ACTION_WRITERS {
-        let action = action_map[name].as_str().expect("writer action");
-        assert!(
-            READ_ACTIONS.contains(&action),
-            "{name} now authorizes under {action}; drop it from READ_ACTION_WRITERS"
         );
     }
 }
@@ -1821,6 +1810,51 @@ fn mcp_rules_run_real_run_requires_rules_run_action() {
         tool_call(home, Some(&token), "rules_run", json!({ "dry_run": false }));
     assert!(is_error, "real rules_run without rules.run must be denied");
     assert_eq!(payload["code"], "agent_policy_denied_action");
+}
+
+/// Contact tags decide which rules match a sender (`ContactHasTag`), so the
+/// contacts tool's writes need `contacts.write`. `contacts.read` lists and
+/// shows only.
+#[test]
+fn mcp_contact_writes_need_contacts_write() {
+    let temp = tempfile::tempdir().expect("temp HOME");
+    let home = temp.path();
+    seed_account(home);
+    let (token, _id) = create_agent(home, "skippy");
+    let contacts = |arguments: Value| tool_call(home, Some(&token), "contacts", arguments);
+    let writes = [
+        json!({ "action": "add", "email": "a@b.test", "tag": "vip" }),
+        json!({ "action": "tag", "email": "a@b.test", "tag": "friend" }),
+        json!({ "action": "untag", "email": "a@b.test", "tag": "vip" }),
+    ];
+
+    set_policy_actions(home, "skippy", "contacts.read");
+    for write in &writes {
+        let (payload, is_error) = contacts(write.clone());
+        assert!(is_error, "contacts.read must not allow {write}: {payload}");
+        assert_eq!(payload["code"], "agent_policy_denied_action", "{payload}");
+    }
+    let (listed, is_error) = contacts(json!({ "action": "list" }));
+    assert!(!is_error, "contacts.read lists: {listed}");
+    assert_eq!(listed, json!([]), "a refused add wrote nothing");
+
+    set_policy_actions(home, "skippy", "contacts.read,contacts.write");
+    for write in &writes {
+        let (payload, is_error) = contacts(write.clone());
+        assert!(!is_error, "contacts.write allows {write}: {payload}");
+    }
+
+    set_policy_actions(home, "skippy", "contacts.read");
+    let (shown, is_error) = contacts(json!({ "action": "show", "email": "a@b.test" }));
+    assert!(!is_error, "contacts.read shows: {shown}");
+    assert_eq!(shown["email"], "a@b.test", "{shown}");
+    assert_eq!(shown["tags"], r#"["friend"]"#, "{shown}");
+
+    // "*" (the default policy) still includes contact writes.
+    set_policy_actions(home, "skippy", "*");
+    let (payload, is_error) =
+        contacts(json!({ "action": "untag", "email": "a@b.test", "tag": "friend" }));
+    assert!(!is_error, "a \"*\" policy writes contacts: {payload}");
 }
 
 #[test]

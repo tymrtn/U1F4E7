@@ -607,7 +607,7 @@ fn parse_allow_list(raw: &str) -> anyhow::Result<Vec<String>> {
 /// | read                  | inbox.read       |
 /// | search                | inbox.read       |
 /// | folders               | folders.list     |
-/// | contacts              | contacts.read    |
+/// | contacts              | contacts.write   |
 /// | send                  | send             |
 /// | reply                 | send             |
 /// | send_draft            | send             |
@@ -619,12 +619,15 @@ fn parse_allow_list(raw: &str) -> anyhow::Result<Vec<String>> {
 /// | flag                  | flag             |
 /// | tag                   | tag              |
 /// | threat_show           | inbox.read       |
+///
+/// `contacts` lists and shows under `contacts.read`; see
+/// [`contacts_op_action`].
 pub fn tool_action(tool_name: &str) -> Option<&'static str> {
     Some(match tool_name {
         "accounts" => "accounts.list",
         "inbox" | "read" | "search" | "threat_show" => "inbox.read",
         "folders" => "folders.list",
-        "contacts" => "contacts.read",
+        "contacts" => "contacts.write",
         "send" | "reply" | "send_draft" => "send",
         "create_reply_draft" | "create_forward_draft" => "draft.create",
         "modify_draft" => "draft.modify",
@@ -640,6 +643,16 @@ pub fn tool_action(tool_name: &str) -> Option<&'static str> {
         "snooze" => "snooze",
         _ => return None,
     })
+}
+
+/// The policy action a `contacts` tool operation needs. `list` and `show`
+/// read. Any other operation (`add`, `tag`, `untag`, or one Envelope does not
+/// know) writes, and contact tags decide which rules match a sender.
+pub fn contacts_op_action(op: Option<&str>) -> &'static str {
+    match op {
+        Some("list" | "show") => "contacts.read",
+        _ => "contacts.write",
+    }
 }
 
 /// Map a bulk operation name to the single-message policy action it must ALSO be
@@ -795,7 +808,17 @@ mod tests {
         assert_eq!(tool_action("rules_run"), Some("rules.run"));
         assert_eq!(tool_action("watch_status"), Some("watch.read"));
         assert_eq!(tool_action("snooze"), Some("snooze"));
+        assert_eq!(tool_action("contacts"), Some("contacts.write"));
         assert_eq!(tool_action("nonexistent_tool"), None);
+    }
+
+    #[test]
+    fn contacts_reads_need_contacts_read_and_everything_else_contacts_write() {
+        assert_eq!(contacts_op_action(Some("list")), "contacts.read");
+        assert_eq!(contacts_op_action(Some("show")), "contacts.read");
+        for op in [Some("add"), Some("tag"), Some("untag"), Some("LIST"), None] {
+            assert_eq!(contacts_op_action(op), "contacts.write", "{op:?}");
+        }
     }
 
     #[test]
