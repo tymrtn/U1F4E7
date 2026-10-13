@@ -144,21 +144,7 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
         tokio::spawn(async move { backfill_address_history(&state).await });
     }
 
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
-            let s = origin.to_str().unwrap_or("");
-            s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
-        }))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT]);
-
-    let app = dashboard_router(state.clone()).layer(cors);
+    let app = dashboard_router(state.clone()).layer(dashboard_cors(&state.auth));
 
     let addr = SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -374,6 +360,32 @@ fn validate_dashboard_bind(bind: IpAddr, port: u16, auth: &AuthConfig) -> anyhow
     }
 
     Ok(())
+}
+
+/// Reflecting every localhost origin is only defensible while a credential is
+/// required: the credential is what stops another local page from reading the
+/// mailbox. With auth disabled the same reflection hands any page on any
+/// localhost origin a readable cross-origin GET, so allow no cross-origin
+/// requests at all in that mode. The dashboard SPA is same-origin with its own
+/// server and needs none.
+fn dashboard_cors(auth: &AuthConfig) -> CorsLayer {
+    let auth_is_enforced = auth.is_enforced();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            if !auth_is_enforced {
+                return false;
+            }
+            let s = origin.to_str().unwrap_or("");
+            s.starts_with("http://localhost:") || s.starts_with("http://127.0.0.1:")
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
 }
 
 /// Build the dashboard router (HTML shell, static assets, and the `/api`
@@ -5186,6 +5198,98 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    async fn cross_origin(
+        app: &Router,
+        method: Method,
+        origin: &str,
+        extra: &[(&str, &str)],
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("/api/accounts")
+            .header(header::ORIGIN, origin);
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_mode_grants_no_cross_origin_read() {
+        let (state, _, _) = test_state();
+        assert!(!state.auth.is_enforced());
+        let app = dashboard_router(state.clone()).layer(dashboard_cors(&state.auth));
+
+        for origin in ["http://localhost:5173", "http://127.0.0.1:5173"] {
+            let read = cross_origin(&app, Method::GET, origin, &[]).await;
+            assert_eq!(read.status(), StatusCode::OK, "{origin}");
+            assert_eq!(
+                read.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                None,
+                "{origin}: open mode must not let another local page read the mailbox"
+            );
+
+            let preflight = cross_origin(
+                &app,
+                Method::OPTIONS,
+                origin,
+                &[("access-control-request-method", "GET")],
+            )
+            .await;
+            assert_eq!(
+                preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                None,
+                "{origin}: preflight must not grant cross-origin access in open mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn token_mode_still_reflects_localhost_origins() {
+        let (state, _, _) = test_state();
+        let state = state.with_auth(AuthConfig::from_parts(Some("t0ken".into()), []));
+        let app = dashboard_router(state.clone()).layer(dashboard_cors(&state.auth));
+
+        for origin in ["http://localhost:5173", "http://127.0.0.1:5173"] {
+            let unauth = cross_origin(&app, Method::GET, origin, &[]).await;
+            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "{origin}");
+            assert_eq!(
+                unauth.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                origin,
+                "{origin}"
+            );
+
+            let authed = cross_origin(
+                &app,
+                Method::GET,
+                origin,
+                &[("authorization", "Bearer t0ken")],
+            )
+            .await;
+            assert_eq!(authed.status(), StatusCode::OK, "{origin}");
+            assert_eq!(
+                authed.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                origin,
+                "{origin}"
+            );
+        }
+
+        let foreign = cross_origin(
+            &app,
+            Method::GET,
+            "https://evil.example",
+            &[("authorization", "Bearer t0ken")],
+        )
+        .await;
+        assert_eq!(
+            foreign.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None
+        );
     }
 
     #[tokio::test]
