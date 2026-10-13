@@ -577,7 +577,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | `envelope flag add/remove <uid> <flag>` | IMAP flags |
 | `envelope attachment list/download <uid>` | Attachments |
 | `envelope draft create/list/send/discard` | Drafts (IMAP-backed) |
-| `envelope snooze set/list/cancel` | Snooze with flexible time parsing |
+| `envelope snooze set/list/cancel` | Snooze with flexible time parsing; `cancel --forget` deletes a snooze whose message is gone, moving nothing |
 | `envelope unsnooze [--once]` | Return due snoozed messages |
 | `envelope thread show/list/build` | Conversation threads |
 | `envelope tag set/show/list` | Score and tag messages |

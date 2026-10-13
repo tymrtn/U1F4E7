@@ -18,11 +18,11 @@ use crate::commands::governor_gate::{account_domain, governor_request, precheck_
 use crate::commands::send_attempt::{
     GovernorRefused, Queued, SendNotConfirmed, SendRequest, queue_request, uncertain_outcome,
 };
+use crate::commands::snooze::SnoozeMailbox;
 use crate::commands::ui;
 use envelope_email_store::models::{AccountWithCredentials, Draft};
 use envelope_email_store::{CredentialBackend, Database, Event, SnoozedMessage};
 use envelope_email_transport::attribution_persist::success_attribution_block;
-use envelope_email_transport::errors::ImapError;
 use envelope_email_transport::outbound::{
     IMMEDIATE_SEND_CONFIRM_CODE, OUTBOX_COOLDOWN_REASON, OUTBOX_COOLDOWN_REASON_CODE,
     SendDisposition, SendSurface, resolve_cooldown_seconds, resolve_disposition,
@@ -3022,7 +3022,7 @@ async fn handle_snooze(
             let mut client = envelope_email_transport::imap::connect(&creds)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
-            return_snoozed(&mut client, &snoozed, &account_email).await?;
+            return_snoozed(&mut client, &snoozed).await?;
             db.delete_snoozed(&snoozed.id)
                 .map_err(|e| format!("{e:#}"))?;
 
@@ -3049,62 +3049,16 @@ async fn handle_snooze(
     }
 }
 
-/// The mailbox calls a snooze cancel makes: the live IMAP client, or a fake
-/// in tests.
-trait SnoozeMailbox {
-    async fn find_uid_by_message_id(
-        &mut self,
-        folder: &str,
-        message_id: &str,
-    ) -> Result<Option<u32>, ImapError>;
-    async fn move_message(&mut self, uid: u32, from: &str, to: &str) -> Result<(), ImapError>;
-}
-
-impl SnoozeMailbox for envelope_email_transport::imap::ImapClient {
-    async fn find_uid_by_message_id(
-        &mut self,
-        folder: &str,
-        message_id: &str,
-    ) -> Result<Option<u32>, ImapError> {
-        envelope_email_transport::imap::find_uid_by_message_id(self, folder, message_id).await
-    }
-
-    async fn move_message(&mut self, uid: u32, from: &str, to: &str) -> Result<(), ImapError> {
-        envelope_email_transport::imap::move_message(self, uid, from, to).await
-    }
-}
-
-/// Move a snoozed message back to the folder it came from. Its stored UID
-/// names it in that folder, so in the snooze folder it may be another
-/// message, or none: the message is found there by its Message-ID first, and
-/// a search that is refused or finds nothing moves nothing.
+/// Move a snoozed message back to the folder it came from, for the MCP
+/// `snooze` tool's cancel. The message is found by
+/// [`crate::commands::snooze::find_in_snoozed`].
 async fn return_snoozed(
     mailbox: &mut impl SnoozeMailbox,
     snoozed: &SnoozedMessage,
-    account_email: &str,
 ) -> Result<(), String> {
-    let folder = &snoozed.snoozed_folder;
-    let Some(message_id) = snoozed.message_id.as_deref() else {
-        return Err(format!(
-            "the snooze of UID {} has no Message-ID to find it by in {folder} on {account_email}; nothing was moved",
-            snoozed.uid
-        ));
-    };
-    let uid = mailbox
-        .find_uid_by_message_id(folder, message_id.trim_matches(|c| c == '<' || c == '>'))
-        .await
-        .map_err(|e| {
-            format!(
-                "could not search {folder} on {account_email} for the snoozed message; nothing was moved: {e:#}"
-            )
-        })?
-        .ok_or_else(|| {
-            format!(
-                "the snoozed message {message_id} is no longer in {folder} on {account_email}; nothing was moved"
-            )
-        })?;
+    let uid = crate::commands::snooze::find_in_snoozed(mailbox, snoozed).await?;
     mailbox
-        .move_message(uid, folder, &snoozed.original_folder)
+        .move_message(uid, &snoozed.snoozed_folder, &snoozed.original_folder)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -3282,6 +3236,7 @@ fn write_mcp_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envelope_email_transport::errors::ImapError;
     use std::io::Cursor;
 
     /// A Snoozed folder whose Message-ID search answers `found`. It records
@@ -3343,7 +3298,7 @@ mod tests {
     async fn snooze_cancel_moves_the_message_found_in_snoozed() {
         let mut mailbox = FakeSnoozeMailbox::answering(Ok(Some(3)));
 
-        return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+        return_snoozed(&mut mailbox, &snoozed_from_inbox())
             .await
             .expect("the message is found and returned");
 
@@ -3363,7 +3318,7 @@ mod tests {
     async fn snooze_cancel_moves_nothing_when_the_message_is_gone() {
         let mut mailbox = FakeSnoozeMailbox::answering(Ok(None));
 
-        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox())
             .await
             .expect_err("a message that is gone is not returned");
 
@@ -3383,7 +3338,7 @@ mod tests {
             ..snoozed_from_inbox()
         };
 
-        let err = return_snoozed(&mut mailbox, &snoozed, "me@example.test")
+        let err = return_snoozed(&mut mailbox, &snoozed)
             .await
             .expect_err("nothing to find it by");
 
@@ -3401,7 +3356,7 @@ mod tests {
                 .into(),
         )));
 
-        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox(), "me@example.test")
+        let err = return_snoozed(&mut mailbox, &snoozed_from_inbox())
             .await
             .expect_err("a refused search returns nothing");
 

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `envelope unsnooze` and `envelope snooze check-replies` no longer return or flag snoozed mail early (or late) by your time-zone offset. Return times are stored in UTC, but both commands compared them with your local clock: two hours ahead of UTC, a snooze came back two hours early, and behind UTC it came back late. They now compare in UTC, as `envelope serve` already did.
+- `envelope unsnooze` and `envelope snooze cancel` no longer move whatever message happens to hold the snoozed message's old UID in the Snoozed folder. A snooze stores the UID the message had in the folder it came from, and when the search for its Message-ID found nothing, or the snooze had no Message-ID, both commands moved that UID out of Snoozed, which could be a different snoozed message. Now they find the message by its Message-ID or move nothing. When the message isn't there, the snooze has no Message-ID, or the server refuses the search, the command fails with an error that names the snooze and the reason, and keeps the snooze. If the message is gone for good, `envelope snooze cancel <uid> --forget` deletes the snooze without touching the mailbox. The MCP `snooze` tool's cancel shares the same search and now gives the same errors.
 
 ## [1.3.24] — 2026-10-12
 
