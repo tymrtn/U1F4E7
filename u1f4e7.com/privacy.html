@@ -27,7 +27,7 @@
     "name": "Envelope privacy",
     "description": "What Envelope keeps on your computer, every outside service it contacts and what triggers each one, and what this website's analytics collect.",
     "datePublished": "2026-10-12",
-    "dateModified": "2026-10-13",
+    "dateModified": "2026-10-14",
     "author": {"@type": "Person", "name": "Tyler Martin", "url": "https://github.com/tymrtn"},
     "about": {"@type": "SoftwareApplication", "name": "Envelope", "applicationCategory": "CommunicationApplication", "operatingSystem": "macOS, Linux", "url": "https://u1f4e7.com/"},
     "mainEntityOfPage": "https://u1f4e7.com/privacy"
@@ -53,7 +53,7 @@
     <article id="privacy-article" class="article wrap">
       <p class="eyebrow">Privacy</p>
       <h1>Privacy</h1>
-      <p class="byline">Effective 13 October 2026, for Envelope 1.3.24 and this website.</p>
+      <p class="byline">Effective 14 October 2026, for Envelope 1.3.25 and this website.</p>
       <p class="lede">Envelope is an email client that runs on your own computer and connects to the mail accounts you add. Tyler Martin publishes it and runs no server that your mail, passwords or usage pass through. This page lists what Envelope keeps on your machine, each outside service it can contact and what makes it do so, and what u1f4e7.com collects when you visit.</p>
 
       <section id="privacy-local" class="article-section">
@@ -75,7 +75,7 @@
 
       <section id="privacy-discovery" class="article-section">
         <h2>When you add an account</h2>
-        <p>If you add an account without naming its servers, Envelope looks up the SRV and MX records for the domain of your email address to find them. Envelope 1.3.22 sends those lookups to Google Public DNS (8.8.8.8 and 8.8.4.4), so Google sees the domain and your IP address. Envelope then opens a test connection to each likely server, such as <code>imap.example.com</code> on port 993, until one answers. You can skip both steps by giving the servers yourself with <code>--imap-host</code> and <code>--smtp-host</code>.</p>
+        <p>If you add an account without naming its servers, Envelope looks up the SRV and MX records for the domain of your email address to find them. It asks the DNS resolver your computer already uses first. Only when that resolver times out, fails, or answers SERVFAIL or REFUSED, or when Envelope can't read your system's DNS settings, does Envelope repeat the lookup with Google Public DNS (8.8.8.8 and 8.8.4.4), and then Google sees the domain and your IP address. If your resolver answers that the domain has no such records, Envelope stops there. Envelope then opens a test connection to each likely server, such as <code>imap.example.com</code> on port 993, until one answers. You can skip both steps by giving the servers yourself with <code>--imap-host</code> and <code>--smtp-host</code>.</p>
         <p>Every other name Envelope looks up goes to the DNS resolver your computer already uses. The one exception is <code>envelope deliverability check</code>, which falls back to Google Public DNS when it can't read your system's DNS settings.</p>
       </section>
 
