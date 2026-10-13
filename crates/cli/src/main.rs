@@ -1416,6 +1416,10 @@ enum SnoozeCmd {
         /// Account ID or email
         #[arg(long)]
         account: Option<String>,
+        /// Delete the snooze without moving anything, for one whose message
+        /// is no longer in the Snoozed folder
+        #[arg(long)]
+        forget: bool,
     },
 }
 
@@ -2764,9 +2768,11 @@ fn main() {
             SnoozeCmd::CheckReplies { account } => {
                 commands::snooze::run_check_replies(account.as_deref(), cli.json, backend)
             }
-            SnoozeCmd::Cancel { uid, account } => {
-                commands::snooze::run_unsnooze(uid, account.as_deref(), cli.json, backend)
-            }
+            SnoozeCmd::Cancel {
+                uid,
+                account,
+                forget,
+            } => commands::snooze::run_unsnooze(uid, account.as_deref(), forget, cli.json, backend),
         },
 
         Commands::Unsnooze { once: _, account } => {

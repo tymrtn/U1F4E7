@@ -6,10 +6,12 @@
 //! snooze an hour ahead in UTC is not due and one an hour past is, whatever
 //! the local zone. No account is configured, so no mailbox is touched: a due
 //! snooze shows up as one `unsnooze` could not return, and `check-replies`
-//! settles each follow-up without searching.
+//! settles each follow-up without searching. The one account a test adds has
+//! a mail server that never resolves.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use chrono::{Duration, Utc};
 use envelope_email_store::Database;
@@ -21,8 +23,8 @@ const EMAIL: &str = "me@corp.test";
 /// early in the first and late in the second.
 const ZONES: [&str; 2] = ["Europe/Madrid", "America/New_York"];
 
-fn cli(home: &Path, tz: &str, args: &[&str]) -> Value {
-    let out = Command::new(env!("CARGO_BIN_EXE_envelope"))
+fn run(home: &Path, tz: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_envelope"))
         .args(args)
         .env("HOME", home)
         .env("ENVELOPE_HOME", home)
@@ -32,7 +34,11 @@ fn cli(home: &Path, tz: &str, args: &[&str]) -> Value {
         .env_remove("ENVELOPE_MASTER_PASSPHRASE_FILE")
         .stdin(Stdio::null())
         .output()
-        .expect("run envelope");
+        .expect("run envelope")
+}
+
+fn cli(home: &Path, tz: &str, args: &[&str]) -> Value {
+    let out = run(home, tz, args);
     assert!(
         out.status.success(),
         "TZ={tz} {args:?}\nstdout:\n{}\nstderr:\n{}",
@@ -117,4 +123,78 @@ fn check_replies_calls_a_follow_up_overdue_only_past_its_utc_return_time() {
         assert_eq!(row["overdue"], true, "TZ={tz}: {checked}");
         assert_eq!(row["escalation_tier"], 1, "TZ={tz}: {checked}");
     }
+}
+
+/// Add the account [`EMAIL`] to `home`, with a mail server whose name never
+/// resolves: anything that tries to reach it fails.
+fn add_unreachable_account(home: &Path) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_envelope"))
+        .args([
+            "accounts",
+            "add",
+            "--skip-login-check",
+            "--email",
+            EMAIL,
+            "--password-stdin",
+            "--smtp-host",
+            "smtp.corp.invalid",
+            "--smtp-port",
+            "587",
+            "--imap-host",
+            "imap.corp.invalid",
+            "--imap-port",
+            "993",
+            "--json",
+        ])
+        .env("HOME", home)
+        .env("ENVELOPE_HOME", home)
+        .env("ENVELOPE_MASTER_KEY", "snooze-cli-test-key")
+        .env_remove("ENVELOPE_AGENT_TOKEN")
+        .env_remove("ENVELOPE_MASTER_PASSPHRASE_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn accounts add");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"pw\n")
+        .expect("write password");
+    let out = child.wait_with_output().expect("wait accounts add");
+    assert!(
+        out.status.success(),
+        "accounts add failed\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A snooze whose message is gone is dropped with `snooze cancel --forget`,
+/// which deletes the snooze and touches no mailbox: the account's server
+/// never resolves, so the plain cancel fails and keeps the snooze, and the
+/// forget still succeeds.
+#[test]
+fn snooze_cancel_forget_drops_the_snooze_without_touching_the_mailbox() {
+    let home = home_with_snooze(Duration::hours(1), None, None);
+    add_unreachable_account(home.path());
+    let db_path = home.path().join("envelope-email").join("envelope.db");
+
+    let args = ["snooze", "cancel", "7", "--account", EMAIL, "--json"];
+    let cancel = run(home.path(), "UTC", &args);
+    assert!(!cancel.status.success(), "the server can't be reached");
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.list_snoozed(None).unwrap().len(), 1, "kept");
+    drop(db);
+
+    let forgot = cli(home.path(), "UTC", &[&args[..], &["--forget"]].concat());
+
+    assert_eq!(forgot["action"], "forget", "{forgot}");
+    assert_eq!(forgot["uid"], 7, "{forgot}");
+    assert_eq!(forgot["moved"], false, "{forgot}");
+    let db = Database::open(&db_path).unwrap();
+    assert!(
+        db.list_snoozed(None).unwrap().is_empty(),
+        "the snooze is gone"
+    );
 }
