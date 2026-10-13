@@ -94,6 +94,16 @@ impl JsonRpcResponse {
 
 // ── MCP protocol types ──────────────────────────────────────────────
 
+/// Product principle, sent to every MCP client at initialize. The user's
+/// mailbox history is the learning data; agents never ask for per-sender
+/// decisions. Keep the skill's "Learning from the user's mail" section in step.
+const AGENT_INSTRUCTIONS: &str = "Envelope works the user's own mailboxes, and \
+those mailboxes already record how the user handles mail: what they delete, archive, \
+file into folders, mark as junk, read, reply to and flag. Learn from that record. Do \
+not ask the user to decide what to do with each sender, or to write sorting rules for \
+you. When their past behavior does not settle what to do with a message, leave it \
+where it is.";
+
 fn server_info() -> Value {
     json!({
         "protocolVersion": "2024-11-05",
@@ -103,7 +113,8 @@ fn server_info() -> Value {
         "serverInfo": {
             "name": "envelope",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": AGENT_INSTRUCTIONS
     })
 }
 
@@ -3760,6 +3771,26 @@ mod tests {
         let parsed: Value = serde_json::from_str(text.trim_end_matches('\n')).expect("valid JSON");
         assert_eq!(parsed["id"], 1);
         assert_eq!(parsed["result"]["content"][0]["text"], "line one\nline two");
+    }
+
+    #[test]
+    fn initialize_tells_agents_to_learn_from_mailbox_history() {
+        let instructions = server_info()["instructions"]
+            .as_str()
+            .expect("initialize carries instructions")
+            .to_string();
+        for phrase in [
+            "delete, archive",
+            "mark as junk",
+            "Learn from that record",
+            "each sender",
+            "leave it where it is",
+        ] {
+            assert!(
+                instructions.contains(phrase),
+                "instructions lost {phrase:?}: {instructions}"
+            );
+        }
     }
 
     #[test]
