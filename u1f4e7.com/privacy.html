@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy | Envelope</title>
+  <meta name="description" content="What Envelope keeps on your computer, every outside service it contacts and what triggers each one, and what this website's analytics collect.">
+  <link rel="canonical" href="https://u1f4e7.com/privacy">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%E2%9C%89%EF%B8%8F</text></svg>">
+  <meta name="theme-color" content="#0b1020">
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Envelope">
+  <meta property="og:url" content="https://u1f4e7.com/privacy">
+  <meta property="og:title" content="Envelope privacy">
+  <meta property="og:description" content="What Envelope keeps on your computer, every outside service it contacts and what triggers each one, and what this website's analytics collect.">
+  <meta property="og:image" content="https://u1f4e7.com/og-card.png">
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Envelope privacy">
+  <meta name="twitter:description" content="What Envelope keeps on your computer, every outside service it contacts and what triggers each one, and what this website's analytics collect.">
+  <meta name="twitter:image" content="https://u1f4e7.com/og-card.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    "name": "Envelope privacy",
+    "description": "What Envelope keeps on your computer, every outside service it contacts and what triggers each one, and what this website's analytics collect.",
+    "datePublished": "2026-10-12",
+    "dateModified": "2026-10-13",
+    "author": {"@type": "Person", "name": "Tyler Martin", "url": "https://github.com/tymrtn"},
+    "about": {"@type": "SoftwareApplication", "name": "Envelope", "applicationCategory": "CommunicationApplication", "operatingSystem": "macOS, Linux", "url": "https://u1f4e7.com/"},
+    "mainEntityOfPage": "https://u1f4e7.com/privacy"
+  }
+  </script>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="https://umami.tmrtn.com/script.js" data-website-id="536e835e-4ffc-422e-82f3-6d80a3df44eb"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="index.html#top">✉️ Envelope</a>
+      <nav>
+        <a href="index.html#use-cases">Use cases</a>
+        <a href="index.html#workflows">What it does</a>
+        <a href="index.html#control">Human control</a>
+        <a href="index.html#pricing">Pricing</a>
+        <a class="button button-small button-secondary" href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=privacy&amp;utm_content=privacy-nav" data-umami-event="github-nav">Repo</a>
+      </nav>
+    </div>
+  </header>
+  <main id="top">
+    <article id="privacy-article" class="article wrap">
+      <p class="eyebrow">Privacy</p>
+      <h1>Privacy</h1>
+      <p class="byline">Effective 13 October 2026, for Envelope 1.3.24 and this website.</p>
+      <p class="lede">Envelope is an email client that runs on your own computer and connects to the mail accounts you add. Tyler Martin publishes it and runs no server that your mail, passwords or usage pass through. This page lists what Envelope keeps on your machine, each outside service it can contact and what makes it do so, and what u1f4e7.com collects when you visit.</p>
+
+      <section id="privacy-local" class="article-section">
+        <h2>What Envelope keeps on your computer</h2>
+        <p>Envelope stores its data in one folder: <code>~/Library/Application Support/envelope-email/</code> on macOS and <code>~/.config/envelope-email/</code> on Linux. If you set <code>ENVELOPE_HOME</code>, the folder is <code>$ENVELOPE_HOME/envelope-email</code> instead.</p>
+        <ul class="checklist">
+          <li><code>envelope.db</code>, a SQLite database with your account settings, an index of message headers with a short snippet of each message, drafts and their attachments, contacts, rules, tags, snoozes, webhook settings, and a log of the actions you and your agents took.</li>
+          <li>Account passwords, encrypted with AES-256-GCM inside that database. A Google sign-in is stored the same way.</li>
+          <li>The key that unlocks those passwords. By default it is in <code>credentials.json</code>, protected by your passphrase. If you choose <code>--credential-store keychain</code>, it goes in the macOS Keychain or your Linux keyring.</li>
+          <li><code>config.json</code> for your settings, plus any backup archives you make.</li>
+        </ul>
+        <p>Full message bodies stay on your mail provider's servers. Envelope fetches them over IMAP when it needs them. The exceptions are drafts (a reply can quote the message it answers) and the backups and evidence exports you run yourself.</p>
+      </section>
+
+      <section id="privacy-mail-servers" class="article-section">
+        <h2>Your mail servers</h2>
+        <p>Envelope connects over TLS to the IMAP and SMTP servers of each account you add. That is where your mail is read and sent. Your password goes only to your mail provider's servers: IMAP, SMTP and, if you publish Sieve rules, ManageSieve. While the dashboard (<code>envelope serve</code>) is running, it checks your inboxes for new mail every five minutes by default.</p>
+      </section>
+
+      <section id="privacy-discovery" class="article-section">
+        <h2>When you add an account</h2>
+        <p>If you add an account without naming its servers, Envelope looks up the SRV and MX records for the domain of your email address to find them. Envelope 1.3.22 sends those lookups to Google Public DNS (8.8.8.8 and 8.8.4.4), so Google sees the domain and your IP address. Envelope then opens a test connection to each likely server, such as <code>imap.example.com</code> on port 993, until one answers. You can skip both steps by giving the servers yourself with <code>--imap-host</code> and <code>--smtp-host</code>.</p>
+        <p>Every other name Envelope looks up goes to the DNS resolver your computer already uses. The one exception is <code>envelope deliverability check</code>, which falls back to Google Public DNS when it can't read your system's DNS settings.</p>
+      </section>
+
+      <section id="privacy-google" class="article-section">
+        <h2>Signing in with Google</h2>
+        <p>A Gmail account can sign in through Google instead of using an app password. The sign-in opens accounts.google.com in your browser, and Envelope exchanges the result for tokens at oauth2.googleapis.com. Envelope asks for Gmail access (the <code>https://mail.google.com/</code> scope, the only one that allows IMAP and SMTP) and for your email address. It uses the tokens to log in to Gmail's IMAP and SMTP servers and calls no other Google API. When the access token expires, Envelope renews it at oauth2.googleapis.com. When you remove the account with <code>envelope accounts remove</code>, Envelope asks Google to revoke its access.</p>
+        <p>Envelope uses the mail it reads from a Google account only to show it to you and to the agents you connect, and to carry out what you or those agents ask. It doesn't sell that data, use it for advertising, or use it to train AI models. Envelope's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy#additional_requirements_for_specific_api_scopes">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+      </section>
+
+      <section id="privacy-on-request" class="article-section">
+        <h2>Connections Envelope makes only when you ask</h2>
+        <ul class="checklist">
+          <li><strong>Unsubscribing.</strong> <code>envelope unsubscribe --confirm</code>, or a rule you write with the unsubscribe action, sends a one-click unsubscribe request (an HTTPS POST) to the URL in the message's List-Unsubscribe header when the sender supports one-click. If the sender lists only an email address, Envelope sends the unsubscribe email through your own mail server. Envelope never opens an unsubscribe link with a GET request and doesn't follow redirects.</li>
+          <li><strong>Webhooks.</strong> If you give <code>envelope watch</code> a <code>--webhook</code> URL, add an event route, or write a rule with a webhook action, Envelope posts to that URL. The post can include the sender and recipient addresses, the subject, and a short snippet with one-time codes removed.</li>
+          <li><strong>Reporting phishing.</strong> <code>envelope threat report</code>, or the report action in the dashboard, looks up the registrar of the sending domain through RDAP, and the registrar of the domain it imitates when Envelope spots a look-alike. It downloads a list from IANA (data.iana.org), then asks the domain registry's RDAP server and sometimes the registrar's. Only domain names are sent. The result is a draft to the Anti-Phishing Working Group (reportphishing@apwg.org) and the registrars' abuse contacts, with the original message attached. Nothing goes out until you send that draft.</li>
+          <li><strong>Remote images.</strong> The dashboard blocks images hosted elsewhere. If you click <em>Load remote images</em> on a message, your browser fetches that message's images from the sender's servers, which can tell the sender you opened it. Opening the next message blocks them again.</li>
+          <li><strong>Sieve rules.</strong> <code>envelope rule publish-sieve --confirm</code> uploads your rules to your mail provider's ManageSieve server.</li>
+        </ul>
+      </section>
+
+      <section id="privacy-opt-in" class="article-section">
+        <h2>Off unless you turn them on</h2>
+        <ul class="checklist">
+          <li><strong>Spamhaus domain reputation.</strong> With <code>threat.reputation.provider</code> set to <code>spamhaus-dbl</code>, Envelope checks the sender's domain and the domains of links in each scanned message against the Spamhaus Domain Block List. It sends up to 10 domain names per message as DNS queries through your system's resolver, never full addresses or links, and caches each answer for an hour.</li>
+          <li><strong>ClamAV.</strong> With <code>threat.clamd.address</code> set, Envelope sends attachments to the ClamAV daemon at the address you give, for a virus scan.</li>
+        </ul>
+      </section>
+
+      <section id="privacy-never" class="article-section">
+        <h2>What Envelope doesn't do</h2>
+        <p>These statements describe the 1.3.22 source code, which is public on <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=privacy&amp;utm_content=privacy-source" data-umami-event="privacy-source">GitHub</a>.</p>
+        <ul class="checklist">
+          <li>Envelope has no server of its own. Your mail, passwords, tokens and contacts never reach Tyler Martin or any server he runs.</li>
+          <li>It sends no telemetry, usage statistics or crash reports, and it doesn't check for updates.</li>
+          <li>License keys are checked on your machine. Activating one contacts nothing.</li>
+          <li>It doesn't call any AI model provider itself. The section below covers the agents you connect.</li>
+          <li>It doesn't fetch avatars, link previews or remote images on its own. The dashboard's fonts and code are built into the app.</li>
+        </ul>
+      </section>
+
+      <section id="privacy-agents" class="article-section">
+        <h2>Agents and MCP clients</h2>
+        <p>When an agent uses Envelope through the command line or the MCP server, including the Claude Desktop extension, Envelope gives the agent what it asks for: message headers, bodies, search results and drafts. The agent sends that content to whichever AI model provider it runs on, and that provider's terms apply. You choose the agent and its provider, and you set what each agent may do. A new agent starts at draft-only, so anything it writes waits for your approval before it is sent. Envelope leaves your Tailscale machine name out of MCP results unless the agent asks for dashboard links.</p>
+      </section>
+
+      <section id="privacy-website" class="article-section">
+        <h2>This website</h2>
+        <p>u1f4e7.com is a static site hosted on Netlify. It counts visits with a self-hosted Umami instance at umami.tmrtn.com. The Umami script sets no cookies. For each page view it sends the page address and title, the page you came from, your screen size and your browser language, and it records clicks on buttons such as Copy and the GitHub links. Your IP address reaches Netlify and the Umami server with each request, as it does with any website.</p>
+        <p>The install script and Homebrew download Envelope from GitHub, so GitHub's privacy terms cover those downloads.</p>
+      </section>
+
+      <section id="privacy-removing" class="article-section">
+        <h2>Removing Envelope</h2>
+        <p>Run <code>envelope accounts remove</code> for each account first. For an account that signed in with Google, this asks Google to revoke Envelope's access, which you can also do at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</p>
+        <p>Then delete the program and its data. Uninstall the program with <code>brew uninstall envelope</code>, or delete <code>~/.local/bin/envelope</code> if you used the install script, and remove the Claude Desktop extension or agent plugin if you installed one. Delete the folder that holds Envelope's database and encrypted credentials: <code>~/Library/Application Support/envelope-email/</code> on macOS, <code>~/.config/envelope-email/</code> on Linux, or <code>envelope-email</code> inside <code>$ENVELOPE_HOME</code> if you set it. On macOS, Envelope may also keep its encryption key in your login keychain under the name <code>envelope-email</code>; delete that entry in Keychain Access. Envelope keeps no copy of your data anywhere else.</p>
+      </section>
+
+      <section id="privacy-contact" class="article-section">
+        <h2>Questions and changes</h2>
+        <p>Send questions about this page to Tyler Martin at <a href="mailto:privacy@u1f4e7.com?subject=Envelope%20privacy" data-umami-event="privacy-contact">privacy@u1f4e7.com</a>. When Envelope's network behavior changes, Tyler updates this page and its effective date.</p>
+      </section>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <p>Envelope: one inbox for you and your agents.</p>
+      <div class="footer-links">
+        <a href="https://github.com/tymrtn/U1F4E7?utm_source=u1f4e7.com&amp;utm_medium=website&amp;utm_campaign=privacy&amp;utm_content=privacy-footer" data-umami-event="github-footer">GitHub</a>
+        <a href="mailto:ty@tmrtn.com?subject=Envelope%20licensing" data-umami-event="license-licensing-footer">Licensing</a>
+        <a href="privacy.html" data-umami-event="privacy-footer">Privacy</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
