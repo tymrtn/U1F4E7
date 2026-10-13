@@ -313,6 +313,7 @@ pub fn agent_contract() -> Value {
             "bulk_two_action_gate": "The bulk tool requires BOTH the coarse `bulk` action AND the underlying single action the op maps to: move/copy require `move`, flag_add/flag_remove require `flag`, delete requires `delete`, tag requires `tag`. Missing either denies with the standard {agent_policy_denied_action|account|folder} codes.",
             "bulk_delete_confirmation": "In the MCP context a bulk `delete` op requires explicit `confirm: true` in the tool input; without it the call is coerced to a dry run (no mutations) and the result carries a `note` explaining the coercion. This mirrors the CLI `--confirm` default and prevents an unconfirmed destructive bulk delete.",
             "rules_run_dry_run_default": "The rules_run tool defaults `dry_run` to true; a preview is returned unless the caller passes `dry_run: false`. A real (mutating) run additionally requires the `rules.run` policy action, while rules_preview needs only `rules.read`.",
+            "contacts_read_operations": "The contacts tool's `list` and `show` operations authorize under `contacts.read`. `add`, `tag`, `untag` and any other operation need `contacts.write`, the action tool_action_map gives the tool, because contact tags decide which rules match a sender. A \"*\" policy includes both.",
             "revoked_token_session_persistence": "Agent bearer tokens are validated once at MCP server startup (`resolve_from_env`). Revoking an agent (`envelope agent revoke`) does not terminate an already-running MCP session — revocation takes effect at the next session start, when the now-unknown/revoked token fails startup loud. Operators rotating access must restart affected MCP server processes for a revocation to apply. (Closes review finding F4.)",
             "send_mode_ceilings": ["draft-only", "confirm-send", "allowlisted-send", "autonomous-send"],
             "free_tier": {
@@ -1016,13 +1017,15 @@ const MCP_TOOLS: [McpTool; 24] = [
         name: "contacts",
         title: "Manage contacts",
         // add replaces an existing contact's tags; untag removes one. Local store only.
+        // Not read-only: its policy action is contacts.write, though list and show
+        // need only contacts.read.
         hints: ToolHints {
             read_only: false,
             destructive: true,
             idempotent: false,
             open_world: false,
         },
-        description: "Manage contacts. Supports list, add, show, and tag operations.",
+        description: "Manage contacts: list, show, add, tag and untag. list and show need the contacts.read policy action; add, tag and untag need contacts.write.",
     },
     McpTool {
         name: "accounts",

@@ -335,6 +335,15 @@ fn authorize_tool_call_with_db(
             .map_err(|denial| denial.to_json().to_string());
     }
 
+    // contacts lists and shows under `contacts.read`; add, tag and untag need
+    // `contacts.write`, because contact tags decide which rules match a sender.
+    if tool_name == "contacts" {
+        let op = params.get("action").and_then(Value::as_str);
+        return ctx
+            .authorize_action(agent_context::contacts_op_action(op), &account, folder)
+            .map_err(|denial| denial.to_json().to_string());
+    }
+
     ctx.authorize_tool(tool_name, &account, folder)
         .map_err(|denial| denial.to_json().to_string())
 }
@@ -374,13 +383,16 @@ fn changes_quarantine(tool_name: &str, params: &Value) -> bool {
                 .unwrap_or("list")
                 == "list"
         }
+        "contacts" => {
+            agent_context::contacts_op_action(params.get("action").and_then(Value::as_str))
+                == "contacts.read"
+        }
         _ => matches!(
             agent_context::tool_action(tool_name),
             Some(
                 "accounts.list"
                     | "inbox.read"
                     | "folders.list"
-                    | "contacts.read"
                     | "draft.read"
                     | "rules.read"
                     | "watch.read"
@@ -3644,6 +3656,10 @@ mod tests {
                 json!({"account": acct, "uid": 1, "folder": quarantine}),
             ),
             ("snooze", json!({"account": acct, "action": "list"})),
+            (
+                "contacts",
+                json!({"account": acct, "action": "list", "folder": quarantine}),
+            ),
         ] {
             assert!(
                 authorize_tool_call_with_db(&db, Some(&ctx), tool, &params).is_ok(),

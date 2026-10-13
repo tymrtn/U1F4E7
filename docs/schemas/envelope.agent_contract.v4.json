@@ -220,6 +220,7 @@
       "send": "`envelope send` and `envelope draft send` also check the `send` action for the resolved account and apply the agent's ceiling, recipient allowlist and human approval (see outbound_safety.send_authority). A draft-only agent gets a draft and nothing reaches the outbox.",
       "threat_tags": "Under a token, setting a threat:* tag is operator-only: `tag set` and `bulk tag` with one, and `rule create` with an action that sets one (read after JSON decoding, trimmed and case-insensitive, including actions a confirm offer takes from another rule) or `rule enable` of such a rule, are refused with operator_only_command."
     },
+    "contacts_read_operations": "The contacts tool's `list` and `show` operations authorize under `contacts.read`. `add`, `tag`, `untag` and any other operation need `contacts.write`, the action tool_action_map gives the tool, because contact tags decide which rules match a sender. A \"*\" policy includes both.",
     "env": "ENVELOPE_AGENT_TOKEN",
     "free_tier": {
       "behavior": "Creating more than 2 active (non-revoked) agents requires an activated license (honor-system). `envelope agent create` beyond the limit returns agent_limit_license_required and points to `envelope license activate` (hidden prompt or --key-stdin).",
@@ -251,7 +252,7 @@
     "tool_action_map": {
       "accounts": "accounts.list",
       "bulk": "bulk",
-      "contacts": "contacts.read",
+      "contacts": "contacts.write",
       "create_forward_draft": "draft.create",
       "create_reply_draft": "draft.create",
       "flag": "flag",
@@ -1469,7 +1470,7 @@
         "title": "Manage contacts"
       },
       "contractSchema": "envelope.agent_contract.v4",
-      "description": "Manage contacts. Supports list, add, show, and tag operations.",
+      "description": "Manage contacts: list, show, add, tag and untag. list and show need the contacts.read policy action; add, tag and untag need contacts.write.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

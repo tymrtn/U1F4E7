@@ -35,6 +35,10 @@ Finishing a Gmail sign-in from another device now takes whatever you paste, the 
 - Pasting a Gmail sign-in back from another device accepts the bare address or the whole "can't connect" page, over several lines. The prompt read only the first line, so a pasted page failed.
 - The paste prompt gives up after 10 minutes with the reason. It used to wait forever.
 
+### Changed
+
+- An agent needs the new `contacts.write` policy action to add contacts or change their tags over MCP. The `contacts` tool used to run `add`, `tag` and `untag` under `contacts.read`, so an agent you allowed only to look at contacts could create them and rewrite their tags, and contact tags decide which rules move, delete, snooze or webhook a sender's mail. `list` and `show` still need only `contacts.read`. Agents with the default `*` policy keep both. If you listed actions for an agent and it should keep writing contacts, add the new one: `envelope agent policy set <name> --allow-actions '<current actions>,contacts.write'`. Until you do, its contact writes are refused with `agent_policy_denied_action`. In `envelope contract`, `tool_action_map` now gives `contacts` the `contacts.write` action, and the new `agent_identity.contacts_read_operations` entry explains the split. The CLI's `contacts add`, `import`, `tag` and `untag` were already refused under an agent token and still are.
+
 ## [1.3.23] — 2026-10-12
 
 A fix release. Gmail interleaves its own updates for other messages (a flag change on a new arrival) into the reply to a read, and Envelope took one of those for a refusal: `envelope read` and `envelope attachment download` on an old message intermittently failed with "server omitted RFC822.SIZE" naming a different, newer UID. Reads now keep only the UID they asked for. A missing size on the requested message itself still stops the read.
