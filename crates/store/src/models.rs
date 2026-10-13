@@ -30,6 +30,8 @@ pub struct AccountWithCredentials {
     /// Set when the account signs in with OAuth (Gmail XOAUTH2). `password`
     /// is then empty and must never be offered to a server.
     pub oauth: Option<OAuthGrant>,
+    /// STARTTLS choice and pinned certificate for the account's servers.
+    pub server_tls: crate::server_tls::ServerTls,
 }
 
 /// A decrypted OAuth sign-in. Clones share `cache`, so one refresh serves

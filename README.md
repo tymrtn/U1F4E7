@@ -85,6 +85,8 @@ Gmail with Google sign-in. That decides which mailboxes work today:
   within 24 hours.
 - **Migadu, self-hosted Dovecot, and most other IMAP hosts:** your normal
   mailbox password.
+- **Proton Mail:** through Proton Mail Bridge, which needs a paid Proton plan.
+  See [Proton Mail](#proton-mail) for the setup.
 - **Outlook.com, Hotmail, Live, and Microsoft 365:** not supported yet.
   Microsoft turned off password sign-in for IMAP on
   [Outlook.com accounts](https://support.microsoft.com/en-us/office/modern-authentication-methods-now-needed-to-continue-syncing-outlook-email-in-non-microsoft-email-apps-c5d65390-9676-4763-b41f-d7986499a90d)
@@ -297,8 +299,54 @@ Envelope auto-discovers IMAP/SMTP from your email domain via DNS. Tested with:
 | **Migadu** | Password | Standard folders |
 | **Fastmail** | App password | Standard folders |
 | **iCloud Mail** | App-specific password | Standard folders |
+| **Proton Mail** | Bridge password, through [Proton Mail Bridge](https://proton.me/mail/bridge) (paid Proton plan) | Trust Bridge's certificate with `--trust-cert`; see [Proton Mail](#proton-mail) |
 | **Self-hosted Dovecot** | Password | `INBOX.` dot-separator detected |
 | **Generic IMAP** | Password | Anything RFC 3501 |
+
+### Proton Mail
+
+Proton Mail Bridge runs on your computer and serves your Proton mailbox over
+IMAP and SMTP on `127.0.0.1`. Bridge is
+[available only with a paid Proton Mail plan](https://proton.me/support/imap-smtp-and-pop3-setup).
+Envelope's Bridge support has been tested against a stand-in server that
+presents a certificate shaped like Bridge's. Nobody has run it against Bridge
+itself yet, so please report what you find.
+
+1. Install Bridge, sign in, and open your account's **Mailbox details**. Note
+   the password Bridge shows there; Envelope signs in to Bridge with it, and
+   your Proton account password won't work. Bridge uses IMAP port 1143 and
+   SMTP port 1025 [by default](https://proton.me/support/port-already-occupied-error), with
+   STARTTLS on both unless you change its
+   [connection mode](https://proton.me/support/comprehensive-guide-to-bridge-settings).
+2. Bridge encrypts those connections with a
+   [self-signed certificate](https://proton.me/support/apple-mail-certificate)
+   it made when you set it up. Export it from **Settings → Advanced settings →
+   Export TLS certificates**. Bridge writes `cert.pem` and `key.pem` to the
+   folder you pick. Envelope needs only `cert.pem`; it skips any private key
+   in the file and never stores one.
+3. Add the account:
+
+```bash
+printf '%s\n' "$BRIDGE_PASSWORD" | envelope accounts add \
+  --email you@proton.me --password-stdin \
+  --imap-host 127.0.0.1 --imap-port 1143 --imap-security starttls \
+  --smtp-host 127.0.0.1 --smtp-port 1025 \
+  --trust-cert ~/Downloads/cert.pem
+```
+
+`--trust-cert` makes this account accept exactly that certificate for its
+IMAP, SMTP and ManageSieve connections, in place of the public certificate
+authorities. Every other account checks certificates as before. If you set
+Bridge's IMAP connection mode to SSL, use `--imap-security tls`. Keep Bridge's
+SMTP on STARTTLS: Envelope uses SSL for SMTP only on port 465.
+
+When Bridge's certificate changes, Envelope refuses the connection before it
+signs in and prints the fingerprints of the trusted and the presented
+certificates. Export the new certificate and trust it with
+`envelope accounts tls --account you@proton.me --trust-cert cert.pem`.
+`envelope accounts tls --account you@proton.me` shows what the account
+trusts now, and `openssl x509 -noout -fingerprint -sha256 -in cert.pem`
+prints a file's fingerprint in the same form.
 
 ## MCP server
 
@@ -568,6 +616,7 @@ Thread inclusion is driven only by `Message-ID`, `In-Reply-To`, and `References`
 | Command | Description |
 |---|---|
 | `envelope accounts add/list/remove` | Manage accounts (auto-discovers hosts) |
+| `envelope accounts tls --account <a> [--trust-cert <pem>] [--imap-security tls\|starttls]` | Show or change an account's pinned certificate and IMAP STARTTLS choice |
 | `envelope folders` | List folders with unread/total counts |
 | `envelope inbox [--folder] [--limit]` | List messages |
 | `envelope read <uid>` | Read a message (BODY.PEEK — no auto-mark-read) |

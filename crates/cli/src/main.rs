@@ -635,6 +635,16 @@ enum AccountsCmd {
         /// setup only: a wrong password is not caught until first use.
         #[arg(long)]
         skip_login_check: bool,
+        /// How IMAP starts TLS: `tls` from the first byte, or `starttls` on a
+        /// plain connection (Proton Mail Bridge's default). Defaults to
+        /// `starttls` on port 143 and `tls` on every other port.
+        #[arg(long, value_parser = ["tls", "starttls"])]
+        imap_security: Option<String>,
+        /// Trust exactly this certificate (a PEM file) for the account's
+        /// servers instead of the public certificate authorities, e.g. the
+        /// certificate Proton Mail Bridge exports
+        #[arg(long, value_name = "PEM_FILE")]
+        trust_cert: Option<std::path::PathBuf>,
         /// Sign in with the provider in a browser instead of a password.
         /// `google` connects Gmail over IMAP and SMTP with OAuth (XOAUTH2).
         #[arg(
@@ -642,7 +652,7 @@ enum AccountsCmd {
             value_parser = ["google"],
             conflicts_with_all = [
                 "password_stdin", "smtp_host", "smtp_port", "imap_host", "imap_port",
-                "skip_login_check",
+                "skip_login_check", "imap_security", "trust_cert",
             ]
         )]
         provider: Option<String>,
@@ -687,6 +697,20 @@ enum AccountsCmd {
     },
     /// Re-encrypt the file credential store under a new passphrase
     Rekey,
+    /// Show or change how an account's connections use TLS: the pinned
+    /// certificate and IMAP's STARTTLS choice
+    Tls {
+        /// Account ID or email address
+        #[arg(long)]
+        account: String,
+        /// Trust exactly this certificate (a PEM file) for the account's
+        /// servers, replacing any certificate trusted before
+        #[arg(long, value_name = "PEM_FILE")]
+        trust_cert: Option<std::path::PathBuf>,
+        /// How IMAP starts TLS: `tls` or `starttls`
+        #[arg(long, value_parser = ["tls", "starttls"])]
+        imap_security: Option<String>,
+    },
     /// Discover/import matching macOS Mail.app/Keychain internet-password entries
     ImportKeychain {
         /// Email address to match in Keychain internet-password entries

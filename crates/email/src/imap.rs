@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
 
 use async_imap::Session;
 use chrono::{DateTime, FixedOffset};
+use envelope_email_store::ImapSecurity;
 use envelope_email_store::models::{
     AccountWithCredentials, AttachmentMeta, FolderStats, Message, MessageSummary, PartialFetch,
 };
@@ -14,7 +14,6 @@ use futures_util::{StreamExt, TryStreamExt};
 use imap_proto::types::{BodyStructure, ContentEncoding, MessageSection, SectionPath};
 use mail_parser::MimeHeaders;
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 
@@ -289,31 +288,46 @@ pub async fn expunge_uids(client: &mut ImapClient, seq_set: &str) -> Result<(), 
 
 /// Connect to an IMAP server over TLS and authenticate.
 pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, ImapError> {
+    Ok(ImapClient {
+        session: open_session(account).await?,
+        warned_bare_expunge: false,
+    })
+}
+
+/// Connect, start TLS the way the account is set up for (implicit TLS, or
+/// STARTTLS on port 143 or with `--imap-security starttls`), verify the
+/// server's certificate (the public roots, or the account's pinned
+/// certificate), and authenticate.
+pub(crate) async fn open_session(
+    account: &AccountWithCredentials,
+) -> Result<ImapSession, ImapError> {
     let host = &account.account.imap_host;
     let port = account.account.imap_port;
     let username = account.effective_imap_username();
+    let security = account.server_tls.imap_security_for(port);
 
-    info!("connecting to IMAP {host}:{port} as {username}");
+    info!(
+        "connecting to IMAP {host}:{port} ({}) as {username}",
+        security.label()
+    );
 
     let tcp = TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| ImapError::Connection(format!("{host}:{port}: {e}")))?;
+    let tcp = match security {
+        ImapSecurity::Tls => tcp,
+        ImapSecurity::Starttls => starttls(tcp, host, port).await?,
+    };
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-        .map_err(|e| ImapError::Connection(format!("invalid server name {host}: {e}")))?
-        .to_owned();
-
-    let tls_stream = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| ImapError::Connection(format!("TLS handshake with {host}: {e}")))?;
+    let tls_stream = crate::tls::handshake(
+        tcp,
+        host,
+        port,
+        account.server_tls.pinned_cert.as_deref(),
+        &account.account.username,
+    )
+    .await
+    .map_err(|f| ImapError::Connection(f.message))?;
 
     let mut client = async_imap::Client::new(tls_stream);
 
@@ -321,16 +335,120 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
     // does not consume the untagged `* OK ...` greeting; if we pipeline LOGIN
     // before reading it, some Dovecot-compatible servers can reset the
     // connection. The canonical async-imap pattern is to read the
-    // greeting first — see the crate's lib.rs docs.
-    read_imap_greeting(&mut client, host).await?;
+    // greeting first — see the crate's lib.rs docs. After STARTTLS the
+    // greeting was read before TLS and the server sends no second one.
+    if security == ImapSecurity::Tls {
+        read_imap_greeting(&mut client, host).await?;
+    }
 
     let session = authenticate_client(client, account, host).await?;
 
     debug!("IMAP session established for {username}@{host}");
-    Ok(ImapClient {
-        session,
-        warned_bare_expunge: false,
-    })
+    Ok(session)
+}
+
+/// Longest line accepted before TLS starts.
+const MAX_PLAIN_LINE: u64 = 8192;
+
+/// Upgrade a plain IMAP connection with STARTTLS (RFC 3501 section 6.2.1).
+/// Only `CAPABILITY` and `STARTTLS` cross the wire before TLS, so no
+/// credential can. A server that does not offer STARTTLS is refused.
+async fn starttls(tcp: TcpStream, host: &str, port: u16) -> Result<TcpStream, ImapError> {
+    use tokio::io::AsyncWriteExt;
+
+    let refused = |why: String| ImapError::Connection(format!("{host}:{port} {why}"));
+    let mut stream = tokio::io::BufReader::new(tcp);
+
+    let greeting = read_plain_line(&mut stream, host, port).await?;
+    if !starts_with_ignore_case(&greeting, "* OK") {
+        return Err(refused(format!(
+            "greeted with {:?} instead of `* OK`; not starting TLS",
+            greeting.trim_end()
+        )));
+    }
+
+    stream
+        .write_all(b"S1 CAPABILITY\r\n")
+        .await
+        .map_err(|e| refused(format!("CAPABILITY: {e}")))?;
+    let mut offers_starttls = false;
+    loop {
+        let line = read_plain_line(&mut stream, host, port).await?;
+        if starts_with_ignore_case(&line, "* CAPABILITY ") {
+            offers_starttls |= line
+                .split_whitespace()
+                .any(|cap| cap.eq_ignore_ascii_case("STARTTLS"));
+        } else if let Some(status) = line.strip_prefix("S1 ") {
+            if !starts_with_ignore_case(status, "OK") {
+                return Err(refused(format!(
+                    "refused CAPABILITY: {}",
+                    status.trim_end()
+                )));
+            }
+            break;
+        }
+    }
+    if !offers_starttls {
+        return Err(refused(
+            "does not offer STARTTLS, so Envelope will not sign in over this unencrypted \
+             connection. If the server uses TLS from the first byte, set --imap-security tls"
+                .to_string(),
+        ));
+    }
+
+    stream
+        .write_all(b"S2 STARTTLS\r\n")
+        .await
+        .map_err(|e| refused(format!("STARTTLS: {e}")))?;
+    loop {
+        let line = read_plain_line(&mut stream, host, port).await?;
+        if let Some(status) = line.strip_prefix("S2 ") {
+            if !starts_with_ignore_case(status, "OK") {
+                return Err(refused(format!("refused STARTTLS: {}", status.trim_end())));
+            }
+            break;
+        }
+    }
+    // Bytes that arrived before TLS but would be read after it are an
+    // injection attempt (CVE-2011-0411 class): refuse rather than discard.
+    if !stream.buffer().is_empty() {
+        return Err(refused(
+            "sent data after agreeing to STARTTLS, before TLS began; refusing the connection"
+                .to_string(),
+        ));
+    }
+    Ok(stream.into_inner())
+}
+
+async fn read_plain_line(
+    stream: &mut tokio::io::BufReader<TcpStream>,
+    host: &str,
+    port: u16,
+) -> Result<String, ImapError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let mut line = String::new();
+    let read = (&mut *stream)
+        .take(MAX_PLAIN_LINE)
+        .read_line(&mut line)
+        .await
+        .map_err(|e| ImapError::Connection(format!("{host}:{port} before STARTTLS: {e}")))?;
+    if read == 0 {
+        return Err(ImapError::Connection(format!(
+            "{host}:{port} closed the connection before STARTTLS"
+        )));
+    }
+    if !line.ends_with('\n') {
+        return Err(ImapError::Connection(format!(
+            "{host}:{port} sent a line longer than {MAX_PLAIN_LINE} bytes before STARTTLS"
+        )));
+    }
+    Ok(line)
+}
+
+fn starts_with_ignore_case(line: &str, prefix: &str) -> bool {
+    line.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Read and discard the untagged `* OK ...` greeting from a freshly constructed
@@ -3406,6 +3524,7 @@ fn imap_envelope_addresses(addrs: &Option<Vec<imap_proto::types::Address<'_>>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_imap_mailbox_arg_quotes_workmail_junk_folder() {
@@ -4062,6 +4181,7 @@ Subject: hi\r\n\r\nbody\r\n";
                     expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
                 })),
             }),
+            server_tls: Default::default(),
         }
     }
 

@@ -25,7 +25,6 @@
 //!   `STARTTLS` before issuing `AUTHENTICATE` — credentials never leave
 //!   the client unencrypted.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use envelope_email_store::models::AccountWithCredentials;
@@ -33,7 +32,6 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::TcpStream;
 use tokio::time;
-use tokio_rustls::TlsConnector;
 
 /// Migadu's canonical IMAP host. Used to recognize Migadu accounts when
 /// resolving ManageSieve endpoint defaults.
@@ -841,7 +839,15 @@ async fn connect_authenticated(
     write_line(&mut plain, b"STARTTLS\r\n", timeout).await?;
     expect_ok(&mut plain, "STARTTLS", timeout).await?;
 
-    let tls_stream = upgrade_to_tls(plain.into_inner(), host).await?;
+    let tls_stream = crate::tls::handshake(
+        plain.into_inner(),
+        host,
+        port,
+        account.server_tls.pinned_cert.as_deref(),
+        &account.account.username,
+    )
+    .await
+    .map_err(|f| ManageSieveError::Connection(f.message))?;
     let mut tls = BufStream::new(tls_stream);
 
     let tls_caps = read_capabilities(&mut tls, timeout).await?;
@@ -1042,25 +1048,6 @@ where
             "{command} BYE: {reason}"
         ))),
     }
-}
-
-async fn upgrade_to_tls(
-    tcp: TcpStream,
-    host: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ManageSieveError> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from(host)
-        .map_err(|e| ManageSieveError::Connection(format!("invalid server name {host}: {e}")))?
-        .to_owned();
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| ManageSieveError::Connection(format!("TLS handshake with {host}: {e}")))
 }
 
 #[cfg(test)]

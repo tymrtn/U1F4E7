@@ -57,3 +57,5 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite.workspace = true
 envelope-email-transport = { path = "../email", features = ["test-support"] }
+# Throwaway self-signed certificates for the Proton Mail Bridge setup tests.
+rcgen = "0.13"

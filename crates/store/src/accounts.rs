@@ -266,12 +266,15 @@ impl Database {
             .map(|enc| crypto::decrypt(enc, passphrase))
             .transpose()?;
 
+        let server_tls = self.server_tls(id)?;
+
         Ok(AccountWithCredentials {
             account,
             password,
             smtp_password,
             imap_password,
             oauth,
+            server_tls,
         })
     }
 
@@ -306,6 +309,8 @@ impl Database {
         }
         let rows = tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
         tx.commit()?;
+        self.remove_server_tls(id)
+            .map_err(|e| StoreError::Config(format!("account {id} was deleted, but {e}")))?;
         Ok(rows > 0)
     }
 

@@ -10,7 +10,7 @@ use envelope_email_store::credential_store::{
     self, CredentialBackend, PassphrasePrompter, RekeyOutcome,
 };
 use envelope_email_store::errors::StoreError;
-use envelope_email_store::{Account, Database, Event};
+use envelope_email_store::{Account, Database, Event, ImapSecurity, ServerTls};
 use std::io::{self, IsTerminal, Write};
 
 pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<()> {
@@ -42,6 +42,8 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             imap_port,
             insecure_machine_key,
             skip_login_check,
+            imap_security,
+            trust_cert,
             provider: None,
             ..
         } => add(
@@ -52,6 +54,7 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             smtp_port,
             imap_host,
             imap_port,
+            server_tls_from_flags(ServerTls::default(), imap_security, trust_cert)?,
             insecure_machine_key,
             skip_login_check,
             json,
@@ -71,6 +74,11 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             backend,
         ),
         AccountsCmd::Rekey => rekey(json, backend),
+        AccountsCmd::Tls {
+            account,
+            trust_cert,
+            imap_security,
+        } => tls(&account, trust_cert, imap_security, json),
         AccountsCmd::List => list(json),
         AccountsCmd::SetupInstructions {
             account,
@@ -105,6 +113,82 @@ pub fn run(cmd: AccountsCmd, json: bool, backend: CredentialBackend) -> Result<(
             backend,
         ),
         AccountsCmd::Signature { subcommand } => signature(subcommand, json),
+    }
+}
+
+/// Apply `--imap-security` and `--trust-cert` to `settings`. The certificate
+/// file is read here, before anything is saved, so a wrong path fails first.
+fn server_tls_from_flags(
+    mut settings: ServerTls,
+    imap_security: Option<String>,
+    trust_cert: Option<std::path::PathBuf>,
+) -> Result<ServerTls> {
+    if let Some(security) = imap_security {
+        settings.imap_security = Some(match security.as_str() {
+            "starttls" => ImapSecurity::Starttls,
+            "tls" => ImapSecurity::Tls,
+            other => bail!("--imap-security must be tls or starttls, not {other:?}"),
+        });
+    }
+    if let Some(path) = trust_cert {
+        settings.pinned_cert = Some(
+            envelope_email_transport::tls::read_pem_certificate(&path)
+                .map_err(|e| anyhow::anyhow!("--trust-cert: {e}"))?,
+        );
+    }
+    Ok(settings)
+}
+
+/// The non-secret TLS settings of an account, as `accounts list --json` and
+/// `accounts tls --json` print them.
+fn tls_json(account: &Account, settings: &ServerTls) -> serde_json::Value {
+    serde_json::json!({
+        "imap_security": settings.imap_security_for(account.imap_port).label(),
+        "pinned_cert_sha256": settings.pinned_cert_sha256(),
+    })
+}
+
+/// Show or change an account's TLS settings.
+fn tls(
+    id_or_email: &str,
+    trust_cert: Option<std::path::PathBuf>,
+    imap_security: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let db = Database::open_default().context("failed to open database")?;
+    let account = resolve_account(&db, id_or_email)?;
+    let current = db
+        .server_tls(&account.id)
+        .context("failed to read the account's TLS settings")?;
+    let changing = trust_cert.is_some() || imap_security.is_some();
+    let settings = server_tls_from_flags(current, imap_security, trust_cert)?;
+    if changing {
+        db.set_server_tls(&account.id, &settings)
+            .context("failed to save the account's TLS settings")?;
+    }
+
+    if json {
+        let mut value = tls_json(&account, &settings);
+        value["account_id"] = account.id.clone().into();
+        value["email"] = account.username.clone().into();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if changing {
+        println!("Updated TLS settings for {}.", account.username);
+    }
+    print_tls(&account, &settings);
+    Ok(())
+}
+
+fn print_tls(account: &Account, settings: &ServerTls) {
+    println!(
+        "IMAP security:        {}",
+        settings.imap_security_for(account.imap_port).label()
+    );
+    match settings.pinned_cert_sha256() {
+        Some(fingerprint) => println!("Trusted certificate:  SHA-256 {fingerprint}"),
+        None => println!("Trusted certificate:  public certificate authorities"),
     }
 }
 
@@ -232,6 +316,7 @@ async fn add(
     smtp_port: Option<u16>,
     imap_host: Option<String>,
     imap_port: Option<u16>,
+    server_tls: ServerTls,
     insecure_machine_key: bool,
     skip_login_check: bool,
     json: bool,
@@ -286,9 +371,10 @@ async fn add(
         eprintln!("Skipping the IMAP login check (--skip-login-check).");
     } else {
         eprintln!("Checking IMAP login at {imap_host}:{imap_port}...");
-        let probe = crate::commands::keychain_import::account_with_credentials(
+        let mut probe = crate::commands::keychain_import::account_with_credentials(
             email, &imap_host, imap_port, &smtp_host, smtp_port, &password, &password,
         );
+        probe.server_tls = server_tls.clone();
         let login = tokio::time::timeout(
             LOGIN_CHECK_TIMEOUT,
             envelope_email_transport::imap::connect(&probe),
@@ -327,12 +413,21 @@ async fn add(
             &passphrase,
         )
         .context("failed to create account")?;
+    if let Err(e) = db.set_server_tls(&account.id, &server_tls) {
+        db.delete_account(&account.id)
+            .context("failed to undo the account after its TLS settings failed to save")?;
+        bail!("failed to save the account's TLS settings: {e}. Nothing was saved.");
+    }
 
     if json {
-        let value = ui::with_ui(&account, ui::account_ui(&account.id));
+        let mut value = ui::with_ui(&account, ui::account_ui(&account.id));
+        value["tls"] = tls_json(&account, &server_tls);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("Account added: {} ({})", account.username, account.id);
+        if let Some(fingerprint) = server_tls.pinned_cert_sha256() {
+            println!("Trusted certificate: SHA-256 {fingerprint}");
+        }
     }
 
     Ok(())
@@ -372,10 +467,21 @@ fn list(json: bool) -> Result<()> {
     let db = Database::open_default().context("failed to open database")?;
     let accounts = db.list_accounts().context("failed to list accounts")?;
 
+    let tls_settings = accounts
+        .iter()
+        .map(|a| db.server_tls(&a.id))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read account TLS settings")?;
+
     if json {
         let enriched: Vec<serde_json::Value> = accounts
             .iter()
-            .map(|a| ui::with_ui(a, ui::account_ui(&a.id)))
+            .zip(&tls_settings)
+            .map(|(a, settings)| {
+                let mut value = ui::with_ui(a, ui::account_ui(&a.id));
+                value["tls"] = tls_json(a, settings);
+                value
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&enriched)?);
         return Ok(());
@@ -394,28 +500,26 @@ fn list(json: bool) -> Result<()> {
         "ID", "EMAIL", "DOMAIN", "CREATED"
     );
     println!("{}", "-".repeat(100));
-    for acct in &accounts {
+    for (acct, settings) in accounts.iter().zip(&tls_settings) {
         println!(
             "{:<36}  {:<30}  {:<20}  {}",
             acct.id, acct.username, acct.domain, acct.created_at,
         );
+        if let Some(fingerprint) = settings.pinned_cert_sha256() {
+            println!(
+                "{:<36}  trusts only the certificate SHA-256 {fingerprint}",
+                ""
+            );
+        }
     }
     println!("\n{} account(s)", accounts.len());
 
     Ok(())
 }
 
-/// Map a well-known mail port to its transport security. Returns a stable
-/// string used in both JSON and human output. Defaults conservatively to TLS
-/// for unknown ports so setup guidance never suggests an unencrypted client.
-fn imap_security_for_port(port: u16) -> &'static str {
-    match port {
-        993 => "SSL/TLS",
-        143 => "STARTTLS",
-        _ => "SSL/TLS",
-    }
-}
-
+/// Map a well-known SMTP port to its transport security. Returns a stable
+/// string used in both JSON and human output. IMAP's comes from the account's
+/// TLS settings (`ServerTls::imap_security_for`).
 fn smtp_security_for_port(port: u16) -> &'static str {
     match port {
         465 => "SSL/TLS",
@@ -610,7 +714,11 @@ fn setup_instructions(
         .as_deref()
         .unwrap_or(&account.username)
         .to_string();
-    let imap_security = imap_security_for_port(account.imap_port);
+    let imap_security = db
+        .server_tls(&account.id)
+        .context("failed to read the account's TLS settings")?
+        .imap_security_for(account.imap_port)
+        .label();
     let smtp_security = smtp_security_for_port(account.smtp_port);
 
     if json {
@@ -1069,10 +1177,11 @@ mod tests {
 
     #[test]
     fn imap_security_mapping() {
-        assert_eq!(imap_security_for_port(993), "SSL/TLS");
-        assert_eq!(imap_security_for_port(143), "STARTTLS");
+        let defaults = ServerTls::default();
+        assert_eq!(defaults.imap_security_for(993).label(), "SSL/TLS");
+        assert_eq!(defaults.imap_security_for(143).label(), "STARTTLS");
         // Unknown ports default to TLS, never plaintext.
-        assert_eq!(imap_security_for_port(1234), "SSL/TLS");
+        assert_eq!(defaults.imap_security_for(1234).label(), "SSL/TLS");
     }
 
     #[test]

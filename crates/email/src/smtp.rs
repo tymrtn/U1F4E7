@@ -469,6 +469,7 @@ mod tests {
             smtp_password: None,
             imap_password: None,
             oauth: None,
+            server_tls: Default::default(),
         }
     }
 

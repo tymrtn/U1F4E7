@@ -7,6 +7,15 @@ use rusqlite::{Connection, OpenFlags};
 
 pub struct Database {
     conn: Connection,
+    /// Where per-account TLS settings live: `server-tls` next to the
+    /// database file. `None` for an in-memory database.
+    server_tls_dir: Option<std::path::PathBuf>,
+}
+
+fn server_tls_dir_for(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    db_path
+        .parent()
+        .map(|dir| dir.join(crate::server_tls::DIR_NAME))
 }
 
 impl Database {
@@ -43,7 +52,10 @@ impl Database {
         )?;
         crate::migrations::run(&mut conn)?;
         crate::sieve_publications::ensure_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            server_tls_dir: server_tls_dir_for(path),
+        })
     }
 
     /// Open an existing database read-only without creating directories, creating
@@ -55,10 +67,13 @@ impl Database {
             return Ok(None);
         }
         let conn = Connection::open_with_flags(
-            path,
+            &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            server_tls_dir: server_tls_dir_for(&path),
+        }))
     }
 
     /// Open an in-memory database (for testing).
@@ -66,11 +81,18 @@ impl Database {
         let mut conn = Connection::open_in_memory()?;
         crate::migrations::run(&mut conn)?;
         crate::sieve_publications::ensure_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            server_tls_dir: None,
+        })
     }
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    pub(crate) fn server_tls_dir(&self) -> Option<&std::path::Path> {
+        self.server_tls_dir.as_deref()
     }
 
     pub fn conn_mut(&mut self) -> &mut Connection {

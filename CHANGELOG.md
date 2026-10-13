@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Proton Mail works through Proton Mail Bridge. `envelope accounts add` takes `--trust-cert <file>` to trust exactly one certificate for an account, such as the one Bridge exports, and `--imap-security starttls` for IMAP servers that start TLS on a plain connection, as Bridge does on port 1143. The account then accepts only that certificate for IMAP, IDLE, SMTP and ManageSieve; every other account checks certificates against the public authorities as before. Port 143 now uses STARTTLS by default. Envelope sends nothing but `CAPABILITY` and `STARTTLS` before TLS, and refuses a server that doesn't offer it. When the certificate changes, the error names the server and both fingerprints, and `envelope accounts tls --account <you> --trust-cert <file>` trusts the new one. The README's new Proton Mail section has the setup.
+
 ## [1.3.25] — 2026-10-14
 
 A fix release. While `envelope serve` runs without a dashboard token, other web pages on your computer can no longer read your mail through the dashboard. An agent now needs the new `contacts.write` action to add contacts or change their tags over MCP, so an agent you gave only `contacts.read` loses those writes until you add it. Adding an account asks your computer's own DNS resolver before Google Public DNS, which lets discovery work behind a VPN that blocks outside DNS. Snoozed mail comes back at the time you set, returning a snooze never moves a different message, and the MCP server now tells agents to learn how you handle mail from your mailbox history.
