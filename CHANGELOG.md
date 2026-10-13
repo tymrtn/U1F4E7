@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The MCP server now tells every agent that connects how to handle your mail. Your mailboxes already show what you delete, archive, file, mark as junk, read, answer and flag. The agent should decide from that, should not ask you to rule on each sender or write sorting rules, and should leave a message alone when your history doesn't settle it. The bundled skill and the agent guide say the same.
+
 ### Fixed
 
 - `envelope unsnooze` and `envelope snooze check-replies` no longer return or flag snoozed mail early (or late) by your time-zone offset. Return times are stored in UTC, but both commands compared them with your local clock: two hours ahead of UTC, a snooze came back two hours early, and behind UTC it came back late. They now compare in UTC, as `envelope serve` already did.
