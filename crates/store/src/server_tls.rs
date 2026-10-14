@@ -6,25 +6,35 @@
 //! account's servers must present (a local bridge such as Proton Mail Bridge
 //! serves its own self-signed certificate).
 //!
-//! The settings live in a small JSON file per account in a `server-tls`
-//! directory next to the database (`<data dir>/server-tls/<account id>.json`),
-//! so the database schema is unchanged. An account without a file uses the
-//! defaults: implicit TLS for IMAP (STARTTLS on port 143) and the public
-//! certificate authorities.
+//! The `account_server_tls` table is ensured additively outside
+//! `PRAGMA user_version`, like `sieve_publications`: the V1 and V2 lines share
+//! one migration sequence, so a numbered migration here would collide with
+//! V2's. An account without a row uses the defaults: implicit TLS for IMAP
+//! (STARTTLS on port 143) and the public certificate authorities. A row that
+//! can't be read is an error, never the defaults, because the defaults would
+//! trust every public authority where the account trusted one certificate.
 
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::db::Database;
 use crate::errors::{Result, StoreError};
 
-pub(crate) const DIR_NAME: &str = "server-tls";
+pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS account_server_tls (
+            account_id TEXT PRIMARY KEY,
+            imap_security TEXT,
+            pinned_cert_der BLOB
+        );
+        ",
+    )?;
+    Ok(())
+}
 
 /// How the IMAP connection starts TLS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapSecurity {
     /// TLS from the first byte (port 993).
     Tls,
@@ -41,23 +51,23 @@ impl ImapSecurity {
             Self::Starttls => "STARTTLS",
         }
     }
+
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Starttls => "starttls",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerTls {
     /// Set with `--imap-security`. Unset means STARTTLS on port 143 and
     /// implicit TLS on every other port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imap_security: Option<ImapSecurity>,
     /// Set with `--trust-cert`: the DER bytes of the one certificate the
     /// account's IMAP, SMTP and ManageSieve servers must present. When set,
     /// it replaces the public certificate authorities for this account.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "pinned_cert_der_base64",
-        with = "der_base64"
-    )]
     pub pinned_cert: Option<Vec<u8>>,
 }
 
@@ -85,121 +95,94 @@ pub fn sha256_fingerprint(der: &[u8]) -> String {
         .join(":")
 }
 
-mod der_base64 {
-    use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(der: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-        match der {
-            Some(bytes) => {
-                s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
-            }
-            None => s.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
-        Option::<String>::deserialize(d)?
-            .map(|text| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(text)
-                    .map_err(serde::de::Error::custom)
-            })
-            .transpose()
-    }
-}
-
-/// The settings file for `account_id` inside `dir`. Account ids are UUIDs;
-/// anything else could escape the directory, so it is refused.
-fn file_path(dir: &Path, account_id: &str) -> Result<PathBuf> {
-    if account_id.is_empty()
-        || !account_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(StoreError::Config(format!(
-            "invalid account id for TLS settings: {account_id:?}"
-        )));
-    }
-    Ok(dir.join(format!("{account_id}.json")))
-}
-
-fn load_from(dir: &Path, account_id: &str) -> Result<ServerTls> {
-    let path = file_path(dir, account_id)?;
-    let data = match std::fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ServerTls::default()),
-        Err(e) => {
-            return Err(StoreError::Config(format!(
-                "cannot read {}: {e}",
-                path.display()
-            )));
-        }
-    };
-    serde_json::from_str(&data).map_err(|e| {
-        StoreError::Config(format!("corrupt TLS settings file {}: {e}", path.display()))
-    })
-}
-
-fn save_to(dir: &Path, account_id: &str, settings: &ServerTls) -> Result<()> {
-    let path = file_path(dir, account_id)?;
-    if *settings == ServerTls::default() {
-        return remove_from(dir, account_id);
-    }
-    std::fs::create_dir_all(dir)
-        .map_err(|e| StoreError::Config(format!("cannot create {}: {e}", dir.display())))?;
-    let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_string_pretty(settings)?;
-    std::fs::write(&tmp, data.as_bytes())
-        .map_err(|e| StoreError::Config(format!("write {}: {e}", tmp.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            StoreError::Config(format!("set permissions on {}: {e}", tmp.display()))
-        })?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        StoreError::Config(format!("replace {}: {e}", path.display()))
-    })
-}
-
-fn remove_from(dir: &Path, account_id: &str) -> Result<()> {
-    let path = file_path(dir, account_id)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::Config(format!(
-            "cannot remove {}: {e}",
-            path.display()
-        ))),
-    }
+fn corrupt(account_id: &str, why: impl std::fmt::Display) -> StoreError {
+    StoreError::Config(format!(
+        "corrupt TLS settings for account {account_id} (table account_server_tls in \
+         envelope.db): {why}. Envelope will not connect this account until they are \
+         fixed; removing the account and adding it again resets them"
+    ))
 }
 
 impl Database {
-    /// An account's TLS settings. An in-memory database has no settings
-    /// directory, so every account there uses the defaults.
+    /// An account's TLS settings.
     pub fn server_tls(&self, account_id: &str) -> Result<ServerTls> {
-        match self.server_tls_dir() {
-            Some(dir) => load_from(dir, account_id),
-            None => Ok(ServerTls::default()),
+        // A read-only open does not ensure the table. Without it no account
+        // has stored settings.
+        if !self.has_server_tls_table()? {
+            return Ok(ServerTls::default());
         }
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT imap_security, pinned_cert_der FROM account_server_tls
+                 WHERE account_id = ?1",
+                params![account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| corrupt(account_id, e))?;
+        let Some((imap_security, pinned_cert)) = row else {
+            return Ok(ServerTls::default());
+        };
+        let imap_security = match imap_security.as_deref() {
+            None => None,
+            Some("tls") => Some(ImapSecurity::Tls),
+            Some("starttls") => Some(ImapSecurity::Starttls),
+            Some(other) => {
+                return Err(corrupt(
+                    account_id,
+                    format!("unknown imap_security {other:?}"),
+                ));
+            }
+        };
+        if pinned_cert.as_ref().is_some_and(Vec::is_empty) {
+            return Err(corrupt(account_id, "the pinned certificate is empty"));
+        }
+        Ok(ServerTls {
+            imap_security,
+            pinned_cert,
+        })
     }
 
-    /// Store an account's TLS settings. Saving the defaults deletes the file.
+    /// Store an account's TLS settings. Saving the defaults deletes the row.
     pub fn set_server_tls(&self, account_id: &str, settings: &ServerTls) -> Result<()> {
-        let dir = self.server_tls_dir().ok_or_else(|| {
-            StoreError::Config("an in-memory database cannot keep TLS settings".to_string())
-        })?;
-        save_to(dir, account_id, settings)
+        if *settings == ServerTls::default() {
+            self.conn().execute(
+                "DELETE FROM account_server_tls WHERE account_id = ?1",
+                params![account_id],
+            )?;
+        } else {
+            self.conn().execute(
+                "INSERT INTO account_server_tls (account_id, imap_security, pinned_cert_der)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id) DO UPDATE SET
+                    imap_security = excluded.imap_security,
+                    pinned_cert_der = excluded.pinned_cert_der",
+                params![
+                    account_id,
+                    settings.imap_security.map(ImapSecurity::stored),
+                    settings.pinned_cert,
+                ],
+            )?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn remove_server_tls(&self, account_id: &str) -> Result<()> {
-        match self.server_tls_dir() {
-            Some(dir) => remove_from(dir, account_id),
-            None => Ok(()),
-        }
+    fn has_server_tls_table(&self) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'account_server_tls'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 }
 
@@ -217,53 +200,47 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_means_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_from(dir.path(), ID).unwrap(), ServerTls::default());
+    fn an_account_without_a_row_uses_the_defaults() {
+        let db = Database::open_memory().unwrap();
+        assert_eq!(db.server_tls(ID).unwrap(), ServerTls::default());
     }
 
     #[test]
-    fn settings_survive_a_round_trip_through_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        save_to(dir.path(), ID, &pinned()).unwrap();
-        assert_eq!(load_from(dir.path(), ID).unwrap(), pinned());
-    }
+    fn settings_survive_a_round_trip_through_the_table() {
+        let db = Database::open_memory().unwrap();
+        db.set_server_tls(ID, &pinned()).unwrap();
+        assert_eq!(db.server_tls(ID).unwrap(), pinned());
 
-    #[cfg(unix)]
-    #[test]
-    fn the_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        save_to(dir.path(), ID, &pinned()).unwrap();
-        let mode = std::fs::metadata(dir.path().join(format!("{ID}.json")))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let tls_only = ServerTls {
+            imap_security: Some(ImapSecurity::Tls),
+            pinned_cert: None,
+        };
+        db.set_server_tls(ID, &tls_only).unwrap();
+        assert_eq!(db.server_tls(ID).unwrap(), tls_only);
     }
 
     #[test]
-    fn saving_the_defaults_removes_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        save_to(dir.path(), ID, &pinned()).unwrap();
-        save_to(dir.path(), ID, &ServerTls::default()).unwrap();
-        assert!(!dir.path().join(format!("{ID}.json")).exists());
+    fn saving_the_defaults_removes_the_row() {
+        let db = Database::open_memory().unwrap();
+        db.set_server_tls(ID, &pinned()).unwrap();
+        db.set_server_tls(ID, &ServerTls::default()).unwrap();
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM account_server_tls", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
-    fn a_corrupt_file_is_an_error_not_the_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(format!("{ID}.json")), "{not json").unwrap();
-        let err = load_from(dir.path(), ID).unwrap_err().to_string();
-        assert!(err.contains("corrupt TLS settings file"), "{err}");
-    }
-
-    #[test]
-    fn an_account_id_that_could_leave_the_directory_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        for id in ["../x", "a/b", "", "a.json"] {
-            assert!(load_from(dir.path(), id).is_err(), "{id:?}");
-        }
+    fn without_the_table_every_account_uses_the_defaults() {
+        // What a read-only open of a database this build never wrote sees.
+        let db = Database::open_memory().unwrap();
+        db.conn()
+            .execute_batch("DROP TABLE account_server_tls")
+            .unwrap();
+        assert_eq!(db.server_tls(ID).unwrap(), ServerTls::default());
     }
 
     #[test]
@@ -284,35 +261,95 @@ mod tests {
         );
     }
 
+    fn bridge_account(db: &Database) -> crate::models::Account {
+        db.create_account(
+            "Bridge",
+            "you@proton.me",
+            "bridge-password",
+            "127.0.0.1",
+            1025,
+            "127.0.0.1",
+            1143,
+            "passphrase",
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn deleting_an_account_deletes_its_settings() {
+    fn the_pin_survives_a_backup_copy_of_the_database() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("envelope.db")).unwrap();
-        let account = db
-            .create_account(
-                "Bridge",
-                "you@proton.me",
-                "bridge-password",
-                "127.0.0.1",
-                1025,
-                "127.0.0.1",
-                1143,
-                "passphrase",
-            )
-            .unwrap();
+        let account = bridge_account(&db);
         db.set_server_tls(&account.id, &pinned()).unwrap();
-        let file = dir
-            .path()
-            .join(DIR_NAME)
-            .join(format!("{}.json", account.id));
-        assert!(file.exists());
+
+        // Copied somewhere else, as a backup or a move to another machine.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let copy = elsewhere.path().join("envelope.db");
+        db.conn()
+            .backup(rusqlite::DatabaseName::Main, &copy, None)
+            .unwrap();
+        let restored = Database::open(&copy).unwrap();
+
+        assert_eq!(restored.server_tls(&account.id).unwrap(), pinned());
+    }
+
+    #[test]
+    fn removing_and_adding_an_account_again_leaves_no_stale_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("envelope.db")).unwrap();
+        let first = bridge_account(&db);
+        db.set_server_tls(&first.id, &pinned()).unwrap();
+
+        assert!(db.delete_account(&first.id).unwrap());
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM account_server_tls", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        let again = bridge_account(&db);
+        assert_eq!(db.server_tls(&again.id).unwrap(), ServerTls::default());
+    }
+
+    #[test]
+    fn a_corrupt_row_refuses_to_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("envelope.db")).unwrap();
+        let account = bridge_account(&db);
+        db.set_server_tls(&account.id, &pinned()).unwrap();
+
+        for corruption in [
+            "UPDATE account_server_tls SET imap_security = 'ssl' WHERE account_id = ?1",
+            "UPDATE account_server_tls SET pinned_cert_der = 'not a blob' WHERE account_id = ?1",
+            "UPDATE account_server_tls SET pinned_cert_der = x'' WHERE account_id = ?1",
+        ] {
+            db.set_server_tls(&account.id, &pinned()).unwrap();
+            db.conn()
+                .execute(corruption, rusqlite::params![account.id])
+                .unwrap();
+
+            // Every connection starts from these credentials.
+            let err = match db.get_account_with_credentials(&account.id, "passphrase") {
+                Ok(_) => panic!("{corruption}: loaded an account with corrupt TLS settings"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("corrupt TLS settings"), "{corruption}: {err}");
+            assert!(err.contains(&account.id), "{corruption}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_account_credentials_carry_its_settings() {
+        let db = Database::open_memory().unwrap();
+        let account = bridge_account(&db);
+        db.set_server_tls(&account.id, &pinned()).unwrap();
 
         let creds = db
             .get_account_with_credentials(&account.id, "passphrase")
             .unwrap();
-        assert_eq!(creds.server_tls, pinned());
 
-        assert!(db.delete_account(&account.id).unwrap());
-        assert!(!file.exists());
+        assert_eq!(creds.server_tls, pinned());
     }
 }

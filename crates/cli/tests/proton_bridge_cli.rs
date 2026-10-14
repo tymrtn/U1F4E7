@@ -101,6 +101,22 @@ fn listed(home: &Path) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn database(home: &Path) -> std::path::PathBuf {
+    home.join("envelope-email/envelope.db")
+}
+
+/// Rows in the TLS settings table for one account.
+fn stored_settings(home: &Path, account_id: &str) -> i64 {
+    rusqlite::Connection::open(database(home))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM account_server_tls WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn fingerprint(cert: &ServerCert) -> String {
     envelope_email_store::server_tls::sha256_fingerprint(&cert.cert_der)
 }
@@ -134,11 +150,7 @@ async fn a_bridge_account_logs_in_over_starttls_with_its_certificate_and_keeps_i
     assert_eq!(account["tls"]["imap_security"], "STARTTLS");
     assert_eq!(account["tls"]["pinned_cert_sha256"], fingerprint(&cert));
     let id = account["id"].as_str().unwrap();
-    let settings_file = home
-        .path()
-        .join("envelope-email/server-tls")
-        .join(format!("{id}.json"));
-    assert!(settings_file.exists(), "{}", settings_file.display());
+    assert_eq!(stored_settings(home.path(), id), 1);
 
     let out = envelope(home.path(), &["accounts", "remove", "you@proton.me"], None);
     assert!(
@@ -146,7 +158,69 @@ async fn a_bridge_account_logs_in_over_starttls_with_its_certificate_and_keeps_i
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!settings_file.exists(), "remove deletes the TLS settings");
+    assert_eq!(
+        stored_settings(home.path(), id),
+        0,
+        "remove deletes the row"
+    );
+
+    // Added again without --trust-cert: nothing of the old pin comes back.
+    let mut again = add_args(1, &cert_file);
+    again.truncate(again.len() - 2);
+    again.retain(|arg| arg != "--imap-security" && arg != "starttls");
+    again.push("--skip-login-check".into());
+    let out = run(home.path(), again, Some("bridge-password")).await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let readded = &listed(home.path())[0];
+    assert_eq!(readded["tls"]["pinned_cert_sha256"], Value::Null);
+    assert_eq!(readded["tls"]["imap_security"], "SSL/TLS");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_settings_row_stops_the_account_connecting() {
+    let home = tempfile::tempdir().unwrap();
+    let (cert, pem) = bridge_like_cert();
+    let cert_file = home.path().join("cert.pem");
+    std::fs::write(&cert_file, pem).unwrap();
+    let server = testing::imap(Mode::Starttls, cert).await;
+    let out = run(
+        home.path(),
+        add_args(server.port, &cert_file),
+        Some("bridge-password"),
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let connections_before = server.transcript.plaintext_verbs().len();
+    rusqlite::Connection::open(database(home.path()))
+        .unwrap()
+        .execute("UPDATE account_server_tls SET imap_security = 'ssl'", [])
+        .unwrap();
+
+    let out = run(
+        home.path(),
+        ["folders", "--account", "you@proton.me"]
+            .map(String::from)
+            .to_vec(),
+        None,
+    )
+    .await;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("corrupt TLS settings"), "stderr: {stderr}");
+    assert_eq!(
+        server.transcript.plaintext_verbs().len(),
+        connections_before,
+        "nothing was sent to the server"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

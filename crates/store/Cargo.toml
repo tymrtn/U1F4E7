@@ -47,6 +47,8 @@ whoami = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# The online backup API, as `sqlite3 .backup` uses it, for the TLS settings tests.
+rusqlite = { workspace = true, features = ["backup"] }
 
 # macOS: use the native Keychain API
 [target.'cfg(target_os = "macos")'.dependencies]
