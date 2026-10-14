@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.26] — 2026-10-14
+
+Proton Mail now works through Proton Mail Bridge, the app that comes with paid Proton plans and serves your mailbox over IMAP and SMTP on your own computer. You can tell Envelope to trust Bridge's own certificate for that one account, and IMAP can start TLS with STARTTLS the way Bridge expects. This support was tested against a stand-in server shaped like Bridge, on 127.0.0.1 with STARTTLS and a self-signed certificate; it hasn't been tested against Bridge itself. Every IMAP connection also gives up after 20 seconds when the server takes it and never finishes setting up TLS, where before it could wait forever.
+
 ### Added
 
 - Proton Mail works through Proton Mail Bridge. `envelope accounts add` takes `--trust-cert <file>` to trust exactly one certificate for an account, such as the one Bridge exports, and `--imap-security starttls` for IMAP servers that start TLS on a plain connection, as Bridge does on port 1143. The account then accepts only that certificate for IMAP, IDLE, SMTP and ManageSieve; every other account checks certificates against the public authorities as before. Port 143 now uses STARTTLS by default. Envelope sends nothing but `CAPABILITY` and `STARTTLS` before TLS, and refuses a server that doesn't offer it. When the certificate changes, the error names the server and both fingerprints, and `envelope accounts tls --account <you> --trust-cert <file>` trusts the new one. The README's new Proton Mail section has the setup.
+
+### Fixed
+
+- Setting up an IMAP connection now has a time limit for every account, including accounts that use TLS from the first byte. The TCP connect, STARTTLS when the account uses it, the TLS handshake and the server's greeting must all finish within 20 seconds, or Envelope gives up before signing in. There was no limit before, so a server that accepted the connection and then went quiet left the command waiting forever. In the dashboard, which holds one lock over all its IMAP connections while it connects, every account's IMAP waited with it. The usual cause is the wrong IMAP security setting, such as STARTTLS against Proton Mail Bridge with its connection mode set to SSL, so the error names the server, the `--imap-security` value to try, and the `envelope accounts tls` command that changes it for a saved account.
 
 ## [1.3.25] — 2026-10-14
 
