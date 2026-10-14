@@ -3190,6 +3190,7 @@ mod tests {
             smtp_password: None,
             imap_password: None,
             oauth: None,
+            server_tls: Default::default(),
         }
     }
 
@@ -4638,6 +4639,7 @@ mod tests {
             smtp_password: None,
             imap_password: None,
             oauth: None,
+            server_tls: Default::default(),
         };
         // Same body arguments the sweep passes to `SmtpSender::send`.
         let (message, _) = envelope_email_transport::smtp::build_message(

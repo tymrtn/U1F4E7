@@ -74,3 +74,5 @@ psl = "2.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Throwaway self-signed certificates for the TLS pinning tests.
+rcgen = "0.13"

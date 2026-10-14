@@ -266,12 +266,15 @@ impl Database {
             .map(|enc| crypto::decrypt(enc, passphrase))
             .transpose()?;
 
+        let server_tls = self.server_tls(id)?;
+
         Ok(AccountWithCredentials {
             account,
             password,
             smtp_password,
             imap_password,
             oauth,
+            server_tls,
         })
     }
 
@@ -287,10 +290,11 @@ impl Database {
     /// transaction so a failure part-way cannot leave the account gone and its
     /// address book behind.
     ///
-    /// Scoped to `account_id`: every other account keeps its own rows. Other
-    /// account-scoped tables are deliberately untouched here — this closes the
-    /// address book the autocomplete work opened, and widening it is a
-    /// separate decision.
+    /// Scoped to `account_id`: every other account keeps its own rows. The
+    /// account's TLS settings (`account_server_tls`) go in the same
+    /// transaction. Other account-scoped tables are deliberately untouched
+    /// here — this closes the address book the autocomplete work opened, and
+    /// widening it is a separate decision.
     pub fn delete_account(&self, id: &str) -> Result<bool> {
         let tx = self.conn().unchecked_transaction()?;
         tx.execute("DELETE FROM contacts WHERE account_id = ?1", params![id])?;
@@ -304,6 +308,10 @@ impl Database {
                 params![id],
             )?;
         }
+        tx.execute(
+            "DELETE FROM account_server_tls WHERE account_id = ?1",
+            params![id],
+        )?;
         let rows = tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(rows > 0)

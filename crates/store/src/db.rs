@@ -43,6 +43,7 @@ impl Database {
         )?;
         crate::migrations::run(&mut conn)?;
         crate::sieve_publications::ensure_schema(&conn)?;
+        crate::server_tls::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -66,6 +67,7 @@ impl Database {
         let mut conn = Connection::open_in_memory()?;
         crate::migrations::run(&mut conn)?;
         crate::sieve_publications::ensure_schema(&conn)?;
+        crate::server_tls::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
 

@@ -102,6 +102,8 @@ const CLI_OPERATOR_ONLY_COMMANDS: &[&str] = &[
     "accounts setup-instructions --copy-password",
     "accounts copy-password",
     "accounts remove",
+    "accounts tls --trust-cert",
+    "accounts tls --imap-security",
     "accounts signature set",
     "accounts signature clear",
     "migrate folders",

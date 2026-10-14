@@ -32,6 +32,7 @@ pub mod relationship_facts;
 pub mod rule_store;
 pub mod send_attempts;
 pub mod sent_relationships;
+pub mod server_tls;
 pub mod sieve_publications;
 pub mod snoozed;
 pub mod tag_store;
@@ -63,4 +64,5 @@ pub use send_attempts::{
     IntentLookup, Liveness, NewSendIntent, ProviderCleanupRetry, ReconcileReport, ReleaseBasis,
 };
 pub use sent_relationships::{SentRelationship, SentRelationshipPage, SentRelationshipSignal};
+pub use server_tls::{ImapSecurity, ServerTls};
 pub use threads::ThreadContext;

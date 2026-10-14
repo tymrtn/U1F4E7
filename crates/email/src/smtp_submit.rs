@@ -21,7 +21,9 @@
 //! partial recipient rejection submits nothing. The tests below pin that.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use envelope_email_store::models::AccountWithCredentials;
@@ -29,10 +31,14 @@ use lettre::Message;
 use lettre::address::Envelope;
 use lettre::transport::smtp::Error as LettreError;
 use lettre::transport::smtp::authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism};
-use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream, TlsParameters};
 use lettre::transport::smtp::commands::{Data, Mail, Rcpt};
 use lettre::transport::smtp::extension::{ClientId, Extension, MailBodyParameter, MailParameter};
 use lettre::transport::smtp::response::{Response, Severity};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
+use tokio::net::TcpStream;
 
 /// lettre's own TCP connect timeout for the relay transport.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -228,6 +234,8 @@ pub trait SmtpConnect {
 
 /// Connects to an account's SMTP server: implicit TLS on port 465, STARTTLS
 /// (required) on every other port, the same choice the relay transport made.
+/// An account with a pinned certificate accepts only that certificate (see
+/// [`crate::tls`]).
 pub struct AccountConnector<'a> {
     account: &'a AccountWithCredentials,
     /// The OAuth access token, fetched in `connect` before AUTH needs it.
@@ -248,6 +256,7 @@ impl SmtpConnect for AccountConnector<'_> {
         let host = self.account.account.smtp_host.clone();
         let port = self.account.account.smtp_port;
         let username = self.account.account.username.clone();
+        let pinned_cert = self.account.server_tls.pinned_cert.clone();
         let grant = self.account.oauth.clone();
         let placeholder = grant.is_none()
             && envelope_email_store::oauth_grants::is_oauth_password(
@@ -277,6 +286,10 @@ impl SmtpConnect for AccountConnector<'_> {
                 let _ = token_slot.set(token);
             }
             let hello = ClientId::default();
+            if let Some(pinned_cert) = &pinned_cert {
+                return connect_pinned(&host, port, port == 465, pinned_cert, &username, &hello)
+                    .await;
+            }
             let tls = TlsParameters::new(host.clone())?;
             if port == 465 {
                 Ok(AsyncSmtpConnection::connect_tokio1(
@@ -331,6 +344,241 @@ impl SmtpConnect for AccountConnector<'_> {
             .oauth
             .as_ref()
             .map(|_| crate::oauth_session::reauth_hint(&self.account.account.username))
+    }
+}
+
+/// Opens a connection whose TLS accepts only `pinned_cert`.
+///
+/// lettre's TLS settings take extra CA roots but no certificate verifier,
+/// and a pinned certificate such as Proton Mail Bridge's is a CA certificate
+/// that root-based verification refuses as a server certificate. So the TLS
+/// layer is set up here and the encrypted stream handed to lettre. For
+/// STARTTLS the exchange before TLS (greeting, EHLO, STARTTLS) also runs
+/// here; lettre then reads the server's greeting, replayed from that
+/// exchange, and sends EHLO again over TLS as RFC 3207 requires.
+pub(crate) async fn connect_pinned(
+    host: &str,
+    port: u16,
+    implicit_tls: bool,
+    pinned_cert: &[u8],
+    account: &str,
+    hello: &ClientId,
+) -> Result<AsyncSmtpConnection, ConnectFailure> {
+    let failed = |permanent: bool, error: String| ConnectFailure {
+        reply_code: None,
+        permanent,
+        error,
+    };
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| failed(false, format!("timed out connecting to {host}:{port}")))?
+        .map_err(|e| failed(false, format!("{host}:{port}: {e}")))?;
+    let (tcp, greeting) = if implicit_tls {
+        (tcp, Vec::new())
+    } else {
+        smtp_starttls(tcp, host, port, hello).await?
+    };
+    let tls = crate::tls::handshake(tcp, host, port, Some(pinned_cert), account)
+        .await
+        .map_err(|f| failed(f.pin_mismatch, f.message))?;
+    Ok(AsyncSmtpConnection::connect_with_transport(
+        Box::new(PinnedTlsStream {
+            replay: greeting,
+            replayed: 0,
+            tls,
+        }),
+        hello,
+    )
+    .await?)
+}
+
+/// Longest SMTP line accepted before TLS starts.
+const MAX_PLAIN_LINE: u64 = 8192;
+
+/// Greeting, EHLO and STARTTLS on a plain connection. Returns the socket,
+/// ready for the TLS handshake, and the server's greeting. Nothing but EHLO
+/// and STARTTLS crosses the wire before TLS, so no credential can, and a
+/// server that does not offer STARTTLS is refused.
+async fn smtp_starttls(
+    tcp: TcpStream,
+    host: &str,
+    port: u16,
+    hello: &ClientId,
+) -> Result<(TcpStream, Vec<u8>), ConnectFailure> {
+    let mut stream = BufReader::new(tcp);
+    let (code, greeting) = read_plain_reply(&mut stream, host, port).await?;
+    if code != 220 {
+        return Err(refusal(
+            code,
+            format!("{host}:{port} greeted with {}", lossy(&greeting)),
+        ));
+    }
+
+    send_plain(&mut stream, format!("EHLO {hello}\r\n"), host, port).await?;
+    let (code, ehlo) = read_plain_reply(&mut stream, host, port).await?;
+    if code != 250 {
+        return Err(refusal(
+            code,
+            format!("{host}:{port} refused EHLO: {}", lossy(&ehlo)),
+        ));
+    }
+    let offers_starttls = lossy(&ehlo).lines().any(|line| {
+        line.get(4..)
+            .and_then(|ext| ext.split_whitespace().next())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("STARTTLS"))
+    });
+    if !offers_starttls {
+        return Err(ConnectFailure {
+            reply_code: None,
+            permanent: true,
+            error: format!(
+                "{host}:{port} does not offer STARTTLS, so Envelope will not sign in over \
+                 this unencrypted connection"
+            ),
+        });
+    }
+
+    send_plain(&mut stream, "STARTTLS\r\n".to_string(), host, port).await?;
+    let (code, reply) = read_plain_reply(&mut stream, host, port).await?;
+    if code != 220 {
+        return Err(refusal(
+            code,
+            format!("{host}:{port} refused STARTTLS: {}", lossy(&reply)),
+        ));
+    }
+    // Bytes that arrived before TLS but would be read after it are an
+    // injection attempt (CVE-2011-0411 class): refuse rather than discard.
+    if !stream.buffer().is_empty() {
+        return Err(ConnectFailure {
+            reply_code: None,
+            permanent: false,
+            error: format!(
+                "{host}:{port} sent data after agreeing to STARTTLS, before TLS began; \
+                 refusing the connection"
+            ),
+        });
+    }
+    Ok((stream.into_inner(), greeting))
+}
+
+fn refusal(code: u16, error: String) -> ConnectFailure {
+    ConnectFailure {
+        reply_code: Some(code),
+        permanent: (500..600).contains(&code),
+        error,
+    }
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim_end().to_string()
+}
+
+async fn send_plain(
+    stream: &mut BufReader<TcpStream>,
+    line: String,
+    host: &str,
+    port: u16,
+) -> Result<(), ConnectFailure> {
+    stream
+        .get_mut()
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| ConnectFailure {
+            reply_code: None,
+            permanent: false,
+            error: format!("{host}:{port} before STARTTLS: {e}"),
+        })
+}
+
+/// One SMTP reply, all of its lines (`250-...` continues, `250 ...` ends).
+async fn read_plain_reply(
+    stream: &mut BufReader<TcpStream>,
+    host: &str,
+    port: u16,
+) -> Result<(u16, Vec<u8>), ConnectFailure> {
+    let failed = |error: String| ConnectFailure {
+        reply_code: None,
+        permanent: false,
+        error,
+    };
+    let mut reply = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let read = (&mut *stream)
+            .take(MAX_PLAIN_LINE)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|e| failed(format!("{host}:{port} before STARTTLS: {e}")))?;
+        if read == 0 {
+            return Err(failed(format!(
+                "{host}:{port} closed the connection before STARTTLS"
+            )));
+        }
+        if !line.ends_with(b"\n") {
+            return Err(failed(format!(
+                "{host}:{port} sent a line longer than {MAX_PLAIN_LINE} bytes before STARTTLS"
+            )));
+        }
+        let code = std::str::from_utf8(line.get(..3).unwrap_or_default())
+            .ok()
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| failed(format!("{host}:{port} sent {:?}", lossy(&line))))?;
+        let last = line.get(3) != Some(&b'-');
+        reply.extend_from_slice(&line);
+        if last {
+            return Ok((code, reply));
+        }
+    }
+}
+
+/// The TLS stream lettre reads and writes for a pinned account, after the
+/// greeting read before STARTTLS (empty for implicit TLS).
+#[derive(Debug)]
+struct PinnedTlsStream {
+    replay: Vec<u8>,
+    replayed: usize,
+    tls: tokio_rustls::client::TlsStream<TcpStream>,
+}
+
+impl AsyncRead for PinnedTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let rest = &this.replay[this.replayed..];
+        if !rest.is_empty() {
+            let n = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..n]);
+            this.replayed += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.tls).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PinnedTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().tls).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().tls).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().tls).poll_shutdown(cx)
+    }
+}
+
+impl AsyncTokioStream for PinnedTlsStream {
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.tls.get_ref().0.peer_addr()
     }
 }
 
@@ -1107,6 +1355,7 @@ mod tests {
             smtp_password: None,
             imap_password: None,
             oauth: None,
+            server_tls: Default::default(),
         };
         let failure = AccountConnector::new(&creds).connect().await.err().unwrap();
         assert!(failure.permanent);

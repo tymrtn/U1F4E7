@@ -159,16 +159,9 @@ pub async fn verify(State(state): State<AppState>, Path(id): Path<String>) -> im
     }
 }
 
-/// Map a well-known IMAP/SMTP port to its transport security label. Mirrors the
-/// CLI `accounts setup-instructions` mapping and defaults to TLS for unknown
-/// ports so setup guidance never suggests an unencrypted client.
-fn imap_security_for_port(port: u16) -> &'static str {
-    match port {
-        143 => "STARTTLS",
-        _ => "SSL/TLS",
-    }
-}
-
+/// Map a well-known SMTP port to its transport security label. Mirrors the
+/// CLI `accounts setup-instructions` mapping and defaults to STARTTLS, never
+/// plaintext. IMAP's label comes from the account's TLS settings.
 fn smtp_security_for_port(port: u16) -> &'static str {
     match port {
         465 => "SSL/TLS",
@@ -199,6 +192,16 @@ pub async fn setup_instructions(
         }
     };
 
+    let imap_security = match db.server_tls(&account.id) {
+        Ok(settings) => settings.imap_security_for(account.imap_port).label(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot read the account's TLS settings: {e}"),
+            )
+                .into_response();
+        }
+    };
     let imap_username = account
         .imap_username
         .as_deref()
@@ -219,7 +222,7 @@ pub async fn setup_instructions(
             "host": account.imap_host,
             "port": account.imap_port,
             "username": imap_username,
-            "security": imap_security_for_port(account.imap_port),
+            "security": imap_security,
         },
         "smtp": {
             "host": account.smtp_host,

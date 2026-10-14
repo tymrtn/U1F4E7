@@ -73,6 +73,17 @@ pub(crate) fn token_mode_permission(command: &Commands) -> Permission {
                     ReadOnly
                 }
             }
+            AccountsCmd::Tls {
+                trust_cert,
+                imap_security,
+                ..
+            } => {
+                if trust_cert.is_some() || imap_security.is_some() {
+                    OperatorOnly
+                } else {
+                    ReadOnly
+                }
+            }
             AccountsCmd::Signature { subcommand } => match subcommand {
                 SignatureCmd::Show { .. } => ReadOnly,
                 SignatureCmd::Set { .. } | SignatureCmd::Clear { .. } => OperatorOnly,
@@ -475,6 +486,12 @@ mod tests {
         ),
         ("accounts copy-password --account a", OperatorOnly),
         ("accounts remove a", OperatorOnly),
+        ("accounts tls --account a", ReadOnly),
+        ("accounts tls --account a --trust-cert c.pem", OperatorOnly),
+        (
+            "accounts tls --account a --imap-security starttls",
+            OperatorOnly,
+        ),
         ("accounts signature show --account a", ReadOnly),
         ("accounts signature set --account a --text t", OperatorOnly),
         ("accounts signature clear --account a", OperatorOnly),
@@ -796,6 +813,8 @@ mod tests {
             "--webhook",
             "--deliver",
             "--run-rules",
+            "--trust-cert",
+            "--imap-security",
         ];
         let mut key = path_of(argv);
         for word in argv.split_whitespace().filter(|w| CLASS_FLAGS.contains(w)) {

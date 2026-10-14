@@ -43,6 +43,7 @@ pub mod smtp_submit;
 pub mod snooze_time;
 pub mod threading;
 pub mod threat;
+pub mod tls;
 pub mod unsubscribe;
 pub mod url_guard;
 

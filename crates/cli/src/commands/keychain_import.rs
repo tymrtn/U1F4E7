@@ -516,6 +516,7 @@ pub(crate) fn account_with_credentials(
         smtp_password: Some(smtp_password.to_string()),
         imap_password: None,
         oauth: None,
+        server_tls: Default::default(),
     }
 }
 
