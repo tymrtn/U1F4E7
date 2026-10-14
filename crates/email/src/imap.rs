@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
+use std::time::Duration;
 
 use async_imap::Session;
 use chrono::{DateTime, FixedOffset};
@@ -301,6 +302,22 @@ pub async fn connect(account: &AccountWithCredentials) -> Result<ImapClient, Ima
 pub(crate) async fn open_session(
     account: &AccountWithCredentials,
 ) -> Result<ImapSession, ImapError> {
+    open_session_within(account, PRE_LOGIN_TIMEOUT).await
+}
+
+/// How long everything before LOGIN may take: the TCP connect, STARTTLS, the
+/// TLS handshake and the greeting. The IMAP connect path had no timeout at
+/// all, so this one constant covers implicit TLS and STARTTLS alike. A mode
+/// mismatch (STARTTLS against a server that speaks TLS from the first byte,
+/// or the reverse) leaves both sides waiting for the other, and the dashboard
+/// holds its shared IMAP pool lock across a connect. Shorter than the 30s
+/// login check in `accounts add`, so that check reports this error.
+pub(crate) const PRE_LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub(crate) async fn open_session_within(
+    account: &AccountWithCredentials,
+    limit: Duration,
+) -> Result<ImapSession, ImapError> {
     let host = &account.account.imap_host;
     let port = account.account.imap_port;
     let username = account.effective_imap_username();
@@ -311,40 +328,81 @@ pub(crate) async fn open_session(
         security.label()
     );
 
-    let tcp = TcpStream::connect((host.as_str(), port))
+    let deadline = tokio::time::Instant::now() + limit;
+    let tcp = tokio::time::timeout_at(deadline, TcpStream::connect((host.as_str(), port)))
         .await
+        .map_err(|_| {
+            ImapError::Connection(format!("{host}:{port}: connect timed out after {limit:?}"))
+        })?
         .map_err(|e| ImapError::Connection(format!("{host}:{port}: {e}")))?;
-    let tcp = match security {
-        ImapSecurity::Tls => tcp,
-        ImapSecurity::Starttls => starttls(tcp, host, port).await?,
-    };
 
-    let tls_stream = crate::tls::handshake(
-        tcp,
-        host,
-        port,
-        account.server_tls.pinned_cert.as_deref(),
-        &account.account.username,
-    )
+    let client = tokio::time::timeout_at(deadline, async {
+        let tcp = match security {
+            ImapSecurity::Tls => tcp,
+            ImapSecurity::Starttls => starttls(tcp, host, port).await?,
+        };
+
+        let tls_stream = crate::tls::handshake(
+            tcp,
+            host,
+            port,
+            account.server_tls.pinned_cert.as_deref(),
+            &account.account.username,
+        )
+        .await
+        .map_err(|f| ImapError::Connection(f.message))?;
+
+        let mut client = async_imap::Client::new(tls_stream);
+
+        // Drain the server greeting before issuing LOGIN. async-imap's `Client::new`
+        // does not consume the untagged `* OK ...` greeting; if we pipeline LOGIN
+        // before reading it, some Dovecot-compatible servers can reset the
+        // connection. The canonical async-imap pattern is to read the
+        // greeting first — see the crate's lib.rs docs. After STARTTLS the
+        // greeting was read before TLS and the server sends no second one.
+        if security == ImapSecurity::Tls {
+            read_imap_greeting(&mut client, host).await?;
+        }
+        Ok::<_, ImapError>(client)
+    })
     .await
-    .map_err(|f| ImapError::Connection(f.message))?;
-
-    let mut client = async_imap::Client::new(tls_stream);
-
-    // Drain the server greeting before issuing LOGIN. async-imap's `Client::new`
-    // does not consume the untagged `* OK ...` greeting; if we pipeline LOGIN
-    // before reading it, some Dovecot-compatible servers can reset the
-    // connection. The canonical async-imap pattern is to read the
-    // greeting first — see the crate's lib.rs docs. After STARTTLS the
-    // greeting was read before TLS and the server sends no second one.
-    if security == ImapSecurity::Tls {
-        read_imap_greeting(&mut client, host).await?;
-    }
+    .map_err(|_| tls_setup_timed_out(account, security, limit))??;
 
     let session = authenticate_client(client, account, host).await?;
 
     debug!("IMAP session established for {username}@{host}");
     Ok(session)
+}
+
+/// The server took the connection but TLS was not up within `limit`. The
+/// usual cause is the wrong `--imap-security` for the server, so say which
+/// one to try.
+fn tls_setup_timed_out(
+    account: &AccountWithCredentials,
+    security: ImapSecurity,
+    limit: Duration,
+) -> ImapError {
+    let host = &account.account.imap_host;
+    let port = account.account.imap_port;
+    let user = &account.account.username;
+    let advice = match security {
+        ImapSecurity::Starttls => format!(
+            "This account starts IMAP with STARTTLS. If the server uses TLS from the first \
+             byte, as Proton Mail Bridge does with its IMAP connection mode set to SSL, use \
+             --imap-security tls (for a saved account: envelope accounts tls --account {user} \
+             --imap-security tls)"
+        ),
+        ImapSecurity::Tls => format!(
+            "This account starts IMAP with TLS from the first byte. If the server expects \
+             STARTTLS first, as Proton Mail Bridge does by default, use --imap-security \
+             starttls (for a saved account: envelope accounts tls --account {user} \
+             --imap-security starttls)"
+        ),
+    };
+    ImapError::Connection(format!(
+        "IMAP setup with {host}:{port} timed out after {limit:?}: the server accepted the \
+         connection, but TLS was not set up, so Envelope gave up before signing in. {advice}"
+    ))
 }
 
 /// Longest line accepted before TLS starts.

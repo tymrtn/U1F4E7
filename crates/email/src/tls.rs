@@ -672,6 +672,76 @@ mod tests {
         );
     }
 
+    /// A server that accepts the connection and never sends a byte.
+    async fn silent_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = listener.accept().await {
+                held.push(tcp);
+            }
+        });
+        port
+    }
+
+    /// Open a session with a short pre-login limit, failing the test if it
+    /// is still waiting after five seconds.
+    async fn open_with_short_limit(creds: &AccountWithCredentials) -> String {
+        install_provider();
+        let limit = std::time::Duration::from_millis(300);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::imap::open_session_within(creds, limit),
+        )
+        .await
+        {
+            Ok(Ok(_)) => panic!("connected to a server that never set up TLS"),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => panic!("IMAP connect still waiting after 5s"),
+        }
+    }
+
+    #[tokio::test]
+    async fn starttls_against_a_silent_server_gives_up_and_suggests_tls() {
+        let port = silent_server().await;
+        let creds = account(port, 9, Some(ImapSecurity::Starttls), None);
+
+        let err = open_with_short_limit(&creds).await;
+
+        assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
+        assert!(err.contains("--imap-security tls"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn starttls_against_an_implicit_tls_server_gives_up_and_suggests_tls() {
+        // Proton Mail Bridge with its IMAP connection mode switched to SSL:
+        // it waits for a TLS ClientHello while Envelope waits for "* OK".
+        let cert = bridge_like_cert();
+        let server = super::testing::imap(Mode::ImplicitTls, cert.clone()).await;
+        let creds = account(server.port, 9, Some(ImapSecurity::Starttls), Some(&cert));
+
+        let err = open_with_short_limit(&creds).await;
+
+        assert!(err.contains("--imap-security tls"), "{err}");
+        assert!(
+            err.contains("envelope accounts tls --account you@proton.me --imap-security tls"),
+            "{err}"
+        );
+        assert!(server.transcript.tls_verbs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn implicit_tls_against_a_silent_server_gives_up_and_suggests_starttls() {
+        let port = silent_server().await;
+        let creds = account(port, 9, Some(ImapSecurity::Tls), None);
+
+        let err = open_with_short_limit(&creds).await;
+
+        assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
+        assert!(err.contains("--imap-security starttls"), "{err}");
+    }
+
     #[test]
     fn trust_cert_reads_the_certificate_and_never_the_key() {
         let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
