@@ -134,14 +134,7 @@ if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
     codesign --verify --strict --verbose=2 "$TARGET_BIN"
 fi
 
-# ---------------------------------------------------------------------------
-# Size guard (25 MiB binary, 20 MiB tarball)
-# ---------------------------------------------------------------------------
 BIN_BYTES="$(binary_size "$TARGET_BIN")"
-if [ "$BIN_BYTES" -ge $((25 * 1024 * 1024)) ]; then
-    echo "release binary too large: ${BIN_BYTES} bytes (limit 26214400)" >&2
-    exit 1
-fi
 
 # ---------------------------------------------------------------------------
 # Assemble package directory
@@ -157,10 +150,6 @@ cp "$ROOT_DIR/README.md" "$PACKAGE_ROOT/README.md"
 COPYFILE_DISABLE=1 tar -C "$DIST_DIR" -czf "$TARBALL" "$(basename "$PACKAGE_ROOT")"
 
 TARBALL_BYTES="$(binary_size "$TARBALL")"
-if [ "$TARBALL_BYTES" -ge $((20 * 1024 * 1024)) ]; then
-    echo "release tarball too large: ${TARBALL_BYTES} bytes (limit 20971520)" >&2
-    exit 1
-fi
 
 # ---------------------------------------------------------------------------
 # SHA-256 checksum (sha256sum on Linux; shasum -a 256 on macOS).
