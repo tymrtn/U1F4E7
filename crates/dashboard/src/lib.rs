@@ -17,6 +17,7 @@
 
 pub mod assets;
 pub mod auth;
+mod background_owner;
 pub mod csrf;
 pub mod events;
 pub mod handlers;
@@ -168,129 +169,185 @@ pub async fn serve_with_config(cfg: ServeConfig) -> anyhow::Result<()> {
              valid credential."
         );
     }
-    if options.background_sweeps {
-        // Rows from before Message-IDs had one stored form, or from a build
-        // that still writes brackets into this DB.
-        match state.db.lock().await.normalize_stored_message_ids() {
-            Ok(r) => println!(
-                "Stored Message-IDs normalized: {} index rows, {} events, {} thread rows",
-                r.index_rows, r.events, r.thread_messages
-            ),
-            Err(e) => tracing::warn!("Message-ID normalization failed: {e}"),
+    // Held until the server stops; the kernel releases it if the process dies.
+    let _background_owner = if options.background_sweeps {
+        let home = envelope_email_store::paths::app_data_dir();
+        match background_owner::BackgroundOwner::try_acquire(&home)? {
+            Some(owner) => {
+                start_background_work(&state).await;
+                Some(owner)
+            }
+            None => {
+                println!(
+                    "Another Envelope server on this mail home runs the background jobs; this one \
+                     serves the dashboard and takes them over if that server stops"
+                );
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let owner = wait_for_background_ownership(&state, &home).await;
+                    println!(
+                        "The other Envelope server on this mail home stopped; this one runs the \
+                         background jobs now"
+                    );
+                    start_background_work(&state).await;
+                    // Ownership lasts as long as the process.
+                    let _owner = owner;
+                    std::future::pending::<()>().await;
+                });
+                None
+            }
         }
-        // Sends a crashed process left mid-attempt: release the ones that never
-        // reached the body, park the rest. The first sweep tick repeats this.
-        match state.db.lock().await.reconcile_stale_sending_now() {
-            Ok(r) => println!(
-                "Stale sends recovered: {} released, {} parked delivery_uncertain",
-                r.released.len(),
-                r.parked.len()
-            ),
-            Err(e) => tracing::error!("stale send recovery failed: {e}"),
-        }
-        println!("Background unsnooze + scheduled-send + event-delivery sweep running every 60s");
-        let ticker_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
-                    tracing::warn!("unsnooze sweep error: {e}");
-                }
-                if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
-                    tracing::warn!("scheduled send sweep error: {e}");
-                }
-            }
-        });
-
-        // Drafts cleanup retries run on their own timer. One can wait on an
-        // IMAP server up to its time limits, which must never hold up a send.
-        println!("Background Drafts cleanup retry running every 60s");
-        let cleanup_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            // A pass can outlast the period while a server is slow: wait a
-            // full period after it instead of running missed ticks back to back.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                retry_pending_provider_draft_cleanups(&cleanup_state).await;
-            }
-        });
-
-        // Hourly Sent index sweep: keeps the cross-account Sent cache warm so
-        // the Sent box reads locally instead of fanning IMAP from the browser.
-        // First tick fires immediately, so the index populates on startup.
-        println!("Background Sent index sweep running every 3600s");
-        let sent_sweep_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                interval.tick().await;
-                if let Err(e) = handlers::messages::run_sent_index_sweep(&sent_sweep_state).await {
-                    tracing::warn!("sent index sweep error: {e}");
-                }
-            }
-        });
-
-        // Inbox index refresh on the `sync.poll_interval_secs` timer (default
-        // 300s), so the Inbox and Digest stay current with no browser open.
-        // The first pass runs at startup; the interval is re-read after each.
-        println!(
-            "Background Inbox index refresh running every sync.poll_interval_secs (default 300s)"
-        );
-        let inbox_sweep_state = state.clone();
-        tokio::spawn(async move {
-            use envelope_email_transport::threat::ThreatConfig;
-            use envelope_email_transport::threat::config::DEFAULT_POLL_INTERVAL_SECS;
-            loop {
-                if let Err(e) = handlers::messages::run_inbox_index_sweep(&inbox_sweep_state).await
-                {
-                    tracing::warn!("inbox index sweep error: {e}");
-                }
-                // An invalid config.json must not stop Inbox refresh: say so
-                // on every pass and keep the default period until it is fixed.
-                let secs = match ThreatConfig::load() {
-                    Ok(config) => config.poll_interval_secs,
-                    Err(e) => {
-                        tracing::warn!(
-                            "inbox index sweep: invalid config ({e:#}); refreshing every \
-                             {DEFAULT_POLL_INTERVAL_SECS}s until it is fixed"
-                        );
-                        DEFAULT_POLL_INTERVAL_SECS
-                    }
-                };
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            }
-        });
-
-        // Threat scan of new INBOX mail on each account's
-        // `sync.poll_interval_secs` timer (default 300s), checked every tick.
-        println!("Background threat scan: per-account timer (sync.poll_interval_secs)");
-        let threat_state = state.clone();
-        tokio::spawn(async move {
-            let mut last_run = std::collections::HashMap::new();
-            let mut interval = tokio::time::interval(handlers::threat::SWEEP_TICK);
-            loop {
-                interval.tick().await;
-                handlers::threat::run_sweep(&threat_state, &mut last_run).await;
-            }
-        });
-
-        // The durable webhook delivery executor interleaves DB reads/writes with
-        // HTTP awaits and holds a non-Send rusqlite handle across those awaits,
-        // so it cannot run on the multi-threaded runtime's `tokio::spawn` (which
-        // requires Send). Give it its own OS thread with a current-thread runtime
-        // and its own DB connection (WAL makes the second connection safe against
-        // the shared state DB). This keeps the existing sweeps untouched.
-        spawn_event_delivery_sweeper();
     } else {
         println!("Background unsnooze + scheduled-send sweeps disabled for diagnostic mode");
-    }
+        None
+    };
 
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("server error: {e}"))
+}
+
+/// Start every background job this home needs. Only the server holding the
+/// home's [`background_owner::BackgroundOwner`] calls this.
+async fn start_background_work(state: &AppState) {
+    // Rows from before Message-IDs had one stored form, or from a build
+    // that still writes brackets into this DB.
+    match state.db.lock().await.normalize_stored_message_ids() {
+        Ok(r) => println!(
+            "Stored Message-IDs normalized: {} index rows, {} events, {} thread rows",
+            r.index_rows, r.events, r.thread_messages
+        ),
+        Err(e) => tracing::warn!("Message-ID normalization failed: {e}"),
+    }
+    // Sends a crashed process left mid-attempt: release the ones that never
+    // reached the body, park the rest. The first sweep tick repeats this.
+    match state.db.lock().await.reconcile_stale_sending_now() {
+        Ok(r) => println!(
+            "Stale sends recovered: {} released, {} parked delivery_uncertain",
+            r.released.len(),
+            r.parked.len()
+        ),
+        Err(e) => tracing::error!("stale send recovery failed: {e}"),
+    }
+    println!("Background unsnooze + scheduled-send + event-delivery sweep running every 60s");
+    let ticker_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_unsnooze_sweep(&ticker_state).await {
+                tracing::warn!("unsnooze sweep error: {e}");
+            }
+            if let Err(e) = run_scheduled_send_sweep(&ticker_state).await {
+                tracing::warn!("scheduled send sweep error: {e}");
+            }
+        }
+    });
+
+    // Drafts cleanup retries run on their own timer. One can wait on an
+    // IMAP server up to its time limits, which must never hold up a send.
+    println!("Background Drafts cleanup retry running every 60s");
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // A pass can outlast the period while a server is slow: wait a
+        // full period after it instead of running missed ticks back to back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            retry_pending_provider_draft_cleanups(&cleanup_state).await;
+        }
+    });
+
+    // Hourly Sent index sweep: keeps the cross-account Sent cache warm so
+    // the Sent box reads locally instead of fanning IMAP from the browser.
+    // First tick fires immediately, so the index populates on startup.
+    println!("Background Sent index sweep running every 3600s");
+    let sent_sweep_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            if let Err(e) = handlers::messages::run_sent_index_sweep(&sent_sweep_state).await {
+                tracing::warn!("sent index sweep error: {e}");
+            }
+        }
+    });
+
+    // Inbox index refresh on the `sync.poll_interval_secs` timer (default
+    // 300s), so the Inbox and Digest stay current with no browser open.
+    // The first pass runs at startup; the interval is re-read after each.
+    println!("Background Inbox index refresh running every sync.poll_interval_secs (default 300s)");
+    let inbox_sweep_state = state.clone();
+    tokio::spawn(async move {
+        use envelope_email_transport::threat::ThreatConfig;
+        use envelope_email_transport::threat::config::DEFAULT_POLL_INTERVAL_SECS;
+        loop {
+            if let Err(e) = handlers::messages::run_inbox_index_sweep(&inbox_sweep_state).await {
+                tracing::warn!("inbox index sweep error: {e}");
+            }
+            // An invalid config.json must not stop Inbox refresh: say so
+            // on every pass and keep the default period until it is fixed.
+            let secs = match ThreatConfig::load() {
+                Ok(config) => config.poll_interval_secs,
+                Err(e) => {
+                    tracing::warn!(
+                        "inbox index sweep: invalid config ({e:#}); refreshing every \
+                         {DEFAULT_POLL_INTERVAL_SECS}s until it is fixed"
+                    );
+                    DEFAULT_POLL_INTERVAL_SECS
+                }
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+    });
+
+    // Threat scan of new INBOX mail on each account's
+    // `sync.poll_interval_secs` timer (default 300s), checked every tick.
+    println!("Background threat scan: per-account timer (sync.poll_interval_secs)");
+    let threat_state = state.clone();
+    tokio::spawn(async move {
+        let mut last_run = std::collections::HashMap::new();
+        let mut interval = tokio::time::interval(handlers::threat::SWEEP_TICK);
+        loop {
+            interval.tick().await;
+            handlers::threat::run_sweep(&threat_state, &mut last_run).await;
+        }
+    });
+
+    // The durable webhook delivery executor interleaves DB reads/writes with
+    // HTTP awaits and holds a non-Send rusqlite handle across those awaits,
+    // so it cannot run on the multi-threaded runtime's `tokio::spawn` (which
+    // requires Send). Give it its own OS thread with a current-thread runtime
+    // and its own DB connection (WAL makes the second connection safe against
+    // the shared state DB). This keeps the existing sweeps untouched.
+    spawn_event_delivery_sweeper();
+}
+
+/// Wait until no other server on the home runs its background jobs, then
+/// take them. Meanwhile, announce the new mail that server's sync indexes,
+/// since its own announcements never leave its process.
+async fn wait_for_background_ownership(
+    state: &AppState,
+    home: &std::path::Path,
+) -> background_owner::BackgroundOwner {
+    let mut watch = handlers::messages::IndexWatch::default();
+    let mut warned = false;
+    loop {
+        handlers::messages::announce_index_changes(state, &mut watch).await;
+        tokio::time::sleep(background_owner::RETRY_INTERVAL).await;
+        match background_owner::BackgroundOwner::try_acquire(home) {
+            Ok(Some(owner)) => return owner,
+            Ok(None) => {}
+            Err(e) if !warned => {
+                tracing::error!(
+                    "cannot check whether this server should run the background jobs: {e:#}"
+                );
+                warned = true;
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Local backfill of the compose autocomplete address history, once per

@@ -142,6 +142,27 @@ impl Database {
     /// The last successful `indexed_at` is preserved: a failed refresh never
     /// overwrites it with the failure time. A mailbox with no prior successful
     /// index keeps a NULL `indexed_at`.
+    /// One folder's indexed `(message count, highest UID, unread count)`.
+    ///
+    /// A server that leaves the background sync to another server on its home
+    /// compares this between looks to tell whether that sync changed anything.
+    pub fn message_index_fingerprint(
+        &self,
+        account_id: &str,
+        folder: &str,
+    ) -> Result<(i64, i64, i64)> {
+        let mut stmt = self.conn().prepare(
+            "SELECT COUNT(*),
+                    COALESCE(MAX(uid), 0),
+                    COALESCE(SUM(CASE WHEN LOWER(flags_json) LIKE '%seen%' THEN 0 ELSE 1 END), 0)
+             FROM indexed_message_summaries
+             WHERE account_id = ?1 AND folder = ?2",
+        )?;
+        Ok(stmt.query_row(params![account_id, folder], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?)
+    }
+
     pub fn record_message_index_error(
         &self,
         account_id: &str,
