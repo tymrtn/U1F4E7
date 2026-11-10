@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Envelope</title>
+    <style>
+      :root {
+        color: #1d2430;
+        background: #f7f8fa;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      main {
+        box-sizing: border-box;
+        height: 100vh;
+        padding: 0;
+      }
+
+      /* Slots exist so render() has somewhere to write without touching the
+         dashboard host. They must not become layout boxes of their own. */
+      #chromeRoot,
+      #statusRoot,
+      #failureSlot,
+      #diagnosticsSlot {
+        display: contents;
+      }
+
+      /* `display: contents` above outranks the UA rule for [hidden], so a
+         hidden slot would still lay its children out. */
+      [hidden] {
+        display: none !important;
+      }
+
+      .desktop-shell {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 24px;
+        line-height: 1.2;
+        font-weight: 650;
+      }
+
+      h2 {
+        margin: 0 0 12px;
+        font-size: 14px;
+        line-height: 1.2;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: #566171;
+      }
+
+      p {
+        margin: 0;
+        color: #566171;
+        line-height: 1.5;
+      }
+
+      .center {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 48px 32px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 24px;
+        border-bottom: 1px solid #d8dde6;
+        background: #ffffff;
+        padding: 18px 24px;
+      }
+
+      .topbar-status {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 10px;
+        min-width: 280px;
+        color: #667085;
+        font-size: 13px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 26px;
+        border-radius: 999px;
+        padding: 0 10px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .ok-bg {
+        background: #dcfce7;
+        color: #166534;
+      }
+
+      .warn {
+        background: #fef3c7;
+        color: #92400e;
+      }
+
+      .fail-bg {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        border-bottom: 1px solid #d8dde6;
+        background: #ffffff;
+        padding: 12px 24px;
+      }
+
+      .notice {
+        border-bottom: 1px solid #d8dde6;
+        background: #eef4ff;
+        color: #1849a9;
+        padding: 10px 24px;
+        font-size: 14px;
+      }
+
+      .workspace {
+        box-sizing: border-box;
+        flex: 1;
+        min-height: 0;
+        padding: 18px;
+      }
+
+      .workspace.with-dashboard {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(360px, 440px);
+        /* Without this the grid rows take their content height and the page
+           grows past the viewport instead of the panel scrolling. */
+        grid-template-rows: minmax(0, 1fr);
+        min-height: 0;
+        gap: 18px;
+      }
+
+      .workspace.diagnostics-only {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 18px;
+        max-width: 1180px;
+        width: 100%;
+        margin: 0 auto;
+      }
+
+      /* Healthy state: the mail owns the window, no frame around it. */
+      .workspace.full-bleed {
+        display: flex;
+        flex-direction: column;
+        padding: 0;
+      }
+
+      .dashboard-pane.bare {
+        flex: 1;
+        min-height: 0;
+        border: 0;
+        border-radius: 0;
+      }
+
+      .statusbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        border-top: 1px solid #d8dde6;
+        background: #ffffff;
+        padding: 6px 12px;
+        color: #667085;
+        font-size: 12px;
+      }
+
+      .statusbar .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #667085;
+      }
+
+      .statusbar .dot.ok-bg {
+        background: #12b76a;
+      }
+
+      .statusbar .dot.fail-bg {
+        background: #d92d20;
+      }
+
+      .statusbar .dot.warn {
+        background: #f79009;
+      }
+
+      .statusbar .linkish {
+        margin-left: auto;
+        border: 0;
+        background: none;
+        padding: 2px 4px;
+        color: #3054b8;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .statusbar .linkish:hover {
+        text-decoration: underline;
+      }
+
+      .dashboard-pane {
+        min-width: 0;
+        min-height: 620px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        border: 1px solid #d8dde6;
+        border-radius: 8px;
+        background: #ffffff;
+      }
+
+      .load-state {
+        border-bottom: 1px solid #eaecf0;
+        color: #566171;
+        font-size: 13px;
+        padding: 8px 12px;
+      }
+
+      iframe {
+        flex: 1;
+        width: 100%;
+        min-height: 0;
+        border: 0;
+        background: #ffffff;
+      }
+
+      .remedy {
+        margin-top: 10px;
+        color: #1d2430;
+        font-weight: 500;
+      }
+
+      .failure-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      /* The raw server message stays reachable, but it is not the headline:
+         it is what you read after the explanation, not instead of it. */
+      .raw-detail {
+        margin-top: 18px;
+        color: #566171;
+        font-size: 13px;
+      }
+
+      .raw-detail summary {
+        cursor: pointer;
+      }
+
+      .raw-detail p {
+        margin-top: 8px;
+      }
+
+      .failure-screen {
+        border: 1px solid #d8dde6;
+        border-radius: 8px;
+        background: #ffffff;
+        padding: 24px;
+      }
+
+      .failure-screen h2 {
+        margin-bottom: 8px;
+        font-size: 20px;
+        text-transform: none;
+        color: #1d2430;
+      }
+
+      .command {
+        margin-top: 16px;
+      }
+
+      .diagnostics {
+        min-width: 0;
+        /* Scroll the panel, not the window: opening Details should not move
+           the mail or make the whole app scroll. */
+        min-height: 0;
+        overflow-y: auto;
+        display: grid;
+        align-content: start;
+        gap: 14px;
+      }
+
+      .panel {
+        border: 1px solid #d8dde6;
+        border-radius: 8px;
+        background: #ffffff;
+        padding: 16px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(140px, 180px) 1fr;
+        gap: 10px 16px;
+        font-size: 14px;
+      }
+
+      .label {
+        color: #667085;
+      }
+
+      code,
+      pre {
+        font-family:
+          "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      }
+
+      code {
+        overflow-wrap: anywhere;
+      }
+
+      pre {
+        max-height: 180px;
+        margin: 12px 0 0;
+        overflow: auto;
+        border-radius: 6px;
+        background: #101828;
+        color: #f2f4f7;
+        padding: 12px;
+        white-space: pre-wrap;
+      }
+
+      textarea {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 220px;
+        resize: vertical;
+        border: 1px solid #cfd6e3;
+        border-radius: 6px;
+        font-family:
+          "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 12px;
+        padding: 12px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        padding: 10px 8px;
+        border-bottom: 1px solid #eaecf0;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: #667085;
+        font-weight: 600;
+      }
+
+      .ok {
+        color: #087443;
+        font-weight: 600;
+      }
+
+      .fail {
+        color: #b42318;
+        font-weight: 600;
+      }
+
+      .attempts {
+        display: grid;
+        gap: 10px;
+      }
+
+      .attempt {
+        display: grid;
+        gap: 4px;
+      }
+
+      .attempt span {
+        color: #667085;
+        font-size: 13px;
+      }
+
+      button {
+        border: 1px solid #cfd6e3;
+        border-radius: 6px;
+        background: #ffffff;
+        color: #1d2430;
+        cursor: pointer;
+        font: inherit;
+        font-size: 14px;
+        min-height: 36px;
+        padding: 0 12px;
+      }
+
+      button.primary {
+        border-color: #1d4ed8;
+        background: #1d4ed8;
+        color: #ffffff;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      @media (max-width: 1080px) {
+        .workspace.with-dashboard {
+          grid-template-columns: 1fr;
+        }
+
+        .dashboard-pane {
+          min-height: 520px;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .topbar {
+          display: grid;
+        }
+
+        .topbar-status {
+          justify-content: flex-start;
+          min-width: 0;
+        }
+
+        .workspace {
+          padding: 12px;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="app" class="shell"></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
