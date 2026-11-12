@@ -22,7 +22,8 @@
 //!    identity *is* the credential, so a human just opens the `.ts.net` URL — no
 //!    token to type. **Only safe behind `tailscale serve`**, which sets/strips
 //!    the header; do not enable the allowlist if untrusted local processes can
-//!    reach the port and forge the header.
+//!    reach the port and forge the header. The header counts only when `Host`
+//!    is a `.ts.net` name, which `tailscale serve` forwards unchanged.
 //!
 //! Enforcement keys off *configuration*, not bind address: if either method is
 //! configured, auth is enforced on every `/api` route regardless of bind. That
@@ -182,8 +183,14 @@ impl AuthConfig {
         }
     }
 
+    /// The login header counts only on a request addressed to a tailnet name.
+    /// `tailscale serve` forwards the `.ts.net` name it was reached under and
+    /// replaces any login header the client sent, so a login header under any
+    /// other name came from something else, such as a web page that pointed its
+    /// own hostname at this port.
     fn identity_authorized(&self, headers: &HeaderMap) -> bool {
         !self.tailscale_allow.is_empty()
+            && header_str(headers, header::HOST.as_str()).is_some_and(is_tailnet_host)
             && header_str(headers, TAILSCALE_USER_LOGIN)
                 .map(|login| {
                     self.tailscale_allow
@@ -191,6 +198,15 @@ impl AuthConfig {
                 })
                 .unwrap_or(false)
     }
+}
+
+/// True when a `Host` value is a Tailscale MagicDNS name (`*.ts.net`), with or
+/// without a port or a trailing dot.
+fn is_tailnet_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = host.split_once(':').map_or(host, |(name, _)| name);
+    let name = name.strip_suffix('.').unwrap_or(name);
+    name.len() > ".ts.net".len() && name.to_ascii_lowercase().ends_with(".ts.net")
 }
 
 /// Split a comma/whitespace/newline-separated allowlist into entries.
@@ -284,6 +300,64 @@ pub async fn require_auth(
     next.run(request).await
 }
 
+/// Axum middleware for open loopback mode, applied to every dashboard route.
+///
+/// With no credential configured, the loopback bind is the only boundary, and
+/// a bind address does not tell the server which name a browser used to reach
+/// it. A page served from another site can point its own hostname at
+/// 127.0.0.1 and then read the dashboard as a same-origin page. That page's
+/// requests carry its hostname in `Host`, so answering only loopback names
+/// closes the gap. A request without `Host` passes, because browsers always
+/// send one. With a credential configured this is a no-op; the credential is
+/// the boundary there.
+pub async fn require_loopback_host_when_open(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.auth.is_enforced() {
+        return next.run(request).await;
+    }
+    let host = match header_str(request.headers(), header::HOST.as_str()) {
+        Some(host) => Some(host.to_string()),
+        None => request.uri().authority().map(|a| a.to_string()),
+    };
+    match host {
+        Some(host) if !is_loopback_host(&host) => host_not_loopback().into_response(),
+        _ => next.run(request).await,
+    }
+}
+
+/// True when a `Host` value names loopback: `localhost`, `127.0.0.1` or
+/// `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let (name, rest) = match host.strip_prefix("[::1]") {
+        Some(rest) => ("[::1]", rest),
+        None => host.split_at(host.find(':').unwrap_or(host.len())),
+    };
+    let port_ok = rest.is_empty()
+        || rest
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name == "[::1]" || name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost"))
+}
+
+fn host_not_loopback() -> impl IntoResponse {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "error": "host_not_loopback",
+            "code": "dashboard_host_not_loopback",
+            "detail": "This dashboard has no credential configured, so it answers only \
+                        requests addressed to localhost, 127.0.0.1 or [::1]. Open it at one \
+                        of those addresses, or set a token (ENVELOPE_DASHBOARD_TOKEN or \
+                        `envelope config set dashboard.auth_token <token>`) to reach it \
+                        under another name.",
+        })),
+    )
+}
+
 /// Extract the `access_token` query parameter from the request URI, if present.
 fn query_access_token(request: &Request) -> Option<String> {
     let query = request.uri().query()?;
@@ -324,6 +398,37 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn loopback_host_names_with_and_without_ports() {
+        for host in [
+            "localhost",
+            "LocalHost:3141",
+            "127.0.0.1",
+            "127.0.0.1:65535",
+            "[::1]",
+            "[::1]:3141",
+            " localhost:3141 ",
+        ] {
+            assert!(is_loopback_host(host), "{host:?} is loopback");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example:3141",
+            "evil.localhost:3141",
+            "127.0.0.2:3141",
+            "[::2]:3141",
+            "[::1].evil.example",
+            "localhost:",
+            "localhost:31a1",
+            "localhost:3141:1",
+            "0.0.0.0:3141",
+        ] {
+            assert!(!is_loopback_host(host), "{host:?} is not loopback");
+        }
     }
 
     #[test]
@@ -372,16 +477,55 @@ mod tests {
         assert_eq!(cfg.mode_label(), "tailscale-identity");
         assert!(!cfg.authorize(&HeaderMap::new()));
         assert!(
-            cfg.authorize(&headers(&[(
-                "tailscale-user-login",
-                "skippy@tailnet.ts.net"
-            )])),
+            cfg.authorize(&headers(&[
+                ("host", "rey.tail1234.ts.net"),
+                ("tailscale-user-login", "skippy@tailnet.ts.net"),
+            ])),
             "case-insensitive identity match"
         );
-        assert!(!cfg.authorize(&headers(&[(
-            "tailscale-user-login",
-            "intruder@tailnet.ts.net"
-        )])));
+        assert!(!cfg.authorize(&headers(&[
+            ("host", "rey.tail1234.ts.net"),
+            ("tailscale-user-login", "intruder@tailnet.ts.net"),
+        ])));
+    }
+
+    #[test]
+    fn tailscale_identity_counts_only_on_a_tailnet_host() {
+        let login = ("tailscale-user-login", "skippy@tailnet.ts.net");
+        let cfg = AuthConfig::from_parts(None, ["skippy@tailnet.ts.net".to_string()]);
+        for host in [
+            "rey.tail1234.ts.net",
+            "REY.TAIL1234.TS.NET:443",
+            "rey.tail1234.ts.net.",
+        ] {
+            assert!(
+                cfg.authorize(&headers(&[("host", host), login])),
+                "{host:?} is a tailnet name"
+            );
+        }
+        for host in [
+            "evil.example:3141",
+            "127.0.0.1:3141",
+            "localhost:3141",
+            "[::1]:3141",
+            "evilts.net",
+            "ts.net",
+            "rey.tail1234.ts.net.evil.example",
+        ] {
+            assert!(
+                !cfg.authorize(&headers(&[("host", host), login])),
+                "{host:?} is not a tailnet name"
+            );
+        }
+        assert!(!cfg.authorize(&headers(&[login])), "no Host, no identity");
+
+        let both =
+            AuthConfig::from_parts(Some("tok".into()), ["skippy@tailnet.ts.net".to_string()]);
+        assert!(!both.authorize(&headers(&[("host", "evil.example:3141"), login])));
+        assert!(both.authorize(&headers(&[
+            ("host", "evil.example:3141"),
+            ("authorization", "Bearer tok"),
+        ])));
     }
 
     #[test]
@@ -389,8 +533,14 @@ mod tests {
         let cfg = AuthConfig::from_parts(Some("tok".into()), ["a@b.ts.net".to_string()]);
         assert_eq!(cfg.mode_label(), "token+tailscale-identity");
         assert!(cfg.authorize(&headers(&[("authorization", "Bearer tok")])));
-        assert!(cfg.authorize(&headers(&[("tailscale-user-login", "a@b.ts.net")])));
-        assert!(!cfg.authorize(&headers(&[("tailscale-user-login", "c@d.ts.net")])));
+        assert!(cfg.authorize(&headers(&[
+            ("host", "rey.tail1234.ts.net"),
+            ("tailscale-user-login", "a@b.ts.net"),
+        ])));
+        assert!(!cfg.authorize(&headers(&[
+            ("host", "rey.tail1234.ts.net"),
+            ("tailscale-user-login", "c@d.ts.net"),
+        ])));
     }
 
     #[test]

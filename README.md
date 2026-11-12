@@ -219,7 +219,9 @@ require a credential. Configure one of:
 - **Tailscale identity allowlist** (`dashboard.tailscale_allow`) — a request
   whose `Tailscale-User-Login` header (injected by `tailscale serve`) is in the
   allowlist is authorized. Humans just open the `.ts.net` URL; no token to type.
-  Only safe behind `tailscale serve`, which sets and strips that header.
+  Only safe behind `tailscale serve`, which sets and strips that header. The
+  header counts only on requests addressed to a `.ts.net` name, which
+  `tailscale serve` forwards unchanged.
 - **Bearer token** (`dashboard.auth_token` or `ENVELOPE_DASHBOARD_TOKEN`) —
   sent as `Authorization: Bearer <token>` (or `X-Envelope-Token`), compared in
   constant time. The path for Hermes/OpenClaw agents and scripts.
@@ -230,6 +232,10 @@ credential — including when `tailscale serve` fronts loopback. `envelope serve
 `/api/health` stays reachable for liveness probes but discloses local
 filesystem paths only to authorized callers. The CORS allowlist is a
 browser-only defense, not the access control.
+
+With no credential configured, the dashboard answers only requests addressed to
+`localhost`, `127.0.0.1` or `[::1]`. Reaching it under any other name, a `.ts.net`
+name included, returns `403` with `dashboard_host_not_loopback`.
 
 ## Why not Himalaya / Cloudflare / Resend?
 

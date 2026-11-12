@@ -648,6 +648,12 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route("/accounts/{account}/rules", get(legacy_rules_redirect))
         .nest("/api", api)
         .fallback(spa_fallback)
+        // With no credential configured, answer loopback names only, on every
+        // route (no-op once a credential is set).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_loopback_host_when_open,
+        ))
         // Apply at the outer router so SPA shell/fallback, embedded static assets,
         // API JSON, redirects, and errors cannot be framed by another origin.
         .layer(axum::middleware::from_fn(anti_clickjacking))
@@ -5305,7 +5311,10 @@ mod tests {
         let (denied, _) = get_api(
             &app,
             "/api/accounts",
-            &[("tailscale-user-login", "intruder@tail.ts.net")],
+            &[
+                ("host", "rey.tail1234.ts.net"),
+                ("tailscale-user-login", "intruder@tail.ts.net"),
+            ],
         )
         .await;
         assert_eq!(denied, StatusCode::UNAUTHORIZED);
@@ -5313,7 +5322,10 @@ mod tests {
         let (allowed, _) = get_api(
             &app,
             "/api/accounts",
-            &[("tailscale-user-login", "skippy@tail.ts.net")],
+            &[
+                ("host", "rey.tail1234.ts.net"),
+                ("tailscale-user-login", "skippy@tail.ts.net"),
+            ],
         )
         .await;
         assert_eq!(allowed, StatusCode::OK);
