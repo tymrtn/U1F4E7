@@ -284,6 +284,64 @@ pub async fn require_auth(
     next.run(request).await
 }
 
+/// Axum middleware for open loopback mode, applied to every dashboard route.
+///
+/// With no credential configured, the loopback bind is the only boundary, and
+/// a bind address does not tell the server which name a browser used to reach
+/// it. A page served from another site can point its own hostname at
+/// 127.0.0.1 and then read the dashboard as a same-origin page. That page's
+/// requests carry its hostname in `Host`, so answering only loopback names
+/// closes the gap. A request without `Host` passes, because browsers always
+/// send one. With a credential configured this is a no-op; the credential is
+/// the boundary there.
+pub async fn require_loopback_host_when_open(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.auth.is_enforced() {
+        return next.run(request).await;
+    }
+    let host = match header_str(request.headers(), header::HOST.as_str()) {
+        Some(host) => Some(host.to_string()),
+        None => request.uri().authority().map(|a| a.to_string()),
+    };
+    match host {
+        Some(host) if !is_loopback_host(&host) => host_not_loopback().into_response(),
+        _ => next.run(request).await,
+    }
+}
+
+/// True when a `Host` value names loopback: `localhost`, `127.0.0.1` or
+/// `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let (name, rest) = match host.strip_prefix("[::1]") {
+        Some(rest) => ("[::1]", rest),
+        None => host.split_at(host.find(':').unwrap_or(host.len())),
+    };
+    let port_ok = rest.is_empty()
+        || rest
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name == "[::1]" || name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost"))
+}
+
+fn host_not_loopback() -> impl IntoResponse {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "error": "host_not_loopback",
+            "code": "dashboard_host_not_loopback",
+            "detail": "This dashboard has no credential configured, so it answers only \
+                        requests addressed to localhost, 127.0.0.1 or [::1]. Open it at one \
+                        of those addresses, or set a token (ENVELOPE_DASHBOARD_TOKEN or \
+                        `envelope config set dashboard.auth_token <token>`) to reach it \
+                        under another name.",
+        })),
+    )
+}
+
 /// Extract the `access_token` query parameter from the request URI, if present.
 fn query_access_token(request: &Request) -> Option<String> {
     let query = request.uri().query()?;
@@ -324,6 +382,37 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn loopback_host_names_with_and_without_ports() {
+        for host in [
+            "localhost",
+            "LocalHost:3141",
+            "127.0.0.1",
+            "127.0.0.1:65535",
+            "[::1]",
+            "[::1]:3141",
+            " localhost:3141 ",
+        ] {
+            assert!(is_loopback_host(host), "{host:?} is loopback");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example:3141",
+            "evil.localhost:3141",
+            "127.0.0.2:3141",
+            "[::2]:3141",
+            "[::1].evil.example",
+            "localhost:",
+            "localhost:31a1",
+            "localhost:3141:1",
+            "0.0.0.0:3141",
+        ] {
+            assert!(!is_loopback_host(host), "{host:?} is not loopback");
+        }
     }
 
     #[test]

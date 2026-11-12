@@ -648,6 +648,12 @@ pub fn dashboard_router(state: AppState) -> Router {
         .route("/accounts/{account}/rules", get(legacy_rules_redirect))
         .nest("/api", api)
         .fallback(spa_fallback)
+        // With no credential configured, answer loopback names only, on every
+        // route (no-op once a credential is set).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_loopback_host_when_open,
+        ))
         // Apply at the outer router so SPA shell/fallback, embedded static assets,
         // API JSON, redirects, and errors cannot be framed by another origin.
         .layer(axum::middleware::from_fn(anti_clickjacking))

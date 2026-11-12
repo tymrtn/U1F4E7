@@ -231,6 +231,10 @@ credential — including when `tailscale serve` fronts loopback. `envelope serve
 filesystem paths only to authorized callers. The CORS allowlist is a
 browser-only defense, not the access control.
 
+With no credential configured, the dashboard answers only requests addressed to
+`localhost`, `127.0.0.1` or `[::1]`. Reaching it under any other name, a `.ts.net`
+name included, returns `403` with `dashboard_host_not_loopback`.
+
 ## Why not Himalaya / Cloudflare / Resend?
 
 ### vs. Himalaya
