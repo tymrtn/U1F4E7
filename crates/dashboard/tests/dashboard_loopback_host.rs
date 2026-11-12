@@ -131,6 +131,31 @@ async fn token_mode_answers_a_tailnet_host_with_the_token() {
 }
 
 #[tokio::test]
+async fn an_allowed_login_on_any_other_host_is_unauthorized() {
+    // `tailscale serve` forwards the tailnet name it was reached under, so a
+    // login header under any other name came from somewhere else.
+    for token in [None, Some("t0ken".to_string())] {
+        let app = dashboard_router(state().with_auth(AuthConfig::from_parts(
+            token,
+            ["skippy@tail.ts.net".to_string()],
+        )));
+        for host in ["evil.example:3141", "127.0.0.1:3141", "localhost:3141"] {
+            let (status, body) = send(
+                &app,
+                "GET",
+                "/api/accounts",
+                &[
+                    ("host", host),
+                    ("tailscale-user-login", "skippy@tail.ts.net"),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "Host {host}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn identity_mode_answers_a_tailnet_host_for_an_allowed_login() {
     let app = dashboard_router(state().with_auth(AuthConfig::from_parts(
         None,

@@ -5311,7 +5311,10 @@ mod tests {
         let (denied, _) = get_api(
             &app,
             "/api/accounts",
-            &[("tailscale-user-login", "intruder@tail.ts.net")],
+            &[
+                ("host", "rey.tail1234.ts.net"),
+                ("tailscale-user-login", "intruder@tail.ts.net"),
+            ],
         )
         .await;
         assert_eq!(denied, StatusCode::UNAUTHORIZED);
@@ -5319,7 +5322,10 @@ mod tests {
         let (allowed, _) = get_api(
             &app,
             "/api/accounts",
-            &[("tailscale-user-login", "skippy@tail.ts.net")],
+            &[
+                ("host", "rey.tail1234.ts.net"),
+                ("tailscale-user-login", "skippy@tail.ts.net"),
+            ],
         )
         .await;
         assert_eq!(allowed, StatusCode::OK);

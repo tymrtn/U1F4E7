@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - While `envelope serve` runs without a dashboard token, it now answers only requests addressed to `localhost`, `127.0.0.1` or `[::1]`, on any port. Before, a web page could point a hostname it controls at your computer and then read the dashboard as if it were that page's own site. Those requests carry the page's hostname, so the server now refuses them with `dashboard_host_not_loopback`, and the refusal says how to reach the dashboard. The dashboard at `http://localhost:3141` and scripts that call `127.0.0.1` work as before. A token-less dashboard reached under any other name, for example through `tailscale serve`, now refuses those requests too. Anyone on your tailnet could read your mail that way, so set a token with `envelope config set dashboard.auth_token <token>` if you use one.
+- The dashboard's Tailscale allowlist (`dashboard.tailscale_allow`) now accepts the `Tailscale-User-Login` header only on requests addressed to a `.ts.net` name. `tailscale serve` forwards that name unchanged and replaces any login header the browser sent, so opening the dashboard through your tailnet works as before. Before, a web page that knew an allowed login could point a hostname it controls at the dashboard's port, send that login itself and read your mail. A login header under any other name now gets the usual `401 dashboard_auth_required`. The bearer token works under any name, as before.
 
 ## [1.3.26] — 2026-10-14
 

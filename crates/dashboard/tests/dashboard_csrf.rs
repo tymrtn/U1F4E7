@@ -76,7 +76,10 @@ async fn identity_auth_mutating_post_without_csrf_is_rejected() {
         &app,
         "POST",
         MUTATING_URI,
-        &[("tailscale-user-login", "skippy@tail.ts.net")],
+        &[
+            ("host", "rey.tail1234.ts.net"),
+            ("tailscale-user-login", "skippy@tail.ts.net"),
+        ],
     )
     .await;
     assert!(

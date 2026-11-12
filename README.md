@@ -219,7 +219,9 @@ require a credential. Configure one of:
 - **Tailscale identity allowlist** (`dashboard.tailscale_allow`) — a request
   whose `Tailscale-User-Login` header (injected by `tailscale serve`) is in the
   allowlist is authorized. Humans just open the `.ts.net` URL; no token to type.
-  Only safe behind `tailscale serve`, which sets and strips that header.
+  Only safe behind `tailscale serve`, which sets and strips that header. The
+  header counts only on requests addressed to a `.ts.net` name, which
+  `tailscale serve` forwards unchanged.
 - **Bearer token** (`dashboard.auth_token` or `ENVELOPE_DASHBOARD_TOKEN`) —
   sent as `Authorization: Bearer <token>` (or `X-Envelope-Token`), compared in
   constant time. The path for Hermes/OpenClaw agents and scripts.
