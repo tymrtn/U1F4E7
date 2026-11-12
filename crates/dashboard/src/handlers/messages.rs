@@ -729,6 +729,62 @@ fn publish_new_mail(
     }
 }
 
+/// What a server that leaves the background jobs to another server has last
+/// seen of each account's indexed INBOX.
+#[derive(Debug, Default)]
+pub struct IndexWatch {
+    seen: std::collections::HashMap<String, (i64, i64, i64)>,
+}
+
+/// Announce the mail another server's background sync indexed.
+///
+/// That server's `new_mail` events stay in its own process, so a server that
+/// leaves the background jobs to it (the desktop app beside the installed
+/// dashboard) would never hear of new mail. This compares each account's INBOX
+/// fingerprint between looks and announces a change. The first look at an
+/// account is its baseline.
+pub async fn announce_index_changes(state: &AppState, watch: &mut IndexWatch) {
+    let fingerprints: Vec<(String, (i64, i64, i64))> = {
+        let db = state.db.lock().await;
+        let accounts = match db.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!("new-mail watch: could not list accounts: {e}");
+                return;
+            }
+        };
+        accounts
+            .into_iter()
+            .filter_map(|account| {
+                match db.message_index_fingerprint(&account.id, UNIFIED_INBOX_FOLDER) {
+                    Ok(fingerprint) => Some((account.id, fingerprint)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "new-mail watch: {} ({}) could not be read: {e}",
+                            account.username,
+                            account.id
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    };
+    for (account_id, fingerprint) in fingerprints {
+        let previous = watch.seen.insert(account_id.clone(), fingerprint);
+        if previous.is_some_and(|previous| previous != fingerprint) {
+            let (count, _, unseen) = fingerprint;
+            state
+                .events
+                .publish(crate::events::DashboardEvent::NewMail {
+                    account_id,
+                    message_count: count as usize,
+                    unread_count: unseen as usize,
+                });
+        }
+    }
+}
+
 /// Apply this sync's failures to the response in memory, independent of
 /// whether the flight's error marker persisted. A failed account keeps its
 /// cached rows, now labeled stale, and reports the error; nothing is dropped

@@ -25,12 +25,16 @@ worktrees/
 .hermes/
 /node_modules/
 
-# Out-of-scope subprojects (tracked separately or deferred)
-apps/
-
 # Stray scratch files
 *.tif
 .worktrees/
 
 # Agent instructions live in the parent dir, never in this public repo
 CLAUDE.md
+
+# Desktop shell (Tauri): source tracked, build artifacts ignored
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/

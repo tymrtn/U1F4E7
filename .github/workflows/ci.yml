@@ -141,6 +141,74 @@ jobs:
           fi
           echo "OK: committed bundle matches sources."
 
+  desktop-shell:
+    name: Desktop shell (Tauri)
+    # apps/desktop declares its own [workspace], so root `cargo test --all`
+    # never compiles it. macOS is the primary target and needs no webkit deps.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Cache desktop cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/src-tauri/target
+          key: macos-desktop-cargo-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Stage the envelope sidecar
+        working-directory: apps/desktop
+        # tauri-build resolves externalBin at compile time, so even `cargo test`
+        # fails without it. Staging here is what makes the desktop crate
+        # compile at all.
+        run: npm run stage-sidecar
+
+      - name: Typecheck frontend
+        working-directory: apps/desktop
+        run: npx tsc --noEmit
+
+      - name: Build frontend bundle
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Clippy (errors only)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets
+
+      - name: Test supervisor
+        working-directory: apps/desktop/src-tauri
+        run: cargo test
+
+      - name: Install Chromium for layout tests
+        run: |
+          python3 -m pip install --quiet --break-system-packages playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: End-to-end (server + layout)
+        working-directory: apps/desktop
+        # The lifecycle group launches real windows and is deliberately left to
+        # local runs; server and ui are deterministic and headless.
+        run: |
+          python3 tests/e2e/run.py --only server --only ui
+
   actionlint:
     name: Lint GitHub Actions workflows
     runs-on: ubuntu-latest
@@ -150,7 +218,7 @@ jobs:
       - name: Run actionlint
         uses: docker://rhysd/actionlint:latest
         with:
-          args: -color /github/workspace/.github/workflows/ci.yml /github/workspace/.github/workflows/release.yml
+          args: -color /github/workspace/.github/workflows/ci.yml /github/workspace/.github/workflows/release.yml /github/workspace/.github/workflows/release-desktop.yml
 
   security-grep:
     name: Governor architecture guard

@@ -1,0 +1,22 @@
+[package]
+name = "envelope-desktop"
+version = "1.3.26"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs-next = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `devtools` in release builds too. Without it there is no way to read a console
+# error or a blocked request inside the shipped app, which is exactly what was
+# needed to diagnose why mail images and links misbehaved here.
+tauri = { version = "2", features = ["devtools", "image-png", "tray-icon"] }
+# 2.5 and later require tauri 2.12; stay on the tauri this app already ships.
+tauri-plugin-notification = "~2.4"

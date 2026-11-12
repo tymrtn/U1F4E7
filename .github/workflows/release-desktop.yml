@@ -1,0 +1,176 @@
+name: Release desktop
+
+# Signed, notarized macOS bundle plus unsigned Linux packages. Runs on desktop
+# tags only, so a normal `v*` CLI release is unaffected. No Windows build: the
+# envelope server itself does not build for Windows yet.
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    name: Bundle, sign, notarize
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Stage the envelope sidecar
+        working-directory: apps/desktop
+        # Without this the bundle ships no server. Tauri fails the build when an
+        # externalBin entry is missing, so a staging failure cannot pass silently.
+        # The Google client is compiled into the server, as in release.yml.
+        env:
+          ENVELOPE_GOOGLE_CLIENT_ID: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_ID }}
+          ENVELOPE_GOOGLE_CLIENT_SECRET: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ENVELOPE_GOOGLE_CLIENT_ID" ] || [ -z "$ENVELOPE_GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::Repo secrets ENVELOPE_GOOGLE_CLIENT_ID/SECRET are not set; this release would ship without Google sign-in."
+            exit 1
+          fi
+          npm run stage-sidecar
+
+      - name: Bundle, sign and notarize
+        working-directory: apps/desktop
+        # Tauri signs when APPLE_SIGNING_IDENTITY is present and submits to
+        # notarytool when APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID are all set.
+        # Absent these the job still produces an unsigned bundle Gatekeeper will
+        # block, so the guard below fails the run instead.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is not set. Add it under Settings > Secrets and variables > Actions." >&2
+              exit 1
+            fi
+          done
+          npm run tauri build
+
+      - name: Verify the artifact is signed and notarized
+        # Fail loud rather than publishing something Gatekeeper rejects.
+        run: |
+          set -euo pipefail
+          app="apps/desktop/src-tauri/target/release/bundle/macos/Envelope.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then
+            echo "::error::bundle is adhoc-signed, not Developer ID signed" >&2
+            exit 1
+          fi
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: envelope-desktop-macos
+          path: apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  bundle-linux:
+    name: Bundle for Linux
+    # The oldest supported runner, so the packages link against a glibc that
+    # older distributions still have.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        # WebKitGTK draws the window and the appindicator library draws the
+        # tray icon; without the latter the app has no way back once its
+        # window is closed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Stage the envelope sidecar
+        working-directory: apps/desktop
+        env:
+          ENVELOPE_GOOGLE_CLIENT_ID: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_ID }}
+          ENVELOPE_GOOGLE_CLIENT_SECRET: ${{ secrets.ENVELOPE_GOOGLE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ENVELOPE_GOOGLE_CLIENT_ID" ] || [ -z "$ENVELOPE_GOOGLE_CLIENT_SECRET" ]; then
+            echo "::error::Repo secrets ENVELOPE_GOOGLE_CLIENT_ID/SECRET are not set; this release would ship without Google sign-in."
+            exit 1
+          fi
+          npm run stage-sidecar
+
+      - name: Bundle
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles deb,appimage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: envelope-desktop-linux
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+            apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # An artifact needs a GitHub login to download and expires. The tag is
+  # documented as the way users get the app, so it has to reach a release.
+  # One job publishes everything, so a platform that failed holds the release
+  # back instead of shipping a release with a platform missing.
+  publish:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: [bundle, bundle-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$GH_REF_NAME" \
+            --title "Envelope Desktop ${GH_REF_NAME#desktop-}" \
+            --generate-notes \
+            artifacts/envelope-desktop-macos/*.dmg \
+            artifacts/envelope-desktop-linux/*.deb \
+            artifacts/envelope-desktop-linux/*.AppImage
